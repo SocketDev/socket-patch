@@ -254,6 +254,8 @@ pub(crate) fn capture_value<T: Any + Send + Sync>(
 ///
 /// `Err(edit)` — nothing run, nothing captured — when `path` is not
 /// captured, so the caller can apply the edit and write the disk itself.
+/// Should `edit` unwind, the caller's value is re-captured before the
+/// panic continues, so the overlay never loses the key.
 pub(crate) fn edit_value<T, F>(
     path: &Path,
     value: &mut Arc<T>,
@@ -279,10 +281,8 @@ where
     if ours {
         files.remove(&key);
     }
-    edit(Arc::make_mut(value));
-    let held: Arc<dyn Any + Send + Sync> = Arc::clone(value) as Arc<dyn Any + Send + Sync>;
-    files.insert(
-        key,
+    let captured = |value: &Arc<T>| {
+        let held: Arc<dyn Any + Send + Sync> = Arc::clone(value) as Arc<dyn Any + Send + Sync>;
         Captured {
             bytes: Some(Content::Value {
                 value: held,
@@ -290,8 +290,21 @@ where
                 rendered: OnceLock::new(),
             }),
             preserve_mode: false,
-        },
-    );
+        }
+    };
+    // Should `edit` (or the copy `make_mut` makes) unwind, the key must not
+    // be left missing from the overlay: a commit that still ran would then
+    // write the lock edits beside the pre-run ledger. Put the caller's value
+    // back before the unwind continues — the same value a caught-and-
+    // continued caller holds.
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        edit(Arc::make_mut(value))
+    })) {
+        files.insert(key, captured(value));
+        drop(files);
+        std::panic::resume_unwind(panic);
+    }
+    files.insert(key, captured(value));
     Ok(())
 }
 
@@ -1104,6 +1117,45 @@ mod tests {
 
     fn render_string(value: &(dyn Any + Send + Sync)) -> std::io::Result<Vec<u8>> {
         Ok(value.downcast_ref::<String>().unwrap().as_bytes().to_vec())
+    }
+
+    /// An `edit_value` closure that unwinds leaves the value captured (the
+    /// overlay keeps the key) and the panic propagates: a commit that
+    /// still runs writes the caller's ledger, never the pre-run one beside
+    /// the run's other edits.
+    #[tokio::test]
+    async fn an_unwinding_edit_keeps_the_value_captured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        let ledger = root.join(".socket/vendor/state.json");
+        std::fs::write(&ledger, b"pre-run").unwrap();
+        let group = GroupCommit::begin(root);
+        let mut value = Arc::new("first".to_string());
+        assert!(capture_value(&ledger, Arc::clone(&value), render_string));
+        // Second save by the same caller: its Arc is the held one, so the
+        // overlay entry is released for the in-place edit.
+        assert!(edit_value(&ledger, &mut value, |s| s.push_str("+a"), render_string).is_ok());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = edit_value(
+                &ledger,
+                &mut value,
+                |s: &mut String| {
+                    s.push_str("+b");
+                    panic!("edit unwound");
+                },
+                render_string,
+            );
+        }));
+        assert!(caught.is_err(), "the panic propagates");
+        assert_eq!(
+            read_value::<String>(&ledger).as_deref().map(String::as_str),
+            Some("first+a+b"),
+            "the key stays captured with the caller's value"
+        );
+        assert!(Arc::ptr_eq(&read_value::<String>(&ledger).unwrap(), &value));
+        group.commit().await.unwrap();
+        assert_eq!(std::fs::read(&ledger).unwrap(), b"first+a+b");
     }
 
     /// A value capture answers typed readers with the value itself, byte
