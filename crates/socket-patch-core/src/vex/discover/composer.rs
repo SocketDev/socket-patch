@@ -61,6 +61,7 @@ use super::{
     DiscoverCtx, Discovery, LocateOpts, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
 };
 use crate::crawlers::composer_crawler::normalize_version;
+use crate::utils::composer_version::composer_purls_equivalent;
 use crate::vendor::lock_inventory::{composer_lock_packages, ComposerLockPackage};
 
 /// The lock both backends rewrite (root-relative).
@@ -155,8 +156,11 @@ fn entry_ref(
     };
 
     if let Some(vref) = vendored {
-        let leaf_matches = vendored_leaf_purl("composer", &vref.leaf).as_deref()
-            == Some(canonical_base_purl(&purl).as_str());
+        // The leaf carries the patch purl's spelling (`@3.0.2.0`), the lock
+        // its own (`3.0.2`): the same release either way.
+        let leaf_matches = vendored_leaf_purl("composer", &vref.leaf).is_some_and(|leaf| {
+            leaf == canonical_base_purl(&purl) || composer_purls_equivalent(&leaf, &purl)
+        });
         if vref.eco != "composer" || !leaf_matches {
             out.diag(
                 DIAG_REF_INVALID,
@@ -452,6 +456,53 @@ mod tests {
                     WiringMode::Vendored,
                 ),
             ],
+        );
+    }
+
+    /// The backend keys the leaf by the PATCH purl's version, which may be
+    /// composer's padded spelling (`@3.0.2.0`, `@1.0.0.0-RC1`) of the release
+    /// the lock records (`3.0.2`, `v1.0-rc1`): the same release, accepted and
+    /// keyed by the lock's own spelling. A leaf for another release is not.
+    #[tokio::test]
+    async fn vendored_leaf_in_an_equivalent_version_spelling_is_accepted() {
+        let wired = |name: &str, version: &str, uuid: &str, leaf: &str| {
+            Value::Object(crate::vendor::composer_lock::rewrite_lock_entry(
+                registry_entry(name, version).as_object().unwrap(),
+                &format!(".socket/vendor/composer/{uuid}/{leaf}"),
+                uuid,
+            ))
+        };
+        let padded = wired("psr/log", "3.0.2", UUID_B, "psr/log@3.0.2.0");
+        let rc = wired("Acme/Lib", "v1.0-rc1", UUID_A, "acme/lib@1.0.0.0-RC1");
+        let other = wired("psr/cache", "3.0.2", UUID_B, "psr/cache@3.0.2.1");
+        let p = Project::new();
+        p.write("composer.lock", lock(json!([padded, rc, other]), json!([])));
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[
+                ("pkg:composer/psr/log@3.0.2", UUID_B, WiringMode::Vendored),
+                (
+                    "pkg:composer/acme/lib@1.0-rc1",
+                    UUID_A,
+                    WiringMode::Vendored,
+                ),
+            ],
+        );
+        let psr = out
+            .refs
+            .iter()
+            .find(|r| r.purl == "pkg:composer/psr/log@3.0.2")
+            .unwrap();
+        assert_eq!(
+            psr.artifact_rel.as_deref(),
+            Some(format!(".socket/vendor/composer/{UUID_B}/psr/log@3.0.2.0").as_str())
+        );
+        assert_eq!(
+            diag_codes(&out),
+            vec![DIAG_REF_INVALID],
+            "{:#?}",
+            out.diagnostics
         );
     }
 

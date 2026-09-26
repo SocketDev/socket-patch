@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::FileEdit;
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
+use crate::utils::composer_version::purl_identity_key;
 use crate::utils::fs::read_regular_to_bytes;
 use crate::utils::purl::{canonical_purl, purl_name_version};
 use crate::utils::socket_dir::{remove_file_and_prune, write_json_ledger};
@@ -64,14 +65,15 @@ impl RedirectState {
     }
 
     /// The stored record keys whose canonical purl (qualifiers stripped,
-    /// percent-decoded — [`canonical_purl`]) matches `purl`, in ledger
-    /// order. Normally zero or one; a hand-edited ledger may carry the same
-    /// package under two spellings, and every caller must drop them all.
+    /// percent-decoded — [`canonical_purl`]; composer by release identity,
+    /// so a `@3.0.2.0` record is found for `@3.0.2`) matches `purl`, in
+    /// ledger order. Normally zero or one; a hand-edited ledger may carry the
+    /// same package under two spellings, and every caller must drop them all.
     pub(crate) fn record_keys_for(&self, purl: &str) -> Vec<String> {
-        let target = canonical_purl(purl);
+        let target = purl_identity_key(purl);
         self.records
             .keys()
-            .filter(|k| canonical_purl(k) == target)
+            .filter(|k| purl_identity_key(k) == target)
             .cloned()
             .collect()
     }
@@ -811,6 +813,45 @@ mod tests {
         )];
         assert!(drop_superseded_purl(&mut state, "pkg:npm/@scope/pkg@1.0.0"));
         assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// Composer: the hosted record is keyed by the API's padded spelling
+    /// (`@3.0.2.0`) while the vendor run supersedes the lock's `@3.0.2`.
+    /// Both halves must still be claimed (the record by release identity,
+    /// the name-keyed lock edit through the record's uuid anchor), and the
+    /// other version's halves must survive.
+    #[test]
+    fn drop_superseded_purl_matches_composer_version_spellings() {
+        const UUID_OTHER: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0f9e8d7c6b5a";
+        let composer_edit = |uuid: &str| FileEdit {
+            path: "composer.lock".to_string(),
+            kind: "redirect_composer_lock_entry".to_string(),
+            action: "rewritten".to_string(),
+            key: Some("psr/log".to_string()),
+            original: Some(serde_json::json!("orig")),
+            new: Some(serde_json::json!(format!(
+                "\"url\": \"https:\\/\\/patch.test\\/patch\\/composer\\/{uuid}\\/log.zip\""
+            ))),
+        };
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:composer/psr/log@3.0.2.0".to_string(), sample_record());
+        state.records.insert(
+            "pkg:composer/psr/log@3.0.20".to_string(),
+            record_with_uuid(UUID_OTHER),
+        );
+        state.edits = vec![composer_edit(SAMPLE_UUID), composer_edit(UUID_OTHER)];
+
+        assert!(drop_superseded_purl(
+            &mut state,
+            "pkg:composer/psr/log@3.0.2"
+        ));
+        assert_eq!(
+            state.records.keys().collect::<Vec<_>>(),
+            vec!["pkg:composer/psr/log@3.0.20"]
+        );
+        assert_eq!(state.edits, vec![composer_edit(UUID_OTHER)]);
     }
 
     /// Cargo purls are refused: their takeover must revert the hosted edits

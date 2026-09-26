@@ -179,6 +179,51 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/composer/composer-lock/padded-version/expected": {
+    "refs": [
+      {
+        "purl": "pkg:composer/monolog/monolog@2.0.0",
+        "uuid": "44444444-4444-4444-4444-444444444444",
+        "mode": "hosted",
+        "source_file": "composer.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sha1Hex(\"abcdef0123456789abcdef0123456789abcdef01\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/composer/monolog/monolog/2.0.0.0/11111111-1111-1111-1111-111111111111/44444444-4444-4444-4444-444444444444/monolog-2.0.0.0.zip",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "composer.lock"
+      },
+      {
+        "uuid": "44444444-4444-4444-4444-444444444444",
+        "mode": "hosted",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "44444444-4444-4444-4444-444444444444",
+        "purl": "pkg:composer/monolog/monolog@2.0.0"
+      }
+    ]
+  },
+  "redirect/composer/composer-lock/padded-version/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "redirect/composer/composer-lock/source-and-dist/expected": {
     "refs": [
       {

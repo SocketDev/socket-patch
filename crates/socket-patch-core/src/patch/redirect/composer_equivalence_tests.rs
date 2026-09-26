@@ -47,7 +47,7 @@ fn find_composer_entry_oracle(content: &str, pkg: &str, version: &str) -> Compos
         let Some(locked) = json_string_field(entry, "version") else {
             continue;
         };
-        if normalize_version(locked) == normalize_version(version) {
+        if composer_versions_equivalent(locked, version) {
             return ComposerEntry::Found(name_idx, end);
         }
         mismatched = Some(locked.to_string());

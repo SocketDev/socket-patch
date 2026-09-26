@@ -10,6 +10,7 @@ use super::{
     ComposerCrawler, ComposerPackageEntry,
 };
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
+use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::is_dir;
 
 pub(super) struct LegacyComposerCrawler;
@@ -87,7 +88,8 @@ impl LegacyComposerCrawler {
                     continue;
                 };
 
-                if normalize_version(&entry.version) != normalize_version(version) {
+                // Release identity, exactly as the parent module compares.
+                if !composer_versions_equivalent(&entry.version, version) {
                     continue;
                 }
 
