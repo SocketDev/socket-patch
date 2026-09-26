@@ -448,6 +448,41 @@
       "identity": "20100102"
     },
     {
+      "input": "20231001",
+      "composerNormalized": "20231001",
+      "identity": "20231001"
+    },
+    {
+      "input": "v20231001",
+      "composerNormalized": "20231001",
+      "identity": "20231001"
+    },
+    {
+      "input": "20231001.0",
+      "composerNormalized": "20231001.0",
+      "identity": "20231001.0"
+    },
+    {
+      "input": "20231001.0.0.0",
+      "composerNormalized": null,
+      "identity": "20231001"
+    },
+    {
+      "input": "20231001.1.0.0",
+      "composerNormalized": null,
+      "identity": "20231001.1"
+    },
+    {
+      "input": "123456.1.0.0",
+      "composerNormalized": null,
+      "identity": "123456.1"
+    },
+    {
+      "input": "1234567.0.0.0",
+      "composerNormalized": null,
+      "identity": "1234567"
+    },
+    {
       "input": "2010-01-02",
       "composerNormalized": "2010.01.02",
       "identity": "2010.01.02"
@@ -952,6 +987,31 @@
     {
       "left": "",
       "right": "0",
+      "equivalent": false
+    },
+    {
+      "left": "20231001",
+      "right": "20231001.0.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "v20231001",
+      "right": "20231001.0.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "123456.1",
+      "right": "123456.1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "20231001.0",
+      "right": "20231001.0.0.0",
+      "equivalent": false
+    },
+    {
+      "left": "20231001.1.0.0",
+      "right": "20231001.0.0.0",
       "equivalent": false
     }
   ]

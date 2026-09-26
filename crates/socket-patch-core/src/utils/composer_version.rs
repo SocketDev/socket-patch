@@ -12,9 +12,12 @@
 //! release by (Packagist keeps `version_normalized` unique per package). It is
 //! checked against real Composer 2.10.3 by the shared vector file
 //! `tests/fixtures/composer-version-vectors.json`, which depscan's
-//! `composerPatchIdentityVersion` twin asserts byte for byte. A spelling
-//! Composer rejects keys as itself minus one leading `v`, and is equivalent
-//! only to other rejected spellings with the same key.
+//! `composerPatchIdentityVersion` twin asserts byte for byte. A 2-4 part
+//! numeric spelling Composer rejects (the SBOM's four-part padding of a date
+//! version, `20231001.0.0.0`) is normalized with its trailing `.0` parts
+//! dropped. Any other spelling Composer rejects keys as itself minus one
+//! leading `v`, and is equivalent only to other rejected spellings with the
+//! same key.
 //!
 //! Only comparisons go through this module. Stored spellings (manifest keys,
 //! vendored leaf directories, ledger keys, crawler purls) are unchanged.
@@ -189,10 +192,37 @@ fn strip_leading_v(version: &str) -> &str {
     }
 }
 
-/// The identity key of a composer version: [`composer_version_normalize`],
-/// else the spelling minus one leading `v`.
+/// [`composer_version_normalize`], or for a 2-4 part numeric spelling
+/// Composer rejects, the normalized form with its trailing `.0` parts dropped.
+/// SBOM rows pad every numeric version to four parts, which Composer rejects
+/// for a 6+ digit (date) major (`20231001` → `20231001.0.0.0`).
+fn identity_normalize(version: &str) -> Option<String> {
+    if let Some(normalized) = composer_version_normalize(version) {
+        return Some(normalized);
+    }
+    let stripped = strip_leading_v(version);
+    let parts: Vec<&str> = stripped.split('.').collect();
+    if !(2..=4).contains(&parts.len())
+        || !parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let keep = parts
+        .iter()
+        .rposition(|part| *part != "0")
+        .map_or(1, |index| index + 1);
+    if keep == parts.len() {
+        return None;
+    }
+    composer_version_normalize(&parts[..keep].join("."))
+}
+
+/// The identity key of a composer version: its normalized form (see
+/// [`identity_normalize`]), else the spelling minus one leading `v`.
 pub fn composer_version_key(version: &str) -> String {
-    composer_version_normalize(version).unwrap_or_else(|| strip_leading_v(version).to_string())
+    identity_normalize(version).unwrap_or_else(|| strip_leading_v(version).to_string())
 }
 
 /// Whether two composer version spellings name the same release
@@ -200,7 +230,7 @@ pub fn composer_version_key(version: &str) -> String {
 /// Composer rejects matches only another rejected spelling with the same
 /// `v`-stripped text.
 pub fn composer_versions_equivalent(a: &str, b: &str) -> bool {
-    match (composer_version_normalize(a), composer_version_normalize(b)) {
+    match (identity_normalize(a), identity_normalize(b)) {
         (Some(left), Some(right)) => left == right,
         (None, None) => strip_leading_v(a) == strip_leading_v(b),
         _ => false,
@@ -317,6 +347,22 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn sbom_padded_date_versions_match_their_lock_spelling() {
+        assert_eq!(composer_version_key("20231001.0.0.0"), "20231001");
+        assert!(composer_versions_equivalent("20231001", "20231001.0.0.0"));
+        assert!(composer_versions_equivalent("123456.1", "123456.1.0.0"));
+        assert!(!composer_versions_equivalent(
+            "20231001.0",
+            "20231001.0.0.0"
+        ));
+        assert!(!composer_versions_equivalent("1.2.3.4.5", "1.2.3.4.5.0"));
+        assert_eq!(
+            composer_purl_identity("pkg:composer/acme/dated@20231001.0.0.0"),
+            composer_purl_identity("pkg:composer/acme/dated@20231001"),
+        );
     }
 
     #[test]
