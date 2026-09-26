@@ -1001,6 +1001,58 @@ fn pipenv_workon_home_venvs(
     found
 }
 
+/// What the interpreter query below depends on besides the interpreter
+/// itself: the whole process environment (`PATH` picks the interpreter;
+/// `HOME`, `PYTHONUSERBASE`, `PYTHONHOME`, … shape its answer) and the
+/// working directory.
+type SiteQueryKey = (
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    Option<PathBuf>,
+);
+
+fn site_query_key() -> SiteQueryKey {
+    let mut env: Vec<_> = std::env::vars_os().collect();
+    env.sort();
+    (env, std::env::current_dir().ok())
+}
+
+/// The last `(key, answer)` of an expensive query, re-run whenever the key
+/// differs.
+struct KeyedMemo<K, V> {
+    slot: std::sync::Mutex<Option<(K, V)>>,
+}
+
+impl<K: PartialEq, V: Clone> KeyedMemo<K, V> {
+    const fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn get_or_run(&self, key: K, run: impl FnOnce() -> V) -> V {
+        let lock = || {
+            self.slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some((cached, value)) = lock().as_ref() {
+            if *cached == key {
+                return value.clone();
+            }
+        }
+        let value = run();
+        *lock() = Some((key, value.clone()));
+        value
+    }
+}
+
+/// The interpreter's site-packages answer (the `find_python_command` probe
+/// plus the `site` query — two process spawns), per [`SiteQueryKey`]: a
+/// scan asks it once for its crawl and again when it vendors, in the same
+/// environment, so the second ask re-spawned both processes for the same
+/// output.
+static SITE_QUERY_MEMO: KeyedMemo<SiteQueryKey, Option<String>> = KeyedMemo::new();
+
 /// Get global/system Python `site-packages` directories.
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
@@ -1022,15 +1074,17 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 
     // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
     let site_output = run_blocking(|| {
-        let python_cmd = find_python_command()?;
-        let runner = SystemCommandRunner;
-        runner.run(
-            python_cmd,
-            &[
-                "-c",
-                "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
-            ],
-        )
+        SITE_QUERY_MEMO.get_or_run(site_query_key(), || {
+            let python_cmd = find_python_command()?;
+            let runner = SystemCommandRunner;
+            runner.run(
+                python_cmd,
+                &[
+                    "-c",
+                    "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
+                ],
+            )
+        })
     })
     .await;
     if let Some(stdout) = site_output {
@@ -2787,5 +2841,44 @@ mod tests {
                 "vacuous fixtures: {crawled}/{found}"
             );
         }
+    }
+
+    /// DC-6: the interpreter query memo answers from its slot only for the
+    /// exact key it was filled under, re-runs on any other key (a changed
+    /// environment or working directory), and keeps a failed query's
+    /// `None` the same way.
+    #[test]
+    fn keyed_memo_reruns_only_on_a_different_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let memo: KeyedMemo<(u32, &str), Option<String>> = KeyedMemo::new();
+        let runs = AtomicUsize::new(0);
+        let run = |out: Option<&str>| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            out.map(str::to_string)
+        };
+        assert_eq!(
+            memo.get_or_run((1, "a"), || run(Some("x"))),
+            Some("x".into())
+        );
+        assert_eq!(
+            memo.get_or_run((1, "a"), || run(Some("stale"))),
+            Some("x".into())
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(memo.get_or_run((2, "a"), || run(None)), None);
+        assert_eq!(memo.get_or_run((2, "a"), || run(Some("y"))), None);
+        assert_eq!(
+            memo.get_or_run((1, "a"), || run(Some("z"))),
+            Some("z".into())
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    /// DC-6: in an unchanged process environment the memoized global
+    /// site-packages discovery answers exactly what a fresh one does.
+    #[tokio::test]
+    async fn global_site_packages_are_stable_across_calls() {
+        let first = get_global_python_site_packages().await;
+        assert_eq!(get_global_python_site_packages().await, first);
     }
 }
