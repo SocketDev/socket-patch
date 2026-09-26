@@ -18,6 +18,7 @@ use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
 use socket_patch_core::patch::apply::PatchSources;
+use socket_patch_core::patch::redirect::vlt::DISCARDING_LOCK_CODES;
 use socket_patch_core::patch::redirect::{rewrite_registry_redirect, DepOverride};
 use socket_patch_core::vendor::lock_inventory::{inventory_project, LockIntegrity};
 use socket_patch_core::vendor::npm_flavor::{revert_npm_any, vendor_npm_any};
@@ -883,9 +884,12 @@ async fn lock_inventory_reads_every_capture_and_drops_vendored_nodes() {
 #[tokio::test]
 async fn vex_discovers_every_hosted_rewrite_and_nothing_before_it() {
     let overrides = overrides();
-    for (version, targets, _) in CAPTURES {
+    for (version, targets, warnings) in CAPTURES {
         let files = read_capture(version);
         let rewritten = rewrite_registry_redirect(&files, &overrides);
+        let discarded = warnings
+            .iter()
+            .any(|code| DISCARDING_LOCK_CODES.contains(code));
         for (label, text) in [
             ("input", files["vlt-lock.json"].clone()),
             ("output", rewritten.files["vlt-lock.json"].clone()),
@@ -896,9 +900,18 @@ async fn vex_discovers_every_hosted_rewrite_and_nothing_before_it() {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             fs::write(tmp.path().join("vlt-lock.json"), &text).unwrap();
+            if let Some(config) = files.get("vlt.json") {
+                fs::write(tmp.path().join("vlt.json"), config).unwrap();
+            }
             let out = discover_patched_refs(tmp.path()).await;
-            assert!(
-                out.diagnostics.is_empty(),
+            let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code).collect();
+            let want_codes: Vec<&str> = if discarded && label != "input" {
+                vec!["patched_ref_unattributable"]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                codes, want_codes,
                 "{version} {label}: {:?}",
                 out.diagnostics
             );
@@ -907,11 +920,8 @@ async fn vex_discovers_every_hosted_rewrite_and_nothing_before_it() {
                 .iter()
                 .map(|r| {
                     assert_eq!(r.mode, WiringMode::Hosted, "{version} {label}");
-                    assert_eq!(
-                        r.locked_integrity,
-                        Some(LockIntegrity::Sri(patched_sha(&r.uuid))),
-                        "{version} {label}"
-                    );
+                    let pin = (!discarded).then(|| LockIntegrity::Sri(patched_sha(&r.uuid)));
+                    assert_eq!(r.locked_integrity, pin, "{version} {label}");
                     (r.purl.clone(), r.uuid.clone())
                 })
                 .collect();
