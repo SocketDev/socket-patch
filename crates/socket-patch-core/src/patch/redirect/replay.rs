@@ -468,6 +468,7 @@ pub async fn revert_remaining_redirect_edits(
         let mut staged_bytes: StagedBytes = BTreeMap::new();
         let mut group_drops: BTreeSet<usize> = BTreeSet::new();
         let mut group_warnings: Vec<(String, String)> = Vec::new();
+        let mut vanished_vlt: Vec<usize> = Vec::new();
         let files: BTreeSet<String> = indices
             .iter()
             .map(|&i| state.edits[i].path.clone())
@@ -547,11 +548,15 @@ pub async fn revert_remaining_redirect_edits(
                         }
                     };
                     match super::vlt::revert_vlt_slots(&content, edit) {
-                        Ok(Some(restored)) => {
+                        Ok(super::vlt::SlotRevert::Restored(restored)) => {
                             staged.insert(edit.path.clone(), Some(restored));
                             group_drops.insert(idx);
                         }
-                        Ok(None) => {
+                        Ok(super::vlt::SlotRevert::Unchanged) => {
+                            group_drops.insert(idx);
+                        }
+                        Ok(super::vlt::SlotRevert::Vanished) => {
+                            vanished_vlt.push(idx);
                             group_drops.insert(idx);
                         }
                         Err(reason) => {
@@ -1083,6 +1088,20 @@ pub async fn revert_remaining_redirect_edits(
                     }
                     group_drops.insert(idx);
                 }
+            }
+        }
+
+        for &idx in &vanished_vlt {
+            let edit = &state.edits[idx];
+            let checked = match staged_read(&staged, project_root, &edit.path).await {
+                Ok(Some(content)) => super::vlt::check_vanished(&content, edit),
+                Ok(None) => Err(format!("{} no longer exists", edit.path)),
+                Err(error) => Err(error),
+            };
+            if let Err(reason) = checked {
+                refuse(reason, &mut outcome);
+                refused_groups.insert(group);
+                continue 'group;
             }
         }
 
@@ -2186,6 +2205,72 @@ mod tests {
         assert_eq!(read(dir.path(), "vlt-lock.json").await, vlt_lock(&drifted));
         assert_eq!(state.edits.len(), 1);
         assert!(state.records.contains_key("pkg:npm/minimist@1.2.8"));
+    }
+
+    #[tokio::test]
+    async fn vlt_replay_keeps_a_relaid_flag_and_trailing_slots() {
+        let dir = TempDir::new().unwrap();
+        let relaid = VLT_HOSTED_ENTRY.replacen("[2,", "[0,", 1).replacen(
+            "\"]",
+            "\",null,null,null,null,{  \"m\": \"bin.js\"}]",
+            1,
+        );
+        write(dir.path(), "vlt-lock.json", &vlt_lock(&relaid)).await;
+        let mut state = state_with(vec![vlt_edit()], &["pkg:npm/minimist@1.2.8"]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{out:?}");
+        assert_eq!(
+            read(dir.path(), "vlt-lock.json").await,
+            vlt_lock(
+                "\"~npm~minimist@1.2.8~peer.1\": [0,\"minimist\",\"sha512-r\",null,null,null,null,null,{  \"m\": \"bin.js\"}]"
+            )
+        );
+        assert!(state.edits.is_empty() && state.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_relocked_away_vlt_variant_reverts_whatever_the_ledger_order() {
+        let plain_registry = VLT_REGISTRY_ENTRY.replace("~peer.1", "");
+        let plain_hosted = VLT_HOSTED_ENTRY.replace("~peer.1", "");
+        let plain_edit = FileEdit {
+            key: Some("minimist@1.2.8".into()),
+            ..edit(
+                "vlt-lock.json",
+                super::super::vlt::KIND,
+                "rewritten",
+                Some(&plain_registry),
+                Some(&plain_hosted),
+            )
+        };
+        for edits in [
+            vec![plain_edit.clone(), vlt_edit()],
+            vec![vlt_edit(), plain_edit.clone()],
+        ] {
+            let dir = TempDir::new().unwrap();
+            write(dir.path(), "vlt-lock.json", &vlt_lock(&plain_hosted)).await;
+            let mut state = state_with(edits, &["pkg:npm/minimist@1.2.8"]);
+            let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert!(out.fully_reverted(), "{out:?}");
+            assert_eq!(
+                read(dir.path(), "vlt-lock.json").await,
+                vlt_lock(&plain_registry)
+            );
+            assert!(state.edits.is_empty() && state.records.is_empty());
+        }
+
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "vlt-lock.json", &vlt_lock(&plain_hosted)).await;
+        let mut state = state_with(vec![vlt_edit()], &["pkg:npm/minimist@1.2.8"]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(
+            out.refusals[0].reason.contains("still pins its hosted URL"),
+            "{out:?}"
+        );
+        assert_eq!(
+            read(dir.path(), "vlt-lock.json").await,
+            vlt_lock(&plain_hosted)
+        );
     }
 
     #[tokio::test]

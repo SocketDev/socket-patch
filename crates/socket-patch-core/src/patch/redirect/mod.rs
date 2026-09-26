@@ -228,7 +228,8 @@ pub struct RewriteResult {
     /// the node grammar, a failed residual gate). Never confirmed, whichever
     /// lock drives.
     pub refused_vlt_uuids: std::collections::BTreeSet<String>,
-    /// [`vlt::vlt_drives`] over the rewriter's input files.
+    /// [`vlt::vlt_drives`] over the rewriter's input files and the
+    /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
 }
 
@@ -274,7 +275,7 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
 ) -> RewriteResult {
-    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None)
+    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None, false)
 }
 
 /// Whether any pypi override targets an entry of `files["Pipfile.lock"]` —
@@ -325,11 +326,15 @@ fn withhold<'a>(
     }
 }
 
+/// `bun_lockb_present` reports a `bun.lockb` in the project that `files`
+/// leaves out because the caller rewrites its bytes itself; vlt counts it
+/// as a sibling lock.
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     // pdm runs FIRST, but only when `pdm.lock` is the project's PyPI install
@@ -351,8 +356,8 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     rewrite_yarn_classic(files, overrides, &mut result);
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
-    vlt::rewrite_vlt_lock(files, overrides, &mut result);
-    result.vlt_drives = vlt::vlt_drives(files);
+    vlt::rewrite_vlt_lock(files, overrides, bun_lockb_present, &mut result);
+    result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
     requirements::rewrite(files, overrides, &mut result);
     rewrite_hatch(files, overrides, &mut result);
     rewrite_uv_lock(files, overrides, python_metadata, &mut result);

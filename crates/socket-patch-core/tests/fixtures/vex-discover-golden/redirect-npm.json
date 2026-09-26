@@ -1237,6 +1237,14 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/npm/vlt/hidden-lock-sentinel-only/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "redirect/npm/vlt/invalid-json/input": {
     "refs": [],
     "diagnostics": [],
@@ -1302,6 +1310,38 @@
     "live_claims": []
   },
   "redirect/npm/vlt/lock-absent-version-warning/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-alias-url-equals-registry/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-alias-url-equals-registry/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-default-registry-alias/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-default-registry-alias/input": {
     "refs": [],
     "diagnostics": [],
     "recognized": [],

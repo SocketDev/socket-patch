@@ -17,9 +17,9 @@ use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::vendor::vlt_lock_text::{
-    entry_text, is_default_registry, nodes_block, parse_node_entry_text, parse_node_line,
-    parse_vendored_path, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
-    split_lines, DepIdKind, LockSniff, NodeEntry, ParsedLock, SectionSpan,
+    entry_text, is_default_registry, is_registry_url_segment, nodes_block, parse_node_entry_text,
+    parse_node_line, parse_vendored_path, render_entry_line, render_tuple_with_slots, sniff_lock,
+    split_dep_id, split_lines, DepIdKind, LockSniff, NodeEntry, ParsedLock, SectionSpan,
 };
 
 /// The ledger kind of a hosted vlt node splice.
@@ -36,14 +36,26 @@ const SIBLING_LOCKS: [&str; 6] = [
     BUN_LOCKB,
 ];
 
+/// The other npm-family locks present. `bun_lockb_present` reports a
+/// `bun.lockb` on disk, which a caller holding its bytes keeps out of
+/// `files`.
+fn sibling_locks(files: &BTreeMap<String, String>, bun_lockb_present: bool) -> Vec<&'static str> {
+    SIBLING_LOCKS
+        .iter()
+        .copied()
+        .filter(|lock| files.contains_key(*lock) || (*lock == BUN_LOCKB && bun_lockb_present))
+        .collect()
+}
+
 /// Does vlt drive hosted confirmation and the artifact preflight?
 /// `vlt-lock.json` must be present, and either vlt's install state (the
 /// `node_modules/.vlt-lock.json` sentinel) is too, or no other npm-family
-/// lock is. Otherwise both locks are rewritten and neither decides alone.
-pub fn vlt_drives(files: &BTreeMap<String, String>) -> bool {
+/// lock is (`bun_lockb_present`: see [`sibling_locks`]). Otherwise both
+/// locks are rewritten and neither decides alone.
+pub fn vlt_drives(files: &BTreeMap<String, String>, bun_lockb_present: bool) -> bool {
     files.contains_key(VLT_LOCK)
         && (files.contains_key(VLT_HIDDEN_LOCK_REL)
-            || !SIBLING_LOCKS.iter().any(|lock| files.contains_key(*lock)))
+            || sibling_locks(files, bun_lockb_present).is_empty())
 }
 
 fn lock_unsupported(detail: &str) -> RewriteWarning {
@@ -122,8 +134,7 @@ fn is_old_lockfile_ignored(lock: &HostedLock, files: &BTreeMap<String, String>) 
         nodes.keys().any(|id| {
             split_dep_id(id).is_some_and(|dep_id| {
                 dep_id.kind == DepIdKind::Registry
-                    && dep_id.first != "npm"
-                    && is_default_registry(&dep_id.first, options)
+                    && (dep_id.first.is_empty() || is_registry_url_segment(&dep_id.first, options))
             })
         })
     });
@@ -149,7 +160,11 @@ fn is_scalar_registry_ignored(lock: &HostedLock) -> bool {
     scalar && (lock.parsed.version != Some(1) || !registries_npm)
 }
 
-fn lock_level_warnings(lock: &HostedLock, files: &BTreeMap<String, String>) -> Vec<RewriteWarning> {
+fn lock_level_warnings(
+    lock: &HostedLock,
+    files: &BTreeMap<String, String>,
+    bun_lockb_present: bool,
+) -> Vec<RewriteWarning> {
     let mut warnings = Vec::new();
     if lock.parsed.version.is_none() {
         warnings.push(RewriteWarning {
@@ -176,12 +191,8 @@ fn lock_level_warnings(lock: &HostedLock, files: &BTreeMap<String, String>) -> V
                 .into(),
         });
     }
-    if !vlt_drives(files) {
-        let others: Vec<&str> = SIBLING_LOCKS
-            .iter()
-            .copied()
-            .filter(|lock| files.contains_key(*lock))
-            .collect();
+    if !vlt_drives(files, bun_lockb_present) {
+        let others = sibling_locks(files, bun_lockb_present);
         warnings.push(RewriteWarning {
             code: "redirect_vlt_sibling_lockfiles".into(),
             detail: format!(
@@ -409,6 +420,7 @@ fn rewrite_dep(
 pub(super) fn rewrite_vlt_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    bun_lockb_present: bool,
     result: &mut RewriteResult,
 ) {
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
@@ -433,7 +445,9 @@ pub(super) fn rewrite_vlt_lock(
             return;
         }
     };
-    result.warnings.extend(lock_level_warnings(&lock, files));
+    result
+        .warnings
+        .extend(lock_level_warnings(&lock, files, bun_lockb_present));
 
     let mut lines: Vec<String> = split_lines(text).into_iter().map(str::to_string).collect();
     let mut changed = false;
@@ -465,13 +479,21 @@ fn drift(id: &str, why: &str) -> String {
     )
 }
 
-/// Undo one [`KIND`] edit by slots. The line keyed by the recorded DepID
-/// gets `original`'s slots [2] and [3] back while its current flags,
-/// trailing slots, indent, comma and `\r` stay, so a lock vlt re-laid since
-/// the rewrite still reverts. `Ok(None)` when there is nothing to revert:
-/// the line already holds `original`'s slots, or the DepID and the hosted
-/// URL are both gone (a re-lock). Anything else is drift.
-pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<Option<String>, String> {
+/// What [`revert_vlt_slots`] found on the line keyed by an edit's DepID.
+#[derive(Debug, PartialEq)]
+pub(crate) enum SlotRevert {
+    /// The lock text with `original`'s slots back on that line.
+    Restored(String),
+    /// The line already holds `original`'s slots.
+    Unchanged,
+    /// No line has the DepID. Every instance of a `name@version` shares one
+    /// hosted URL, so [`check_vanished`] runs only after the transaction's
+    /// other edits are staged.
+    Vanished,
+}
+
+/// The recorded DepID and entries of a [`KIND`] edit.
+fn recorded(edit: &FileEdit) -> Result<(NodeEntry<'_>, NodeEntry<'_>), String> {
     fn fragment(v: &Option<Value>) -> Option<&str> {
         v.as_ref().and_then(Value::as_str)
     }
@@ -487,6 +509,16 @@ pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<Option<Str
     if original.key != new.key {
         return Err(format!("{KIND} edit records two different DepIDs"));
     }
+    Ok((original, new))
+}
+
+/// Undo one [`KIND`] edit by slots. The line keyed by the recorded DepID
+/// gets `original`'s slots [2] and [3] back while its current flags,
+/// trailing slots, indent, comma and `\r` stay, so a lock vlt re-laid since
+/// the rewrite still reverts. A line that already holds `original`'s slots
+/// is [`SlotRevert::Unchanged`]; anything else on that line is drift.
+pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<SlotRevert, String> {
+    let (original, new) = recorded(edit)?;
     let id = original.key;
     let lines = split_lines(text);
     let Some(span) = nodes_block(&lines) else {
@@ -497,22 +529,8 @@ pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<Option<Str
         .entry_lines()
         .filter(|&i| lines[i].starts_with(prefix.as_str()))
         .collect();
-    let url = slot_value(&new, 3);
     match keyed.as_slice() {
-        [] => {
-            let url_left = url
-                .as_ref()
-                .and_then(Value::as_str)
-                .is_some_and(|url| lines.iter().any(|line| line.contains(url)));
-            if url_left {
-                Err(drift(
-                    id,
-                    &format!("no longer has {id}, but still pins its hosted URL"),
-                ))
-            } else {
-                Ok(None)
-            }
-        }
+        [] => Ok(SlotRevert::Vanished),
         [idx] => {
             let Some(line) = parse_node_line(lines[*idx]) else {
                 return Err(drift(
@@ -521,7 +539,7 @@ pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<Option<Str
                 ));
             };
             if same_slots(&line.entry, &original) {
-                return Ok(None);
+                return Ok(SlotRevert::Unchanged);
             }
             if !same_slots(&line.entry, &new) {
                 return Err(drift(
@@ -536,9 +554,28 @@ pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<Option<Str
             );
             let mut out: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
             out[*idx] = render_entry_line(&entry_text(id, &tuple), line.comma, line.cr);
-            Ok(Some(out.join("\n")))
+            Ok(SlotRevert::Restored(out.join("\n")))
         }
         _ => Err(drift(id, &format!("has {id} more than once"))),
+    }
+}
+
+/// A [`SlotRevert::Vanished`] edit is already reverted (a re-lock dropped
+/// its pin) unless its hosted URL is still on some line of `text`, the lock
+/// with every other edit of the same revert already staged.
+pub(crate) fn check_vanished(text: &str, edit: &FileEdit) -> Result<(), String> {
+    let (_, new) = recorded(edit)?;
+    let url_left = slot_value(&new, 3)
+        .as_ref()
+        .and_then(Value::as_str)
+        .is_some_and(|url| text.contains(url));
+    if url_left {
+        Err(drift(
+            new.key,
+            &format!("no longer has {}, but still pins its hosted URL", new.key),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -588,7 +625,7 @@ mod tests {
 
     fn rewrite(lock: &str, deps: &[DepOverride]) -> RewriteResult {
         let mut result = RewriteResult::default();
-        rewrite_vlt_lock(&files(&[(VLT_LOCK, lock)]), deps, &mut result);
+        rewrite_vlt_lock(&files(&[(VLT_LOCK, lock)]), deps, false, &mut result);
         result
     }
 
@@ -621,24 +658,74 @@ mod tests {
     fn vlt_drives_needs_the_lock_and_the_sentinel_or_no_sibling() {
         let sentinel = (VLT_HIDDEN_LOCK_REL, "");
         let lock = (VLT_LOCK, "{}");
-        assert!(!vlt_drives(&files(&[])));
-        assert!(!vlt_drives(&files(&[sentinel, (VLT_CONFIG, "{}")])));
-        assert!(vlt_drives(&files(&[lock])));
-        assert!(vlt_drives(&files(&[lock, (VLT_CONFIG, "{}")])));
+        assert!(!vlt_drives(&files(&[]), false));
+        assert!(!vlt_drives(&files(&[sentinel, (VLT_CONFIG, "{}")]), false));
+        assert!(vlt_drives(&files(&[lock]), false));
+        assert!(vlt_drives(&files(&[lock, (VLT_CONFIG, "{}")]), false));
         for sibling in SIBLING_LOCKS {
             let other = (sibling, "x");
-            assert!(!vlt_drives(&files(&[lock, other])), "{sibling}");
-            assert!(vlt_drives(&files(&[lock, other, sentinel])), "{sibling}");
+            assert!(!vlt_drives(&files(&[lock, other]), false), "{sibling}");
+            assert!(
+                vlt_drives(&files(&[lock, other, sentinel]), false),
+                "{sibling}"
+            );
         }
-        assert!(!vlt_drives(&files(&[
-            lock,
-            ("package-lock.json", "x"),
-            ("bun.lockb", "x")
-        ])));
-        assert!(vlt_drives(&files(&[
-            lock,
-            ("packages/a/package-lock.json", "x")
-        ])));
+        assert!(!vlt_drives(
+            &files(&[lock, ("package-lock.json", "x"), ("bun.lockb", "x")]),
+            false
+        ));
+        assert!(vlt_drives(
+            &files(&[lock, ("packages/a/package-lock.json", "x")]),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_bun_lockb_on_disk_is_a_sibling_outside_files() {
+        let lock = (VLT_LOCK, "{}");
+        assert!(!vlt_drives(&files(&[lock]), true));
+        assert!(vlt_drives(&files(&[lock, (VLT_HIDDEN_LOCK_REL, "")]), true));
+        assert!(!vlt_drives(&files(&[]), true));
+
+        let text = lock_with(&[&registry_entry()]);
+        let deps = [dep("left-pad", "1.3.0", Some(SHA))];
+        let mut result = RewriteResult::default();
+        rewrite_vlt_lock(&files(&[(VLT_LOCK, &text)]), &deps, true, &mut result);
+        assert_eq!(codes(&result), ["redirect_vlt_sibling_lockfiles"]);
+        assert!(result.warnings[0].detail.contains("and bun.lockb are both"));
+        assert!(result.confirmed_vlt_uuids.contains("uuid-left-pad"));
+    }
+
+    #[test]
+    fn old_lockfile_ignored_counts_only_empty_and_registry_url_segments() {
+        let r = "https://registry.example.com/";
+        let v0 = |options: &str, id: &str| {
+            format!(
+                "{{\n  \"lockfileVersion\": 0,\n  \"options\": {options},\n  \"nodes\": {{\n    \"{id}\": [0,\"left-pad\",\"{REG_SHA}\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+            )
+        };
+        let old_lockfile = |lock: &str| {
+            codes(&rewrite(lock, &[dep("left-pad", "1.3.0", Some(SHA))]))
+                .contains(&"redirect_vlt_old_lockfile_ignored")
+        };
+        assert!(old_lockfile(&v0("{}", "··left-pad@1.3.0")));
+        let url_segment = format!(
+            "·{}·left-pad@1.3.0",
+            r.replace(':', "%3A").replace('/', "§")
+        );
+        assert!(old_lockfile(&v0(
+            &format!("{{\"registry\": \"{r}\"}}"),
+            &url_segment
+        )));
+        assert!(!old_lockfile(&v0("{}", "·npm·left-pad@1.3.0")));
+        assert!(!old_lockfile(&v0(
+            "{\"default-registry-alias\": \"corp\"}",
+            "·corp·left-pad@1.3.0"
+        )));
+        assert!(!old_lockfile(&v0(
+            &format!("{{\"registry\": \"{r}\", \"registries\": {{\"acme\": \"{r}\"}}}}"),
+            "·acme·left-pad@1.3.0"
+        )));
     }
 
     #[test]
@@ -760,12 +847,16 @@ mod tests {
         let mut other = dep("left-pad", "1.3.0", Some(SHA));
         other.ecosystem = "pypi".into();
         let mut result = RewriteResult::default();
-        rewrite_vlt_lock(&files(&[(VLT_CONFIG, "{}")]), &[other], &mut result);
+        rewrite_vlt_lock(&files(&[(VLT_CONFIG, "{}")]), &[other], false, &mut result);
         assert!(result.warnings.is_empty());
     }
 
     fn revert(lock: &str, edit: &FileEdit) -> Result<Option<String>, String> {
-        revert_vlt_slots(lock, edit)
+        match revert_vlt_slots(lock, edit)? {
+            SlotRevert::Restored(text) => Ok(Some(text)),
+            SlotRevert::Unchanged => Ok(None),
+            SlotRevert::Vanished => check_vanished(lock, edit).map(|()| None),
+        }
     }
 
     #[test]

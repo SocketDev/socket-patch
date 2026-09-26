@@ -372,16 +372,27 @@ pub(crate) fn is_default_registry(segment: &str, options: Option<&Map<String, Va
     else {
         return false;
     };
-    let registry = with_trailing_slash(registry);
     let aliased = options
         .and_then(|o| o.get("registries"))
         .and_then(|r| r.get(segment))
         .and_then(Value::as_str);
-    if aliased.is_some_and(|url| with_trailing_slash(url) == registry) {
+    if aliased.is_some_and(|url| with_trailing_slash(url) == with_trailing_slash(registry)) {
         return true;
     }
+    is_registry_url_segment(segment, options)
+}
+
+/// Is `segment` an http(s) URL naming `options.registry` (a trailing `/`
+/// aside)?
+pub(crate) fn is_registry_url_segment(segment: &str, options: Option<&Map<String, Value>>) -> bool {
+    let Some(registry) = options
+        .and_then(|o| o.get("registry"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
     reqwest::Url::parse(segment).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-        && with_trailing_slash(segment) == registry
+        && with_trailing_slash(segment) == with_trailing_slash(registry)
 }
 
 // ── lock-level sniff ─────────────────────────────────────────────────────

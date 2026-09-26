@@ -676,6 +676,7 @@ mod tests {
                 &[dep],
                 &BTreeMap::new(),
                 major,
+                false,
             );
             let lock = result.files.get("Pipfile.lock").expect("lock rewritten");
             assert!(lock.contains(&format!("\"{key}\": ")), "{lock}");

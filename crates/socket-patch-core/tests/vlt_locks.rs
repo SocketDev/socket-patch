@@ -1,7 +1,8 @@
 //! Real vlt locks (`tests/fixtures/vlt-locks/<version>/`, captured from every
 //! era) through the hosted rewriter: only the target nodes' slots [2] and [3]
 //! change, and the output stays in vlt's own canonical serialization, so
-//! vlt's next save leaves it byte-identical.
+//! vlt's next save leaves it byte-identical. A CRLF checkout of each capture
+//! gets the same edits, with every line keeping its `\r`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -340,5 +341,23 @@ fn hosted_rewrite_changes_exactly_the_target_slots() {
         let again = rewrite_registry_redirect(&result.files, &overrides);
         assert!(again.files.is_empty(), "{version}: a rerun is a no-op");
         assert!(again.edits.is_empty(), "{version}");
+
+        let crlf: BTreeMap<String, String> = files
+            .iter()
+            .map(|(name, text)| (name.clone(), text.replace('\n', "\r\n")))
+            .collect();
+        let crlf_result = rewrite_registry_redirect(&crlf, &overrides);
+        let crlf_codes: Vec<&str> = crlf_result
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect();
+        assert_eq!(&crlf_codes, warnings, "{version}: CRLF");
+        assert_eq!(
+            crlf_result.files["vlt-lock.json"],
+            output.replace('\n', "\r\n"),
+            "{version}: CRLF"
+        );
+        assert_eq!(crlf_result.edits, result.edits, "{version}: CRLF");
     }
 }

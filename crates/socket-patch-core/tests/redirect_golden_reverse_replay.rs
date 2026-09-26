@@ -4,10 +4,11 @@
 //! what the depscan server writes into its PR ledgers, so this is also the
 //! proof that socket-patch reverts a server-written vlt redirect.
 //!
-//! Each case runs three ways: as written, after vlt's LF re-save of a CRLF
-//! lock, and after a re-save that appended a sibling node (which moves the
-//! trailing comma). Both the whole-ledger replay and the per-purl revert are
-//! exercised.
+//! Each case runs up to four ways: as written, after vlt's LF re-save of a
+//! CRLF lock, after a re-save that appended a sibling node (which moves the
+//! trailing comma), and after a re-lock that dropped the last node while
+//! earlier instances of the same package may still carry its hosted URL.
+//! Both the whole-ledger replay and the per-purl revert are exercised.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -104,13 +105,7 @@ fn ledger(case: &Case) -> RedirectState {
 /// nodes section, so the formerly last entry gains a comma.
 fn with_appended_node(text: &str) -> String {
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    let open = lines
-        .iter()
-        .position(|l| l.trim_end_matches('\r') == "  \"nodes\": {")
-        .expect("nodes section");
-    let close = (open + 1..lines.len())
-        .find(|&i| matches!(lines[i].trim_end_matches('\r'), "  }" | "  },"))
-        .expect("nodes section end");
+    let (_, close) = nodes_section(&lines);
     let last = close - 1;
     let cr = if lines[last].ends_with('\r') {
         "\r"
@@ -127,6 +122,37 @@ fn with_appended_node(text: &str) -> String {
     lines.join("\n")
 }
 
+/// The nodes section's line range: the opening line and the closing one.
+fn nodes_section(lines: &[String]) -> (usize, usize) {
+    let open = lines
+        .iter()
+        .position(|l| l.trim_end_matches('\r') == "  \"nodes\": {")
+        .expect("nodes section");
+    let close = (open + 1..lines.len())
+        .find(|&i| matches!(lines[i].trim_end_matches('\r'), "  }" | "  },"))
+        .expect("nodes section end");
+    (open, close)
+}
+
+/// The lock after vlt re-locked its last node away (the new last entry
+/// loses its comma), or `None` when fewer than two nodes remain.
+fn without_last_node(text: &str) -> Option<String> {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let (open, close) = nodes_section(&lines);
+    if close - open < 3 {
+        return None;
+    }
+    lines.remove(close - 1);
+    let last = &mut lines[close - 2];
+    let cr = last.ends_with('\r');
+    let body = last
+        .trim_end_matches('\r')
+        .trim_end_matches(',')
+        .to_string();
+    *last = if cr { format!("{body}\r") } else { body };
+    Some(lines.join("\n"))
+}
+
 fn variants(case: &Case) -> Vec<(&'static str, String, String)> {
     let mut out = vec![("as-written", case.expected.clone(), case.input.clone())];
     if case.expected.contains('\r') {
@@ -141,6 +167,12 @@ fn variants(case: &Case) -> Vec<(&'static str, String, String)> {
         with_appended_node(&case.expected),
         with_appended_node(&case.input),
     ));
+    if let (Some(on_disk), Some(want)) = (
+        without_last_node(&case.expected),
+        without_last_node(&case.input),
+    ) {
+        out.push(("last-node-relocked-away", on_disk, want));
+    }
     out
 }
 

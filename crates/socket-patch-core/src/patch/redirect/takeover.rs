@@ -921,6 +921,7 @@ pub async fn revert_npm_redirect_purl(
     let mut out = RedirectRevert::default();
     let mut staged: Staged = Staged::new();
     let mut staged_bytes: StagedBytes = StagedBytes::new();
+    let mut vanished_vlt: Vec<usize> = Vec::new();
     // Newest-first: the hosted flow appends edits, so reverse index order
     // unwinds re-redirect chains correctly (each step's `original` is the
     // previous step's `new`).
@@ -975,9 +976,13 @@ pub async fn revert_npm_redirect_purl(
                 ));
             };
             if edit.kind == super::vlt::KIND {
-                if let Some(restored) = super::vlt::revert_vlt_slots(&content, edit)? {
-                    staged.insert(edit.path.clone(), Some(restored));
-                    out.reverted_files.push(edit.path.clone());
+                match super::vlt::revert_vlt_slots(&content, edit)? {
+                    super::vlt::SlotRevert::Restored(restored) => {
+                        staged.insert(edit.path.clone(), Some(restored));
+                        out.reverted_files.push(edit.path.clone());
+                    }
+                    super::vlt::SlotRevert::Unchanged => {}
+                    super::vlt::SlotRevert::Vanished => vanished_vlt.push(i),
                 }
                 continue;
             }
@@ -1042,6 +1047,18 @@ pub async fn revert_npm_redirect_purl(
             )
             .await?;
         }
+    }
+
+    for &i in &vanished_vlt {
+        let edit = &state.edits[i];
+        let Some(content) = staged_read(&staged, project_root, &edit.path).await? else {
+            return Err(format!(
+                "{} no longer exists; cannot revert the recorded hosted \
+                 redirect for {lock_key}",
+                edit.path
+            ));
+        };
+        super::vlt::check_vanished(&content, edit)?;
     }
 
     // LAST ONE OUT: the `.npmrc` `allow-remote=all` auto-config exists only
@@ -2594,6 +2611,62 @@ mod tests {
                 .unwrap(),
             wired
         );
+    }
+
+    #[tokio::test]
+    async fn npm_vlt_takeover_keeps_a_relaid_flag_and_trailing_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let relaid = format!(
+            "\"~npm~left-pad@1.3.0\": [2,\"left-pad\",\"sha512-p\",\"{NPM_URL}\",null,null,null,null,{{  \"lp\": \"bin.js\"}}]"
+        );
+        tokio::fs::write(root.join("vlt-lock.json"), vlt_lock(&[relaid]))
+            .await
+            .unwrap();
+        let mut state = RedirectState::new();
+        state.records.insert(NPM_PURL.into(), record());
+        state.edits = vec![vlt_node_edit("left-pad@1.3.0", "~npm~left-pad@1.3.0")];
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("vlt-lock.json"))
+                .await
+                .unwrap(),
+            vlt_lock(&["\"~npm~left-pad@1.3.0\": [2,\"left-pad\",\"sha512-r\",null,null,null,null,null,{  \"lp\": \"bin.js\"}]".to_string()])
+        );
+        assert!(state.edits.is_empty() && state.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn npm_vlt_takeover_reverts_a_relocked_away_variant_whatever_the_ledger_order() {
+        let hosted = format!("\"sha512-p\",\"{NPM_URL}\"");
+        let plain = vlt_node_edit("left-pad@1.3.0", "~npm~left-pad@1.3.0");
+        let peer = vlt_node_edit("left-pad@1.3.0~peer.2", "~npm~left-pad@1.3.0~peer.2");
+        for edits in [
+            vec![plain.clone(), peer.clone()],
+            vec![peer.clone(), plain.clone()],
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let wired = vlt_lock(&[vlt_entry("~npm~left-pad@1.3.0", &hosted)]);
+            tokio::fs::write(root.join("vlt-lock.json"), &wired)
+                .await
+                .unwrap();
+            let mut state = RedirectState::new();
+            state.records.insert(NPM_PURL.into(), record());
+            state.edits = edits;
+            revert_redirect_purl(root, &mut state, NPM_PURL, false)
+                .await
+                .expect("revert succeeds");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("vlt-lock.json"))
+                    .await
+                    .unwrap(),
+                vlt_lock(&[vlt_entry("~npm~left-pad@1.3.0", "\"sha512-r\"")])
+            );
+            assert!(state.edits.is_empty() && state.records.is_empty());
+        }
     }
 
     #[tokio::test]

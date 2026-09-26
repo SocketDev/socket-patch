@@ -1881,6 +1881,7 @@ pub(crate) async fn run_redirect_selected(
         &rewrite_overrides,
         &python_metadata,
         pipenv_major,
+        common.cwd.join("bun.lockb").exists(),
     );
     if let Some(content) = binary_content {
         rewrite
