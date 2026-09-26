@@ -28,6 +28,9 @@ A hosted re-run over a lock rewritten by an older CLI or by the GitHub app
 (redirected `dist` with `source` or `mirrors` still present) heals it with one
 edit. `vendor --revert` and the hosted revert restore the recorded fragments
 byte for byte.
+Both modes keep a CRLF `composer.lock` (a Windows or `core.autocrlf`
+checkout) in CRLF, so the diff is the patched entry alone and the revert
+restores the original bytes.
 
 ## Test matrix
 

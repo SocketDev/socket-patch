@@ -45,6 +45,7 @@ use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::LineEndings;
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
@@ -95,6 +96,9 @@ struct ComposerPrelude {
     uuid_dir: PathBuf,
     copy_dir: PathBuf,
     lock_path: PathBuf,
+    /// The lock bytes `lock` was parsed from: the writes keep their line
+    /// endings.
+    lock_text: String,
     lock: Arc<Value>,
     section: &'static str,
     idx: usize,
@@ -200,6 +204,7 @@ async fn composer_prelude(
         uuid_dir,
         copy_dir,
         lock_path,
+        lock_text,
         lock,
         section,
         idx,
@@ -268,6 +273,7 @@ pub async fn vendor_composer<'a>(
         uuid_dir,
         copy_dir,
         lock_path,
+        lock_text,
         lock,
         section,
         idx,
@@ -458,12 +464,12 @@ pub async fn vendor_composer<'a>(
         .is_some_and(|p| p.eco == "composer");
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
-    let write_result = match composer_json_bytes(&lock) {
+    let write_result = match composer_lock_bytes(&lock, &lock_text) {
         Ok(bytes) => match atomic_write_bytes_preserving_mode(&lock_path, &bytes).await {
             // The bytes now on disk and the doc they came from: the next
             // package in this run reads them back and skips the parse.
             Ok(()) => {
-                LOCK_MEMO.store(bytes, lock);
+                reseed_lock_memo(bytes, lock);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -998,6 +1004,38 @@ fn composer_json_bytes(value: &Value) -> std::io::Result<Vec<u8>> {
     serialize_json(value, "    ")
 }
 
+/// [`composer_json_bytes`] in the line endings of `current`, the lock text
+/// being replaced: a CRLF lock (a Windows checkout) is written back CRLF,
+/// so vendor then `--revert` is byte-identical. serde_json escapes every
+/// newline inside a string, so each raw `\n` is a line break.
+fn composer_lock_bytes(value: &Value, current: &str) -> std::io::Result<Vec<u8>> {
+    let bytes = composer_json_bytes(value)?;
+    if LineEndings::of(current) != LineEndings::Crlf {
+        return Ok(bytes);
+    }
+    let lf = String::from_utf8(bytes).map_err(std::io::Error::other)?;
+    Ok(LineEndings::Crlf.restore(&lf).into_owned().into_bytes())
+}
+
+/// Re-seed [`LOCK_MEMO`] with the lock this run just wrote, but only when
+/// `bytes` are exactly `lock`'s canonical render: the memo then answers the
+/// next package's read with the very document those bytes parse to. Any
+/// other bytes (a CRLF lock written back CRLF, a spliced entry) leave the
+/// memo empty, so the next read parses what is actually on disk.
+fn reseed_lock_memo(bytes: Vec<u8>, lock: Value) {
+    reseed_memo(&LOCK_MEMO, bytes, lock);
+}
+
+/// [`reseed_lock_memo`] over any memo (the tests use their own).
+fn reseed_memo(memo: &ParseMemo<Value>, bytes: Vec<u8>, lock: Value) {
+    match composer_json_bytes(&lock) {
+        Ok(render) if render == bytes => {
+            memo.store(bytes, lock);
+        }
+        _ => memo.invalidate(),
+    }
+}
+
 /// The `<section>:<lowercase pkg>` keys this entry can actually put back:
 /// a recognized wiring kind, a well-formed key, and a recorded `original`.
 fn restorable_keys(entry: &VendorEntry) -> HashSet<String> {
@@ -1092,13 +1130,13 @@ async fn restore_lock_entry(
     if !dry_run {
         let mut lock = (*lock).clone();
         lock[section][idx] = original;
-        let bytes = composer_json_bytes(&lock).map_err(|e| e.to_string())?;
+        let bytes = composer_lock_bytes(&lock, &lock_text).map_err(|e| e.to_string())?;
         atomic_write_bytes_preserving_mode(lock_path, &bytes)
             .await
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
         // Re-seeded the same way the vendor path does, so the next record's
         // restore reads back its own write for free.
-        LOCK_MEMO.store(bytes, lock);
+        reseed_lock_memo(bytes, lock);
     }
     Ok(true)
 }
@@ -1965,6 +2003,99 @@ mod tests {
                 .join(format!(".socket/vendor/composer/{UUID}"))
                 .exists(),
             "uuid dir removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_crlf_lock_stays_crlf_and_reverts_byte_identical() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let lf = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        let crlf_bytes = lf.replace('\n', "\r\n").into_bytes();
+        tokio::fs::write(root.join(COMPOSER_LOCK), &crlf_bytes)
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let vendored = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        assert_eq!(
+            LineEndings::of(&vendored),
+            LineEndings::Crlf,
+            "{vendored:?}"
+        );
+        let wired: Value = serde_json::from_str(&vendored).unwrap();
+        assert_eq!(wired["packages"][0]["dist"]["type"], "path");
+
+        let (rerun, _, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(rerun.success, "{:?}", rerun.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+            vendored,
+            "an in-sync re-vendor leaves the CRLF lock untouched"
+        );
+
+        let outcome = revert_composer(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            crlf_bytes,
+            "CRLF lock restored byte-identically"
+        );
+    }
+
+    /// The memo is re-seeded only with bytes that ARE the doc's render; a
+    /// CRLF write-back or a spliced entry (whose bytes differ) leaves it
+    /// empty, so the next read parses what is on disk.
+    #[test]
+    fn memo_is_reseeded_only_with_the_docs_own_render() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let render = composer_json_bytes(&lock).unwrap();
+        let memo: ParseMemo<Value> = ParseMemo::new();
+        reseed_memo(&memo, render.clone(), lock.clone());
+        assert_eq!(memo.get(&render).as_deref(), Some(&lock));
+
+        let crlf = String::from_utf8(render.clone())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+        reseed_memo(&memo, crlf.clone(), lock.clone());
+        assert!(memo.get(&crlf).is_none(), "CRLF bytes are not the render");
+        assert!(memo.get(&render).is_none(), "the stale slot is dropped");
+
+        let escaped = String::from_utf8(render.clone())
+            .unwrap()
+            .replace('/', "\\/")
+            .into_bytes();
+        reseed_memo(&memo, render.clone(), lock.clone());
+        reseed_memo(&memo, escaped.clone(), lock);
+        assert!(memo.get(&escaped).is_none());
+        assert!(memo.get(&render).is_none());
+    }
+
+    #[test]
+    fn composer_lock_bytes_follows_the_replaced_text() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let lf = composer_json_bytes(&lock).unwrap();
+        let crlf = String::from_utf8(lf.clone())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+        assert_eq!(composer_lock_bytes(&lock, "{\r\n}\r\n").unwrap(), crlf);
+        assert_eq!(composer_lock_bytes(&lock, "{\n}\n").unwrap(), lf);
+        assert_eq!(composer_lock_bytes(&lock, "{}").unwrap(), lf);
+        assert_eq!(
+            composer_lock_bytes(&lock, "{\r\n\n}").unwrap(),
+            lf,
+            "mixed endings have no single style to restore"
         );
     }
 
