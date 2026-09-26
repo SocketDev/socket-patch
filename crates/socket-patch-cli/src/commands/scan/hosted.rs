@@ -3041,7 +3041,9 @@ pub(crate) async fn run_redirect_selected(
         // Hosted mode wrote only lockfiles and config files since scan's
         // crawl, never a directory the npm root walk descends into, so its
         // roots and packages still describe the tree (the snapshot checks
-        // it was taken with these crawler options).
+        // it was taken with these crawler options). The interactive scan
+        // hands none in when its confirm prompt waited on a person — the
+        // tree may have changed while it did.
         params.npm_prior = npm_prior.cloned();
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
