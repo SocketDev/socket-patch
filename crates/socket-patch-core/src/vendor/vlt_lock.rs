@@ -39,11 +39,12 @@ use super::state::{
     WiringRecord,
 };
 use super::vlt_lock_text::{
-    edges_block, entry_text, file_dep_id, is_default_registry, is_importer_dep_id,
-    is_registry_url_segment, nodes_block, parse_edge_entry_text, parse_edge_line,
-    parse_node_entry_text, parse_node_line, parse_vendored_dir_path, render_entry_line,
-    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, vendored_dir_rel, vlt_collate,
-    vlt_edge_cmp, DepIdEra, DepIdKind, LockSniff, ParsedLock, SectionSpan,
+    edges_block, entry_text, file_dep_id, installs_outside_registry, is_default_registry,
+    is_importer_dep_id, is_registry_url_segment, nodes_block, parse_edge_entry_text,
+    parse_edge_line, parse_node_entry_text, parse_node_line, parse_vendored_dir_path,
+    render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id, split_lines,
+    vendored_dir_rel, vlt_collate, vlt_edge_cmp, DepIdEra, DepIdKind, LockSniff, ParsedLock,
+    SectionSpan,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -407,10 +408,18 @@ fn find_target(doc: &LockDoc, name: &str, version: &str) -> Result<Target, Refus
     let mut defaults = Vec::new();
     let mut foreign = Vec::new();
     let mut ours = Vec::new();
+    let mut outside = Vec::new();
     for (i, e) in doc.nodes.entries.iter().enumerate() {
         let Some(dep_id) = split_dep_id(&e.key) else {
             continue;
         };
+        let slot1 = parse_node_entry_text(&e.text()).and_then(|n| n.name());
+        if slot1
+            .as_deref()
+            .is_some_and(|slot1| installs_outside_registry(&dep_id, slot1, name, version))
+        {
+            outside.push(i);
+        }
         match dep_id.kind {
             DepIdKind::Registry if dep_id.registry_identity() == Some((name, version)) => {
                 if is_default_registry(&dep_id.first, options) {
@@ -440,6 +449,17 @@ fn find_target(doc: &LockDoc, name: &str, version: &str) -> Result<Target, Refus
             format!(
                 "vlt-lock.json resolves {name}@{version} as {}, which is not from vlt's default \
                  registry; vendoring rewires only default-registry packages",
+                key(i)
+            ),
+        ));
+    }
+    if let Some(&i) = outside.first() {
+        return Err((
+            UNSUPPORTED,
+            format!(
+                "vlt-lock.json also installs {name} from {}, a git, remote tarball or local \
+                 directory dependency that vendoring cannot rewire and whose version vlt does \
+                 not record; remove that dependency, or use agent mode",
                 key(i)
             ),
         ));
@@ -2144,6 +2164,18 @@ mod tests {
                 ROOT_PKG,
                 UNSUPPORTED,
                 "not from vlt's default registry",
+            ),
+            (
+                render(1, &[r#""remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz": [0,"left-pad","sha512-R=="]"#, REG_NODE], &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#, r#""file~_d lp2": "prod https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz""#]),
+                ROOT_PKG,
+                UNSUPPORTED,
+                "also installs left-pad from remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz",
+            ),
+            (
+                render(1, &[r#""git~github_cfoo+left-pad~v1.3.0": [0,"left-pad"]"#, REG_NODE], &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#, r#""file~_d lp2": "prod github:foo/left-pad#v1.3.0 git~github_cfoo+left-pad~v1.3.0""#]),
+                ROOT_PKG,
+                UNSUPPORTED,
+                "a git, remote tarball or local directory dependency",
             ),
             (
                 render(1, &[REG_NODE, url_node], &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#]),

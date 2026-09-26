@@ -353,6 +353,37 @@ pub(crate) fn registry_name_version(second: &str) -> Option<(&str, &str)> {
     (is_registry_package_name(name) && is_npm_semver(version)).then_some((name, version))
 }
 
+/// Whether a node with id `dep_id` and slot [1] `slot1` may install
+/// `name@version` from outside every registry and socket-patch's vendored
+/// dirs: a git, remote or user `file:` node of that name. Those ids carry
+/// no version, so any of them counts unless a remote tarball's
+/// `<name>-<version>.tgz` leaf names another version.
+pub(crate) fn installs_outside_registry(
+    dep_id: &DepId,
+    slot1: &str,
+    name: &str,
+    version: &str,
+) -> bool {
+    if slot1 != name {
+        return false;
+    }
+    match dep_id.kind {
+        DepIdKind::Git => true,
+        DepIdKind::File => !dep_id.first.starts_with(".socket/vendor/"),
+        DepIdKind::Remote => {
+            let path = dep_id.first.split(['?', '#']).next().unwrap_or_default();
+            let leaf = path.rsplit('/').next().unwrap_or_default();
+            let bare = name.rsplit('/').next().unwrap_or(name);
+            leaf.strip_prefix(bare)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .and_then(|rest| rest.strip_suffix(".tgz"))
+                .filter(|v| is_npm_semver(v))
+                .is_none_or(|v| v == version)
+        }
+        DepIdKind::Registry | DepIdKind::Workspace => false,
+    }
+}
+
 /// The store decoder: `(full name, version)` of a `.vlt/<DepID>` entry,
 /// from any registry segment (the store holds every installed copy) and
 /// ignoring the extra. Git, remote, file, workspace and undecodable ids are
@@ -2502,5 +2533,31 @@ mod tests {
                 "node_modules/.vlt"
             ]
         );
+    }
+
+    #[test]
+    fn nodes_that_install_a_package_outside_every_registry() {
+        let outside = |id: &str, slot1: &str| {
+            installs_outside_registry(&split_dep_id(id).unwrap(), slot1, "left-pad", "1.3.0")
+        };
+        assert!(outside("git~github_cfoo+left-pad~v1.3.0", "left-pad"));
+        assert!(outside("file~vendor+left-pad", "left-pad"));
+        assert!(outside(
+            "remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz",
+            "left-pad"
+        ));
+        assert!(outside("remote~https_c++example.test+lp.tgz", "left-pad"));
+        assert!(!outside(
+            "remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.2.0.tgz",
+            "left-pad"
+        ));
+        assert!(!outside("git~github_cfoo+right-pad~v1.3.0", "right-pad"));
+        assert!(!outside(
+            "file~.socket+vendor+npm+u+left-pad-1.3.0+node__modules+left-pad",
+            "left-pad"
+        ));
+        assert!(!outside("~npm~left-pad@1.3.0", "left-pad"));
+        assert!(!outside("~acme~left-pad@1.3.0", "left-pad"));
+        assert!(!outside("workspace~packages+left-pad", "left-pad"));
     }
 }

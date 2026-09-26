@@ -17,9 +17,10 @@ use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::vendor::vlt_lock_text::{
-    entry_text, is_default_registry, is_registry_url_segment, nodes_block, parse_node_entry_text,
-    parse_node_line, parse_vendored_path, render_entry_line, render_tuple_with_slots, sniff_lock,
-    split_dep_id, split_lines, DepIdKind, LockSniff, NodeEntry, ParsedLock, SectionSpan,
+    entry_text, installs_outside_registry, is_default_registry, is_registry_url_segment,
+    nodes_block, parse_node_entry_text, parse_node_line, parse_vendored_path, render_entry_line,
+    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, DepIdKind, LockSniff,
+    NodeEntry, ParsedLock, SectionSpan,
 };
 
 /// The ledger kind of a hosted vlt node splice.
@@ -372,6 +373,26 @@ fn rewrite_dep(
                 "hosted mode only redirects packages from vlt's default registry; {} left \
                  unchanged (use --mode vendored or agent mode)",
                 foreign.join(", ")
+            ),
+        });
+    }
+    let outside: Vec<&str> = nodes
+        .iter()
+        .filter(|(id, tuple)| {
+            let slot1 = tuple.get(1).and_then(Value::as_str).unwrap_or_default();
+            split_dep_id(id)
+                .is_some_and(|dep_id| installs_outside_registry(&dep_id, slot1, &name, version))
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if !outside.is_empty() {
+        result.vlt_foreign_uuids.insert(dep.patch_uuid.clone());
+        result.warnings.push(RewriteWarning {
+            code: "redirect_vlt_custom_registry_skipped".into(),
+            detail: format!(
+                "hosted mode only redirects registry packages; {} also install {name} from git, \
+                 a remote tarball or a local directory and stay unpatched (use agent mode)",
+                outside.join(", ")
             ),
         });
     }
@@ -966,6 +987,25 @@ mod tests {
         assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, "{\"nodes\": {}}")])).is_ok());
         let ok = lock_with(&[&registry_entry()]);
         assert!(preflight_vlt_hosted(&files(&[(VLT_LOCK, &ok)])).is_ok());
+    }
+
+    #[test]
+    fn a_git_remote_or_file_install_of_the_package_is_withheld() {
+        let remote = "\"remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz\": \
+                      [0,\"left-pad\",\"sha512-r\"]";
+        let lock = lock_with(&[remote, &registry_entry()]);
+        let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert_eq!(codes(&result), ["redirect_vlt_custom_registry_skipped"]);
+        assert!(result.warnings[0].detail.contains("remote~https_c++"));
+        assert!(result.vlt_foreign_uuids.contains("uuid-left-pad"));
+        assert!(result.confirmed_vlt_uuids.contains("uuid-left-pad"));
+        assert_eq!(result.edits.len(), 1);
+
+        let older = remote.replace("1.3.0.tgz", "1.2.0.tgz");
+        let lock = lock_with(&[&older, &registry_entry()]);
+        let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.vlt_foreign_uuids.is_empty());
     }
 
     #[test]

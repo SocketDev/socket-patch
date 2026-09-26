@@ -44,6 +44,10 @@
 //! * a vendored ref beside it is diagnosed ([`DIAG_REF_UNATTRIBUTABLE`])
 //!   and not emitted, since only the committed directory would be hashed.
 //!
+//! A git, remote or user `file:` node whose slot [1] names the package
+//! counts the same way (no writer rewires it, and its id records no
+//! version), unless a remote tarball's leaf names another version.
+//!
 //! Every other registry instance is evidence against another lock's wiring
 //! of the same package ([`Discovery::resolved_elsewhere`]).
 //!
@@ -71,7 +75,7 @@ use crate::utils::digest::is_sri_pin;
 use crate::utils::purl::percent_decode_purl_component;
 use crate::vendor::lock_inventory::vlt::{vlt_lock_model, VltLockNode};
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::vendor::vlt_lock_text::{parse_vendored_path, DepIdKind};
+use crate::vendor::vlt_lock_text::{installs_outside_registry, parse_vendored_path, DepIdKind};
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(text) = ctx.read_text(VLT_LOCK, out).await else {
@@ -99,7 +103,25 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             _ => None,
         })
         .collect();
+    // A git, remote or user `file:` node of the same package installs bytes
+    // no Socket writer rewires, and its id records no version.
+    let outside = |name: &str, version: &str| {
+        lock.nodes
+            .iter()
+            .find(|n| installs_outside_registry(&n.dep_id, &n.name, name, version))
+            .map(|n| n.key.as_str())
+    };
     for (node, found) in lock.nodes.iter().zip(&classified) {
+        let outside_source = match found {
+            Classified::Hosted { .. } => node
+                .dep_id
+                .registry_identity()
+                .and_then(|(name, version)| outside(name, version)),
+            Classified::Vendored { path, .. } => {
+                parse_vendored_path(path, &node.name).and_then(|p| outside(&p.name, &p.version))
+            }
+            _ => None,
+        };
         match found {
             Classified::Registry(purl) => out.resolved_elsewhere(VLT_LOCK, Some(purl.clone())),
             Classified::Hosted {
@@ -108,7 +130,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 url,
                 integrity,
             } => {
-                let pin = (!unattested.contains(purl.as_str()))
+                let pin = (!unattested.contains(purl.as_str()) && outside_source.is_none())
                     .then(|| LockIntegrity::Sri(integrity.clone()));
                 out.push(PatchedRef::hosted(
                     purl.clone(),
@@ -131,6 +153,20 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                          pins every default-registry instance, otherwise remove the \
                          dependents that resolve the other instance",
                         node.key
+                    ),
+                );
+            }
+            Classified::Vendored { purl, path } if outside_source.is_some() => {
+                out.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    VLT_LOCK,
+                    format!(
+                        "{VLT_LOCK}: {}: {purl} is wired to {path}, but {} also installs the \
+                         package from outside the registry, and vlt records no version for it, \
+                         so the vendored patch is not attested; remove the dependents that \
+                         resolve that node",
+                        node.key,
+                        outside_source.unwrap_or_default()
                     ),
                 );
             }
@@ -778,6 +814,61 @@ mod tests {
         ))
         .await;
         assert_refs(&out, &[(PURL, UUID_B, WiringMode::Vendored)]);
+    }
+
+    #[tokio::test]
+    async fn a_git_remote_or_file_node_of_the_package_withholds_the_lock_basis() {
+        let hosted = url(UUID_A, "left-pad-1.3.0.tgz");
+        let path = dir_path(UUID_B);
+        let remote = "remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz";
+        for other in [
+            node(remote, "left-pad", Some(UPSTREAM), None),
+            node("git~github_cfoo+left-pad~v1.3.0", "left-pad", None, None),
+            node(
+                "file~vendor+left-pad",
+                "left-pad",
+                None,
+                Some("vendor/left-pad"),
+            ),
+        ] {
+            let out = discover(&lock(
+                Some(1),
+                &[
+                    node("~npm~left-pad@1.3.0", "left-pad", Some(SRI), Some(&hosted)),
+                    other.clone(),
+                ],
+            ))
+            .await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.refs[0].locked_integrity, None, "{other}");
+            assert!(!out.refs[0].lockfile_basis_ok(), "{other}");
+
+            let out = discover(&lock(
+                Some(1),
+                &[
+                    node(&file_id(&path), "left-pad", None, Some(&path)),
+                    other.clone(),
+                ],
+            ))
+            .await;
+            assert!(out.refs.is_empty(), "{other}: {:?}", out.refs);
+            assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE], "{other}");
+        }
+
+        let older = "remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.2.0.tgz";
+        let out = discover(&lock(
+            Some(1),
+            &[
+                node("~npm~left-pad@1.3.0", "left-pad", Some(SRI), Some(&hosted)),
+                node(older, "left-pad", Some(UPSTREAM), None),
+                node("git~github_cfoo+right-pad~v1.3.0", "right-pad", None, None),
+            ],
+        ))
+        .await;
+        assert_eq!(
+            out.refs[0].locked_integrity,
+            Some(LockIntegrity::Sri(SRI.into()))
+        );
     }
 
     #[tokio::test]
