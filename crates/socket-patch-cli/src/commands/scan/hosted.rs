@@ -3464,18 +3464,36 @@ fn format_next_steps(
 }
 
 /// Merge this run's vlt node edits into the recorded ones. A fresh edit
-/// for the same `key` and DepID keeps the recorded `original` (the
-/// pristine registry entry) and takes the fresh `new`; one whose recorded
-/// same-key edits all name DepIDs the pre-run lock no longer holds (a
-/// re-lock, or a new id grammar after a vlt upgrade) replaces them,
-/// `original` included. Returns, per fresh edit, whether it was merged
-/// (anything else is appended as usual).
+/// for the same `key` and DepID keeps the oldest recorded `original` (the
+/// pristine registry entry), takes the fresh `new` and drops the chain's
+/// later links (a server-written ledger appends one per hosted PR). One
+/// whose recorded same-key edits all name DepIDs the pre-run lock no longer
+/// holds (a re-lock, or a new id grammar after a vlt upgrade) replaces
+/// them. So does one for another key of the same `name@version` whose
+/// vanished recorded edit's pin vlt carried to the fresh DepID (a new peer
+/// context). A replacing edit keeps the recorded pristine slots when vlt
+/// carried the pin ([`carried_pin_original`]). Returns, per fresh edit,
+/// whether it was merged (anything else is appended as usual).
 fn rebase_vlt_edits(
     ledger: &mut Vec<socket_patch_core::patch::redirect::FileEdit>,
     fresh: &[socket_patch_core::patch::redirect::FileEdit],
     before_lock: Option<&str>,
 ) -> Vec<bool> {
-    use socket_patch_core::patch::redirect::vlt::{edit_dep_id, lock_node_ids, KIND};
+    use socket_patch_core::patch::redirect::vlt::{
+        carried_pin_original, edit_dep_id, lock_node_ids, KIND,
+    };
+    use socket_patch_core::patch::redirect::FileEdit;
+    fn superseding(edit: &FileEdit, old: &FileEdit) -> FileEdit {
+        let mut next = edit.clone();
+        if let Some(original) = carried_pin_original(edit, old) {
+            next.original = Some(original);
+        }
+        next
+    }
+    fn key_base(key: &Option<String>) -> Option<&str> {
+        key.as_deref()
+            .map(|k| k.split_once('~').map_or(k, |(base, _)| base))
+    }
     let live = before_lock.and_then(lock_node_ids).unwrap_or_default();
     let mut merged = vec![false; fresh.len()];
     for (i, edit) in fresh.iter().enumerate() {
@@ -3489,24 +3507,41 @@ fn rebase_vlt_edits(
             .filter(|(_, old)| old.kind == KIND && old.path == edit.path && old.key == edit.key)
             .map(|(j, _)| j)
             .collect();
-        if let Some(&j) = same_key
+        let same_dep: Vec<usize> = same_key
             .iter()
-            .find(|&&j| id.is_some() && edit_dep_id(&ledger[j]) == id)
-        {
-            ledger[j].new = edit.new.clone();
-            ledger[j].action = edit.action.clone();
-            merged[i] = true;
-            continue;
-        }
-        let vanished: Vec<usize> = same_key
-            .into_iter()
-            .filter(|&j| edit_dep_id(&ledger[j]).is_none_or(|old| !live.contains(&old)))
+            .copied()
+            .filter(|&j| id.is_some() && edit_dep_id(&ledger[j]) == id)
             .collect();
-        if let Some((&first, rest)) = vanished.split_first() {
-            ledger[first] = edit.clone();
+        if let Some((&first, rest)) = same_dep.split_first() {
+            ledger[first].new = edit.new.clone();
+            ledger[first].action = edit.action.clone();
             for &j in rest.iter().rev() {
                 ledger.remove(j);
             }
+            merged[i] = true;
+            continue;
+        }
+        let vanished = |j: &usize| edit_dep_id(&ledger[*j]).is_none_or(|old| !live.contains(&old));
+        let gone: Vec<usize> = same_key.into_iter().filter(vanished).collect();
+        if let Some((&first, rest)) = gone.split_first() {
+            ledger[first] = superseding(edit, &ledger[first]);
+            for &j in rest.iter().rev() {
+                ledger.remove(j);
+            }
+            merged[i] = true;
+            continue;
+        }
+        let rekeyed = (0..ledger.len()).find(|j| {
+            let old = &ledger[*j];
+            old.kind == KIND
+                && old.path == edit.path
+                && old.key != edit.key
+                && key_base(&old.key) == key_base(&edit.key)
+                && vanished(j)
+                && carried_pin_original(edit, old).is_some()
+        });
+        if let Some(j) = rekeyed {
+            ledger[j] = superseding(edit, &ledger[j]);
             merged[i] = true;
         }
     }
@@ -5128,6 +5163,96 @@ mod tests {
         assert_eq!(
             ledger,
             [fresh, vlt_edit("y@1.0.0", "·npm·y@1.0.0", "sha512-p", "u")]
+        );
+    }
+
+    fn vlt_pinned_at(edit: &FileEdit, id: &str) -> Option<serde_json::Value> {
+        let new = edit.new.as_ref()?.as_str()?;
+        let (_, tuple) = new.split_once(": ")?;
+        Some(serde_json::Value::String(format!("\"{id}\": {tuple}")))
+    }
+
+    #[test]
+    fn vlt_rerun_collapses_a_server_appended_chain_into_one_link() {
+        let first = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pa", "ua");
+        let mut second = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pb", "ub");
+        second.original = first.new.clone();
+        let mut ledger = vec![first, second.clone()];
+        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pc", "uc");
+        fresh.original = second.new.clone();
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(
+            ledger,
+            [FileEdit {
+                original: vlt_edit("x@1.0.0", "~npm~x@1.0.0", "", "").original,
+                ..fresh
+            }]
+        );
+    }
+
+    #[test]
+    fn vlt_rerun_after_a_peer_context_rekey_keeps_the_pristine_slots() {
+        let old_id = "~npm~x@1.0.0~peer.0df72515a50372ba";
+        let new_id = "~npm~x@1.0.0~peer.32643a3290c32d5d";
+        let recorded = vlt_edit("x@1.0.0~peer.0df72515a50372ba", old_id, "sha512-p1", "u1");
+        let mut ledger = vec![
+            vlt_edit("y@1.0.0", "~npm~y@1.0.0", "sha512-p", "u"),
+            recorded.clone(),
+        ];
+        let mut fresh = vlt_edit("x@1.0.0~peer.32643a3290c32d5d", new_id, "sha512-p2", "u2");
+        fresh.original = vlt_pinned_at(&recorded, new_id);
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&[new_id, "~npm~y@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger[1].key, fresh.key);
+        assert_eq!(ledger[1].new, fresh.new);
+        assert_eq!(
+            ledger[1].original,
+            Some(serde_json::Value::String(format!(
+                "\"{new_id}\": [0,\"x\",\"sha512-reg\"]"
+            )))
+        );
+
+        let mut pristine = vec![recorded.clone()];
+        let relocked = vlt_edit("x@1.0.0~peer.32643a3290c32d5d", new_id, "sha512-p2", "u2");
+        let merged = rebase_vlt_edits(
+            &mut pristine,
+            std::slice::from_ref(&relocked),
+            Some(&vlt_lock_with(&[new_id])),
+        );
+        assert_eq!(merged, [false], "a re-lock that dropped the pin appends");
+        assert_eq!(pristine, [recorded]);
+    }
+
+    #[test]
+    fn vlt_relocked_dep_id_that_kept_the_pin_keeps_the_pristine_slots() {
+        let recorded = vlt_edit("x@1.0.0", "·npm·x@1.0.0", "sha512-p1", "u1");
+        let mut ledger = vec![recorded.clone()];
+        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p2", "u2");
+        fresh.original = vlt_pinned_at(&recorded, "~npm~x@1.0.0");
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(
+            ledger,
+            [FileEdit {
+                original: Some(serde_json::Value::String(
+                    "\"~npm~x@1.0.0\": [0,\"x\",\"sha512-reg\"]".into()
+                )),
+                ..fresh
+            }]
         );
     }
 

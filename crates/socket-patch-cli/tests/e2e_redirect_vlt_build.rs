@@ -458,6 +458,74 @@ async fn vlt_pinned_matrix_hosted_peer_workspace_instances() {
     fx.leg.ran();
 }
 
+/// From 1.0.8 vlt keys a root dependency with resolved peers by its peer
+/// context (`~peer.<16 hex>`), so `vlt install <peer>@<new>` re-keys the
+/// pinned node and carries the pin to the new DepID: a rescan leaves the
+/// ledger alone, and rollback restores the registry pin on the new DepID.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
+async fn vlt_pinned_matrix_hosted_peer_rekey_rollback() {
+    let Some(leg) = hosted_leg("peer_rekey_rollback") else {
+        return;
+    };
+    if !leg.at_least(PEER_HASH_FROM) {
+        return leg.skip("no-root-peer-extra");
+    }
+    let usx = ("use-sync-external-store", "1.2.0");
+    let shape = Shape {
+        deps: vec![usx, ("react", "18.2.0")],
+        pins: vec![
+            usx,
+            ("react", "18.2.0"),
+            ("react", "18.3.1"),
+            ("loose-envify", "1.4.0"),
+            ("js-tokens", "4.0.0"),
+        ],
+        targets: vec![(usx.0, usx.1, UUID_USX, "index.js")],
+        ..Shape::left_pad()
+    };
+    let fx = Fixture::build(leg, shape).await;
+    let t = fx.t().clone();
+    let before: Value = serde_json::from_slice(&fx.lock_before).unwrap();
+    let pinned_id = node_id(&before, &t.name, &t.version);
+    assert!(pinned_id.contains("~peer."), "{before:#}");
+    let doc = fx.scan(&[]);
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    fx.vlt_ok(&fx.proj, &["install", "react@18.3.1"]);
+    let rekeyed_id = node_id(&read_lock(&fx.proj), &t.name, &t.version);
+    assert_ne!(rekeyed_id, pinned_id, "vlt re-keys the peer context");
+    assert_pinned(&fx.proj, &fx.svc, &t);
+    assert_eq!(state(&fx.proj, &t), State::Patched);
+    let lock = lock_bytes(&fx.proj);
+    let ledger = fx.ledger();
+    fx.scan(&[]);
+    assert_eq!(lock_bytes(&fx.proj), lock, "the rescan keeps the lock");
+    assert_eq!(fx.ledger(), ledger, "the rescan keeps the ledger");
+    let out = rollback(&fx.proj, &[]);
+    assert_eq!(out.code, 0, "{out}");
+    assert_not_pinned(&fx.proj, &t);
+    fx.assert_advisory(&out.json(), &advisory_rolled_back(1));
+    assert!(
+        !store_entry(&fx.proj, &rekeyed_id).exists(),
+        "the patched copy under the re-keyed DepID is healed"
+    );
+    let after = read_lock(&fx.proj);
+    assert_eq!(
+        after["nodes"][&rekeyed_id][2], before["nodes"][&pinned_id][2],
+        "the registry integrity is back on the re-keyed node: {after:#}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&lock_bytes(&fx.proj)).contains(&fx.svc.artifact_url(&t)),
+        "no hosted URL is left"
+    );
+    fx.vlt_ok(&fx.proj, &["install"]);
+    assert_eq!(state(&fx.proj, &t), State::Pristine);
+    let co = fx.checkout("after-rollback");
+    fx.vlt_ok_profile(&co, &["ci"], "after-rollback");
+    assert_eq!(state(&co, &t), State::Pristine);
+    fx.leg.ran();
+}
+
 // ── lock re-saves ─────────────────────────────────────────────────────────
 
 /// `vlt install <newdep>` keeps the redirect.

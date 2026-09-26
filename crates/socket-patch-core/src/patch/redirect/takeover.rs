@@ -1058,7 +1058,12 @@ pub async fn revert_npm_redirect_purl(
                 edit.path
             ));
         };
-        super::vlt::check_vanished(&content, edit)?;
+        if let Some(restored) = super::vlt::revert_vanished(&content, edit)? {
+            staged.insert(edit.path.clone(), Some(restored));
+            if !out.reverted_files.contains(&edit.path) {
+                out.reverted_files.push(edit.path.clone());
+            }
+        }
     }
 
     // LAST ONE OUT: the `.npmrc` `allow-remote=all` auto-config exists only
@@ -2667,6 +2672,41 @@ mod tests {
             );
             assert!(state.edits.is_empty() && state.records.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn npm_vlt_takeover_follows_a_pin_vlt_carried_to_a_new_peer_context() {
+        let hosted = format!("\"sha512-p\",\"{NPM_URL}\"");
+        let old_id = "~npm~left-pad@1.3.0~peer.0df72515a50372ba";
+        let new_id = "~npm~left-pad@1.3.0~peer.32643a3290c32d5d";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wired = vlt_lock(&[
+            vlt_entry(new_id, &hosted),
+            vlt_entry("~npm~right-pad@1.3.0", "\"sha512-q\""),
+        ]);
+        tokio::fs::write(root.join("vlt-lock.json"), &wired)
+            .await
+            .unwrap();
+        let mut state = RedirectState::new();
+        state.records.insert(NPM_PURL.into(), record());
+        state.edits = vec![vlt_node_edit(
+            "left-pad@1.3.0~peer.0df72515a50372ba",
+            old_id,
+        )];
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("vlt-lock.json"))
+                .await
+                .unwrap(),
+            vlt_lock(&[
+                vlt_entry(new_id, "\"sha512-r\""),
+                vlt_entry("~npm~right-pad@1.3.0", "\"sha512-q\""),
+            ])
+        );
+        assert!(state.edits.is_empty() && state.records.is_empty());
     }
 
     #[tokio::test]

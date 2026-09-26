@@ -537,7 +537,7 @@ pub(crate) enum SlotRevert {
     /// The line already holds `original`'s slots.
     Unchanged,
     /// No line has the DepID. Every instance of a `name@version` shares one
-    /// hosted URL, so [`check_vanished`] runs only after the transaction's
+    /// hosted URL, so [`revert_vanished`] runs only after the transaction's
     /// other edits are staged.
     Vanished,
 }
@@ -610,23 +610,109 @@ pub(crate) fn revert_vlt_slots(text: &str, edit: &FileEdit) -> Result<SlotRevert
     }
 }
 
-/// A [`SlotRevert::Vanished`] edit is already reverted (a re-lock dropped
-/// its pin) unless its hosted URL is still on some line of `text`, the lock
-/// with every other edit of the same revert already staged.
-pub(crate) fn check_vanished(text: &str, edit: &FileEdit) -> Result<(), String> {
-    let (_, new) = recorded(edit)?;
-    let url_left = slot_value(&new, 3)
-        .as_ref()
-        .and_then(Value::as_str)
-        .is_some_and(|url| text.contains(url));
-    if url_left {
-        Err(drift(
+/// Finish a [`SlotRevert::Vanished`] edit against `text`, the lock with
+/// every other edit of the same revert already staged. `Ok(None)`: a
+/// re-lock dropped the pin, so nothing is left to revert. `Ok(Some(text))`:
+/// vlt re-keyed the node (a new peer context) and carried the pin, so every
+/// default-registry instance of the same `name@version` that holds exactly
+/// `new`'s slots gets `original`'s back. The hosted URL on any other line
+/// is drift.
+pub(crate) fn revert_vanished(text: &str, edit: &FileEdit) -> Result<Option<String>, String> {
+    let (original, new) = recorded(edit)?;
+    let Some(url) = slot_value(&new, 3).and_then(|v| v.as_str().map(str::to_string)) else {
+        return Ok(None);
+    };
+    if !text.contains(url.as_str()) {
+        return Ok(None);
+    }
+    let lines = split_lines(text);
+    let mut out: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
+    let carried = carried_pin_lines(text, &lines, &new);
+    for &i in &carried {
+        let line = parse_node_line(lines[i]).expect("carried_pin_lines parsed this line");
+        let tuple = render_tuple_with_slots(
+            &line.entry.elems,
+            original.slot(2).filter(|s| *s != "null"),
+            original.slot(3).filter(|s| *s != "null"),
+        );
+        out[i] = render_entry_line(&entry_text(line.entry.key, &tuple), line.comma, line.cr);
+    }
+    let restored = out.join("\n");
+    if carried.is_empty() || restored.contains(url.as_str()) {
+        return Err(drift(
             new.key,
             &format!("no longer has {}, but still pins its hosted URL", new.key),
-        ))
-    } else {
-        Ok(())
+        ));
     }
+    Ok(Some(restored))
+}
+
+/// The nodes-section lines of `text` that hold `new`'s pin under another
+/// DepID: default-registry instances of the same `name@version` whose
+/// slots [2] and [3] are exactly `new`'s.
+fn carried_pin_lines(text: &str, lines: &[&str], new: &NodeEntry<'_>) -> Vec<usize> {
+    let Some(recorded_id) = split_dep_id(new.key) else {
+        return Vec::new();
+    };
+    let Some(identity) = recorded_id.registry_identity() else {
+        return Vec::new();
+    };
+    let LockSniff::Readable(lock) = sniff_lock(text) else {
+        return Vec::new();
+    };
+    let Some(span) = nodes_block(lines) else {
+        return Vec::new();
+    };
+    span.entry_lines()
+        .filter(|&i| {
+            parse_node_line(lines[i]).is_some_and(|line| {
+                line.entry.key != new.key
+                    && split_dep_id(line.entry.key).is_some_and(|id| {
+                        id.registry_identity() == Some(identity)
+                            && is_default_registry(&id.first, lock.options())
+                    })
+                    && same_slots(&line.entry, new)
+            })
+        })
+        .collect()
+}
+
+/// The DepIDs (with their slot [0] flags) a [`KIND`] edit's pin moved to
+/// when vlt re-keyed its node: empty while `text` still holds the recorded
+/// DepID.
+pub(crate) fn carried_pin_ids(text: &str, edit: &FileEdit) -> Vec<(String, Option<u64>)> {
+    let Ok((_, new)) = recorded(edit) else {
+        return Vec::new();
+    };
+    let lines = split_lines(text);
+    let prefix = format!("    \"{}\": ", new.key);
+    if lines.iter().any(|l| l.starts_with(prefix.as_str())) {
+        return Vec::new();
+    }
+    carried_pin_lines(text, &lines, &new)
+        .into_iter()
+        .filter_map(|i| parse_node_line(lines[i]))
+        .map(|l| (l.entry.key.to_string(), l.entry.elems[0].parse().ok()))
+        .collect()
+}
+
+/// The `original` a fresh edit takes when it supersedes `old`, a recorded
+/// edit whose DepID vanished, if vlt carried `old`'s pin to the fresh
+/// DepID: the fresh entry is then Socket's, not the registry's, so it gets
+/// `old`'s pristine slots back. `None` when the fresh entry is not `old`'s
+/// pin (a re-lock that dropped it already left the pristine entry).
+pub fn carried_pin_original(fresh: &FileEdit, old: &FileEdit) -> Option<Value> {
+    let fresh_original = parse_node_entry_text(fresh.original.as_ref()?.as_str()?)?;
+    let (old_original, old_new) = recorded(old).ok()?;
+    if !same_slots(&fresh_original, &old_new) {
+        return None;
+    }
+    let tuple = render_tuple_with_slots(
+        &fresh_original.elems,
+        old_original.slot(2).filter(|s| *s != "null"),
+        old_original.slot(3).filter(|s| *s != "null"),
+    );
+    Some(Value::String(entry_text(fresh_original.key, &tuple)))
 }
 
 #[cfg(test)]
@@ -905,7 +991,7 @@ mod tests {
         match revert_vlt_slots(lock, edit)? {
             SlotRevert::Restored(text) => Ok(Some(text)),
             SlotRevert::Unchanged => Ok(None),
-            SlotRevert::Vanished => check_vanished(lock, edit).map(|()| None),
+            SlotRevert::Vanished => revert_vanished(lock, edit),
         }
     }
 
@@ -997,11 +1083,23 @@ mod tests {
         )]);
         assert!(revert(&other, &edit).unwrap_err().contains("drifted"));
         let moved = lock_with(&[&format!(
-            "\"~npm~left-pad@1.3.0~peer.1\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"
+            "\"~npm~left-pad@1.3.0~peer.1\": [0,\"left-pad\",\"sha512-OTHER==\",\"{URL}\"]"
         )]);
         let err = revert(&moved, &edit).unwrap_err();
         assert!(err.contains("still pins its hosted URL"), "{err}");
         assert!(err.contains("restore the registry pin for ~npm~left-pad@1.3.0 manually"));
+        let elsewhere = lock_with(&[&format!(
+            "\"~npm~right-pad@1.3.0\": [0,\"right-pad\",\"{SHA}\",\"{URL}\"]"
+        )]);
+        let err = revert(&elsewhere, &edit).unwrap_err();
+        assert!(err.contains("still pins its hosted URL"), "{err}");
+        let foreign = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\": {{\"acme\": \
+             \"https://acme.test/\"}}}},\n  \"nodes\": {{\n    \"~acme~left-pad@1.3.0\": \
+             [0,\"left-pad\",\"{SHA}\",\"{URL}\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+        );
+        let err = revert(&foreign, &edit).unwrap_err();
+        assert!(err.contains("still pins its hosted URL"), "{err}");
         let twice = format!(
             "{{\n  \"nodes\": {{\n    {},\n    {}\n  }}\n}}\n",
             hosted_entry(),
@@ -1015,6 +1113,70 @@ mod tests {
         assert!(revert("{\"nodes\": {}}", &edit)
             .unwrap_err()
             .contains("canonical"));
+    }
+
+    #[test]
+    fn revert_follows_a_pin_vlt_carried_to_a_new_peer_context() {
+        let old_id = "~npm~left-pad@1.3.0~peer.0df72515a50372ba";
+        let new_id = "~npm~left-pad@1.3.0~peer.32643a3290c32d5d";
+        let edit = vlt_edit(
+            &format!("\"{old_id}\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+            &format!("\"{old_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
+        );
+        let sibling = "\"~npm~zz@1.0.0\": [0,\"zz\",\"sha512-z\"]";
+        let rekeyed = lock_with(&[
+            &format!("\"{new_id}\": [2,\"left-pad\",\"{SHA}\",\"{URL}\",null,null,null,\"lib\"]"),
+            sibling,
+        ]);
+        assert_eq!(
+            revert(&rekeyed, &edit).unwrap().unwrap(),
+            lock_with(&[
+                &format!(
+                    "\"{new_id}\": [2,\"left-pad\",\"{REG_SHA}\",null,null,null,null,\"lib\"]"
+                ),
+                sibling,
+            ])
+        );
+        let crlf = lock_with(&[&format!(
+            "\"{new_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"
+        )])
+        .replace('\n', "\r\n");
+        assert_eq!(
+            revert(&crlf, &edit).unwrap().unwrap(),
+            lock_with(&[&format!("\"{new_id}\": [0,\"left-pad\",\"{REG_SHA}\"]")])
+                .replace('\n', "\r\n")
+        );
+        let both = lock_with(&[
+            &format!("\"{new_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
+            &format!("\"~npm~right-pad@1.3.0\": [0,\"right-pad\",\"sha512-R==\",\"{URL}\"]"),
+        ]);
+        let err = revert(&both, &edit).unwrap_err();
+        assert!(err.contains("still pins its hosted URL"), "{err}");
+    }
+
+    #[test]
+    fn a_superseding_edit_keeps_the_pristine_slots_of_a_carried_pin() {
+        let old_id = "~npm~left-pad@1.3.0~peer.1";
+        let new_id = "~npm~left-pad@1.3.0~peer.2";
+        let old = vlt_edit(
+            &format!("\"{old_id}\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+            &format!("\"{old_id}\": [0,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
+        );
+        let carried = vlt_edit(
+            &format!("\"{new_id}\": [1,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
+            &format!("\"{new_id}\": [1,\"left-pad\",\"sha512-P2==\",\"u2\"]"),
+        );
+        assert_eq!(
+            carried_pin_original(&carried, &old),
+            Some(Value::String(format!(
+                "\"{new_id}\": [1,\"left-pad\",\"{REG_SHA}\"]"
+            )))
+        );
+        let relocked = vlt_edit(
+            &format!("\"{new_id}\": [1,\"left-pad\",\"{REG_SHA}\"]"),
+            &format!("\"{new_id}\": [1,\"left-pad\",\"{SHA}\",\"{URL}\"]"),
+        );
+        assert_eq!(carried_pin_original(&relocked, &old), None);
     }
 
     #[test]

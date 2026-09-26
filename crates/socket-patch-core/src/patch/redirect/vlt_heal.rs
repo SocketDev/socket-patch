@@ -459,8 +459,14 @@ pub async fn invalidate(root: &Path, state: &InstallState, stale: &[String]) -> 
 }
 
 /// The vlt nodes the ledger's `redirect_vlt_lock_node` edits name for each
-/// of `purls`, with the purl's patch record.
-pub fn ledger_targets(state: &RedirectState, purls: &[String]) -> Vec<LedgerTarget> {
+/// of `purls`, with the purl's patch record. With the pre-revert `lock`,
+/// a node vlt re-keyed (a new peer context) is named by the DepID its pin
+/// moved to, since that is where the patched installed copy lives.
+pub fn ledger_targets(
+    state: &RedirectState,
+    purls: &[String],
+    lock: Option<&str>,
+) -> Vec<LedgerTarget> {
     let mut out: Vec<LedgerTarget> = Vec::new();
     for purl in purls {
         let Some((ecosystem, name, version)) = purl_parts(purl) else {
@@ -492,16 +498,20 @@ pub fn ledger_targets(state: &RedirectState, purls: &[String]) -> Vec<LedgerTarg
             else {
                 continue;
             };
-            if out.iter().any(|t| t.dep_id == entry.key && t.purl == *purl) {
-                continue;
+            let mut nodes = vec![(entry.key.to_string(), entry.elems[0].parse().ok())];
+            nodes.extend(lock.map_or_else(Vec::new, |text| vlt::carried_pin_ids(text, edit)));
+            for (dep_id, flags) in nodes {
+                if out.iter().any(|t| t.dep_id == dep_id && t.purl == *purl) {
+                    continue;
+                }
+                out.push(LedgerTarget {
+                    purl: purl.clone(),
+                    dep_id,
+                    name: name.clone(),
+                    record: record.clone(),
+                    flags,
+                });
             }
-            out.push(LedgerTarget {
-                purl: purl.clone(),
-                dep_id: entry.key.to_string(),
-                name: name.clone(),
-                record: record.clone(),
-                flags: entry.elems[0].parse().ok(),
-            });
         }
     }
     out
@@ -977,11 +987,45 @@ mod tests {
         state
             .records
             .insert("pkg:npm/left-pad@1.3.0".into(), record());
-        let targets = ledger_targets(&state, &["pkg:npm/left-pad@1.3.0".into()]);
+        let targets = ledger_targets(&state, &["pkg:npm/left-pad@1.3.0".into()], None);
         let ids: Vec<&str> = targets.iter().map(|t| t.dep_id.as_str()).collect();
         assert_eq!(ids, ["~npm~left-pad@1.3.0", "~npm~left-pad@1.3.0~peer.2"]);
         assert!(targets.iter().all(|t| t.record.is_some()));
         assert!(targets.iter().all(|t| t.flags == Some(0)));
+    }
+
+    #[test]
+    fn ledger_targets_follow_a_pin_vlt_carried_to_a_new_peer_context() {
+        let old_id = "~npm~left-pad@1.3.0~peer.0df72515a50372ba";
+        let new_id = "~npm~left-pad@1.3.0~peer.32643a3290c32d5d";
+        let mut state = RedirectState::new();
+        state.edits = vec![FileEdit {
+            path: "vlt-lock.json".into(),
+            kind: vlt::KIND.into(),
+            action: "rewritten".into(),
+            key: Some("left-pad@1.3.0~peer.0df72515a50372ba".into()),
+            original: Some(Value::String(format!(
+                "\"{old_id}\": [0,\"left-pad\",\"r\"]"
+            ))),
+            new: Some(Value::String(format!(
+                "\"{old_id}\": [0,\"left-pad\",\"s\",\"u\"]"
+            ))),
+        }];
+        let lock = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{new_id}\": \
+             [2,\"left-pad\",\"s\",\"u\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+        );
+        let purls = ["pkg:npm/left-pad@1.3.0".to_string()];
+        let targets: Vec<(String, Option<u64>)> = ledger_targets(&state, &purls, Some(&lock))
+            .into_iter()
+            .map(|t| (t.dep_id, t.flags))
+            .collect();
+        assert_eq!(
+            targets,
+            [(old_id.to_string(), Some(0)), (new_id.to_string(), Some(2))]
+        );
+        let kept = lock.replace(new_id, old_id);
+        assert_eq!(ledger_targets(&state, &purls, Some(&kept)).len(), 1);
     }
 
     #[test]
@@ -1001,10 +1045,11 @@ mod tests {
             new: None,
         })
         .collect();
-        let flags: Vec<Option<u64>> = ledger_targets(&state, &["pkg:npm/left-pad@1.3.0".into()])
-            .iter()
-            .map(|t| t.flags)
-            .collect();
+        let flags: Vec<Option<u64>> =
+            ledger_targets(&state, &["pkg:npm/left-pad@1.3.0".into()], None)
+                .iter()
+                .map(|t| t.flags)
+                .collect();
         assert_eq!(flags, [Some(0), Some(3)]);
     }
 

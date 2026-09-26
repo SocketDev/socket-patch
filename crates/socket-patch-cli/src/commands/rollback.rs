@@ -1054,8 +1054,18 @@ pub(crate) async fn run_hosted_leg(
     } else {
         purls.to_vec()
     };
-    let vlt_targets =
-        socket_patch_core::patch::redirect::vlt_heal::ledger_targets(state, &vlt_scope);
+    let vlt_lock = tokio::fs::read_to_string(
+        common
+            .cwd
+            .join(socket_patch_core::constants::npm_family::VLT_LOCK),
+    )
+    .await
+    .ok();
+    let vlt_targets = socket_patch_core::patch::redirect::vlt_heal::ledger_targets(
+        state,
+        &vlt_scope,
+        vlt_lock.as_deref(),
+    );
     // When the whole-ledger replay will run anyway (the scope covers every
     // record), npm purls on Bun projects defer to it so all lockfile edits
     // are staged together atomically. A scoped unwind of one of several

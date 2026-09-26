@@ -17,6 +17,7 @@
         "heal_rule_c_no_record",
         "scoped",
         "peer_workspace_instances",
+        "peer_rekey_rollback",
         "install_newdep_preserves",
         "update_drops",
         "resave_install_rollback",
@@ -158,6 +159,7 @@
       "heal_rule_c_no_record",
       "scoped",
       "peer_workspace_instances",
+      "peer_rekey_rollback",
       "install_newdep_preserves",
       "update_drops",
       "resave_install_rollback",
@@ -538,6 +540,20 @@
       },
       "conditions": [],
       "reason": "vlt-platform-optional-bug"
+    },
+    {
+      "boundary": "the root importer's direct dependency with resolved peers has no peer extra, so bumping its peer never re-keys the pinned node (`peer_rekey_rollback` pins the re-key and the rollback that follows it)",
+      "suite": "hosted",
+      "legs": [
+        "peer_rekey_rollback"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.0.8"
+      },
+      "conditions": [],
+      "reason": "no-root-peer-extra"
     },
     {
       "boundary": "a scalar `registry` makes lock-driven installs re-resolve from public npm",

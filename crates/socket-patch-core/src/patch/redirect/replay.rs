@@ -1094,14 +1094,20 @@ pub async fn revert_remaining_redirect_edits(
         for &idx in &vanished_vlt {
             let edit = &state.edits[idx];
             let checked = match staged_read(&staged, project_root, &edit.path).await {
-                Ok(Some(content)) => super::vlt::check_vanished(&content, edit),
+                Ok(Some(content)) => super::vlt::revert_vanished(&content, edit),
                 Ok(None) => Err(format!("{} no longer exists", edit.path)),
                 Err(error) => Err(error),
             };
-            if let Err(reason) = checked {
-                refuse(reason, &mut outcome);
-                refused_groups.insert(group);
-                continue 'group;
+            match checked {
+                Ok(Some(restored)) => {
+                    staged.insert(edit.path.clone(), Some(restored));
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    refuse(reason, &mut outcome);
+                    refused_groups.insert(group);
+                    continue 'group;
+                }
             }
         }
 
@@ -2258,8 +2264,21 @@ mod tests {
             assert!(state.edits.is_empty() && state.records.is_empty());
         }
 
+        // vlt re-keyed the only pinned node and carried the pin with it.
         let dir = TempDir::new().unwrap();
         write(dir.path(), "vlt-lock.json", &vlt_lock(&plain_hosted)).await;
+        let mut state = state_with(vec![vlt_edit()], &["pkg:npm/minimist@1.2.8"]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{out:?}");
+        assert_eq!(
+            read(dir.path(), "vlt-lock.json").await,
+            vlt_lock(&plain_registry)
+        );
+        assert!(state.edits.is_empty() && state.records.is_empty());
+
+        let dir = TempDir::new().unwrap();
+        let other = plain_hosted.replace("sha512-p", "sha512-x");
+        write(dir.path(), "vlt-lock.json", &vlt_lock(&other)).await;
         let mut state = state_with(vec![vlt_edit()], &["pkg:npm/minimist@1.2.8"]);
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
         assert_eq!(out.refusals.len(), 1, "{out:?}");
@@ -2267,10 +2286,7 @@ mod tests {
             out.refusals[0].reason.contains("still pins its hosted URL"),
             "{out:?}"
         );
-        assert_eq!(
-            read(dir.path(), "vlt-lock.json").await,
-            vlt_lock(&plain_hosted)
-        );
+        assert_eq!(read(dir.path(), "vlt-lock.json").await, vlt_lock(&other));
     }
 
     #[tokio::test]

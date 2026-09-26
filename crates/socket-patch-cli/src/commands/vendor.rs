@@ -1721,9 +1721,17 @@ pub(crate) async fn vendor_records(
                     }
                 } else if claimed {
                     let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
+                    let vlt_lock = tokio::fs::read_to_string(
+                        common
+                            .cwd
+                            .join(socket_patch_core::constants::npm_family::VLT_LOCK),
+                    )
+                    .await
+                    .ok();
                     let targets = socket_patch_core::patch::redirect::vlt_heal::ledger_targets(
                         ledger,
                         std::slice::from_ref(candidate),
+                        vlt_lock.as_deref(),
                     );
                     match socket_patch_core::patch::redirect::revert_redirect_purl(
                         &common.cwd,
