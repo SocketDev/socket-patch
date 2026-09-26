@@ -303,13 +303,16 @@ async fn vlt_pinned_matrix_hosted_heal_rule_b_hidden_lock_without_node() {
         doc["nodes"].as_object_mut().unwrap().remove(id);
     }
     std::fs::write(&hidden, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+    let snap = fx.snapshot(&fx.proj, &ids);
     let out = fx.scan(&["--no-vlt-install-cleanup"]);
     fx.assert_advisory(&out, &advisory_cleanup_skipped(ids.len()));
+    snap.assert_same(&fx.snapshot(&fx.proj, &ids), "the skipped cleanup");
     let out = fx.scan(&[]);
     fx.assert_advisory(&out, &advisory_invalidated(ids.len()));
     for id in &ids {
         assert!(!store_entry(&fx.proj, id).exists(), "{id} invalidated");
     }
+    snap.assert_same(&fx.snapshot(&fx.proj, &ids), "the rule (b) heal");
     fx.vlt_ok(&fx.proj, &["install"]);
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
     fx.leg.ran();
@@ -325,11 +328,13 @@ async fn vlt_pinned_matrix_hosted_heal_rule_c_no_hidden_lock() {
     let fx = Fixture::build(leg, Shape::with_bystander().warm()).await;
     let _ = std::fs::remove_file(fx.proj.join(HIDDEN_LOCK));
     let ids = fx.store_ids(fx.t());
+    let snap = fx.snapshot(&fx.proj, &ids);
     let doc = fx.scan(&[]);
     fx.assert_advisory(&doc, &advisory_invalidated(ids.len()));
     for id in &ids {
         assert!(!store_entry(&fx.proj, id).exists(), "{id} invalidated");
     }
+    snap.assert_same(&fx.snapshot(&fx.proj, &ids), "the rule (c) heal");
     assert!(
         store_entry(&fx.proj, &node_id(&read_lock(&fx.proj), MS.0, MS.1)).exists(),
         "the bystander is healthy"
@@ -358,11 +363,13 @@ async fn vlt_pinned_matrix_hosted_heal_rule_c_no_record() {
         .mount(&fx.svc.server)
         .await;
     let ids = fx.store_ids(fx.t());
+    let snap = fx.snapshot(&fx.proj, &ids);
     let doc = fx.scan(&[]);
     fx.assert_advisory(&doc, &advisory_invalidated(ids.len()));
     for id in &ids {
         assert!(!store_entry(&fx.proj, id).exists(), "{id} invalidated");
     }
+    snap.assert_same(&fx.snapshot(&fx.proj, &ids), "the artifact-bytes heal");
     fx.vlt_ok(&fx.proj, &["install"]);
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
     fx.leg.ran();
@@ -392,9 +399,10 @@ async fn vlt_pinned_matrix_hosted_scoped() {
 }
 
 /// Two workspaces depend on `use-sync-external-store` beside react 17 and
-/// react 18: every default-registry instance (vlt dedupes them into one
-/// shared peer instance) is pinned, and both
-/// workspaces install the patched bytes.
+/// react 18: vlt dedupes them into exactly one shared peer instance on
+/// every measured release (no real-vlt shape yields several instances of
+/// one name@version), it is pinned, and both workspaces install the
+/// patched bytes.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_peer_workspace_instances() {
@@ -432,9 +440,10 @@ async fn vlt_pinned_matrix_hosted_peer_workspace_instances() {
     let fx = Fixture::build(leg, shape).await;
     let t = fx.t().clone();
     let ids = fx.store_ids(&t);
-    assert!(
-        !ids.is_empty(),
-        "{}",
+    assert_eq!(
+        ids.len(),
+        1,
+        "one shared instance: {}",
         String::from_utf8_lossy(&fx.lock_before)
     );
     let doc = fx.scan(&[]);
@@ -1262,8 +1271,13 @@ async fn vlt_pinned_matrix_hosted_optional_dependency_heal() {
     let lp = fx.svc.target(LP.0).clone();
     let ms = fx.svc.target(MS.0).clone();
     let lp_ids = fx.store_ids(&lp);
+    let snap = fx.snapshot(&fx.proj, &lp_ids);
     let out = fx.scan_vex(&[]);
     let doc = out.json();
+    snap.assert_same(
+        &fx.snapshot(&fx.proj, &lp_ids),
+        "the heal keeps the optional copies",
+    );
     let held = format!(
         "node_modules also still holds {n_opt} unpatched copies of optional dependencies; \
          {OPTIONAL_KEPT}"
@@ -1296,8 +1310,13 @@ async fn vlt_pinned_matrix_hosted_optional_dependency_heal() {
         assert_eq!(state(&fx.proj, t), State::Patched, "{} after ci", t.name);
     }
     assert_eq!(lock_bytes(&fx.proj), before_ci, "ci keeps the lock");
+    let snap = fx.snapshot(&fx.proj, &lp_ids);
     let out = rollback(&fx.proj, &[]);
     assert_eq!(out.code, 0, "{out}");
+    snap.assert_same(
+        &fx.snapshot(&fx.proj, &lp_ids),
+        "the rollback heal keeps the patched optional copies",
+    );
     let want = format!(
         "restored registry pins for {} packages; removed {} patched installed copies, so \
          node_modules is incomplete until you run `vlt install` (or `vlt ci`). node_modules \
@@ -1344,13 +1363,30 @@ async fn optional_only_leg(leg: &Leg) {
     remove_tree(&proj);
     scan_hosted(&proj, &svc, &[]);
     assert_pinned(&proj, &svc, &ms);
-    let run = VltRun::profile("optional-only");
-    leg.vlt_ok_with(&proj, &["ci"], &run);
     let want = match behavior {
         OptionalOnly::Installs => State::Patched,
         _ => State::Absent,
     };
+    let lock = lock_bytes(&proj);
+    leg.vlt_ok_with(&proj, &["ci"], &VltRun::profile("optional-only"));
     assert_eq!(state(&proj, &ms), want, "optional-only vlt ci");
+    assert_eq!(
+        lock_bytes(&proj),
+        lock,
+        "optional-only vlt ci keeps the lock"
+    );
+    remove_tree(&proj);
+    leg.vlt_ok_with(
+        &proj,
+        &["install"],
+        &VltRun::profile("optional-only-install"),
+    );
+    assert_eq!(state(&proj, &ms), want, "optional-only locked vlt install");
+    assert_eq!(
+        lock_bytes(&proj),
+        lock,
+        "optional-only locked vlt install keeps the lock"
+    );
 }
 
 /// Hosted pin of an optional dependency, warm install, then `scan --mode
@@ -1358,8 +1394,11 @@ async fn optional_only_leg(leg: &Leg) {
 /// the takeover advisory names the kept optional copy, a plain `vlt
 /// install` keeps the importer linked to the hosted copy, and `vlt ci`
 /// links the vendored dir (mixed projects on every era; optional-only from
-/// 1.0.5, before which `vlt ci` leaves it absent). 0.0.0-19 … 0.0.0-29
-/// already relink the vendored dir on the plain install.
+/// 1.0.5, before which `vlt ci` leaves it absent). The mixed project's
+/// warm tree is the hosted `vlt ci`; the optional-only one's is the
+/// registry install whose optional copy the hosted heal kept (`vlt ci`
+/// would install nothing there before 1.0.5). 0.0.0-19 … 0.0.0-29 already
+/// relink the vendored dir on the plain install.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_then_vendored_optional_takeover() {
@@ -1370,8 +1409,9 @@ async fn vlt_pinned_matrix_hosted_then_vendored_optional_takeover() {
         return leg.skip("no-vlt-ci");
     }
     for optional_only in [false, true] {
+        let kind = if optional_only { "optonly" } else { "mixed" };
         let reg = Registry::start(&[LP, MS]).await;
-        let proj = leg.dir(if optional_only { "optonly" } else { "mixed" });
+        let proj = leg.dir(kind);
         let mut fields: Vec<(&str, &[(&str, &str)])> = vec![("optionalDependencies", &[MS])];
         if !optional_only {
             fields.push(("dependencies", &[LP]));
@@ -1389,57 +1429,71 @@ async fn vlt_pinned_matrix_hosted_then_vendored_optional_takeover() {
         let ms = PatchTarget::from_pkg(reg.pkg(MS.0, MS.1), UUID_MS, "index.js");
         let svc = PatchService::start(vec![ms.clone()]).await;
         scan_hosted(&proj, &svc, &[]);
-        leg.vlt_ok(&proj, &["ci"]);
+        assert_pinned(&proj, &svc, &ms);
         let hosted_id = node_id(&read_lock(&proj), MS.0, MS.1);
-        let hosted_ok = if optional_only && optional_only_kind(&leg) != OptionalOnly::Installs {
-            State::Absent
+        if optional_only {
+            assert_eq!(
+                state(&proj, &ms),
+                State::Pristine,
+                "{kind}: the heal keeps the optional copy"
+            );
         } else {
-            State::Patched
-        };
-        assert_eq!(state(&proj, &ms), hosted_ok, "hosted ci");
-        if hosted_ok == State::Absent {
-            continue;
+            leg.vlt_ok(&proj, &["ci"]);
+            assert_eq!(state(&proj, &ms), State::Patched, "{kind}: hosted ci");
         }
+        assert!(
+            hidden_lock_exists(&proj),
+            "{kind}: the warm tree has a hidden lock"
+        );
         let out = socket_api(&proj, &svc, &["scan", "--mode", "vendored"], &[]);
-        assert_eq!(out.code, 0, "{out}");
+        assert_eq!(out.code, 0, "{kind}: {out}");
         let doc = out.json();
         let detail = event_reason(&doc, ADVISORY);
-        assert!(
-            detail.contains("copies of the hosted artifacts of optional dependencies")
-                && detail.ends_with(OPTIONAL_KEPT),
-            "{detail}"
+        assert_eq!(
+            detail,
+            format!(
+                "vendored 1 hosted-pinned packages, but node_modules still holds 1 copies of \
+                 the hosted artifacts of optional dependencies; {OPTIONAL_KEPT}"
+            ),
+            "{kind}"
         );
-        assert!(store_entry(&proj, &hosted_id).exists(), "hosted copy kept");
+        assert!(
+            store_entry(&proj, &hosted_id).exists(),
+            "{kind}: hosted copy kept"
+        );
+        assert!(hidden_lock_exists(&proj), "{kind}: hidden lock kept");
+        let link = |proj: &Path| {
+            std::fs::read_link(proj.join("node_modules/ms"))
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        };
         leg.vlt_ok(&proj, &["install"]);
-        let link = std::fs::read_link(proj.join("node_modules/ms"))
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
+        let installed_link = link(&proj);
         if takeover_install_relinks(leg.version()) {
             assert!(
-                link.contains(".socket/vendor/npm/"),
-                "0.0.0-19 … 0.0.0-29 relink on a plain install: {link}"
+                installed_link.contains(".socket/vendor/npm/"),
+                "{kind}: 0.0.0-19 … 0.0.0-29 relink on a plain install: {installed_link}"
             );
         } else {
             assert!(
-                link.contains(".vlt/"),
-                "install keeps the hosted link: {link}"
+                installed_link.contains(&format!(".vlt/{hosted_id}/")),
+                "{kind}: install keeps the hosted link: {installed_link}"
             );
         }
         leg.vlt_ok(&proj, &["ci"]);
-        let link = std::fs::read_link(proj.join("node_modules/ms"))
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        let want_vendor = !optional_only || optional_only_kind(&leg) == OptionalOnly::Installs;
-        if want_vendor {
+        if !optional_only || optional_only_kind(&leg) == OptionalOnly::Installs {
+            let ci_link = link(&proj);
             assert!(
-                link.contains(".socket/vendor/npm/"),
-                "ci links the vendored dir: {link}"
+                ci_link.contains(".socket/vendor/npm/"),
+                "{kind}: ci links the vendored dir: {ci_link}"
             );
-            assert_eq!(state(&proj, &ms), State::Patched);
+            assert_eq!(state(&proj, &ms), State::Patched, "{kind}");
         } else {
-            assert!(
-                !proj.join("node_modules/ms").exists(),
-                "absent before 1.0.5"
+            assert_eq!(
+                state(&proj, &ms),
+                State::Absent,
+                "{kind}: vlt ci installs no optional dependency of an optional-only project \
+                 before 1.0.5"
             );
         }
     }
@@ -1490,9 +1544,12 @@ async fn vlt_pinned_matrix_hosted_platform_optional_skipped() {
         &staging.join("node_modules/left-pad/package.json"),
         r#"{"name":"left-pad","version":"1.3.0"}"#,
     );
+    let healed = vec![lp_id.clone()];
+    let snap = fx.snapshot(&fx.proj, &healed);
     let doc = fx.scan(&[]);
     fx.assert_advisory(&doc, &advisory_invalidated(1));
     assert!(staging.exists(), "the heal never touches staging dirs");
+    snap.assert_same(&fx.snapshot(&fx.proj, &healed), "the heal");
     fx.vlt_ok(&fx.proj, &["install"]);
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
     let out = socket_api(&fx.proj, &fx.svc, &["scan"], &[]);

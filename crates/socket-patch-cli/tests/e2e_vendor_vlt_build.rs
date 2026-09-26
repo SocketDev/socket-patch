@@ -401,6 +401,122 @@ async fn vlt_pinned_matrix_vendored_alias_selfref() {
     fx.leg.ran();
 }
 
+// ── peer-bearing self-references (DESIGN §8.3) ───────────────────────────
+
+const USX: (&str, &str) = ("use-sync-external-store", "1.2.0");
+const REACT: (&str, &str) = ("react", "18.2.0");
+
+/// `use-sync-external-store` beside react 18, a direct dependency of the
+/// root or of workspace member `packages/a`. Where vlt gives the node a
+/// peer extra (members from rc.15, the root from 1.0.8) vendored mode
+/// refuses it today (`vendor_lock_entry_unsupported`, nothing written);
+/// elsewhere it is vendored and `with-selector`'s self-reference
+/// (`require('use-sync-external-store/shim')`) loads the patched copy after
+/// a fresh `vlt ci`.
+async fn peer_selfref(name: &'static str, member: bool) {
+    let Some(leg) = vendored_leg(name) else {
+        return;
+    };
+    let importer = if member { "packages/a" } else { "" };
+    let mut shape = Shape {
+        deps: vec![USX, REACT],
+        pins: vec![
+            USX,
+            REACT,
+            ("loose-envify", "1.4.0"),
+            ("js-tokens", "4.0.0"),
+        ],
+        targets: vec![(USX.0, USX.1, UUID_USX, "shim/index.js")],
+        warm: true,
+        ..Shape::left_pad()
+    };
+    if member {
+        shape.deps = vec![];
+        shape.vlt_json.workspaces = Some(json!("packages/*"));
+        shape.files = vec![(
+            "packages/a/package.json".into(),
+            package_json("a", &[USX, REACT]),
+        )];
+    }
+    let fx = Fixture::build(leg, shape).await;
+    let t = fx.t().clone();
+    let ids = fx.store_ids(&t);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let id = &ids[0];
+    let sep = if fx.leg.era().tilde() { '~' } else { '·' };
+    let extra = id.split(sep).count() > 3;
+    assert_eq!(
+        extra,
+        direct_peer_extra(fx.leg.version(), member),
+        "the measured peer-extra boundary: {id}"
+    );
+    if extra {
+        let manifest = fx.proj.join(importer).join("package.json");
+        let pkg = std::fs::read(&manifest).unwrap();
+        let lock = lock_bytes(&fx.proj);
+        let out = socket_api(
+            &fx.proj,
+            &fx.svc,
+            &["scan", "--mode", "vendored"],
+            &["--vendor-source", "build"],
+        );
+        assert_eq!(out.code, 1, "{out}");
+        let refusal = coded(&out.json())
+            .into_iter()
+            .find(|e| e["errorCode"] == "vendor_lock_entry_unsupported")
+            .map(Value::to_string)
+            .unwrap_or_else(|| panic!("a vendor_lock_entry_unsupported refusal: {out}"));
+        assert!(
+            refusal.contains(&format!("a variant instance ({id})")),
+            "{refusal}"
+        );
+        assert_eq!(lock_bytes(&fx.proj), lock, "the lock is untouched");
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            pkg,
+            "{importer}/package.json"
+        );
+        assert!(!fx.proj.join(".socket/vendor/npm").exists(), "no artifact");
+        return fx.leg.ran();
+    }
+    vendor_scan(&fx);
+    assert_vendored(&fx, &t, importer);
+    let co = fx.checkout(&format!("fresh-{name}"));
+    assert_ci_byte_stable(&fx.leg, &co, &VltRun::profile(name), false);
+    let script = "const path=require('path'),fs=require('fs');\
+         const ws=require.resolve('use-sync-external-store/shim/with-selector');\
+         require(ws);\
+         const inner=require.resolve('use-sync-external-store/shim',{paths:[path.dirname(ws)]});\
+         const patched=fs.readFileSync(inner,'utf8').startsWith('/* SOCKET-PATCHED */');\
+         console.log((patched?'PATCHED ':'PRISTINE ')+fs.realpathSync(inner).split(path.sep).join('/'))";
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .current_dir(co.join(importer))
+        .output()
+        .unwrap();
+    assert_ok(&out, &format!("with-selector from {importer:?}"));
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(got.starts_with("PATCHED "), "{got}");
+    assert!(
+        got.contains(&format!(".socket/vendor/npm/{}/", t.uuid)),
+        "{got}"
+    );
+    fx.leg.ran();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
+async fn vlt_pinned_matrix_vendored_peer_root_selfref() {
+    peer_selfref("peer_root_selfref", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
+async fn vlt_pinned_matrix_vendored_peer_member_selfref() {
+    peer_selfref("peer_member_selfref", true).await;
+}
+
 /// A dependency with dependencies: vlt creates the link dir inside the
 /// vendored package (socket-patch never reads or commits it) and `git
 /// status` stays clean.
@@ -559,7 +675,9 @@ async fn vlt_pinned_matrix_vendored_bin_bearing() {
 
 /// A patch that also touches package.json of a package with
 /// devDependencies: vendoring verifies it under the vlt manifest exemption
-/// and VEX attests it.
+/// and VEX attests it. Without the vendor ledger (no inventory pin) VEX
+/// judges the stripped package.json by the afterHash blob alone: absent,
+/// it fails closed (`vendor_manifest_unverifiable`); present, it attests.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_vendored_package_json_devdeps_patch() {
@@ -589,20 +707,50 @@ async fn vlt_pinned_matrix_vendored_package_json_devdeps_patch() {
     fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "fresh-pkgjson");
     assert_eq!(state(&co, &t2), State::Patched);
     let uri = svc.uri();
-    let out = socket_api(
-        &co,
-        &svc,
-        &["vex"],
-        &[
-            "--output",
-            "out.vex.json",
-            "--product",
-            PRODUCT,
-            "--patch-server-url",
-            &uri,
-        ],
+    let vex = |dir: &Path| {
+        let _ = std::fs::remove_file(dir.join("out.vex.json"));
+        let out = socket_api(
+            dir,
+            &svc,
+            &["vex"],
+            &[
+                "--output",
+                "out.vex.json",
+                "--product",
+                PRODUCT,
+                "--patch-server-url",
+                &uri,
+            ],
+        );
+        let attested = vex_doc_attests(&dir.join("out.vex.json"), &t2);
+        (out, attested)
+    };
+    let (out, attested) = vex(&co);
+    assert!(attested, "{out}");
+    let bare = fx.checkout("ledgerless-pkgjson");
+    fx.vlt_ok_profile(&bare, &fx.leg.locked_install_args(), "ledgerless-pkgjson");
+    std::fs::remove_file(bare.join(".socket/vendor/state.json")).unwrap();
+    let after = t2
+        .all_files()
+        .into_iter()
+        .find(|(rel, _, _)| rel == "package.json")
+        .map(|(_, _, after)| after)
+        .unwrap();
+    let blob = bare.join(".socket/blobs").join(git_sha256(&after));
+    assert!(!blob.exists(), "no afterHash blob in the checkout");
+    let (out, attested) = vex(&bare);
+    assert!(!attested, "no ledger and no blob: {out}");
+    assert_eq!(out.code, 1, "the omission exit: {out}");
+    assert!(
+        event_codes(&out.json())
+            .iter()
+            .any(|c| c == "vendor_manifest_unverifiable"),
+        "{out}"
     );
-    assert!(vex_doc_attests(&co.join("out.vex.json"), &t2), "{out}");
+    write(&blob, &after);
+    let (out, attested) = vex(&bare);
+    assert!(attested, "the afterHash blob verifies it: {out}");
+    assert_eq!(out.code, 0, "{out}");
     fx.leg.ran();
 }
 

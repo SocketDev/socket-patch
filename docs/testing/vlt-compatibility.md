@@ -22,8 +22,9 @@ python3 scripts/check-vlt-legs.py --manifest crates/socket-patch-cli/tests/vlt-l
 
 Every leg is a test named `vlt_pinned_matrix_<suite>_<leg>` that prints one
 `VLT-LEG <vlt-version> <os> <suite> <leg> ran|skip:<reason>` line.
-`scripts/check-vlt-legs.py` fails a run on `0 passed`, on a missing `ran`, on
-a skip the manifest does not predict, and on an unknown leg. The manifest
+`scripts/check-vlt-legs.py` fails a run on `0 passed`, on a binary that
+prints no `test result:` line (a crash), on a missing `ran`, on a skip the
+manifest does not predict, and on an unknown leg. The manifest
 `crates/socket-patch-cli/tests/vlt-leg-manifest.json` is generated from the
 three tables below (`python3 scripts/check-vlt-legs.py --derive
 docs/testing/vlt-compatibility.md`), never written by hand;
@@ -59,7 +60,7 @@ them per OS).
 | Binary | Suite | Legs |
 |---|---|---|
 | `e2e_redirect_vlt_build` | `hosted` | `scan_fresh_ci`, `frozen_dead_registry`, `ordinary_install_stable`, `get_uuid_fresh_ci`, `tamper_cold_eintegrity`, `rollback_byte_exact`, `rerun_noop`, `warm_tree_invalidates`, `no_cleanup_stays_stale`, `heal_rule_b_hidden_lock_without_node`, `heal_rule_c_no_hidden_lock`, `heal_rule_c_no_record`, `scoped`, `peer_workspace_instances`, `install_newdep_preserves`, `update_drops`, `resave_install_rollback`, `resave_crlf_rollback`, `resave_update_rollback`, `crlf_lock`, `mirror_registries_npm`, `scalar_registry`, `named_alias_untouched`, `scoped_registry_untouched`, `jsr_untouched`, `default_registry_alias`, `registry_from_env`, `registry_from_user_config`, `content_encoding_refused`, `old_lockfile_ignored`, `warm_cache_hazard`, `idempotence`, `manifestless_vex`, `ts_written_lock`, `optional_dependency_heal`, `then_vendored_optional_takeover`, `platform_optional_skipped` |
-| `e2e_vendor_vlt_build` | `vendored` | `scan_fresh_ci`, `get_build_fresh_ci`, `get_service_fresh_ci`, `durability`, `workspace_member_selfref`, `alias_selfref`, `dep_with_deps`, `hostile_gitignore`, `autocrlf_checkout`, `bin_bearing`, `package_json_devdeps_patch`, `repair_rebuilds`, `idempotency`, `revert_byte_exact`, `resave_install_revert`, `resave_uninstall_revert`, `resave_crlf_revert`, `tamper_planted_file`, `tamper_file_content`, `tamper_payload_package_json`, `tamper_symlink_outside`, `tamper_deleted_gitignore`, `tamper_lock_file_node_path`, `transitive_refused`, `legacy_lockfile_warning`, `absent_version_refused`, `lockless_reinstall`, `manifestless_vex` |
+| `e2e_vendor_vlt_build` | `vendored` | `scan_fresh_ci`, `get_build_fresh_ci`, `get_service_fresh_ci`, `durability`, `workspace_member_selfref`, `alias_selfref`, `peer_root_selfref`, `peer_member_selfref`, `dep_with_deps`, `hostile_gitignore`, `autocrlf_checkout`, `bin_bearing`, `package_json_devdeps_patch`, `repair_rebuilds`, `idempotency`, `revert_byte_exact`, `resave_install_revert`, `resave_uninstall_revert`, `resave_crlf_revert`, `tamper_planted_file`, `tamper_file_content`, `tamper_payload_package_json`, `tamper_symlink_outside`, `tamper_deleted_gitignore`, `tamper_lock_file_node_path`, `transitive_refused`, `legacy_lockfile_warning`, `absent_version_refused`, `lockless_reinstall`, `manifestless_vex` |
 | `mode_migration_vlt` | `migration` | `vendored_then_hosted`, `hosted_then_vendored`, `dry_run_parity`, `scoped_unwind_one_of_two`, `rollback_from_mixed`, `agent_apply_yields_to_vendored`, `agent_apply_after_hosted`, `hosted_scan_keeps_agent_patched_tree`, `agent_rollback_after_takeovers`, `pm_switch_npm_to_vlt`, `pm_switch_vlt_to_npm`, `flavor_changed`, `upgrade_hosted`, `upgrade_vendored` |
 | `e2e_safety_vlt` | `safety` | `linux_auto`, `explicit_hardlink`, `private_copies`, `cross_device_cache`, `agent_rollback`, `peer_fanout`, `hosted_heal`, `vendored_build`, `vendor_revert_and_repair`, `layout_note` |
 | `e2e_vlt` | `agent` | `scan_apply_rollback_list`, `get_and_remove`, `install_then_apply_patches_file`, `transitive_only_dep_apply_patches_store`, `lockfile_supplement`, `launcher`, `persistence_survives`, `persistence_reverted_by_reinstall`, `reruns_and_vex` |
@@ -136,6 +137,9 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | a warm cache re-fetches a changed tarball and fails its integrity (no stale-bytes hazard) | `1.0.0-rc.27 … 1.0.2` | — | — | — | — |
 | `vlt update` re-resolves an unchanged exact spec (dropping a hosted pin); earlier releases keep the locked node | `>= 1.0.8` | — | — | — | — |
 | vlt.json spells the scope map `scoped-registries` (`scope-registries` before) | `>= 1.0.0-rc.28` | — | — | — | — |
+| a workspace member's direct dependency with resolved peers (use-sync-external-store beside react) gets a peer extra (`~peer.1`); vendored mode refuses such a variant instance (`vendor_lock_entry_unsupported`, nothing written), which `peer_member_selfref` pins until vendored mode accepts a single peer context | `>= 1.0.0-rc.15` | — | — | — | — |
+| the root importer's direct dependency with resolved peers gets a peer extra (`~peer.<16 hex>`); `peer_root_selfref` pins the same refusal | `>= 1.0.8` | — | — | — | — |
+| two workspaces with use-sync-external-store beside react 17 and react 18 share ONE peer instance (`peer_workspace_instances` pins the count); no real-vlt shape was found that writes several instances of one name@version, so multi-instance pinning is covered by the in-process goldens only | `all` | — | — | — | — |
 
 ## OS coverage
 

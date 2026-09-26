@@ -7,7 +7,7 @@ This script reads the libtest output of one or more capstone binaries and
 fails when:
 
 * a binary reports ``0 passed`` (a filter that matched nothing), or any
-  binary failed;
+  binary failed, crashed or printed no ``test result:`` line;
 * a leg the manifest expects is missing, ran where it must skip, skipped
   where it must run, skipped for another reason, or printed twice;
 * a leg is unknown to the manifest, or the run mixed vlt versions or OSes.
@@ -36,7 +36,11 @@ LEG_RE = re.compile(
     r"VLT-LEG (?P<version>\S+) (?P<os>\S+) (?P<suite>[a-z]+) (?P<leg>[a-z0-9_]+) "
     r"(?P<status>ran|skip:[a-z0-9-]+)"
 )
-RUNNING_RE = re.compile(r"^\s*Running (?:tests/)?(?P<name>[A-Za-z0-9_]+)(?:\.rs)?\b")
+RUNNING_RE = re.compile(
+    r"^\s*Running (?:tests[/\\])?(?P<name>[A-Za-z0-9_]+)(?:\.rs)?\b.* \(.*\)\s*$"
+)
+DOCTESTS_RE = re.compile(r"^\s*Doc-tests (?P<name>[A-Za-z0-9_]+)\s*$")
+CRASH_RE = re.compile(r"process didn't exit successfully|^error: test failed")
 RESULT_RE = re.compile(r"test result: (?P<outcome>\w+)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed")
 
 
@@ -312,9 +316,31 @@ def parse_log(text: str):
     return running, results, lines
 
 
+def unfinished_binaries(text: str) -> list:
+    """Binaries whose ``Running`` line no ``test result:`` line follows."""
+    unfinished = []
+    pending = None
+    for raw in text.splitlines():
+        m = RUNNING_RE.match(raw) or DOCTESTS_RE.match(raw)
+        if m:
+            if pending is not None:
+                unfinished.append(pending)
+            pending = m.group("name")
+        elif RESULT_RE.search(raw):
+            pending = None
+    if pending is not None:
+        unfinished.append(pending)
+    return unfinished
+
+
 def check(manifest: dict, text: str, knobs_env: dict, binaries: list) -> list:
     errors = []
     running, results, lines = parse_log(text)
+    for name in unfinished_binaries(text):
+        errors.append(f"test binary {name} printed no `test result:` line (it crashed or was killed)")
+    for raw in text.splitlines():
+        if CRASH_RE.search(raw):
+            errors.append(f"cargo reported a failed test binary: {raw.strip()}")
     for outcome, passed, failed in results:
         if passed == 0:
             errors.append("a test binary reported `0 passed` (vacuous run)")

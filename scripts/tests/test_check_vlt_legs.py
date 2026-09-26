@@ -231,6 +231,36 @@ class Checking(unittest.TestCase):
         dotted = "\n".join("." + l if l.startswith("VLT-LEG") else l for l in text.splitlines())
         self.assertEqual(self.run_check(dotted), [])
 
+    def test_windows_running_lines_name_the_binary(self):
+        for binary in ["e2e_hosted_production", "e2e_vendored_production", "e2e_vlt"]:
+            text = full_run(self.manifest, binary, "1.2.0", "windows", {})
+            windows = text.replace("Running tests/", "Running tests\\").replace(
+                "target/debug/deps/", "target\\debug\\deps\\")
+            self.assertIn("Running tests\\", windows)
+            running, _, _ = legs.parse_log(windows)
+            self.assertEqual(running, [binary])
+            self.assertEqual(self.run_check(windows), [], binary)
+
+    def test_a_binary_that_crashes_before_its_result_line_fails(self):
+        first = full_run(self.manifest, "e2e_redirect_vlt_build", "1.2.0", "macos", {})
+        second = full_run(self.manifest, "e2e_vlt", "1.2.0", "macos", {})
+        self.assertEqual(self.run_check(first + "\n" + second), [])
+        crashed = "\n".join(l for l in second.splitlines() if not l.startswith("test result:"))
+        crashed += ("\nerror: test failed, to rerun pass `-p socket-patch-cli --test e2e_vlt`\n"
+                    "Caused by:\n  process didn't exit successfully: `e2e_vlt-0123` "
+                    "(signal: 11, SIGSEGV: invalid memory reference)")
+        errors = self.run_check(first + "\n" + crashed)
+        self.assertTrue(any("e2e_vlt printed no `test result:`" in e for e in errors), errors)
+        self.assertTrue(any("didn't exit successfully" in e for e in errors), errors)
+        silent = "\n".join(l for l in second.splitlines() if not l.startswith("test result:"))
+        errors = self.run_check(silent + "\n" + first)
+        self.assertTrue(any("e2e_vlt printed no `test result:`" in e for e in errors), errors)
+
+    def test_program_output_that_says_running_is_not_a_binary(self):
+        text = full_run(self.manifest, "e2e_vlt", "1.2.0", "macos", {})
+        noisy = text.replace("VLT-LEG", "Running postinstall\nVLT-LEG", 1)
+        self.assertEqual(self.run_check(noisy), [])
+
     def test_excluded_releases_are_rejected(self):
         text = log("0.0.0-22", "macos", [("hosted", "scan_fresh_ci", "ran")])
         self.assertTrue(any("excluded" in e for e in self.run_check(text)))

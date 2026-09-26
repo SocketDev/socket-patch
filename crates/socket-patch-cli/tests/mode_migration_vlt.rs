@@ -238,9 +238,10 @@ async fn two_target_fixture(leg: Leg) -> Fixture {
 
 // ── 1–2. takeovers ────────────────────────────────────────────────────────
 
-/// Vendored → hosted: the vendored entry, artifact and wiring go, the
-/// ledger original is the pristine registry line, a fresh checkout is
-/// patched; the unscoped rollback restores the pristine lock.
+/// Vendored → hosted through `scan --mode hosted` and through `get <uuid>
+/// --mode hosted`: the vendored entry, artifact and wiring go, the ledger
+/// original is the pristine registry line, a fresh checkout is patched;
+/// the unscoped rollback restores the pristine lock.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_vendored_then_hosted() {
@@ -250,16 +251,32 @@ async fn vlt_pinned_matrix_migration_vendored_then_hosted() {
     let fx = Fixture::build(leg, Shape::with_bystander().warm()).await;
     let out = vendored_scan(&fx, &fx.proj, &[]);
     assert_eq!(out.code, 0, "{out}");
-    let out = hosted_scan(&fx, &fx.proj, &[]);
-    assert_eq!(out.code, 0, "{out}");
-    assert!(
-        has_code(&out.json(), "redirect_takeover_reverted_vendored"),
-        "{out}"
-    );
-    assert_pure_hosted(&fx, &fx.proj, fx.t());
-    assert!(!fx.proj.join(".socket/vendor/state.json").exists());
-    assert_fresh(&fx, &fx.proj, fx.t(), State::Patched, "hosted");
-    assert_unscoped_rollback_pristine(&fx, &fx.proj, "rollback");
+    for driver in ["scan", "get"] {
+        let dir = copy_project(&fx, &fx.proj, &format!("drv-{driver}"));
+        let out = if driver == "scan" {
+            hosted_scan(&fx, &dir, &[])
+        } else {
+            socket_api(&dir, &fx.svc, &["get", UUID, "--mode", "hosted"], &[])
+        };
+        assert_eq!(out.code, 0, "{driver}: {out}");
+        assert!(
+            has_code(&out.json(), "redirect_takeover_reverted_vendored"),
+            "{driver}: {out}"
+        );
+        assert_pure_hosted(&fx, &dir, fx.t());
+        assert!(
+            !dir.join(".socket/vendor/state.json").exists(),
+            "{driver}: no vendor ledger"
+        );
+        assert_fresh(
+            &fx,
+            &dir,
+            fx.t(),
+            State::Patched,
+            &format!("{driver}-hosted"),
+        );
+        assert_unscoped_rollback_pristine(&fx, &dir, &format!("{driver}-rollback"));
+    }
     fx.leg.ran();
 }
 

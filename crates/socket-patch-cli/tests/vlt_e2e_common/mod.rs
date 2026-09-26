@@ -193,6 +193,19 @@ pub const VLT_UPDATE_FROM: VltVersion = VltVersion::zero(20);
 pub const UPDATE_RERESOLVES_FROM: VltVersion = VltVersion::release(1, 0, 8);
 /// Peer extras (`ṗ:N` / `peer.N`) exist.
 pub const PEER_EXTRA_FROM: VltVersion = VltVersion::rc(6);
+/// A workspace member's direct dependency whose peers resolve gets a peer
+/// extra (`~peer.1`); the root importer's gets one from [`PEER_HASH_FROM`].
+pub const MEMBER_PEER_EXTRA_FROM: VltVersion = VltVersion::rc(15);
+
+/// Whether vlt writes a peer extra on a direct dependency with resolved
+/// peers, for a workspace-member (`member`) or the root importer.
+pub fn direct_peer_extra(v: VltVersion, member: bool) -> bool {
+    if member {
+        v >= MEMBER_PEER_EXTRA_FROM
+    } else {
+        v >= PEER_HASH_FROM
+    }
+}
 
 /// Named registry specs (`acme:x@1`), scoped registries and URL-segment
 /// DepIDs exist (flat-config releases record every registry node under
@@ -766,8 +779,14 @@ pub fn assert_ok(out: &Output, what: &str) {
 /// @socketsecurity/socket-patch <args>` runs the socket-patch binary under
 /// test and logs one line per invocation to `log`; `vlt` runs `js`.
 pub fn write_shims(bin: &Path, js: &Path, log: &Path) {
+    write_shims_for(bin, js, log, &socket_bin());
+}
+
+/// [`write_shims`] with the `npx` shim running `socket`. cmd.exe's `%*`
+/// ignores `shift`, so the `.cmd` shim rebuilds the argument list after
+/// the package token itself.
+pub fn write_shims_for(bin: &Path, js: &Path, log: &Path, socket: &Path) {
     std::fs::create_dir_all(bin).unwrap();
-    let socket = socket_bin();
     let sh_npx = format!(
         "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    @socketsecurity/socket-patch|@socketsecurity/socket-patch@*) shift; break;;\n    *) shift;;\n  esac\ndone\nprintf '%s\\n' \"npx $*\" >> '{log}'\nexec '{socket}' \"$@\"\n",
         log = log.display(),
@@ -778,7 +797,7 @@ pub fn write_shims(bin: &Path, js: &Path, log: &Path) {
         js.display()
     );
     let cmd_npx = format!(
-        "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto run\r\nset a=%~1\r\nshift\r\nif \"%a:~0,28%\"==\"@socketsecurity/socket-patch\" goto run\r\ngoto loop\r\n:run\r\necho npx %*>> \"{log}\"\r\n\"{socket}\" %*\r\n",
+        "@echo off\r\nsetlocal\r\nset SP_ARGS=\r\n:loop\r\nif \"%~1\"==\"\" goto run\r\nset SP_PKG=%~1\r\nshift\r\nif \"%SP_PKG:~0,28%\"==\"@socketsecurity/socket-patch\" goto collect\r\ngoto loop\r\n:collect\r\nif \"%~1\"==\"\" goto run\r\nset SP_ARGS=%SP_ARGS% %1\r\nshift\r\ngoto collect\r\n:run\r\n>>\"{log}\" echo npx%SP_ARGS%\r\n\"{socket}\"%SP_ARGS%\r\n",
         log = log.display(),
         socket = socket.display()
     );
@@ -2441,4 +2460,54 @@ fn vlt_e2e_harness_tarballs_are_deterministic() {
     let a = build_tgz(&files);
     assert_eq!(a, build_tgz(&files));
     assert_eq!(tgz_files(&a), files);
+}
+
+#[test]
+fn vlt_e2e_harness_npx_shim_forwards_the_args_after_the_package() {
+    let dir = std::env::temp_dir().join(format!("vlt-e2e-shim-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let argv = dir.join("argv.txt");
+    let log = dir.join("npx.log");
+    let fake = if cfg!(windows) {
+        let fake = dir.join("socket.cmd");
+        write(
+            &fake,
+            format!("@echo off\r\n>\"{}\" echo %*\r\n", argv.display()),
+        );
+        fake
+    } else {
+        let fake = dir.join("socket");
+        write(
+            &fake,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n", argv.display()),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fake
+    };
+    let bin = dir.join("bin");
+    write_shims_for(&bin, Path::new("vlt.js"), &log, &fake);
+    let npx = bin.join(if cfg!(windows) { "npx.cmd" } else { "npx" });
+    let out = Command::new(npx)
+        .args([
+            "-y",
+            "@socketsecurity/socket-patch",
+            "apply",
+            "--silent",
+            "--ecosystems",
+            "npm",
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&out, "the npx shim");
+    let args = "apply --silent --ecosystems npm";
+    assert_eq!(std::fs::read_to_string(&argv).unwrap().trim(), args);
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().trim(),
+        format!("npx {args}")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

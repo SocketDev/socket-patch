@@ -692,11 +692,16 @@ async fn vlt_pinned_matrix_setup_hook_failure() {
     .env("SOCKET_PROXY_URL", dead)
     .env("SOCKET_API_URL", dead);
     let direct = cmd.output().unwrap();
-    let code = direct.status.code();
     let text = String::from_utf8_lossy(&direct.stdout).into_owned();
     assert!(
         text.contains("sources_download_failed") && text.contains("partialFailure"),
         "the contract's warning: {text}"
+    );
+    assert_eq!(
+        direct.status.code(),
+        Some(1),
+        "partialFailure exits 1: {}",
+        out_text(&direct)
     );
     remove_tree(&fx.proj);
     let mut run = with_hook_env(&fx);
@@ -705,15 +710,11 @@ async fn vlt_pinned_matrix_setup_hook_failure() {
     run.env.push(("SOCKET_API_URL".into(), dead.into()));
     let out = fx.leg.vlt_with(&fx.proj, &["install"], &run);
     assert_eq!(hook_count(&fx), 2, "the failing hook ran");
-    if code == Some(0) {
-        assert_ok(&out, "vlt keeps the install when the hook exits 0");
-    } else {
-        assert!(
-            !out.status.success(),
-            "a failing hook ({code:?}) aborts the install: {}",
-            out_text(&out)
-        );
-    }
+    assert!(
+        !out.status.success(),
+        "the failing hook aborts the install: {}",
+        out_text(&out)
+    );
     fx.leg.ran();
 }
 
