@@ -1,21 +1,86 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use super::walk_pool::{par_map, run_walk};
 use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
+
+#[cfg(test)]
+mod oracle;
+
+/// How many `.pom` paths the parallel parse takes at a time. Every phase
+/// stays in walk order whatever the chunk, so this only bounds peak
+/// memory: a real `~/.m2` holds 10-50k artifacts (corporate caches many
+/// times that, and a GAV dir commonly holds more than one `.pom`), and
+/// buffering every path and every parse result before the dedup would put
+/// tens of megabytes on a scan that runs eight other crawlers beside it.
+const POM_PARSE_CHUNK: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // POM XML minimal parser
 // ---------------------------------------------------------------------------
 
+/// The tag needles for one POM element, built at compile time so the
+/// per-line matching allocates nothing.
+struct Element {
+    /// `<name` — an opening tag's prefix ([`opening_tag_needle`]).
+    open: &'static str,
+    /// `</name` — a closing tag's prefix ([`closing_tag_needle`]).
+    close: &'static str,
+    /// `<name>` / `</name>` — a single-line value ([`xml_value_needles`]).
+    value_open: &'static str,
+    value_close: &'static str,
+}
+
+macro_rules! element {
+    ($name:literal) => {
+        Element {
+            open: concat!("<", $name),
+            close: concat!("</", $name),
+            value_open: concat!("<", $name, ">"),
+            value_close: concat!("</", $name, ">"),
+        }
+    };
+}
+
+const GROUP_ID: Element = element!("groupId");
+const ARTIFACT_ID: Element = element!("artifactId");
+const VERSION: Element = element!("version");
+const PARENT: Element = element!("parent");
+
+/// Sections whose `groupId`/`artifactId`/`version` are never the project's.
+const SKIP_SECTIONS: [Element; 11] = [
+    element!("dependencies"),
+    element!("build"),
+    element!("profiles"),
+    element!("reporting"),
+    element!("dependencyManagement"),
+    element!("pluginManagement"),
+    element!("modules"),
+    element!("distributionManagement"),
+    element!("repositories"),
+    element!("pluginRepositories"),
+    // Free-form (xs:any): a property may be named exactly `version`/
+    // `groupId`/`artifactId` (Maven warns but permits it) and would
+    // otherwise win first-match extraction over the project's own
+    // coordinates. Project coordinates never live in <properties>,
+    // so skipping it can only prevent leaks.
+    element!("properties"),
+];
+
 /// Extract the text value between `<element>` and `</element>` on a single line.
+#[cfg(test)]
 fn extract_xml_value(line: &str, element: &str) -> Option<String> {
-    let open = format!("<{element}>");
-    let close = format!("</{element}>");
-    let start = line.find(&open)?;
+    xml_value_needles(line, &format!("<{element}>"), &format!("</{element}>"))
+}
+
+/// [`extract_xml_value`] over prebuilt `<element>` / `</element>` needles.
+fn xml_value_needles(line: &str, open: &str, close: &str) -> Option<String> {
+    let start = line.find(open)?;
     let value_start = start + open.len();
-    let end = line[value_start..].find(&close)?;
+    let end = line[value_start..].find(close)?;
     let value = line[value_start..value_start + end].trim().to_string();
     if value.is_empty() {
         None
@@ -33,7 +98,11 @@ fn extract_xml_value(line: &str, element: &str) -> Option<String> {
 /// substring matching would otherwise miscount skip-section depth (e.g. a
 /// comment containing `</build>` could "close" a block that is still open
 /// and leak a plugin's coordinates as the project's).
-fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
+fn strip_comment_spans<'a>(line: &'a str, in_comment: &mut bool) -> Cow<'a, str> {
+    // The common line: no comment open and none starting — nothing to strip.
+    if !*in_comment && !line.contains("<!--") {
+        return Cow::Borrowed(line);
+    }
     let mut out = String::new();
     let mut rest = line;
     loop {
@@ -43,7 +112,7 @@ fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
                     rest = &rest[end + 3..];
                     *in_comment = false;
                 }
-                None => return out, // remainder of the line is inside a comment
+                None => return Cow::Owned(out), // remainder of the line is inside a comment
             }
         } else {
             match rest.find("<!--") {
@@ -54,7 +123,7 @@ fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
                 }
                 None => {
                     out.push_str(rest);
-                    return out;
+                    return Cow::Owned(out);
                 }
             }
         }
@@ -73,10 +142,15 @@ fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
 /// equals `</build>`, that phantom open would never be matched by a close and
 /// would leak the entire remainder of the document into the skip section,
 /// dropping the project's real coordinates.
+#[cfg(test)]
 fn opening_tag(line: &str, element: &str) -> Option<bool> {
-    let needle = format!("<{element}");
+    opening_tag_needle(line, &format!("<{element}"))
+}
+
+/// [`opening_tag`] over a prebuilt `<element` needle.
+fn opening_tag_needle(line: &str, needle: &str) -> Option<bool> {
     let mut from = 0;
-    while let Some(rel) = line[from..].find(&needle) {
+    while let Some(rel) = line[from..].find(needle) {
         let pos = from + rel;
         let after = &line[pos + needle.len()..];
         match after.chars().next() {
@@ -102,10 +176,15 @@ fn opening_tag(line: &str, element: &str) -> Option<bool> {
 /// whitespace before `>`, e.g. `</build >`)? The boundary `>` is required, so
 /// `</buildtools>` is not treated as a close of `</build>` — mirroring the
 /// boundary discipline of [`opening_tag`].
+#[cfg(test)]
 fn contains_closing_tag(line: &str, element: &str) -> bool {
-    let needle = format!("</{element}");
+    closing_tag_needle(line, &format!("</{element}"))
+}
+
+/// [`contains_closing_tag`] over a prebuilt `</element` needle.
+fn closing_tag_needle(line: &str, needle: &str) -> bool {
     let mut from = 0;
-    while let Some(rel) = line[from..].find(&needle) {
+    while let Some(rel) = line[from..].find(needle) {
         let pos = from + rel;
         let after = &line[pos + needle.len()..];
         if after.trim_start().starts_with('>') {
@@ -133,28 +212,15 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
     let mut in_comment = false;
     let mut skip_depth: u32 = 0;
 
-    let skip_sections = [
-        "dependencies",
-        "build",
-        "profiles",
-        "reporting",
-        "dependencyManagement",
-        "pluginManagement",
-        "modules",
-        "distributionManagement",
-        "repositories",
-        "pluginRepositories",
-        // Free-form (xs:any): a property may be named exactly `version`/
-        // `groupId`/`artifactId` (Maven warns but permits it) and would
-        // otherwise win first-match extraction over the project's own
-        // coordinates. Project coordinates never live in <properties>,
-        // so skipping it can only prevent leaks.
-        "properties",
-    ];
-
     for line in content.lines() {
         let cleaned = strip_comment_spans(line, &mut in_comment);
         let trimmed = cleaned.trim();
+        // Every open, close and value below needs a `<`: a tag-free line
+        // (text, attribute continuations, the inside of a comment) changes
+        // no state.
+        if !trimmed.contains('<') {
+            continue;
+        }
 
         // Check for skip section open/close. A tag that opens and closes on
         // the same line (`<modules></modules>`) or self-closes
@@ -169,10 +235,10 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
         // legitimately follows a close on the same line is sacrificed to
         // `None`, which scan rescues via the directory-path fallback.
         let mut saw_section_close = false;
-        for section in &skip_sections {
-            let open = opening_tag(trimmed, section);
+        for section in &SKIP_SECTIONS {
+            let open = opening_tag_needle(trimmed, section.open);
             let has_open = open.is_some();
-            let has_close = contains_closing_tag(trimmed, section);
+            let has_close = closing_tag_needle(trimmed, section.close);
             saw_section_close |= has_close;
             if has_open && !has_close && open != Some(true) {
                 skip_depth += 1;
@@ -187,22 +253,22 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
 
         // Track parent section (a self-closing `<parent/>` carries no
         // coordinates, so it never opens a parent block).
-        let parent_open = opening_tag(trimmed, "parent");
-        if parent_open.is_some()
-            && !contains_closing_tag(trimmed, "parent")
-            && parent_open != Some(true)
-        {
+        let parent_open = opening_tag_needle(trimmed, PARENT.open);
+        let parent_close = closing_tag_needle(trimmed, PARENT.close);
+        if parent_open.is_some() && !parent_close && parent_open != Some(true) {
             in_parent = true;
             continue;
         }
-        if contains_closing_tag(trimmed, "parent") {
+        if parent_close {
             in_parent = false;
             continue;
         }
 
         if in_parent {
             if parent_group_id.is_none() {
-                if let Some(val) = extract_xml_value(trimmed, "groupId") {
+                if let Some(val) =
+                    xml_value_needles(trimmed, GROUP_ID.value_open, GROUP_ID.value_close)
+                {
                     if val.contains("${") {
                         // Property reference in parent — skip
                     } else {
@@ -215,7 +281,8 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
 
         // Extract top-level coordinates
         if group_id.is_none() {
-            if let Some(val) = extract_xml_value(trimmed, "groupId") {
+            if let Some(val) = xml_value_needles(trimmed, GROUP_ID.value_open, GROUP_ID.value_close)
+            {
                 if val.contains("${") {
                     return None;
                 }
@@ -223,7 +290,9 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
             }
         }
         if artifact_id.is_none() {
-            if let Some(val) = extract_xml_value(trimmed, "artifactId") {
+            if let Some(val) =
+                xml_value_needles(trimmed, ARTIFACT_ID.value_open, ARTIFACT_ID.value_close)
+            {
                 if val.contains("${") {
                     return None;
                 }
@@ -231,12 +300,18 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
             }
         }
         if version.is_none() {
-            if let Some(val) = extract_xml_value(trimmed, "version") {
+            if let Some(val) = xml_value_needles(trimmed, VERSION.value_open, VERSION.value_close) {
                 if val.contains("${") {
                     return None;
                 }
                 version = Some(val);
             }
+        }
+        // All three are first-match: once set, later lines can neither
+        // replace them nor reach a `${` refusal, and a parent groupId only
+        // fills a missing top-level one.
+        if group_id.is_some() && artifact_id.is_some() && version.is_some() {
+            break;
         }
     }
 
@@ -289,6 +364,148 @@ fn parse_path_coordinates(
     }
 
     Some((group_id, artifact_id, version))
+}
+
+/// The coordinates a canonical repository layout spells out for one `.pom`
+/// file: `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom`,
+/// relative to the repository root. `None` when the path is not that shape
+/// and the POM has to be read instead:
+///
+/// - fewer than four components (no group segment at all, or a stray
+///   `.pom` in the root) — nothing to take the coordinates from;
+/// - a file name that is not exactly `<artifactId>-<version>.pom` for the
+///   two directories above it (a SNAPSHOT dir's timestamped
+///   `a-1.0-20240101.120000-1.pom`, a hand-placed `extra.pom`);
+/// - a component that is not UTF-8 or not a plain name;
+/// - a group segment that itself holds a `.` (`org.acme/lib/1.0/...`),
+///   which reads the same as a nested `org/acme/` group but is not the
+///   layout Maven writes, so its content decides.
+///
+/// Maven itself writes every POM it resolves at exactly this path, so on a
+/// real `~/.m2` — scanned from its repository root — the answer equals what
+/// the POM's own coordinates say, and the scan takes it without opening the
+/// file once [`LayoutTrust`] has confirmed the root. The case where the two
+/// differ under a confirmed root is a POM at a canonical path whose contents
+/// disagree with its directory (hand-placed, or a legacy upstream POM with
+/// mismatched coordinates): it reports the directory's coordinates.
+fn canonical_layout_coordinates(pom: &Path, repo_root: &Path) -> Option<(String, String, String)> {
+    let rel = pom.strip_prefix(repo_root).ok()?;
+    let mut components: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => components.push(name.to_str()?),
+            _ => return None,
+        }
+    }
+    let [group @ .., artifact_id, version, file] = components.as_slice() else {
+        return None;
+    };
+    if group.is_empty() || group.iter().any(|segment| segment.contains('.')) {
+        return None;
+    }
+    let spelled = file
+        .strip_suffix(".pom")?
+        .strip_prefix(artifact_id)?
+        .strip_prefix('-')?;
+    if spelled != *version {
+        return None;
+    }
+    Some((
+        group.join("."),
+        artifact_id.to_string(),
+        version.to_string(),
+    ))
+}
+
+/// How many canonical POMs of one top-level group directory
+/// [`LayoutTrust`] reads, at most, looking for one whose content parses.
+/// Past that the directory stays unconfirmed (content-first, as before
+/// MVN-1) rather than reading on, serially, through a tree of unparseable
+/// POMs.
+const LAYOUT_TRUST_ATTEMPTS: u8 = 8;
+
+/// Whether the path of a canonical POM ([`canonical_layout_coordinates`])
+/// may stand in for its content — confirmed per top-level group directory
+/// of one repository root (`org`, `com`, `io`, ...).
+///
+/// The canonical path only spells the right group when the scan root IS
+/// the repository root. A `--global-prefix` / `MAVEN_REPO_LOCAL` one level
+/// too high (`~/.m2`) would prepend `repository.` to every group, and a
+/// subtree root (`~/.m2/repository/org`) would drop `org.` — where the
+/// content-first parse still read the right coordinates. So the first
+/// canonical POM (walk order) of each top-level directory whose content
+/// parses decides it: content equal to the path confirms the directory,
+/// and every later canonical POM under it is taken from its path; content
+/// that disagrees leaves the directory content-first, exactly the pre-MVN-1
+/// scan. A directory whose canonical POMs never parse (within
+/// [`LAYOUT_TRUST_ATTEMPTS`]) stays content-first too — for those the
+/// content-first answer is the directory path anyway.
+#[derive(Default)]
+struct LayoutTrust {
+    dirs: HashMap<String, TrustVerdict>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrustVerdict {
+    Trusted,
+    Untrusted,
+    /// No sampled POM parsed yet; how many were read.
+    Unsettled(u8),
+}
+
+impl LayoutTrust {
+    /// A trust that starts with `trusted` top-level directories confirmed,
+    /// so a test can pin what a confirmed directory does with a POM that
+    /// walk order might otherwise have sampled first.
+    #[cfg(test)]
+    fn trusting(trusted: &[&str]) -> Self {
+        Self {
+            dirs: trusted
+                .iter()
+                .map(|dir| ((*dir).to_string(), TrustVerdict::Trusted))
+                .collect(),
+        }
+    }
+
+    /// The top-level group directory of canonical coordinates: the group's
+    /// first segment (canonical group segments never hold a `.`).
+    fn dir_of(gav: &(String, String, String)) -> &str {
+        gav.0.split('.').next().unwrap_or_default()
+    }
+
+    /// Whether `gav`, a canonical path's coordinates, may be taken as is.
+    fn trusts(&self, gav: &(String, String, String)) -> bool {
+        self.dirs.get(Self::dir_of(gav)) == Some(&TrustVerdict::Trusted)
+    }
+
+    /// Settle what one chunk's canonical POMs (in walk order, `None` for
+    /// the off-shape ones) can settle, reading at most one POM per
+    /// unsettled directory that parses — serially, so the verdict is the
+    /// same for every chunk size and thread count.
+    fn settle<'a>(
+        &mut self,
+        poms: impl IntoIterator<Item = (&'a Path, Option<&'a (String, String, String)>)>,
+    ) {
+        for (path, gav) in poms {
+            let Some(gav) = gav else {
+                continue;
+            };
+            let attempts = match self.dirs.get(Self::dir_of(gav)) {
+                None => 0,
+                Some(TrustVerdict::Unsettled(n)) if *n < LAYOUT_TRUST_ATTEMPTS => *n,
+                Some(_) => continue,
+            };
+            let verdict = match std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| parse_pom_group_artifact_version(&content))
+            {
+                Some(content) if content == *gav => TrustVerdict::Trusted,
+                Some(_) => TrustVerdict::Untrusted,
+                None => TrustVerdict::Unsettled(attempts + 1),
+            };
+            self.dirs.insert(Self::dir_of(gav).to_string(), verdict);
+        }
+    }
 }
 
 /// Whether the PURL-derived Maven coordinates are safe to join onto the
@@ -397,8 +614,16 @@ impl MavenCrawler {
 
         let repo_paths = self.get_maven_repo_paths(options).await.unwrap_or_default();
 
-        for repo_path in &repo_paths {
-            let found = self.scan_maven_repo(repo_path, &mut seen);
+        for repo_path in repo_paths {
+            // The walkdir walk and POM reads are blocking: run each repo
+            // on the walk pool so concurrently crawled ecosystems keep
+            // making progress (the dedup set rides along and comes back).
+            let (found, returned_seen) = run_walk(move || {
+                let found = MavenCrawler.scan_maven_repo(&repo_path, &mut seen);
+                (found, seen)
+            })
+            .await;
+            seen = returned_seen;
             packages.extend(found);
         }
 
@@ -497,47 +722,119 @@ impl MavenCrawler {
 
     /// Scan a Maven repository directory and return all valid packages found.
     ///
-    /// Uses `walkdir` to recursively find `.pom` files, then extracts
-    /// coordinates from the POM content or falls back to directory path parsing.
+    /// Uses `walkdir` to recursively find `.pom` files, then takes the
+    /// coordinates from the canonical `<group>/<a>/<v>/<a>-<v>.pom` path
+    /// ([`canonical_layout_coordinates`]) without reading the file once
+    /// [`LayoutTrust`] has confirmed the path spells them under this root,
+    /// and only otherwise extracts them from the POM content, falling back
+    /// to directory path parsing.
+    ///
+    /// Four phases per chunk of the walk: the (serial) walk collects
+    /// `.pom` paths in walk order, [`LayoutTrust::settle`] reads (serially,
+    /// in walk order) the few POMs that confirm or refute its top-level
+    /// directories, the reads and parses run through [`par_map`] — in
+    /// parallel on the walk pool's threads, and on the calling thread when
+    /// no walk thread could be spawned (each POM's coordinates depend on
+    /// that file and the settled trust alone) — and the PURL dedup runs
+    /// serially in walk order, so the first-seen version dir wins and
+    /// packages come out exactly as the one-at-a-time scan's did.
     fn scan_maven_repo(&self, repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
+        self.scan_maven_repo_chunked(repo_path, seen, POM_PARSE_CHUNK)
+    }
 
-        for entry in walkdir::WalkDir::new(repo_path)
+    /// [`Self::scan_maven_repo`] over an explicit chunk size, so tests can
+    /// cross the chunk boundary on a small fixture.
+    fn scan_maven_repo_chunked(
+        &self,
+        repo_path: &Path,
+        seen: &mut HashSet<String>,
+        chunk: usize,
+    ) -> Vec<CrawledPackage> {
+        self.scan_maven_repo_trusting(repo_path, seen, chunk, LayoutTrust::default())
+    }
+
+    /// [`Self::scan_maven_repo_chunked`] from an explicit starting
+    /// [`LayoutTrust`], so tests can pin what a confirmed directory does.
+    fn scan_maven_repo_trusting(
+        &self,
+        repo_path: &Path,
+        seen: &mut HashSet<String>,
+        chunk: usize,
+        mut trust: LayoutTrust,
+    ) -> Vec<CrawledPackage> {
+        let chunk = chunk.max(1);
+        let mut results = Vec::new();
+        let mut poms: Vec<PathBuf> = Vec::new();
+        let mut walk = walkdir::WalkDir::new(repo_path)
             .follow_links(false)
             .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "pom") {
-                continue;
-            }
+            .filter_map(|e| e.ok());
 
-            let version_dir = match path.parent() {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Try POM parsing first, fall back to directory path parsing
-            let coords = std::fs::read_to_string(path)
-                .ok()
-                .and_then(|content| parse_pom_group_artifact_version(&content))
-                .or_else(|| parse_path_coordinates(version_dir, repo_path));
-
-            if let Some((group_id, artifact_id, version)) = coords {
-                let purl = crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
-                if seen.insert(purl.clone()) {
-                    results.push(CrawledPackage {
-                        name: artifact_id,
-                        version,
-                        namespace: Some(group_id),
-                        purl,
-                        path: version_dir.to_path_buf(),
-                    });
+        loop {
+            for entry in walk.by_ref() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "pom") {
+                    continue;
+                }
+                if path.parent().is_none() {
+                    continue;
+                }
+                poms.push(entry.into_path());
+                if poms.len() >= chunk {
+                    break;
                 }
             }
+            if poms.is_empty() {
+                break;
+            }
+
+            let canonical: Vec<Option<(String, String, String)>> = poms
+                .iter()
+                .map(|path| canonical_layout_coordinates(path, repo_path))
+                .collect();
+            trust.settle(
+                poms.iter()
+                    .map(PathBuf::as_path)
+                    .zip(canonical.iter().map(Option::as_ref)),
+            );
+            let work: Vec<_> = poms.iter().zip(canonical).collect();
+            let trust = &trust;
+            let parsed: Vec<Option<(String, String, String)>> = par_map(work, |(path, gav)| {
+                // A canonical path under a confirmed top-level directory
+                // names the coordinates outright; any other POM is parsed,
+                // falling back to the directory path.
+                if let Some(gav) = gav.filter(|gav| trust.trusts(gav)) {
+                    return Some(gav);
+                }
+                let version_dir = path.parent()?;
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| parse_pom_group_artifact_version(&content))
+                    .or_else(|| parse_path_coordinates(version_dir, repo_path))
+            });
+
+            for (path, coords) in poms.iter().zip(parsed) {
+                let Some(version_dir) = path.parent() else {
+                    continue;
+                };
+                if let Some((group_id, artifact_id, version)) = coords {
+                    let purl =
+                        crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
+                    if seen.insert(purl.clone()) {
+                        results.push(CrawledPackage {
+                            name: artifact_id,
+                            version,
+                            namespace: Some(group_id),
+                            purl,
+                            path: version_dir.to_path_buf(),
+                        });
+                    }
+                }
+            }
+            poms.clear();
         }
 
         results
@@ -933,8 +1230,10 @@ mod tests {
         // the entry must be skipped rather than emit a garbage package.
         // (b) Two DIFFERENT .pom files that resolve to the SAME purl — one
         // from correct content in its own version dir, one elsewhere whose
-        // CONTENT declares the first's coordinates (content wins over the
-        // path): the seen-set must dedupe them to a single package.
+        // CONTENT declares the first's coordinates (its file name is not
+        // the canonical `<a>-<v>.pom` of its own dir, so the content is
+        // read and wins over the path): the seen-set must dedupe them to a
+        // single package.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stray.pom"), "<project/>").unwrap();
 
@@ -956,7 +1255,8 @@ mod tests {
         .unwrap();
 
         // Lives at com/other/shadow/9.9.9 but its content claims the same
-        // coordinates as the package above.
+        // coordinates as the package above. Named for those coordinates,
+        // not its own directory's, so the path does not decide it.
         let shadow_dir = dir
             .path()
             .join("com")
@@ -965,7 +1265,7 @@ mod tests {
             .join("9.9.9");
         std::fs::create_dir_all(&shadow_dir).unwrap();
         std::fs::write(
-            shadow_dir.join("shadow-9.9.9.pom"),
+            shadow_dir.join("dup-1.0.0.pom"),
             r#"<project>
   <groupId>com.example</groupId>
   <artifactId>dup</artifactId>
@@ -986,6 +1286,260 @@ mod tests {
         assert_eq!(pkgs[0].name, "dup");
         assert_eq!(pkgs[0].version, "1.0.0");
         assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
+    }
+
+    #[test]
+    fn test_canonical_layout_coordinates() {
+        let root = Path::new("/repo");
+        let coords = |rel: &str| canonical_layout_coordinates(&root.join(rel), root);
+        let gav = |g: &str, a: &str, v: &str| Some((g.to_string(), a.to_string(), v.to_string()));
+
+        assert_eq!(
+            coords("org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"),
+            gav("org.apache.commons", "commons-lang3", "3.12.0")
+        );
+        // Hyphens inside the artifact or the version are no ambiguity: the
+        // file name is compared against the two directory names.
+        assert_eq!(
+            coords("com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.pom"),
+            gav("com.google.guava", "guava", "32.1.3-jre")
+        );
+        assert_eq!(
+            coords("io/x/my-lib/1.0-SNAPSHOT/my-lib-1.0-SNAPSHOT.pom"),
+            gav("io.x", "my-lib", "1.0-SNAPSHOT")
+        );
+        // A single-segment group is still a group.
+        assert_eq!(
+            coords("junit/junit/4.13/junit-4.13.pom"),
+            gav("junit", "junit", "4.13")
+        );
+
+        // Not the canonical shape: the POM must be read.
+        for rel in [
+            // SNAPSHOT dir's timestamped POM.
+            "io/x/my-lib/1.0-SNAPSHOT/my-lib-1.0-20240101.120000-1.pom",
+            // Hand-placed extra POM, or one named for other coordinates.
+            "com/example/app/1.0/extra.pom",
+            "com/example/app/1.0/other-1.0.pom",
+            "com/example/app/1.0/app-1.0.1.pom",
+            "com/example/app/1.0/app1.0.pom",
+            "com/example/app/1.0/app-1.0.xml",
+            // No group segment, or a stray POM near the root.
+            "app/1.0/app-1.0.pom",
+            "stray.pom",
+            // A dotted group segment is not the layout Maven writes.
+            "org.acme/lib/1.0/lib-1.0.pom",
+            "org/acme.tools/lib/1.0/lib-1.0.pom",
+        ] {
+            assert_eq!(coords(rel), None, "{rel}");
+        }
+        // Outside the repository root.
+        assert_eq!(
+            canonical_layout_coordinates(Path::new("/elsewhere/a/b/1/b-1.pom"), root),
+            None
+        );
+    }
+
+    /// A canonical POM at `com/example/real/2.0.0/real-2.0.0.pom` whose
+    /// contents name other coordinates.
+    fn disagreeing_canonical_pom(root: &Path) -> PathBuf {
+        let pkg_dir = root.join("com").join("example").join("real").join("2.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("real-2.0.0.pom"),
+            r#"<project>
+  <groupId>org.claimed</groupId>
+  <artifactId>claimed</artifactId>
+  <version>9.9.9</version>
+</project>"#,
+        )
+        .unwrap();
+        pkg_dir
+    }
+
+    #[test]
+    fn test_scan_canonical_path_wins_over_disagreeing_pom() {
+        // MVN-1: under a top-level directory the scan has confirmed, a POM
+        // at its canonical `<group>/<a>/<v>/<a>-<v>.pom` path reports the
+        // directory's coordinates without being read — even one whose
+        // contents name something else.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = disagreeing_canonical_pom(dir.path());
+
+        let mut seen = HashSet::new();
+        let pkgs = MavenCrawler::new().scan_maven_repo_trusting(
+            dir.path(),
+            &mut seen,
+            POM_PARSE_CHUNK,
+            LayoutTrust::trusting(&["com"]),
+        );
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].purl, "pkg:maven/com.example/real@2.0.0");
+        assert_eq!(pkgs[0].name, "real");
+        assert_eq!(pkgs[0].version, "2.0.0");
+        assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
+        assert_eq!(pkgs[0].path, pkg_dir);
+    }
+
+    #[test]
+    fn test_scan_disagreeing_first_sample_keeps_its_dir_content_first() {
+        // The same POM as the only one under `com/`: it is the sample that
+        // decides `com/`, and its disagreement leaves the directory
+        // content-first — the scan reports what the file says, as it did
+        // before MVN-1.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = disagreeing_canonical_pom(dir.path());
+
+        let mut seen = HashSet::new();
+        let pkgs = MavenCrawler::new().scan_maven_repo(dir.path(), &mut seen);
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].purl, "pkg:maven/org.claimed/claimed@9.9.9");
+        assert_eq!(pkgs[0].path, pkg_dir);
+    }
+
+    /// A small real-shaped repository under `root/repository`: two groups
+    /// under `org/`, one under `com/`, each POM agreeing with its path.
+    fn agreeing_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repository");
+        for (group, artifact, version) in [
+            ("org/apache/commons", "commons-lang3", "3.12.0"),
+            ("org/slf4j", "slf4j-api", "2.0.9"),
+            ("com/google/guava", "guava", "32.1.3-jre"),
+        ] {
+            let dir = repo.join(group).join(artifact).join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{artifact}-{version}.pom")),
+                format!(
+                    "<project><groupId>{}</groupId><artifactId>{artifact}</artifactId><version>{version}</version></project>",
+                    group.replace('/', ".")
+                ),
+            )
+            .unwrap();
+        }
+        repo
+    }
+
+    #[test]
+    fn test_scan_misrooted_repository_keeps_content_coordinates() {
+        // The canonical path spells the group relative to the scan root, so
+        // a root one level too high (`~/.m2` for `~/.m2/repository`) or a
+        // subtree of the repository would turn every path-derived group
+        // wrong. The first POM of each top-level directory refutes the
+        // path there, and the scan reads the contents as it always did.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = agreeing_repo(dir.path());
+        const LANG3: &str = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
+        const SLF4J: &str = "pkg:maven/org.slf4j/slf4j-api@2.0.9";
+        const GUAVA: &str = "pkg:maven/com.google.guava/guava@32.1.3-jre";
+        for (root, want) in [
+            (repo.clone(), vec![LANG3, SLF4J, GUAVA]),
+            (dir.path().to_path_buf(), vec![LANG3, SLF4J, GUAVA]),
+            (repo.join("org"), vec![LANG3, SLF4J]),
+            (repo.join("org").join("apache"), vec![LANG3]),
+        ] {
+            let mut seen = HashSet::new();
+            let purls: HashSet<String> = MavenCrawler::new()
+                .scan_maven_repo(&root, &mut seen)
+                .into_iter()
+                .map(|p| p.purl)
+                .collect();
+            let want: HashSet<String> = want.into_iter().map(str::to_string).collect();
+            assert_eq!(purls, want, "root {}", root.display());
+        }
+    }
+
+    #[test]
+    fn test_layout_trust_reads_a_bounded_number_of_unparseable_samples() {
+        // Unparseable canonical POMs leave their directory unsettled; the
+        // first one that parses settles it, but only within
+        // LAYOUT_TRUST_ATTEMPTS reads — past that the directory stays
+        // content-first instead of reading on.
+        let dir = tempfile::tempdir().unwrap();
+        let pom = |i: usize, content: &str| -> (PathBuf, (String, String, String)) {
+            let version = format!("1.{i}");
+            let path = dir
+                .path()
+                .join("org")
+                .join("x")
+                .join("a")
+                .join(&version)
+                .join(format!("a-{version}.pom"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content.replace("{v}", &version)).unwrap();
+            let gav = canonical_layout_coordinates(&path, dir.path()).unwrap();
+            (path, gav)
+        };
+        let agreeing = "<project><groupId>org.x</groupId><artifactId>a</artifactId><version>{v}</version></project>";
+        let cap = usize::from(LAYOUT_TRUST_ATTEMPTS);
+        for (unparseable, want) in [
+            (0, TrustVerdict::Trusted),
+            (cap - 1, TrustVerdict::Trusted),
+            (cap, TrustVerdict::Unsettled(LAYOUT_TRUST_ATTEMPTS)),
+        ] {
+            let mut poms: Vec<_> = (0..unparseable).map(|i| pom(i, "not xml")).collect();
+            poms.push(pom(unparseable, agreeing));
+            let mut trust = LayoutTrust::default();
+            trust.settle(poms.iter().map(|(path, gav)| (path.as_path(), Some(gav))));
+            assert_eq!(trust.dirs.get("org"), Some(&want), "{unparseable}");
+        }
+        // A disagreeing first parse refutes the directory for good.
+        let mut trust = LayoutTrust::default();
+        let refuting = pom(99, "<project><groupId>x</groupId><artifactId>a</artifactId><version>{v}</version></project>");
+        let confirming = pom(98, agreeing);
+        trust.settle([
+            (refuting.0.as_path(), Some(&refuting.1)),
+            (confirming.0.as_path(), Some(&confirming.1)),
+        ]);
+        assert_eq!(trust.dirs.get("org"), Some(&TrustVerdict::Untrusted));
+        assert!(!trust.trusts(&confirming.1));
+    }
+
+    #[test]
+    fn test_scan_non_canonical_pom_name_still_parses_content() {
+        // Off the canonical shape the content still decides (and the path
+        // still rescues an unparseable one): a SNAPSHOT dir's timestamped
+        // POM and a POM under a dotted group directory.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir
+            .path()
+            .join("io")
+            .join("x")
+            .join("snap")
+            .join("1.0-SNAPSHOT");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(
+            snap_dir.join("snap-1.0-20240101.120000-1.pom"),
+            r#"<project>
+  <groupId>io.x</groupId>
+  <artifactId>snap</artifactId>
+  <version>1.0-SNAPSHOT</version>
+</project>"#,
+        )
+        .unwrap();
+        let dotted_dir = dir.path().join("org.acme").join("lib").join("1.0");
+        std::fs::create_dir_all(&dotted_dir).unwrap();
+        std::fs::write(
+            dotted_dir.join("lib-1.0.pom"),
+            r#"<project>
+  <groupId>org.acme.content</groupId>
+  <artifactId>lib</artifactId>
+  <version>1.0</version>
+</project>"#,
+        )
+        .unwrap();
+
+        let mut seen = HashSet::new();
+        let pkgs = MavenCrawler::new().scan_maven_repo(dir.path(), &mut seen);
+        let purls: HashSet<_> = pkgs.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(
+            purls,
+            HashSet::from([
+                "pkg:maven/io.x/snap@1.0-SNAPSHOT",
+                "pkg:maven/org.acme.content/lib@1.0",
+            ]),
+            "{pkgs:?}"
+        );
     }
 
     #[test]
@@ -1609,5 +2163,245 @@ mod tests {
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], dir.path().to_path_buf());
+    }
+
+    // ── Equivalence with the serial scan (oracle) ────────────────────
+
+    mod equivalence {
+        use super::super::oracle::LegacyMavenCrawler;
+        use super::*;
+        use crate::crawlers::oracle_support::{
+            mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+        };
+
+        const GROUPS: &[&str] = &["org/apache/commons", "com/google/guava", "io/netty"];
+        const ARTIFACTS: &[&str] = &["commons-lang3", "guava", "netty-all", "dup"];
+        const VERSIONS: &[&str] = &["3.12.0", "31.1-jre", "4.1.100.Final", "1.0-SNAPSHOT"];
+
+        /// A POM for `group/artifact/version`. `consistent` never writes
+        /// one whose content names other coordinates than its directory.
+        fn pom(
+            rng: &mut Rng,
+            group: &str,
+            artifact: &str,
+            version: &str,
+            consistent: bool,
+        ) -> String {
+            let g = group.replace('/', ".");
+            match rng.below(6) {
+                2 if consistent => format!("<project><groupId>{g}</groupId><artifactId>{artifact}</artifactId><version>{version}</version></project>"),
+                0 => format!("<project><parent><groupId>{g}</groupId><artifactId>parent</artifactId><version>{version}</version></parent><artifactId>{artifact}</artifactId></project>"),
+                1 => "<project><!-- <groupId>x</groupId> --></project>".to_string(),
+                2 => "<project>\n<groupId>dup.group</groupId>\n<artifactId>dup</artifactId>\n<version>1.0</version>\n</project>".to_string(),
+                3 => "not xml at all".to_string(),
+                _ => format!("<project>\n  <groupId>{g}</groupId>\n  <artifactId>{artifact}</artifactId>\n  <version>{version}</version>\n  <dependencies><dependency><groupId>z</groupId></dependency></dependencies>\n</project>"),
+            }
+        }
+
+        fn repo(rng: &mut Rng, root: &Path, outside: &Path, perms: &mut PermGuard) {
+            repo_with(rng, root, outside, perms, false);
+        }
+
+        fn repo_with(
+            rng: &mut Rng,
+            root: &Path,
+            outside: &Path,
+            perms: &mut PermGuard,
+            consistent: bool,
+        ) {
+            mkdir(root);
+            for i in 0..rng.below(30) {
+                let (group, artifact, version) =
+                    (rng.pick(GROUPS), rng.pick(ARTIFACTS), rng.pick(VERSIONS));
+                let dir = root.join(group).join(artifact).join(version);
+                let file = dir.join(format!("{artifact}-{version}.pom"));
+                match rng.below(12) {
+                    0 => mkdir(&file),
+                    1 => write_bytes(&file, b"<project><groupId>\xff</groupId></project>"),
+                    2 => write(&dir.join(format!("{artifact}-{version}.jar")), "jar"),
+                    3 => {
+                        let target = outside.join(format!("t{i}"));
+                        write(
+                            &target.join("linked-1.0.pom"),
+                            &pom(rng, group, artifact, version, consistent),
+                        );
+                        symlink(&target, &dir.join("linked"));
+                        symlink(&target.join("linked-1.0.pom"), &dir.join("link.pom"));
+                    }
+                    4 => {
+                        write(&file, &pom(rng, group, artifact, version, consistent));
+                        perms.plan(&dir, 0o000);
+                    }
+                    5 => write(
+                        &dir.join("extra.pom"),
+                        &pom(rng, group, artifact, version, consistent),
+                    ),
+                    _ => write(&file, &pom(rng, group, artifact, version, consistent)),
+                }
+            }
+        }
+
+        /// Chunking the parallel parse changes nothing: the walk, the
+        /// parse and the dedup each stay in walk order, so every chunk
+        /// size — one POM at a time included — produces the serial
+        /// oracle's rows, with the first-seen version dir still winning
+        /// across a chunk boundary.
+        #[tokio::test]
+        async fn every_parse_chunk_size_matches_the_serial_oracle() {
+            let mut total = 0;
+            for seed in 0..16u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let old = LegacyMavenCrawler::crawl_all(&options).await;
+                for chunk in [0usize, 1, 2, 3, 7, 4096] {
+                    let mut seen = HashSet::new();
+                    let found = MavenCrawler.scan_maven_repo_chunked(&root, &mut seen, chunk);
+                    assert_eq!(rows(&found), rows(&old), "seed {seed}, chunk {chunk}");
+                }
+                total += old.len();
+            }
+            assert!(total > 50, "vacuous fixtures: {total}");
+        }
+
+        /// The no-walk-pool fallback (the OS refused even one walk thread,
+        /// so `run_walk` runs the walk on the calling blocking-pool thread)
+        /// scans exactly as the serial oracle does. A bare rayon iterator
+        /// here would instead build rayon's GLOBAL pool from that thread —
+        /// which needs the threads the OS just refused, and panics when it
+        /// cannot get them — where the serial scan simply finished.
+        #[tokio::test]
+        async fn no_pool_repos_match_the_serial_oracle() {
+            let _off = crate::crawlers::walk_pool::test_hooks::DisablePool::new();
+            let mut total = 0;
+            for seed in 0..16u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = MavenCrawler::new().crawl_all(&options).await;
+                let old = LegacyMavenCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "no pool, seed {seed}");
+                total += old.len();
+            }
+            assert!(total > 50, "vacuous fixtures: {total}");
+        }
+
+        /// MVN-1 changes nothing on a repository whose canonically placed
+        /// POMs agree with their directories — the shape Maven itself
+        /// writes: the path-first scan reports exactly what the scan that
+        /// read every POM reported, the parse and path-rescue arms
+        /// included (`extra.pom`, unreadable and non-UTF-8 files, parent-only
+        /// and comment-only POMs).
+        #[tokio::test]
+        async fn consistent_repos_match_the_content_first_scan() {
+            let mut total = 0;
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo_with(
+                    &mut rng,
+                    &root,
+                    &tmp.path().join("outside"),
+                    &mut perms,
+                    true,
+                );
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = MavenCrawler::new().crawl_all(&options).await;
+                let old = super::super::oracle::crawl_all_content_first(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                total += old.len();
+            }
+            assert!(total > 200, "vacuous fixtures: {total}");
+        }
+
+        /// The path-first step is only as right as the scan root: from a
+        /// root one level above the repository, or from inside it (a
+        /// top-level group dir, or two levels in), every path-derived group
+        /// would be wrong. [`LayoutTrust`] must notice and leave such a
+        /// scan exactly as the content-first scan had it — the parse and
+        /// path-rescue arms included.
+        #[tokio::test]
+        async fn misrooted_repos_match_the_content_first_scan() {
+            let mut total = 0;
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo_with(
+                    &mut rng,
+                    &root,
+                    &tmp.path().join("outside"),
+                    &mut perms,
+                    true,
+                );
+                perms.apply();
+                let mut misroots = vec![tmp.path().to_path_buf()];
+                misroots.extend(
+                    ["org", "com", "io", "org/apache", "com/google"]
+                        .iter()
+                        .map(|sub| root.join(sub))
+                        .filter(|dir| dir.is_dir()),
+                );
+                for misroot in misroots {
+                    let options = CrawlerOptions {
+                        cwd: tmp.path().to_path_buf(),
+                        global: false,
+                        global_prefix: Some(misroot.clone()),
+                    };
+                    let new = MavenCrawler::new().crawl_all(&options).await;
+                    let old = super::super::oracle::crawl_all_content_first(&options).await;
+                    assert_eq!(rows(&new), rows(&old), "seed {seed}, {}", misroot.display());
+                    total += old.len();
+                }
+            }
+            assert!(total > 400, "vacuous fixtures: {total}");
+        }
+
+        #[tokio::test]
+        async fn randomized_repos_match_the_serial_oracle() {
+            let mut total = 0;
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = MavenCrawler::new().crawl_all(&options).await;
+                let old = LegacyMavenCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                total += old.len();
+            }
+            assert!(total > 200, "vacuous fixtures: {total}");
+        }
     }
 }

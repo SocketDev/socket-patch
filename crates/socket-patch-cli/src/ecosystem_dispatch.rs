@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::args::GlobalArgs;
 
+use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
 use socket_patch_core::crawlers::ComposerCrawler;
 use socket_patch_core::crawlers::DenoCrawler;
@@ -243,11 +244,16 @@ fn passthrough_purls(purls: &[String]) -> Vec<String> {
 /// inserts the crawler-returned PURL with first-wins semantics. It is
 /// applied to the release-variant ecosystems (PyPI / RubyGems / Maven),
 /// which are also queried with deduped base PURLs.
+///
+/// `npm_roots`, when given, are the `node_modules` roots an earlier crawl of
+/// the same options and (untouched) tree walked — used instead of walking
+/// the tree for them again ([`NpmRootsCrawler`]).
 async fn dispatch_find(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
     variant_merge: MergeFn,
+    npm_roots: Option<&[PathBuf]>,
 ) -> HashMap<String, Vec<PathBuf>> {
     let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
@@ -257,7 +263,7 @@ async fn dispatch_find(
         eco = Ecosystem::Npm,
         options = options,
         silent = silent,
-        crawler = NpmCrawler,
+        crawler = NpmRootsCrawler { roots: npm_roots },
         get_paths = get_node_modules_paths,
         using_label = "global npm packages",
         err_label = "npm packages",
@@ -418,7 +424,7 @@ pub async fn find_all_packages_for_purls(
     // `merge_qualified`'s `push_path`. Single-copy ecosystems keep true
     // first-wins via their own `merge_first_wins` wiring in
     // `dispatch_find`.
-    dispatch_find(partitioned, options, silent, merge_variant_copies).await
+    dispatch_find(partitioned, options, silent, merge_variant_copies, None).await
 }
 
 /// Multi-copy variant of `find_packages_for_rollback` (qualified-aware
@@ -428,7 +434,7 @@ pub async fn find_all_packages_for_rollback(
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, Vec<PathBuf>> {
-    dispatch_find(partitioned, options, silent, merge_qualified).await
+    dispatch_find(partitioned, options, silent, merge_qualified, None).await
 }
 
 /// Qualified-aware PURL resolution for rollback, vendor, repair and
@@ -445,7 +451,87 @@ pub async fn find_packages_for_rollback(
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, PathBuf> {
-    collapse_to_first(find_all_packages_for_rollback(partitioned, options, silent).await)
+    find_packages_for_rollback_reusing(partitioned, options, silent, None).await
+}
+
+/// [`find_packages_for_rollback`], taking the npm `node_modules` roots from
+/// `prior` (a crawl of the same options earlier in this process, over a
+/// tree nothing has touched since) instead of walking the tree for them
+/// again. Only the root discovery is reused: each root is still searched
+/// by `find_by_purls`, so copy choice and order are unchanged. A snapshot
+/// taken with other options is ignored.
+pub async fn find_packages_for_rollback_reusing(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashMap<String, PathBuf> {
+    let npm_roots = prior
+        .filter(|p| p.taken_with(options))
+        .map(|p| p.roots.as_slice());
+    collapse_to_first(dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await)
+}
+
+/// The npm half of one [`crawl_ecosystems_with_npm`] run: the packages
+/// the npm crawler found (its whole output, in crawl order) and the
+/// `node_modules` roots it walked, with the options they were taken with.
+/// Handed from `scan`'s crawl to its vendor step so the vendor engine does
+/// not walk the same untouched tree again ([`npm_paths_by_identity_in`],
+/// [`find_packages_for_rollback_reusing`]).
+#[derive(Debug, Clone)]
+pub struct NpmCrawlSnapshot {
+    cwd: PathBuf,
+    global: bool,
+    global_prefix: Option<PathBuf>,
+    roots: Vec<PathBuf>,
+    packages: Vec<CrawledPackage>,
+}
+
+impl NpmCrawlSnapshot {
+    /// Whether this snapshot was crawled with exactly `options`.
+    fn taken_with(&self, options: &CrawlerOptions) -> bool {
+        // Destructured, not field-by-field: a new crawler option that
+        // changes what the crawler walks has to be answered here, and the
+        // compiler is what asks. Everything this snapshot stands in for
+        // was crawled with these options and nothing else.
+        let CrawlerOptions {
+            cwd,
+            global,
+            global_prefix,
+        } = options;
+        self.cwd == *cwd && self.global == *global && self.global_prefix == *global_prefix
+    }
+
+    /// The crawled npm packages, when crawled with exactly `options`.
+    pub(crate) fn packages_for(&self, options: &CrawlerOptions) -> Option<&[CrawledPackage]> {
+        self.taken_with(options).then_some(self.packages.as_slice())
+    }
+}
+
+/// [`NpmCrawler`] for [`dispatch_find`], answering its root discovery from
+/// an earlier crawl's roots when it has them.
+struct NpmRootsCrawler<'a> {
+    roots: Option<&'a [PathBuf]>,
+}
+
+impl NpmRootsCrawler<'_> {
+    async fn get_node_modules_paths(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        match self.roots {
+            Some(roots) => Ok(roots.to_vec()),
+            None => NpmCrawler.get_node_modules_paths(options).await,
+        }
+    }
+
+    async fn find_by_purls(
+        &self,
+        node_modules_path: &std::path::Path,
+        purls: &[String],
+    ) -> Result<HashMap<String, Vec<CrawledPackage>>, std::io::Error> {
+        NpmCrawler.find_by_purls(node_modules_path, purls).await
+    }
 }
 
 /// The installed copy of each npm purl in `purls`, found by its
@@ -463,11 +549,21 @@ pub(crate) async fn npm_paths_by_identity(
     options: &CrawlerOptions,
     purls: &[&String],
 ) -> HashMap<String, Vec<PathBuf>> {
-    let mut out = HashMap::new();
     if purls.is_empty() {
-        return out;
+        return HashMap::new();
     }
     let installed = NpmCrawler::new().crawl_all(options).await;
+    npm_paths_by_identity_in(&installed, purls)
+}
+
+/// [`npm_paths_by_identity`] over an npm crawl already in hand (the whole
+/// output of `NpmCrawler::crawl_all` for the same options, over a tree
+/// nothing has touched since) instead of crawling again.
+pub(crate) fn npm_paths_by_identity_in(
+    installed: &[CrawledPackage],
+    purls: &[&String],
+) -> HashMap<String, Vec<PathBuf>> {
+    let mut out = HashMap::new();
     for purl in purls {
         let want = canonical_purl(purl);
         let paths: Vec<PathBuf> = installed
@@ -521,6 +617,16 @@ pub async fn find_manifest_package_copies(
     find_all_packages_for_rollback(&partitioned, &crawler_options, quiet).await
 }
 
+/// Box the future `make` returns, constructing it inside this (non-async)
+/// frame so the caller's poll frame only ever holds the pointer.
+fn boxed<'a, T, F, Fut>(make: F) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T> + 'a,
+{
+    Box::pin(make())
+}
+
 /// Crawl all ecosystems and return all packages, per-ecosystem counts and
 /// the gem crawl's refused config-sourced `BUNDLE_PATH`
 /// (`BundleStoreDiscovery::skipped_config_path`, local mode only) —
@@ -533,31 +639,174 @@ pub async fn crawl_all_ecosystems(
     HashMap<Ecosystem, usize>,
     Option<String>,
 ) {
+    crawl_ecosystems(options, None).await
+}
+
+/// [`crawl_all_ecosystems`] over only the ecosystems `only` names
+/// (`--ecosystems` spellings; `None` crawls every one). A crawler that is
+/// not selected never runs: it contributes no packages and no `counts`
+/// entry. Each crawler reports only its own ecosystem's purls, so the
+/// selected ecosystems' packages, their order and their counts are exactly
+/// the full crawl's.
+pub async fn crawl_ecosystems(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+) {
+    let (packages, counts, skipped_config_path, _) = crawl_every_ecosystem(options, only).await;
+    (packages, counts, skipped_config_path)
+}
+
+/// [`crawl_all_ecosystems`], also handing back the npm half of the crawl as
+/// an [`NpmCrawlSnapshot`] (its packages are the leading `counts[Npm]`
+/// entries of the package list).
+#[cfg(test)]
+pub async fn crawl_all_ecosystems_with_npm(
+    options: &CrawlerOptions,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+    NpmCrawlSnapshot,
+) {
+    let (packages, counts, skipped_config_path, snapshot) =
+        crawl_ecosystems_with_npm(options, None).await;
+    let snapshot = snapshot.expect("a crawl of every ecosystem crawls npm");
+    (packages, counts, skipped_config_path, snapshot)
+}
+
+/// [`crawl_ecosystems`], also handing back the npm half of the crawl as an
+/// [`NpmCrawlSnapshot`] — `None` when `only` leaves npm out, so nothing
+/// mistakes the skipped crawl for an empty `node_modules`.
+pub async fn crawl_ecosystems_with_npm(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+    Option<NpmCrawlSnapshot>,
+) {
+    let (packages, counts, skipped_config_path, npm_roots) =
+        crawl_every_ecosystem(options, only).await;
+    let snapshot = counts
+        .get(&Ecosystem::Npm)
+        .map(|&npm_count| NpmCrawlSnapshot {
+            cwd: options.cwd.clone(),
+            global: options.global,
+            global_prefix: options.global_prefix.clone(),
+            roots: npm_roots,
+            packages: packages[..npm_count].to_vec(),
+        });
+    (packages, counts, skipped_config_path, snapshot)
+}
+
+/// Whether a crawl limited to `only` visits `eco` (`None`: every one).
+fn crawl_selects(only: Option<&[String]>, eco: Ecosystem) -> bool {
+    only.is_none_or(|list| list.iter().any(|name| name == eco.cli_name()))
+}
+
+/// The crawl behind the entry points above; the fourth element is the npm
+/// crawler's `node_modules` roots (empty when npm was not selected).
+async fn crawl_every_ecosystem(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+    Vec<PathBuf>,
+) {
+    // The nine crawlers are independent (none prints, none mutates shared
+    // state), so they run concurrently; their blocking walks and
+    // subprocesses sit on the blocking pool. Results are consumed in the
+    // fixed order below, so packages and counts are exactly the serial
+    // run's. Each future is heap-allocated through `boxed` (constructed
+    // in that helper's frame) so joining nine does not grow the caller's
+    // poll frame by their combined size. Under a tight descriptor limit
+    // they run one at a time instead, keeping the serial run's descriptor
+    // profile (see `walk_pool`): a crawler treats a failed open as an
+    // absent dir, so extra concurrent descriptors could silently drop
+    // packages there. A crawler `only` leaves out resolves to its empty
+    // result without running.
+    macro_rules! crawl {
+        ($eco:expr, $crawl:expr) => {
+            boxed(move || async move {
+                if crawl_selects(only, $eco) {
+                    Some($crawl.await)
+                } else {
+                    None
+                }
+            })
+        };
+    }
+    let (npm, pypi, cargo, gems, golang, maven, composer, nuget, deno) =
+        if walk_pool::fd_limit_is_tight() {
+            (
+                crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)).await,
+                crawl!(Ecosystem::Pypi, PythonCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)).await,
+                crawl!(
+                    Ecosystem::Gem,
+                    RubyCrawler.crawl_all_with_discovery(options)
+                )
+                .await,
+                crawl!(Ecosystem::Golang, GoCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Maven, MavenCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Composer, ComposerCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Nuget, NuGetCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Deno, DenoCrawler.crawl_all(options)).await,
+            )
+        } else {
+            tokio::join!(
+                crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)),
+                crawl!(Ecosystem::Pypi, PythonCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)),
+                crawl!(
+                    Ecosystem::Gem,
+                    RubyCrawler.crawl_all_with_discovery(options)
+                ),
+                crawl!(Ecosystem::Golang, GoCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Maven, MavenCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Composer, ComposerCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Nuget, NuGetCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Deno, DenoCrawler.crawl_all(options)),
+            )
+        };
+    let (npm, npm_roots) = match npm {
+        Some((packages, roots)) => (Some(packages), roots),
+        None => (None, Vec::new()),
+    };
+    let (gems, gem_discovery) = match gems {
+        Some((packages, discovery)) => (Some(packages), discovery),
+        None => (None, None),
+    };
+
     let mut all_packages = Vec::new();
     let mut counts: HashMap<Ecosystem, usize> = HashMap::new();
-
-    macro_rules! crawl {
-        ($eco:expr, $crawler:expr) => {{
-            let pkgs = $crawler.crawl_all(options).await;
-            counts.insert($eco, pkgs.len());
-            all_packages.extend(pkgs);
-        }};
+    for (eco, pkgs) in [
+        (Ecosystem::Npm, npm),
+        (Ecosystem::Pypi, pypi),
+        (Ecosystem::Cargo, cargo),
+        (Ecosystem::Gem, gems),
+        (Ecosystem::Golang, golang),
+        (Ecosystem::Maven, maven),
+        (Ecosystem::Composer, composer),
+        (Ecosystem::Nuget, nuget),
+        (Ecosystem::Deno, deno),
+    ] {
+        let Some(pkgs) = pkgs else {
+            continue;
+        };
+        counts.insert(eco, pkgs.len());
+        all_packages.extend(pkgs);
     }
 
-    crawl!(Ecosystem::Npm, NpmCrawler);
-    crawl!(Ecosystem::Pypi, PythonCrawler);
-    crawl!(Ecosystem::Cargo, CargoCrawler);
-    let (gems, gem_discovery) = RubyCrawler.crawl_all_with_discovery(options).await;
-    counts.insert(Ecosystem::Gem, gems.len());
-    all_packages.extend(gems);
-    crawl!(Ecosystem::Golang, GoCrawler);
-    crawl!(Ecosystem::Maven, MavenCrawler);
-    crawl!(Ecosystem::Composer, ComposerCrawler);
-    crawl!(Ecosystem::Nuget, NuGetCrawler);
-    crawl!(Ecosystem::Deno, DenoCrawler);
-
     let skipped_config_path = gem_discovery.and_then(|d| d.skipped_config_path);
-    (all_packages, counts, skipped_config_path)
+    (all_packages, counts, skipped_config_path, npm_roots)
 }
 
 #[cfg(test)]
@@ -1335,6 +1584,321 @@ mod tests {
                 "{eco:?} must be crawled unconditionally — no runtime gates"
             );
         }
+    }
+
+    /// The vendor engine's reuse of scan's npm crawl is an oracle-equal
+    /// substitute: over one tree (a hoisted dep, a nested duplicate, an
+    /// alias install, a workspace member's own `node_modules`), the
+    /// snapshot's roots and packages equal what the engine's own discovery
+    /// and identity crawl find, and both lookups built on it answer
+    /// exactly as the crawling ones do. A snapshot taken with other
+    /// options is never used.
+    #[tokio::test]
+    async fn npm_crawl_snapshot_matches_the_crawls_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |dir: &std::path::Path, name: &str, version: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            )
+            .unwrap();
+        };
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","version":"1.0.0","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        write(&root.join("node_modules/foo"), "foo", "1.0.0");
+        write(&root.join("node_modules/bar"), "bar", "2.0.0");
+        write(
+            &root.join("node_modules/bar/node_modules/foo"),
+            "foo",
+            "0.9.0",
+        );
+        write(&root.join("node_modules/@s/qux"), "@s/qux", "4.0.0");
+        // `"lp": "npm:left-pad@1.3.0"` installs under the alias key.
+        write(&root.join("node_modules/lp"), "left-pad", "1.3.0");
+        write(&root.join("packages/app"), "app", "0.1.0");
+        write(&root.join("packages/app/node_modules/baz"), "baz", "3.0.0");
+        write(&root.join("packages/app/node_modules/foo"), "foo", "0.9.0");
+        let options = local_options(root.to_path_buf());
+
+        let (packages, counts, _, snapshot) = crawl_all_ecosystems_with_npm(&options).await;
+        let npm_count = counts[&Ecosystem::Npm];
+        let pairs = |pkgs: &[CrawledPackage]| -> Vec<(String, PathBuf)> {
+            pkgs.iter()
+                .map(|p| (p.purl.clone(), p.path.clone()))
+                .collect()
+        };
+        assert_eq!(
+            snapshot.roots,
+            NpmCrawler.get_node_modules_paths(&options).await.unwrap()
+        );
+        assert_eq!(
+            pairs(snapshot.packages_for(&options).unwrap()),
+            pairs(&NpmCrawler.crawl_all(&options).await)
+        );
+        assert_eq!(pairs(&snapshot.packages), pairs(&packages[..npm_count]));
+        assert!(snapshot.roots.len() >= 2, "roots={:?}", snapshot.roots);
+
+        let purls: Vec<String> = [
+            "pkg:npm/foo@1.0.0",
+            "pkg:npm/foo@0.9.0",
+            "pkg:npm/bar@2.0.0",
+            "pkg:npm/baz@3.0.0",
+            "pkg:npm/%40s/qux@4.0.0",
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:npm/absent@9.9.9",
+        ]
+        .map(String::from)
+        .to_vec();
+        let partitioned = partition_purls(&purls, None);
+        let crawled = find_packages_for_rollback(&partitioned, &options, true).await;
+        let reused =
+            find_packages_for_rollback_reusing(&partitioned, &options, true, Some(&snapshot)).await;
+        assert_eq!(reused, crawled);
+        assert!(crawled.contains_key("pkg:npm/baz@3.0.0"), "{crawled:?}");
+
+        let missing: Vec<&String> = purls.iter().filter(|p| !crawled.contains_key(*p)).collect();
+        assert!(
+            missing.iter().any(|p| p.contains("left-pad")),
+            "{missing:?}"
+        );
+        let by_crawl = npm_paths_by_identity(&options, &missing).await;
+        let by_snapshot =
+            npm_paths_by_identity_in(snapshot.packages_for(&options).unwrap(), &missing);
+        assert_eq!(by_snapshot, by_crawl);
+        assert_eq!(
+            by_crawl.get("pkg:npm/left-pad@1.3.0"),
+            Some(&vec![root.join("node_modules/lp")])
+        );
+
+        let elsewhere = local_options(root.join("packages/app"));
+        assert!(snapshot.packages_for(&elsewhere).is_none());
+        let app_purls = vec!["pkg:npm/foo@1.0.0".to_string()];
+        let app_partitioned = partition_purls(&app_purls, None);
+        assert_eq!(
+            find_packages_for_rollback_reusing(&app_partitioned, &elsewhere, true, Some(&snapshot))
+                .await,
+            find_packages_for_rollback(&app_partitioned, &elsewhere, true).await,
+            "a snapshot of another root must not answer for this one"
+        );
+    }
+
+    /// Stage one installed package for EVERY ecosystem under `root`, the
+    /// dir handed to all nine crawlers verbatim as `--global-prefix`. Each
+    /// layout is the one that crawler's own global-prefix tests use, and
+    /// they do not collide: a cargo crate dir has no `lib/` (so it is no
+    /// gem), a gem dir has no `Cargo.toml`, a NuGet id dir carries its
+    /// version as a child rather than a `-` suffix, and the jsr scope dir
+    /// holds no package.json.
+    fn stage_every_ecosystem(root: &std::path::Path) {
+        let dir = |path: PathBuf| std::fs::create_dir_all(path).unwrap();
+        let file = |path: PathBuf, body: String| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+
+        // npm: <root>/<name>/package.json
+        for (name, version) in [("zeta", "1.0.0"), ("alpha", "2.0.0"), ("mid", "3.0.0")] {
+            file(
+                root.join(name).join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            );
+        }
+        // pypi: <root>/<name>-<version>.dist-info/METADATA
+        for (name, version) in [("requests", "2.31.0"), ("attrs", "23.1.0")] {
+            file(
+                root.join(format!("{name}-{version}.dist-info"))
+                    .join("METADATA"),
+                format!("Name: {name}\nVersion: {version}\n"),
+            );
+        }
+        // cargo: <root>/<name>-<version>/Cargo.toml
+        for (name, version) in [("serde", "1.0.0"), ("anyhow", "1.0.75")] {
+            file(
+                root.join(format!("{name}-{version}")).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            );
+        }
+        // gem: <root>/<name>-<version>/ verified by a .gemspec (a `lib/`
+        // would also make NuGet's legacy `<Name>.<Version>` reading of the
+        // same dir stick).
+        file(
+            root.join("rgem-2.0.0").join("rgem.gemspec"),
+            "Gem::Specification.new\n".to_string(),
+        );
+        // golang: <root>/<host>/<path>@<version>/
+        dir(root.join("example.com").join("gomod@v1.2.3"));
+        // maven: <root>/<group path>/<artifact>/<version>/<artifact>-<version>.pom
+        file(
+            root.join("org")
+                .join("example")
+                .join("mlib")
+                .join("4.0.0")
+                .join("mlib-4.0.0.pom"),
+            "<project><groupId>org.example</groupId>\
+             <artifactId>mlib</artifactId><version>4.0.0</version></project>"
+                .to_string(),
+        );
+        // composer: the prefix IS the vendor dir — its metadata plus the
+        // install dir, which crawl_all requires to exist.
+        dir(root.join("acme").join("phplib"));
+        file(
+            root.join("composer").join("installed.json"),
+            serde_json::json!({"packages": [{"name": "acme/phplib", "version": "3.0.0"}]})
+                .to_string(),
+        );
+        // nuget: <root>/<id>/<version>/ verified by a lib/
+        dir(root.join("nugetlib").join("5.0.0").join("lib"));
+        // deno (jsr): <root>/@<scope>/<name>/<version>/
+        dir(root.join("@denoscope").join("jsrlib").join("6.0.0"));
+    }
+
+    /// A crawl scoped to some ecosystems runs only their crawlers — a
+    /// skipped one leaves no `counts` entry, the pin that it never ran —
+    /// and yields exactly the full crawl's packages of those ecosystems,
+    /// in the full crawl's order, with the full crawl's counts. Scoped to
+    /// every ecosystem (or `None`) it IS the full crawl. The npm snapshot
+    /// exists exactly when npm was crawled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scoped_crawl_is_the_full_crawl_filtered_to_its_ecosystems() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_every_ecosystem(root);
+        let options = CrawlerOptions {
+            cwd: root.to_path_buf(),
+            global: false,
+            global_prefix: Some(root.to_path_buf()),
+        };
+        let key = |p: &CrawledPackage| (p.purl.clone(), p.path.clone());
+        let (full, full_counts, _, full_snapshot) = crawl_all_ecosystems_with_npm(&options).await;
+        assert_eq!(full_counts.len(), Ecosystem::all().len());
+
+        let every: Vec<String> = Ecosystem::all()
+            .iter()
+            .map(|e| e.cli_name().to_string())
+            .collect();
+        let mut scopes: Vec<Vec<String>> = every.iter().map(|e| vec![e.clone()]).collect();
+        scopes.push(vec!["maven".into(), "npm".into()]);
+        scopes.push(vec!["pypi".into(), "deno".into(), "gem".into()]);
+        scopes.push(every.clone());
+        for scope in &scopes {
+            let selected = |eco: &Ecosystem| scope.iter().any(|name| name == eco.cli_name());
+            let (packages, counts, _, snapshot) =
+                crawl_ecosystems_with_npm(&options, Some(scope)).await;
+            let expected: Vec<_> = full
+                .iter()
+                .filter(|p| Ecosystem::from_purl(&p.purl).is_some_and(|e| selected(&e)))
+                .map(key)
+                .collect();
+            assert_eq!(
+                packages.iter().map(key).collect::<Vec<_>>(),
+                expected,
+                "{scope:?}"
+            );
+            let expected_counts: HashMap<Ecosystem, usize> = full_counts
+                .iter()
+                .filter(|(eco, _)| selected(eco))
+                .map(|(eco, n)| (*eco, *n))
+                .collect();
+            assert_eq!(counts, expected_counts, "{scope:?}");
+            assert_eq!(
+                snapshot.is_some(),
+                scope.iter().any(|name| name == "npm"),
+                "{scope:?}"
+            );
+            if let Some(snapshot) = snapshot {
+                assert_eq!(snapshot.roots, full_snapshot.roots, "{scope:?}");
+                assert_eq!(
+                    snapshot.packages.iter().map(key).collect::<Vec<_>>(),
+                    full_snapshot.packages.iter().map(key).collect::<Vec<_>>(),
+                    "{scope:?}"
+                );
+            }
+        }
+
+        let (unscoped, unscoped_counts, _) = crawl_ecosystems(&options, None).await;
+        assert_eq!(
+            unscoped.iter().map(key).collect::<Vec<_>>(),
+            full.iter().map(key).collect::<Vec<_>>()
+        );
+        assert_eq!(unscoped_counts, full_counts);
+    }
+
+    /// The concurrent crawl must yield exactly the serial run's packages,
+    /// in the fixed ecosystem order, with the same counts. A
+    /// `--global-prefix` root is handed to every crawler verbatim, so one
+    /// polyglot dir exercises every ecosystem at once — and it has to:
+    /// an ecosystem that finds nothing contributes nothing to the
+    /// concatenation, so its POSITION in the consumption array is
+    /// unobservable and a reordering would ship silently. That order is
+    /// shipped behavior: `scan` chunks the crawl-ordered purls into
+    /// batches, so it decides batch composition, the `batch N/M failed`
+    /// warning text and order, and `last_batch_error`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crawl_all_ecosystems_matches_serial_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_every_ecosystem(root);
+        let options = CrawlerOptions {
+            cwd: root.to_path_buf(),
+            global: false,
+            global_prefix: Some(root.to_path_buf()),
+        };
+
+        let (packages, counts, _) = crawl_all_ecosystems(&options).await;
+
+        let mut serial: Vec<CrawledPackage> = Vec::new();
+        let mut serial_counts: HashMap<Ecosystem, usize> = HashMap::new();
+        macro_rules! serial {
+            ($eco:expr, $pkgs:expr) => {{
+                let pkgs = $pkgs;
+                serial_counts.insert($eco, pkgs.len());
+                serial.extend(pkgs);
+            }};
+        }
+        serial!(Ecosystem::Npm, NpmCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Pypi, PythonCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Cargo, CargoCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Gem, RubyCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Golang, GoCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Maven, MavenCrawler.crawl_all(&options).await);
+        serial!(
+            Ecosystem::Composer,
+            ComposerCrawler.crawl_all(&options).await
+        );
+        serial!(Ecosystem::Nuget, NuGetCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Deno, DenoCrawler.crawl_all(&options).await);
+
+        let key = |p: &CrawledPackage| (p.purl.clone(), p.path.clone());
+        assert_eq!(
+            packages.iter().map(key).collect::<Vec<_>>(),
+            serial.iter().map(key).collect::<Vec<_>>()
+        );
+        assert_eq!(counts, serial_counts);
+        // Non-vacuous for EVERY ecosystem, or the ones that found nothing
+        // are pinned only by this test's own copy of the order.
+        for eco in [
+            Ecosystem::Npm,
+            Ecosystem::Pypi,
+            Ecosystem::Cargo,
+            Ecosystem::Gem,
+            Ecosystem::Golang,
+            Ecosystem::Maven,
+            Ecosystem::Composer,
+            Ecosystem::Nuget,
+            Ecosystem::Deno,
+        ] {
+            assert!(
+                counts.get(&eco).is_some_and(|&n| n >= 1),
+                "{eco:?} found nothing — its position is unobservable: {counts:?}"
+            );
+        }
+        assert!(counts[&Ecosystem::Npm] >= 3, "{counts:?}");
+        assert!(counts[&Ecosystem::Pypi] >= 2, "{counts:?}");
     }
 
     /// Deno is the ONE dispatch branch no other test drives end-to-end

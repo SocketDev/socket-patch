@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
+[features]
+# Compiles the crash-injection failpoints (`utils::failpoint`) into builds
+# without debug assertions too. Debug builds always have them; this exists
+# so the crash-safety e2e suites also run against the optimized binary the
+# `test-release` CI job builds — the CLI enables it from its
+# [dev-dependencies] only, so a `cargo build --release` / `cargo install`
+# binary never carries it.
+failpoints = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -15,6 +24,7 @@ sha1 = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 thiserror = { workspace = true }
 walkdir = { workspace = true }
 uuid = { workspace = true }
@@ -22,6 +32,7 @@ regex = { workspace = true }
 toml_edit = { workspace = true }
 once_cell = { workspace = true }
 qbsdiff = { workspace = true }
+rayon = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 fs2 = { workspace = true }
@@ -39,6 +50,18 @@ libc = { workspace = true }
 # do ourselves (mode-preserving, setuid-refusing — see update/swap.rs).
 [target.'cfg(windows)'.dependencies]
 self-replace = { workspace = true }
+
+# sha2 0.10 compiles its aarch64 SHA-256 hardware path only under the `asm`
+# feature (x86/x86_64 already select SHA-NI at runtime without it); the
+# soft fallback is 3-5x slower on every git-sha256 in apply, verify and
+# vendor. The digests are identical. The hardware path is sha2's own
+# in-crate intrinsics (runtime-detected, soft fallback on CPUs without the
+# crypto extension); the feature also builds and links sha2-asm, which
+# aarch64 never calls — sha2 0.11 needs neither the feature nor a C
+# toolchain for it. Windows-on-ARM is left on the soft path: sha2-asm's
+# GNU-syntax assembly does not assemble under the MSVC toolchain.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
 
 # All ecosystems (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
 # Deno) are unconditionally compiled in AND enabled at runtime — there are

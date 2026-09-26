@@ -45,6 +45,7 @@
 //! the wired config pointing at nothing.)
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -55,18 +56,30 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
+// The two package-root paths the NuGet sidecar fixup reads while the apply
+// runs over the stage: it deletes the first and reports an advisory when a
+// file matching the second sits beside it. A local rebuild that keeps the
+// package's parts in memory materialises both, so the fixup sees the same
+// package root a full extraction would have given it. (Neither normally rides
+// INSIDE a `.nupkg` — they are install-dir bookkeeping — but a crafted package
+// can carry them, and the staging decision must not turn on that.)
+use crate::patch::sidecars::nuget::{
+    METADATA_FILE as SIDECAR_METADATA_PART,
+    SIGNATURE_MARKER_SUFFIX as SIDECAR_SIGNATURE_MARKER_SUFFIX,
+};
 use crate::utils::fs::{
-    atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries,
+    atomic_write_artifact, atomic_write_bytes_preserving_mode, list_dir_entries,
     read_regular_to_bytes, read_regular_to_string,
 };
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, any_live_file_references, done, failed_result,
+    already_patched_result, any_live_file_references, done, failed_result, prepare_memory_repack,
     prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
-    zip_bytes_match_after_hashes,
+    write_zip_entries, zip_bytes_match_after_hashes, MemoryRepack, Stage,
 };
+use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{service_archive_copy, ServiceCopy};
@@ -375,6 +388,7 @@ pub async fn vendor_nuget(
                 let new_hash = content_hash(&bytes);
                 match edit_lock(text, name, &version_norm, &new_hash) {
                     Ok(Some(edit)) => {
+                        LOCK_VALUE_MEMO.invalidate();
                         if let Err(e) =
                             atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes())
                                 .await
@@ -500,6 +514,7 @@ pub async fn vendor_nuget(
     if let Some(text) = &lock_text {
         match edit_lock(text, name, &version_norm, &new_hash) {
             Ok(Some(edit)) => {
+                LOCK_VALUE_MEMO.invalidate();
                 if let Err(e) =
                     atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes()).await
                 {
@@ -824,12 +839,14 @@ async fn materialise_patched_nupkg(
     }
 }
 
-/// Local rebuild: locate the cached pristine `.nupkg` in `installed_dir`,
-/// extract it to a private stage, force-apply the patch, and re-zip
-/// deterministically. The `.signature.p7s` part is dropped (see the module
-/// doc). Returns `(bytes, ApplyResult)`; a failure surfaces as an un-successful
-/// `ApplyResult` (partial uuid dir cleaned up — unless `config_wired`, see
-/// [`materialise_patched_nupkg`]), or a refusal to bubble.
+/// Local rebuild: locate the cached pristine `.nupkg` in `installed_dir`, read
+/// it for a private stage — only the paths the apply pipeline and the sidecar
+/// fixup resolve are materialised there, see [`prepare_memory_repack`] —
+/// force-apply the patch, and re-zip deterministically. The `.signature.p7s`
+/// part is dropped (see the module doc). Returns `(bytes, ApplyResult)`; a
+/// failure surfaces as an un-successful `ApplyResult` (partial uuid dir cleaned
+/// up — unless `config_wired`, see [`materialise_patched_nupkg`]), or a refusal
+/// to bubble.
 #[allow(clippy::too_many_arguments)]
 async fn local_rebuild(
     purl: &str,
@@ -867,7 +884,7 @@ async fn local_rebuild(
             ));
         }
     };
-    let stage = match tempfile::tempdir() {
+    let stage = match Stage::new() {
         Ok(dir) => dir,
         Err(e) => {
             return Ok((
@@ -876,9 +893,36 @@ async fn local_rebuild(
             ));
         }
     };
-    // The nupkg carries content at the archive root (no strip). extract_zip is
-    // traversal-guarded and refuses an escaping entry fail-closed.
-    if let Err(e) = extract_zip(&bytes, stage.path(), /*strip_first=*/ false) {
+    // The nupkg carries content at the archive root (no strip). Both staging
+    // paths are traversal-guarded and refuse an escaping entry fail-closed
+    // with the same message: `prepare_memory_repack` keeps the parts in
+    // memory and materialises only what the apply pipeline resolves, while a
+    // package whose part names a filesystem could fold together or re-spell
+    // is extracted whole, the shape the in-memory repack is defined against.
+    // The sidecar fixup deletes `.nupkg.metadata` and looks beside it for a
+    // `*.nupkg.sha512` marker, so both have to be on disk for it to see
+    // exactly what a full extraction would have shown it.
+    let mut repack = match prepare_memory_repack(&bytes, &record.files, &[SIDECAR_METADATA_PART])
+        .map_err(|e| format!("cannot extract {}: {e}", src_nupkg.display()))
+    {
+        Ok(repack) => repack,
+        Err(e) => return Ok((Vec::new(), failed_result(purl, nupkg_path, e))),
+    };
+    let staged = match repack.as_mut() {
+        Some(repack) => {
+            let markers: Vec<String> = repack
+                .member_names()
+                .filter(|n| !n.contains('/') && n.ends_with(SIDECAR_SIGNATURE_MARKER_SUFFIX))
+                .map(str::to_string)
+                .collect();
+            for marker in &markers {
+                repack.also_stage(marker);
+            }
+            repack.stage_into(stage.path()).await
+        }
+        None => extract_zip(&bytes, stage.path(), /*strip_first=*/ false),
+    };
+    if let Err(e) = staged {
         return Ok((
             Vec::new(),
             failed_result(
@@ -888,6 +932,9 @@ async fn local_rebuild(
             ),
         ));
     }
+    // The compressed package has been read out; the in-memory repack holds
+    // the parts it needs, so don't carry a second copy through the apply.
+    drop(bytes);
 
     let result = super::force_apply_staged(
         purl,
@@ -902,29 +949,15 @@ async fn local_rebuild(
     )
     .await;
     if !result.success {
+        stage.dispose().await;
         return Ok((Vec::new(), result));
     }
 
-    // Deterministic re-zip of the patched stage (RECORD-free — a nupkg is a
-    // plain OPC zip; NuGet reads the central directory, so entry order is free
-    // to be lexicographic for stable bytes across re-runs).
-    let stage_path = stage.path().to_path_buf();
-    let rezip =
-        tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, Some(SIGNATURE_PART))).await;
-    let nupkg_bytes = match rezip {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            return Ok((
-                Vec::new(),
-                failed_result(purl, nupkg_path, format!("nupkg re-zip failed: {e}")),
-            ));
-        }
-        Err(e) => {
-            return Ok((
-                Vec::new(),
-                failed_result(purl, nupkg_path, format!("nupkg re-zip task failed: {e}")),
-            ));
-        }
+    let rebuilt = rebuild_nupkg_bytes(repack, stage.path()).await;
+    stage.dispose().await;
+    let nupkg_bytes = match rebuilt {
+        Ok(bytes) => bytes,
+        Err(e) => return Ok((Vec::new(), failed_result(purl, nupkg_path, e))),
     };
 
     if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &nupkg_bytes).await {
@@ -940,12 +973,42 @@ async fn local_rebuild(
     Ok((nupkg_bytes, result))
 }
 
+/// Deterministic re-zip of the patched stage (RECORD-free — a nupkg is a plain
+/// OPC zip; NuGet reads the central directory, so entry order is free to be
+/// lexicographic for stable bytes across re-runs). The in-memory repack
+/// assembles the same entry list from the parts it never wrote out; a package
+/// that had to be extracted is walked as before.
+async fn rebuild_nupkg_bytes(
+    repack: Option<MemoryRepack>,
+    stage: &Path,
+) -> Result<Vec<u8>, String> {
+    let rezip = match repack {
+        Some(repack) => {
+            let entries = repack
+                .into_entries(stage, Some(SIGNATURE_PART))
+                .await
+                .map_err(|e| format!("nupkg re-zip failed: {e}"))?;
+            tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await
+        }
+        None => {
+            let stage_path = stage.to_path_buf();
+            tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, Some(SIGNATURE_PART)))
+                .await
+        }
+    };
+    match rezip {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(format!("nupkg re-zip failed: {e}")),
+        Err(e) => Err(format!("nupkg re-zip task failed: {e}")),
+    }
+}
+
 /// Write `bytes` to `nupkg_path`, creating the uuid dir. Errors are strings.
 async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result<(), String> {
     tokio::fs::create_dir_all(uuid_dir)
         .await
         .map_err(|e| format!("cannot create {}: {e}", uuid_dir.display()))?;
-    atomic_write_bytes(nupkg_path, bytes)
+    atomic_write_artifact(nupkg_path, bytes)
         .await
         .map_err(|e| format!("cannot write {}: {e}", nupkg_path.display()))
 }
@@ -984,7 +1047,9 @@ struct ConfigEdit {
 async fn existing_config_path(project_root: &Path) -> Option<PathBuf> {
     for name in ["nuget.config", "NuGet.Config"] {
         let p = project_root.join(name);
-        if tokio::fs::metadata(&p).await.is_ok() {
+        // Answers from a group-committed run's capture: a config an earlier
+        // package of this run created is not on disk yet.
+        if crate::utils::fs::file_exists(&p).await {
             return Some(p);
         }
     }
@@ -1299,7 +1364,7 @@ async fn revert_config_record(
                     .map_err(|e| format!("failed to restore {}: {e}", config_path.display()))?;
             }
             // Created by us → delete the file.
-            _ => match tokio::fs::remove_file(&config_path).await {
+            _ => match crate::utils::fs::remove_file(&config_path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("failed to remove {}: {e}", config_path.display())),
@@ -1358,6 +1423,19 @@ struct LockEdit {
     original_hash: String,
 }
 
+/// The run's `packages.lock.json` parse. Each patched package asks the lock
+/// the same two questions — is it already pinned at our bytes, and what
+/// does it pin today — and an idempotent re-run asks them of bytes nothing
+/// has changed; see [`ParseMemo`]. Both readers below are pure functions of
+/// the text (the rewrite itself is string surgery on the old hash value).
+static LOCK_VALUE_MEMO: ParseMemo<Value> = ParseMemo::new();
+
+/// [`PACKAGES_LOCK`] as JSON, reusing the run's parse while `text` is the
+/// text it came from.
+fn lock_value(text: &str) -> Result<Arc<Value>, serde_json::Error> {
+    LOCK_VALUE_MEMO.parse(text.as_bytes(), || serde_json::from_str::<Value>(text))
+}
+
 /// Rewrite `contentHash` to `new_hash` for every framework entry of `id`
 /// (case-insensitive) whose `resolved` equals `version_norm`. Returns
 /// `Ok(Some(edit))` when a rewrite happened, `Ok(None)` when the lock has no
@@ -1372,8 +1450,7 @@ fn edit_lock(
     version_norm: &str,
     new_hash: &str,
 ) -> Result<Option<LockEdit>, String> {
-    let value: Value =
-        serde_json::from_str(text).map_err(|e| format!("unparseable {PACKAGES_LOCK}: {e}"))?;
+    let value = lock_value(text).map_err(|e| format!("unparseable {PACKAGES_LOCK}: {e}"))?;
     // Collect the original hash of every matching (framework, id) entry.
     let mut old_hash: Option<String> = None;
     for h in locked_at(&value, id, version_norm).filter_map(|e| e.content_hash) {
@@ -1412,7 +1489,7 @@ fn edit_lock(
 /// True when the lock already pins `id` at `expected_hash` for the matching
 /// resolved version (the hot-path in-sync check).
 fn lock_pinned(text: &str, id: &str, version_norm: &str, expected_hash: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
+    let Ok(value) = lock_value(text) else {
         return false;
     };
     let mut matched = false;
@@ -1454,6 +1531,7 @@ async fn revert_lock_record(
         return Ok(true);
     }
     let restored = text.replace(&ours_q, &format!("\"{orig}\""));
+    LOCK_VALUE_MEMO.invalidate();
     atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
         .await
         .map_err(|e| format!("failed to restore {}: {e}", lock_path.display()))?;
@@ -1468,7 +1546,7 @@ async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &
             let _ = atomic_write_bytes_preserving_mode(config_target, orig.as_bytes()).await;
         }
         None => {
-            let _ = tokio::fs::remove_file(config_target).await;
+            let _ = crate::utils::fs::remove_file(config_target).await;
         }
     }
     let _ = remove_tree(uuid_dir).await;
@@ -1924,6 +2002,44 @@ mod tests {
         zw.finish().unwrap().into_inner()
     }
 
+    /// A nupkg carrying every spelling the in-memory repack and the
+    /// extract-to-disk rebuild could disagree on: a zero-length part, a
+    /// STORED part, an exec-bit part, a nested tree, a part large enough to
+    /// span several read buffers, the signature part the rebuild drops, and
+    /// the two package-root paths the sidecar fixup reads.
+    fn make_rich_nupkg(license: &[u8]) -> Vec<u8> {
+        use zip::CompressionMethod::{Deflated, Stored};
+        let big = vec![b'z'; 3 * 1024 * 1024];
+        let entries: &[(&str, &[u8], zip::CompressionMethod, u32)] = &[
+            ("[Content_Types].xml", b"<?xml version=\"1.0\"?><Types/>", Deflated, 0o644),
+            ("_rels/.rels", b"<?xml version=\"1.0\"?><Relationships/>", Deflated, 0o644),
+            (
+                "Newtonsoft.Json.nuspec",
+                b"<?xml version=\"1.0\"?><package><metadata><id>Newtonsoft.Json</id><version>13.0.3</version></metadata></package>",
+                Deflated,
+                0o644,
+            ),
+            (".signature.p7s", b"FAKE-SIGNATURE-BYTES", Deflated, 0o644),
+            (".nupkg.metadata", b"{\"contentHash\":\"stale\"}", Deflated, 0o644),
+            ("newtonsoft.json.13.0.3.nupkg.sha512", b"marker", Deflated, 0o644),
+            ("lib/net6.0/Newtonsoft.Json.dll", b"MZ-fake-assembly", Deflated, 0o644),
+            ("lib/net6.0/empty.xml", b"", Deflated, 0o644),
+            ("lib/net6.0/stored.bin", b"stored bytes", Stored, 0o644),
+            ("tools/run.sh", b"#!/bin/sh\nexit 0\n", Deflated, 0o755),
+            ("lib/net6.0/big.bin", &big, Deflated, 0o644),
+            ("LICENSE.md", license, Deflated, 0o644),
+        ];
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, method, mode) in entries {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(*method)
+                .unix_permissions(*mode);
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
     async fn fixture(
         with_lock: bool,
         with_config: Option<&str>,
@@ -2044,6 +2160,75 @@ mod tests {
             None,
         )
         .await
+    }
+
+    /// X10 equivalence: keeping the package's parts in memory must rebuild
+    /// the EXACT bytes the extract-to-disk rebuild produced — the lock's
+    /// `contentHash` pin rides on them. Driven twice over one fixture, once
+    /// with the in-memory repack forced off. The fixture also exercises the
+    /// two paths the sidecar fixup reads: `.nupkg.metadata` (deleted, so it
+    /// must drop out of the rebuild) and the `*.nupkg.sha512` marker (which
+    /// must still raise the signed-package advisory).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn in_memory_nupkg_rebuild_matches_the_on_disk_rebuild_byte_for_byte() {
+        async fn rebuild(on_disk: bool) -> (Vec<u8>, ApplyResult) {
+            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let before = crate::vendor::common::in_memory_repacks();
+            let (dir, blobs, installed, record) = fixture(true, None).await;
+            tokio::fs::write(
+                installed.join("newtonsoft.json.13.0.3.nupkg"),
+                make_rich_nupkg(PRISTINE),
+            )
+            .await
+            .unwrap();
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(entry.is_some(), "a successful rebuild records an entry");
+            // Without this the comparison is vacuous: a fixture part name the
+            // gate later rejects would send BOTH runs to disk and the test
+            // would keep passing while asserting nothing.
+            assert_eq!(
+                crate::vendor::common::in_memory_repacks() > before,
+                !on_disk,
+                "this run took the wrong staging path (on_disk={on_disk})"
+            );
+            let bytes = tokio::fs::read(dir.path().join(copy_rel())).await.unwrap();
+            (bytes, result)
+        }
+
+        let (fast, fast_result) = rebuild(false).await;
+        let (oracle, oracle_result) = rebuild(true).await;
+        assert_eq!(
+            fast, oracle,
+            "the in-memory rebuild must be byte-identical to the extracted one"
+        );
+        assert_eq!(
+            format!("{:?}", fast_result.sidecar),
+            format!("{:?}", oracle_result.sidecar),
+            "the sidecar fixup must see the same package root either way"
+        );
+        assert_eq!(
+            read_nupkg_entry(&fast, "LICENSE.md").as_deref(),
+            Some(PATCHED)
+        );
+        assert!(
+            read_nupkg_entry(&fast, SIGNATURE_PART).is_none(),
+            "the signature part is dropped"
+        );
+        assert!(
+            read_nupkg_entry(&fast, ".nupkg.metadata").is_none(),
+            "the sidecar fixup deleted it, so it leaves the rebuild"
+        );
+        assert_eq!(
+            read_nupkg_entry(&fast, "lib/net6.0/empty.xml").as_deref(),
+            Some(&[][..])
+        );
+        assert_eq!(
+            read_nupkg_entry(&fast, "lib/net6.0/stored.bin").as_deref(),
+            Some(&b"stored bytes"[..])
+        );
     }
 
     fn read_nupkg_entry(bytes: &[u8], name: &str) -> Option<Vec<u8>> {

@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "entries": {
+    "pkg:cargo/alpha@1.0.0": {
+      "ecosystem": "cargo",
+      "basePurl": "pkg:cargo/alpha@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000001",
+      "artifact": {
+        "path": ".socket/vendor/cargo/11111111-1111-4111-8111-000000000001/alpha-1.0.0"
+      },
+      "wiring": [
+        {
+          "file": "Cargo.toml",
+          "kind": "cargo_patch_entry",
+          "action": "added",
+          "key": "alpha-socket-11111111",
+          "new": ".socket/vendor/cargo/11111111-1111-4111-8111-000000000001/alpha-1.0.0"
+        },
+        {
+          "file": "Cargo.lock",
+          "kind": "cargo_lock_entry",
+          "action": "rewritten",
+          "key": "alpha@1.0.0",
+          "original": {
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ],
+      "lock": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000001",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "package/src/lib.rs": {
+            "beforeHash": "288e50844f8b06d1428944c2cf984bd9749f34aa6d6482919a6cc83ed16d0bd3",
+            "afterHash": "eda8d84af85be378b1c97ca9bf97db8ba9e2b73502d1144956d88cc7f7d8aaf0"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    },
+    "pkg:cargo/beta@1.0.0": {
+      "ecosystem": "cargo",
+      "basePurl": "pkg:cargo/beta@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000002",
+      "artifact": {
+        "path": ".socket/vendor/cargo/11111111-1111-4111-8111-000000000002/beta-1.0.0"
+      },
+      "wiring": [
+        {
+          "file": "Cargo.toml",
+          "kind": "cargo_patch_entry",
+          "action": "added",
+          "key": "beta-socket-11111111",
+          "new": ".socket/vendor/cargo/11111111-1111-4111-8111-000000000002/beta-1.0.0"
+        },
+        {
+          "file": "Cargo.lock",
+          "kind": "cargo_lock_entry",
+          "action": "rewritten",
+          "key": "beta@1.0.0",
+          "original": {
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        }
+      ],
+      "lock": {
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000002",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "package/src/lib.rs": {
+            "beforeHash": "6c1e663d109d4f226179fd0ace6064071334aa58f7df3f47b57b71a8df98ba28",
+            "afterHash": "c88454177f0821faf61ff7601f190addb45899edfaf6758141682f538909c77f"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    }
+  }
+}

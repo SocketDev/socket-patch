@@ -18,6 +18,7 @@
 //! CLI_CONTRACT.md "Ownership, state, and reversal".
 
 use clap::Args;
+use futures_util::StreamExt;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
@@ -25,16 +26,19 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
+use socket_patch_core::utils::group_commit::GroupCommit;
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
-    save_state, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig,
-    VendorState, VendorWarning,
+    save_state, DeferredMiss, DeferredPackage, PackageSource, RevertOpts, RevertOutcome,
+    VendorEntry, VendorOutcome, VendorServiceConfig, VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -47,7 +51,8 @@ use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
 use crate::ecosystem_dispatch::{
-    find_packages_for_rollback, npm_paths_by_identity, partition_purls,
+    find_packages_for_rollback_reusing, npm_paths_by_identity, npm_paths_by_identity_in,
+    partition_purls, NpmCrawlSnapshot,
 };
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
@@ -97,11 +102,13 @@ fn refusal_is_benign(code: &str) -> bool {
 
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
-/// otherwise). Returns `None` for purls with no vendor backend in this build.
+/// otherwise), or a fetched artifact the backend materialises only if it
+/// reaches a branch that reads it. Returns `None` for purls with no vendor
+/// backend in this build.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_vendor_one(
     purl: &str,
-    pkg_path: &Path,
+    pkg_path: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -114,6 +121,7 @@ pub(crate) async fn dispatch_vendor_one(
     // rebuilds locally from the recorded patch.
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &vendor::pypi::InstalledSiteListings,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
 
@@ -160,6 +168,29 @@ pub(crate) async fn dispatch_vendor_one(
             .await
         };
     }
+    // Maven and NuGet have no registry-fetch rung — `fetch_and_stage` serves
+    // no fetcher for either and `stage_local_artifact` is npm-only — so their
+    // source is always the crawler's own directory.
+    macro_rules! vend_installed {
+        ($backend:path) => {{
+            debug_assert!(
+                matches!(pkg_path, PackageSource::Installed(_)),
+                "{eco} has no fetch rung; a pending source would need materialising"
+            );
+            $backend(
+                purl,
+                pkg_path.path(),
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+            )
+            .await
+        }};
+    }
     Some(match eco {
         // The flavor router probes the project's lockfile (package-lock /
         // yarn / pnpm / bun) and dispatches or refuses per flavor.
@@ -176,6 +207,7 @@ pub(crate) async fn dispatch_vendor_one(
                 force,
                 service,
                 pipenv_version,
+                installed_sites,
             )
             .await
         }
@@ -183,8 +215,8 @@ pub(crate) async fn dispatch_vendor_one(
         "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
         "golang" => vend!(vendor::golang::vendor_go_module),
         "composer" => vend!(vendor::composer_lock::vendor_composer),
-        "nuget" => vend!(vendor::nuget_feed::vendor_nuget),
-        "maven" => vend!(vendor::maven_repo::vendor_maven),
+        "nuget" => vend_installed!(vendor::nuget_feed::vendor_nuget),
+        "maven" => vend_installed!(vendor::maven_repo::vendor_maven),
         _ => return None,
     })
 }
@@ -989,11 +1021,40 @@ pub(crate) async fn persist_vendor_entry(
     env: &mut Envelope,
     state: &mut VendorState,
     candidate: &str,
-    mut entry: VendorEntry,
+    entry: VendorEntry,
     detached: bool,
     record: &PatchRecord,
 ) -> bool {
-    let mut has_errors = false;
+    let (has_errors, stale) =
+        record_vendor_entry(common, env, state, candidate, entry, detached, record).await;
+    if let Some(stale) = stale {
+        sweep_stale_artifact(common, env, state, stale).await;
+    }
+    has_errors
+}
+
+/// The entry a re-vendor under a newer patch uuid replaced, whose uuid dir
+/// is an orphan once the new wiring and ledger are committed.
+pub(crate) struct StaleArtifact {
+    candidate: String,
+    prev: VendorEntry,
+}
+
+/// [`persist_vendor_entry`]'s bookkeeping half: everything but the sweep of
+/// the replaced uuid's dir, which is handed back so a group-committed run
+/// can hold it until its commit (deleting it earlier would leave the
+/// committed, pre-run wiring pointing at a dir that is gone if the run
+/// never commits).
+#[allow(clippy::too_many_arguments)]
+async fn record_vendor_entry(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    state: &mut VendorState,
+    candidate: &str,
+    mut entry: VendorEntry,
+    detached: bool,
+    record: &PatchRecord,
+) -> (bool, Option<StaleArtifact>) {
     let candidate = candidate.to_string();
     entry.detached = detached;
     // EVERY entry embeds its patch record, not only detached (vendored-mode)
@@ -1021,59 +1082,66 @@ pub(crate) async fn persist_vendor_entry(
     }
     let new_uuid = entry.uuid.clone();
     state.entries.insert(candidate.clone(), entry);
-    // Persist per-package so a crash mid-run leaves a
-    // ledger that matches what's already wired.
+    // Persist per-package so a crash mid-run leaves a ledger that matches
+    // what's already wired (under a group commit this lands in the run's
+    // captured state, committed with the wiring it describes).
     if let Err(e) = save_state(&common.cwd, state).await {
-        has_errors = true;
         env.record(
             PatchEvent::new(PatchAction::Failed, candidate.clone())
                 .with_error("vendor_state_write_failed", e.to_string()),
         );
-    } else if let Some(prev) = prev.filter(|p| p.uuid != new_uuid) {
-        // Re-vendor under a newer patch uuid: the old
-        // uuid's dir is an orphan now — the wiring and
-        // ledger both point at the new uuid — unless
-        // another entry still shares it (the same
-        // `(eco, uuid)` ownership test as `--revert`'s
-        // orphan sweep). Only the live entry would
-        // otherwise reclaim it, and that never happens.
-        let still_referenced = state
-            .entries
-            .values()
-            .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
-        let stale_rel = vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
-        if let Some(rel) = stale_rel.filter(|_| !still_referenced) {
-            if let Err(detail) = vendor::bun_lock::cleanup_binary_workspace_artifacts(
-                &common.cwd,
-                &prev,
-                common.dry_run,
-            )
-            .await
-            {
-                record_warning(
-                    env,
-                    &candidate,
-                    &VendorWarning::new("vendor_stale_artifact_kept", detail),
-                    common,
-                );
-                return has_errors;
-            }
-            if !common.dry_run {
-                // Prunes the emptied `<eco>/` level too (a uuid change
-                // within one ecosystem never empties it, but a re-vendor
-                // that moved ecosystems would otherwise leave a husk).
-                let _ = remove_tree_and_prune(&common.cwd.join(rel), &common.cwd.join(SOCKET_DIR))
-                    .await;
-            }
-            env.record(
-                PatchEvent::new(PatchAction::Removed, candidate.clone()).with_reason(
-                    "vendor_stale_artifact_removed",
-                    "previous patch uuid's vendored artifact removed",
-                ),
-            );
-        }
+        return (true, None);
     }
-    has_errors
+    let stale = prev
+        .filter(|p| p.uuid != new_uuid)
+        .map(|prev| StaleArtifact { candidate, prev });
+    (false, stale)
+}
+
+/// Re-vendor under a newer patch uuid: the old uuid's dir is an orphan now —
+/// the wiring and ledger both point at the new uuid — unless another entry
+/// still shares it (the same `(eco, uuid)` ownership test as `--revert`'s
+/// orphan sweep). Only the live entry would otherwise reclaim it, and that
+/// never happens.
+async fn sweep_stale_artifact(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    state: &VendorState,
+    stale: StaleArtifact,
+) {
+    let StaleArtifact { candidate, prev } = stale;
+    let still_referenced = state
+        .entries
+        .values()
+        .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
+    let stale_rel = vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
+    let Some(rel) = stale_rel.filter(|_| !still_referenced) else {
+        return;
+    };
+    if let Err(detail) =
+        vendor::bun_lock::cleanup_binary_workspace_artifacts(&common.cwd, &prev, common.dry_run)
+            .await
+    {
+        record_warning(
+            env,
+            &candidate,
+            &VendorWarning::new("vendor_stale_artifact_kept", detail),
+            common,
+        );
+        return;
+    }
+    if !common.dry_run {
+        // Prunes the emptied `<eco>/` level too (a uuid change
+        // within one ecosystem never empties it, but a re-vendor
+        // that moved ecosystems would otherwise leave a husk).
+        let _ = remove_tree_and_prune(&common.cwd.join(rel), &common.cwd.join(SOCKET_DIR)).await;
+    }
+    env.record(
+        PatchEvent::new(PatchAction::Removed, candidate).with_reason(
+            "vendor_stale_artifact_removed",
+            "previous patch uuid's vendored artifact removed",
+        ),
+    );
 }
 
 /// One registry-fetch attempt through the pristine-source ladder's network
@@ -1130,6 +1198,259 @@ pub(crate) async fn fetch_pristine_package(
     }
 }
 
+/// Whether [`fetch_pristine_package`] would pick a VERIFIABLE registry
+/// resolution for this purl — the same entry choice, made without the
+/// download: the lock's own entry when it carries an integrity, else the
+/// pre-vendor resolution the ledger recovers. A cargo crate from a git,
+/// path or custom-registry source has neither, so its fetch refuses
+/// `vendor_fetch_unverifiable` and the purl is not vendored; deferring that
+/// fetch behind the patch service would instead vendor the crates.io patch
+/// over it.
+async fn cargo_fetch_is_verifiable(
+    project_root: &Path,
+    inventory: &[lock_inventory::LockfileEntry],
+    purl: &str,
+    ledger_entry: Option<&VendorEntry>,
+) -> bool {
+    let verifiable =
+        |e: &lock_inventory::LockfileEntry| e.integrity != lock_inventory::LockIntegrity::None;
+    if lock_inventory::lookup(inventory, purl).is_some_and(verifiable) {
+        return true;
+    }
+    match ledger_entry {
+        Some(le) => lock_inventory::recover_lock_entry(project_root, le)
+            .await
+            .is_ok_and(|e| verifiable(&e)),
+        None => false,
+    }
+}
+
+/// One purl's pristine source while the vendor loop is being assembled.
+///
+/// A fetched artifact is held by index into the run's `fetched_holders`
+/// rather than by path: the tree is not on disk yet (see
+/// [`registry_fetch::FetchedPackage`]), and only a backend branch that
+/// actually reads it makes it so.
+enum StagedSource {
+    /// The crawler's installed location.
+    Installed(std::path::PathBuf),
+    /// `fetched_holders[i]`.
+    Fetched(usize),
+    /// `deferred_holders[i]`: not downloaded unless a backend reads it.
+    Deferred(usize),
+}
+
+impl StagedSource {
+    fn as_source<'a>(
+        &'a self,
+        holders: &'a [registry_fetch::FetchedPackage],
+        deferred: &'a [DeferredPackage],
+    ) -> PackageSource<'a> {
+        match self {
+            Self::Installed(dir) => PackageSource::Installed(dir),
+            Self::Fetched(at) => PackageSource::Pending(&holders[*at]),
+            Self::Deferred(at) => PackageSource::Deferred(&deferred[*at]),
+        }
+    }
+}
+
+/// Where a vendorable purl with no installed copy stands after the local
+/// rungs of the pristine-source ladder (see [`missing_local_rung`]).
+enum MissingRung {
+    /// Staged from its own committed artifact (sha256-verified).
+    Staged(registry_fetch::FetchedPackage),
+    /// Its committed artifact is present but corrupt (the detail).
+    StageFailed(String),
+    /// `--offline`: no registry rung.
+    Offline,
+    /// Left for the registry fetch ([`fetch_pristine_package`]).
+    Fetch,
+    /// The registry fetch, run only if the backend reads the pristine tree
+    /// ([`deferred_pristine_package`]).
+    Deferred,
+    /// A gem a local build cannot vendor from a download: refused before
+    /// the fetch.
+    GemBuildRefused,
+}
+
+impl MissingRung {
+    /// Whether this purl still needs [`fetch_pristine_package`] — the one
+    /// predicate behind both the fetch plan and the lazy lock inventory,
+    /// so they cannot name different purls.
+    fn needs_registry(&self) -> bool {
+        matches!(self, MissingRung::Fetch)
+    }
+}
+
+/// The local rungs for one missing purl, deciding without emitting
+/// anything: an already-vendored npm purl with no installed copy (fresh
+/// clone) stages from its own committed artifact, sha256-verified against
+/// the ledger — offline-safe, no registry traffic — and `--offline` stops
+/// before the registry. Also returns the committed artifact's path when it
+/// is missing (the caller's `vendor_artifact_missing` warning; the purl
+/// then falls through to the registry ladder, which recovers the
+/// pre-vendor resolution from the ledger and rebuilds).
+async fn missing_local_rung(
+    common: &GlobalArgs,
+    ledger_entry: Option<&VendorEntry>,
+) -> (Option<String>, MissingRung) {
+    let mut artifact_missing = None;
+    if let Some(entry) =
+        ledger_entry.filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
+    {
+        let tgz = common.cwd.join(&entry.artifact.path);
+        if tokio::fs::metadata(&tgz).await.is_err() {
+            artifact_missing = Some(entry.artifact.path.clone());
+        } else {
+            match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256).await {
+                Ok(staged) => return (None, MissingRung::Staged(staged)),
+                Err(registry_fetch::FetchError::Failed(detail)) => {
+                    return (None, MissingRung::StageFailed(detail))
+                }
+                // No recorded hash (legacy ledger) — fall through to the
+                // lockfile/registry path.
+                Err(registry_fetch::FetchError::Unverifiable(_)) => {}
+            }
+        }
+    }
+    let rung = if common.offline {
+        MissingRung::Offline
+    } else {
+        MissingRung::Fetch
+    };
+    (artifact_missing, rung)
+}
+
+/// Whether the ledger already covers `record` for `entry`'s purl: the entry
+/// records this very patch uuid and its committed artifact is on disk — a
+/// FILE artifact (wheel, tarball) hashing to the ledger's `sha256`.
+/// Read-only, no network. The backend's in-sync hot path answers such a
+/// purl from the committed artifact without reading the pristine tree,
+/// which is what lets its download be deferred. Some in-sync checks look
+/// only for the artifact's presence (pypi's), so a file artifact that no
+/// longer hashes to its ledger pin is not covered: it keeps the eager
+/// ladder, and a run that cannot reach the registry says so as it always
+/// did. A copy DIR's integrity stays the backend's own question — a
+/// drifted one is rebuilt, and a rebuild that needs the pristine tree
+/// fetches it then.
+async fn ledger_covers(cwd: &Path, entry: Option<&VendorEntry>, record: &PatchRecord) -> bool {
+    match entry {
+        Some(entry) if entry.uuid == record.uuid => entry.committed_artifact_intact(cwd).await,
+        _ => false,
+    }
+}
+
+/// The pristine source for a purl whose download is deferred: the same
+/// [`fetch_pristine_package`] ladder, run on the first backend call that
+/// reads the tree. `--offline` never reaches the registry, so there the
+/// deferred fetch reports the offline stop instead. The outcome's `code`
+/// tells [`deferred_miss`] which eager-fetch report to reproduce.
+fn deferred_pristine_package(
+    common: &GlobalArgs,
+    inventory: &Arc<tokio::sync::OnceCell<Vec<lock_inventory::LockfileEntry>>>,
+    client: &registry_fetch::RegistryClient,
+    purl: &str,
+    ledger_entry: Option<&VendorEntry>,
+) -> DeferredPackage {
+    let cwd = common.cwd.clone();
+    let offline = common.offline;
+    let inventory = Arc::clone(inventory);
+    let client = client.clone();
+    let owned_purl = purl.to_string();
+    let ledger_entry = ledger_entry.cloned();
+    DeferredPackage::new(
+        &registry_fetch::staged_leaf_for_purl(purl),
+        Box::new(move || {
+            Box::pin(async move {
+                if offline {
+                    return Err(DeferredMiss {
+                        code: "offline",
+                        detail: "--offline prevents fetching the pristine artifact from \
+                                 the registry"
+                            .to_string(),
+                    });
+                }
+                let inv = inventory
+                    .get_or_init(|| lock_inventory::inventory_project(&cwd))
+                    .await;
+                match fetch_pristine_package(&cwd, inv, &client, &owned_purl, ledger_entry.as_ref())
+                    .await
+                {
+                    PristineFetch::Fetched(fetched) => Ok(fetched),
+                    PristineFetch::NoSource => Err(DeferredMiss {
+                        code: "no_source",
+                        detail: "no installed package found on disk".to_string(),
+                    }),
+                    PristineFetch::Unverifiable(detail) => Err(DeferredMiss {
+                        code: "unverifiable",
+                        detail,
+                    }),
+                    PristineFetch::Failed(detail) => Err(DeferredMiss {
+                        code: "failed",
+                        detail,
+                    }),
+                }
+            })
+        }),
+    )
+}
+
+/// The `vendor_fetched_missing` advisory for a pristine artifact fetched
+/// because the package is not installed.
+fn record_fetched_missing(env: &mut Envelope, common: &GlobalArgs, purl: &str, url: &str) {
+    record_warning(
+        env,
+        purl,
+        &VendorWarning::new(
+            "vendor_fetched_missing",
+            format!(
+                "{} is not installed; fetched the pristine artifact from {url} (integrity \
+                 verified) and vendored from that copy — the project tree was not touched",
+                normalize_purl(purl)
+            ),
+        ),
+        common,
+    );
+}
+
+/// Report a deferred fetch that produced no package exactly as the eager
+/// fetch would have reported it for `purl`: a failed download is the same
+/// `vendor_fetch_failed` failure (and suppresses the later
+/// `package_not_installed` skip for the whole variant group), an
+/// unverifiable lock entry the same `vendor_fetch_unverifiable` warning;
+/// no source, and the `--offline` stop, say nothing here and leave the
+/// candidates to the unmatched pass's `package_not_installed` skip. The
+/// caller drops the backend's own outcome — the backend only failed
+/// because the tree it asked for never arrived — and un-matches
+/// `candidates`.
+fn deferred_miss(
+    env: &mut Envelope,
+    common: &GlobalArgs,
+    purl: &str,
+    miss: &DeferredMiss,
+    candidates: &[String],
+    fetch_failed: &mut HashSet<String>,
+) {
+    match miss.code {
+        "unverifiable" => record_warning(
+            env,
+            purl,
+            &VendorWarning::new("vendor_fetch_unverifiable", miss.detail.clone()),
+            common,
+        ),
+        "no_source" | "offline" => {}
+        _ => {
+            fetch_failed.insert(purl.to_string());
+            fetch_failed.extend(candidates.iter().cloned());
+            env.record(
+                PatchEvent::new(PatchAction::Failed, purl.to_string())
+                    .with_error("vendor_fetch_failed", miss.detail.clone()),
+            );
+            report_vendor_failure(common, purl, &format!("fetch failed: {}", miss.detail));
+        }
+    }
+}
+
 /// The vendoring engine, decoupled from the manifest file. `records` is the
 /// purl → [`PatchRecord`] view to vendor: `manifest.patches` for the
 /// manifest-driven `vendor` command, or the in-memory record map
@@ -1159,6 +1480,30 @@ pub(crate) async fn vendor_records(
     // command and `scan --vendor` pass `Some(_)`, honoring `--vendor-source`.
     service: Option<&VendorServiceConfig>,
     ledger: std::io::Result<VendorState>,
+) -> bool {
+    vendor_records_reusing(
+        common, records, sources, detached, force, env, service, ledger, None,
+    )
+    .await
+}
+
+/// [`vendor_records`], resolving npm packages from `prior` — the npm half
+/// of a crawl this process made earlier with the same options, over a tree
+/// nothing has touched since (`scan`'s own crawl) — instead of walking
+/// `node_modules` again: its roots feed the targeted lookup and its
+/// packages the alias identity fallback. `None` (or a snapshot taken with
+/// other options) crawls as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_records_reusing(
+    common: &GlobalArgs,
+    records: &HashMap<String, PatchRecord>,
+    sources: &PatchSources<'_>,
+    detached: bool,
+    force: bool,
+    env: &mut Envelope,
+    service: Option<&VendorServiceConfig>,
+    ledger: std::io::Result<VendorState>,
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> bool {
     let mut has_errors = false;
     // Lockfile flavors the backends wired THIS run (from the returned ledger
@@ -1240,12 +1585,16 @@ pub(crate) async fn vendor_records(
     // registry download, and (for gem) a HashMap-order platform coin-flip.
     // The rollback variant fans each base path back out to every qualified
     // manifest purl (same invariant as `find_manifest_package_paths`).
-    let mut all_packages = find_packages_for_rollback(
+    let mut all_packages: HashMap<String, StagedSource> = find_packages_for_rollback_reusing(
         &vendorable_partition,
         &crawler_options,
         common.silent || common.json,
+        prior,
     )
-    .await;
+    .await
+    .into_iter()
+    .map(|(purl, dir)| (purl, StagedSource::Installed(dir)))
+    .collect();
 
     // An npm alias is installed under its dependency key, not its actual
     // package name. The targeted resolver probes canonical paths; before
@@ -1257,8 +1606,12 @@ pub(crate) async fn vendor_records(
         .flatten()
         .filter(|p| !all_packages.contains_key(*p))
         .collect();
-    for (purl, paths) in npm_paths_by_identity(&crawler_options, &missing_npm).await {
-        all_packages.insert(purl, paths[0].clone());
+    let by_identity = match prior.and_then(|p| p.packages_for(&crawler_options)) {
+        Some(installed) => npm_paths_by_identity_in(installed, &missing_npm),
+        None => npm_paths_by_identity(&crawler_options, &missing_npm).await,
+    };
+    for (purl, paths) in by_identity {
+        all_packages.insert(purl, StagedSource::Installed(paths[0].clone()));
     }
 
     // ── Auto-fetch: lockfile-resolved packages with no installed copy ────
@@ -1270,16 +1623,21 @@ pub(crate) async fn vendor_records(
     // installed copy (it keys off lock entries). The holders keep the
     // tempdirs alive until the dispatch loop below has staged from them.
     let mut fetched_holders: Vec<registry_fetch::FetchedPackage> = Vec::new();
+    // Sources whose download is deferred to the backend branch that reads
+    // them (see the plan below), held by index like `fetched_holders`.
+    let mut deferred_holders: Vec<DeferredPackage> = Vec::new();
     // Fetch failures must keep their distinct Failed event; this set
     // suppresses the later duplicate `package_not_installed` skip.
     let mut fetch_failed: HashSet<String> = HashSet::new();
     // The lockfile inventory (every recognized lockfile parsed) — a local
     // read, fine offline — built lazily at the first site that consumes it
-    // and shared by the registry-fetch rung below and the `--offline`
-    // "the lockfile resolves it" detail at the end, so a run parses the
-    // lockfiles at most once (and not at all when every missing purl
-    // stages from its committed artifact or nothing is missing).
-    let mut inventory: Option<Vec<lock_inventory::LockfileEntry>> = None;
+    // and shared by the registry-fetch rung below, the deferred fetches and
+    // the `--offline` "the lockfile resolves it" detail at the end, so a run
+    // parses the lockfiles at most once (and not at all when every missing
+    // purl stages from its committed artifact, every deferred source is
+    // answered by its backend's hot path, or nothing is missing).
+    let inventory: Arc<tokio::sync::OnceCell<Vec<lock_inventory::LockfileEntry>>> =
+        Arc::new(tokio::sync::OnceCell::new());
     {
         let missing: Vec<String> = vendorable
             .iter()
@@ -1288,93 +1646,245 @@ pub(crate) async fn vendor_records(
             .collect();
         if !missing.is_empty() {
             let client = registry_fetch::build_registry_client();
-            // Artifact-staging path: an already-vendored purl with no
-            // installed copy (fresh clone) stages from its own committed
-            // artifact, sha256-verified against the ledger — offline-safe,
-            // no registry traffic.
-            for purl in &missing {
-                let ledger_entry = lookup_entry(&state.entries, purl);
-                if let Some(entry) = ledger_entry
-                    .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
-                {
-                    let tgz = common.cwd.join(&entry.artifact.path);
-                    if tokio::fs::metadata(&tgz).await.is_err() {
-                        // The committed artifact is GONE (gitignored or
-                        // deleted): not corruption — fall through to the
-                        // registry ladder, which recovers the pre-vendor
-                        // resolution from the ledger and rebuilds.
-                        record_warning(
-                            env,
-                            purl,
-                            &VendorWarning::new(
-                                "vendor_artifact_missing",
-                                format!(
-                                    "the committed vendored artifact {} is missing; \
-                                     recovering the registry resolution to rebuild it",
-                                    entry.artifact.path
-                                ),
-                            ),
-                            common,
-                        );
-                    } else {
-                        match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256)
-                            .await
-                        {
-                            Ok(staged) => {
-                                all_packages.insert(purl.clone(), staged.dir().to_path_buf());
-                                fetched_holders.push(staged);
-                                continue;
-                            }
-                            Err(registry_fetch::FetchError::Failed(detail)) => {
-                                // A PRESENT-but-corrupt committed artifact is
-                                // worth a loud failure — silently re-vendoring
-                                // over it would mask the corruption.
-                                fetch_failed.insert(purl.clone());
-                                let detail = format!(
-                                    "{detail}; run `socket-patch repair` to rebuild the \
-                                     vendored artifact"
-                                );
-                                env.record(
-                                    PatchEvent::new(PatchAction::Failed, purl.clone())
-                                        .with_error("vendor_fetch_failed", detail.clone()),
-                                );
-                                report_vendor_failure(common, purl, &detail);
-                                continue;
-                            }
-                            Err(registry_fetch::FetchError::Unverifiable(_)) => {
-                                // No recorded hash (legacy ledger) — fall
-                                // through to the lockfile/registry path.
-                            }
-                        }
-                    }
+            // Two passes over `missing`, so the registry fetches can run
+            // concurrently while every event, warning and stderr line still
+            // lands in `missing` order, exactly as the one-purl-at-a-time
+            // loop emitted them. Pass 1 decides each purl's local rungs (the
+            // committed-artifact staging and the offline stop: local and
+            // read-only, so deciding them early changes nothing) without
+            // emitting anything; the purls left for the registry are then
+            // fetched at most `registry_concurrency` at a time, in order, and
+            // pass 2 emits every purl's outcome in turn.
+            let mut rungs: Vec<(Option<String>, MissingRung)> = {
+                let mut rungs = Vec::with_capacity(missing.len());
+                for purl in &missing {
+                    rungs
+                        .push(missing_local_rung(common, lookup_entry(&state.entries, purl)).await);
                 }
-                if common.offline {
-                    // The enriched skip detail lands below in the unmatched
-                    // pass (the purl stays unmatched).
+                rungs
+            };
+            // Downloads nothing may need, deferred to the backend branch
+            // that reads the pristine tree (see `DeferredPackage`):
+            //
+            //  * a purl the ledger already covers — its entry records this
+            //    record's patch uuid and the committed artifact is on disk —
+            //    is what the backend's in-sync hot path answers from those
+            //    committed bytes alone, so a re-run makes no registry request
+            //    (and succeeds with no network at all). `--force` may
+            //    rebuild anyway, so it keeps the eager fetch.
+            //  * a cargo crate the patch service can serve: the backend reads
+            //    the pristine tree only once `cargo_service_copy` falls back
+            //    to the local build. Only a crate the registry ladder COULD
+            //    fetch (see `cargo_fetch_is_verifiable`) — a git, path or
+            //    custom-registry crate keeps the eager rung, whose
+            //    `vendor_fetch_unverifiable` refusal is what keeps a
+            //    crates.io patch off a crate that does not come from
+            //    crates.io.
+            //
+            // A backend that does reach its pristine tree fetches it then,
+            // through the same ladder, and the loop reports the fetch as the
+            // eager one would have (see `deferred_miss`).
+            let service_enabled = service.is_some_and(VendorServiceConfig::service_enabled);
+            for (purl, (_, rung)) in missing.iter().zip(rungs.iter_mut()) {
+                if !matches!(rung, MissingRung::Fetch | MissingRung::Offline) {
                     continue;
                 }
-                if inventory.is_none() {
-                    inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
+                let covered = !force
+                    && match records.get(purl) {
+                        Some(record) => {
+                            ledger_covers(&common.cwd, lookup_entry(&state.entries, purl), record)
+                                .await
+                        }
+                        None => false,
+                    };
+                let cargo_via_service = service_enabled
+                    && matches!(rung, MissingRung::Fetch)
+                    && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
+                    && cargo_fetch_is_verifiable(
+                        &common.cwd,
+                        inventory
+                            .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
+                            .await,
+                        purl,
+                        lookup_entry(&state.entries, purl),
+                    )
+                    .await;
+                if covered || cargo_via_service {
+                    *rung = MissingRung::Deferred;
                 }
-                let inv = inventory.as_deref().expect("filled just above");
-                match fetch_pristine_package(&common.cwd, inv, &client, purl, ledger_entry).await {
-                    PristineFetch::Fetched(fetched) => {
-                        record_warning(
-                            env,
-                            purl,
-                            &VendorWarning::new(
-                                "vendor_fetched_missing",
-                                format!(
-                                    "{} is not installed; fetched the pristine artifact \
-                                     from {} (integrity verified) and vendored from that \
-                                     copy — the project tree was not touched",
-                                    normalize_purl(purl),
-                                    fetched.url
-                                ),
+            }
+            // A NOT-INSTALLED gem can only be vendored through the patch
+            // service. The bundler path source the gem backend wires needs
+            // the eval-able stub gemspec rubygems writes into
+            // `<gem home>/specifications/` at INSTALL time; a fetched `.gem`
+            // carries its gemspec only as YAML in `metadata.gz`, which is
+            // exactly why the service serves a converted `gem-stub-gemspec`
+            // second artifact. With the service off (`--vendor-source build`,
+            // or no config at all) the fetched copy is unusable, so the
+            // backend refused `gem_spec_missing` — AFTER paying for the
+            // download, on every run. Refuse before the download instead,
+            // with the same code and a detail that names the real remedy.
+            // The backend keeps its own refusal as the backstop for every
+            // other route into it.
+            //
+            // Scoped to the purls a DOWNLOAD would actually happen for,
+            // mirroring `fetch_pristine_package`'s own `fetchable` filter: a
+            // gem the lock cannot VERIFY (no `CHECKSUMS` section) is never
+            // fetched and keeps its `vendor_fetch_unverifiable` warning plus
+            // the calm `package_not_installed` skip; a gem the ledger already
+            // holds is the already-vendored fresh-clone case the backend's
+            // hot path confirms without a stub gemspec; a gem that resolves
+            // from nowhere keeps the calm skip. Refusing first also means a
+            // refusal the backend would have reached earlier on the fetched
+            // copy (an uneditable Gemfile declaration, say) now reports as
+            // `gem_spec_missing` instead; either way the package fails.
+            // A dry run never refused: the backend's verify-only preview
+            // runs on the fetched copy, so it keeps the eager fetch.
+            if !service_enabled
+                && !common.dry_run
+                && missing
+                    .iter()
+                    .zip(&rungs)
+                    .any(|(p, (_, r))| p.starts_with("pkg:gem/") && r.needs_registry())
+            {
+                let inv = inventory
+                    .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
+                    .await;
+                for (purl, (_, rung)) in missing.iter().zip(rungs.iter_mut()) {
+                    if purl.starts_with("pkg:gem/")
+                        && rung.needs_registry()
+                        && lookup_entry(&state.entries, purl).is_none()
+                        && lock_inventory::lookup(inv, purl)
+                            .is_some_and(|e| e.integrity != lock_inventory::LockIntegrity::None)
+                    {
+                        *rung = MissingRung::GemBuildRefused;
+                    }
+                }
+            }
+            // Parsed only when some purl reaches the registry rung (the
+            // serial loop's lazy first use).
+            let inv: &[lock_inventory::LockfileEntry] =
+                if rungs.iter().any(|(_, r)| r.needs_registry()) {
+                    inventory
+                        .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
+                        .await
+                } else {
+                    &[]
+                };
+            let (cwd, client_ref, ledger) = (&common.cwd, &client, &state.entries);
+            let to_fetch: Vec<&String> = missing
+                .iter()
+                .zip(&rungs)
+                .filter(|(_, (_, rung))| rung.needs_registry())
+                .map(|(purl, _)| purl)
+                .collect();
+            let mut pristine = std::pin::pin!(ordered_concurrent(
+                to_fetch,
+                registry_concurrency(),
+                |purl| fetch_pristine_package(
+                    cwd,
+                    inv,
+                    client_ref,
+                    purl,
+                    lookup_entry(ledger, purl)
+                ),
+            ));
+            for (purl, (artifact_missing, rung)) in missing.iter().zip(rungs) {
+                if let Some(artifact) = artifact_missing {
+                    // The committed artifact is GONE (gitignored or
+                    // deleted): not corruption — fall through to the
+                    // registry ladder, which recovers the pre-vendor
+                    // resolution from the ledger and rebuilds.
+                    record_warning(
+                        env,
+                        purl,
+                        &VendorWarning::new(
+                            "vendor_artifact_missing",
+                            format!(
+                                "the committed vendored artifact {artifact} is missing; \
+                                 recovering the registry resolution to rebuild it"
                             ),
-                            common,
+                        ),
+                        common,
+                    );
+                }
+                let fetched = match rung {
+                    MissingRung::Staged(staged) => {
+                        all_packages
+                            .insert(purl.clone(), StagedSource::Fetched(fetched_holders.len()));
+                        fetched_holders.push(staged);
+                        continue;
+                    }
+                    MissingRung::StageFailed(detail) => {
+                        // A PRESENT-but-corrupt committed artifact is
+                        // worth a loud failure — silently re-vendoring
+                        // over it would mask the corruption.
+                        fetch_failed.insert(purl.clone());
+                        let detail = format!(
+                            "{detail}; run `socket-patch repair` to rebuild the \
+                             vendored artifact"
                         );
-                        all_packages.insert(purl.clone(), fetched.dir().to_path_buf());
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, purl.clone())
+                                .with_error("vendor_fetch_failed", detail.clone()),
+                        );
+                        report_vendor_failure(common, purl, &detail);
+                        continue;
+                    }
+                    MissingRung::Deferred => {
+                        all_packages
+                            .insert(purl.clone(), StagedSource::Deferred(deferred_holders.len()));
+                        deferred_holders.push(deferred_pristine_package(
+                            common,
+                            &inventory,
+                            &client,
+                            purl,
+                            lookup_entry(&state.entries, purl),
+                        ));
+                        continue;
+                    }
+                    MissingRung::GemBuildRefused => {
+                        fetch_failed.insert(purl.clone());
+                        // The backend's own refusal text, word for word.
+                        let detail = format!(
+                            "no local stub gemspec for {} (a path source cannot be wired \
+                             without one); install the gem or use --vendor-source=service",
+                            strip_purl_qualifiers(purl).trim_start_matches("pkg:gem/")
+                        );
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, purl.clone())
+                                .with_error("gem_spec_missing", detail.clone()),
+                        );
+                        report_vendor_failure(common, purl, &detail);
+                        continue;
+                    }
+                    // The enriched skip detail lands below in the unmatched
+                    // pass (the purl stays unmatched).
+                    MissingRung::Offline => continue,
+                    MissingRung::Fetch => match pristine.next().await {
+                        Some(fetched) => fetched,
+                        // Unreachable: `to_fetch` holds one fetch per
+                        // `needs_registry` rung, and this is the only arm
+                        // that consumes one. A live fetch keeps the outcome
+                        // right if the two ever fall out of step.
+                        None => {
+                            debug_assert!(false, "pristine prefetch plan out of step at {purl}");
+                            fetch_pristine_package(
+                                cwd,
+                                inv,
+                                client_ref,
+                                purl,
+                                lookup_entry(ledger, purl),
+                            )
+                            .await
+                        }
+                    },
+                };
+                match fetched {
+                    PristineFetch::Fetched(fetched) => {
+                        record_fetched_missing(env, common, purl, &fetched.url);
+                        all_packages
+                            .insert(purl.clone(), StagedSource::Fetched(fetched_holders.len()));
                         fetched_holders.push(fetched);
                     }
                     PristineFetch::NoSource => {
@@ -1472,16 +1982,105 @@ pub(crate) async fn vendor_records(
     let berry_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
         tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
+    let installed_sites = vendor::pypi::InstalledSiteListings::default();
     let mut dry_in_sync: u32 = 0;
     // Sorted, so per-package lines print in the same order every run.
-    let mut all_packages: Vec<(String, std::path::PathBuf)> = all_packages.into_iter().collect();
-    all_packages.sort();
+    // Purls are unique keys, so ordering on the purl alone is the order the
+    // `(purl, path)` sort produced.
+    let mut all_packages: Vec<(String, StagedSource)> = all_packages.into_iter().collect();
+    all_packages.sort_by(|a, b| a.0.cmp(&b.0));
     // Progress over the per-package engine calls (download, pack, lockfile
     // rewrite): shown only while an engine call runs, so every per-package
     // line prints on a clean line.
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
-    for (index, (purl, pkg_path)) in all_packages.iter().enumerate() {
+    // Service downloads, fetched ahead of this serial loop (the wiring and
+    // every write stay here, in order). The plan is EXACT — the npm records
+    // the loop will ask the service for, in loop order: past the Bun
+    // refusal and the takeover gate below, past every refusal the flavor
+    // backend raises before its first service call (evaluated here with
+    // the backend's own gates, `preflight_packages`), and with no committed
+    // artifact the ledger anchors at the record's uuid (those re-runs reuse
+    // it and never ask the service). A download grant can start a
+    // server-side build and counts against quota, so a package the loop
+    // refuses is never granted on its behalf. The plan stays advisory —
+    // the breaker and every outcome are still decided at the loop's own
+    // call (see `VendorPrefetch`). Asking `wants_prefetch` first keeps the
+    // walk off the runs that would drop the plan anyway (`--vendor-source
+    // build`, `--offline`, one request at a time), and a plan of fewer
+    // than two downloads has nothing to overlap, so the backend gates are
+    // only consulted past that.
+    let _service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
+        Some(cfg) => {
+            let candidates: Vec<(&str, &PatchRecord)> = all_packages
+                .iter()
+                .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Npm))
+                .filter(|(purl, _)| bun_refusal.as_ref().is_none_or(|r| !r.applies_to(purl)))
+                .filter(|(purl, _)| {
+                    redirect_ledger_corrupt.is_none()
+                        && redirect_ledger.as_ref().is_none_or(|l| {
+                            !l.records
+                                .keys()
+                                .any(|k| canonical_purl(k) == canonical_purl(purl))
+                        })
+                })
+                .filter_map(|(purl, _)| records.get(purl).map(|record| (purl.as_str(), record)))
+                .filter(|(_, record)| {
+                    !state.entries.values().any(|e| {
+                        e.ecosystem == "npm"
+                            && e.uuid == record.uuid
+                            && !e.artifact.sha256.is_empty()
+                    })
+                })
+                .collect();
+            if candidates.len() < 2 {
+                None
+            } else {
+                let admitted =
+                    vendor::npm_flavor::preflight_packages(&common.cwd, &candidates).await;
+                let planned: Vec<String> = candidates
+                    .iter()
+                    .zip(admitted)
+                    .filter(|(_, verdict)| verdict.is_ok())
+                    .map(|((_, record), _)| record.uuid.clone())
+                    .collect();
+                cfg.prefetch_archives(planned)
+            }
+        }
+        None => None,
+    };
+    // The source of the purl the loop has just left. Its archive is what a
+    // fetched source holds to be able to write its tree, and `all_packages`
+    // gives each holder to exactly one purl — so once the loop moves on,
+    // nothing reads it again, and a run that fetched 110 artifacts need not
+    // carry all 110 to the end of the loop.
+    let mut spent: Option<PackageSource<'_>> = None;
+    // Deferred sources whose fetch the loop has already reported.
+    let mut deferred_fetch_reported: HashSet<String> = HashSet::new();
+    // Group commit: from here until the loop ends, every backend's
+    // lockfile / manifest / config edits, the takeover's hosted reverts and
+    // the per-package ledger saves are captured in memory — every read in
+    // the loop sees them — and written to disk ONCE, after the loop (see
+    // `socket_patch_core::utils::group_commit`). A run that never reaches
+    // the commit (a crash, a panic) leaves the pre-run lockfiles and ledgers
+    // on disk; the artifacts it wrote are orphans the next run re-vendors
+    // over. The replaced uuid dirs of re-vendored packages are swept only
+    // after the commit, since until then the committed wiring still names
+    // them. Dry runs write nothing and capture nothing.
+    let group = (!common.dry_run
+        && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
+    .then(|| GroupCommit::begin(&common.cwd));
+    let mut stale_artifacts: Vec<StaleArtifact> = Vec::new();
+    for (index, (purl, staged)) in all_packages.iter().enumerate() {
+        if let Some(done) = spent.take() {
+            done.release();
+        }
+        let pkg_source = staged.as_source(&fetched_holders, &deferred_holders);
+        let deferred = match staged {
+            StagedSource::Deferred(at) => Some(&deferred_holders[*at]),
+            _ => None,
+        };
+        spent = Some(pkg_source);
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let candidates: Vec<String> = if is_variant_eco {
@@ -1514,14 +2113,57 @@ pub(crate) async fn vendor_records(
             // to select), so the probe is inapplicable and is skipped for it.
             let probe_applicable = is_variant_eco
                 && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
-            if probe_applicable && !force {
+            // A deferred source was deferred because the ledger covers the
+            // purl at this record's uuid: the variant the ledger vendored is
+            // the installed one's by construction, so it answers the probe
+            // without downloading the pristine tree just to read one file.
+            let ledger_answers_probe = deferred.is_some_and(|d| d.outcome().is_none())
+                && lookup_entry(&state.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
+            if probe_applicable && !force && !ledger_answers_probe {
                 // The representative must be a file that MODIFIES existing
                 // content: a new file (empty beforeHash) verifies `Ready`
                 // against any environment, so it can neither identify nor
                 // disqualify a variant. Same deterministic pick as apply /
                 // core's `select_installed_variants`.
                 let first = match representative_file(&record.files) {
-                    Some((f, info)) => Some(verify_file_patch(pkg_path, f, info).await.status),
+                    Some((f, info)) => match pkg_source.materialize().await {
+                        Ok(dir) => Some(verify_file_patch(dir, f, info).await.status),
+                        // A deferred download that produced nothing is
+                        // reported as the eager fetch would have reported it.
+                        Err(_) if deferred.is_some_and(|d| matches!(d.outcome(), Some(Err(_)))) => {
+                            if let Some(Some(Err(miss))) = deferred.map(DeferredPackage::outcome) {
+                                deferred_miss(
+                                    env,
+                                    common,
+                                    purl,
+                                    miss,
+                                    &candidates,
+                                    &mut fetch_failed,
+                                );
+                            }
+                            break;
+                        }
+                        // Not a variant verdict: the tree could not be
+                        // WRITTEN at all — a full or unwritable `$TMPDIR`,
+                        // no file descriptors. The eager fetch hit that
+                        // while fetching and reported it; reading it as a
+                        // variant that does not match would file the purl
+                        // under `package_not_installed` ("no installed
+                        // package found on disk") and lose the cause.
+                        // One failure for the SOURCE, keyed on the purl the
+                        // fetch was issued for — the eager fetch raised it
+                        // once, before the variants were ever fanned out.
+                        Err(detail) => {
+                            env.record(
+                                PatchEvent::new(PatchAction::Failed, purl.clone())
+                                    .with_error("vendor_fetch_failed", detail.clone()),
+                            );
+                            report_vendor_failure(common, purl, &format!("fetch failed: {detail}"));
+                            fetch_failed.insert(purl.clone());
+                            fetch_failed.extend(candidates.iter().cloned());
+                            break;
+                        }
+                    },
                     None => None,
                 };
                 if !variant_matches_installed(first.as_ref()) {
@@ -1788,7 +2430,7 @@ pub(crate) async fn vendor_records(
             ));
             let outcome = dispatch_vendor_one(
                 candidate,
-                pkg_path,
+                pkg_source,
                 &common.cwd,
                 record,
                 sources,
@@ -1797,9 +2439,31 @@ pub(crate) async fn vendor_records(
                 force,
                 service,
                 &pipenv_version,
+                &installed_sites,
             )
             .await;
             status.finish();
+
+            // A deferred source whose backend needed the pristine tree after
+            // all fetched it inside the call. Report that fetch as the eager
+            // ladder did — ahead of this package's own outcome — once per
+            // source; a fetch that produced nothing replaces the outcome.
+            if let Some(fetch) = deferred.and_then(DeferredPackage::outcome) {
+                match fetch {
+                    Ok(fetched) => {
+                        if deferred_fetch_reported.insert(purl.clone()) {
+                            record_fetched_missing(env, common, purl, &fetched.url);
+                        }
+                    }
+                    Err(miss) => {
+                        deferred_miss(env, common, purl, miss, &candidates, &mut fetch_failed);
+                        for c in &candidates {
+                            matched.remove(c);
+                        }
+                        break;
+                    }
+                }
+            }
 
             match outcome {
                 None => {
@@ -1923,12 +2587,68 @@ pub(crate) async fn vendor_records(
                         if let Some(flavor) = entry.flavor.as_deref() {
                             wired_flavors.insert(flavor.to_string());
                         }
-                        has_errors |= persist_vendor_entry(
+                        let (save_failed, stale) = record_vendor_entry(
                             common, env, &mut state, candidate, entry, detached, record,
                         )
                         .await;
+                        has_errors |= save_failed;
+                        socket_patch_core::utils::failpoint::hit("vendor_package_recorded");
+                        if let Some(stale) = stale {
+                            if group.is_some() {
+                                stale_artifacts.push(stale);
+                            } else {
+                                sweep_stale_artifact(common, env, &state, stale).await;
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    // Every backend has staged what it needed, so the fetch tempdirs can
+    // go. Dropping them removes whatever was extracted into them — a
+    // recursive delete that belongs off the runtime thread.
+    if !fetched_holders.is_empty() || !deferred_holders.is_empty() {
+        let _ =
+            tokio::task::spawn_blocking(move || drop((fetched_holders, deferred_holders))).await;
+    }
+
+    // The run's one commit of every lockfile, manifest, config and ledger
+    // the loop changed. The packages that succeeded are committed even when
+    // others failed — a failed package's backend already put back what it
+    // had touched, in the captured state — so a completed run ends exactly
+    // where committing after every package would have left it.
+    if let Some(group) = group {
+        socket_patch_core::utils::failpoint::hit("vendor_group_commit");
+        match group.commit().await {
+            Ok(_) => {
+                for stale in stale_artifacts {
+                    sweep_stale_artifact(common, env, &state, stale).await;
+                }
+            }
+            Err(e) => {
+                has_errors = true;
+                let detail = if socket_patch_core::utils::group_commit::is_pending(&e) {
+                    // Some files were replaced and could not be put back:
+                    // the journal left behind makes the next locked command
+                    // finish the commit.
+                    format!(
+                        "could not commit the vendored lockfile, manifest and ledger edits: \
+                         {e}; the commit is journaled and the next socket-patch command in \
+                         this project finishes it"
+                    )
+                } else {
+                    format!(
+                        "could not commit the vendored lockfile, manifest and ledger edits: \
+                         {e}; the project's lockfiles and .socket/vendor/state.json are \
+                         unchanged"
+                    )
+                };
+                if !common.json {
+                    eprintln!("Error: {detail}");
+                }
+                env.mark_error(EnvelopeError::new("vendor_commit_failed", detail));
             }
         }
     }
@@ -1954,10 +2674,9 @@ pub(crate) async fn vendor_records(
         // the inventory is a local file read, allowed offline (and reused
         // when the fetch rung above already built it).
         let lock_resolvable: HashSet<String> = if common.offline {
-            if inventory.is_none() {
-                inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
-            }
-            let entries = inventory.as_deref().expect("filled just above");
+            let entries = inventory
+                .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
+                .await;
             unmatched
                 .iter()
                 .filter(|p| lock_inventory::lookup(entries, p).is_some())
@@ -2548,7 +3267,7 @@ mod dispatch_tests {
         assert_eq!(service.source, VendorSource::Service);
         let outcome = dispatch_vendor_one(
             "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0",
-            tmp.path(),
+            tmp.path().into(),
             tmp.path(),
             &record,
             &sources,
@@ -2557,6 +3276,7 @@ mod dispatch_tests {
             false,
             Some(&service),
             &tokio::sync::OnceCell::new(),
+            &Default::default(),
         )
         .await;
         // The backend itself may refuse (nothing is installed in the

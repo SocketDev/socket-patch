@@ -6,9 +6,12 @@
 use std::path::Path;
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
@@ -83,6 +86,25 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // redirect rewriter edits its integrity entries today — recording the
     // decision here so the omission reads as deliberate, not forgotten.
 ];
+
+/// Most hosted wheel-metadata downloads in flight at once, below the patch
+/// API's own in-flight cap: each one buffers a whole wheel (up to
+/// `MAX_VENDOR_PACKAGE_BYTES`) where the serial loop held one, so the
+/// window is bounded by what it costs as well as by what it saves.
+const WHEEL_METADATA_CONCURRENCY: usize = 4;
+
+/// The in-flight cap for the hosted wheel-metadata window.
+///
+/// These GETs go to the patch server, so they are paced by the same knob as
+/// every other patch-API window ([`api_concurrency`], and with it
+/// `SOCKET_API_CONCURRENCY`) — an operator who caps in-flight requests per
+/// client must be able to cap this one too, or a `uv.lock` project's wheels
+/// land in `skipped` as `python_metadata_unavailable`. `api_concurrency`
+/// already returns 1 under a tight descriptor limit, which is what the
+/// serial loop's one-socket-at-a-time profile needs.
+fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
+    api_concurrency(use_public_proxy).min(WHEEL_METADATA_CONCURRENCY)
+}
 
 /// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
 /// For user-facing messages that name where a lockfile now points — the
@@ -749,22 +771,18 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
 /// already-patched install must not produce a delete prescription.
 /// (`current_hash` is `Some` only when the bytes were really hashed, which
 /// also excludes the absent-new-file `Ready`.)
+///
+/// The probes take this from the same one-pass
+/// [`socket_patch_core::vex::verify::judge_installed_record`] that decides
+/// PATCHED (`stale_evidence`); this view of it is what the unit tests pin.
+#[cfg(test)]
 async fn installed_stale_positive_evidence(
     package_dir: &Path,
     record: &socket_patch_core::manifest::schema::PatchRecord,
 ) -> bool {
-    use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
-    for (file_name, info) in &record.files {
-        let result = verify_file_patch(package_dir, file_name, info).await;
-        if matches!(
-            result.status,
-            VerifyStatus::Ready | VerifyStatus::HashMismatch
-        ) && result.current_hash.is_some()
-        {
-            return true;
-        }
-    }
-    false
+    socket_patch_core::vex::verify::judge_installed_record(package_dir, record)
+        .await
+        .stale_evidence
 }
 
 /// Post-rewrite stale-materialization probe for gem redirects — the guard
@@ -785,12 +803,14 @@ async fn installed_stale_positive_evidence(
 ///   itself). Record availability is part of the candidate filter, and the
 ///   probe returns before any crawler work (or `gem env` subprocess spawn)
 ///   when no judgment is possible.
-/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle.
+/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle
+///   (decided, with STALE, by one pass of
+///   [`socket_patch_core::vex::verify::judge_installed_record`]).
 ///   Judgments are grouped BY INSTALLED DIR: platform-variant purls of one
 ///   gem resolve to the same dir, and if ANY variant's record proves the
 ///   dir patched, the dir is patched — never warned.
-/// * STALE requires [`installed_stale_positive_evidence`] — never inferred from
-///   missing/unreadable files.
+/// * STALE requires positive evidence (the `installed_stale_positive_evidence`
+///   rule) — never inferred from missing/unreadable files.
 /// * A committed `vendor/cache/<leaf>.gem` whose sha256 differs from the
 ///   patched artifact's is stale too (bundler installs from it first, fresh
 ///   checkouts included): folded into a project-local install warning's
@@ -815,7 +835,7 @@ async fn gem_stale_install_warnings(
     use socket_patch_core::crawlers::RubyCrawler;
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::vendor::file_sha256_hex;
-    use socket_patch_core::vex::verify::verify_patch_record;
+    use socket_patch_core::vex::verify::judge_installed_record;
 
     let mut out = StaleInstallOutcome::default();
     let find_record =
@@ -849,16 +869,22 @@ async fn gem_stale_install_warnings(
         global_prefix,
     };
     let gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
+    // Every candidate's installed dir in every gem home, one blocking pass
+    // (and at most one listing) per home — the per-candidate lookups the
+    // loop below consumes, in the same (candidate, home) order.
+    let stripped: Vec<String> = candidates
+        .iter()
+        .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
+        .collect();
+    let mut found_per_home = Vec::with_capacity(gem_paths.len());
+    for gems_dir in &gem_paths {
+        found_per_home.push(crawler.find_each_by_purl(gems_dir, &stripped).await);
+    }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
-    for (purl, record) in &candidates {
-        let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string();
-        for gems_dir in &gem_paths {
-            let found = crawler
-                .find_by_purls(gems_dir, std::slice::from_ref(&stripped))
-                .await
-                .unwrap_or_default();
-            let Some(pkg) = found.get(&stripped) else {
+    for (index, (purl, record)) in candidates.iter().enumerate() {
+        for found in &found_per_home {
+            let Some(pkg) = &found[index] else {
                 continue;
             };
             // A dir whose leaf isn't clean UTF-8 cannot be a real crawler
@@ -875,10 +901,10 @@ async fn gem_stale_install_warnings(
                     patched: false,
                     positive: false,
                 });
-            if verify_patch_record(&pkg.path, record).await.is_ok() {
+            let judged = judge_installed_record(&pkg.path, record).await;
+            if judged.patched {
                 entry.patched = true;
-            } else if !entry.positive && installed_stale_positive_evidence(&pkg.path, record).await
-            {
+            } else if !entry.positive && judged.stale_evidence {
                 entry.positive = true;
                 entry.purl = (*purl).to_string();
             }
@@ -966,6 +992,31 @@ async fn gem_stale_install_warnings(
     out
 }
 
+/// Whether the hosted flow's Pipenv probe is CERTAIN to run: the candidates
+/// that no wheel-metadata failure can drop (none shares a fetched wheel's
+/// artifact URL) already target an entry of Pipfile.lock, so
+/// `pipenv_lock_targets` over the post-fetch overrides — a superset of
+/// them — is true whatever the fetch returns.
+fn pipenv_probe_certain<'a>(
+    files: &std::collections::BTreeMap<String, String>,
+    candidates: impl Iterator<Item = &'a DepOverride>,
+    fetched_wheel_urls: impl Iterator<Item = &'a str>,
+) -> bool {
+    // `pipenv_lock_targets` answers false on its first line when there is
+    // no Pipfile.lock, and EVERY hosted redirect run reaches this — an
+    // npm-only one with hundreds of candidates included. Ask that question
+    // before building the list to ask it with.
+    if !files.contains_key("Pipfile.lock") {
+        return false;
+    }
+    let droppable: std::collections::BTreeSet<&str> = fetched_wheel_urls.collect();
+    let kept: Vec<DepOverride> = candidates
+        .filter(|dep| !droppable.contains(dep.artifact_url.as_str()))
+        .cloned()
+        .collect();
+    socket_patch_core::patch::redirect::pipenv_lock_targets(files, &kept)
+}
+
 /// The `(name, version)` key the gem artifact-sha map uses — derived from
 /// the purl so overrides (which carry no purl) and confirmed purls meet on
 /// neutral ground.
@@ -989,6 +1040,9 @@ pub(super) async fn run_redirect(
     // it so the hosted `--json` envelope stays schema-consistent with every
     // other scan; `.take()` at each terminal (error or success) folds it in.
     mut scan_result: Option<serde_json::Value>,
+    // Scan's pending telemetry, flushed by `discover_selected` before
+    // anything below writes to stdout.
+    telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
     let selected = match discover_selected(
@@ -998,6 +1052,7 @@ pub(super) async fn run_redirect(
         &args.common,
         false,
         false,
+        telemetry,
     )
     .await
     {
@@ -1773,66 +1828,147 @@ pub(crate) async fn run_redirect_selected(
     // it rides the same atomic-write / ledger-first machinery as the locks.
     let mut python_metadata = std::collections::BTreeMap::new();
     let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
-    for dep in candidates
-        .iter()
-        .map(|c| &c.dep)
-        .filter(|dep| dep.ecosystem == "pypi")
+    // `pipenv --version` (see `pipenv_major` below), started before the
+    // wheel metadata fetch when that probe is certain to be needed.
+    let mut pipenv_probe: Option<tokio::task::JoinHandle<Option<u32>>> = None;
     {
-        let Some(sha256) = dep.integrity.sha256.as_deref() else {
-            continue;
-        };
-        if !dep
-            .artifact_url
-            .split(['?', '#'])
-            .next()
-            .is_some_and(|path| path.ends_with(".whl"))
-        {
-            continue;
-        }
-        let native_target = files
+        use socket_patch_core::utils::python_lock::{ArtifactSource, PythonLockProbe};
+        // Each native Python lock is parsed once, on the first dep that
+        // needs the probe, rather than rewritten per dep just to learn
+        // whether it would be.
+        let mut probes: Option<Vec<PythonLockProbe>> = None;
+        let mut wheel_deps: Vec<(&DepOverride, &str)> = Vec::new();
+        for dep in candidates
             .iter()
-            .filter(|(path, _)| {
-                *path == "uv.lock"
-                    || socket_patch_core::utils::python_lock::is_script_lock_name(path)
-            })
-            .any(|(_, text)| {
-                socket_patch_core::utils::python_lock::rewrite_python_lock(
-                    text,
-                    &dep.name,
-                    &dep.version,
-                    socket_patch_core::utils::python_lock::ArtifactSource::Url(&dep.artifact_url),
-                    sha256,
-                )
-                .ok()
-                .flatten()
-                .is_some()
-            });
-        if !native_target {
-            continue;
-        }
-        status.set(format!(
-            "Fetching hosted wheel metadata for {}...",
-            dep.name
-        ));
-        match socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
-            api_client,
-            &dep.artifact_url,
-            sha256,
-        )
-        .await
+            .map(|c| &c.dep)
+            .filter(|dep| dep.ecosystem == "pypi")
         {
-            Ok(Some(metadata)) => {
-                python_metadata.insert(dep.artifact_url.clone(), metadata);
+            let Some(sha256) = dep.integrity.sha256.as_deref() else {
+                continue;
+            };
+            if !dep
+                .artifact_url
+                .split(['?', '#'])
+                .next()
+                .is_some_and(|path| path.ends_with(".whl"))
+            {
+                continue;
             }
-            Ok(None) => {}
-            Err(detail) => {
-                unavailable_python_artifacts.insert(dep.artifact_url.clone());
-                skipped.push(serde_json::json!({
-                    "purl": format!("pkg:pypi/{}@{}", dep.name, dep.version),
-                    "uuid": dep.patch_uuid,
-                    "reason": "python_metadata_unavailable",
-                    "detail": detail.replace(&dep.artifact_url, "<hosted artifact>"),
-                }));
+            let native_target = probes
+                .get_or_insert_with(|| {
+                    files
+                        .iter()
+                        .filter(|(path, _)| {
+                            *path == "uv.lock"
+                                || socket_patch_core::utils::python_lock::is_script_lock_name(path)
+                        })
+                        .map(|(_, text)| PythonLockProbe::new(text))
+                        .collect()
+                })
+                .iter()
+                .any(|probe| {
+                    probe.rewrites(
+                        &dep.name,
+                        &dep.version,
+                        ArtifactSource::Url(&dep.artifact_url),
+                    )
+                });
+            if native_target {
+                wheel_deps.push((dep, sha256));
+            }
+        }
+        // The only candidates the metadata fetch can still drop are those
+        // sharing a fetched wheel's artifact URL. If the rest already
+        // target an entry of Pipfile.lock, the Pipenv probe below is certain
+        // to run: start it now so it overlaps the fetch. Otherwise it runs
+        // (or not) exactly where it always did.
+        if pipenv_probe_certain(
+            &files,
+            candidates.iter().map(|c| &c.dep),
+            wheel_deps.iter().map(|(dep, _)| dep.artifact_url.as_str()),
+        ) {
+            let root = common.cwd.clone();
+            pipenv_probe = Some(tokio::spawn(async move {
+                socket_patch_core::utils::pipenv::installed_major(&root).await
+            }));
+        }
+        // The wheels' FIRST attempts run concurrently and are folded in dep
+        // order, so `python_metadata`, `unavailable_python_artifacts` and
+        // `skipped` come out exactly as the serial loop's did; each attempt's
+        // opt-in debug lines are held back and printed at its fold, so they
+        // keep the serial order too.
+        //
+        // An attempt the client would RETRY (a 429 / 5xx / transport
+        // failure) is never settled concurrently. At the first one no
+        // further attempt is started, the ones already in flight are awaited
+        // (so the host is idle again, as the serial loop would find it), and
+        // that dep plus every later one are finished one at a time. A
+        // deferred attempt is RESUMED, not restarted: `Retry-After` is
+        // waited out and only the budget it left is spent, so each wheel
+        // costs the host exactly the requests the serial loop's would have.
+        // What stays different is only their overlap: a host that answers a
+        // burst differently than it answers the same requests one at a time
+        // (a sliding-window limiter, a bot challenge) can still hand back a
+        // status the serial loop would not have seen. The first such answer
+        // is what closes the window.
+        //
+        // Kept small on purpose, and paced by `SOCKET_API_CONCURRENCY` like
+        // every other patch-API window — see `wheel_metadata_concurrency`.
+        let wheel_metadata_concurrency = wheel_metadata_concurrency(api_client.uses_public_proxy());
+        use futures_util::StreamExt as _;
+        use socket_patch_core::vendor::pypi::{
+            finish_hosted_wheel_metadata, try_fetch_hosted_wheel_metadata_once,
+        };
+        // Lazily built: a dep's attempt starts only once it is pulled here.
+        let mut unstarted = wheel_deps.iter().map(|&(dep, sha256)| {
+            try_fetch_hosted_wheel_metadata_once(api_client, &dep.artifact_url, sha256)
+        });
+        let mut in_flight: futures_util::stream::FuturesOrdered<_> = unstarted
+            .by_ref()
+            .take(wheel_metadata_concurrency)
+            .collect();
+        // Once serial: the attempts that were in flight when a dep needed a
+        // retry, in dep order (the deps after them were never started).
+        let mut drained: Option<std::collections::VecDeque<_>> = None;
+        for &(dep, sha256) in &wheel_deps {
+            status.set(format!(
+                "Fetching hosted wheel metadata for {}...",
+                dep.name
+            ));
+            let attempt = match drained.as_mut() {
+                Some(drained) => drained.pop_front(),
+                None => match in_flight.next().await {
+                    Some(attempt) if !attempt.needs_retry() => {
+                        in_flight.extend(unstarted.next());
+                        Some(attempt)
+                    }
+                    // A retryable failure (or nothing left in flight): let
+                    // the host go idle, then finish one at a time from here.
+                    struggling => {
+                        let mut rest = std::collections::VecDeque::new();
+                        while let Some(later) = in_flight.next().await {
+                            rest.push_back(later);
+                        }
+                        drained = Some(rest);
+                        struggling
+                    }
+                },
+            };
+            match finish_hosted_wheel_metadata(api_client, &dep.artifact_url, sha256, attempt).await
+            {
+                Ok(Some(metadata)) => {
+                    python_metadata.insert(dep.artifact_url.clone(), metadata);
+                }
+                Ok(None) => {}
+                Err(detail) => {
+                    unavailable_python_artifacts.insert(dep.artifact_url.clone());
+                    skipped.push(serde_json::json!({
+                        "purl": format!("pkg:pypi/{}@{}", dep.name, dep.version),
+                        "uuid": dep.patch_uuid,
+                        "reason": "python_metadata_unavailable",
+                        "detail": detail.replace(&dep.artifact_url, "<hosted artifact>"),
+                    }));
+                }
             }
         }
     }
@@ -1849,10 +1985,19 @@ pub(crate) async fn run_redirect_selected(
     // run must neither spawn Pipenv nor warn about its absence.
     let targets_pipenv_lock =
         socket_patch_core::patch::redirect::pipenv_lock_targets(&files, &overrides);
-    let pipenv_major = if targets_pipenv_lock {
-        socket_patch_core::utils::pipenv::installed_major(&common.cwd).await
-    } else {
-        None
+    let pipenv_major = match (targets_pipenv_lock, pipenv_probe) {
+        (true, Some(probe)) => match probe.await {
+            Ok(major) => major,
+            Err(err) => std::panic::resume_unwind(err.into_panic()),
+        },
+        (true, None) => socket_patch_core::utils::pipenv::installed_major(&common.cwd).await,
+        // Unreachable (the early start implies the target), but never leave
+        // a probe running: aborting drops it, which reaps the child.
+        (false, Some(probe)) => {
+            probe.abort();
+            None
+        }
+        (false, None) => None,
     };
     let binary_content = if binary_bun && overrides.iter().any(|o| o.ecosystem == "npm") {
         Some(
@@ -2476,12 +2621,34 @@ pub(crate) async fn run_redirect_selected(
 
     if !common.dry_run {
         let total = confirmed.len();
-        for (i, (purl, uuid)) in confirmed.iter().enumerate() {
+        // The views are fetched concurrently but consumed in `confirmed`
+        // order, so `records` (newest wins) and `record_warnings` fold
+        // exactly as the serial loop's did. Each response is reduced to
+        // its record inside the window: a view carries every file's
+        // `blobContent`, so buffering whole responses would hold the cap's
+        // worth of patch payloads in memory at once, where the loop only
+        // ever needed the hashes. `record_from_patch_response` is pure, so
+        // folding it early changes nothing downstream. Each fetch's
+        // `--debug` lines are held back and printed at its fold, where the
+        // serial loop would have made the request.
+        let mut views = std::pin::pin!(ordered_concurrent(
+            confirmed.iter(),
+            api_concurrency(api_client.uses_public_proxy()),
+            |(_, uuid)| {
+                hold_back_debug(async move {
+                    api_client.fetch_patch(uuid).await.map(|resp| {
+                        resp.map(|resp| crate::commands::get::record_from_patch_response(&resp))
+                    })
+                })
+            },
+        ));
+        for (i, (purl, _)) in confirmed.iter().enumerate() {
             status.set(format!("Fetching patch records... ({}/{total})", i + 1));
-            match api_client.fetch_patch(uuid).await {
-                Ok(Some(resp)) => {
-                    let (rec_purl, record) =
-                        crate::commands::get::record_from_patch_response(&resp);
+            let Some(view) = views.next().await else {
+                break;
+            };
+            match view.release() {
+                Ok(Some((rec_purl, record))) => {
                     records.insert(rec_purl, record);
                 }
                 Ok(None) | Err(_) => {
@@ -3337,8 +3504,50 @@ mod tests {
         pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
+    use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;
+    use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+
+    /// The wheel window is a patch-API window, so the documented escape
+    /// hatch has to reach it: an operator behind something that caps
+    /// in-flight requests per client sets `SOCKET_API_CONCURRENCY=1` and
+    /// gets one artifact GET at a time here too — otherwise the capping
+    /// endpoint rejects the extras and those deps land in `skipped` as
+    /// `python_metadata_unavailable`. Serial: `SOCKET_*` is process-global.
+    #[test]
+    #[serial_test::serial]
+    fn socket_api_concurrency_paces_the_wheel_metadata_window() {
+        let orig = std::env::var(API_CONCURRENCY_ENV).ok();
+        std::env::remove_var(API_CONCURRENCY_ENV);
+        // The window's own ceiling still binds: the authenticated cap is 8,
+        // but a whole wheel per in-flight request is what sizes this one.
+        assert_eq!(
+            wheel_metadata_concurrency(false),
+            WHEEL_METADATA_CONCURRENCY
+        );
+        assert_eq!(wheel_metadata_concurrency(true), WHEEL_METADATA_CONCURRENCY);
+
+        std::env::set_var(API_CONCURRENCY_ENV, "1");
+        assert_eq!(wheel_metadata_concurrency(false), 1);
+        assert_eq!(wheel_metadata_concurrency(true), 1);
+
+        // A value between 1 and the ceiling lowers the window to it.
+        std::env::set_var(API_CONCURRENCY_ENV, "2");
+        assert_eq!(wheel_metadata_concurrency(false), 2);
+
+        // Raising the API cap never raises this one past its own ceiling.
+        std::env::set_var(API_CONCURRENCY_ENV, "32");
+        assert_eq!(
+            wheel_metadata_concurrency(false),
+            WHEEL_METADATA_CONCURRENCY
+        );
+
+        match orig {
+            Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+            None => std::env::remove_var(API_CONCURRENCY_ENV),
+        }
+    }
 
     /// Lock-head version sniff against the byte-real heads the 2026-08-18
     /// matrix captured from pnpm 7/8/9-12: quoted `'9.0'` and `'6.0'`,
@@ -3588,6 +3797,101 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
+    }
+
+    /// The early Pipenv probe start is exact: whenever it fires, the
+    /// post-fetch gate is true for EVERY outcome of the wheel metadata
+    /// fetch (any subset of the fetched wheels' URLs dropped).
+    #[test]
+    fn pipenv_probe_certain_implies_the_post_fetch_gate() {
+        use super::pipenv_probe_certain;
+        use socket_patch_core::patch::redirect::pipenv_lock_targets;
+
+        let lock = serde_json::json!({
+            "_meta": {"pipfile-spec": 6, "hash": {"sha256": "x"}},
+            "default": {"urllib3": {"version": "==1.26.18"}, "six": {"version": "==1.16.0"}},
+            "develop": {},
+        });
+        let files = std::collections::BTreeMap::from([(
+            "Pipfile.lock".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        )]);
+        let names = ["urllib3", "Six", "requests", "idna"];
+        let urls = ["u0", "u1", "u2", "u3"];
+        let (mut fired, mut held) = (0, 0);
+        for seed in 0..4096u64 {
+            // Deterministic spread over names, ecosystems, URLs and the
+            // fetched-URL set.
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |n: u64| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n) as usize
+            };
+            let candidates: Vec<DepOverride> = (0..next(4))
+                .map(|_| {
+                    let mut dep = npm_override(urls[next(4)]);
+                    dep.name = names[next(4)].to_string();
+                    if next(4) != 0 {
+                        dep.ecosystem = "pypi".to_string();
+                    }
+                    dep
+                })
+                .collect();
+            let fetched: Vec<&str> = urls.iter().copied().filter(|_| next(2) == 0).collect();
+            if !pipenv_probe_certain(&files, candidates.iter(), fetched.iter().copied()) {
+                held += 1;
+                continue;
+            }
+            fired += 1;
+            for mask in 0..(1u32 << fetched.len()) {
+                let dropped: Vec<&str> = fetched
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, url)| *url)
+                    .collect();
+                let kept: Vec<DepOverride> = candidates
+                    .iter()
+                    .filter(|dep| !dropped.contains(&dep.artifact_url.as_str()))
+                    .cloned()
+                    .collect();
+                assert!(
+                    pipenv_lock_targets(&files, &kept),
+                    "seed {seed} mask {mask}"
+                );
+            }
+        }
+        assert!(fired > 100 && held > 100, "{fired}/{held}");
+    }
+
+    /// Without a Pipfile.lock the gate is false whatever the candidates
+    /// are, exactly as `pipenv_lock_targets` answers it — so the early
+    /// return skips only the list the question would have been asked with.
+    #[test]
+    fn pipenv_probe_certain_is_false_without_a_pipfile_lock() {
+        use super::pipenv_probe_certain;
+        use socket_patch_core::patch::redirect::pipenv_lock_targets;
+
+        let files =
+            std::collections::BTreeMap::from([("package-lock.json".to_string(), "{}".to_string())]);
+        let mut pypi = npm_override("u1");
+        pypi.ecosystem = "pypi".to_string();
+        pypi.name = "urllib3".to_string();
+        let candidates = [npm_override("u0"), pypi];
+
+        assert!(!pipenv_probe_certain(
+            &files,
+            candidates.iter(),
+            std::iter::empty()
+        ));
+        assert!(!pipenv_lock_targets(&files, &candidates));
+        assert!(!pipenv_probe_certain(
+            &std::collections::BTreeMap::new(),
+            candidates.iter(),
+            std::iter::empty()
+        ));
     }
 
     fn npm_override(artifact_url: &str) -> DepOverride {

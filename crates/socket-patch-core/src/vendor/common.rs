@@ -3,7 +3,7 @@
 //! Each backend used to carry a private, byte-identical copy of these; they
 //! are hoisted here so the shapes stay in lockstep.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -234,9 +234,12 @@ impl JsonLayout {
 }
 
 /// Serialize `(name, bytes, unix mode)` entries — in the given order — into
-/// a deterministic zip: a fixed DOS timestamp (1980-01-01 00:00:00) and a
-/// fixed deflate level, so rebuilding the same content always yields
-/// identical bytes (churn-free commits, stable checksums).
+/// a deterministic zip: a fixed DOS timestamp (1980-01-01 00:00:00), a
+/// fixed deflate level and a fixed "made by" host (Unix — the zip crate
+/// otherwise stamps DOS on a Windows build, which also tells readers to
+/// ignore the unix modes it carries), so rebuilding the same content always
+/// yields identical bytes on every platform (churn-free commits, stable
+/// checksums).
 pub(crate) fn write_zip_entries(entries: &[(String, Vec<u8>, u32)]) -> Result<Vec<u8>, String> {
     use std::io::Write as _;
 
@@ -246,6 +249,7 @@ pub(crate) fn write_zip_entries(entries: &[(String, Vec<u8>, u32)]) -> Result<Ve
             .compression_method(zip::CompressionMethod::Deflated)
             .compression_level(Some(6))
             .last_modified_time(zip::DateTime::default())
+            .system(zip::System::Unix)
             .unix_permissions(*mode);
         writer
             .start_file(name, options)
@@ -299,6 +303,520 @@ pub(crate) fn rebuild_zip(stage: &Path, skip_entry: Option<&str>) -> Result<Vec<
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     write_zip_entries(&entries)
+}
+
+// ── in-memory local repack (the maven / nuget local build paths) ────────────
+
+/// One archive member, decompressed into memory instead of onto disk.
+pub(crate) struct ArchiveMember {
+    /// Archive-relative, `/`-separated name — the name the rebuilt zip uses.
+    name: String,
+    bytes: Vec<u8>,
+    /// The entry's unix exec bit, i.e. the mode
+    /// [`super::registry_fetch::extract_zip`] would have put on the
+    /// extracted file (0o755 vs 0o644).
+    exec: bool,
+    /// Set when the staged twin is gone after the apply (NuGet's sidecar
+    /// fixup deletes `.nupkg.metadata`): the member then drops out of the
+    /// rebuild exactly as it drops out of a walk over the stage.
+    dropped: bool,
+}
+
+/// The in-memory twin of an [`super::registry_fetch::extract_zip`] with
+/// `strip_first = false`:
+/// every member decompressed into memory, in archive order, with the LAST
+/// spelling of a repeated name winning — what an extraction to disk leaves
+/// behind. Every guard (entry count, the per-entry and total decompressed
+/// caps, the traversal refusal and the declared-vs-actual size check) runs in
+/// the same order over the same constants and yields the same message, so a
+/// refusal is indistinguishable from the on-disk path's.
+///
+/// The one thing it cannot reproduce is an extraction that fails because the
+/// *filesystem* mangles or collides names — [`names_are_unambiguous`] is the
+/// gate that keeps those archives on the on-disk path.
+pub(crate) fn read_zip_members(bytes: &[u8]) -> Result<Vec<ArchiveMember>, String> {
+    use std::io::Read as _;
+
+    use super::registry_fetch::{MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_TOTAL_DECOMPRESSED_BYTES};
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("unreadable zip: {e}"))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(format!("zip exceeds {MAX_ENTRIES} entries"));
+    }
+    let mut members: Vec<ArchiveMember> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("unreadable zip entry: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        let raw = std::path::PathBuf::from(file.name());
+        let rel_str = raw.to_string_lossy().into_owned();
+        if !is_safe_relative_subpath(&rel_str) {
+            return Err(format!(
+                "zip entry `{}` escapes the extraction dir — refusing the artifact",
+                raw.display()
+            ));
+        }
+        let declared = file.size();
+        if declared > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "zip entry `{rel_str}` is {declared} bytes (cap {MAX_ENTRY_BYTES})"
+            ));
+        }
+        total += declared;
+        if total > MAX_TOTAL_DECOMPRESSED_BYTES {
+            return Err(format!(
+                "zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
+            ));
+        }
+        // The declared size is header data a crafted zip can understate, so
+        // hold the caps against the ACTUAL decompressed bytes too: read at
+        // most declared+1 and refuse on any mismatch (the on-disk twin's
+        // `take(declared + 1)` copy).
+        let mut content = Vec::with_capacity(declared as usize);
+        (&mut file)
+            .take(declared + 1)
+            .read_to_end(&mut content)
+            .map_err(|e| format!("cannot extract `{rel_str}`: {e}"))?;
+        if content.len() as u64 != declared {
+            return Err(format!(
+                "zip entry `{rel_str}` decompresses to {} bytes but declares {declared} \
+                 — refusing the artifact",
+                content.len()
+            ));
+        }
+        let exec = file.unix_mode().is_some_and(|m| m & 0o111 != 0);
+        match at.get(&rel_str) {
+            // A repeated name overwrote the earlier extraction in place. Two
+            // entries whose RAW name bytes are identical never get this far —
+            // `ZipArchive` keys its central directory on them in an `IndexMap`
+            // and already collapsed the pair, last-wins, at the first index —
+            // so what lands here is two raw spellings that DECODE to one name
+            // (`String::from_utf8_lossy` folds distinct invalid bytes onto
+            // U+FFFD), which `extract_zip` writes to one path just the same.
+            Some(&i) => {
+                members[i].bytes = content;
+                members[i].exec = exec;
+            }
+            None => {
+                at.insert(rel_str.clone(), members.len());
+                members.push(ArchiveMember {
+                    name: rel_str,
+                    bytes: content,
+                    exec,
+                    dropped: false,
+                });
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// DOS device names: a file created under one of these on Windows opens the
+/// device instead, so the "extracted" member never lands in the stage.
+const DOS_DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// `NAME_MAX`: the longest single path component APFS, ext4 and NTFS will
+/// create. A member past it cannot be extracted at all — the on-disk path
+/// fails the whole rebuild with `cannot create <path>: File name too long`,
+/// so a name this long has to keep taking that path to keep failing.
+const MAX_COMPONENT_BYTES: usize = 255;
+
+/// And the whole name, so `<stage>/<name>` cannot pass `PATH_MAX` either
+/// (1024 on macOS, the tightest of the three; a `tempfile` stage prefix is
+/// ~60 bytes there, and Rust's Windows `File::create` takes the verbatim
+/// `\\?\` route past `MAX_PATH`). Deliberately far above real archives: the
+/// longest entry name across 78k members of 362 real jars is 149 bytes.
+const MAX_NAME_BYTES: usize = 512;
+
+/// True when `name` is spelled so that a filesystem can only ever store it as
+/// itself — and can store it at all: printable ASCII (so no Unicode-normalising
+/// filesystem folds it into a sibling), none of the characters Windows rewrites
+/// or rejects, no component that a path walk re-spells (`.`, `..`, empty) or
+/// that Windows trims (a trailing `.` or space) or redirects (a DOS device
+/// name), and nothing longer than the filesystem would accept.
+fn is_plain_archive_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES {
+        return false;
+    }
+    if !name.chars().all(|c| {
+        (c.is_ascii_graphic() || c == ' ')
+            && !matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return false;
+    }
+    name.split('/').all(|part| {
+        !part.is_empty()
+            && part.len() <= MAX_COMPONENT_BYTES
+            && part != "."
+            && part != ".."
+            && !part.ends_with('.')
+            && !part.ends_with(' ')
+            && !DOS_DEVICE_NAMES.iter().any(|d| {
+                part.split('.')
+                    .next()
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(d))
+            })
+    })
+}
+
+/// True when `members` (the archive's, or the installed tree's) and `targets`
+/// (the patch keys, normalized) name disjoint filesystem entries on any
+/// filesystem, and no member is a directory another name lives in — the
+/// precondition under which keeping members in memory is indistinguishable
+/// from extracting them (see [`read_zip_members`]).
+///
+/// Extracting to disk is lossy in ways only the filesystem knows about: a
+/// case-insensitive or Unicode-normalising volume collapses two names into one
+/// entry, Windows trims and redirects some spellings, a `\` in a name becomes a
+/// `/` on the way back out of the walk, and a name that is a file where another
+/// needs a directory fails the extraction (or the patch write) outright. Rather
+/// than model any of that, the callers keep memory and disk in lockstep only
+/// while every name is plain ASCII and no two distinct spellings fold together;
+/// anything else falls back to the extract-to-disk path, whose behaviour is then
+/// reproduced by definition.
+///
+/// Members and targets are told apart for the ancestor rule alone: a target
+/// that names a DIRECTORY of the archive is ordinary (the staging materialises
+/// one), whereas a name living under a member — which is a FILE — is the case
+/// where the two paths diverge.
+///
+/// Every `/`-separated PREFIX is checked, not only the whole name: a directory
+/// is a filesystem entry too, so `Lib/a.class` + `lib/b.class` collapse into
+/// one directory on a case-insensitive volume and the walk back out re-spells
+/// the second member under the first's casing — a different rebuilt archive,
+/// silently.
+pub(crate) fn names_are_unambiguous<'a>(
+    members: impl IntoIterator<Item = &'a str>,
+    targets: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let mut folded: HashMap<String, &str> = HashMap::new();
+    let mut member_folded: HashSet<String> = HashSet::new();
+    for (name, is_member) in members
+        .into_iter()
+        .map(|n| (n, true))
+        .chain(targets.into_iter().map(|n| (n, false)))
+    {
+        if !is_plain_archive_name(name) {
+            return false;
+        }
+        for end in name
+            .match_indices('/')
+            .map(|(at, _)| at)
+            .chain(std::iter::once(name.len()))
+        {
+            let part = &name[..end];
+            let lower = part.to_ascii_lowercase();
+            // The same path can legitimately arrive twice — a patch target IS
+            // usually a member, and siblings share their directories. Only a
+            // DIFFERENT spelling folding onto one already seen is ambiguous.
+            match folded.get(lower.as_str()) {
+                Some(seen) if *seen != part => return false,
+                Some(_) => {}
+                None => {
+                    folded.insert(lower.clone(), part);
+                }
+            }
+            // Only the whole name is a member FILE; its prefixes are the
+            // directories it lives in, which the ancestor rule below is about.
+            if is_member && end == name.len() {
+                member_folded.insert(lower);
+            }
+        }
+    }
+    for name in folded.keys() {
+        let mut prefix = name.as_str();
+        while let Some(cut) = prefix.rfind('/') {
+            prefix = &prefix[..cut];
+            if member_folded.contains(prefix) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: forces every local rebuild down the extract-to-disk staging
+    /// the in-memory repack is defined against, so the equivalence tests can
+    /// drive one fixture through both and compare the rebuilt artifact byte
+    /// for byte. Only [`can_repack_in_memory`] reads it —
+    /// [`names_are_unambiguous`] keeps answering for itself, so the gate's own
+    /// tests are unaffected.
+    ///
+    /// THREAD-LOCAL, not process-wide: `#[tokio::test]` runs its whole future
+    /// on the test's own thread, and libtest gives every test a thread of its
+    /// own, so a forced run cannot reach the ~40 other local-rebuild tests
+    /// running beside it and silently move them off the in-memory path.
+    static FORCE_ON_DISK_REPACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// How many rebuilds took the in-memory path on THIS thread — the
+    /// equivalence tests read it to prove which staging each of their two runs
+    /// actually used, rather than trusting the seam and the fixture's names.
+    static IN_MEMORY_REPACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets [`FORCE_ON_DISK_REPACK`] for as long as it is held.
+#[cfg(test)]
+pub(crate) struct OnDiskRepackGuard;
+
+#[cfg(test)]
+impl OnDiskRepackGuard {
+    pub(crate) fn acquire() -> Self {
+        FORCE_ON_DISK_REPACK.set(true);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for OnDiskRepackGuard {
+    fn drop(&mut self) {
+        FORCE_ON_DISK_REPACK.set(false);
+    }
+}
+
+/// The running count of [`IN_MEMORY_REPACKS`] for this thread; a test brackets
+/// a rebuild with it to assert which staging ran.
+#[cfg(test)]
+pub(crate) fn in_memory_repacks() -> usize {
+    IN_MEMORY_REPACKS.get()
+}
+
+/// Whether a local rebuild may keep the archive (or the installed tree) in
+/// memory: the [`names_are_unambiguous`] gate, plus the test seam.
+pub(crate) fn can_repack_in_memory<'a>(
+    members: impl IntoIterator<Item = &'a str>,
+    targets: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    #[cfg(test)]
+    if FORCE_ON_DISK_REPACK.get() {
+        return false;
+    }
+    let in_memory = names_are_unambiguous(members, targets);
+    #[cfg(test)]
+    if in_memory {
+        IN_MEMORY_REPACKS.set(IN_MEMORY_REPACKS.get() + 1);
+    }
+    in_memory
+}
+
+/// A local rebuild carried in memory: the archive's members never touch the
+/// stage, only the handful of paths the apply pipeline (and the ecosystem's
+/// sidecar fixup) resolves do, and the rebuilt archive is assembled from the
+/// two halves.
+pub(crate) struct MemoryRepack {
+    members: Vec<ArchiveMember>,
+    at: HashMap<String, usize>,
+    /// The paths materialised in the stage — everything the apply pipeline
+    /// can read, write, create or delete — in a deterministic order: the
+    /// sorted patch targets, then the extras the caller adds, each once.
+    /// [`Self::stage_into`] and [`Self::into_entries`] both return on the
+    /// first I/O failure, so the order decides which path a failure names.
+    wanted: Vec<String>,
+}
+
+/// Read `archive` into memory for an in-place rebuild, or `Ok(None)` when its
+/// names (together with `files`' patch targets and `extra`) are not unambiguous
+/// on every filesystem — the caller must then extract to disk instead, which is
+/// what this path is defined against. Errors are
+/// [`super::registry_fetch::extract_zip`]'s, verbatim.
+///
+/// `extra` names the fixed paths the ecosystem's sidecar fixup resolves beside
+/// the patch targets (NuGet's `.nupkg.metadata`). They are materialised like a
+/// target and, like one, must not fold onto a member under a different
+/// spelling — the fixup would delete that member on a case-insensitive volume
+/// and leave it in place on a case-sensitive one.
+pub(crate) fn prepare_memory_repack(
+    archive: &[u8],
+    files: &HashMap<String, PatchFileInfo>,
+    extra: &[&str],
+) -> Result<Option<MemoryRepack>, String> {
+    let members = read_zip_members(archive)?;
+    let mut targets: Vec<&str> = patch_target_paths(files);
+    targets.extend_from_slice(extra);
+    if !can_repack_in_memory(
+        members.iter().map(|m| m.name.as_str()),
+        targets.iter().copied(),
+    ) {
+        return Ok(None);
+    }
+    let at = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.clone(), i))
+        .collect();
+    let mut repack = MemoryRepack {
+        members,
+        at,
+        wanted: Vec::new(),
+    };
+    for target in targets {
+        repack.also_stage(target);
+    }
+    Ok(Some(repack))
+}
+
+/// The in-package paths the apply pipeline resolves for `files`: each key
+/// normalized, with the escaping keys the pipeline itself refuses dropped (it
+/// never joins them, so nothing has to be materialised for them either).
+///
+/// SORTED, because `files` is a `HashMap` with a per-process random hasher and
+/// every caller walks this list until the first I/O error: without the sort,
+/// two runs over one package under ENOSPC or EACCES name a different file in
+/// the failure. That is the invariant `patch::apply::files_in_order` states for
+/// the apply itself, and the reason `PatchRecord::files` serializes sorted.
+pub(crate) fn patch_target_paths(files: &HashMap<String, PatchFileInfo>) -> Vec<&str> {
+    let mut paths: Vec<&str> = files
+        .keys()
+        .map(|key| normalize_file_path(key))
+        .filter(|path| is_safe_relative_subpath(path))
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+impl MemoryRepack {
+    /// Also materialise `name` in the stage — the hook the ecosystem sidecar
+    /// fixups need for the paths they inspect outside the patch target set
+    /// (NuGet's `.nupkg.metadata` and its `*.nupkg.sha512` markers).
+    pub(crate) fn also_stage(&mut self, name: &str) {
+        if !self.wanted.iter().any(|w| w == name) {
+            self.wanted.push(name.to_string());
+        }
+    }
+
+    /// Every member name, for the callers that pick their extra staged paths
+    /// out of the archive itself.
+    pub(crate) fn member_names(&self) -> impl Iterator<Item = &str> {
+        self.members.iter().map(|m| m.name.as_str())
+    }
+
+    /// Materialise the wanted paths under `stage`: a member is written with
+    /// the mode [`super::registry_fetch::extract_zip`] would have given it, a name that only exists
+    /// as a directory in the archive is created as one (so a patch key
+    /// pointing at a directory still hashes as one), and a name the archive
+    /// does not carry is left absent.
+    pub(crate) async fn stage_into(&self, stage: &Path) -> Result<(), String> {
+        for name in &self.wanted {
+            let target = stage.join(name);
+            match self.at.get(name) {
+                Some(&i) => {
+                    if let Some(parent) = target.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                    }
+                    tokio::fs::write(&target, &self.members[i].bytes)
+                        .await
+                        .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let perms = if self.members[i].exec { 0o755 } else { 0o644 };
+                        let _ = std::fs::set_permissions(
+                            &target,
+                            std::fs::Permissions::from_mode(perms),
+                        );
+                    }
+                }
+                None if self.names_a_directory(name) => {
+                    tokio::fs::create_dir_all(&target)
+                        .await
+                        .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// True when the archive carries members UNDER `name`, i.e. extracting it
+    /// would have created a directory there.
+    fn names_a_directory(&self, name: &str) -> bool {
+        let prefix = format!("{name}/");
+        self.members.iter().any(|m| m.name.starts_with(&prefix))
+    }
+
+    /// Reconcile the staged paths back into the in-memory members and emit the
+    /// [`write_zip_entries`] list: the same lexicographic order and flat 0o644
+    /// mode [`rebuild_zip`] produces over a fully extracted stage. A staged
+    /// path the apply wrote carries its new bytes, one it created joins the
+    /// archive, and one it deleted leaves it.
+    pub(crate) async fn into_entries(
+        mut self,
+        stage: &Path,
+        skip_entry: Option<&str>,
+    ) -> Result<Vec<(String, Vec<u8>, u32)>, String> {
+        for name in &self.wanted {
+            let path = stage.join(name);
+            // A walk over the stage yields regular files and nothing else, so
+            // an absent path (or a directory left where a patch key pointed)
+            // simply contributes no entry.
+            let live = matches!(tokio::fs::metadata(&path).await, Ok(m) if m.is_file());
+            match (live, self.at.get(name)) {
+                (true, Some(&i)) => {
+                    self.members[i].bytes = tokio::fs::read(&path)
+                        .await
+                        .map_err(|e| format!("read {name}: {e}"))?;
+                }
+                (true, None) => {
+                    let bytes = tokio::fs::read(&path)
+                        .await
+                        .map_err(|e| format!("read {name}: {e}"))?;
+                    self.members.push(ArchiveMember {
+                        name: name.clone(),
+                        bytes,
+                        exec: false,
+                        dropped: false,
+                    });
+                }
+                (false, Some(&i)) => self.members[i].dropped = true,
+                (false, None) => {}
+            }
+        }
+        let mut entries: Vec<(String, Vec<u8>, u32)> = self
+            .members
+            .into_iter()
+            .filter(|m| !m.dropped && skip_entry != Some(m.name.as_str()))
+            .map(|m| (m.name, m.bytes, 0o644))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
+}
+
+/// A private stage directory whose (recursive) deletion can be handed to the
+/// blocking pool: [`tempfile::TempDir`]'s own `Drop` unlinks the whole tree
+/// synchronously, which on the build paths ran on the runtime thread. Dropping
+/// a `Stage` without [`Stage::dispose`] still deletes it the old way, so every
+/// early return stays correct.
+pub(crate) struct Stage(Option<tempfile::TempDir>);
+
+impl Stage {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        Ok(Self(Some(tempfile::tempdir()?)))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.as_ref().expect("stage is live until dispose").path()
+    }
+
+    /// Delete the stage on the blocking pool.
+    pub(crate) async fn dispose(mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
+        }
+    }
 }
 
 /// Bound on a committed `.jar` / `.nupkg` the in-sync probe is willing to
@@ -426,6 +944,7 @@ pub(crate) async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std:
     };
     match tokio::fs::rename(stage, copy_dir).await {
         Ok(()) => {
+            crate::utils::durability::moved(stage, copy_dir);
             if had_old {
                 let _ = remove_tree(&backup).await;
             }
@@ -1549,6 +2068,738 @@ mod tests {
             tokio::fs::read_to_string(&lock).await.unwrap(),
             "alpha\nNEW-FRAGMENT\nomega\n",
             "a failed revert must leave the lock content untouched"
+        );
+    }
+
+    // ── in-memory repack equivalence (X10) ──────────────────────────────────
+
+    /// A zip built entry by entry, so the oracle fixtures can carry the
+    /// spellings `write_zip_entries` never emits: repeated names, STORED
+    /// members, zero-length members, an exec bit, a directory entry and a
+    /// traversal-escaping name.
+    fn build_zip(entries: &[(&str, &[u8], zip::CompressionMethod, u32)]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, method, mode) in entries {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(*method)
+                .unix_permissions(*mode);
+            if name.ends_with('/') {
+                writer.add_directory(*name, options).unwrap();
+                continue;
+            }
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// The default zip fixture entry: deflated, 0o644.
+    fn entry<'a>(
+        name: &'a str,
+        bytes: &'a [u8],
+    ) -> (&'a str, &'a [u8], zip::CompressionMethod, u32) {
+        (name, bytes, zip::CompressionMethod::Deflated, 0o644)
+    }
+
+    /// A patch-files map naming `keys` (content irrelevant: these tests drive
+    /// the staging and the rebuild, not the apply).
+    fn target_files(keys: &[&str]) -> HashMap<String, PatchFileInfo> {
+        keys.iter()
+            .map(|k| {
+                (
+                    (*k).to_string(),
+                    PatchFileInfo {
+                        before_hash: compute_git_sha256_from_bytes(b"before"),
+                        after_hash: compute_git_sha256_from_bytes(b"after"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The pre-X10 repack, kept verbatim as the oracle: extract every member
+    /// to a stage, let the caller stand in for the apply pipeline, then walk
+    /// the stage back into a deterministic zip.
+    async fn on_disk_repack(
+        archive: &[u8],
+        skip_entry: Option<&str>,
+        apply: impl AsyncFn(&Path),
+    ) -> Result<Vec<u8>, String> {
+        let stage = tempfile::tempdir().map_err(|e| format!("stage: {e}"))?;
+        super::super::registry_fetch::extract_zip(archive, stage.path(), false)?;
+        apply(stage.path()).await;
+        rebuild_zip(stage.path(), skip_entry)
+    }
+
+    /// The X10 repack: members stay in memory, only the patch targets (plus
+    /// `extra`) are materialised, and the same stand-in apply runs over them.
+    /// `None` means the name gate sent the rebuild back to the on-disk path.
+    async fn in_memory_repack(
+        archive: &[u8],
+        files: &HashMap<String, PatchFileInfo>,
+        extra: &[&str],
+        skip_entry: Option<&str>,
+        apply: impl AsyncFn(&Path),
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(mut repack) = prepare_memory_repack(archive, files, extra)? else {
+            return Ok(None);
+        };
+        for name in extra {
+            repack.also_stage(name);
+        }
+        let stage = tempfile::tempdir().map_err(|e| format!("stage: {e}"))?;
+        repack.stage_into(stage.path()).await?;
+        apply(stage.path()).await;
+        let entries = repack.into_entries(stage.path(), skip_entry).await?;
+        write_zip_entries(&entries).map(Some)
+    }
+
+    /// Both repacks over one fixture must agree byte for byte; returns the
+    /// shared bytes so a caller can assert on the archive itself.
+    async fn assert_repacks_agree(
+        archive: &[u8],
+        keys: &[&str],
+        extra: &[&str],
+        skip_entry: Option<&str>,
+        apply: impl AsyncFn(&Path) + Copy,
+    ) -> Vec<u8> {
+        let files = target_files(keys);
+        let oracle = on_disk_repack(archive, skip_entry, apply).await.unwrap();
+        let fast = in_memory_repack(archive, &files, extra, skip_entry, apply)
+            .await
+            .unwrap()
+            .expect("this fixture's names must take the in-memory path");
+        assert_eq!(
+            fast, oracle,
+            "the in-memory repack must reproduce the extract-and-rezip bytes"
+        );
+        fast
+    }
+
+    /// An untouched archive: nested dirs, an explicit directory entry, a
+    /// zero-length member, a STORED member, an exec-bit member and a member
+    /// large enough to span several read buffers must all repack to the same
+    /// bytes as a full extraction would.
+    #[tokio::test]
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
+    #[serial_test::serial]
+    async fn in_memory_repack_matches_the_extract_and_rezip_oracle() {
+        let big = vec![b'z'; 3 * 1024 * 1024];
+        let archive = build_zip(&[
+            ("META-INF/", b"", zip::CompressionMethod::Stored, 0o755),
+            entry("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+            entry("lib/empty.txt", b""),
+            (
+                "lib/stored.bin",
+                b"stored bytes",
+                zip::CompressionMethod::Stored,
+                0o644,
+            ),
+            (
+                "bin/run.sh",
+                b"#!/bin/sh\nexit 0\n",
+                zip::CompressionMethod::Deflated,
+                0o755,
+            ),
+            entry("lib/big.bin", &big),
+            entry("LICENSE", b"license\n"),
+        ]);
+        let bytes = assert_repacks_agree(&archive, &["LICENSE"], &[], None, async |_| {}).await;
+        let names = zip_entry_names(&bytes);
+        assert_eq!(
+            names,
+            [
+                "LICENSE",
+                "META-INF/MANIFEST.MF",
+                "bin/run.sh",
+                "lib/big.bin",
+                "lib/empty.txt",
+                "lib/stored.bin",
+            ],
+            "directory entries drop out; files sort lexicographically"
+        );
+    }
+
+    /// The three ways an apply can change the stage — rewriting a patch
+    /// target, creating one that was not in the archive, and deleting a
+    /// staged path (NuGet's `.nupkg.metadata` fixup) — must land in the
+    /// rebuilt archive exactly as they do over a full extraction.
+    #[tokio::test]
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
+    #[serial_test::serial]
+    async fn in_memory_repack_tracks_rewrites_creations_and_deletions() {
+        let archive = build_zip(&[
+            entry("LICENSE", b"pristine\n"),
+            entry(".nupkg.metadata", b"{\"contentHash\":\"x\"}"),
+            entry("lib/keep.txt", b"keep\n"),
+        ]);
+        let bytes = assert_repacks_agree(
+            &archive,
+            &["LICENSE", "lib/new.txt"],
+            &[".nupkg.metadata"],
+            None,
+            async |stage: &Path| {
+                tokio::fs::write(stage.join("LICENSE"), b"patched\n")
+                    .await
+                    .unwrap();
+                // `apply_file_patch_at` materialises a created file's parent
+                // itself, so the stand-in does too.
+                tokio::fs::create_dir_all(stage.join("lib")).await.unwrap();
+                tokio::fs::write(stage.join("lib/new.txt"), b"created\n")
+                    .await
+                    .unwrap();
+                tokio::fs::remove_file(stage.join(".nupkg.metadata"))
+                    .await
+                    .unwrap();
+            },
+        )
+        .await;
+        assert_eq!(
+            zip_entry_names(&bytes),
+            ["LICENSE", "lib/keep.txt", "lib/new.txt"],
+            "the deleted part is gone and the created one joined"
+        );
+        assert_eq!(zip_member(&bytes, "LICENSE"), b"patched\n");
+    }
+
+    /// The `skip_entry` drop (NuGet's `.signature.p7s`) is applied by both
+    /// repacks at the same point.
+    #[tokio::test]
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
+    #[serial_test::serial]
+    async fn in_memory_repack_drops_the_skipped_entry() {
+        let archive = build_zip(&[
+            entry(".signature.p7s", b"FAKE-SIGNATURE"),
+            entry("LICENSE", b"pristine\n"),
+        ]);
+        let bytes = assert_repacks_agree(
+            &archive,
+            &["LICENSE"],
+            &[],
+            Some(".signature.p7s"),
+            async |_| {},
+        )
+        .await;
+        assert_eq!(zip_entry_names(&bytes), ["LICENSE"]);
+    }
+
+    /// A patch key that names a DIRECTORY of the archive must find one in the
+    /// stage, exactly as a full extraction leaves one there — otherwise the
+    /// verify reports "File not found" where it used to report a hash
+    /// failure, and `--force` would silently skip the key.
+    #[tokio::test]
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
+    #[serial_test::serial]
+    async fn in_memory_repack_materialises_a_directory_a_patch_key_names() {
+        let archive = build_zip(&[entry("lib/net6.0/x.dll", b"MZ")]);
+        let files = target_files(&["lib/net6.0"]);
+        let repack = prepare_memory_repack(&archive, &files, &[])
+            .unwrap()
+            .unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        repack.stage_into(stage.path()).await.unwrap();
+        assert!(
+            stage.path().join("lib/net6.0").is_dir(),
+            "a patch key naming a directory must be staged as one"
+        );
+        assert!(
+            !stage.path().join("lib/net6.0/x.dll").exists(),
+            "its members stay in memory"
+        );
+    }
+
+    /// Only the patch targets and the explicitly requested extras are written
+    /// out — the point of the whole change.
+    #[tokio::test]
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
+    #[serial_test::serial]
+    async fn in_memory_repack_stages_only_what_the_apply_resolves() {
+        let archive = build_zip(&[
+            entry("LICENSE", b"pristine\n"),
+            entry("lib/a.dll", b"MZ-a"),
+            entry("lib/b.dll", b"MZ-b"),
+            entry(".nupkg.metadata", b"{}"),
+        ]);
+        let files = target_files(&["LICENSE"]);
+        let mut repack = prepare_memory_repack(&archive, &files, &[])
+            .unwrap()
+            .unwrap();
+        repack.also_stage(".nupkg.metadata");
+        let stage = tempfile::tempdir().unwrap();
+        repack.stage_into(stage.path()).await.unwrap();
+        assert!(stage.path().join("LICENSE").is_file());
+        assert!(stage.path().join(".nupkg.metadata").is_file());
+        assert!(!stage.path().join("lib/a.dll").exists());
+        assert!(!stage.path().join("lib/b.dll").exists());
+        assert!(!stage.path().join("lib").exists(), "no directory pass");
+    }
+
+    /// Archives whose names a filesystem can fold together, re-spell or
+    /// refuse must go back to the extract-to-disk path rather than be guessed
+    /// at in memory. Repeated names are the load-bearing case: on disk the
+    /// last one wins, in memory a naive map would keep both.
+    #[tokio::test]
+    async fn ambiguous_names_fall_back_to_the_on_disk_repack() {
+        let over_name_max = format!("lib/{}.class", "A".repeat(MAX_COMPONENT_BYTES));
+        let cases: Vec<(&str, Vec<u8>, Vec<&str>)> = vec![
+            (
+                "case-colliding names",
+                build_zip(&[
+                    entry("META-INF/NOTICE", b"a"),
+                    entry("META-INF/notice", b"b"),
+                ]),
+                vec![],
+            ),
+            (
+                "a name that is also a directory",
+                build_zip(&[entry("lib", b"a"), entry("lib/x.dll", b"b")]),
+                vec![],
+            ),
+            (
+                "a backslash in a name",
+                build_zip(&[entry("lib\\x.dll", b"a")]),
+                vec![],
+            ),
+            (
+                "a non-ASCII name",
+                build_zip(&[entry("lib/caf\u{e9}.txt", b"a")]),
+                vec![],
+            ),
+            (
+                "a DOS device name",
+                build_zip(&[entry("lib/NUL.txt", b"a")]),
+                vec![],
+            ),
+            (
+                "a trailing dot",
+                build_zip(&[entry("lib/x.", b"a")]),
+                vec![],
+            ),
+            (
+                "a patch key colliding with a member",
+                build_zip(&[entry("LICENSE", b"a")]),
+                vec!["license"],
+            ),
+            (
+                "two spellings of one directory",
+                build_zip(&[entry("Lib/a.class", b"a"), entry("lib/b.class", b"b")]),
+                vec![],
+            ),
+            (
+                "a patch key naming a member's directory under another spelling",
+                build_zip(&[entry("Lib/x.dll", b"a")]),
+                vec!["lib"],
+            ),
+            (
+                "a component past NAME_MAX",
+                build_zip(&[entry(&over_name_max, b"a")]),
+                vec![],
+            ),
+        ];
+        for (label, archive, keys) in cases {
+            let files = target_files(&keys);
+            assert!(
+                prepare_memory_repack(&archive, &files, &[])
+                    .unwrap()
+                    .is_none(),
+                "{label} must fall back to the on-disk repack"
+            );
+        }
+    }
+
+    /// The rebuilt archive is byte-identical on every platform: every
+    /// central-directory entry names Unix as its "made by" host (the zip
+    /// crate's own default is DOS on Windows) and keeps the unix mode it was
+    /// given, so a wheel/jar/nupkg rebuilt on Windows hashes like the one
+    /// the ledger recorded on macOS or Linux.
+    #[test]
+    fn write_zip_entries_stamps_a_unix_host_on_every_platform() {
+        let bytes = write_zip_entries(&[
+            ("pkg/run.sh".to_string(), b"#!/bin/sh\n".to_vec(), 0o755),
+            ("pkg/data.txt".to_string(), b"data\n".to_vec(), 0o644),
+        ])
+        .unwrap();
+        let mut hosts = Vec::new();
+        let mut at = 0;
+        while let Some(i) = bytes[at..].windows(4).position(|w| w == b"PK\x01\x02") {
+            let header = at + i;
+            hosts.push(bytes[header + 5]);
+            at = header + 4;
+        }
+        assert_eq!(hosts, vec![3, 3], "made-by host byte is Unix (3)");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let modes: Vec<u32> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().unix_mode().unwrap() & 0o777)
+            .collect();
+        assert_eq!(modes, vec![0o755, 0o644]);
+    }
+
+    /// `record.files` is a `HashMap` with a per-process random hasher, and
+    /// every walk over the staged paths returns on the FIRST I/O error — so
+    /// without a sort, two runs over one package under ENOSPC or EACCES name a
+    /// different file in the failure that reaches stdout.
+    #[test]
+    fn staged_paths_are_walked_in_a_deterministic_order() {
+        let files = target_files(&[
+            "z.txt",
+            "a/b.txt",
+            "m.txt",
+            "package/m.txt",
+            "d.txt",
+            "q/r.txt",
+            "../escapes.txt",
+        ]);
+        assert_eq!(
+            patch_target_paths(&files),
+            ["a/b.txt", "d.txt", "m.txt", "q/r.txt", "z.txt"],
+            "sorted, deduplicated past `package/`, and without the keys the \
+             apply pipeline refuses to join"
+        );
+    }
+
+    /// And the order survives into the stage, ahead of the extras the caller
+    /// adds for its sidecar fixup.
+    #[tokio::test]
+    async fn the_repack_stages_the_sorted_targets_then_the_extras() {
+        let archive = build_zip(&[
+            entry("z.txt", b"z"),
+            entry("m.txt", b"m"),
+            entry("d.txt", b"d"),
+            entry("a/b.txt", b"b"),
+            entry("q/r.txt", b"r"),
+            entry(".nupkg.metadata", b"{}"),
+        ]);
+        let files = target_files(&["z.txt", "m.txt", "d.txt", "a/b.txt", "q/r.txt"]);
+        let repack = prepare_memory_repack(&archive, &files, &[".nupkg.metadata"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repack.wanted,
+            [
+                "a/b.txt",
+                "d.txt",
+                "m.txt",
+                "q/r.txt",
+                "z.txt",
+                ".nupkg.metadata"
+            ]
+        );
+    }
+
+    /// A member folding onto one of the sidecar fixup's fixed paths must fall
+    /// back too: the fixup would delete that member on a case-insensitive
+    /// volume and leave it in place on a case-sensitive one, so the rebuilt
+    /// package is only reproducible through the on-disk path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_member_folding_onto_a_sidecar_path_falls_back() {
+        let archive = build_zip(&[entry(".NUPKG.METADATA", b"{}"), entry("LICENSE", b"x")]);
+        let files = target_files(&["LICENSE"]);
+        assert!(
+            prepare_memory_repack(&archive, &files, &[".nupkg.metadata"])
+                .unwrap()
+                .is_none(),
+            "a member folding onto `.nupkg.metadata` must take the on-disk path"
+        );
+        assert!(
+            prepare_memory_repack(&archive, &files, &[])
+                .unwrap()
+                .is_some(),
+            "and only because the fixup path was declared"
+        );
+    }
+
+    /// A repeated entry name: the extraction overwrites in place, so the LAST
+    /// spelling's bytes are what the rebuild carries. The in-memory reader
+    /// collapses the pair the same way, and the two repacks must agree.
+    #[tokio::test]
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
+    #[serial_test::serial]
+    async fn repeated_entry_names_repack_as_last_one_wins() {
+        // `ZipWriter` refuses a repeated name, so build two same-length names
+        // and rename the second in place (local header + central directory).
+        let mut archive = build_zip(&[entry("dup.txt", b"first"), entry("dup2txt", b"second")]);
+        rename_zip_entry(&mut archive, b"dup2txt", b"dup.txt");
+        // WHERE the pair collapses is the zip crate's business: it keys the
+        // central directory on the RAW name bytes in an `IndexMap`, so
+        // `ZipArchive` hands out one entry, at the first one's index, before
+        // `read_zip_members` sees it. Pinned here so a crate bump that stops
+        // doing it is caught rather than silently changing what the rebuild
+        // carries.
+        assert_eq!(
+            zip::ZipArchive::new(std::io::Cursor::new(archive.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "the zip crate collapses identical raw names itself"
+        );
+        let members = read_zip_members(&archive).unwrap();
+        assert_eq!(members.len(), 1, "the repeat collapses, as on disk");
+        assert_eq!(members[0].bytes, b"second");
+        let bytes = assert_repacks_agree(&archive, &["dup.txt"], &[], None, async |_| {}).await;
+        assert_eq!(zip_entry_names(&bytes), ["dup.txt"]);
+        assert_eq!(zip_member(&bytes, "dup.txt"), b"second");
+    }
+
+    /// The collapse `read_zip_members` does itself: two DIFFERENT raw names
+    /// that decode to one (`from_utf8_lossy` folds distinct invalid bytes onto
+    /// U+FFFD), which the zip crate keeps apart and `extract_zip` writes to a
+    /// single path — last one wins, exactly as the reader's `at` map does.
+    #[tokio::test]
+    async fn raw_names_decoding_to_one_name_collapse_last_one_wins() {
+        let mut archive = build_zip(&[entry("dupA.txt", b"first"), entry("dupB.txt", b"second")]);
+        rename_zip_entry(&mut archive, b"dupA.txt", b"dup\xff.txt");
+        rename_zip_entry(&mut archive, b"dupB.txt", b"dup\xfe.txt");
+        // Without the language-encoding flag the names decode through CP437,
+        // which is a bijection — the lossy fold needs the UTF-8 flag set.
+        set_utf8_name_flag(&mut archive);
+        let decoded = "dup\u{fffd}.txt";
+        assert_eq!(
+            zip::ZipArchive::new(std::io::Cursor::new(archive.clone()))
+                .unwrap()
+                .len(),
+            2,
+            "the raw names differ, so the zip crate keeps both entries"
+        );
+        let members = read_zip_members(&archive).unwrap();
+        assert_eq!(members.len(), 1, "but they name one file");
+        assert_eq!(members[0].name, decoded);
+        assert_eq!(members[0].bytes, b"second");
+        // And that is what an extraction leaves behind.
+        let stage = tempfile::tempdir().unwrap();
+        super::super::registry_fetch::extract_zip(&archive, stage.path(), false).unwrap();
+        assert_eq!(
+            tokio::fs::read(stage.path().join(decoded)).await.unwrap(),
+            b"second"
+        );
+        // The name is not plain ASCII, so the rebuild itself takes the
+        // extract-to-disk path — the reader still has to agree about it,
+        // because it runs before the gate does.
+        assert!(
+            prepare_memory_repack(&archive, &target_files(&["dup.txt"]), &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Set the general-purpose "language encoding" bit (bit 11) on every local
+    /// file header and central directory header, so the reader decodes entry
+    /// names as UTF-8 instead of CP437.
+    fn set_utf8_name_flag(archive: &mut [u8]) {
+        for (signature, flags_at) in [(b"PK\x03\x04".as_slice(), 6), (b"PK\x01\x02".as_slice(), 8)]
+        {
+            let mut at = 0;
+            let mut hits = 0;
+            while at + flags_at + 2 <= archive.len() {
+                if archive[at..].starts_with(signature) {
+                    archive[at + flags_at + 1] |= 0b0000_1000;
+                    hits += 1;
+                    at += signature.len();
+                } else {
+                    at += 1;
+                }
+            }
+            assert_eq!(hits, 2, "two entries, one header of each kind apiece");
+        }
+    }
+
+    /// A member no filesystem can create: the extraction fails the whole
+    /// rebuild with ENAMETOOLONG, so the gate has to keep such an archive on
+    /// that path. In memory it would rebuild cleanly and turn a package the
+    /// baseline refused into a vendored one.
+    #[tokio::test]
+    async fn a_member_past_name_max_still_fails_the_rebuild() {
+        let long = format!("lib/{}.class", "A".repeat(MAX_COMPONENT_BYTES));
+        let archive = build_zip(&[entry("LICENSE", b"a"), entry(&long, b"b")]);
+        assert!(
+            prepare_memory_repack(&archive, &target_files(&["LICENSE"]), &[])
+                .unwrap()
+                .is_none(),
+            "an unwritable member name must take the on-disk repack"
+        );
+        let stage = tempfile::tempdir().unwrap();
+        let error = super::super::registry_fetch::extract_zip(&archive, stage.path(), false)
+            .expect_err("no filesystem creates a component past NAME_MAX");
+        assert!(
+            error.starts_with("cannot create ") && error.contains(&long["lib/".len()..]),
+            "{error}"
+        );
+    }
+
+    /// Two spellings of one directory: a case-insensitive stage collapses them,
+    /// and the walk back out re-spells the second member under the first's
+    /// casing — a different rebuilt artifact, and so a different `.sha1`
+    /// sidecar and NuGet `contentHash`. The in-memory repack cannot reproduce
+    /// that, so the gate must send the archive to disk.
+    #[tokio::test]
+    async fn case_variant_directory_spellings_take_the_on_disk_repack() {
+        let archive = build_zip(&[
+            entry("LICENSE", b"pristine\n"),
+            entry("Lib/a.class", b"a"),
+            entry("lib/b.class", b"b"),
+        ]);
+        assert!(
+            prepare_memory_repack(&archive, &target_files(&["LICENSE"]), &[])
+                .unwrap()
+                .is_none(),
+            "a folded directory spelling must take the on-disk repack"
+        );
+        // And on a volume that really does fold, pin what the extraction
+        // leaves behind — so the gate stays necessary rather than cosmetic.
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::create_dir(probe.path().join("Lib")).unwrap();
+        if std::fs::create_dir(probe.path().join("lib")).is_err() {
+            let oracle = on_disk_repack(&archive, None, async |_| {}).await.unwrap();
+            assert_eq!(
+                zip_entry_names(&oracle),
+                ["LICENSE", "Lib/a.class", "Lib/b.class"],
+                "the second member is republished under the first's casing"
+            );
+        }
+    }
+
+    /// Rewrite every occurrence of an entry name in a zip's bytes. `from` and
+    /// `to` must be the same length so no offset in the archive moves.
+    fn rename_zip_entry(archive: &mut [u8], from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len(), "renaming must not move offsets");
+        let mut at = 0;
+        let mut hits = 0;
+        while at + from.len() <= archive.len() {
+            if &archive[at..at + from.len()] == from {
+                archive[at..at + from.len()].copy_from_slice(to);
+                hits += 1;
+                at += from.len();
+            } else {
+                at += 1;
+            }
+        }
+        assert_eq!(hits, 2, "local header and central directory");
+    }
+
+    /// Every refusal the on-disk extractor raises must come out of the
+    /// in-memory reader with the identical message, so a poisoned artifact
+    /// fails the same way whichever path ran.
+    #[tokio::test]
+    async fn in_memory_reader_refuses_exactly_what_the_extractor_refuses() {
+        let escaping = build_zip(&[entry("../evil.js", b"x")]);
+        let truncated = {
+            let mut bytes = build_zip(&[entry("a.txt", b"hello")]);
+            bytes.truncate(bytes.len() / 2);
+            bytes
+        };
+        for (label, archive) in [("escaping entry", escaping), ("truncated", truncated)] {
+            let stage = tempfile::tempdir().unwrap();
+            let oracle = super::super::registry_fetch::extract_zip(&archive, stage.path(), false)
+                .unwrap_err();
+            let fast = match read_zip_members(&archive) {
+                Err(e) => e,
+                Ok(_) => panic!("{label}: the in-memory reader must refuse this archive"),
+            };
+            assert_eq!(fast, oracle, "{label}: the two readers must agree");
+        }
+    }
+
+    /// The entry names of a zip, in central-directory order.
+    fn zip_entry_names(bytes: &[u8]) -> Vec<String> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    /// One member's bytes.
+    fn zip_member(bytes: &[u8], name: &str) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut out = Vec::new();
+        archive
+            .by_name(name)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    /// The name gate's rules, one by one.
+    #[test]
+    fn names_are_unambiguous_rejects_what_a_filesystem_can_fold_or_respell() {
+        let plain = |names: [&str; 1]| names_are_unambiguous(names, []);
+        assert!(names_are_unambiguous(["a/b.txt", "a/c.txt", "d.txt"], []));
+        assert!(
+            names_are_unambiguous(["a/b.txt"], ["a/b.txt"]),
+            "a patch target IS usually a member"
+        );
+        assert!(
+            !names_are_unambiguous(["A.txt"], ["a.txt"]),
+            "a target folding onto a member"
+        );
+        assert!(!names_are_unambiguous(["A.txt", "a.txt"], []), "case fold");
+        assert!(
+            !names_are_unambiguous(["Lib/a.class", "lib/b.class"], []),
+            "two spellings of one DIRECTORY fold into one entry too — the walk \
+             back out would re-spell the second member under the first's casing"
+        );
+        assert!(
+            !names_are_unambiguous(["META-INF/services/a", "meta-inf/services/b"], []),
+            "a folded directory anywhere along the path"
+        );
+        assert!(
+            !names_are_unambiguous(["Lib/x.dll"], ["lib"]),
+            "a target naming a member's directory under a different spelling"
+        );
+        assert!(
+            names_are_unambiguous(["lib/a.dll", "lib/b.dll", "lib/net6.0/c.dll"], []),
+            "siblings sharing a directory spelling stay on the fast path"
+        );
+        assert!(
+            !names_are_unambiguous(["a", "a/b"], []),
+            "file vs directory"
+        );
+        assert!(!names_are_unambiguous(["a/b", "A"], []), "folded ancestor");
+        assert!(
+            !names_are_unambiguous(["lib"], ["lib/x"]),
+            "a target living under a member FILE"
+        );
+        assert!(
+            names_are_unambiguous(["lib/net6.0/x.dll"], ["lib/net6.0"]),
+            "a target naming a member's DIRECTORY is ordinary"
+        );
+        assert!(!plain(["a\\b"]), "backslash");
+        assert!(!plain(["caf\u{e9}"]), "non-ASCII");
+        assert!(!plain(["a:b"]), "alternate data stream");
+        assert!(!plain(["a*"]), "Windows wildcard");
+        assert!(!plain(["a."]), "trailing dot");
+        assert!(!plain(["a "]), "trailing space");
+        assert!(!plain(["nul"]), "DOS device");
+        assert!(!plain(["dir/COM1.txt"]), "DOS device stem");
+        assert!(!plain(["a/./b"]), "re-spelled component");
+        assert!(!plain(["a//b"]), "empty component");
+        assert!(!plain([""]), "empty name");
+        let long_part = "A".repeat(MAX_COMPONENT_BYTES + 1);
+        assert!(
+            !plain([format!("org/apache/{long_part}.class").as_str()]),
+            "a component past NAME_MAX — the extraction would have failed with \
+             ENAMETOOLONG, so the rebuild has to keep failing"
+        );
+        assert!(
+            plain([format!("org/apache/{}.class", "A".repeat(MAX_COMPONENT_BYTES - 6)).as_str()]),
+            "a component exactly at NAME_MAX still extracts"
+        );
+        let deep = vec!["dir"; MAX_NAME_BYTES / 4 + 1].join("/");
+        assert!(
+            !plain([deep.as_str()]),
+            "a whole name long enough to push `<stage>/<name>` past PATH_MAX"
+        );
+        assert!(
+            names_are_unambiguous(["my lib/x.dll", "a-b_c+d$e.txt", "[Content_Types].xml"], []),
+            "ordinary jar/nupkg spellings stay on the fast path"
         );
     }
 }

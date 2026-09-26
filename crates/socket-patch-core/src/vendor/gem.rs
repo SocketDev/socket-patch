@@ -58,7 +58,7 @@ use serde_json::Value;
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_trailing_options;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
@@ -72,10 +72,11 @@ use super::common::{
 };
 use super::gemfile_lock::{is_plain_gem_token, split_checksum_entry, split_entry};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
-use super::registry_fetch::extract_gem_data;
+use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::service_fetch::{
     fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult, ServiceArtifact,
 };
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -128,9 +129,9 @@ const MANAGED_CLOSE: &str = "# <<< socket-patch vendor (managed) <<<";
 /// unwinds the Gemfile to its recorded original bytes, so the pair is never
 /// left half-wired.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_gem(
+pub async fn vendor_gem<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -139,6 +140,7 @@ pub async fn vendor_gem(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     // ── coordinates ──────────────────────────────────────────────────────
     let Some((name, version)) = parse_gem_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a gem purl: {purl}"));
@@ -215,6 +217,7 @@ pub async fn vendor_gem(
         }
     }
     let dir_name = installed_dir
+        .path()
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -286,6 +289,7 @@ pub async fn vendor_gem(
     // stub is actually required.
     let local_stub: Option<(PathBuf, String)> = {
         let spec_src = installed_dir
+            .path()
             .parent()
             .filter(|gems| gems.file_name().is_some_and(|n| n == "gems"))
             .and_then(Path::parent)
@@ -425,6 +429,24 @@ pub async fn vendor_gem(
     // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
         let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        // The verify reads the installed gem, so a lazily-fetched source
+        // materialises here — the one dry-run branch that touches it.
+        let installed_dir = match installed_dir.materialize().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                return done(
+                    synthesized_result(
+                        purl,
+                        &copy_dir,
+                        Vec::new(),
+                        false,
+                        Some(format!("failed to copy installed gem: {e}")),
+                    ),
+                    None,
+                    dry_warnings,
+                )
+            }
+        };
         let mut result = super::force_apply_staged(
             purl,
             installed_dir,
@@ -813,7 +835,7 @@ async fn gem_service_copy(
     };
 
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
-    let archive = match fetch_verified_archive(cfg, &record.uuid).await {
+    let mut archive = match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => archive,
         // Bytes that fail integrity verification are an active tamper signal:
         // ALWAYS a hard error, in `auto` exactly as in `service` — never a
@@ -954,7 +976,8 @@ async fn gem_service_copy(
             format!("cannot create {}: {e}", stage.display()),
         );
     }
-    if let Err(e) = extract_gem_data(&archive.bytes, &stage) {
+    let gem_bytes = std::mem::take(&mut archive.bytes);
+    if let Err(e) = extract_on_blocking_pool(gem_bytes, &stage, extract_gem_data).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return hard(
             "vendor_prebuilt_extract_failed",
@@ -1022,7 +1045,7 @@ async fn gem_service_copy(
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_copy(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: PackageSource<'_>,
     copy_dir: &Path,
     uuid_dir: &Path,
     name: &str,
@@ -1110,8 +1133,11 @@ async fn materialise_patched_copy(
                 )));
             }
             let stage = stage_dir_for(copy_dir);
-            // `fresh_copy` removes + recreates the stage itself.
-            if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+            // The local build is the first branch that reads the source. An
+            // installed gem is copied out of the gem home; a fetched one is
+            // written straight here from the verified `.gem`. `stage_into`
+            // removes + recreates the stage itself.
+            if let Err(e) = installed_dir.stage_into(&stage, None).await {
                 cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 return Ok(synthesized_result(
                     purl,

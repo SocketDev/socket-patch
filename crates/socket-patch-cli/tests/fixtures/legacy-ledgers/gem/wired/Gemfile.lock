@@ -1,0 +1,23 @@
+PATH
+  remote: .socket/vendor/gem/11111111-1111-4111-8111-000000000001/alpha-1.0.0
+  specs:
+    alpha (1.0.0)
+
+PATH
+  remote: .socket/vendor/gem/11111111-1111-4111-8111-000000000002/beta-1.0.0
+  specs:
+    beta (1.0.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  alpha (= 1.0.0)!
+  beta (= 1.0.0)!
+
+BUNDLED WITH
+   2.5.3

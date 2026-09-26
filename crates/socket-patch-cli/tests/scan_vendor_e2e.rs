@@ -2147,3 +2147,253 @@ fn run_manifestless_tail(label: &str, checkout: &Path, pristine: Vec<u8>) {
             .expect("manifest-less VEX tail panicked");
     });
 }
+
+// ───────────────────── the download plan is exact ─────────────────────
+
+mod exact_download_plan {
+    //! A vendored run fetches prebuilt archives ahead of its serial wiring
+    //! loop, from a plan of the packages the loop will ask the service
+    //! for. A download grant (`POST /patches/package`) can start a
+    //! server-side build and counts against quota, so the plan must be
+    //! EXACT: a package the loop refuses before it would ask the service
+    //! — here a pnpm entry the backend cannot rewire — costs no grant at
+    //! all, while every package the loop does reach costs exactly one.
+    use super::*;
+    use wiremock::matchers::path_regex;
+
+    const UUID_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const UUID_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const UUID_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const PACKAGES: [(&str, &str); 3] = [("pkg-a", UUID_A), ("pkg-b", UUID_B), ("pkg-c", UUID_C)];
+
+    fn purl(name: &str) -> String {
+        format!("pkg:npm/{name}@1.0.0")
+    }
+
+    /// A pnpm 9 project with three installed, patched packages. `pkg-b`'s
+    /// snapshot key carries a peer suffix (`1.0.0(peer-x@1.0.0)`), which
+    /// the pnpm backend refuses as `vendor_lock_entry_unsupported` before
+    /// staging anything — the shape behind two of the three speculative
+    /// grants the plan used to issue on depscan.
+    fn write_pnpm_fixture(root: &Path) {
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "plan-test", "version": "0.0.0", "dependencies": { "pkg-a": "1.0.0", "pkg-b": "1.0.0", "pkg-c": "1.0.0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      pkg-a:
+        specifier: 1.0.0
+        version: 1.0.0
+      pkg-b:
+        specifier: 1.0.0
+        version: 1.0.0(peer-x@1.0.0)
+      pkg-c:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  pkg-a@1.0.0:
+    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
+
+  pkg-b@1.0.0:
+    resolution: {integrity: sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==}
+    peerDependencies:
+      peer-x: '*'
+
+  pkg-c@1.0.0:
+    resolution: {integrity: sha512-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC==}
+
+snapshots:
+
+  pkg-a@1.0.0: {}
+
+  pkg-b@1.0.0(peer-x@1.0.0): {}
+
+  pkg-c@1.0.0: {}
+",
+        )
+        .unwrap();
+        for (name, _) in PACKAGES {
+            let pkg = root.join("node_modules").join(name);
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+    }
+
+    /// Discovery, per-package search and views for the three patches, and a
+    /// grant endpoint that answers `not_found` for every uuid (the loop then
+    /// builds locally — the grant is what this test counts).
+    async fn mount_three_patch_api(mock: &MockServer) {
+        let before_hash = git_sha256(BEFORE);
+        let after_hash = git_sha256(AFTER);
+        let packages: Vec<serde_json::Value> = PACKAGES
+            .iter()
+            .map(|(name, uuid)| {
+                serde_json::json!({
+                    "purl": purl(name),
+                    "patches": [{
+                        "uuid": uuid, "purl": purl(name), "tier": "free",
+                        "cveIds": ["CVE-2026-0001"], "ghsaIds": [], "severity": "high",
+                        "title": "plan target"
+                    }]
+                })
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": packages,
+                "canAccessPaidPatches": false,
+            })))
+            .mount(mock)
+            .await;
+        for (name, uuid) in PACKAGES {
+            let encoded = format!("pkg%3Anpm%2F{name}%401.0.0");
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "patches": [{
+                        "uuid": uuid, "purl": purl(name),
+                        "publishedAt": "2026-01-01T00:00:00Z",
+                        "description": "plan target", "license": "MIT", "tier": "free",
+                        "vulnerabilities": {}
+                    }],
+                    "canAccessPaidPatches": false,
+                })))
+                .mount(mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": uuid,
+                    "purl": purl(name),
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "files": {
+                        "package/index.js": {
+                            "beforeHash": before_hash,
+                            "afterHash": after_hash,
+                            "blobContent": AFTER_B64,
+                        }
+                    },
+                    "vulnerabilities": {
+                        "GHSA-aaaa-bbbb-cccc": {
+                            "cves": ["CVE-2026-0001"], "summary": "test vuln",
+                            "severity": "high", "description": "details"
+                        }
+                    },
+                    "description": "plan target", "license": "MIT", "tier": "free",
+                })))
+                .mount(mock)
+                .await;
+        }
+        let results: serde_json::Map<String, serde_json::Value> = PACKAGES
+            .iter()
+            .map(|(_, uuid)| {
+                (
+                    uuid.to_string(),
+                    serde_json::json!({ "status": "not_found", "url": null, "artifacts": [] }),
+                )
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path_regex(format!("^/v0/orgs/{ORG_SLUG}/patches/package$")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })),
+            )
+            .mount(mock)
+            .await;
+    }
+
+    /// Every uuid the run asked a download grant for, in request order
+    /// (one request may name several).
+    async fn granted_uuids(mock: &MockServer) -> Vec<String> {
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == wiremock::http::Method::POST
+                    && r.url.path().ends_with("/patches/package")
+            })
+            .flat_map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).expect("grant body");
+                body["uuids"]
+                    .as_array()
+                    .expect("uuids array")
+                    .iter()
+                    .map(|u| u.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// A package the loop refuses before its first service call costs ZERO
+    /// download grants: the plan is built from the backend's own pre-flight,
+    /// so `pkg-b` is never asked for, while `pkg-a` and `pkg-c` — which the
+    /// loop does ask for — cost exactly one grant each. The refusal itself
+    /// is still the loop's, reported as it always was.
+    #[tokio::test]
+    async fn a_package_the_loop_refuses_costs_zero_grants() {
+        // The plan is only built when the run may keep more than one
+        // request in flight, and a tight descriptor limit pins the API
+        // concurrency at one whatever the environment says (the helper
+        // already scrubs `SOCKET_API_CONCURRENCY`). The strictly serial
+        // loop then trivially grants nothing for the refused package, and
+        // this test would pass without the pre-flight it pins ever
+        // running — so fail loudly rather than vacuously.
+        assert!(
+            !socket_patch_core::crawlers::walk_pool::fd_limit_is_tight(),
+            "the descriptor limit is too tight for the download plan to be built, so this \
+             test cannot exercise the pre-flight it pins; raise `ulimit -n` and re-run"
+        );
+        let mock = MockServer::start().await;
+        mount_three_patch_api(&mock).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_fixture(tmp.path());
+
+        let (_code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
+        let events = v["vendor"]["events"].as_array().expect("vendor events");
+        let event_for = |name: &str| {
+            events
+                .iter()
+                .find(|e| e["purl"] == purl(name))
+                .unwrap_or_else(|| panic!("no vendor event for {name}: {v}"))
+        };
+        assert_eq!(event_for("pkg-a")["action"], "applied", "{v}");
+        assert_eq!(event_for("pkg-c")["action"], "applied", "{v}");
+        let refused = event_for("pkg-b");
+        assert_eq!(refused["action"], "failed", "{v}");
+        assert_eq!(refused["errorCode"], "vendor_lock_entry_unsupported", "{v}");
+
+        let mut granted = granted_uuids(&mock).await;
+        granted.sort();
+        assert_eq!(
+            granted,
+            vec![UUID_A.to_string(), UUID_C.to_string()],
+            "exactly one grant per package the loop reaches the service for, and none \
+             for the package it refuses first"
+        );
+    }
+}

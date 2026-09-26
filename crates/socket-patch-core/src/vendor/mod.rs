@@ -65,6 +65,7 @@ pub(crate) mod gemfile_lock;
 pub mod go_mod_edit;
 pub mod go_sum_edit;
 pub mod golang;
+pub(crate) mod ledger_snapshots;
 pub mod lock_inventory;
 pub(crate) mod maven_pom;
 pub mod maven_repo;
@@ -74,6 +75,7 @@ pub mod npm_lock;
 mod npm_pack;
 pub(crate) mod nuget_config;
 pub mod nuget_feed;
+pub(crate) mod parse_memo;
 pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod pypi;
@@ -88,6 +90,7 @@ mod pypi_wheel;
 pub mod registry_fetch;
 pub(crate) mod reuse;
 pub(crate) mod service_fetch;
+pub mod source;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod toml_surgery;
@@ -99,6 +102,7 @@ mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
 pub(crate) use pypi_lock::restore_document as restore_python_document;
+pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
 // `vex::discover` validates lockfile-recorded npm names with the same rule the
 // npm backends apply to their own coordinates.
 pub(crate) use npm_common::is_safe_npm_name;
@@ -274,11 +278,54 @@ pub struct VendorServiceConfig {
     pub offline: bool,
 }
 
+/// Most prebuilt archives the vendor prefetch keeps outstanding, below the
+/// patch API's own in-flight cap. An archive is a whole tarball in memory
+/// where the serial loop held exactly one, so the window is bounded by
+/// what it costs, not only by what it saves: the wiring loop is fsync-
+/// bound between packages, so four downloads ahead already keep it fed,
+/// and one more only raises peak memory by another artifact.
+const ARCHIVE_PREFETCH_WINDOW: usize = 4;
+
 impl VendorServiceConfig {
     /// Whether this run may actually attempt a service download right now:
     /// the mode permits it, we're online, and a client is configured.
     pub fn service_enabled(&self) -> bool {
         self.source.may_use_service() && !self.offline && self.client.is_some()
+    }
+
+    /// Whether a run through this config would prefetch service downloads
+    /// at all — false when the service is not enabled, and false whenever
+    /// the in-flight cap is one, which is
+    /// [`crate::utils::concurrent::API_CONCURRENCY_ENV`]'s documented
+    /// promise (and what a tight descriptor limit forces): one request at
+    /// a time, the strictly serial loop, nothing fetched ahead. Callers
+    /// ask before doing the work of naming the plan.
+    pub fn wants_prefetch(&self) -> bool {
+        self.service_enabled()
+            && crate::utils::concurrent::api_concurrency(self.use_public_proxy) > 1
+    }
+
+    /// Attach a download plan to this config's client: `uuids` are the
+    /// records the vendor loop is expected to download from the service,
+    /// in loop order (see [`crate::api::client::ApiClient::prefetch_vendor_packages`]).
+    /// `None` — nothing attached — when [`Self::wants_prefetch`] is false,
+    /// or when fewer than two downloads are planned (nothing to overlap).
+    pub fn prefetch_archives(
+        &self,
+        uuids: Vec<String>,
+    ) -> Option<crate::api::client::VendorPrefetchGuard> {
+        if !self.wants_prefetch() || uuids.len() < 2 {
+            return None;
+        }
+        let client = self.client.as_ref()?;
+        Some(client.prefetch_vendor_packages(
+            uuids,
+            self.use_public_proxy,
+            self.vendor_url.as_deref(),
+            self.patch_server_url.as_deref(),
+            crate::utils::concurrent::api_concurrency(self.use_public_proxy)
+                .min(ARCHIVE_PREFETCH_WINDOW),
+        ))
     }
 }
 
@@ -381,6 +428,12 @@ pub async fn harvest_artifact_blobs(
     harvest_artifact_blobs_from(project_root, &state.entries, manifest_patches).await
 }
 
+/// Hard cap on a committed artifact's own bytes, and on any one member
+/// harvested out of it. Shared by [`harvest_artifact_blobs_from`] and the
+/// zip reader it hands the work to.
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// [`harvest_artifact_blobs`] over an already-loaded ledger (`entries`),
 /// for callers that hold the run's single `load_state` result.
 pub async fn harvest_artifact_blobs_from(
@@ -389,9 +442,6 @@ pub async fn harvest_artifact_blobs_from(
     manifest_patches: &HashMap<String, PatchRecord>,
 ) -> HashMap<String, Vec<u8>> {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-
-    const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
-    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();
     if entries.is_empty() {
@@ -465,42 +515,22 @@ pub async fn harvest_artifact_blobs_from(
             {
                 continue;
             }
-            let Ok(bytes) = tokio::fs::read(&artifact).await else {
-                continue;
-            };
-            let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
-                continue;
-            };
-            for i in 0..archive.len() {
-                use std::io::Read as _;
-                let Ok(mut file) = archive.by_index(i) else {
-                    continue;
-                };
-                if file.is_dir() || file.size() > MAX_FILE_BYTES {
-                    continue;
-                }
-                // SECURITY: `file.size()` above is only the archive-DECLARED
-                // uncompressed size; the entry reader is bounded solely by the
-                // COMPRESSED size, so a zip bomb can declare a tiny size (past
-                // the gate) yet decompress far beyond the cap. Bound the
-                // decompressed read itself and drop any entry that overflows,
-                // before its bytes are all in memory.
-                let mut content = Vec::with_capacity(file.size() as usize);
-                if file
-                    .by_ref()
-                    .take(MAX_FILE_BYTES + 1)
-                    .read_to_end(&mut content)
-                    .is_err()
-                {
-                    continue;
-                }
-                if content.len() as u64 > MAX_FILE_BYTES {
-                    continue;
-                }
-                let h = compute_git_sha256_from_bytes(&content);
-                if needed.contains(h.as_str()) {
-                    out.insert(h, content);
-                }
+            // The record's own keys name the members carrying the
+            // afterHashes, so the reader below can seek straight to them.
+            let wanted: Vec<(String, String)> = record
+                .files
+                .iter()
+                .filter(|(_, info)| needed.contains(info.after_hash.as_str()))
+                .map(|(file_name, info)| (file_name.clone(), info.after_hash.clone()))
+                .collect();
+            let zip_path = artifact.clone();
+            // Read + inflate are synchronous: run them off the async thread
+            // like the tarball branch above, so a large committed artifact
+            // never stalls the runtime.
+            let read =
+                tokio::task::spawn_blocking(move || harvest_zip_blobs(&zip_path, &wanted)).await;
+            if let Ok(found) = read {
+                out.extend(found);
             }
             continue;
         }
@@ -535,6 +565,131 @@ pub async fn harvest_artifact_blobs_from(
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+// Test-only: how many times `harvest_zip_blobs`'s fallback scan ran on THIS
+// thread. The name path and the scan return the same blobs by construction,
+// so which one produced them is otherwise unobservable — and it is the whole
+// point of the item. Thread-local, so the tests that read it call
+// `harvest_zip_blobs` directly rather than through the blocking pool.
+#[cfg(test)]
+thread_local! {
+    static FALLBACK_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: run `f` and report how many fallback scans it took.
+#[cfg(test)]
+fn fallback_scans_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    FALLBACK_SCANS.with(|n| n.set(0));
+    let out = f();
+    (out, FALLBACK_SCANS.with(std::cell::Cell::get))
+}
+
+/// One zip-shaped committed artifact's contribution to the harvest: the
+/// blobs whose git-sha256 is one of the `(record key, afterHash)` pairs in
+/// `wanted`. Synchronous — the caller runs it on the blocking pool.
+///
+/// A zip is addressable by member name and `wanted`'s keys ARE the member
+/// names (modulo the `package/` prefix a manifest key may carry), so the
+/// common case costs one seek and one inflate per needed hash instead of
+/// inflating the whole archive. Everything the name lookup does not settle —
+/// a member renamed since the patch was exported, a duplicate name, an
+/// entry the caps reject — falls back to the exhaustive index scan the
+/// harvest always did, which is what keeps the result identical to reading
+/// every entry: the name path only ever admits an entry whose hash IS one of
+/// the wanted ones, and the scan then supplies every hash still outstanding.
+fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String, Vec<u8>> {
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// The entry's bytes, or `None` when either cap rejects it.
+    ///
+    /// SECURITY: `size` is only the archive-DECLARED uncompressed size; the
+    /// entry reader is bounded solely by the COMPRESSED size, so a zip bomb
+    /// can declare a tiny size (past the gate) yet decompress far beyond the
+    /// cap. Bound the decompressed read itself and drop any entry that
+    /// overflows, before its bytes are all in memory.
+    fn capped(size: u64, entry: &mut impl std::io::Read) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+
+        if size > MAX_FILE_BYTES {
+            return None;
+        }
+        let mut content = Vec::with_capacity(size as usize);
+        entry
+            .by_ref()
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut content)
+            .ok()?;
+        (content.len() as u64 <= MAX_FILE_BYTES).then_some(content)
+    }
+
+    let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    // The caller's metadata gate already refused a non-regular path; the
+    // guarded opener refuses one swapped in since, so a FIFO planted between
+    // the two can never wedge the blocking pool in `open(2)`.
+    let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(path) else {
+        return out;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return out;
+    };
+
+    let mut remaining: HashSet<&str> = wanted.iter().map(|(_, hash)| hash.as_str()).collect();
+    for (file_name, hash) in wanted {
+        if !remaining.contains(hash.as_str()) {
+            continue;
+        }
+        // The same two spellings `verify_member_map` looks a member up by:
+        // the normalized key first, then the raw manifest key.
+        let normalized = normalize_file_path(file_name);
+        let names = [normalized, file_name.as_str()];
+        for (i, name) in names.iter().enumerate() {
+            if names[..i].contains(name) {
+                continue;
+            }
+            let Ok(mut entry) = archive.by_name(name) else {
+                continue;
+            };
+            if entry.is_dir() {
+                continue;
+            }
+            let size = entry.size();
+            let Some(content) = capped(size, &mut entry) else {
+                continue;
+            };
+            let h = compute_git_sha256_from_bytes(&content);
+            if h == *hash {
+                remaining.remove(hash.as_str());
+                out.insert(h, content);
+                break;
+            }
+        }
+    }
+    if remaining.is_empty() {
+        return out;
+    }
+
+    // Fallback: the member names disagree with the record's keys (or an
+    // entry was rejected above). Scan every entry, exactly as before.
+    #[cfg(test)]
+    FALLBACK_SCANS.with(|n| n.set(n.get() + 1));
+    for i in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let size = entry.size();
+        let Some(content) = capped(size, &mut entry) else {
+            continue;
+        };
+        let h = compute_git_sha256_from_bytes(&content);
+        if remaining.contains(h.as_str()) {
+            out.insert(h, content);
         }
     }
     out
@@ -578,7 +733,9 @@ pub(crate) async fn force_apply_staged(
             );
         }
     }
-    let result = apply_package_patch(
+    // The stage becomes a content-verified artifact: its patched files are
+    // written without an fsync (see `crate::utils::durability`).
+    let result = crate::utils::durability::artifact_writes(apply_package_patch(
         purl,
         staged_dir,
         &record.files,
@@ -589,7 +746,7 @@ pub(crate) async fn force_apply_staged(
         // Force additionally covers the caller's --force NotFound-skip
         // (the missing-file pre-check above handles the default case).
         crate::patch::apply::MismatchPolicy::Force,
-    )
+    ))
     .await;
     if result.success {
         warnings.extend(mismatch_overwrite_warnings(&result, name, version));
@@ -1251,6 +1408,332 @@ mod harvest_tests {
             mem.get(&hash).map(|b| b.as_slice()),
             Some(PATCHED),
             "an in-bounds zip entry must still yield its afterHash blob"
+        );
+    }
+
+    // ── The name-seeking harvest against the scan it replaced ───────────
+    // `harvest_zip_blobs` returns the same blobs whichever path produced
+    // them, which is what makes it safe and also what makes a scenario test
+    // blind to the path: every test below still passes with the name lookup
+    // deleted. The oracle pins the RESULT against the pre-change scan, and
+    // `fallback_scans_of` pins the PATH.
+
+    /// The whole-archive scan `harvest_zip_blobs` replaced, verbatim, over
+    /// the hashes a record needs.
+    fn exhaustive_scan(path: &Path, needed: &HashSet<&str>) -> HashMap<String, Vec<u8>> {
+        use std::io::Read as _;
+
+        let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+        let Ok(bytes) = std::fs::read(path) else {
+            return out;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+            return out;
+        };
+        for i in 0..archive.len() {
+            let Ok(mut file) = archive.by_index(i) else {
+                continue;
+            };
+            if file.is_dir() || file.size() > MAX_FILE_BYTES {
+                continue;
+            }
+            let mut content = Vec::with_capacity(file.size() as usize);
+            if file
+                .by_ref()
+                .take(MAX_FILE_BYTES + 1)
+                .read_to_end(&mut content)
+                .is_err()
+            {
+                continue;
+            }
+            if content.len() as u64 > MAX_FILE_BYTES {
+                continue;
+            }
+            let h = compute_git_sha256_from_bytes(&content);
+            if needed.contains(h.as_str()) {
+                out.insert(h, content);
+            }
+        }
+        out
+    }
+
+    /// A zip holding `entries` in order, member names verbatim.
+    fn write_zip_members(path: &Path, entries: &[(&str, &[u8])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(*name, opts).unwrap();
+            writer.write_all(content).unwrap();
+        }
+        std::fs::write(path, writer.finish().unwrap().into_inner()).unwrap();
+    }
+
+    /// A zip carrying the SAME member name twice: written under two
+    /// distinct names, then renamed in place (all three names are five
+    /// bytes, so every header offset is preserved).
+    fn write_duplicate_name_zip(path: &Path, name: &str, first: &[u8], second: &[u8]) {
+        write_zip_members(path, &[("x1.py", first), ("x2.py", second)]);
+        let mut bytes = std::fs::read(path).unwrap();
+        for old in [b"x1.py".as_slice(), b"x2.py".as_slice()] {
+            while let Some(at) = bytes.windows(5).position(|w| w == old) {
+                bytes[at..at + 5].copy_from_slice(name.as_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn wanted_pairs(keys: &[(&str, &[u8])]) -> Vec<(String, String)> {
+        keys.iter()
+            .map(|(k, c)| (k.to_string(), compute_git_sha256_from_bytes(c)))
+            .collect()
+    }
+
+    /// Whatever the archive's member names turn out to be, the harvest must
+    /// return exactly the blob SET the exhaustive scan returns — that is
+    /// the equivalence the by-name seek rests on, and the shapes below are
+    /// the ways a name can disagree with a record key.
+    #[test]
+    fn name_seeking_harvest_matches_the_exhaustive_scan() {
+        const A: &[u8] = b"alpha\n";
+        const B: &[u8] = b"beta\n";
+        const C: &[u8] = b"gamma\n";
+
+        // The zip's members, and the record keys naming the bytes the
+        // record claims live behind them.
+        type Members<'a> = Vec<(&'a str, &'a [u8])>;
+        let cases: Vec<(&str, Members, Members)> = vec![
+            (
+                "exact-names",
+                vec![("a.py", A), ("b.py", B)],
+                vec![("a.py", A), ("b.py", B)],
+            ),
+            ("renamed", vec![("renamed.py", A)], vec![("a.py", A)]),
+            (
+                "package-prefix",
+                vec![("index.js", A)],
+                vec![("package/index.js", A)],
+            ),
+            (
+                "reverse-prefix",
+                vec![("package/index.js", A)],
+                vec![("index.js", A)],
+            ),
+            // Each key names the other's bytes.
+            (
+                "swapped",
+                vec![("a.py", B), ("b.py", A)],
+                vec![("a.py", A), ("b.py", B)],
+            ),
+            // A key naming a directory-shaped member, beside the real file.
+            (
+                "dir-entry",
+                vec![("d/", b""), ("d/a.py", A)],
+                vec![("d", A), ("d/a.py", A)],
+            ),
+            (
+                "same-hash-twice",
+                vec![("a.py", A), ("b.py", A)],
+                vec![("a.py", A), ("b.py", A)],
+            ),
+            (
+                "absent-member",
+                vec![("a.py", A)],
+                vec![("a.py", A), ("ghost.py", C)],
+            ),
+            // A windows-packed archive spells its separators the other way.
+            (
+                "backslashes",
+                vec![("lib\\mod.py", A)],
+                vec![("lib/mod.py", A)],
+            ),
+            (
+                "case-skew",
+                vec![("Lib/Mod.py", A)],
+                vec![("lib/mod.py", A)],
+            ),
+            (
+                "mixed",
+                vec![("a.py", A), ("renamed", B), ("c.py", C)],
+                vec![("a.py", A), ("b.py", B), ("c.py", C)],
+            ),
+        ];
+
+        for (label, members, keys) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let zip_path = tmp.path().join("artifact.zip");
+            write_zip_members(&zip_path, &members);
+
+            let wanted = wanted_pairs(&keys);
+            let needed: HashSet<&str> = wanted.iter().map(|(_, h)| h.as_str()).collect();
+            let got = harvest_zip_blobs(&zip_path, &wanted);
+            let want = exhaustive_scan(&zip_path, &needed);
+
+            let mut got_keys: Vec<&String> = got.keys().collect();
+            let mut want_keys: Vec<&String> = want.keys().collect();
+            got_keys.sort();
+            want_keys.sort();
+            assert_eq!(
+                got_keys, want_keys,
+                "[{label}] the name-seeking harvest returned a different blob set \
+                 than the scan it replaced"
+            );
+            for k in got_keys {
+                assert_eq!(
+                    got[k], want[k],
+                    "[{label}] blob {k} differs from the scan's"
+                );
+            }
+        }
+    }
+
+    /// A zip may carry one member name twice (`by_name` resolves exactly one
+    /// of them), and the blob the record wants may be in either. Both ways
+    /// round, the harvest must still agree with the scan.
+    #[test]
+    fn duplicate_member_names_match_the_exhaustive_scan() {
+        const A: &[u8] = b"alpha\n";
+        const B: &[u8] = b"beta\n";
+        for (label, want) in [("wanted-is-first", A), ("wanted-is-second", B)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let zip_path = tmp.path().join("dup.zip");
+            write_duplicate_name_zip(&zip_path, "xx.py", A, B);
+
+            let wanted = wanted_pairs(&[("xx.py", want)]);
+            let needed: HashSet<&str> = wanted.iter().map(|(_, h)| h.as_str()).collect();
+            let got = harvest_zip_blobs(&zip_path, &wanted);
+            let scan = exhaustive_scan(&zip_path, &needed);
+            assert_eq!(
+                got, scan,
+                "[{label}] a duplicate member name must not change what is harvested"
+            );
+        }
+    }
+
+    /// The point of the item: a record whose keys name the archive's members
+    /// costs no whole-archive scan, and one whose keys do not still gets its
+    /// blob from the scan. This is the only test that can see the
+    /// difference — the assertions above pass either way.
+    #[test]
+    fn the_scan_runs_only_for_what_the_names_do_not_settle() {
+        const A: &[u8] = b"alpha\n";
+        const B: &[u8] = b"beta\n";
+        let tmp = tempfile::tempdir().unwrap();
+
+        let named = tmp.path().join("named.zip");
+        write_zip_members(&named, &[("a.py", A), ("index.js", B)]);
+        // The bare member under a `package/`-prefixed key: the second
+        // spelling the name lookup tries.
+        let wanted = wanted_pairs(&[("a.py", A), ("package/index.js", B)]);
+        let (got, scans) = fallback_scans_of(|| harvest_zip_blobs(&named, &wanted));
+        assert_eq!(got.len(), 2, "both blobs must come back");
+        assert_eq!(
+            scans, 0,
+            "keys that name their members must not fall back to the archive scan"
+        );
+
+        let renamed = tmp.path().join("renamed.zip");
+        write_zip_members(&renamed, &[("renamed.py", A)]);
+        let wanted = wanted_pairs(&[("a.py", A)]);
+        let (got, scans) = fallback_scans_of(|| harvest_zip_blobs(&renamed, &wanted));
+        assert_eq!(got.len(), 1, "the renamed member's blob must come back");
+        assert_eq!(scans, 1, "a name the archive does not carry needs the scan");
+    }
+
+    /// The record's key names the member the blob normally lives in, so the
+    /// harvest looks it up by name — but the archive is free to spell it
+    /// differently (a wheel repacked under a renamed member, a `.nupkg`
+    /// whose OPC path was rewritten). The blob is keyed by HASH, not by
+    /// name, so a name miss must fall back to the exhaustive scan and still
+    /// find it.
+    #[tokio::test]
+    async fn renamed_zip_member_still_yields_its_after_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        // Member name ≠ the record key below.
+        write_zip(&tmp.path().join(&rel), "lib/renamed.py", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "a member the record's key does not name must still be harvested"
+        );
+    }
+
+    /// A manifest key may carry the npm `package/` prefix while the archive
+    /// spells the member without it — the same two spellings the member-map
+    /// verify accepts. Both must yield the blob; that the second spelling is
+    /// what settled it (rather than the fallback scan) is pinned by
+    /// [`the_scan_runs_only_for_what_the_names_do_not_settle`].
+    #[tokio::test]
+    async fn package_prefixed_key_matches_the_bare_zip_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/lib@1.0.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/lib-1.0.0.zip");
+        write_zip(&tmp.path().join(&rel), "index.js", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "the normalized key must resolve the bare member"
+        );
+    }
+
+    /// Two record files, one whose key names its member and one whose does
+    /// not: BOTH blobs must land, which is the whole-archive scan's result.
+    /// (Which path produced each one is pinned by
+    /// [`the_scan_runs_only_for_what_the_names_do_not_settle`].)
+    #[tokio::test]
+    async fn mixed_named_and_renamed_members_yield_every_after_blob() {
+        const OTHER: &[u8] = b"module.exports = also_patched;\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:nuget/Lib@1.0.0";
+        let rel = format!(".socket/vendor/nuget/{UUID}/lib.1.0.0.nupkg");
+        let path = tmp.path().join(&rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("lib/net8.0/Lib.dll", opts).unwrap();
+        writer.write_all(PATCHED).unwrap();
+        writer.start_file("lib/net8.0/Renamed.xml", opts).unwrap();
+        writer.write_all(OTHER).unwrap();
+        std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, mut r) = record(purl, UUID, "lib/net8.0/Lib.dll", PATCHED);
+        r.files.insert(
+            "lib/net8.0/Lib.xml".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original"),
+                after_hash: compute_git_sha256_from_bytes(OTHER),
+            },
+        );
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        assert_eq!(
+            mem.get(&compute_git_sha256_from_bytes(PATCHED))
+                .map(|b| b.as_slice()),
+            Some(PATCHED),
+            "the named member must be harvested"
+        );
+        assert_eq!(
+            mem.get(&compute_git_sha256_from_bytes(OTHER))
+                .map(|b| b.as_slice()),
+            Some(OTHER),
+            "the renamed member must be harvested by the fallback scan"
         );
     }
 

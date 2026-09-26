@@ -4,7 +4,7 @@ use serde_json::json;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::pdm_lock::{pdm_lock_edits, rewrite_pdm_lock};
+use crate::utils::pdm_lock::{rewrite_pdm_lock_in, PdmLockParse};
 
 pub(super) fn rewrite(
     files: &BTreeMap<String, String>,
@@ -16,26 +16,26 @@ pub(super) fn rewrite(
     };
     let mut text = original.clone();
     let mut stale_warned = false;
+    // Each lock state is parsed once: the presence probe, the rewrite, the
+    // format probe and the next dep all share it.
+    let mut parse = PdmLockParse::default();
     for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
         // A package `pdm.lock` simply does not contain is not installed by pdm —
         // a sibling `requirements.txt`/pylock may legitimately carry it — so we
         // neither redirect it here nor veto the other pypi rewriters. Only a
         // package the lock DOES contain but the plan refuses (source conflict,
         // unsupported format, forked variants, bad hashes) withholds siblings.
-        if !lock_contains(&text, &dep.name) {
+        if !lock_contains(&mut parse, &text, &dep.name) {
             continue;
         }
-        match plan(&text, dep) {
+        match plan_in(&mut parse, &text, dep) {
             Ok((rewritten, edits)) => {
                 result.confirmed_pdm_uuids.insert(dep.patch_uuid.clone());
-                let lock_ver: Option<String> = rewritten
-                    .parse::<toml_edit::DocumentMut>()
-                    .ok()
-                    .and_then(|lock| {
-                        crate::utils::pdm_lock::lock_version(&lock)
-                            .ok()
-                            .map(str::to_string)
-                    });
+                let lock_ver: Option<String> = parse.parsed(&rewritten).ok().and_then(|lock| {
+                    crate::utils::pdm_lock::lock_version(lock)
+                        .ok()
+                        .map(str::to_string)
+                });
                 if lock_ver.as_deref() == Some("2") {
                     result.warnings.push(RewriteWarning { code: "redirect_pdm_legacy_sync_required".into(), detail: "PDM 0.x may regenerate freshly generated locks during install; use `pdm sync` to preserve this patch, or upgrade PDM".into() });
                 }
@@ -87,8 +87,8 @@ pub(super) fn rewrite(
 /// sibling rewriters rather than vetoing them. A malformed lock, or one with no
 /// package array, returns `true` so the genuine refusal still surfaces from
 /// `rewrite_pdm_lock` (and, when pdm drives, withholds the siblings).
-fn lock_contains(text: &str, name: &str) -> bool {
-    let Ok(lock) = text.parse::<toml_edit::DocumentMut>() else {
+fn lock_contains(parse: &mut PdmLockParse, text: &str, name: &str) -> bool {
+    let Ok(lock) = parse.parsed(text) else {
         return true;
     };
     let canon = canonicalize_pypi_name(name);
@@ -106,7 +106,17 @@ fn lock_contains(text: &str, name: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn plan(text: &str, dep: &DepOverride) -> Result<(String, Vec<FileEdit>), String> {
+    plan_in(&mut PdmLockParse::default(), text, dep)
+}
+
+/// Plan `dep`'s rewrite of `text`, reusing (and refreshing) `parse`.
+fn plan_in(
+    parse: &mut PdmLockParse,
+    text: &str,
+    dep: &DepOverride,
+) -> Result<(String, Vec<FileEdit>), String> {
     let sha256 = dep
         .integrity
         .sha256
@@ -123,6 +133,51 @@ fn plan(text: &str, dep: &DepOverride) -> Result<(String, Vec<FileEdit>), String
         .path_segments()
         .and_then(|mut segments| segments.next_back())
         .ok_or("missing PDM wheel filename")?;
+    let rewrite = rewrite_pdm_lock_in(
+        parse,
+        text,
+        &dep.name,
+        &dep.version,
+        ("url", &dep.artifact_url),
+        filename,
+        sha256,
+    )?;
+    let edits = rewrite
+        .edits()?
+        .into_iter()
+        .map(|(old, new)| FileEdit {
+            path: "pdm.lock".into(),
+            kind: "redirect_pdm_lock_package".into(),
+            action: "rewritten".into(),
+            key: Some(dep.name.clone()),
+            original: Some(json!(old)),
+            new: Some(json!(new)),
+        })
+        .collect();
+    Ok((rewrite.text, edits))
+}
+
+/// The previous [`plan`], which re-derived the rewrite's edits, kept as the
+/// equivalence oracle.
+#[cfg(test)]
+fn plan_reference(text: &str, dep: &DepOverride) -> Result<(String, Vec<FileEdit>), String> {
+    let sha256 = dep
+        .integrity
+        .sha256
+        .as_deref()
+        .ok_or("missing PDM SHA-256")?;
+    let url = reqwest::Url::parse(&dep.artifact_url).map_err(|e| e.to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.fragment().is_some()
+        || url.query().is_some()
+    {
+        return Err("unsupported PDM artifact URL".into());
+    }
+    let filename = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .ok_or("missing PDM wheel filename")?;
+    use crate::utils::pdm_lock::{pdm_lock_edits, rewrite_pdm_lock};
     let rewritten = rewrite_pdm_lock(
         text,
         &dep.name,
@@ -241,5 +296,273 @@ mod tests {
                 .count();
             assert_eq!(n, usize::from(warns), "stale advisory once for < 2.11 only");
         }
+    }
+}
+
+#[cfg(test)]
+mod equivalence_tests {
+    use super::*;
+    use crate::patch::redirect::Integrity;
+
+    fn fixtures() -> Vec<(String, String)> {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pdm-native");
+        let mut out: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lock"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(&path).unwrap())
+            })
+            .collect();
+        out.sort();
+        assert!(out.len() >= 15, "every native pdm lock generation");
+        out
+    }
+
+    fn dep(name: &str, version: &str, sha256: &str, url_tail: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: name.into(),
+            namespace: None,
+            version: version.into(),
+            token: String::new(),
+            patch_uuid: "e828efa5-5c6d-43f3-9909-03f5ac232b98".into(),
+            artifact_url: format!("https://patch.socket.dev/patch/pypi/{name}/{url_tail}"),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some(sha256.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// `plan` equals the oracle (text and FileEdits, or the refusal) on every
+    /// native lock generation, LF and CRLF, for a landing dep, refusals, and
+    /// again over the landed output (re-run and rotated-token takeover).
+    #[test]
+    fn plan_matches_reference_on_every_lock_generation() {
+        let sha = "a".repeat(64);
+        let wheel = "urllib3-1.26.18-py2.py3-none-any.whl";
+        let deps = [
+            dep("urllib3", "1.26.18", &sha, &format!("uuid-a/{wheel}")),
+            dep("urllib3", "1.26.18", &sha, &format!("uuid-b/{wheel}")),
+            dep(
+                "urllib3",
+                "9.9.9",
+                &sha,
+                "uuid-a/urllib3-9.9.9-py3-none-any.whl",
+            ),
+            dep(
+                "urllib3",
+                "1.26.18",
+                "not-a-sha",
+                &format!("uuid-a/{wheel}"),
+            ),
+            dep(
+                "PySocks",
+                "1.7.1",
+                &sha,
+                "uuid-c/PySocks-1.7.1-py3-none-any.whl",
+            ),
+        ];
+        let mut landed = 0;
+        for (name, lock) in fixtures() {
+            for crlf in [false, true] {
+                let lock = if crlf {
+                    lock.replace("\r\n", "\n").replace('\n', "\r\n")
+                } else {
+                    lock.clone()
+                };
+                for (i, first) in deps.iter().enumerate() {
+                    let want = plan_reference(&lock, first);
+                    let got = plan(&lock, first);
+                    assert_eq!(
+                        format!("{got:?}"),
+                        format!("{want:?}"),
+                        "{name} crlf={crlf} dep#{i}"
+                    );
+                    let Ok((rewritten, _)) = want else { continue };
+                    landed += 1;
+                    for (j, second) in deps.iter().enumerate() {
+                        let want = plan_reference(&rewritten, second);
+                        let got = plan(&rewritten, second);
+                        assert_eq!(
+                            format!("{got:?}"),
+                            format!("{want:?}"),
+                            "{name} crlf={crlf} dep#{i} then dep#{j}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            landed >= 20,
+            "the corpus exercises the rewrite path ({landed})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_reuse_equivalence_tests {
+    //! The hosted rewrite sharing one parse per lock state across the
+    //! presence probe, the rewrite, the format probe and the next dep,
+    //! against the previous rewrite (a fresh parse for each), kept verbatim.
+    use super::*;
+    use crate::patch::redirect::Integrity;
+    use crate::utils::pdm_lock::parse_reuse_tests::{fixtures, grown, steps};
+
+    fn rewrite_reference(
+        files: &BTreeMap<String, String>,
+        overrides: &[DepOverride],
+        result: &mut RewriteResult,
+    ) {
+        let Some(original) = files.get("pdm.lock") else {
+            return;
+        };
+        let mut text = original.clone();
+        let mut stale_warned = false;
+        for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+            // A package `pdm.lock` simply does not contain is not installed by pdm —
+            // a sibling `requirements.txt`/pylock may legitimately carry it — so we
+            // neither redirect it here nor veto the other pypi rewriters. Only a
+            // package the lock DOES contain but the plan refuses (source conflict,
+            // unsupported format, forked variants, bad hashes) withholds siblings.
+            if !lock_contains_reference(&text, &dep.name) {
+                continue;
+            }
+            match plan_reference(&text, dep) {
+                Ok((rewritten, edits)) => {
+                    result.confirmed_pdm_uuids.insert(dep.patch_uuid.clone());
+                    let lock_ver: Option<String> = rewritten
+                        .parse::<toml_edit::DocumentMut>()
+                        .ok()
+                        .and_then(|lock| {
+                            crate::utils::pdm_lock::lock_version(&lock)
+                                .ok()
+                                .map(str::to_string)
+                        });
+                    if lock_ver.as_deref() == Some("2") {
+                        result.warnings.push(RewriteWarning { code: "redirect_pdm_legacy_sync_required".into(), detail: "PDM 0.x may regenerate freshly generated locks during install; use `pdm sync` to preserve this patch, or upgrade PDM".into() });
+                    }
+                    // PDM < 2.11 (lock_version "2"/"4.3"/"4.4") does not replace an
+                    // already-installed package at the same version, so a warm
+                    // `pdm sync`/`pdm install` leaves the upstream bytes live
+                    // (measured: 1.4.5/2.9.3/2.10.4 keep them; 2.11+ reinstall). The
+                    // installed-byte probe only fires for a discoverable venv, so a
+                    // PEP 582 `__pypackages__` or a lock-only/CI scan gets no
+                    // warning: warn proactively once per lock, mirroring poetry's
+                    // `redirect_poetry_stale_install_risk`.
+                    if !stale_warned
+                        && matches!(lock_ver.as_deref(), Some("2") | Some("4.3") | Some("4.4"))
+                    {
+                        stale_warned = true;
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_pdm_stale_install_risk".into(),
+                            detail: format!(
+                                "pdm.lock (lock_version {}) was written by PDM < 2.11, which does \
+                                 not replace an already-installed package at the same version: an \
+                                 existing environment keeps the upstream {} until it is reinstalled \
+                                 \u{2014} recreate the environment (or uninstall the package) before \
+                                 `pdm sync`/`pdm install`; a fresh install picks up the patched \
+                                 wheel. The installed files were left unchanged.",
+                                lock_ver.as_deref().unwrap_or_default(),
+                                dep.name
+                            ),
+                        });
+                    }
+                    text = rewritten;
+                    result.edits.extend(edits);
+                }
+                Err(detail) => {
+                    result.refused_pdm_uuids.insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_pdm_refused".into(),
+                        detail,
+                    });
+                }
+            }
+        }
+        if text != *original {
+            result.files.insert("pdm.lock".into(), text);
+        }
+    }
+
+    /// Whether `pdm.lock` carries a `[[package]]` entry for `name`. When it does
+    /// not, pdm does not install this package, so the caller leaves it to the
+    /// sibling rewriters rather than vetoing them. A malformed lock, or one with no
+    /// package array, returns `true` so the genuine refusal still surfaces from
+    /// `rewrite_pdm_lock` (and, when pdm drives, withholds the siblings).
+    fn lock_contains_reference(text: &str, name: &str) -> bool {
+        let Ok(lock) = text.parse::<toml_edit::DocumentMut>() else {
+            return true;
+        };
+        let canon = canonicalize_pypi_name(name);
+        match lock
+            .get("package")
+            .and_then(toml_edit::Item::as_array_of_tables)
+        {
+            None => true,
+            Some(packages) => packages.iter().any(|package| {
+                package
+                    .get("name")
+                    .and_then(toml_edit::Item::as_str)
+                    .is_some_and(|candidate| canonicalize_pypi_name(candidate) == canon)
+            }),
+        }
+    }
+
+    #[test]
+    fn shared_parse_matches_the_fresh_parse_rewrite() {
+        let mut confirmed = 0;
+        for (fixture, lock) in fixtures() {
+            for extra in [0, 3] {
+                for crlf in [false, true] {
+                    let mut lock = grown(&lock.replace("\r\n", "\n"), extra);
+                    if crlf {
+                        lock = lock.replace('\n', "\r\n");
+                    }
+                    let deps: Vec<DepOverride> = steps(extra)
+                        .into_iter()
+                        .filter(|(_, _, (kind, _), _)| kind == "url")
+                        .enumerate()
+                        .map(|(n, (name, version, (_, url), sha))| DepOverride {
+                            ecosystem: "pypi".into(),
+                            name,
+                            namespace: None,
+                            version,
+                            token: String::new(),
+                            patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
+                            artifact_url: url,
+                            berry_zip_url: None,
+                            registry_override: None,
+                            integrity: Integrity {
+                                sha256: Some(sha),
+                                ..Default::default()
+                            },
+                        })
+                        .collect();
+                    let files = BTreeMap::from([("pdm.lock".to_string(), lock)]);
+                    let what = format!("{fixture} extra={extra} crlf={crlf}");
+                    let mut want = RewriteResult::default();
+                    rewrite_reference(&files, &deps, &mut want);
+                    let mut got = RewriteResult::default();
+                    rewrite(&files, &deps, &mut got);
+                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "{what}");
+                    confirmed += got.confirmed_pdm_uuids.len();
+
+                    let mut again = files.clone();
+                    again.extend(want.files.clone());
+                    let mut want = RewriteResult::default();
+                    rewrite_reference(&again, &deps, &mut want);
+                    let mut got = RewriteResult::default();
+                    rewrite(&again, &deps, &mut got);
+                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "{what} re-run");
+                }
+            }
+        }
+        assert!(confirmed > 100, "only {confirmed} confirmed");
     }
 }

@@ -70,6 +70,47 @@ pub(crate) async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unp
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Blocking twin of [`compute_git_sha256_from_reader`]: the same header,
+/// the same streaming, and the same short/long-stream refusals.
+pub(crate) fn compute_git_sha256_from_std_reader<R: std::io::Read>(
+    size: u64,
+    mut reader: R,
+) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let header = format!("blob {}\0", size);
+    hasher.update(header.as_bytes());
+
+    let mut buf = [0u8; 8192];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+        if total > size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "git sha256: declared size {size} is smaller than the stream (read at least {total} bytes)"
+                ),
+            ));
+        }
+    }
+
+    if total != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "git sha256: declared size {size} does not match {total} bytes read from stream"
+            ),
+        ));
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +354,41 @@ mod tests {
                 .await
                 .unwrap(),
             "e118a058f018dda253bb692320c940091b15e4f19067e12fff110606a111f5da",
+        );
+    }
+
+    /// The blocking twin refuses the same size/stream disagreements as
+    /// [`compute_git_sha256_from_reader`], with the same error kind and the
+    /// same message. Its one caller passes the open handle's fstat size, so
+    /// these fire when a file is truncated or grows between the stat and the
+    /// read — the race the guards exist for — and the digest they refuse to
+    /// return would belong to no real Git object. Asserted against the async
+    /// twin so the two cannot drift.
+    #[tokio::test]
+    async fn test_std_reader_refuses_a_size_that_disagrees_with_the_stream() {
+        let body = b"exactly-this-many-bytes";
+        let len = body.len() as u64;
+        for size in [len + 100, 4, len - 1, 0] {
+            let sync = compute_git_sha256_from_std_reader(size, &body[..])
+                .expect_err("declared size must match the stream");
+            let asynchronous =
+                compute_git_sha256_from_reader(size, tokio::io::BufReader::new(&body[..]))
+                    .await
+                    .expect_err("declared size must match the stream");
+            assert_eq!(sync.kind(), io::ErrorKind::InvalidData, "size {size}");
+            assert_eq!(sync.kind(), asynchronous.kind(), "size {size}");
+            assert_eq!(sync.to_string(), asynchronous.to_string(), "size {size}");
+        }
+
+        // An agreeing size still hashes, across the buffer boundary too.
+        assert_eq!(
+            compute_git_sha256_from_std_reader(len, &body[..]).unwrap(),
+            compute_git_sha256_from_bytes(body)
+        );
+        let long: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            compute_git_sha256_from_std_reader(long.len() as u64, &long[..]).unwrap(),
+            compute_git_sha256_from_bytes(&long)
         );
     }
 

@@ -10,13 +10,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use futures_util::StreamExt;
 use socket_patch_core::api::blob_fetcher::{
     fetch_missing_blobs, fetch_missing_sources, get_missing_archives, get_missing_blobs,
     DownloadMode, FetchMissingBlobsResult,
 };
-use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
+use socket_patch_core::api::client::{get_api_client_with_overrides, hold_back_debug, ApiClient};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, PatchSources};
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use tempfile::TempDir;
 
 use super::get::base64_decode;
@@ -565,6 +567,15 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             }
         };
         let mut failed: Vec<&str> = Vec::new();
+        // The views are fetched concurrently (at most `api_concurrency` in
+        // flight) but consumed in `to_fetch` order, each request's `--debug`
+        // lines released at its turn, so `mem`, `failed` and every error
+        // line fold exactly as the serial loop's did.
+        let mut views = std::pin::pin!(ordered_concurrent(
+            to_fetch.iter(),
+            api_concurrency(client.uses_public_proxy()),
+            |(_, uuid)| async move { (*uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
+        ));
         for (i, (purl, uuid)) in to_fetch.iter().enumerate() {
             if to_fetch.len() > 1 {
                 status.set(format!(
@@ -574,7 +585,19 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                     to_fetch.len()
                 ));
             }
-            match client.fetch_patch(uuid).await {
+            let view = match views.next().await {
+                Some((planned, view)) if planned == *uuid => view.release(),
+                // Unreachable: the plan IS this list. Falling back to the
+                // live request keeps the staging COMPLETE if the two ever
+                // fall out of step — running dry here would otherwise
+                // return `Ready` with blobs missing and nothing in
+                // `failed`.
+                _ => {
+                    debug_assert!(false, "view prefetch plan out of step with the fetch list");
+                    client.fetch_patch(uuid).await
+                }
+            };
+            match view {
                 Ok(Some(patch)) => {
                     let mut complete = true;
                     for (file, info) in &patch.files {

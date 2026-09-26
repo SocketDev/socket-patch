@@ -28,7 +28,9 @@ use super::common::{already_patched_result, detect_indent, done, refused, serial
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -45,6 +47,14 @@ use crate::constants::npm_family::NPM_LOCKS;
 /// a silent no-op.
 const SHRINKWRAP: &str = NPM_LOCKS[0];
 const PACKAGE_LOCK: &str = NPM_LOCKS[1];
+
+/// The run's npm-lock parses. Every patched package re-read AND re-parsed
+/// the project's lock — both of them in npm 12's dual-lock state — and a
+/// real `package-lock.json` runs to megabytes of JSON. Two slots: the
+/// primary and its sibling are read in the same pass, so one slot would
+/// have them evict each other. An idempotent re-run writes nothing, so
+/// every package after the first hits; see [`ParseMemo`].
+static LOCK_MEMO: ParseMemo<Value, 2> = ParseMemo::new();
 
 const NODE_MODULES_SEG: &str = "node_modules/";
 
@@ -77,9 +87,9 @@ const DEP_MANIFEST_FIELDS: [&str; 4] = [
 /// `None` for dry runs and for the in-sync re-run (the existing ledger entry
 /// stays authoritative; we never re-record our own edit as an "original").
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_npm(
+pub async fn vendor_npm<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -88,6 +98,7 @@ pub async fn vendor_npm(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates (shared guard: fail-closed before any disk access,
@@ -120,7 +131,7 @@ pub async fn vendor_npm(
             );
         }
     };
-    let mut lock: Value = match serde_json::from_slice(&lock_bytes) {
+    let lock = match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
         Ok(v) => v,
         Err(e) => {
             return refused(
@@ -129,73 +140,16 @@ pub async fn vendor_npm(
             );
         }
     };
-    let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
-    if !matches!(lock_version, Some(2) | Some(3))
-        || !lock.get("packages").is_some_and(Value::is_object)
-    {
-        return refused(
-            "vendor_lockfile_version_unsupported",
-            format!(
-                "{lock_name} has lockfileVersion {:?}; only v2/v3 locks (with a `packages` \
-                 object) are supported — run `npm install` with npm >= 7 to upgrade it",
-                lock_version
-            ),
-        );
-    }
+    let lock_version = match lock_version_gate(&lock, &lock_name) {
+        Ok(lock_version) => lock_version,
+        Err(outcome) => return *outcome,
+    };
 
     // ── 3. Find the rewritable lock instances ───────────────────────────
-    let matches = match scan_lock_matches(&lock, name, version, &mut warnings) {
-        LockScan::Matches(m) => m,
-        LockScan::WorkspaceMember { key } => {
-            // A matching key outside node_modules/ is the user's own
-            // workspace member — its source of truth is the working tree,
-            // not a tarball; vendoring it would shadow their code.
-            return refused(
-                "vendor_workspace_member",
-                format!(
-                    "`{key}` is a workspace member of this project; patch the source directly \
-                     instead of vendoring it"
-                ),
-            );
-        }
+    let matches = match rewritable_matches(&lock, name, version, &lock_name, &mut warnings) {
+        Ok(matches) => matches,
+        Err(outcome) => return *outcome,
     };
-    if matches.is_empty() {
-        // Every instance the scan saw was skipped (bundled inside a parent's
-        // tarball, or a link): the entry IS in the lock, so the generic
-        // "not found / run `npm install`" advice would be wrong twice over.
-        // Refuse with the real reason and carry the stays-UNPATCHED
-        // advisories in the detail — a Refused outcome has no warnings
-        // channel, and silently dropping them would hide a security-critical
-        // fact.
-        let skipped: Vec<&str> = warnings
-            .iter()
-            .filter(|w| {
-                matches!(
-                    w.code,
-                    "vendor_bundled_instance_skipped" | "vendor_link_entry_skipped"
-                )
-            })
-            .map(|w| w.detail.as_str())
-            .collect();
-        if !skipped.is_empty() {
-            return refused(
-                "vendor_lock_entry_not_rewritable",
-                format!(
-                    "every {lock_name} entry for {name}@{version} is bundled inside a \
-                     parent's tarball or a link and cannot be rewritten — those copies \
-                     stay UNPATCHED and `npm install` will not help: {}",
-                    skipped.join("; ")
-                ),
-            );
-        }
-        return refused(
-            "vendor_lock_entry_not_found",
-            format!(
-                "{lock_name} has no rewritable entry for {name}@{version} — make sure the \
-                 package is installed and locked (`npm install`) before vendoring"
-            ),
-        );
-    }
 
     // ── 3b. Sibling lock (npm 12) ───────────────────────────────────────
     // npm 12 removed `npm shrinkwrap`, auto-creates a package-lock.json
@@ -266,6 +220,9 @@ pub async fn vendor_npm(
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut changed = false;
     let mut recomputed_deps = false;
+    // The memo hands the parse out shared; the rewrite takes its own copy —
+    // the allocation the per-package parse it replaced would have made.
+    let mut lock = (*lock).clone();
     let rewire = LockRewire {
         name,
         version,
@@ -368,6 +325,17 @@ pub async fn vendor_npm(
     // left resolving through an artifact the unstage removes.
     let mut written: Vec<(&str, &[u8])> = Vec::new();
     let mut write_err: Option<String> = None;
+    // Dropped before the first write, so a torn one leaves nothing behind —
+    // but only for the locks about to be written. In npm 12's dual-lock
+    // state only one of the two may hold a match, and the one nobody writes
+    // is still on disk exactly as parsed: dropping it too would make every
+    // later package re-parse a lock this run never touched.
+    for (_, original, _) in &sibling_writes {
+        LOCK_MEMO.forget(original);
+    }
+    if primary_changed {
+        LOCK_MEMO.forget(&lock_bytes);
+    }
     for (sib_name, original, out) in &sibling_writes {
         if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(sib_name), out).await
         {
@@ -391,6 +359,16 @@ pub async fn vendor_npm(
         }
         return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
             .await;
+    }
+    // The bytes now on disk and the documents they were serialized from: the
+    // next package in this run reads them back and skips the parse.
+    for sib in siblings {
+        if let Some((_, _, written)) = sibling_writes.iter().find(|(name, ..)| *name == sib.name) {
+            LOCK_MEMO.store(written.clone(), sib.lock);
+        }
+    }
+    if primary_changed {
+        LOCK_MEMO.store(out, lock);
     }
 
     // ── 9. Marker + ledger entry ─────────────────────────────────────────
@@ -421,6 +399,143 @@ pub async fn vendor_npm(
         pipenv: None,
     };
     done(result, Some(entry), warnings)
+}
+
+/// The lock version gate of [`vendor_npm`]'s step 2: only v2/v3 locks with
+/// a `packages` object are rewritten. `Ok` is the parsed `lockfileVersion`.
+fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<VendorOutcome>> {
+    let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
+    if !matches!(lock_version, Some(2) | Some(3))
+        || !lock.get("packages").is_some_and(Value::is_object)
+    {
+        return Err(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            format!(
+                "{lock_name} has lockfileVersion {:?}; only v2/v3 locks (with a `packages` \
+                 object) are supported — run `npm install` with npm >= 7 to upgrade it",
+                lock_version
+            ),
+        )));
+    }
+    Ok(lock_version)
+}
+
+/// [`vendor_npm`]'s step 3: the rewritable `packages` instances of
+/// `name@version`, refusing a workspace member, an entry whose every
+/// instance is bundled or linked, and an absent entry. Nothing here reads
+/// the package's source or asks the service, so the vendor loop's download
+/// plan evaluates it ahead of the loop ([`preflight_packages`]).
+fn rewritable_matches(
+    lock: &Value,
+    name: &str,
+    version: &str,
+    lock_name: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<Vec<LockMatch>, Box<VendorOutcome>> {
+    let matches = match scan_lock_matches(lock, name, version, warnings) {
+        LockScan::Matches(m) => m,
+        LockScan::WorkspaceMember { key } => {
+            // A matching key outside node_modules/ is the user's own
+            // workspace member — its source of truth is the working tree,
+            // not a tarball; vendoring it would shadow their code.
+            return Err(Box::new(refused(
+                "vendor_workspace_member",
+                format!(
+                    "`{key}` is a workspace member of this project; patch the source directly \
+                     instead of vendoring it"
+                ),
+            )));
+        }
+    };
+    if matches.is_empty() {
+        // Every instance the scan saw was skipped (bundled inside a parent's
+        // tarball, or a link): the entry IS in the lock, so the generic
+        // "not found / run `npm install`" advice would be wrong twice over.
+        // Refuse with the real reason and carry the stays-UNPATCHED
+        // advisories in the detail — a Refused outcome has no warnings
+        // channel, and silently dropping them would hide a security-critical
+        // fact.
+        let skipped: Vec<&str> = warnings
+            .iter()
+            .filter(|w| {
+                matches!(
+                    w.code,
+                    "vendor_bundled_instance_skipped" | "vendor_link_entry_skipped"
+                )
+            })
+            .map(|w| w.detail.as_str())
+            .collect();
+        if !skipped.is_empty() {
+            return Err(Box::new(refused(
+                "vendor_lock_entry_not_rewritable",
+                format!(
+                    "every {lock_name} entry for {name}@{version} is bundled inside a \
+                     parent's tarball or a link and cannot be rewritten — those copies \
+                     stay UNPATCHED and `npm install` will not help: {}",
+                    skipped.join("; ")
+                ),
+            )));
+        }
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_found",
+            format!(
+                "{lock_name} has no rewritable entry for {name}@{version} — make sure the \
+                 package is installed and locked (`npm install`) before vendoring"
+            ),
+        )));
+    }
+    Ok(matches)
+}
+
+/// The primary lock as [`vendor_npm`]'s step 2 leaves it: selected, parsed
+/// and version-gated. Read once for the vendor loop's download plan
+/// ([`preflight_packages`]); the loop itself runs the same three steps
+/// inline, per package, and refuses with the codes returned here.
+pub(super) struct NpmLockProject {
+    lock_name: String,
+    lock: std::sync::Arc<Value>,
+}
+
+/// Read the lock as [`vendor_npm`]'s step 2 does — selected, parsed,
+/// version-gated — once, for the download plan; refuses with the loop's
+/// codes. The parse goes through the loop's memo, so the loop's first
+/// package reuses it.
+pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, &'static str> {
+    let (lock_name, lock_bytes, _sibling_locks) = match select_lockfile(project_root).await {
+        Ok(Some(found)) => found,
+        Ok(None) | Err(_) => return Err("vendor_lockfile_missing"),
+    };
+    let lock = LOCK_MEMO
+        .parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes))
+        .map_err(|_| "vendor_lockfile_version_unsupported")?;
+    lock_version_gate(&lock, &lock_name).map_err(|o| super::npm_common::refusal_code(&o))?;
+    Ok(NpmLockProject { lock_name, lock })
+}
+
+/// Which of `packages` [`vendor_npm`] would refuse before its first
+/// service call, from one read of the lock; see
+/// [`super::npm_flavor::preflight_packages`]. The skip advisories the scan
+/// raises are the loop's to report, and are dropped here.
+pub(crate) async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    super::npm_common::gate_packages(
+        read_project(project_root).await,
+        packages,
+        |project, coords| {
+            let mut warnings = Vec::new();
+            rewritable_matches(
+                &project.lock,
+                &coords.name,
+                &coords.version,
+                &project.lock_name,
+                &mut warnings,
+            )
+            .map(drop)
+            .map_err(|o| super::npm_common::refusal_code(&o))
+        },
+    )
 }
 
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
@@ -579,16 +694,17 @@ pub async fn revert_npm_opts(
             }
             Err(e) => return RevertOutcome::failed(format!("cannot read {lock_name}: {e}")),
         };
-        let mut lock: Value = match serde_json::from_slice(&lock_bytes) {
-            Ok(v) => v,
-            // Fail-closed: editing a lock we cannot parse risks destroying
-            // it; the user must repair it before revert can restore.
-            Err(e) => {
-                return RevertOutcome::failed(format!(
-                    "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
-                ))
-            }
-        };
+        let mut lock =
+            match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
+                Ok(v) => (*v).clone(),
+                // Fail-closed: editing a lock we cannot parse risks destroying
+                // it; the user must repair it before revert can restore.
+                Err(e) => {
+                    return RevertOutcome::failed(format!(
+                        "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
+                    ))
+                }
+            };
 
         let mut changed = false;
         // Reverse application order, like every backend's revert.
@@ -610,6 +726,7 @@ pub async fn revert_npm_opts(
                     return RevertOutcome::failed(format!("cannot serialize {lock_name}: {e}"))
                 }
             };
+            LOCK_MEMO.invalidate();
             if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, &out).await {
                 return RevertOutcome::failed(format!("cannot write {lock_name}: {e}"));
             }
@@ -1053,8 +1170,10 @@ fn sibling_lock_target(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<SiblingLock, String> {
     let bytes = sib_bytes.map_err(|e| format!("it cannot be read: {e}"))?;
-    let lock: Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("it is not parseable JSON: {e}"))?;
+    let lock = (*LOCK_MEMO
+        .parse(&bytes, || serde_json::from_slice::<Value>(&bytes))
+        .map_err(|e| format!("it is not parseable JSON: {e}"))?)
+    .clone();
     let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
     if !matches!(lock_version, Some(2) | Some(3))
         || !lock.get("packages").is_some_and(Value::is_object)
@@ -1337,6 +1456,44 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
         }
+    }
+
+    /// The lock a package wrote is handed back to the next package through
+    /// the run's memo — but only while it is still the lock on DISK. A
+    /// `git checkout package-lock.json` between two vendor calls must be
+    /// seen: the second call re-wires the pristine lock instead of reading
+    /// its predecessor's document and reporting the project already in sync.
+    #[tokio::test]
+    async fn an_external_lock_reset_between_vendor_calls_is_not_memoized() {
+        let fx = fixture().await;
+
+        let (result, _entry, _w) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = fx.read_lock().await;
+        assert_eq!(
+            wired["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz())),
+            "the first call wires the lock"
+        );
+
+        // Someone restores the pre-vendor lock from version control.
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+
+        let (result, _entry, _w) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let rewired = fx.read_lock().await;
+        assert_eq!(
+            rewired["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz())),
+            "the second call must re-wire the lock it found on disk, not \
+             trust the document the first one left in the memo"
+        );
+        assert_eq!(
+            rewired, wired,
+            "re-wiring the restored lock reproduces the first call's bytes"
+        );
     }
 
     fn expect_done(
@@ -2247,6 +2404,48 @@ mod tests {
             );
         }
         assert!(!fx.root().join(".socket/vendor/npm").join(UUID).exists());
+    }
+
+    /// npm 12 auto-creates a package-lock.json from the registry beside an
+    /// already-wired shrinkwrap, so the second run finds the PRIMARY in sync
+    /// and only the sibling to rewrite — the one state where the primary
+    /// lock is read but never written. It must be left byte-identical while
+    /// the sibling is brought up to the primary's wiring.
+    #[tokio::test]
+    async fn a_sibling_lock_added_after_wiring_is_rewired_without_touching_the_primary() {
+        let fx = fixture().await;
+        // Run one: the shrinkwrap is the only lock, and it is wired.
+        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let wired_shrink = tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap();
+
+        // npm 12 reifies a fresh, unpatched package-lock.json beside it.
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("the sibling rewrite is a wiring change");
+        assert!(
+            entry.wiring.iter().all(|r| r.file == PACKAGE_LOCK),
+            "only the sibling is rewritten: {:?}",
+            entry.wiring
+        );
+        assert_eq!(
+            tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap(),
+            wired_shrink,
+            "the in-sync primary must not be rewritten"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            wired_shrink,
+            "the sibling gets the identical rewrite"
+        );
     }
 
     /// Only the shrinkwrap (primary) is rewired when a stale sibling
@@ -4393,5 +4592,113 @@ mod tests {
         }
         assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
         assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
+    }
+
+    // ── download-plan pre-flight parity ───────────────────────────────────
+
+    /// `(the plan's verdict, the loop's own outcome)` for the fixture's
+    /// package — the pre-flight first, since a successful vendor rewrites
+    /// the lock it would then read.
+    async fn preflight_then_vendor(
+        fx: &Fixture,
+    ) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let planned = preflight_packages(fx.root(), &[(&fx.purl(), &fx.record)])
+            .await
+            .remove(0);
+        let looped = match fx.vendor(false).await {
+            VendorOutcome::Refused { code, .. } => Err(code),
+            VendorOutcome::Done { .. } => Ok(()),
+        };
+        (planned, looped)
+    }
+
+    /// The vendor loop's download plan gates each package with this
+    /// backend's own pre-flight (`preflight_packages`): the lock selected,
+    /// parsed and version-gated once, then the rewritable-instance scan per
+    /// package. Same code wherever the loop refuses, admitted wherever it
+    /// vendors.
+    #[tokio::test]
+    async fn preflight_agrees_with_the_loop_on_every_pre_service_refusal() {
+        let (planned, looped) = preflight_then_vendor(&fixture().await).await;
+        assert_eq!(
+            (planned, looped),
+            (Ok(()), Ok(())),
+            "the plain fixture vendors"
+        );
+
+        let workspace_member = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "packages/left-pad": { "name": "left-pad", "version": "1.3.0" }
+            }
+        });
+        let v1 = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 1,
+            "dependencies": {
+                "left-pad": { "version": "1.3.0", "resolved": REG_RESOLVED, "integrity": "sha512-orig==" }
+            }
+        });
+        let mut absent = default_lock();
+        absent["packages"]["node_modules/left-pad"]["version"] = json!("1.2.0");
+        absent["packages"]["node_modules/foo/node_modules/left-pad"]["version"] = json!("1.2.0");
+        let cases = [
+            (
+                "workspace member",
+                workspace_member,
+                "vendor_workspace_member",
+            ),
+            (
+                "lockfileVersion 1",
+                v1,
+                "vendor_lockfile_version_unsupported",
+            ),
+            ("absent entry", absent, "vendor_lock_entry_not_found"),
+        ];
+        for (label, lock, code) in cases {
+            let (planned, looped) =
+                preflight_then_vendor(&fixture_with("left-pad", "1.3.0", lock).await).await;
+            assert_eq!(looped, Err(code), "{label}: the loop's own refusal");
+            assert_eq!(
+                planned, looped,
+                "{label}: the plan must refuse as the loop does"
+            );
+        }
+
+        let fx = fixture().await;
+        tokio::fs::write(fx.lock_path(), b"{ definitely: not json")
+            .await
+            .unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_lockfile_version_unsupported"));
+        assert_eq!(planned, looped, "an unparseable lock");
+
+        let fx = fixture().await;
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_lockfile_missing"));
+        assert_eq!(planned, looped, "a missing lock");
+    }
+
+    /// A gate only the local build reaches — bundled dependencies are
+    /// checked on the STAGED copy, after the service has been asked — is
+    /// not a pre-flight gate: the plan admits the package (the loop would
+    /// ask the service for it) and the loop's own refusal stands.
+    #[tokio::test]
+    async fn preflight_leaves_post_service_gates_to_the_loop() {
+        let fx = fixture().await;
+        tokio::fs::write(
+            fx.installed().join("package.json"),
+            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#,
+        )
+        .await
+        .unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(planned, Ok(()), "the plan cannot see a staged-copy gate");
+        assert_eq!(looped, Err("vendor_bundled_deps_unsupported"));
     }
 }

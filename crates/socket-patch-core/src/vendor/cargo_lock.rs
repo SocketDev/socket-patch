@@ -59,10 +59,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Table};
 
 use super::cargo_tag;
+use super::parse_memo::ParseMemo;
 use super::state::CargoLockOriginal;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
@@ -100,15 +102,23 @@ impl std::fmt::Display for LockEditError {
     }
 }
 
+/// The run's `Cargo.lock` parse. A wet cargo vendor run reads the lock once
+/// per patched crate — through the probes as well as the edits — and a
+/// workspace lock runs to thousands of `[[package]]` blocks; see
+/// [`ParseMemo`] for why keeping the read while reusing the parse is safe.
+static LOCK_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
+
 /// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`]
 /// (the lock inventory reads the lock through it too).
 ///
 /// The verbatim `content` comes back with the parse: `toml_edit` renders
 /// LF only, so [`write_lock`] needs the original bytes to put the file's
 /// own line endings back (see [`super::cargo_manifest::reconcile_line_endings`]).
+/// The document comes back shared: the probes read it as is, and the
+/// editors take their own copy before mutating.
 pub(crate) async fn read_lock(
     project_root: &Path,
-) -> Result<(std::path::PathBuf, DocumentMut, String), LockEditError> {
+) -> Result<(std::path::PathBuf, Arc<DocumentMut>, String), LockEditError> {
     let path = project_root.join("Cargo.lock");
     let content = match read_regular_to_string(&path).await {
         Ok(c) => c,
@@ -117,8 +127,8 @@ pub(crate) async fn read_lock(
         }
         Err(e) => return Err(LockEditError::Io(e.to_string())),
     };
-    let doc = content
-        .parse::<DocumentMut>()
+    let doc = LOCK_MEMO
+        .parse(content.as_bytes(), || content.parse::<DocumentMut>())
         .map_err(|e| LockEditError::Parse(e.to_string()))?;
     Ok((path, doc, content))
 }
@@ -485,11 +495,23 @@ fn ensure_consistent(
 /// CRLF, a mixed-ending lock keeps each line's own ending, and a lock with
 /// no trailing newline keeps that too, so `vendor --revert` restores the
 /// file byte-for-byte.
-async fn write_lock(path: &Path, doc: &DocumentMut, original: &str) -> Result<(), LockEditError> {
-    let rendered = super::cargo_manifest::reconcile_line_endings(original, &doc.to_string());
+///
+/// When the bytes written are exactly the document's rendering (an LF lock
+/// ending in a newline), the next crate in this run reads them back and
+/// skips the parse. A reconciled rendering is not memoized: its bytes are
+/// not the text the document renders to.
+async fn write_lock(path: &Path, doc: DocumentMut, original: &str) -> Result<(), LockEditError> {
+    let rendered_doc = doc.to_string();
+    let rendered = super::cargo_manifest::reconcile_line_endings(original, &rendered_doc);
     atomic_write_bytes_preserving_mode(path, rendered.as_bytes())
         .await
-        .map_err(|e| LockEditError::Io(e.to_string()))
+        .map_err(|e| LockEditError::Io(e.to_string()))?;
+    // The bytes now on disk and the document they came from: the next crate
+    // in this run reads them back and skips the parse.
+    if rendered == rendered_doc {
+        LOCK_MEMO.store(rendered.into_bytes(), doc);
+    }
+    Ok(())
 }
 
 /// Detach the `[[package]]` entry for `name`+`version` from the registry
@@ -509,7 +531,10 @@ pub async fn detach_lock_entry(
     uuid: &str,
     dry_run: bool,
 ) -> Result<CargoLockOriginal, LockEditError> {
-    let (path, mut doc, lock_text) = read_lock(project_root).await?;
+    let (path, doc, lock_text) = read_lock(project_root).await?;
+    // The shared parse is read-only; this editor takes its own copy — the
+    // allocation the per-crate parse it replaced would have made anyway.
+    let mut doc = (*doc).clone();
     // The registry entry is what gets detached (an entry already at the
     // tagged version beside it then refuses in `ensure_consistent`).
     let registry = doc
@@ -567,7 +592,7 @@ pub async fn detach_lock_entry(
     ensure_consistent(&doc, name, version, &tagged)?;
 
     if !dry_run {
-        write_lock(&path, &doc, &lock_text).await?;
+        write_lock(&path, doc, &lock_text).await?;
     }
     Ok(CargoLockOriginal { source, checksum })
 }
@@ -601,7 +626,8 @@ pub async fn retag_lock_entry_to(
     target: &str,
     dry_run: bool,
 ) -> Result<Option<String>, LockEditError> {
-    let (path, mut doc, lock_text) = read_lock(project_root).await?;
+    let (path, doc, lock_text) = read_lock(project_root).await?;
+    let mut doc = (*doc).clone();
     let table = find_entry_mut(&mut doc, name, version, cargo_tag::tag_uuid(target))
         .ok_or(LockEditError::EntryMissing)?;
     if table.get("source").is_some() {
@@ -621,7 +647,7 @@ pub async fn retag_lock_entry_to(
     rewrite_version_refs(&mut doc, name, &current, None, &format!("{name} {target}"));
     ensure_consistent(&doc, name, &current, target)?;
     if !dry_run {
-        write_lock(&path, &doc, &lock_text).await?;
+        write_lock(&path, doc, &lock_text).await?;
     }
     Ok(Some(current))
 }
@@ -652,7 +678,8 @@ pub async fn restore_lock_entry(
     original: &CargoLockOriginal,
     dry_run: bool,
 ) -> Result<bool, LockEditError> {
-    let (path, mut doc, lock_text) = read_lock(project_root).await?;
+    let (path, doc, lock_text) = read_lock(project_root).await?;
+    let mut doc = (*doc).clone();
     let v1 = is_v1_lock(&doc);
     let Some(idx) = pick_index(&doc, name, version, Some(uuid)) else {
         return Ok(false);
@@ -740,7 +767,7 @@ pub async fn restore_lock_entry(
     }
 
     if !dry_run {
-        write_lock(&path, &doc, &lock_text).await?;
+        write_lock(&path, doc, &lock_text).await?;
     }
     Ok(true)
 }
@@ -1110,6 +1137,154 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(tokio::fs::read_to_string(&lock).await.unwrap(), v1);
+    }
+
+    /// The lock shapes a run can meet, for the warm/cold comparison below:
+    /// a v4 lock, a v1 lock with `[metadata]` checksums, a heavily
+    /// commented one, its CRLF twin, and one with unusual spacing.
+    fn lock_shapes() -> Vec<(&'static str, String)> {
+        let other = "a".repeat(64);
+        let v1 = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({SOURCE})\",\n \"log 0.4.20 ({SOURCE})\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             dependencies = [\n \"cfg-if 1.0.4 ({SOURCE})\",\n]\n\n\
+             [metadata]\n\"checksum cfg-if 1.0.4 ({SOURCE})\" = \"{CHECKSUM}\"\n\
+             \"checksum log 0.4.20 ({SOURCE})\" = \"{other}\"\n"
+        );
+        let v4 = format!(
+            "{}\n[[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             checksum = \"{other}\"\n",
+            lock_body()
+        );
+        let commented = format!(
+            "# header\nversion = 4\n\n# about app\n[[package]]\nname = \"app\"\n\
+             version = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n \"log\",\n]\n\n\
+             # about cfg-if\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             # the source line\nsource = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\" # trailing\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             checksum = \"{other}\"\n# tail comment\n"
+        );
+        let crlf = commented.replace('\n', "\r\n");
+        let spaced = format!(
+            "version  =  4\n\n[[package]]\nname   = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [ \"cfg-if\" , \"log\" ]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\n\
+             checksum = \"{CHECKSUM}\"\n\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\n\
+             source = \"{SOURCE}\"\nchecksum = \"{other}\"\n"
+        );
+        vec![
+            ("v4", v4),
+            ("v1-metadata", v1),
+            ("commented", commented),
+            ("crlf", crlf),
+            ("odd-spacing", spaced),
+        ]
+    }
+
+    /// Detach both crates, then restore both — the shape of a two-crate
+    /// vendor run and its revert. `cold` drops the memo before every call,
+    /// which is the pre-change path (parse the bytes on disk, every time).
+    async fn detach_then_restore_both(body: &str, cold: bool) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        tokio::fs::write(&lock, body).await.unwrap();
+        let cool = || {
+            if cold {
+                LOCK_MEMO.invalidate();
+            }
+        };
+        cool();
+        let first = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, false)
+            .await
+            .unwrap();
+        cool();
+        let second = detach_lock_entry(dir.path(), "log", "0.4.20", UUID2, false)
+            .await
+            .unwrap();
+        cool();
+        let detached = tokio::fs::read_to_string(&lock).await.unwrap();
+        restore_lock_entry(dir.path(), "log", "0.4.20", UUID2, &second, false)
+            .await
+            .unwrap();
+        cool();
+        restore_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, &first, false)
+            .await
+            .unwrap();
+        (detached, tokio::fs::read_to_string(&lock).await.unwrap())
+    }
+
+    /// The memo hands the second crate of a run the document the FIRST one
+    /// mutated in memory, re-seeded by `write_lock` against the bytes it
+    /// wrote — not a fresh parse of those bytes. That is only safe while a
+    /// mutated document and a re-parse of its own output emit the same
+    /// text, which for `toml_edit` is a statement about decor, not a
+    /// tautology. Pin it: the same run, warm and cold, must leave
+    /// byte-identical locks behind at both the detach and the restore.
+    #[tokio::test]
+    async fn a_memoized_run_writes_the_same_lock_as_an_always_reparsing_one() {
+        for (label, body) in lock_shapes() {
+            let warm = detach_then_restore_both(&body, false).await;
+            let cold = detach_then_restore_both(&body, true).await;
+            assert_eq!(
+                warm.0, cold.0,
+                "[{label}] the detached lock differs between the memoized and the \
+                 always-reparse path"
+            );
+            assert_eq!(
+                warm.1, cold.1,
+                "[{label}] the restored lock differs between the memoized and the \
+                 always-reparse path"
+            );
+        }
+    }
+
+    /// Two crates detached in one run with a hand edit to Cargo.lock
+    /// between them: the second detach must edit the bytes on DISK, not the
+    /// document the first one left in the memo. The memo skips the parse,
+    /// never the read.
+    #[tokio::test]
+    async fn external_lock_edit_between_crates_is_not_memoized() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        let two = format!(
+            "{}\n[[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             checksum = \"{}\"\n",
+            lock_body(),
+            "a".repeat(64)
+        );
+        tokio::fs::write(&lock, &two).await.unwrap();
+
+        // Crate one: the lock is rewritten and the memo seeded with it.
+        detach_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, false)
+            .await
+            .unwrap();
+
+        // Someone else edits the lock between the two crates — here a
+        // comment neither detach writes or removes.
+        let edited = format!(
+            "# edited-between-crates\n{}",
+            tokio::fs::read_to_string(&lock).await.unwrap()
+        );
+        tokio::fs::write(&lock, &edited).await.unwrap();
+
+        // Crate two must build on the edited bytes.
+        detach_lock_entry(dir.path(), "log", "0.4.20", UUID2, false)
+            .await
+            .unwrap();
+        let after = tokio::fs::read_to_string(&lock).await.unwrap();
+        assert!(
+            after.starts_with("# edited-between-crates\n"),
+            "the second detach must build on the edited bytes, not on the \
+             first crate's memoized parse: {after}"
+        );
+        assert_eq!(
+            after.matches("source = ").count(),
+            0,
+            "both crates must end up detached: {after}"
+        );
     }
 
     #[tokio::test]

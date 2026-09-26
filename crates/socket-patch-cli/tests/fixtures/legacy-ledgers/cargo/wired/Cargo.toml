@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+alpha = "1"
+beta = "1"
+
+[patch.crates-io]
+alpha-socket-11111111 = { package = "alpha", path = ".socket/vendor/cargo/11111111-1111-4111-8111-000000000001/alpha-1.0.0" }
+beta-socket-11111111 = { package = "beta", path = ".socket/vendor/cargo/11111111-1111-4111-8111-000000000002/beta-1.0.0" }

@@ -18,10 +18,10 @@ use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::package::read_archive_to_map;
 use crate::patch::path_safety;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_artifact;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 use super::common::{
@@ -31,6 +31,7 @@ use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
 use super::reuse;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Validated npm vendoring coordinates (the output of
@@ -110,6 +111,40 @@ pub(super) fn guard_revert_uuid_dir(uuid: &str) -> Result<String, RevertOutcome>
     })
 }
 
+/// The code a pre-flight refusal carries. Every pre-flight gate returns
+/// `Refused`; a `Done` cannot come out of one, and reads as a failure so a
+/// plan built from it still leaves the package to the loop.
+pub(super) fn refusal_code(outcome: &VendorOutcome) -> &'static str {
+    match outcome {
+        VendorOutcome::Refused { code, .. } => code,
+        VendorOutcome::Done { .. } => "vendor_preflight_failed",
+    }
+}
+
+/// Gate `packages` (npm purls with their records) against ONE read of the
+/// project, for the vendor loop's download plan, in the order every
+/// flavor's `vendor_*` gates them: each package is guarded first
+/// ([`guard_coordinates`], the flavors' first gate, ahead of any read),
+/// then a project the flavor refuses outright refuses it with that code,
+/// and otherwise it is handed to the flavor's own per-package pre-flight.
+/// The verdicts come back in `packages` order.
+pub(super) fn gate_packages<P>(
+    project: Result<P, &'static str>,
+    packages: &[(&str, &PatchRecord)],
+    gate: impl Fn(&P, &NpmCoords) -> Result<(), &'static str>,
+) -> Vec<Result<(), &'static str>> {
+    packages
+        .iter()
+        .map(|(purl, record)| {
+            let coords = guard_coordinates(purl, record).map_err(|o| refusal_code(&o))?;
+            match &project {
+                Ok(project) => gate(project, &coords),
+                Err(code) => Err(*code),
+            }
+        })
+        .collect()
+}
+
 /// The shared pipeline's product: a verified, deterministically packed
 /// tarball plus the facts the flavor wiring needs.
 pub(super) struct NpmStagedPack {
@@ -158,7 +193,7 @@ pub(super) struct NpmStagedPack {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_pack(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -222,7 +257,11 @@ pub(super) async fn stage_patch_pack(
         }
     };
     let stage = stage_tmp.path().join("stage");
-    if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+    // The first branch that reads the source. An installed package is
+    // copied out of node_modules; a fetched one is written straight here
+    // from the verified tarball, instead of into a tempdir and copied out
+    // of it again.
+    if let Err(e) = installed_dir.stage_into(&stage, None).await {
         return Err(Box::new(done_failure(
             purl,
             format!("cannot stage a copy of the installed package: {e}"),
@@ -565,7 +604,7 @@ async fn staged_pack_from_service_bytes(
         .await
         .is_ok();
     let (rel_tgz, dest) = prepare_tgz_dest(purl, project_root, coords).await?;
-    if let Err(e) = atomic_write_bytes(&dest, bytes).await {
+    if let Err(e) = atomic_write_artifact(&dest, bytes).await {
         return Err(Box::new(
             done_failure_unstage(
                 purl,
@@ -822,6 +861,50 @@ mod tests {
         }
     }
 
+    /// The download plan gates a package in the loop's order: coordinates
+    /// first, ahead of any read — so a malformed record in a project the
+    /// flavor refuses carries `unsafe_coordinates`, as `vendor_*` reports
+    /// it, and only a well-formed one carries the project's code. A
+    /// readable project hands each well-formed package to the flavor's
+    /// gate, in input order.
+    #[test]
+    fn gate_packages_guards_coordinates_before_it_consults_the_project() {
+        let good = record_with_uuid(UUID);
+        let bad_uuid = record_with_uuid("not-a-uuid");
+        let packages: [(&str, &PatchRecord); 3] = [
+            ("pkg:npm/left-pad@1.3.0", &bad_uuid),
+            ("pkg:npm/left-pad@1.3.0", &good),
+            ("pkg:npm/left-pad@1.2.0", &good),
+        ];
+
+        let unread: Result<(), &'static str> = Err("vendor_lockfile_missing");
+        assert_eq!(
+            gate_packages(unread, &packages, |(), _| unreachable!(
+                "no project to gate against"
+            )),
+            vec![
+                Err("unsafe_coordinates"),
+                Err("vendor_lockfile_missing"),
+                Err("vendor_lockfile_missing"),
+            ]
+        );
+
+        let read: Result<(), &'static str> = Ok(());
+        assert_eq!(
+            gate_packages(read, &packages, |(), coords| {
+                (coords.version == "1.3.0")
+                    .then_some(())
+                    .ok_or("vendor_lock_entry_not_found")
+            }),
+            vec![
+                Err("unsafe_coordinates"),
+                Ok(()),
+                Err("vendor_lock_entry_not_found"),
+            ]
+        );
+        assert_eq!(gate_packages(read, &[], |(), _| Ok(())), Vec::new());
+    }
+
     #[test]
     fn guard_coordinates_accepts_plain_and_scoped_names() {
         let record = record_with_uuid(UUID);
@@ -985,7 +1068,7 @@ mod tests {
             let mut warnings = Vec::new();
             match stage_patch_pack(
                 "pkg:npm/left-pad@1.3.0",
-                &root.join("node_modules/left-pad"),
+                (&root.join("node_modules/left-pad")).into(),
                 root,
                 record,
                 &sources,
@@ -1136,7 +1219,7 @@ mod tests {
         let mut warnings = Vec::new();
         stage_patch_pack(
             LP_PURL,
-            &root.join("node_modules/left-pad"),
+            (&root.join("node_modules/left-pad")).into(),
             root,
             record,
             &sources,
@@ -1414,7 +1497,7 @@ mod tests {
         let cfg = service_cfg(&server.uri(), VendorSource::Auto);
         let Ok((Some(staged), result)) = stage_patch_pack(
             LP_PURL,
-            &root.join("node_modules/left-pad"),
+            (&root.join("node_modules/left-pad")).into(),
             root,
             &record,
             &sources,

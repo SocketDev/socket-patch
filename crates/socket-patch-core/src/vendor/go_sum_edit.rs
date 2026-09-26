@@ -251,6 +251,184 @@ pub fn remove_lines(content: &str, added: &str) -> Option<String> {
     Some(joined)
 }
 
+/// A `go.sum` edited by a sequence of the transforms above without splitting
+/// and re-joining the whole file for every one: the hosted rewriter upserts
+/// and prunes two modules' lines per dep, which on a large go.sum made every
+/// dep cost two full-file copies.
+///
+/// The content is always exactly what applying the text transforms in the
+/// same order would give. Once a transform changes it, the file is held as
+/// its lines: every transform ends with `lines.join(eol) + eol`, whose
+/// `str::lines` are those lines again and whose `detect_eol` is `eol` again —
+/// except when a line ends in a bare `\r` under an LF file (a joined `\r\n`
+/// would then split differently), which is kept as text instead.
+pub(crate) struct GoSumEditor {
+    state: GoSumState,
+}
+
+enum GoSumState {
+    /// The exact content.
+    Text(String),
+    /// Content `lines.join(eol) + eol`; never empty.
+    Lines {
+        lines: Vec<String>,
+        eol: &'static str,
+    },
+}
+
+impl GoSumEditor {
+    pub(crate) fn new(content: String) -> Self {
+        Self {
+            state: GoSumState::Text(content),
+        }
+    }
+
+    fn take_lines(&mut self) -> (Vec<String>, &'static str) {
+        match std::mem::replace(&mut self.state, GoSumState::Text(String::new())) {
+            GoSumState::Text(text) => {
+                let lines = text.lines().map(str::to_string).collect();
+                let eol = super::common::detect_eol(&text);
+                self.state = GoSumState::Text(text);
+                (lines, eol)
+            }
+            GoSumState::Lines { lines, eol } => (lines, eol),
+        }
+    }
+
+    /// Store the transform result `lines.join(eol) + eol` (`""` when empty).
+    fn commit(&mut self, lines: Vec<String>, eol: &'static str) {
+        self.state = if lines.is_empty() {
+            GoSumState::Text(String::new())
+        } else if eol == "\n" && lines.iter().any(|l| l.ends_with('\r')) {
+            let mut text = lines.join(eol);
+            text.push_str(eol);
+            GoSumState::Text(text)
+        } else {
+            GoSumState::Lines { lines, eol }
+        };
+    }
+
+    /// [`upsert_module_lines`] in place; `true` when it changed the content.
+    pub(crate) fn upsert_module_lines(
+        &mut self,
+        module: &str,
+        version: &str,
+        zip_h1: &str,
+        gomod_h1: &str,
+    ) -> bool {
+        let want = module_lines(module, version, zip_h1, gomod_h1);
+        let zip_key = format!("{module} {version} ");
+        let gomod_key = format!("{module} {version}/go.mod ");
+        let is_key = |l: &str| l.starts_with(&zip_key) || l.starts_with(&gomod_key);
+        let applied = {
+            let mut want_seen = [0usize; 2];
+            let mut stale_key_line = false;
+            let mut scan = |l: &str| {
+                if l == want[0] {
+                    want_seen[0] += 1;
+                } else if l == want[1] {
+                    want_seen[1] += 1;
+                } else if is_key(l) {
+                    stale_key_line = true;
+                }
+            };
+            match &self.state {
+                GoSumState::Text(text) => text.lines().for_each(&mut scan),
+                GoSumState::Lines { lines, .. } => {
+                    lines.iter().map(String::as_str).for_each(&mut scan)
+                }
+            }
+            want_seen == [1, 1] && !stale_key_line
+        };
+        if applied {
+            return false;
+        }
+        let (mut lines, eol) = self.take_lines();
+        lines.retain(|l| !is_key(l));
+        let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+        let mut pending = want.into_iter().peekable();
+        for line in lines {
+            while pending.peek().is_some_and(|w| *w < line) {
+                out.push(
+                    pending
+                        .next()
+                        .expect("peek() just confirmed a pending element"),
+                );
+            }
+            out.push(line);
+        }
+        out.extend(pending);
+        self.commit(out, eol);
+        true
+    }
+
+    /// [`has_module_version`] over the current content.
+    pub(crate) fn has_module_version(&self, module: &str, version: &str) -> bool {
+        let zip_key = format!("{module} {version} ");
+        let gomod_key = format!("{module} {version}/go.mod ");
+        let is_key = |l: &str| l.starts_with(&zip_key) || l.starts_with(&gomod_key);
+        match &self.state {
+            GoSumState::Text(text) => text.lines().any(is_key),
+            GoSumState::Lines { lines, .. } => lines.iter().any(|l| is_key(l)),
+        }
+    }
+
+    /// [`remove_exact_module_version_lines`] in place: the removed lines, or
+    /// `None` when nothing matched.
+    pub(crate) fn remove_exact_module_version_lines(
+        &mut self,
+        module: &str,
+        version: &str,
+    ) -> Option<Vec<String>> {
+        let zip_key = format!("{module} {version} ");
+        let gomod_key = format!("{module} {version}/go.mod ");
+        let is_key = |l: &str| l.starts_with(&zip_key) || l.starts_with(&gomod_key);
+        let any = match &self.state {
+            GoSumState::Text(text) => text.lines().any(is_key),
+            GoSumState::Lines { lines, .. } => lines.iter().any(|l| is_key(l)),
+        };
+        if !any {
+            return None;
+        }
+        let (lines, eol) = self.take_lines();
+        let (removed, kept): (Vec<String>, Vec<String>) =
+            lines.into_iter().partition(|l| is_key(l));
+        self.commit(kept, eol);
+        Some(removed)
+    }
+
+    /// [`remove_module_prefix_lines`] in place; `true` when it changed the
+    /// content.
+    pub(crate) fn remove_module_prefix_lines(&mut self, module_prefix: &str) -> bool {
+        let new = match &self.state {
+            GoSumState::Text(text) => remove_module_prefix_lines(text, module_prefix),
+            GoSumState::Lines { lines, eol } => {
+                let mut text = lines.join(eol);
+                text.push_str(eol);
+                remove_module_prefix_lines(&text, module_prefix)
+            }
+        };
+        match new {
+            Some(new) => {
+                self.state = GoSumState::Text(new);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        match self.state {
+            GoSumState::Text(text) => text,
+            GoSumState::Lines { lines, eol } => {
+                let mut text = lines.join(eol);
+                text.push_str(eol);
+                text
+            }
+        }
+    }
+}
+
 // ── pure reader ──────────────────────────────────────────────────────────────
 // The line reader lockfile discovery (`vex::discover::golang`) and the lock
 // inventory share, and the `h1:` shape the hosted rewriter and discovery
@@ -469,5 +647,101 @@ mod tests {
             remove_module_prefix_lines(&content, "patch.socket.dev/gopatch/").unwrap(),
             ""
         );
+    }
+
+    /// Random go.sum-ish text: matching and near-miss lines for a few
+    /// modules, blank lines, unsorted order, CRLF / mixed / bare-`\r`
+    /// endings, a missing final newline, or nothing at all.
+    fn random_go_sum(rng: &mut impl FnMut(usize) -> usize) -> String {
+        const MODS: &[&str] = &[
+            "a.com/x",
+            "a.com/x/y",
+            "b.com/z",
+            "patch.socket.dev/gopatch/u1",
+        ];
+        const VERS: &[&str] = &["v1.0.0", "v1.0.0/go.mod", "v1.0.01", "v2.0.0"];
+        let mut out = String::new();
+        for _ in 0..rng(12) {
+            match rng(10) {
+                0 => {}
+                1 => out.push_str("junk"),
+                _ => out.push_str(&format!(
+                    "{} {} h1:{}",
+                    MODS[rng(MODS.len())],
+                    VERS[rng(VERS.len())],
+                    ["A=", "B=", "C="][rng(3)]
+                )),
+            }
+            out.push_str(["\n", "\n", "\r\n", "\r", "\r\r\n"][rng(5)]);
+        }
+        if rng(4) == 0 {
+            out.pop();
+        }
+        out
+    }
+
+    #[test]
+    fn editor_matches_the_text_transforms_step_by_step() {
+        for seed in 1..=3000u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rng = move |n: usize| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
+            };
+            let start = random_go_sum(&mut rng);
+            let mut text = start.clone();
+            let mut editor = GoSumEditor::new(start.clone());
+            for step in 0..rng(8) {
+                let module = ["a.com/x", "b.com/z", "patch.socket.dev/gopatch/u1"][rng(3)];
+                let version = ["v1.0.0", "v2.0.0"][rng(2)];
+                match rng(3) {
+                    0 => {
+                        let (zip, gomod) = [("h1:A=", "h1:B="), ("h1:C=", "h1:A=")][rng(2)];
+                        let want = upsert_module_lines(&text, module, version, zip, gomod);
+                        let got = editor.upsert_module_lines(module, version, zip, gomod);
+                        assert_eq!(got, want.is_some(), "seed {seed} step {step}");
+                        if let Some(new) = want {
+                            text = new;
+                        }
+                    }
+                    1 => {
+                        let want = remove_exact_module_version_lines(&text, module, version);
+                        let got = editor.remove_exact_module_version_lines(module, version);
+                        assert_eq!(
+                            got,
+                            want.as_ref().map(|(_, removed)| removed.clone()),
+                            "seed {seed} step {step}"
+                        );
+                        if let Some((new, _)) = want {
+                            text = new;
+                        }
+                    }
+                    _ => {
+                        let want = remove_module_prefix_lines(&text, "patch.socket.dev/gopatch/");
+                        let got = editor.remove_module_prefix_lines("patch.socket.dev/gopatch/");
+                        assert_eq!(got, want.is_some(), "seed {seed} step {step}");
+                        if let Some(new) = want {
+                            text = new;
+                        }
+                    }
+                }
+                let snapshot = GoSumEditor {
+                    state: match &editor.state {
+                        GoSumState::Text(t) => GoSumState::Text(t.clone()),
+                        GoSumState::Lines { lines, eol } => GoSumState::Lines {
+                            lines: lines.clone(),
+                            eol,
+                        },
+                    },
+                };
+                assert_eq!(
+                    snapshot.into_string(),
+                    text,
+                    "seed {seed} step {step}: {start:?}"
+                );
+            }
+        }
     }
 }

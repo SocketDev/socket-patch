@@ -7,15 +7,20 @@
 //! small helpers shared across the submodules.
 
 use clap::Args;
+use futures_util::StreamExt;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
+    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
+    is_fallback_candidate, ApiClient, ApiError,
 };
-use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
+use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
+use socket_patch_core::telemetry::{
+    spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
+};
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
@@ -25,7 +30,7 @@ use std::path::Path;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::crawl_all_ecosystems;
+use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use super::get::{download_and_apply_patches_with, select_patches, DownloadParams, DownloadRun};
@@ -449,9 +454,14 @@ async fn discover_selected(
     common: &GlobalArgs,
     show_progress: bool,
     warn: bool,
+    telemetry: &mut PendingTelemetry,
 ) -> Result<Vec<PatchSearchResult>, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
+    // The scan event's send overlapped the detail fetches; every caller's
+    // next output (the error line below, a `--json` envelope, a prompt)
+    // must find it delivered.
+    telemetry.flush().await;
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
         let err = failures
@@ -530,13 +540,31 @@ async fn fetch_patch_details(
     // `show_progress` off reads as `--json` to the status line: never
     // drawn. On, it is live only on a terminal; it never prints a result.
     let mut status = StatusLine::stderr(!show_progress, false);
-    for (i, pkg) in packages.iter().enumerate() {
+    // The queries run concurrently but come back in `packages` order, so
+    // `results` and `failures` fold exactly as the serial loop's did. The
+    // counter names the next result awaited, and each query's `--debug`
+    // lines are held back and printed at its fold, where the serial loop
+    // would have made the request.
+    let mut responses = std::pin::pin!(ordered_concurrent(
+        packages,
+        api_concurrency(api_client.uses_public_proxy()),
+        |pkg| async move {
+            (
+                pkg,
+                hold_back_debug(api_client.search_patches_by_package(&pkg.purl)).await,
+            )
+        },
+    ));
+    for i in 0..packages.len() {
         status.set(format!(
             "Fetching patch details... ({}/{})",
             i + 1,
             packages.len()
         ));
-        match api_client.search_patches_by_package(&pkg.purl).await {
+        let Some((pkg, response)) = responses.next().await else {
+            break;
+        };
+        match response.release() {
             Ok(response) => results.extend(response.patches),
             Err(e) => failures.push((pkg.purl.clone(), e.to_string())),
         }
@@ -634,6 +662,21 @@ fn partition_agent_selection(
 /// shape (`json`/`silent`) and `save_only` differ per flow; vendored mode
 /// never persists blobs (its records stay in memory and the vendor step
 /// consumes the staged sources).
+/// The ecosystems a scan crawls (`None`: every one). `--ecosystems`
+/// narrows everything the run counts, queries and shows to the named
+/// ecosystems, so without a GC the other crawlers' output would only be
+/// filtered away: they are not run at all. A GC run (`--prune` / `--sync`)
+/// still crawls everything — the GC judges every manifest entry against the
+/// FULL installed set (see `scanned_purls` in `run_scan`), and a skipped
+/// ecosystem would read as uninstalled.
+fn crawl_scope(prune: bool, ecosystems: Option<&[String]>) -> Option<&[String]> {
+    if prune {
+        None
+    } else {
+        ecosystems
+    }
+}
+
 fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
@@ -1434,7 +1477,19 @@ fn print_zero_error_envelope(err: &str, paths: &[String]) {
     print_json(&result);
 }
 
-pub async fn run(mut args: ScanArgs) -> i32 {
+pub async fn run(args: ScanArgs) -> i32 {
+    // Scan's telemetry sends run off the critical path: each is spawned
+    // where its event fires and flushed before the first stdout write that
+    // follows it (so a closed pipe's SIGPIPE, or a Ctrl-C at a prompt, still
+    // finds it delivered, as with an inline send). The flush here is the
+    // backstop that keeps every event ahead of the process exit.
+    let mut telemetry = PendingTelemetry::new();
+    let code = Box::pin(run_scan(args, &mut telemetry)).await;
+    telemetry.flush().await;
+    code
+}
+
+async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     apply_env_toggles(&args.common);
 
     // Fold the legacy mode booleans into `args.mode` before anything reads
@@ -1544,15 +1599,29 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
     status.set(format!("Scanning {scan_target}..."));
 
-    // Crawl packages
-    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path) =
-        crawl_all_ecosystems(&crawler_options).await;
+    // Which ecosystems to crawl (see `crawl_scope`).
+    let crawl_scope = crawl_scope(prune, args.common.ecosystems.as_deref());
+
+    // Crawl packages. Vendored mode keeps the npm half: its engine
+    // resolves the same untouched tree and reuses this crawl instead of
+    // walking `node_modules` again (no snapshot when npm was not crawled).
+    // No other mode reads the snapshot, so no other mode pays for copying
+    // it.
+    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if vendor {
+        crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
+    } else {
+        let (packages, counts, skipped) = crawl_ecosystems(&crawler_options, crawl_scope).await;
+        (packages, counts, skipped, None)
+    };
 
     // Lockfile supplement: dependencies the project's lockfile resolves
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery — counts, API lookup, table, the prune "scanned" set — and
     // are flagged "not yet installed" everywhere a user could act on them.
-    let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
+    // Scoped to the crawled ecosystems: a skipped ecosystem's lockfile
+    // entries have no crawl to be measured against, and `--ecosystems`
+    // filters them out of this run anyway.
+    let lockfile_only = lockfile_supplement(&args.common, &all_crawled, crawl_scope).await;
     // Discovery diagnoses unsupported installation layouts and malformed
     // binary Bun locks. Preserve these on empty scans too: an unreadable
     // graph is not evidence that a fresh checkout has no dependencies.
@@ -1619,7 +1688,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // and delete it (plus its blobs) — silent cross-ecosystem data loss.
     // Lockfile-only purls are deliberately included: a dependency the
     // lockfile still resolves must not be pruned just because node_modules
-    // is wiped or partially installed.
+    // is wiped or partially installed. (This is why a GC run never scopes
+    // the crawl — see `crawl_scope`; a scoped run reads this set nowhere.)
     let scanned_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
     // Vendor-ledger purl keys (from the single load above), shared by the
@@ -1705,7 +1775,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
-        track_patch_scanned(
+        spawn_patch_scanned(
+            telemetry,
             0,
             0,
             0,
@@ -1718,8 +1789,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             false,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-        )
-        .await;
+        );
+        // The result prints right away: nothing to overlap the send with.
+        telemetry.flush().await;
         if args.common.json {
             // When the crawler finds nothing, GC is intentionally skipped
             // — pruning every manifest entry on the assumption that the
@@ -1854,63 +1926,115 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
 
-    for (batch_idx, chunk) in all_purls.chunks(batch_size).enumerate() {
-        status.set(format!(
-            "Querying API for patches... (batch {}/{total_batches})",
-            batch_idx + 1
-        ));
-
-        let mut result = api_client.search_patches_batch(chunk).await;
-
-        // Fallback: a 401/403 against the authenticated endpoint can
-        // mean a stale/revoked token. Retry against the public proxy
-        // (free patches only) once, then continue the rest of the
-        // loop with the downgraded client. Only triggers on the
-        // first authenticated batch; subsequent iterations are
-        // already on the proxy.
-        if !use_public_proxy {
-            if let Err(ref e) = result {
-                if is_fallback_candidate(e) {
-                    // Errors-only under --silent; --json keeps it on stderr
-                    // (the envelope has no slot for a mid-run downgrade).
-                    if !args.common.silent {
-                        status.println(format!(
-                            "Warning: authenticated API returned {e}; \
-                             falling back to public patch API proxy (free patches only)."
-                        ));
-                    }
-                    api_client = build_proxy_fallback_client(&overrides);
-                    use_public_proxy = true;
-                    fallback_to_proxy = true;
-                    result = api_client.search_patches_batch(chunk).await;
+    // Fold one batch outcome, in chunk order. Every caller below consumes
+    // outcomes strictly by chunk index, so the per-batch warnings,
+    // `batch_error_count` and `last_batch_error` come out exactly as the
+    // serial loop produced them.
+    let mut fold = |batch_idx: usize,
+                    result: Result<BatchSearchResponse, ApiError>,
+                    status: &mut StatusLine<_>| match result {
+        Ok(response) => {
+            if response.can_access_paid_patches {
+                can_access_paid_patches = true;
+            }
+            for pkg in response.packages {
+                if !pkg.patches.is_empty() {
+                    all_packages_with_patches.push(pkg);
                 }
             }
         }
+        Err(e) => {
+            batch_error_count += 1;
+            last_batch_error = Some(e.to_string());
+            // Not fatal by itself: the scan goes on with the other
+            // batches. A one-batch scan says it once, below.
+            if !args.common.json && !args.common.silent && total_batches > 1 {
+                status.println(render::batch_failed_warning(
+                    batch_idx + 1,
+                    total_batches,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
 
-        match result {
-            Ok(response) => {
-                if response.can_access_paid_patches {
-                    can_access_paid_patches = true;
-                }
-                for pkg in response.packages {
-                    if !pkg.patches.is_empty() {
-                        all_packages_with_patches.push(pkg);
+    // The batches run concurrently (at most `api_concurrency` in flight)
+    // but are CONSUMED in chunk order, one window at a time:
+    //
+    // - On the authenticated client the first chunk goes alone, so a stale
+    //   token costs the authenticated API one request before the
+    //   downgrade, as it always did. Already on the proxy there is no
+    //   downgrade left to cap (the fallback arm below is authenticated-
+    //   only), so a token-less run opens the full window at chunk 0.
+    // - Fallback: a 401/403 against the authenticated endpoint can mean a
+    //   stale/revoked token. At the first consumed chunk `k` whose error is
+    //   a fallback candidate (any index, not just the first), the window is
+    //   dropped — in-flight requests for chunks past `k` are cancelled and
+    //   any responses already received for them are discarded, never
+    //   folded — then chunk `k` is retried against the public proxy (free
+    //   patches only) and the rest continues on the downgraded client.
+    //   That is exactly the serial loop's sequence; on the proxy no further
+    //   fallback applies. A token revoked mid-run does cost the auth
+    //   endpoint the requests the window had already dispatched past `k`
+    //   (up to the in-flight cap, instead of one). Their answers are
+    //   discarded, and so are their `--debug` lines: each chunk's are held
+    //   back until it is folded, so a chunk the window drops announces
+    //   nothing the serial loop would not have announced.
+    let chunks: Vec<&[String]> = all_purls.chunks(batch_size).collect();
+    let mut next = 0usize;
+    'windows: while next < total_batches {
+        let end = if next == 0 && !use_public_proxy {
+            1
+        } else {
+            total_batches
+        };
+        let mut fallback_error = None;
+        {
+            let client = &api_client;
+            let mut results = std::pin::pin!(ordered_concurrent(
+                &chunks[next..end],
+                api_concurrency(use_public_proxy),
+                |chunk| hold_back_debug(client.search_patches_batch(chunk)),
+            ));
+            while next < end {
+                status.set(format!(
+                    "Querying API for patches... (batch {}/{total_batches})",
+                    next + 1
+                ));
+                // `ordered_concurrent` yields exactly one item per chunk,
+                // so the window never runs dry early. Should a future
+                // variant make it, stop the scan here: re-entering the
+                // outer loop with `next` unchanged would rebuild the very
+                // same window and re-POST every chunk in it, forever.
+                let Some(result) = results.next().await else {
+                    debug_assert!(false, "batch window yields one result per chunk");
+                    break 'windows;
+                };
+                match result.release() {
+                    Err(e) if !use_public_proxy && is_fallback_candidate(&e) => {
+                        fallback_error = Some(e);
+                        break;
                     }
+                    result => fold(next, result, &mut status),
                 }
+                next += 1;
             }
-            Err(e) => {
-                batch_error_count += 1;
-                last_batch_error = Some(e.to_string());
-                // Not fatal by itself: the scan goes on with the other
-                // batches. A one-batch scan says it once, below.
-                if !args.common.json && !args.common.silent && total_batches > 1 {
-                    status.println(render::batch_failed_warning(
-                        batch_idx + 1,
-                        total_batches,
-                        &e.to_string(),
-                    ));
-                }
+        }
+        if let Some(e) = fallback_error {
+            // Errors-only under --silent; --json keeps it on stderr
+            // (the envelope has no slot for a mid-run downgrade).
+            if !args.common.silent {
+                status.println(format!(
+                    "Warning: authenticated API returned {e}; \
+                     falling back to public patch API proxy (free patches only)."
+                ));
             }
+            api_client = build_proxy_fallback_client(&overrides);
+            use_public_proxy = true;
+            fallback_to_proxy = true;
+            let result = api_client.search_patches_batch(chunks[next]).await;
+            fold(next, result, &mut status);
+            next += 1;
         }
     }
 
@@ -1927,13 +2051,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        track_patch_scan_failed(
+        spawn_patch_scan_failed(
+            telemetry,
             &err,
             fallback_to_proxy,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-        )
-        .await;
+        );
+        // The failure prints right away: nothing to overlap the send with.
+        telemetry.flush().await;
 
         // A scan in which *every* batch failed produced no trustworthy
         // patch data. Surfacing `status: "success"` / exit 0 here would be
@@ -1997,7 +2123,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // per-tier counts. `fallback_to_proxy` is `true` iff the batch
     // loop downgraded from the authenticated endpoint to the public
     // proxy after a 401/403.
-    track_patch_scanned(
+    spawn_patch_scanned(
+        telemetry,
         package_count,
         free_patches,
         paid_patches,
@@ -2010,8 +2137,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         fallback_to_proxy,
         telemetry_token.as_deref(),
         telemetry_org.as_deref(),
-    )
-    .await;
+    );
 
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
@@ -2042,11 +2168,20 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             Err(corrupt) => (None, Some(corrupt.to_string())),
         }
     } else {
-        (
-            crate::commands::load_redirect_state_lenient(&args.common.cwd, args.common.silent)
-                .await,
-            None,
-        )
+        // `load_redirect_state_lenient`, with the scan event's send flushed
+        // before its warning: that line can be this run's first write since
+        // the event fired, and a closed stderr's SIGPIPE must find the event
+        // delivered, as the inline send it replaced was.
+        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+            Ok(state) => (state, None),
+            Err(corrupt) => {
+                if !args.common.silent {
+                    telemetry.flush().await;
+                    eprintln!("Warning: {corrupt}");
+                }
+                (None, None)
+            }
+        }
     };
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
@@ -2119,6 +2254,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 Some(result),
+                telemetry,
             )
             .await;
         }
@@ -2163,6 +2299,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 &args.common,
                 false,
                 false,
+                telemetry,
             )
             .await
             {
@@ -2305,9 +2442,16 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 prune,
                 telemetry_token.as_deref(),
                 telemetry_org.as_deref(),
+                telemetry,
+                npm_crawl.as_ref(),
             )
             .await;
         }
+
+        // The GC and the VEX build below can write to stderr; the report-
+        // only arm has not flushed the scan event yet (the `--apply` arm
+        // did, in `discover_selected`).
+        telemetry.flush().await;
 
         // --- GC (post-apply, or standalone --prune GC-sweep) -------------
         if prune {
@@ -2333,6 +2477,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         print_json(&result);
         return final_code;
     }
+
+    // Every human exit below prints first; the scan event goes out before.
+    telemetry.flush().await;
 
     let use_color = ui::stdout_color();
     let verbose = args.common.verbose;
@@ -2549,6 +2696,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             &args.common,
             human,
             !silent,
+            telemetry,
         )
         .await
         {
@@ -2825,6 +2973,10 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         HashMap::new()
     };
 
+    // Whether the prompt below waits on a person: the tree may change while
+    // it does, so the vendor step then crawls afresh instead of reusing the
+    // pre-prompt crawl (`--yes` / `--json` / non-terminal answer at once).
+    let prompt_waits = ui::confirm_waits(&args.common);
     if !ui::confirm(&render::confirm_prompt(plan), true, &args.common) {
         if !silent {
             println!();
@@ -2864,6 +3016,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             prune,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
+            npm_crawl.as_ref().filter(|_| !prompt_waits),
         )
         .await
     } else {
@@ -2949,6 +3102,18 @@ mod tests {
             );
         }
         m
+    }
+
+    /// MVN-4: only a non-GC `--ecosystems` run narrows the crawl. A GC run
+    /// crawls every ecosystem whatever `--ecosystems` says (its prune reads
+    /// the full installed set), and no `--ecosystems` crawls every one.
+    #[test]
+    fn crawl_scope_narrows_only_a_non_gc_filtered_run() {
+        let npm = vec!["npm".to_string()];
+        assert_eq!(crawl_scope(false, Some(&npm)), Some(&npm[..]));
+        assert_eq!(crawl_scope(true, Some(&npm)), None);
+        assert_eq!(crawl_scope(false, None), None);
+        assert_eq!(crawl_scope(true, None), None);
     }
 
     // ---- cross-mode ledger takeover (hosted ⇄ vendored) --------------------

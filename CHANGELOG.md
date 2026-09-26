@@ -624,9 +624,46 @@ into the new version's section — see docs/releasing.md.
   `hosted_revert_unsupported` before the manifest mutation), and remove's
   default GC extends from blobs-only to blobs + diff + package archives
   (parity with rollback/repair/`scan --prune`).
+- **`SOCKET_API_CONCURRENCY` paces `scan`'s patch-API requests.** `scan`
+  now keeps several patch-API requests in flight (8 authenticated, 4 on the
+  public proxy) instead of one at a time. Set this variable — clamped to
+  `1`-`32`, and on the public proxy only downward — when something in front
+  of the API caps in-flight requests per client (a self-hosted `--api-url`,
+  a corporate reverse proxy, a WAF, a CDN) and a scan starts losing
+  requests to it. `SOCKET_API_CONCURRENCY=1` restores one request at a
+  time. Unset, empty or non-numeric values keep the defaults. Results,
+  warnings and their order never depend on the setting.
+
+  Two request-count consequences an operator may see before they read the
+  code, neither of which changes any output:
+
+  - A vendored run fetches prebuilt archives ahead of the wiring loop.
+    The plan it fetches is exact — it is gated by the same pre-flight each
+    vendor backend runs before it would ask the service (an unsupported or
+    absent lockfile entry, an override conflict, a workspace gate), so a
+    package the run does not end up vendoring is never asked for: the
+    `POST /v0/orgs/<org>/patches/package` download grants, which can start
+    a server-side archive build and count against quota, are exactly the
+    one-at-a-time loop's (71 on a fresh depscan run, where an earlier
+    draft of the look-ahead issued 74). What changes is only their timing:
+    up to four are in flight at once. `SOCKET_API_CONCURRENCY=1` turns the
+    look-ahead off entirely.
+  - A token revoked *mid-run* now costs the authenticated batch endpoint
+    the requests already in flight — up to the in-flight cap instead of
+    one — before the run downgrades to the public proxy. Their answers are
+    discarded and the connections are dropped mid-response, so the
+    endpoint's access log shows them; the downgrade warning, the patches
+    and the exit code are the same as before.
 
 ### Fixed
 
+- **`vex`'s API-fallback note no longer depends on which refusal landed
+  first.** When the patch API refuses several patch records, the
+  `api_auth_fallback` note quoted whichever refusal happened to answer
+  first — a race, so two runs of the same project could report different
+  text (`Unauthorized` or `Forbidden`) and retry the refused records in a
+  different order. Both now follow the order the records are listed in,
+  like every other note.
 - **Hosted Go redirects no longer claim patches that did not land.**
   `scan`/`get --mode hosted` counted a Go module as redirected (recorded
   it in the redirect ledger, so `vex` attested it) whenever any project
@@ -1195,6 +1232,157 @@ into the new version's section — see docs/releasing.md.
   has no prebuilt crate.
 
 ### Changed
+
+- **Maven discovery takes coordinates from the `~/.m2` path.** A POM at its
+  canonical `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom`
+  location is no longer opened: its groupId / artifactId / version come from
+  the directory names, which is where Maven itself writes every POM, so the
+  crawl skips reading and parsing tens of thousands of files. The path only
+  spells the right group when the scan root is the repository root, so each
+  top-level group directory (`org/`, `com/`, ...) is confirmed first: the
+  first canonical POM under it whose contents parse must agree with its
+  path, and a directory whose first such POM disagrees — every one of them
+  when `--global-prefix` / `SOCKET_GLOBAL_PREFIX` / `MAVEN_REPO_LOCAL` points
+  one level above or inside the repository — is read content-first exactly
+  as before. Other `.pom` files (timestamped SNAPSHOT POMs, hand-placed
+  extras, a dotted group directory) are parsed as before. One semantic
+  change: under a confirmed directory, a POM at a canonical path whose
+  contents disagree with its directory (hand-placed, or a legacy upstream
+  POM with mismatched coordinates) now reports the directory's coordinates
+  instead of the ones in the file.
+- **`scan --ecosystems` crawls only the named ecosystems.** Without
+  `--prune`/`--sync`, a `scan -e npm` no longer walks `~/.m2`, the cargo
+  registry, the Go module cache and the rest only to filter their packages
+  away. What the run counts, queries and shows is unchanged
+  (`scannedPackages` already counted only the selected ecosystems), with
+  one exception: `lockfileOnlyPackages` and the human "not yet installed"
+  note now count only the selected ecosystems' lockfile-only entries
+  instead of every ecosystem's. A GC run (`--prune`/`--sync`) still crawls
+  every ecosystem — the prune needs the full installed set — and reports
+  exactly what it did before.
+
+- **An already-vendored project re-runs `vendor` without the network.** A
+  vendorable purl with no installed copy (the fresh-clone case) used to have
+  its pristine artifact downloaded and verified before the backend was even
+  asked, although the backend's in-sync check answers from the committed
+  artifact alone. That download is now deferred to the backend branch that
+  actually reads the pristine tree, whenever the vendor ledger already
+  covers the purl (its entry records the record's patch uuid and the
+  committed artifact is on disk — a file artifact such as a wheel or
+  tarball only while it still hashes to the ledger's `sha256`; `--force`
+  keeps the eager fetch), and for every lockfile-only cargo crate the
+  registry could fetch and verify (a crates.io `Cargo.lock` entry with a
+  checksum, or the pre-vendor resolution the ledger recovers) while the
+  patch service is enabled (the cargo backend reads the pristine source
+  only once `cargo_service_copy` falls back to the local build). A git,
+  path or custom-registry crate is never deferred: it keeps the eager
+  ladder's `vendor_fetch_unverifiable` + `package_not_installed` refusal
+  and is not vendored from the service's crates.io build, and a committed
+  file artifact that no longer matches its pin keeps the eager ladder's
+  outcome too. Visible effects: an idempotent re-run
+  makes no registry requests and no longer reports `vendor_fetched_missing`
+  for fetches it never needed; with no network (or under `--offline`) the
+  re-run of an already-vendored pypi, cargo, go or lockfile-only gem
+  project now SUCCEEDS (`already_vendored`, exit 0) instead of failing
+  `vendor_fetch_failed` / `package_not_installed`; a cargo crate the service
+  serves is never downloaded from the registry. When a deferred fetch does
+  happen (a drifted committed copy being rebuilt locally, a service miss),
+  its `vendor_fetched_missing` warning is recorded just ahead of that
+  package's own event instead of in the up-front fetch pass, and a failed,
+  unverifiable or `--offline`-refused deferred fetch reports exactly the
+  eager ladder's outcome for the purl (`vendor_fetch_failed` /
+  `vendor_fetch_unverifiable` + `package_not_installed` /
+  `package_not_installed`), in loop order. `vendor --vendor-source build`
+  (or no service config) now refuses a not-installed gem that the lock can
+  verify and no ledger entry covers with `gem_spec_missing` BEFORE
+  downloading it: a local build can never vendor a downloaded `.gem` (no
+  eval-able stub gemspec), so the download was pure waste. The refusal
+  keeps the backend's detail text and drops the `vendor_fetched_missing`
+  warning that used to precede it; since it now comes first, a gem the
+  backend would have refused for another reason after the download (an
+  uneditable Gemfile declaration, a Gemfile.lock it cannot edit) also
+  reports `gem_spec_missing`. `--dry-run` is unchanged: it still fetches
+  the gem and previews it (`vendor_fetched_missing` + `verified`).
+
+- **The vendor ledger stores a whole-file snapshot's new text as an edit.**
+  Several backends record an entire file as a wiring record's `original` /
+  `new` (maven's `pom.xml`, nuget's config, `pylock*.toml`, PEP 723 scripts
+  and hatch's project files), so a ledger held two near-identical copies of
+  that file per vendored package. In `.socket/vendor/state.json` such a
+  record's `new` text of 1 KiB or more is now written as a line-level edit
+  of the same record's `original`: `{"snapshot": "<sha256 of the text>",
+  "ops": [[start, len] | "inserted text", …]}` (a `[start, len]` pair copies
+  that byte range of the `original`, a string inserts itself), and the
+  ledger's `"version"` is `2`. The `original` stays the plain string it
+  always was, every lockfile fragment record (poetry, composer, npm, …) is
+  untouched, and a ledger without such a record keeps its version-1 bytes.
+  Every command reads both versions: version-1 ledgers load and revert
+  exactly as before, and a version-2 edit is rebuilt and checked against its
+  hash (an edit that does not reproduce its text, has no `original` to
+  apply to, or any other `{"snapshot": …}` value, is
+  `vendor_state_unreadable`). Revert, repair, `vex`, rollback and the
+  re-vendor carry-forward see the same full texts as before. Each record is
+  self-contained, so an older socket-patch that re-saves the ledger (it
+  keeps `original` / `new` verbatim) loses nothing; reading a version-2
+  record it leaves that fragment alone with its drift warning. No consumer
+  outside socket-patch reads `state.json` wiring.
+
+- **A vendored run commits its lockfile and ledger edits once, not per
+  package.** `vendor`, `scan --mode vendored` and `get --mode vendored` used
+  to rewrite every touched lockfile / `package.json` / `pnpm-workspace.yaml`
+  / config and the whole `.socket/vendor/state.json` after EACH package. The
+  run now captures those edits in memory (every backend still reads its own
+  and its siblings' earlier edits) and writes the final state once, after
+  the loop, through a roll-forward journal
+  (`.socket/vendor/.commit-journal.json`, removed when the commit
+  completes). The packages that succeeded are committed even when others
+  failed, so a completed run leaves exactly the files per-package commits
+  left. Crash semantics move from per-package to per-run: a crash before
+  the commit leaves the project's lockfiles and ledgers as they were before
+  the run (the artifacts it wrote are orphans the next run re-vendors over);
+  a crash during the commit is finished by the next command that takes the
+  apply lock, before it reads any of those files. When a file the journal
+  covers was edited since, that file is never written over and the journal
+  is set aside (`.commit-journal.set-aside-<uuid>.json`, which keeps every
+  file's pre-commit bytes; a stderr warning names `repair`): if the edited
+  files still carry the commit's own lines the rest of the commit is
+  finished around them (so the ledger records the wiring on disk), if none
+  of them does the files the crash had already replaced are put back to
+  their pre-commit bytes, and otherwise nothing is applied. A journal that
+  would write through a symbolic link, or outside the lockfiles and
+  ledgers, is set aside unapplied. A replay that fails on I/O keeps the
+  journal and fails the command's lock acquire (`lock_io`) rather than
+  letting it work over a half-committed project. A re-vendor under a newer
+  patch uuid now removes the replaced uuid's artifact dir after the commit,
+  so its `vendor_stale_artifact_removed` event comes after the run's
+  per-package events instead of right after the package's own; a golang
+  takeover likewise deletes the `.socket/go-patches/` copy only after the
+  commit that repoints `go.mod` away from it. A commit that cannot be
+  written fails the run with the new top-level error `vendor_commit_failed`
+  (exit 1), leaving the pre-run lockfiles and ledger in place — or, when
+  putting back the files already replaced failed too, keeping the journal
+  (the message says so) for the next locked command to finish the commit.
+  `repair`, `vendor --revert` and `rollback` keep their per-entry saves.
+
+- **Vendored artifacts are no longer fsynced one by one.** The files a
+  vendored run produces under `.socket/vendor/<eco>/<uuid>/` — patched copy
+  trees, the `.tgz` / `.whl` / `.nupkg` / `.jar` + `.pom` artifacts and their
+  `.sha1` sidecars, and the marker — are still written atomically (stage +
+  rename) but without their own `fsync`/`F_FULLFSYNC`. One durability
+  barrier syncs every such file and, once per directory, their directories
+  (with a single `F_FULLFSYNC` per device on macOS) before the next durable
+  commit point — a lockfile, `go.mod`/`go.sum`, `pom.xml`, `nuget.config`,
+  `package.json`, `pnpm-workspace.yaml`, the vendor ledger or the redirect
+  ledger — is written, so nothing durable ever names an artifact that could
+  still be lost. An artifact rebuilt in place that no commit point follows
+  (a drifted committed artifact healed with the lockfiles and ledger
+  unchanged) is synced by the same barrier at the end of the vendored run's
+  commit and when the command releases the apply lock, so no command
+  returns with an unsynced artifact the committed state names; a failed
+  barrier keeps its files pending for the next one. A crash can at worst
+  lose an artifact nothing durable names yet, which the next run rebuilds
+  (see `socket_patch_core::utils::durability` for the full argument). The
+  in-place `apply` of an installed tree keeps its per-file durable writes.
 
 - **Release publishing decomposed into per-registry workflows.** The
   crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live

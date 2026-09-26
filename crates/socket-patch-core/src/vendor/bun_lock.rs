@@ -49,9 +49,11 @@ use crate::vendor::bun_lock_text::{
 
 use super::common::{already_patched_result, refused};
 use super::npm_common::{
-    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+    done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
+    stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -323,9 +325,9 @@ pub async fn binary_vendor_paths(project_root: &Path) -> Result<Vec<String>, Str
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
 /// re-run synthesizes AlreadyPatched with no entry.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn vendor_bun(
+pub(crate) async fn vendor_bun<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -334,7 +336,8 @@ pub(crate) async fn vendor_bun(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
-    if !project_root.join(BUN_LOCK).exists() && project_root.join("bun.lockb").exists() {
+    let installed_dir = installed_dir.into();
+    if binary_lock_drives(project_root) {
         return super::bun_binary::vendor(
             purl,
             installed_dir,
@@ -358,68 +361,19 @@ pub(crate) async fn vendor_bun(
     let (name, version) = (coords.name.as_str(), coords.version.as_str());
 
     // ── 2. Read + strictly parse the lock (refuse before any write) ──────
-    let lock_text = match read_regular_to_string(&project_root.join(BUN_LOCK)).await {
-        Ok(text) => text,
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("cannot read {BUN_LOCK}: {e} — run `bun install` first"),
-            );
-        }
-    };
-    if let Err(detail) = check_lock_version(&lock_text) {
-        return refused("vendor_lockfile_version_unsupported", detail);
-    }
-    let mut lines: Vec<String> = lock_text.split('\n').map(str::to_string).collect();
-    let entries = match parse_packages_section(&lines) {
-        Ok(entries) => entries,
-        Err(detail) => {
-            // SECURITY/fail-closed: never line-splice a lock whose packages
-            // section does not match the pinned single-line grammar.
-            return refused(
-                "vendor_lockfile_version_unsupported",
-                format!("{BUN_LOCK} packages section is not in bun's emitted shape: {detail}"),
-            );
-        }
+    let project = match read_project(project_root).await {
+        Ok(project) => project,
+        Err(outcome) => return *outcome,
     };
 
     // ── 3. Pre-flight: at least one rewritable instance ──────────────────
-    let target_spec = format!("{name}@{version}");
-    let target_leaf = tgz_rel_leaf(name, version);
-    let has_match = entries
-        .iter()
-        .any(|e| classify(e, &target_spec, name, &target_leaf).is_some());
-    if !has_match {
-        return refused(
-            "vendor_lock_entry_not_found",
-            format!(
-                "{BUN_LOCK} has no packages entry resolving {name}@{version} — make sure \
-                 the package is installed and locked (`bun install`) before vendoring"
-            ),
-        );
-    }
-    // Workspace gate, evaluated on the CLASSIFIED target instances rather
-    // than the raw lock: it refuses only a run that would WRITE a new
-    // local-tarball tuple (a `Registry` instance) into a pre-v2 workspace
-    // lock. When every matching instance is already one of ours (`Ours`),
-    // the lock carries the local tuple regardless of what this run does —
-    // an in-sync re-run must synthesize AlreadyPatched and a `repair`
-    // rebuild of a missing/corrupt artifact must proceed (both route here),
-    // otherwise a project vendored before it grew a workspace member is
-    // refused every maintenance verb and `repair` leaves the lock pointing
-    // at a tarball it declined to rebuild. Still ahead of staging, so the
-    // refusal precedes every write.
-    let writes_new_local_tuple = entries.iter().any(|e| {
-        matches!(
-            classify(e, &target_spec, name, &target_leaf),
-            Some(TupleShape::Registry)
-        )
-    });
-    if writes_new_local_tuple {
-        if let Err((code, detail)) = check_workspace_compatibility(&lock_text, &entries) {
-            return refused(code, detail);
-        }
-    }
+    let (target_spec, target_leaf) = match preflight_package(&project, name, version) {
+        Ok(target) => target,
+        Err(outcome) => return *outcome,
+    };
+    let BunProject {
+        mut lines, entries, ..
+    } = project;
 
     // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix (the
     // shared pipeline's `prepare_tgz_dest` builds the identical string).
@@ -673,6 +627,138 @@ pub(crate) async fn vendor_bun(
         entry: Some(entry),
         warnings,
     }
+}
+
+/// Whether the project's installs are driven by the native binary lock:
+/// no `bun.lock` beside a `bun.lockb`. [`vendor_bun`] routes those to
+/// [`super::bun_binary`], and the vendor loop's download plan follows the
+/// same routing.
+pub(super) fn binary_lock_drives(project_root: &Path) -> bool {
+    !project_root.join(BUN_LOCK).exists() && project_root.join("bun.lockb").exists()
+}
+
+/// The text lock, read and strictly parsed before any write: version-
+/// checked, split into its lines, its packages section in bun's emitted
+/// single-line grammar. [`vendor_bun`] reads it per package; the vendor
+/// loop's download plan reads it once and gates every package against the
+/// same parse ([`preflight_packages`]).
+pub(super) struct BunProject {
+    lock_text: String,
+    lines: Vec<String>,
+    entries: Vec<BunEntry>,
+}
+
+/// Read the lock, refusing (before any write) one that is missing,
+/// unreadable, of an unsupported version, or out of grammar.
+pub(super) async fn read_project(project_root: &Path) -> Result<BunProject, Box<VendorOutcome>> {
+    let lock_text = match read_regular_to_string(&project_root.join(BUN_LOCK)).await {
+        Ok(text) => text,
+        Err(e) => {
+            return Err(Box::new(refused(
+                "vendor_lockfile_missing",
+                format!("cannot read {BUN_LOCK}: {e} — run `bun install` first"),
+            )));
+        }
+    };
+    if let Err(detail) = check_lock_version(&lock_text) {
+        return Err(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            detail,
+        )));
+    }
+    let lines: Vec<String> = lock_text.split('\n').map(str::to_string).collect();
+    let entries = match parse_packages_section(&lines) {
+        Ok(entries) => entries,
+        Err(detail) => {
+            // SECURITY/fail-closed: never line-splice a lock whose packages
+            // section does not match the pinned single-line grammar.
+            return Err(Box::new(refused(
+                "vendor_lockfile_version_unsupported",
+                format!("{BUN_LOCK} packages section is not in bun's emitted shape: {detail}"),
+            )));
+        }
+    };
+    Ok(BunProject {
+        lock_text,
+        lines,
+        entries,
+    })
+}
+
+/// The per-package pre-flight against an already-read lock: at least one
+/// instance to rewrite, and the workspace gate when the run would write a
+/// new local tuple. `Ok` is the `(name@version, tarball leaf)` pair the
+/// classification keyed on. Nothing here reads the package's source or
+/// asks the service, so the download plan evaluates it ahead of the loop.
+pub(super) fn preflight_package(
+    project: &BunProject,
+    name: &str,
+    version: &str,
+) -> Result<(String, String), Box<VendorOutcome>> {
+    let target_spec = format!("{name}@{version}");
+    let target_leaf = tgz_rel_leaf(name, version);
+    let has_match = project
+        .entries
+        .iter()
+        .any(|e| classify(e, &target_spec, name, &target_leaf).is_some());
+    if !has_match {
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_found",
+            format!(
+                "{BUN_LOCK} has no packages entry resolving {name}@{version} — make sure \
+                 the package is installed and locked (`bun install`) before vendoring"
+            ),
+        )));
+    }
+    // Workspace gate, evaluated on the CLASSIFIED target instances rather
+    // than the raw lock: it refuses only a run that would WRITE a new
+    // local-tarball tuple (a `Registry` instance) into a pre-v2 workspace
+    // lock. When every matching instance is already one of ours (`Ours`),
+    // the lock carries the local tuple regardless of what this run does —
+    // an in-sync re-run must synthesize AlreadyPatched and a `repair`
+    // rebuild of a missing/corrupt artifact must proceed (both route here),
+    // otherwise a project vendored before it grew a workspace member is
+    // refused every maintenance verb and `repair` leaves the lock pointing
+    // at a tarball it declined to rebuild. Still ahead of staging, so the
+    // refusal precedes every write.
+    let writes_new_local_tuple = project.entries.iter().any(|e| {
+        matches!(
+            classify(e, &target_spec, name, &target_leaf),
+            Some(TupleShape::Registry)
+        )
+    });
+    if writes_new_local_tuple {
+        if let Err((code, detail)) =
+            check_workspace_compatibility(&project.lock_text, &project.entries)
+        {
+            return Err(Box::new(refused(code, detail)));
+        }
+    }
+    Ok((target_spec, target_leaf))
+}
+
+/// Which of `packages` [`vendor_bun`] would refuse before its first
+/// service call, from one read of the lock — routed to the binary
+/// backend's gates exactly as [`vendor_bun`] routes the vendoring; see
+/// [`super::npm_flavor::preflight_packages`].
+pub(crate) async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    if binary_lock_drives(project_root) {
+        return super::bun_binary::preflight_packages(project_root, packages).await;
+    }
+    gate_packages(
+        read_project(project_root)
+            .await
+            .map_err(|o| refusal_code(&o)),
+        packages,
+        |project, coords| {
+            preflight_package(project, &coords.name, &coords.version)
+                .map(drop)
+                .map_err(|o| refusal_code(&o))
+        },
+    )
 }
 
 /// Undo one bun-vendored package: restore the recorded entry lines and
@@ -3745,5 +3831,83 @@ mod tests {
             fx.root().join(fx.rel_tgz()).exists(),
             "artifact survives the failure"
         );
+    }
+
+    // ── download-plan pre-flight parity ───────────────────────────────────
+
+    /// `(the plan's verdict, the loop's own outcome)` for the fixture's
+    /// package — the pre-flight first, since a successful vendor rewrites
+    /// the lock it would then read.
+    async fn preflight_then_vendor(
+        fx: &Fixture,
+    ) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let planned = preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)])
+            .await
+            .remove(0);
+        let looped = match fx.vendor(false).await {
+            VendorOutcome::Refused { code, .. } => Err(code),
+            VendorOutcome::Done { .. } => Ok(()),
+        };
+        (planned, looped)
+    }
+
+    /// The vendor loop's download plan gates each package with this
+    /// backend's own pre-flight (`preflight_packages`): the lock read and
+    /// parsed once, then the instance and workspace gates per package. Same
+    /// code wherever the loop refuses, admitted wherever it vendors.
+    #[tokio::test]
+    async fn preflight_agrees_with_the_loop_on_every_pre_service_refusal() {
+        let (planned, looped) =
+            preflight_then_vendor(&fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await)
+                .await;
+        assert_eq!(
+            (planned, looped),
+            (Ok(()), Ok(())),
+            "the plain fixture vendors"
+        );
+
+        let absent = BN3_BEFORE_LOCK.replace("left-pad@1.3.0", "left-pad@1.2.0");
+        let v3 = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
+        let malformed = BN3_BEFORE_LOCK.replace(
+            "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==\"],",
+            "    \"left-pad\": {\"not\": \"a tuple\"},",
+        );
+        assert_ne!(malformed, BN3_BEFORE_LOCK, "replacement must hit");
+        let workspace_v1 = as_workspace_lock(BN3_BEFORE_LOCK, 1);
+        let cases: [(&str, &str, &str); 4] = [
+            ("absent entry", &absent, "vendor_lock_entry_not_found"),
+            (
+                "lockfileVersion 3",
+                &v3,
+                "vendor_lockfile_version_unsupported",
+            ),
+            (
+                "out-of-grammar packages line",
+                &malformed,
+                "vendor_lockfile_version_unsupported",
+            ),
+            (
+                "pre-v2 workspace lock",
+                &workspace_v1,
+                "vendor_bun_workspace_unsupported",
+            ),
+        ];
+        for (label, lock, code) in cases {
+            let (planned, looped) =
+                preflight_then_vendor(&fixture_with(lock, "node_modules/left-pad").await).await;
+            assert_eq!(looped, Err(code), "{label}: the loop's own refusal");
+            assert_eq!(
+                planned, looped,
+                "{label}: the plan must refuse as the loop does"
+            );
+        }
+
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+            .await
+            .unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_lockfile_missing"));
+        assert_eq!(planned, looped);
     }
 }

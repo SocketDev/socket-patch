@@ -1,0 +1,15 @@
+{
+  "name": "fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "alpha": "1.0.0",
+    "beta": "1.0.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "alpha@1.0.0": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz",
+      "beta@1.0.0": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz"
+    }
+  }
+}

@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use socket_patch_core::crawlers::{types::CrawlerOptions, PythonCrawler};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::vex::verify::verify_patch_record;
+use socket_patch_core::vex::verify::judge_installed_record;
 
-use super::{installed_stale_positive_evidence, StaleInstallOutcome};
+use super::StaleInstallOutcome;
 
 /// A lock rewrite cannot prove a warm virtualenv has installed the wheel.
 /// Use the same discovery as apply (including Poetry's out-of-tree venvs),
@@ -69,26 +69,33 @@ pub(super) async fn stale_install_warnings(
     // package patched; a healthy *different* package cannot.
     let mut judgments = BTreeMap::new();
     let mut pipenv_purls: BTreeSet<String> = BTreeSet::new();
-    for (purl, record) in candidates {
+    // Every candidate's installed copy in every site, from one listing per
+    // site — the per-candidate lookups the loop below consumes, in the same
+    // (candidate, site) order.
+    let bases: Vec<String> = candidates
+        .iter()
+        .map(|(purl, _)| strip_purl_qualifiers(purl).to_string())
+        .collect();
+    let mut found_per_site = Vec::with_capacity(paths.len());
+    for site in &paths {
+        found_per_site.push(crawler.find_each_by_purl(site, &bases).await);
+    }
+    for (index, (purl, record)) in candidates.into_iter().enumerate() {
         if pipenv_uuids.contains(&record.uuid) {
             pipenv_purls.insert(purl.clone());
         }
-        let base = strip_purl_qualifiers(purl).to_string();
-        for site in &paths {
-            let found = crawler
-                .find_by_purls(site, std::slice::from_ref(&base))
-                .await
-                .unwrap_or_default();
-            let Some(pkg) = found.get(&base) else {
+        for found in &found_per_site {
+            let Some(pkg) = &found[index] else {
                 continue;
             };
             let judgment: &mut Judgment = judgments
                 .entry((pkg.path.clone(), pkg.name.clone(), pkg.version.clone()))
                 .or_default();
             judgment.purls.insert(purl.clone());
-            if verify_patch_record(&pkg.path, record).await.is_ok() {
+            let judged = judge_installed_record(&pkg.path, record).await;
+            if judged.patched {
                 judgment.patched = true;
-            } else if installed_stale_positive_evidence(&pkg.path, record).await {
+            } else if judged.stale_evidence {
                 judgment.stale = true;
             }
         }

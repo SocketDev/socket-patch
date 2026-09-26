@@ -21,7 +21,7 @@ use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::telemetry::track_patch_vendor_failed;
+use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
@@ -35,8 +35,9 @@ use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutco
 use crate::commands::get::{download_patch_records_with, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
-    note_classic_migration_risk, track_outcomes_for_vendor, vendor_records,
+    note_classic_migration_risk, track_outcomes_for_vendor, vendor_records_reusing,
 };
+use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 use crate::ui::{plural, print_json};
 
@@ -178,6 +179,9 @@ async fn run_scan_vendor_step(
     // all (the step is a silent no-op then). `get --mode vendored` wants
     // it; scan's interactive arm prints its own closing line instead.
     report_empty: bool,
+    // The npm half of scan's crawl, for the engine to reuse instead of
+    // walking the untouched tree again (see `vendor_records_reusing`).
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> VendorStepResult {
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
     env.dry_run = common.dry_run;
@@ -215,6 +219,7 @@ async fn run_scan_vendor_step(
         client,
         use_public_proxy,
         &mut env,
+        prior,
     )
     .await
     {
@@ -242,6 +247,7 @@ async fn run_scan_vendor_step(
 /// embeds its record). The caller holds the apply lock. `Err` is the
 /// `no_local_source` fold (staging could not obtain the patch content —
 /// offline, or the view fetch failed).
+#[allow(clippy::too_many_arguments)]
 async fn stage_and_vendor(
     common: &GlobalArgs,
     socket_dir: &Path,
@@ -250,6 +256,7 @@ async fn stage_and_vendor(
     client: ApiClient,
     use_public_proxy: bool,
     env: &mut Envelope,
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> Result<bool, (&'static str, String)> {
     // Loaded ONCE under the lock: the staging harvest reads it here, then
     // the engine takes it over for its persists. An unreadable ledger
@@ -289,6 +296,7 @@ async fn stage_and_vendor(
         Some(&service),
         ledger,
         env,
+        prior,
     )
     .await)
 }
@@ -457,6 +465,11 @@ async fn run_vendor_json_path(
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
+    // Scan's pending telemetry, flushed by `discover_selected` before
+    // anything below writes to stdout.
+    telemetry: &mut PendingTelemetry,
+    // The npm half of scan's crawl, for the vendor engine to reuse.
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> i32 {
     // Same discovery as `--apply`. Vendored purls are NOT filtered here —
     // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
@@ -468,6 +481,7 @@ async fn run_vendor_json_path(
         &args.common,
         false,
         false,
+        telemetry,
     )
     .await
     {
@@ -519,12 +533,13 @@ async fn run_vendor_json_path(
 
     // 2) The vendor engine, under the same lock as apply/vendor (a no-op
     //    that creates nothing when there is nothing to vendor).
-    let vendor_code = match boxed_scan_vendor_step(
+    let vendor_code = match boxed_scan_vendor_step_reusing(
         &args.common,
         records,
         blobs,
         api_client.clone(),
         use_public_proxy,
+        prior,
     )
     .await
     {
@@ -615,6 +630,9 @@ async fn run_vendor_interactive_path(
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
+    // The npm half of scan's crawl, for the vendor engine to reuse —
+    // `None` when the tree may have changed since (an answered prompt).
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> i32 {
     // The download phase is quiet about its own header in vendored mode
     // (only the manifest-mode download prints it), so this arm does.
@@ -643,6 +661,7 @@ async fn run_vendor_interactive_path(
         blobs,
         api_client.clone(),
         use_public_proxy,
+        prior,
     )
     .await
     {
@@ -818,6 +837,8 @@ pub(super) fn boxed_vendor_json_path<'a>(
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
+    telemetry: &'a mut PendingTelemetry,
+    prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_json_path(
         args,
@@ -833,6 +854,8 @@ pub(super) fn boxed_vendor_json_path<'a>(
         prune,
         telemetry_token,
         telemetry_org,
+        telemetry,
+        prior,
     ))
 }
 
@@ -853,6 +876,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
+    prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_interactive_path(
         args,
@@ -868,6 +892,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
         prune,
         telemetry_token,
         telemetry_org,
+        prior,
     ))
 }
 
@@ -892,6 +917,28 @@ pub(crate) fn boxed_scan_vendor_step<'a>(
         client,
         use_public_proxy,
         true,
+        None,
+    ))
+}
+
+/// [`boxed_scan_vendor_step`] handing the engine scan's npm crawl to reuse
+/// (see `vendor_records_reusing`).
+fn boxed_scan_vendor_step_reusing<'a>(
+    common: &'a GlobalArgs,
+    records: HashMap<String, PatchRecord>,
+    seed: HashMap<String, Vec<u8>>,
+    client: ApiClient,
+    use_public_proxy: bool,
+    prior: Option<&'a NpmCrawlSnapshot>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
+    Box::pin(run_scan_vendor_step(
+        common,
+        records,
+        seed,
+        client,
+        use_public_proxy,
+        true,
+        prior,
     ))
 }
 
@@ -903,6 +950,7 @@ fn boxed_scan_vendor_step_quiet_empty<'a>(
     seed: HashMap<String, Vec<u8>>,
     client: ApiClient,
     use_public_proxy: bool,
+    prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
     Box::pin(run_scan_vendor_step(
         common,
@@ -911,6 +959,7 @@ fn boxed_scan_vendor_step_quiet_empty<'a>(
         client,
         use_public_proxy,
         false,
+        prior,
     ))
 }
 
@@ -938,14 +987,15 @@ fn boxed_vendor_records<'a>(
     service: Option<&'a socket_patch_core::vendor::VendorServiceConfig>,
     ledger: std::io::Result<VendorState>,
     env: &'a mut Envelope,
+    prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
     // `scan --vendor` threads the SAME service config the `vendor` command
     // builds (honoring `--vendor-source`), so both entry points vendor the
     // same bytes by default. See `run_scan_vendor_step`. Always detached:
     // vendored mode is manifest-free. The ledger is the one the harvest
     // just read, handed over so the engine does not reload it.
-    Box::pin(vendor_records(
-        common, records, sources, /*detached=*/ true, false, env, service, ledger,
+    Box::pin(vendor_records_reusing(
+        common, records, sources, /*detached=*/ true, false, env, service, ledger, prior,
     ))
 }
 

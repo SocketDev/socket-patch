@@ -35,8 +35,9 @@ use super::common::{
     swap_stage_into_place,
 };
 use super::path::vendor_uuid_dir_rel;
-use super::registry_fetch::extract_zip_with_prefix;
+use super::registry_fetch::{extract_on_blocking_pool, extract_zip_with_prefix};
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -54,9 +55,9 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 /// module+version surfaces as a failed result (the engine's `go.mod` editor
 /// refuses it), not a refusal — the verify report is still useful.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_go_module(
+pub async fn vendor_go_module<'a>(
     purl: &str,
-    pristine_src: &Path,
+    pristine_src: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -65,6 +66,7 @@ pub async fn vendor_go_module(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    let pristine_src = pristine_src.into();
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((module, version)) = parse_golang_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a golang purl: {purl}"));
@@ -210,8 +212,24 @@ pub async fn vendor_go_module(
             // patched content. The engine is shared with the in-place `apply`
             // redirect path, whose strict semantics stay unchanged.
             if !force {
-                let missing =
-                    super::missing_existing_patch_files(pristine_src, &record.files).await;
+                // The pre-check reads the pristine tree, so a lazily-fetched
+                // source materialises here; the engine's own copy below then
+                // comes from that tree rather than a second inflate.
+                let probe = match pristine_src.materialize().await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        return done(
+                            failed_result(
+                                purl,
+                                Path::new(""),
+                                format!("failed to copy pristine source: {e}"),
+                            ),
+                            None,
+                            warnings,
+                        )
+                    }
+                };
+                let missing = super::missing_existing_patch_files(probe, &record.files).await;
                 if let Some(first) = missing.first() {
                     return done(
                         failed_result(
@@ -226,8 +244,10 @@ pub async fn vendor_go_module(
             }
             // The engine does the heavy lifting: fresh copy → hardened apply
             // pipeline → `replace` upsert (refuses a user-authored same-version
-            // pin).
-            let result = apply_go_redirect(
+            // pin). The copy is a content-verified artifact, so its patched
+            // files are written without an fsync; the `go.mod` edit stays a
+            // durable commit point (see `crate::utils::durability`).
+            let result = crate::utils::durability::artifact_writes(apply_go_redirect(
                 purl,
                 module,
                 version,
@@ -239,7 +259,7 @@ pub async fn vendor_go_module(
                 Some(&record.uuid),
                 dry_run,
                 MismatchPolicy::Force,
-            )
+            ))
             .await;
             if result.success {
                 warnings.extend(super::mismatch_overwrite_warnings(&result, module, version));
@@ -305,30 +325,18 @@ pub async fn vendor_go_module(
     }
 
     if takeover {
-        // The `replace` line was already atomically repointed by the upsert;
-        // the apply backend's copy is now unreachable — delete it (built from
-        // OUR validated coordinates, never from the go.mod string). NotFound
-        // is fine (the user may have cleaned it already).
+        // The upsert repointed the `replace` line; the apply backend's copy
+        // is then unreachable — delete it (built from OUR validated
+        // coordinates, never from the go.mod string; NotFound is fine, the
+        // user may have cleaned it already) and prune the now-empty parent
+        // husks (`<go-patches>/example.com/`) up to and including the
+        // go-patches root. Inside a group commit the repoint is only
+        // captured, so the on-disk go.mod still names this copy until the
+        // commit: the deletion waits for it (and never happens if the run
+        // crashes or its commit fails).
         let stale = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
-        let _ = remove_tree(&stale).await;
-        // Prune now-empty parent husks (`<go-patches>/example.com/`) up to
-        // and including the go-patches root (`starts_with` holds for the
-        // root itself and bounds the climb). `remove_dir` is non-recursive:
-        // a parent still holding another module's copy fails and stops the
-        // prune; a level the user already removed is skipped.
-        let go_patches_root = project_root.join(GO_PATCHES_DIR);
-        let mut parent = stale.parent().map(|p| p.to_path_buf());
-        while let Some(dir) = parent {
-            if !dir.starts_with(&go_patches_root) {
-                break;
-            }
-            match tokio::fs::remove_dir(&dir).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => break, // non-empty — stop pruning
-            }
-            parent = dir.parent().map(|p| p.to_path_buf());
-        }
+        crate::utils::group_commit::remove_after_commit(&stale, &project_root.join(GO_PATCHES_DIR))
+            .await;
         warnings.push(VendorWarning::new(
             "vendor_takeover",
             format!(
@@ -468,7 +476,7 @@ async fn go_service_redirect(
         }
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
+        ServiceArtifact::Ready(mut archive) => {
             // Extract the module zip (strip its literal `{module}@{version}/`
             // prefix) into a STAGE sibling of the copy dir and swap it into
             // place only once verified — the cargo / composer / gem shape: a
@@ -492,7 +500,13 @@ async fn go_service_redirect(
                 );
             }
             let prefix = format!("{module}@{version}/");
-            if let Err(e) = extract_zip_with_prefix(&archive.bytes, &stage, &prefix) {
+            let zip_bytes = std::mem::take(&mut archive.bytes);
+            let prefix_owned = prefix.clone();
+            if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, move |b, d| {
+                extract_zip_with_prefix(b, d, &prefix_owned)
+            })
+            .await
+            {
                 cleanup_failed_service_stage(
                     &stage,
                     project_root,
@@ -1031,6 +1045,53 @@ mod tests {
             )),
             "the old replace target is recorded verbatim"
         );
+    }
+
+    /// Inside a group commit the takeover's repoint of `go.mod` is only
+    /// captured, so the `.socket/go-patches/` copy the on-disk `go.mod`
+    /// still names survives until the commit: an abandoned commit (a crash,
+    /// a failed commit) leaves a `go.mod` whose replace target exists, and
+    /// a completed one removes the copy.
+    #[tokio::test]
+    async fn test_takeover_in_a_group_commit_removes_the_copy_only_after_it() {
+        use crate::utils::group_commit::GroupCommit;
+        for commit in [false, true] {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            let sources = PatchSources::blobs_only(&blobs);
+            let pre = apply_go_redirect(
+                PURL,
+                MODULE,
+                VERSION,
+                &pristine,
+                root,
+                GO_PATCHES_DIR,
+                &record.files,
+                &sources,
+                Some(UUID),
+                false,
+                MismatchPolicy::Warn,
+            )
+            .await;
+            assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
+            let stale = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+            let go_mod_before = std::fs::read(root.join("go.mod")).unwrap();
+
+            let group = GroupCommit::begin(root);
+            let (result, ..) =
+                expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(stale.exists(), "the on-disk go.mod still names it");
+            if commit {
+                group.commit().await.unwrap();
+                assert!(!stale.exists(), "removed once the repoint is on disk");
+                assert_ne!(std::fs::read(root.join("go.mod")).unwrap(), go_mod_before);
+            } else {
+                drop(group);
+                assert!(stale.exists(), "an abandoned commit removes nothing");
+                assert_eq!(std::fs::read(root.join("go.mod")).unwrap(), go_mod_before);
+            }
+        }
     }
 
     /// Wired go.mod with a deleted committed copy: the module copy is

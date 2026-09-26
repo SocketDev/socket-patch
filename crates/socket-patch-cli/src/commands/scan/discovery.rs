@@ -2,11 +2,14 @@
 //! supplements, update detection against the existing manifest, vendor
 //! baseline pre-verification, and the table's vuln-ID / severity helpers.
 
+use futures_util::StreamExt;
+use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::ranking::cmp_batch_infos;
 use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
@@ -86,9 +89,15 @@ pub(crate) fn unsupported_layout_warnings(
 /// path (hash verify → NotFound, apply → partitioned skip, vendor →
 /// auto-fetch). Global scans target the machine's global tree, not this
 /// project's lockfile, so they get no supplement.
+///
+/// `only` is the crawl's ecosystem scope (`None`: every ecosystem was
+/// crawled): an entry of an ecosystem the crawl skipped is never counted
+/// lockfile-only, since there is no crawl to tell whether it is installed.
+/// `entries` still holds the full inventory.
 pub(super) async fn lockfile_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    only: Option<&[String]>,
 ) -> LockfileSupplement {
     use socket_patch_core::vendor::lock_inventory;
 
@@ -102,8 +111,14 @@ pub(super) async fn lockfile_supplement(
         return out;
     }
     let crawled_purls: HashSet<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
+    let in_scope = |purl: &str| {
+        only.is_none_or(|list| {
+            socket_patch_core::crawlers::Ecosystem::from_purl(purl)
+                .is_some_and(|eco| list.iter().any(|name| name == eco.cli_name()))
+        })
+    };
     for entry in &entries {
-        if crawled_purls.contains(entry.purl.as_str()) {
+        if crawled_purls.contains(entry.purl.as_str()) || !in_scope(&entry.purl) {
             continue;
         }
         let Some(pkg) = crawled_from_purl(&entry.purl, &common.cwd) else {
@@ -283,29 +298,58 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 
     let mut mismatched: HashSet<String> = HashSet::new();
     let mut views: HashMap<String, PatchResponse> = HashMap::new();
-    for (i, patch) in selected.iter().enumerate() {
+    // Per patch, what the loop below compares: `None` to skip it, else the
+    // installed copy plus the ledger's embedded record (`None` = fetch the
+    // view). Local and read-only, so it is computed up front.
+    let plan: Vec<
+        Option<(
+            &socket_patch_core::crawlers::types::CrawledPackage,
+            Option<&PatchRecord>,
+        )>,
+    > = selected
+        .iter()
+        .map(|patch| {
+            // API purls come percent-encoded, crawler purls literal —
+            // purl_eq bridges the two spellings.
+            let base = strip_purl_qualifiers(&patch.purl);
+            // Lockfile-only packages have no installed bytes to compare
+            // — the vendor engine fetches them pristine (nothing to
+            // annotate).
+            if lockfile_only_contains(lockfile_only, base) {
+                return None;
+            }
+            let pkg = crawled.iter().find(|c| purl_eq(&c.purl, base))?;
+            // The same predicate as the download phase's ledger
+            // idempotency skip: its no-fetch set and this one must be
+            // the same set.
+            let embedded = vendor
+                .and_then(|entries| lookup_entry(entries, &patch.purl))
+                .filter(|e| e.detached && e.uuid == patch.uuid)
+                .and_then(|e| e.record.as_ref());
+            Some((pkg, embedded))
+        })
+        .collect();
+    // The views the loop needs, fetched concurrently (at most
+    // `api_concurrency` in flight) and consumed in `selected` order, each
+    // request's `--debug` lines released at its turn.
+    let mut details = std::pin::pin!(ordered_concurrent(
+        selected
+            .iter()
+            .zip(&plan)
+            .filter(|(_, step)| matches!(step, Some((_, None))))
+            .map(|(patch, _)| patch.uuid.as_str()),
+        api_concurrency(api_client.uses_public_proxy()),
+        |uuid| async move { (uuid, hold_back_debug(api_client.fetch_patch(uuid)).await) },
+    ));
+    for (i, (patch, step)) in selected.iter().zip(&plan).enumerate() {
         status.set(format!(
             "Checking installed files against patch baselines... ({}/{})",
             i + 1,
             selected.len()
         ));
-        // API purls come percent-encoded, crawler purls literal — purl_eq
-        // bridges the two spellings.
-        let base = strip_purl_qualifiers(&patch.purl);
-        // Lockfile-only packages have no installed bytes to compare — the
-        // vendor engine fetches them pristine (nothing to annotate).
-        if lockfile_only_contains(lockfile_only, base) {
-            continue;
-        }
-        let Some(pkg) = crawled.iter().find(|c| purl_eq(&c.purl, base)) else {
+        let Some((pkg, embedded)) = *step else {
             continue;
         };
-        // The same predicate as the download phase's ledger idempotency
-        // skip: its no-fetch set and this one must be the same set.
-        let embedded = vendor
-            .and_then(|entries| lookup_entry(entries, &patch.purl))
-            .filter(|e| e.detached && e.uuid == patch.uuid)
-            .and_then(|e| e.record.as_ref());
         let files: Vec<(String, PatchFileInfo)> = match embedded {
             Some(record) => record
                 .files
@@ -313,7 +357,22 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
                 .map(|(file, info)| (file.clone(), info.clone()))
                 .collect(),
             None => {
-                let Ok(Some(detail)) = api_client.fetch_patch(&patch.uuid).await else {
+                // The plan names exactly the patches this arm reaches, so
+                // the next view is this patch's. Checking says so out
+                // loud: a plan out of step would otherwise annotate this
+                // package against ANOTHER patch's hashes and store that
+                // response under this uuid for the download phase.
+                let detail = match details.next().await {
+                    Some((planned, detail)) if planned == patch.uuid => detail.release(),
+                    _ => {
+                        debug_assert!(
+                            false,
+                            "baseline view prefetch plan out of step with the patches"
+                        );
+                        api_client.fetch_patch(&patch.uuid).await
+                    }
+                };
+                let Ok(Some(detail)) = detail else {
                     continue;
                 };
                 let files = detail
@@ -1932,6 +1991,150 @@ mod tests {
                 "a stale or legacy entry still fetches"
             );
         }
+    }
+
+    /// The baseline views are fetched concurrently, so every one must land
+    /// on the patch that planned it. Over a `selected` list mixing all four
+    /// plan outcomes — lockfile-only, uncrawled, an embedded ledger record
+    /// and two fetched views — with the EARLIER view answering LAST, each
+    /// package is compared against its own patch's files (a view that
+    /// slipped by one would name a file that package does not have, and
+    /// annotate nothing), the `views` map pairs each uuid with its own
+    /// response, and only the two planned views are ever requested.
+    #[tokio::test]
+    async fn preverify_pairs_each_concurrent_view_with_its_own_patch() {
+        use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
+        use socket_patch_core::vendor::state::VendorArtifact;
+        use socket_patch_core::vendor::VendorEntry;
+        use wiremock::matchers::{method, path as wm_path};
+
+        let mock = wiremock::MockServer::start().await;
+        // Each patch names a file only ITS OWN package has installed, so a
+        // view taken by the wrong patch verifies a path that is not there.
+        let view = |uuid: &str, file: &str, delay_ms: u64| {
+            wiremock::Mock::given(method("GET"))
+                .and(wm_path(format!("/patch/view/{uuid}")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "uuid": uuid,
+                            "purl": "pkg:npm/ignored@1.0.0",
+                            "publishedAt": "2026-01-01T00:00:00Z",
+                            "files": { file: {
+                                "beforeHash": "0".repeat(64),
+                                "afterHash": "1".repeat(64),
+                            }},
+                            "vulnerabilities": {},
+                            "description": "",
+                            "license": "MIT",
+                            "tier": "free",
+                        }))
+                        .set_delay(std::time::Duration::from_millis(delay_ms)),
+                )
+                .expect(1)
+        };
+        view("u-alpha", "alpha.js", 300).mount(&mock).await;
+        view("u-beta", "beta.js", 0).mount(&mock).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = |name: &str, file: &str| {
+            let dir = tmp.path().join("node_modules").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), b"installed bytes\n").unwrap();
+            dir
+        };
+        let crawled = vec![
+            crawled_pkg(
+                "lockonly",
+                "pkg:npm/lockonly@1.0.0",
+                std::path::PathBuf::from("/nonexistent"),
+            ),
+            crawled_pkg("alpha", "pkg:npm/alpha@1.0.0", installed("alpha", "alpha.js")),
+            crawled_pkg(
+                "embedded",
+                "pkg:npm/embedded@1.0.0",
+                installed("embedded", "embedded.js"),
+            ),
+            // `beta` is installed but WITHOUT the file its own patch names,
+            // so only a view that slipped onto it could annotate it.
+            crawled_pkg("beta", "pkg:npm/beta@1.0.0", installed("beta", "other.js")),
+        ];
+        let selected = vec![
+            search_result("u-lockonly", "pkg:npm/lockonly@1.0.0"),
+            search_result("u-alpha", "pkg:npm/alpha@1.0.0"),
+            search_result("u-embedded", "pkg:npm/embedded@1.0.0"),
+            search_result("u-ghost", "pkg:npm/ghost@1.0.0"),
+            search_result("u-beta", "pkg:npm/beta@1.0.0"),
+        ];
+        let ledger = HashMap::from([(
+            "pkg:npm/embedded@1.0.0".to_string(),
+            VendorEntry {
+                ecosystem: "npm".into(),
+                base_purl: "pkg:npm/embedded@1.0.0".into(),
+                uuid: "u-embedded".into(),
+                artifact: VendorArtifact {
+                    path: ".socket/vendor/npm/u-embedded/embedded-1.0.0.tgz".into(),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring: Vec::new(),
+                lock: None,
+                took_over_go_patches: false,
+                detached: true,
+                record: Some(PatchRecord {
+                    uuid: "u-embedded".into(),
+                    exported_at: "2026-01-01T00:00:00Z".into(),
+                    files: HashMap::from([(
+                        "embedded.js".to_string(),
+                        PatchFileInfo {
+                            before_hash: "0".repeat(64),
+                            after_hash: "1".repeat(64),
+                        },
+                    )]),
+                    vulnerabilities: HashMap::new(),
+                    description: String::new(),
+                    license: "MIT".into(),
+                    tier: "free".into(),
+                }),
+                flavor: None,
+                uv: None,
+                pnpm: None,
+                poetry: None,
+                pdm: None,
+                pipenv: None,
+            },
+        )]);
+
+        let (mismatched, views) = preverify_vendor_baselines(
+            &api_client_for(&mock.uri()),
+            &selected,
+            &crawled,
+            &std::iter::once("pkg:npm/lockonly@1.0.0".to_string()).collect(),
+            Some(&ledger),
+            &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
+        )
+        .await;
+
+        let mut flagged: Vec<&String> = mismatched.iter().collect();
+        flagged.sort();
+        assert_eq!(flagged, vec!["u-alpha", "u-embedded"], "{mismatched:?}");
+        let mut cached: Vec<(&String, &String)> =
+            views.iter().map(|(uuid, v)| (uuid, &v.uuid)).collect();
+        cached.sort();
+        assert_eq!(
+            cached,
+            vec![
+                (&"u-alpha".to_string(), &"u-alpha".to_string()),
+                (&"u-beta".to_string(), &"u-beta".to_string()),
+            ],
+            "each cached view must be its own patch's"
+        );
+        // `.expect(1)` on both views is verified on drop: the skipped and
+        // embedded patches never reached the network.
+        assert_eq!(mock.received_requests().await.unwrap().len(), 2);
+        drop(mock);
     }
 
     #[test]

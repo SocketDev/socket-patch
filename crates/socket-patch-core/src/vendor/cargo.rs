@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{is_symlink, read_regular_to_string};
 use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
@@ -44,8 +44,9 @@ use super::common::{
     synthesized_result,
 };
 use super::path::vendor_uuid_dir_rel;
-use super::registry_fetch::extract_tgz;
+use super::registry_fetch::{extract_on_blocking_pool, extract_tgz};
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker,
     WiringAction, WiringRecord, VENDOR_MARKER_FILE,
@@ -340,7 +341,7 @@ async fn cargo_service_copy(
         }
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
+        ServiceArtifact::Ready(mut archive) => {
             // Extract the `.crate` (tar.gz; strip its single
             // `{name}-{version}/` top-level dir) into a STAGE sibling and
             // swap it into the copy dir only once fully verified — a failure
@@ -354,7 +355,8 @@ async fn cargo_service_copy(
                     format!("cannot create {}: {e}", stage.display()),
                 );
             }
-            if let Err(e) = extract_tgz(&archive.bytes, &stage) {
+            let crate_bytes = std::mem::take(&mut archive.bytes);
+            if let Err(e) = extract_on_blocking_pool(crate_bytes, &stage, extract_tgz).await {
                 cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return hard(
                     "vendor_prebuilt_extract_failed",
@@ -456,7 +458,7 @@ async fn cargo_service_copy(
 #[allow(clippy::too_many_arguments)]
 async fn copy_and_patch(
     purl: &str,
-    pristine_src: &Path,
+    pristine_src: PackageSource<'_>,
     copy_dir: &Path,
     uuid_dir: &Path,
     record: &PatchRecord,
@@ -468,8 +470,15 @@ async fn copy_and_patch(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, ApplyResult> {
     let stage = stage_dir_for(copy_dir);
-    // `fresh_copy` removes + recreates the stage itself.
-    if let Err(e) = fresh_copy(pristine_src, &stage, Some(".cargo-checksum.json")).await {
+    // The local build is the first branch that reads the pristine tree. An
+    // installed crate is copied out of the registry cache; a fetched one is
+    // written straight here from the verified `.crate`, instead of into a
+    // tempdir and copied out of it again. `stage_into` removes + recreates
+    // the stage itself.
+    if let Err(e) = pristine_src
+        .stage_into(&stage, Some(".cargo-checksum.json"))
+        .await
+    {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(synthesized_result(
             purl,
@@ -523,9 +532,9 @@ async fn copy_and_patch(
 /// wired) `entry` is `None` — the lock originals are only recoverable from
 /// the existing ledger entry, so the caller must keep it, not overwrite it.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_cargo_crate(
+pub async fn vendor_cargo_crate<'a>(
     purl: &str,
-    pristine_src: &Path,
+    pristine_src: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -534,6 +543,7 @@ pub async fn vendor_cargo_crate(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    let pristine_src = pristine_src.into();
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((name, version)) = parse_cargo_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a cargo purl: {purl}"));
@@ -719,6 +729,24 @@ pub async fn vendor_cargo_crate(
         // real run would emit), without creating the copy or editing
         // manifest/config/lock.
         let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        // The verify reads the pristine tree, so a lazily-fetched source
+        // materialises here — the one dry-run branch that touches it.
+        let pristine_src = match pristine_src.materialize().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                return done(
+                    synthesized_result(
+                        purl,
+                        &copy_dir,
+                        Vec::new(),
+                        false,
+                        Some(format!("failed to copy pristine source: {e}")),
+                    ),
+                    None,
+                    dry_warnings,
+                )
+            }
+        };
         let mut result = super::force_apply_staged(
             purl,
             pristine_src,

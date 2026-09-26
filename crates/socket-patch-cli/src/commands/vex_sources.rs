@@ -69,11 +69,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use futures_util::StreamExt;
+
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
+    is_fallback_candidate,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::state::{lookup_entry_kv, VendorArtifact, VendorEntry, VendorState};
 use socket_patch_core::vex::discover::{
@@ -103,9 +107,21 @@ pub(crate) const REDIRECT_UNWIRED: &str = "redirect_unwired";
 /// candidate for that package attests.
 pub(crate) const WIRING_CONFLICT: &str = "wiring_conflict";
 
-/// Bound on concurrent patch-view fetches (one GET per uuid; the view
-/// carries blob content, so it is heavy) — the batch fallback's limit.
+/// Ceiling on concurrent patch-view fetches (one GET per uuid; the view
+/// carries blob content, so it is heavy).
 const FETCH_CONCURRENCY: usize = 10;
+
+/// The in-flight cap for the record fetch.
+///
+/// These are patch-API requests — `scan --vex` makes them too — so the
+/// documented escape hatch has to reach them like it reaches every other
+/// window: an operator behind something that caps in-flight requests per
+/// client sets `SOCKET_API_CONCURRENCY=1` and gets one view at a time.
+/// [`FETCH_CONCURRENCY`] is this window's own ceiling on top of that, for
+/// the size of a view.
+fn fetch_concurrency(use_public_proxy: bool) -> usize {
+    api_concurrency(use_public_proxy).min(FETCH_CONCURRENCY)
+}
 
 /// Everything `vex` reads, loaded once by the caller (which owns the
 /// corrupt-ledger hard errors).
@@ -902,30 +918,38 @@ async fn fetch_records(
     loop {
         let mut auth_refused: Vec<String> = Vec::new();
         let mut auth_error: Option<String> = None;
-        for chunk in pending.chunks(FETCH_CONCURRENCY) {
-            status.set(format!(
-                "Fetching {}... ({done}/{total})",
-                if total == 1 {
-                    "the patch record"
-                } else {
-                    "patch records"
-                }
+        // A sliding window of at most FETCH_CONCURRENCY views in flight
+        // (it used to wait for each whole chunk of that size to drain
+        // before starting the next), consumed in `pending` order.
+        //
+        // That IS an observable change, the one in this area: the chunked
+        // JoinSet folded each chunk in COMPLETION order, so which refusal
+        // was reported as `auth_error` (printed in the fallback note) and
+        // the order of the retried `pending` list were a race. They now
+        // follow `pending` order — deterministic, and the same order the
+        // notes above already came out in.
+        {
+            let client = &client;
+            let mut views = std::pin::pin!(ordered_concurrent(
+                pending.iter(),
+                fetch_concurrency(use_public_proxy),
+                |uuid| async move { (uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
             ));
-            let mut set = tokio::task::JoinSet::new();
-            for uuid in chunk {
-                let client = client.clone();
-                let uuid = uuid.clone();
-                set.spawn(async move {
-                    let result = client.fetch_patch(&uuid).await;
-                    (uuid, result)
-                });
-            }
-            while let Some(joined) = set.join_next().await {
-                let Ok((uuid, result)) = joined else {
-                    continue;
+            loop {
+                status.set(format!(
+                    "Fetching {}... ({done}/{total})",
+                    if total == 1 {
+                        "the patch record"
+                    } else {
+                        "patch records"
+                    }
+                ));
+                let Some((uuid, result)) = views.next().await else {
+                    break;
                 };
+                let uuid = uuid.clone();
                 done += 1;
-                match result {
+                match result.release() {
                     Ok(Some(view)) => {
                         out.insert(
                             uuid,
@@ -1026,6 +1050,101 @@ mod tests {
             offline: true,
             ..GlobalArgs::default()
         }
+    }
+
+    /// `scan --vex` reaches this window, so the documented escape hatch
+    /// has to reach it too: `SOCKET_API_CONCURRENCY=1` means one view at a
+    /// time here as well. Serial: `SOCKET_*` is process-global.
+    #[test]
+    #[serial_test::serial]
+    fn socket_api_concurrency_paces_the_record_fetch() {
+        use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+        let orig = std::env::var(API_CONCURRENCY_ENV).ok();
+        std::env::remove_var(API_CONCURRENCY_ENV);
+        // A view is heavy, so the API's own cap is what binds by default.
+        assert_eq!(fetch_concurrency(false), 8);
+        assert_eq!(fetch_concurrency(true), 4);
+
+        std::env::set_var(API_CONCURRENCY_ENV, "1");
+        assert_eq!(fetch_concurrency(false), 1);
+        assert_eq!(fetch_concurrency(true), 1);
+
+        // Turned up past this window's own ceiling, the ceiling holds.
+        std::env::set_var(API_CONCURRENCY_ENV, "32");
+        assert_eq!(fetch_concurrency(false), FETCH_CONCURRENCY);
+
+        match orig {
+            Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+            None => std::env::remove_var(API_CONCURRENCY_ENV),
+        }
+    }
+
+    /// The record fetch folds in `pending` order, not in the order the
+    /// server happens to answer: the FIRST refusal in `pending` is the one
+    /// reported in the fallback note, even when it answers last, and the
+    /// refused uuids are retried against the proxy in that same order.
+    /// (The chunked JoinSet this replaced folded by completion, so which
+    /// refusal was reported was a race.)
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refused_records_fold_in_pending_order_not_completion_order() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        // U1 is first in `pending` and answers LAST; the two refusals are
+        // different statuses, so the reported one is identifiable.
+        for (uuid, status, delay) in [(U1, 401, 300u64), (U2, 403, 0)] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/v0/orgs/acme/patches/view/{uuid}")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_delay(std::time::Duration::from_millis(delay)),
+                )
+                .mount(&api)
+                .await;
+            // The proxy retry serves both, so the run still ends with both
+            // records: only the ORDER of the refusal report is at stake.
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/patch/view/{uuid}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": uuid,
+                    "purl": "pkg:npm/vexorder@1.0.0",
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "files": {},
+                    "vulnerabilities": {},
+                    "description": "",
+                    "license": "MIT",
+                    "tier": "free",
+                })))
+                .mount(&proxy)
+                .await;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            api_url: Some(api.uri()),
+            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+            org: Some("acme".into()),
+            proxy_url: Some(proxy.uri()),
+            ..GlobalArgs::default()
+        };
+        let mut notes: Vec<PlanNote> = Vec::new();
+        let out = fetch_records(&common, &[U1.to_string(), U2.to_string()], &mut notes).await;
+
+        let fallback = notes
+            .iter()
+            .find(|n| n.code == NOTE_API_AUTH_FALLBACK)
+            .unwrap_or_else(|| panic!("no fallback note: {notes:?}"));
+        assert!(
+            fallback.detail.contains("Unauthorized") && !fallback.detail.contains("Forbidden"),
+            "the first refusal in `pending` order must be the reported one: {}",
+            fallback.detail
+        );
+        assert!(out.contains_key(U1) && out.contains_key(U2), "{out:?}");
     }
 
     fn discovery(refs: Vec<PatchedRef>) -> Discovery {

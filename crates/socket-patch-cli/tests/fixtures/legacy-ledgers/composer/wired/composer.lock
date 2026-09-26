@@ -1,0 +1,37 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state"
+    ],
+    "content-hash": "7a59d114f58e9b02546b21d7e57430d3",
+    "packages": [
+        {
+            "name": "fx/alpha",
+            "version": "1.0.0",
+            "dist": {
+                "type": "path",
+                "url": ".socket/vendor/composer/11111111-1111-4111-8111-000000000001/fx/alpha@1.0.0",
+                "reference": "11111111-1111-4111-8111-000000000001"
+            },
+            "transport-options": {
+                "symlink": false
+            },
+            "type": "library"
+        },
+        {
+            "name": "fx/beta",
+            "version": "1.0.0",
+            "dist": {
+                "type": "path",
+                "url": ".socket/vendor/composer/11111111-1111-4111-8111-000000000002/fx/beta@1.0.0",
+                "reference": "11111111-1111-4111-8111-000000000002"
+            },
+            "transport-options": {
+                "symlink": false
+            },
+            "type": "library"
+        }
+    ],
+    "packages-dev": [],
+    "minimum-stability": "stable",
+    "plugin-api-version": "2.6.0"
+}

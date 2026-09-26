@@ -28,7 +28,7 @@ use std::path::Path;
 
 use crate::patch::apply::normalize_file_path;
 use crate::patch::path_safety::is_canonical_uuid;
-use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::fs::{atomic_write_artifact_preserving_mode, read_regular_to_string};
 
 /// The build-metadata identifier that introduces the uuid.
 pub const TAG_IDENT: &str = "socket";
@@ -214,7 +214,10 @@ pub fn untagged_manifest_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Tag the `Cargo.toml` of the copy at `copy_dir` for `uuid` (atomic,
 /// mode-preserving). `Ok(true)` when it was rewritten, `Ok(false)` when it
-/// already carried this tag.
+/// already carried this tag. The copy is a content-verified artifact (every
+/// run re-checks the manifest's untagged bytes against the record's
+/// `afterHash`), so the write is an artifact write: the next durability
+/// barrier syncs it (see `crate::utils::durability`).
 pub async fn tag_copy_manifest(
     copy_dir: &Path,
     version: &str,
@@ -227,7 +230,7 @@ pub async fn tag_copy_manifest(
     match tag_manifest_text(&text, version, uuid)? {
         None => Ok(false),
         Some(tagged) => {
-            atomic_write_bytes_preserving_mode(&path, tagged.as_bytes())
+            atomic_write_artifact_preserving_mode(&path, tagged.as_bytes())
                 .await
                 .map_err(|e| TagError::Io(e.to_string()))?;
             Ok(true)
@@ -241,7 +244,7 @@ pub async fn untag_copy_manifest(copy_dir: &Path) {
     let path = copy_dir.join(COPY_MANIFEST);
     if let Ok(text) = read_regular_to_string(&path).await {
         if let Some(untagged) = untag_manifest_text(&text) {
-            let _ = atomic_write_bytes_preserving_mode(&path, untagged.as_bytes()).await;
+            let _ = atomic_write_artifact_preserving_mode(&path, untagged.as_bytes()).await;
         }
     }
 }

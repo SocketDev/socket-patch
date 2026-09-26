@@ -504,7 +504,14 @@ pub(crate) async fn apply_file_patch_at(
     // `restore_file_permissions` re-applies the pre-patch mode + uid/gid.
     // The directory mode is restored whether or not the write succeeded,
     // before any failure propagates.
-    let write_result = crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await;
+    // Inside a vendor stage the copy is a content-verified artifact, written
+    // without an fsync (see `crate::utils::durability`); an in-place apply
+    // of an installed tree keeps the durable write.
+    let write_result = if crate::utils::durability::in_artifact_scope() {
+        crate::utils::fs::atomic_write_artifact(&filepath, patched_content).await
+    } else {
+        crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await
+    };
     dir_guard.restore().await;
     write_result?;
 

@@ -1,9 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
-use crate::utils::fs::read_regular_to_string;
+use crate::utils::fs::{
+    is_dir, is_dir_sync, read_regular_to_string, read_regular_to_string_sync, run_blocking,
+};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
+
+#[cfg(test)]
+mod oracle;
 
 // ---------------------------------------------------------------------------
 // Python command discovery
@@ -72,16 +78,7 @@ pub async fn read_python_metadata(dist_info_path: &Path) -> Option<(String, Stri
     if let Some(found) = parse_metadata_headers(dist_info_path).await {
         return Some(found);
     }
-
-    let is_dir = tokio::fs::metadata(dist_info_path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
-    if !is_dir {
-        return None;
-    }
-    let dir_name = dist_info_path.file_name()?.to_string_lossy();
-    parse_dist_info_dir_name(&dir_name)
+    dist_info_dir_name_fallback(dist_info_path, is_dir(dist_info_path).await)
 }
 
 /// Parse the `Name`/`Version` headers from `<dist-info>/METADATA`.
@@ -96,7 +93,39 @@ async fn parse_metadata_headers(dist_info_path: &Path) -> Option<(String, String
     // `read_regular_to_string` — non-blocking open on Unix, rejecting
     // FIFOs/devices/directories (see its docs).
     let content = read_regular_to_string(&metadata_path).await.ok()?;
+    parse_metadata_text(&content)
+}
 
+/// Blocking twin of [`read_python_metadata`] for the walk-pool scan: the
+/// same FIFO-safe METADATA read, header parse and directory-name fallback.
+fn read_python_metadata_sync(dist_info_path: &Path) -> Option<(String, String)> {
+    let metadata_path = dist_info_path.join("METADATA");
+    if let Some(found) = read_regular_to_string_sync(&metadata_path)
+        .ok()
+        .and_then(|content| parse_metadata_text(&content))
+    {
+        return Some(found);
+    }
+    dist_info_dir_name_fallback(dist_info_path, is_dir_sync(dist_info_path))
+}
+
+/// The `<name>-<version>.dist-info` directory-name fallback both readers
+/// take once METADATA has yielded nothing — written once so a change to
+/// the rule cannot split the wheel-verification path from the crawl path.
+/// `is_dir` is the caller's own (symlink-following) stat of
+/// `dist_info_path`: the fallback fires only for an actual directory, so
+/// a stray `*.dist-info` FILE cannot masquerade as an install.
+fn dist_info_dir_name_fallback(dist_info_path: &Path, is_dir: bool) -> Option<(String, String)> {
+    if !is_dir {
+        return None;
+    }
+    let dir_name = dist_info_path.file_name()?.to_string_lossy();
+    parse_dist_info_dir_name(&dir_name)
+}
+
+/// The `Name`/`Version` header parse of a METADATA body (see
+/// [`parse_metadata_headers`]).
+fn parse_metadata_text(content: &str) -> Option<(String, String)> {
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
 
@@ -991,19 +1020,22 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
-    // 1. Ask Python for site-packages
-    if let Some(python_cmd) = find_python_command() {
+    // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
+    let site_output = run_blocking(|| {
+        let python_cmd = find_python_command()?;
         let runner = SystemCommandRunner;
-        if let Some(stdout) = runner.run(
+        runner.run(
             python_cmd,
             &[
                 "-c",
                 "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
             ],
-        ) {
-            for p in parse_python_site_packages_output(&stdout) {
-                add_path(p, &mut seen, &mut results);
-            }
+        )
+    })
+    .await;
+    if let Some(stdout) = site_output {
+        for p in parse_python_site_packages_output(&stdout) {
+            add_path(p, &mut seen, &mut results);
         }
     }
 
@@ -1361,60 +1393,149 @@ impl PythonCrawler {
         site_packages_path: &Path,
         purls: &[String],
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
-        let mut result = HashMap::new();
-
         // Build lookup: canonicalized-name@version -> purl. The API serves
         // purls percent-encoded (a PEP 440 local/epoch version carries
         // `+`/`!`, arriving as `%2B`/`%21`), and `parse_pypi_purl` decodes
         // the coordinates — undecoded, the installed package never matches.
-        let mut purl_lookup: HashMap<String, &str> = HashMap::new();
-        for purl in purls {
-            if let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) {
-                let key = format!("{}@{}", canonicalize_pypi_name(&name), version);
-                purl_lookup.insert(key, purl.as_str());
-            }
-        }
-
+        let purl_lookup = purl_lookup(purls);
+        // A lookup with no parseable PURL never lists the directory.
         if purl_lookup.is_empty() {
-            return Ok(result);
+            return Ok(HashMap::new());
+        }
+        let listing = list_dist_info_packages(site_packages_path).await;
+        Ok(match_listing(&purl_lookup, site_packages_path, &listing))
+    }
+
+    /// [`Self::find_by_purls`] over an ALREADY-LISTED `site_packages_path`
+    /// — the same matching over the same listing shape, for a caller that
+    /// lists a site once and asks about it for many packages.
+    pub fn find_by_purls_listed(
+        &self,
+        site_packages_path: &Path,
+        listing: &[(String, String)],
+        purls: &[String],
+    ) -> HashMap<String, CrawledPackage> {
+        let purl_lookup = purl_lookup(purls);
+        if purl_lookup.is_empty() {
+            return HashMap::new();
+        }
+        match_listing(&purl_lookup, site_packages_path, listing)
+    }
+}
+
+/// `canonicalized-name@version -> purl` for every parseable PURL in
+/// `purls`; see [`PythonCrawler::find_by_purls`] for the decoding.
+fn purl_lookup(purls: &[String]) -> HashMap<String, &str> {
+    let mut lookup: HashMap<String, &str> = HashMap::new();
+    for purl in purls {
+        if let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) {
+            let key = format!("{}@{}", canonicalize_pypi_name(&name), version);
+            lookup.insert(key, purl.as_str());
+        }
+    }
+    lookup
+}
+
+/// The listed packages `purl_lookup` names, in listing order (a later
+/// listing entry overwrites an earlier one under the same key).
+fn match_listing(
+    purl_lookup: &HashMap<String, &str>,
+    site_packages_path: &Path,
+    listing: &[(String, String)],
+) -> HashMap<String, CrawledPackage> {
+    let mut result = HashMap::new();
+    for (name, version) in listing {
+        let key = format!("{name}@{version}");
+        if let Some(&matched_purl) = purl_lookup.get(&key) {
+            result.insert(
+                matched_purl.to_string(),
+                CrawledPackage {
+                    name: name.clone(),
+                    version: version.clone(),
+                    namespace: None,
+                    purl: matched_purl.to_string(),
+                    path: site_packages_path.to_path_buf(),
+                },
+            );
+        }
+    }
+    result
+}
+
+impl PythonCrawler {
+    /// [`Self::find_by_purls`] for each of `purls` ON ITS OWN — element `i`
+    /// is what `find_by_purls(site, &[purls[i]])` returns for that PURL —
+    /// from ONE listing of `site_packages_path` instead of one per PURL.
+    /// (A batched `find_by_purls` is not the same thing: two PURLs whose
+    /// canonical `name@version` coincide share one lookup slot there, and
+    /// only the last one is found.)
+    pub async fn find_each_by_purl(
+        &self,
+        site_packages_path: &Path,
+        purls: &[String],
+    ) -> Vec<Option<CrawledPackage>> {
+        let keys: Vec<Option<String>> = purls
+            .iter()
+            .map(|purl| {
+                let (name, version) = crate::utils::purl::parse_pypi_purl(purl)?;
+                Some(format!("{}@{}", canonicalize_pypi_name(&name), version))
+            })
+            .collect();
+        // A lookup with no parseable PURL never lists the directory.
+        if keys.iter().all(Option::is_none) {
+            return vec![None; purls.len()];
         }
 
+        // key -> the LAST listed entry with that key (find_by_purls's
+        // insert-overwrites order).
+        let mut installed: HashMap<String, (String, String)> = HashMap::new();
         for (name, version) in list_dist_info_packages(site_packages_path).await {
-            let key = format!("{name}@{version}");
-            if let Some(&matched_purl) = purl_lookup.get(&key) {
-                result.insert(
-                    matched_purl.to_string(),
-                    CrawledPackage {
-                        name,
-                        version,
-                        namespace: None,
-                        purl: matched_purl.to_string(),
-                        path: site_packages_path.to_path_buf(),
-                    },
-                );
-            }
+            installed.insert(format!("{name}@{version}"), (name, version));
         }
-
-        Ok(result)
+        keys.into_iter()
+            .zip(purls)
+            .map(|(key, purl)| {
+                let (name, version) = installed.get(key.as_ref()?)?.clone();
+                Some(CrawledPackage {
+                    name,
+                    version,
+                    namespace: None,
+                    purl: purl.clone(),
+                    path: site_packages_path.to_path_buf(),
+                })
+            })
+            .collect()
     }
 }
 
 /// Scan a `site-packages` directory for `.dist-info` entries, returning
-/// `(canonicalized name, version)` for each package that yields metadata.
-async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".dist-info") {
-            continue;
-        }
-        let dist_info_path = site_packages_path.join(&*name_str);
-        if let Some((raw_name, version)) = read_python_metadata(&dist_info_path).await {
-            out.push((canonicalize_pypi_name(&raw_name), version));
-        }
-    }
-    out
+/// `(canonicalized name, version)` for each package that yields metadata,
+/// in listing order. One blocking-pool task for the listing and every
+/// METADATA read (one runtime hop per open, read and stat used to set the
+/// scan's pace).
+pub(crate) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
+    let site_packages_path = site_packages_path.to_path_buf();
+    run_blocking(move || list_dist_info_packages_sync(&site_packages_path)).await
+}
+
+/// Blocking body of [`list_dist_info_packages`].
+fn list_dist_info_packages_sync(site_packages_path: &Path) -> Vec<(String, String)> {
+    let dist_infos: Vec<PathBuf> = list_dir_sync(site_packages_path)
+        .into_iter()
+        .filter_map(|entry| {
+            let name_str = entry.name.to_string_lossy();
+            name_str
+                .ends_with(".dist-info")
+                .then(|| site_packages_path.join(&*name_str))
+        })
+        .collect();
+    dist_infos
+        .iter()
+        .filter_map(|dist_info_path| {
+            read_python_metadata_sync(dist_info_path)
+                .map(|(raw_name, version)| (canonicalize_pypi_name(&raw_name), version))
+        })
+        .collect()
 }
 
 impl Default for PythonCrawler {
@@ -2558,5 +2679,113 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("pkg:pypi/requests@2.28.0"));
         assert!(!result.contains_key("pkg:pypi/flask@3.0.0"));
+    }
+
+    // ── Equivalence with the per-call async scan (oracle) ─────────────
+
+    mod equivalence {
+        use super::super::oracle::{self, LegacyPythonCrawler};
+        use super::*;
+        use crate::crawlers::oracle_support::{
+            fifo, map_rows, mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+        };
+
+        const NAMES: &[&str] = &["requests", "Flask_Cors", "zope.interface", "dup", "Dup"];
+        const VERSIONS: &[&str] = &["1.0", "2.31.0", "1.0+local", "3.0a1"];
+
+        fn site(rng: &mut Rng, root: &Path, outside: &Path, perms: &mut PermGuard) {
+            mkdir(root);
+            for i in 0..rng.below(24) {
+                let name = rng.pick(NAMES);
+                let version = rng.pick(VERSIONS);
+                let dir = root.join(format!("{name}-{version}.dist-info"));
+                let metadata = dir.join("METADATA");
+                match rng.below(14) {
+                    0 => mkdir(&dir),
+                    1 => write(&metadata, &format!("Name: {name}\n\nVersion: {version}\n")),
+                    2 => write(&metadata, &format!("Metadata-Version: 2.1\r\nName: {name}\r\nVersion: {version}\r\n\r\nbody")),
+                    3 => fifo(&metadata),
+                    4 => mkdir(&metadata),
+                    5 => {
+                        write_bytes(&metadata, b"Name: \xff\nVersion: 1\n");
+                    }
+                    6 => write(&dir, "stray file"),
+                    7 => {
+                        let target = outside.join(format!("t{i}-{}", rng.next()));
+                        if rng.chance(70) {
+                            write(&target.join("METADATA"), &format!("Name: {name}\nVersion: {version}\n"));
+                        }
+                        symlink(&target, &dir);
+                    }
+                    8 => {
+                        write(&metadata, &format!("Name: {name}\nVersion: {version}\n"));
+                        perms.plan(&dir, 0o000);
+                    }
+                    9 => write(
+                        &root.join(format!("{name}-{version}.egg-info")).join("PKG-INFO"),
+                        "Name: x\nVersion: 1\n",
+                    ),
+                    10 => mkdir(&root.join(format!("{name}.dist-info"))),
+                    _ => write(&metadata, &format!("Name: {name}\nVersion: {version}\n\nName: other\n")),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn randomized_site_packages_match_the_async_oracle() {
+            let (mut crawled, mut found) = (0, 0);
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("site-packages");
+                site(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+
+                assert_eq!(
+                    list_dist_info_packages(&root).await,
+                    oracle::list_dist_info_packages(&root).await,
+                    "seed {seed}: listing"
+                );
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = PythonCrawler::new().crawl_all(&options).await;
+                let old = LegacyPythonCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}: crawl_all");
+
+                let mut purls: Vec<String> = old.iter().map(|p| p.purl.clone()).collect();
+                purls.push("pkg:pypi/Flask-Cors@1.0".to_string());
+                purls.push("pkg:pypi/requests@1.0%2Blocal".to_string());
+                purls.push("pkg:pypi/DUP@1.0".to_string());
+                purls.push("pkg:pypi/dup@1.0".to_string());
+                purls.push("pkg:npm/dup@1.0".to_string());
+                let found_new = PythonCrawler::new()
+                    .find_by_purls(&root, &purls)
+                    .await
+                    .unwrap();
+                let found_old = LegacyPythonCrawler::find_by_purls(&root, &purls).await;
+                assert_eq!(map_rows(&found_new), map_rows(&found_old));
+                // Each PURL on its own, from one listing.
+                let each = PythonCrawler::new().find_each_by_purl(&root, &purls).await;
+                for (purl, got) in purls.iter().zip(&each) {
+                    let single =
+                        LegacyPythonCrawler::find_by_purls(&root, std::slice::from_ref(purl)).await;
+                    assert_eq!(
+                        got.as_ref().map(|p| rows(std::slice::from_ref(p))),
+                        single.get(purl).map(|p| rows(std::slice::from_ref(p))),
+                        "seed {seed}: find_each_by_purl {purl}"
+                    );
+                }
+                crawled += old.len();
+                found += found_new.len();
+            }
+            assert!(
+                crawled > 100 && found > 100,
+                "vacuous fixtures: {crawled}/{found}"
+            );
+        }
     }
 }
