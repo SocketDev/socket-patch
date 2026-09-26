@@ -3562,6 +3562,7 @@ async fn run_get_hosted(
         api_client,
         &pairs,
         scan_result,
+        None,
     )
     .await
 }

@@ -1605,9 +1605,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Crawl packages. Vendored mode keeps the npm half: its engine
     // resolves the same untouched tree and reuses this crawl instead of
     // walking `node_modules` again (no snapshot when npm was not crawled).
-    // No other mode reads the snapshot, so no other mode pays for copying
-    // it.
-    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if vendor {
+    // Hosted mode keeps it only for an embedded `--vex` (skipped under
+    // `--dry-run`), whose installed-copy lookup reuses the npm roots. No
+    // other run reads the snapshot, so no other run pays for copying it.
+    let keep_npm = vendor || (hosted && args.vex.vex.is_some() && !args.common.dry_run);
+    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if keep_npm {
         crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
     } else {
         let (packages, counts, skipped) = crawl_ecosystems(&crawler_options, crawl_scope).await;
@@ -2255,6 +2257,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 can_access_paid_patches,
                 Some(result),
                 telemetry,
+                npm_crawl.as_ref(),
             )
             .await;
         }
@@ -2740,6 +2743,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &api_client,
             &pairs,
             None,
+            npm_crawl.as_ref(),
         )
         .await;
     }
