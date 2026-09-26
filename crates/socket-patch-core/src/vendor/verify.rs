@@ -229,6 +229,49 @@ async fn verify_vlt_dir(
     Ok(())
 }
 
+/// Whether `installed`, an installed copy of the vlt package-dir `entry`,
+/// carries `record`. vlt links a `file:` dependency straight to the
+/// committed directory, so a copy that resolves to it is the artifact
+/// itself; any other copy verifies each member, `package.json` under the
+/// vlt manifest exemption.
+pub(crate) async fn vlt_installed_copy_matches(
+    project_root: &Path,
+    installed: &Path,
+    entry: &VendorEntry,
+    record: &PatchRecord,
+) -> bool {
+    let artifact = project_root.join(normalize_file_path(&entry.artifact.path));
+    if let (Ok(a), Ok(b)) = (
+        tokio::fs::canonicalize(installed).await,
+        tokio::fs::canonicalize(&artifact).await,
+    ) {
+        if a == b {
+            return true;
+        }
+    }
+    let pin = entry
+        .artifact
+        .file_inventory
+        .as_ref()
+        .and_then(|inv| inv.get("package.json"));
+    for (file_name, info) in &record.files {
+        if normalize_file_path(file_name) == "package.json" {
+            if let Some(pin) = pin {
+                if !vlt_manifest_matches(project_root, installed, pin, &info.after_hash).await {
+                    return false;
+                }
+                continue;
+            }
+        }
+        if verify_file_patch(installed, file_name, info).await.status
+            != VerifyStatus::AlreadyPatched
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// The vlt manifest exemption (DESIGN §4.4): the committed `package.json`
 /// is post-transform, so it verifies iff it hashes to the inventory pin and,
 /// when the afterHash blob is in the local blob store, the blob with its

@@ -52,7 +52,7 @@ pub use state::{
 };
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
-pub(crate) use takeover::hosted_url_version;
+pub(crate) use takeover::{hosted_url_names, hosted_url_version};
 pub use takeover::{
     redirect_revert_supported, revert_cargo_redirect_purl, revert_golang_redirect_purl,
     revert_npm_redirect_purl, revert_redirect_purl, RedirectRevert,

@@ -332,6 +332,17 @@ into the new version's section — see docs/releasing.md.
   slots and outgoing edge values vlt rewrote since) or keeps everything on
   drift. Lock inventory reads `vlt-lock.json` too, Socket-hosted pins
   included.
+- **`vex` reads `vlt-lock.json`.** Manifest-less VEX (and the ledger
+  liveness gates behind `vex`, `scan`'s takeovers and the
+  `hosted_wiring_retained` advisory) discovers hosted vlt nodes (a Socket
+  URL and sha512 on a registry node, every DepID era) and vendored vlt
+  package directories, and verifies a vendored directory with the vlt
+  `package.json` exemption, including the out-of-sync check of the
+  installed link. A lock vlt cannot read (BOM, other `lockfileVersion`)
+  wires nothing. A hosted npm package is now judged by every store variant
+  of its installed copies (pnpm and vlt peer, modifier and registry-alias
+  instances), and a same-version instance on another registry keeps a vlt
+  hosted pin from attesting before install. `setup.manual` accepts `vlt`.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

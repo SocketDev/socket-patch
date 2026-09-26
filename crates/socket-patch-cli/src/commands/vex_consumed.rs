@@ -23,7 +23,7 @@
 //! | golang | the REPLACEMENT module `$GOMODCACHE/patch.socket.dev/gopatch/<uuid>@<sver>` (the ref's `url`, else go.mod's hosted `replace`) | the original `M@v` |
 //! | cargo | `registry/src/<host>-<hash>/<name>-<version>` for the lock source's host; several such registries (one per patch uuid) are narrowed to the one whose cached `.crate` has the lock's pinned checksum. A `vendor/` source tree or `--global-prefix` is taken as given | crates.io's / any other registry's extraction |
 //! | maven | `<repo>/<g>/<a>/<base>-socket.<hex8>/` (the version the pom pins), its artifact files matched under the suffixed name | the `<base>` version dir |
-//! | npm | every `node_modules` copy the crawler finds (pnpm and vlt store copies included), plus alias installs (`node_modules/<alias>` holding the package) in the root's and every workspace member's tree | — each serves some dependent: ALL must verify |
+//! | npm | every `node_modules` copy the crawler finds (pnpm and vlt store copies included), every peer / modifier / registry variant of those in the same `.pnpm` / `.vlt` store, plus alias installs (`node_modules/<alias>` holding the package) in the root's and every workspace member's tree | — each serves some dependent: ALL must verify |
 //! | pypi | every copy in the crawler's environment set (the project's venvs when it has any, else the interpreters) | — any may be the one that runs the project: ALL must verify |
 //! | gem | every copy in bundler's gem path | — bundler loads whichever `Gem.path` home it hits first: ALL must verify |
 //!
@@ -40,6 +40,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies;
 use socket_patch_core::crawlers::{
     CargoCrawler, CrawlerOptions, Ecosystem, GoCrawler, MavenCrawler, NpmCrawler,
 };
@@ -94,9 +95,13 @@ pub(crate) async fn hosted_consumed_copies(
             None => HashMap::new(),
         };
         npm_identity_fallback(shared.get(&Ecosystem::Npm), &options, &mut all, &aliases).await;
+        let npm: Vec<&String> = shared.get(&Ecosystem::Npm).into_iter().flatten().collect();
         for purl in shared.values().flatten() {
             let mut paths = all.remove(purl).unwrap_or_default();
             paths.extend(aliases.remove(purl).unwrap_or_default());
+            if npm.contains(&purl) {
+                paths = with_store_variants(paths).await;
+            }
             out.insert(
                 purl.clone(),
                 HostedCopies {
@@ -269,6 +274,28 @@ async fn npm_identity_fallback(
         })
         .collect();
     all.extend(npm_paths_by_identity(options, &missing).await);
+}
+
+/// `paths` plus every store variant of each (a pnpm peer suffix, a vlt peer
+/// or modifier extra, a vlt registry-alias instance of the same
+/// `name@version`): the crawler resolves a store copy only for a package
+/// with no importer copy, leaving the variants to apply's fan-out, but each
+/// variant is what some dependent loads.
+async fn with_store_variants(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for path in &paths {
+        seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
+    }
+    let mut out = paths.clone();
+    for path in &paths {
+        for copy in find_store_peer_variant_copies(path).await {
+            let canonical = tokio::fs::canonicalize(&copy).await.unwrap_or(copy.clone());
+            if seen.insert(canonical) {
+                out.push(copy);
+            }
+        }
+    }
+    out
 }
 
 // ── golang ───────────────────────────────────────────────────────────────
@@ -698,6 +725,45 @@ mod tests {
             ..local(root)
         };
         assert!(npm_alias_copies(&global, &purls).await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_variants_of_a_consumed_copy_are_consumed_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        for id in [
+            "~npm~left-pad@1.3.0",
+            "~npm~left-pad@1.3.0~peer.0df72515a50372ba",
+            "~acme~left-pad@1.3.0",
+            "~npm~left-pad@1.4.0",
+        ] {
+            let version = if id.contains("1.4.0") {
+                "1.4.0"
+            } else {
+                "1.3.0"
+            };
+            pkg(
+                &nm.join(format!(".vlt/{id}/node_modules/left-pad")),
+                "left-pad",
+                version,
+            );
+        }
+        std::os::unix::fs::symlink(
+            ".vlt/~npm~left-pad@1.3.0/node_modules/left-pad",
+            nm.join("left-pad"),
+        )
+        .unwrap();
+        let mut got = with_store_variants(vec![nm.join("left-pad")]).await;
+        got.sort();
+        let mut want = vec![
+            nm.join("left-pad"),
+            nm.join(".vlt/~acme~left-pad@1.3.0/node_modules/left-pad"),
+            nm.join(".vlt/~npm~left-pad@1.3.0~peer.0df72515a50372ba/node_modules/left-pad"),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+        assert!(with_store_variants(Vec::new()).await.is_empty());
     }
 
     /// vlt twin of the `.pnpm` case: every importer entry is a link into

@@ -8,7 +8,7 @@
 //! expected locks real vlt wrote (`regenerate.sh`: an independent surgery,
 //! then `vlt ci`), so byte equality proves `vlt ci` keeps the wired lock
 //! byte-stable; the revert gives the pre-vendor bytes back. The lock
-//! inventory reads the same captures.
+//! inventory and VEX lockfile discovery read the same captures.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,6 +23,7 @@ use socket_patch_core::vendor::lock_inventory::{inventory_project, LockIntegrity
 use socket_patch_core::vendor::npm_flavor::{revert_npm_any, vendor_npm_any};
 use socket_patch_core::vendor::VendorOutcome;
 use socket_patch_core::vendor::{save_state, VendorEntry, VendorState};
+use socket_patch_core::vex::discover::{discover_patched_refs, WiringMode};
 
 const TOKEN: &str = "11111111-1111-1111-1111-111111111111";
 
@@ -865,5 +866,97 @@ async fn lock_inventory_reads_every_capture_and_drops_vendored_nodes() {
             case.name
         );
         assert!(!entries.is_empty(), "{} {}", case.version, case.name);
+    }
+}
+
+#[tokio::test]
+async fn vex_discovers_every_hosted_rewrite_and_nothing_before_it() {
+    let overrides = overrides();
+    for (version, targets, _) in CAPTURES {
+        let files = read_capture(version);
+        let rewritten = rewrite_registry_redirect(&files, &overrides);
+        for (label, text) in [
+            ("input", files["vlt-lock.json"].clone()),
+            ("output", rewritten.files["vlt-lock.json"].clone()),
+            (
+                "output crlf",
+                rewritten.files["vlt-lock.json"].replace('\n', "\r\n"),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("vlt-lock.json"), &text).unwrap();
+            let out = discover_patched_refs(tmp.path()).await;
+            assert!(
+                out.diagnostics.is_empty(),
+                "{version} {label}: {:?}",
+                out.diagnostics
+            );
+            let mut got: Vec<(String, String)> = out
+                .refs
+                .iter()
+                .map(|r| {
+                    assert_eq!(r.mode, WiringMode::Hosted, "{version} {label}");
+                    assert_eq!(
+                        r.locked_integrity,
+                        Some(LockIntegrity::Sri(patched_sha(&r.uuid))),
+                        "{version} {label}"
+                    );
+                    (r.purl.clone(), r.uuid.clone())
+                })
+                .collect();
+            got.sort();
+            let mut want: Vec<(String, String)> = if label == "input" {
+                Vec::new()
+            } else {
+                TARGETS
+                    .iter()
+                    .filter(|(name, v, _)| {
+                        let bare = format!("{}@{v}", name.replace('/', "+"));
+                        let legacy = format!("{}@{v}", name.replace('/', "§"));
+                        targets
+                            .iter()
+                            .any(|id| id.contains(&bare) || id.contains(&legacy))
+                    })
+                    .map(|(name, v, uuid)| (format!("pkg:npm/{name}@{v}"), uuid.to_string()))
+                    .collect()
+            };
+            want.sort();
+            assert_eq!(got, want, "{version} {label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vex_discovers_the_vendored_wiring_until_it_is_reverted() {
+    for case in cases().into_iter().filter(|c| c.refusal.is_none()) {
+        let label = format!("{} {}", case.version, case.name);
+        let staged = stage(&case, false);
+        assert!(
+            discover_patched_refs(&staged.root).await.refs.is_empty(),
+            "{label}: nothing is wired before vendoring"
+        );
+        let entry = expect_done(vendor(&case, &staged).await, &label);
+        let out = discover_patched_refs(&staged.root).await;
+        assert!(out.diagnostics.is_empty(), "{label}: {:?}", out.diagnostics);
+        assert_eq!(out.refs.len(), 1, "{label}: {:?}", out.refs);
+        let r = &out.refs[0];
+        assert_eq!(r.mode, WiringMode::Vendored, "{label}");
+        assert_eq!(r.uuid, case.uuid, "{label}");
+        assert_eq!(r.purl, case.purl, "{label}");
+        assert_eq!(
+            r.artifact_rel.as_deref(),
+            Some(entry.artifact.path.as_str()),
+            "{label}"
+        );
+        assert!(out.vendor_entry_live(&staged.root, &entry).await, "{label}");
+
+        let reverted = revert_npm_any(&entry, &staged.root, false).await;
+        assert!(reverted.success, "{label}: {:?}", reverted.error);
+        let out = discover_patched_refs(&staged.root).await;
+        assert!(out.refs.is_empty(), "{label}: {:?}", out.refs);
+        assert!(
+            !out.vendor_entry_live(&staged.root, &entry).await,
+            "{label}"
+        );
     }
 }

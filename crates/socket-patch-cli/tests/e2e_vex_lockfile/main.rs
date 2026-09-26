@@ -45,6 +45,7 @@ mod pipenv;
 mod pnpm;
 mod poetry;
 mod uv;
+mod vlt;
 mod yarn;
 mod yarn_berry;
 mod yarn_classic;

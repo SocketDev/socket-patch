@@ -3281,6 +3281,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hosted_retained_probe_reads_the_vlt_lock() {
+        let purl = "pkg:npm/minimist@1.2.2";
+        let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
+        let url = format!(
+            "https://patch.socket.dev/patch/npm/minimist/1.2.2/tok/{TAKEOVER_UUID}/minimist-1.2.2.tgz"
+        );
+        let lock = |slot2: &str, slot3: &str| {
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+                 \"~npm~minimist@1.2.2\": [0,\"minimist\",\"{slot2}\",\"{slot3}\"]\n  }},\n  \
+                 \"edges\": {{}}\n}}\n"
+            )
+        };
+        let hosted = lock("sha512-patched==", &url);
+        let registry = lock(
+            "sha512-orig==",
+            "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
+        );
+        for (what, text, live) in [
+            ("hosted pin", hosted.clone(), true),
+            ("reverted to the registry", registry, false),
+            (
+                "BOM-prefixed pin vlt cannot read",
+                format!("\u{feff}{hosted}"),
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_redirect_ledger_with_edit(tmp.path(), &[purl]).await;
+            tokio::fs::write(tmp.path().join("vlt-lock.json"), text)
+                .await
+                .unwrap();
+            let ledger = load_ledger(tmp.path()).await;
+            let retained =
+                hosted_wiring_retained_purls(&common_at(tmp.path()), ledger.as_ref(), &scanned)
+                    .await;
+            let want = if live {
+                vec![purl.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(retained, want, "{what}");
+        }
+    }
+
     #[test]
     fn agent_retention_details_name_packages_and_safe_remediation() {
         let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];

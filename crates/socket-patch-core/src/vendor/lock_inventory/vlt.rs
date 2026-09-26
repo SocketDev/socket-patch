@@ -15,10 +15,12 @@ use super::{http_url, LockIntegrity, LockfileEntry};
 
 // ── entry model ──
 
-/// One node of a readable `vlt-lock.json`: its DepID split, slot [1] (the
-/// package name) and the raw slot [2] integrity and slot [3] location.
+/// One node of a readable `vlt-lock.json`: its raw DepID key and split,
+/// slot [1] (the package name) and the raw slot [2] integrity and slot [3]
+/// location.
 #[derive(Debug, Clone)]
 pub(crate) struct VltLockNode {
+    pub(crate) key: String,
     pub(crate) dep_id: DepId,
     pub(crate) name: String,
     pub(crate) integrity: Option<String>,
@@ -35,8 +37,16 @@ pub(crate) struct VltLock {
 /// The nodes of a lock vlt itself can read; `None` for a BOM-prefixed,
 /// unparseable or unknown-version lock (never BOM-stripped).
 pub(crate) fn vlt_lock_nodes(text: &str) -> Option<VltLock> {
-    let LockSniff::Readable(lock) = sniff_lock(text) else {
-        return None;
+    vlt_lock_model(text).ok()
+}
+
+/// [`vlt_lock_nodes`], with why vlt cannot read the lock as the error.
+pub(crate) fn vlt_lock_model(text: &str) -> Result<VltLock, String> {
+    let lock = match sniff_lock(text) {
+        LockSniff::Readable(lock) => lock,
+        LockSniff::Bom => return Err("starts with a UTF-8 BOM, which vlt cannot read".into()),
+        LockSniff::NotJsonObject => return Err("is not a JSON object".into()),
+        LockSniff::UnsupportedVersion(raw) => return Err(format!("has lockfileVersion {raw}")),
     };
     let string_slot = |tuple: &[Value], i: usize| {
         tuple
@@ -53,6 +63,7 @@ pub(crate) fn vlt_lock_nodes(text: &str) -> Option<VltLock> {
                 .filter_map(|(id, tuple)| {
                     let tuple = tuple.as_array()?;
                     Some(VltLockNode {
+                        key: id.clone(),
                         dep_id: split_dep_id(id)?,
                         name: tuple.get(1)?.as_str()?.to_string(),
                         integrity: string_slot(tuple, 2),
@@ -62,7 +73,7 @@ pub(crate) fn vlt_lock_nodes(text: &str) -> Option<VltLock> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(VltLock {
+    Ok(VltLock {
         options: lock.options().cloned(),
         nodes,
     })

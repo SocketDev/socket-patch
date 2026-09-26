@@ -1306,7 +1306,9 @@ fn redirect_fixture(rel: &str) -> String {
 ///   version;
 /// * nuget: a source + mapping whose lock no longer restores the id (the
 ///   dependency was dropped and the lock regenerated);
-/// * pnpm: only the `shrinkwrap.yaml` debris pnpm never reads names it.
+/// * pnpm: only the `shrinkwrap.yaml` debris pnpm never reads names it;
+/// * vlt: a BOM-prefixed `vlt-lock.json` (vlt cannot read it), and a pin
+///   whose slot [1] names another package.
 #[test]
 fn rejected_hosted_wiring_never_keeps_a_redirect_ledger_alive() {
     let go_mod = redirect_fixture("golang/gomod/basic/expected/go.mod");
@@ -1319,6 +1321,9 @@ fn rejected_hosted_wiring_never_keeps_a_redirect_ledger_alive() {
     let nuget_lock = redirect_fixture("nuget/packages-lock/basic/expected/packages.lock.json");
     let pnpm_hosted = redirect_fixture("npm/pnpm/basic/expected/pnpm-lock.yaml");
     let pnpm_registry = redirect_fixture("npm/pnpm/basic/input/pnpm-lock.yaml");
+    let vlt_hosted = redirect_fixture("npm/vlt/basic/expected/vlt-lock.json");
+    let vlt_misnamed = vlt_hosted.replace("[0,\"left-pad\"", "[0,\"right-pad\"");
+    assert_ne!(vlt_misnamed, vlt_hosted);
 
     let bumped = go_mod.replace(
         "require github.com/foo/bar v1.4.2",
@@ -1404,6 +1409,20 @@ fn rejected_hosted_wiring_never_keeps_a_redirect_ledger_alive() {
             ],
             vec![("pnpm-lock.yaml", pnpm_hosted.clone())],
         ),
+        (
+            "vlt BOM-prefixed lock",
+            "pkg:npm/left-pad@1.3.0",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vec![("vlt-lock.json", format!("\u{feff}{vlt_hosted}"))],
+            vec![("vlt-lock.json", vlt_hosted.clone())],
+        ),
+        (
+            "vlt pin naming another package",
+            "pkg:npm/left-pad@1.3.0",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vec![("vlt-lock.json", vlt_misnamed)],
+            vec![("vlt-lock.json", vlt_hosted.clone())],
+        ),
     ];
 
     for (name, purl, uuid, stale, live) in cases {
@@ -1480,7 +1499,8 @@ fn rejected_hosted_wiring_never_keeps_a_redirect_ledger_alive() {
 /// lock while a SIBLING lock resolves the same version from the registry —
 /// a stale `yarn.lock` beside the hosted `package-lock.json`, a registry
 /// `uv.lock` (what `uv sync --frozen` installs) beside a hosted
-/// `requirements.txt`. Which one the build installs from depends on the
+/// `requirements.txt`, a registry `vlt-lock.json` beside a hosted
+/// `package-lock.json`. Which one the build installs from depends on the
 /// package manager that runs, so the record is not attested
 /// (`redirect_unwired`, with a note naming the contesting lock) where it
 /// used to be `not_affected (redirected)`. Without the stale lock it attests.
@@ -1514,6 +1534,29 @@ fn a_sibling_lock_resolving_the_registry_contests_a_ledger_record() {
                     "# yarn lockfile v1\n\n\nfoo@1.0.0:\n  version \"1.0.0\"\n  resolved \
                      \"https://registry.yarnpkg.com/foo/-/foo-1.0.0.tgz#{}\"\n  integrity {SRI}\n",
                     "0".repeat(40)
+                ),
+            ),
+        ),
+        (
+            "npm + registry vlt-lock.json",
+            "pkg:npm/foo@1.0.0",
+            vec![(
+                "package-lock.json",
+                serde_json::json!({
+                    "name": "app", "lockfileVersion": 3, "requires": true,
+                    "packages": {
+                        "": {"name": "app", "dependencies": {"foo": "1.0.0"}},
+                        "node_modules/foo": {"version": "1.0.0", "resolved": npm_url, "integrity": SRI},
+                    }
+                })
+                .to_string(),
+            )],
+            (
+                "vlt-lock.json",
+                format!(
+                    "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+                     \"~npm~foo@1.0.0\": [0,\"foo\",\"{SRI}\",\"https://registry.npmjs.org/foo/-/foo-1.0.0.tgz\"]\n  \
+                     }},\n  \"edges\": {{\n    \"file~_d foo\": \"prod 1.0.0 ~npm~foo@1.0.0\"\n  }}\n}}\n"
                 ),
             ),
         ),
@@ -1977,4 +2020,88 @@ fn every_project_environment_copy_of_a_hosted_ref_must_verify() {
     install("venv", "python3.11", patched);
     let (code, env) = vex_json(cwd, &args);
     assert_attested(cwd, code, &env, UUID, "every environment's copy verifies");
+}
+
+/// vlt: a redirect-ledger record attests while `vlt-lock.json` still pins
+/// the hosted artifact, judged by vlt's store copy (vlt installs every
+/// package at `node_modules/.vlt/<DepID>/node_modules/<name>`); once the
+/// lock is back on the registry the leftover ledger and patched store copy
+/// no longer attest, `--no-verify` included.
+#[test]
+fn vlt_redirect_ledger_is_judged_by_the_vlt_store_copy_while_the_lock_pins_it() {
+    let (pristine, patched) = (
+        &b"module.exports = 'pristine'\n"[..],
+        &b"module.exports = 'patched'\n"[..],
+    );
+    let purl = "pkg:npm/left-pad@1.3.0";
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let lock = |slot2: &str, slot3: &str| {
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+             \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"{slot2}\",\"{slot3}\"]\n  }},\n  \
+             \"edges\": {{\n    \"file~_d left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0\"\n  }}\n}}\n"
+        )
+    };
+    put(
+        cwd,
+        "package.json",
+        br#"{ "name": "app", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" } }"#,
+    );
+    put(
+        cwd,
+        "vlt-lock.json",
+        lock(SRI, &hosted_npm_url("left-pad", "1.3.0", UUID)).as_bytes(),
+    );
+    let store = "node_modules/.vlt/~npm~left-pad@1.3.0/node_modules/left-pad";
+    put(
+        cwd,
+        &format!("{store}/package.json"),
+        br#"{ "name": "left-pad", "version": "1.3.0" }"#,
+    );
+    put(cwd, &format!("{store}/index.js"), patched);
+    let mut record = make_record(
+        UUID,
+        &compute_git_sha256_from_bytes(patched),
+        "GHSA-vlt-ledger",
+        &["CVE-2026-61"],
+    );
+    record
+        .files
+        .get_mut("package/index.js")
+        .unwrap()
+        .before_hash = compute_git_sha256_from_bytes(pristine);
+    write_redirect_ledger(
+        cwd,
+        &[(purl, record)],
+        &[("vlt-lock.json", "redirect_vlt_lock_node")],
+    );
+
+    let (code, env) = vex_json(cwd, &["--offline"]);
+    assert_attested(cwd, code, &env, UUID, "patched store copy");
+
+    put(cwd, &format!("{store}/index.js"), pristine);
+    let (code, env) = vex_json(cwd, &["--offline"]);
+    assert_eq!(code, Some(1), "{env}");
+    assert_eq!(skipped_reason(&env, purl), "not_applied", "{env}");
+
+    put(cwd, &format!("{store}/index.js"), patched);
+    put(
+        cwd,
+        "vlt-lock.json",
+        lock(
+            SRI,
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        )
+        .as_bytes(),
+    );
+    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+        let (code, env) = vex_json(cwd, extra);
+        assert_eq!(code, Some(1), "{extra:?}: {env}");
+        assert_eq!(
+            skipped_reason(&env, purl),
+            "redirect_unwired",
+            "{extra:?}: {env}"
+        );
+    }
 }

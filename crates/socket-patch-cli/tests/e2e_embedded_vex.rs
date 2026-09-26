@@ -273,6 +273,101 @@ fn apply_vex_writes_document_on_success() {
     );
 }
 
+/// vlt: agent `apply --vex` patches every `.vlt` store copy (a peer
+/// variant included) and attests it, with the ecosystem declared manual
+/// under its package-manager name `vlt`.
+#[test]
+fn apply_vex_attests_a_vlt_store_install_declared_manual_as_vlt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let before = b"before contents\n";
+    let after = b"after contents\n";
+    let before_hash = compute_git_sha256_from_bytes(before);
+    let after_hash = compute_git_sha256_from_bytes(after);
+    std::fs::write(
+        cwd.join("vlt-lock.json"),
+        "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {\n    \
+         \"~npm~vuln-pkg@1.0.0\": [0,\"vuln-pkg\",\"sha512-x==\"]\n  },\n  \"edges\": {}\n}\n",
+    )
+    .unwrap();
+    let copies = [
+        "node_modules/.vlt/~npm~vuln-pkg@1.0.0/node_modules/vuln-pkg",
+        "node_modules/.vlt/~npm~vuln-pkg@1.0.0~peer.0df72515a50372ba/node_modules/vuln-pkg",
+    ];
+    for copy in copies {
+        let pkg = cwd.join(copy);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"vuln-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), before).unwrap();
+    }
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/vuln-pkg@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            &before_hash,
+            &after_hash,
+            "GHSA-aaaa-bbbb-cccc",
+            &["CVE-2024-0001"],
+        ),
+    );
+    manifest.setup = Some(SetupConfig {
+        exclude: Vec::new(),
+        manual: vec!["vlt".to_string()],
+    });
+    let socket = cwd.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(&after_hash), after).unwrap();
+    let vex_path = cwd.join("apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:npm/my-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(
+        out.status.success(),
+        "apply --vex should exit 0. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for copy in copies {
+        let on_disk = std::fs::read(cwd.join(copy).join("index.js")).unwrap();
+        assert_eq!(
+            compute_git_sha256_from_bytes(&on_disk),
+            after_hash,
+            "{copy}"
+        );
+    }
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "{doc}");
+    assert_not_affected_statement(
+        &stmts[0],
+        "GHSA-aaaa-bbbb-cccc",
+        "CVE-2024-0001",
+        "pkg:npm/my-app@1.0.0",
+        "pkg:npm/vuln-pkg@1.0.0",
+    );
+}
+
 #[test]
 fn apply_json_envelope_carries_vex_summary() {
     let tmp = tempfile::tempdir().unwrap();

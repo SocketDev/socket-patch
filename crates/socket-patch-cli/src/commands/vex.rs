@@ -464,7 +464,7 @@ fn org_looks_like_path(org: Option<&str>) -> Option<String> {
 /// Unrecognized names yield `None` and are ignored.
 fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
     match name.to_ascii_lowercase().as_str() {
-        "npm" | "yarn" | "pnpm" | "bun" => Some(Ecosystem::Npm),
+        "npm" | "yarn" | "pnpm" | "bun" | "vlt" => Some(Ecosystem::Npm),
         "pypi" | "python" => Some(Ecosystem::Pypi),
         "gem" | "ruby" => Some(Ecosystem::Gem),
         "cargo" | "rust" => Some(Ecosystem::Cargo),
@@ -1522,6 +1522,7 @@ mod tests {
     #[test]
     fn ecosystem_from_manual_name_maps_every_ecosystem() {
         assert_eq!(ecosystem_from_manual_name("npm"), Some(Ecosystem::Npm));
+        assert_eq!(ecosystem_from_manual_name("vlt"), Some(Ecosystem::Npm));
         assert_eq!(ecosystem_from_manual_name("PyPI"), Some(Ecosystem::Pypi)); // case-insensitive
         assert_eq!(ecosystem_from_manual_name("python"), Some(Ecosystem::Pypi));
         assert_eq!(ecosystem_from_manual_name("ruby"), Some(Ecosystem::Gem));
