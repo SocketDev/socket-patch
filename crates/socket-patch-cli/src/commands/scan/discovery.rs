@@ -9,7 +9,7 @@ use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
+use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
@@ -332,13 +332,16 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     // The views the loop needs, fetched concurrently (at most
     // `api_concurrency` in flight) and consumed in `selected` order, each
     // request's `--debug` lines released at its turn.
+    let to_fetch: Vec<&str> = selected
+        .iter()
+        .zip(&plan)
+        .filter(|(_, step)| matches!(step, Some((_, None))))
+        .map(|(patch, _)| patch.uuid.as_str())
+        .collect();
+    let window_len = to_fetch.len();
     let mut details = std::pin::pin!(ordered_concurrent(
-        selected
-            .iter()
-            .zip(&plan)
-            .filter(|(_, step)| matches!(step, Some((_, None))))
-            .map(|(patch, _)| patch.uuid.as_str()),
-        api_concurrency(api_client.uses_public_proxy()),
+        to_fetch,
+        api_concurrency_for(api_client.uses_public_proxy(), window_len),
         |uuid| async move { (uuid, hold_back_debug(api_client.fetch_patch(uuid)).await) },
     ));
     for (i, (patch, step)) in selected.iter().zip(&plan).enumerate() {

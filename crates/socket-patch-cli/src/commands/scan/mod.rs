@@ -20,7 +20,7 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
 };
-use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
+use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
@@ -547,7 +547,7 @@ async fn fetch_patch_details(
     // would have made the request.
     let mut responses = std::pin::pin!(ordered_concurrent(
         packages,
-        api_concurrency(api_client.uses_public_proxy()),
+        api_concurrency_for(api_client.uses_public_proxy(), packages.len()),
         |pkg| async move {
             (
                 pkg,
@@ -1995,7 +1995,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             let client = &api_client;
             let mut results = std::pin::pin!(ordered_concurrent(
                 &chunks[next..end],
-                api_concurrency(use_public_proxy),
+                api_concurrency_for(use_public_proxy, end - next),
                 |chunk| hold_back_debug(client.search_patches_batch(chunk)),
             ));
             while next < end {
