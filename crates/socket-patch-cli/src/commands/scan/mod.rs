@@ -2714,7 +2714,12 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         // so only a wet run with work confirms. `--mode hosted` is explicit
         // intent, so a non-TTY run auto-proceeds like every other mode —
         // only the mode-less scan below is report-only.
-        if !selected.is_empty() && !args.common.dry_run {
+        let prompts = !selected.is_empty() && !args.common.dry_run;
+        // Whether that prompt waits on a person: the tree may change while it
+        // does, so the embedded VEX then walks node_modules afresh instead of
+        // reusing the pre-prompt crawl (as the vendor path below does).
+        let prompt_waits = prompts && ui::confirm_waits(&args.common);
+        if prompts {
             let prompt = render::hosted_confirm_prompt(selected.len());
             // The prompt (or the non-TTY note) opens its own paragraph
             // under the table's Summary, on the prompt's stream.
@@ -2743,7 +2748,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &api_client,
             &pairs,
             None,
-            npm_crawl.as_ref(),
+            npm_crawl.as_ref().filter(|_| !prompt_waits),
         )
         .await;
     }
