@@ -275,40 +275,138 @@ async fn heal_targets(
 /// Why the heal keeps stale optional copies, and what refreshes them.
 const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt install` does not \
      reinstall a removed optional dependency. Run `vlt ci` (or delete node_modules and run `vlt \
-     install`); vlt releases before 1.0.5 install no optional dependency from the lock of a \
-     project that declares only optional dependencies.";
+     install`). vlt releases before 1.0.5 install no optional dependency from the lock of a \
+     project that declares only optional dependencies, so there both commands remove the \
+     installed copy: upgrade vlt to 1.0.5 or later first.";
+
+/// `detail` followed by the optional copies the heal kept (`held` names
+/// them), when there are any besides what `detail` reports.
+fn with_optional_kept(mut detail: String, optional_left: usize, held: &str) -> String {
+    if optional_left > 0 {
+        detail.push_str(if detail.ends_with('.') { " " } else { ". " });
+        detail.push_str(&format!(
+            "node_modules also still holds {optional_left} {held}; {OPTIONAL_KEPT}"
+        ));
+    }
+    detail
+}
+
+const VLT_UPDATE_NOTE: &str =
+    " Note: `vlt update` re-resolves from the registry and drops these redirects.";
 
 fn reinstall_detail(tally: &HealTally) -> String {
+    let held = "unpatched copies of optional dependencies";
     if tally.stale_left > 0 {
-        format!(
-            "vlt-lock.json pins Socket-patched packages, but node_modules still holds {} \
-             unpatched copies and `vlt install` will not refresh them; run `vlt ci` (or re-run \
-             without --no-vlt-install-cleanup).",
-            tally.stale_left + tally.optional_left
+        with_optional_kept(
+            format!(
+                "vlt-lock.json pins Socket-patched packages, but node_modules still holds {} \
+                 unpatched copies and `vlt install` will not refresh them; run `vlt ci` (or \
+                 re-run without --no-vlt-install-cleanup).",
+                tally.stale_left
+            ),
+            tally.optional_left,
+            held,
         )
+    } else if tally.undeterminable > 0 {
+        with_optional_kept(
+            undeterminable_detail(tally.undeterminable),
+            tally.optional_left,
+            held,
+        )
+    } else if tally.invalidated > 0 {
+        let mut detail = with_optional_kept(
+            format!(
+                "vlt-lock.json pins Socket-patched packages; socket-patch removed {} stale \
+                 installed copies (node_modules/.vlt-lock.json and node_modules/.vlt entries), \
+                 so node_modules is incomplete until you run `vlt install` (or `vlt ci`), which \
+                 installs the patched packages.",
+                tally.invalidated
+            ),
+            tally.optional_left,
+            held,
+        );
+        detail.push_str(VLT_UPDATE_NOTE);
+        detail
     } else if tally.optional_left > 0 {
         format!(
-            "vlt-lock.json pins Socket-patched packages, but node_modules still holds {} \
-             unpatched copies of optional dependencies; {OPTIONAL_KEPT}",
+            "vlt-lock.json pins Socket-patched packages, but node_modules still holds {} {held}; \
+             {OPTIONAL_KEPT}",
             tally.optional_left
+        )
+    } else {
+        format!(
+            "vlt-lock.json pins Socket-patched packages; fresh checkouts install them with `vlt \
+             ci` or `vlt install --frozen-lockfile`.{VLT_UPDATE_NOTE}"
+        )
+    }
+}
+
+fn rollback_detail(tally: &HealTally, restored: usize) -> Option<String> {
+    let held = "patched copies of optional dependencies";
+    let detail = if tally.stale_left > 0 {
+        format!(
+            "restored registry pins for {restored} packages, but node_modules still holds {} \
+             patched copies and `vlt install` will not refresh them; run `vlt ci` (or re-run \
+             without --no-vlt-install-cleanup)",
+            tally.stale_left
         )
     } else if tally.undeterminable > 0 {
         undeterminable_detail(tally.undeterminable)
-    } else if tally.invalidated > 0 {
+    } else if tally.invalidated > 0 && tally.optional_left > 0 {
         format!(
-            "vlt-lock.json pins Socket-patched packages; socket-patch removed {} stale installed \
-             copies (node_modules/.vlt-lock.json and node_modules/.vlt entries), so node_modules \
-             is incomplete until you run `vlt install` (or `vlt ci`), which installs the patched \
-             packages. Note: `vlt update` re-resolves from the registry and drops these \
-             redirects.",
+            "restored registry pins for {restored} packages; removed {} patched installed \
+             copies, so node_modules is incomplete until you run `vlt install` (or `vlt ci`)",
             tally.invalidated
         )
+    } else if tally.invalidated > 0 {
+        format!(
+            "restored registry pins for {restored} packages; removed the patched installed \
+             copies, so node_modules is incomplete until you run `vlt install` (or `vlt ci`)"
+        )
+    } else if tally.optional_left > 0 {
+        return Some(format!(
+            "restored registry pins for {restored} packages, but node_modules still holds {} \
+             {held}; {OPTIONAL_KEPT}",
+            tally.optional_left
+        ));
     } else {
-        "vlt-lock.json pins Socket-patched packages; fresh checkouts install them with `vlt ci` \
-         or `vlt install --frozen-lockfile`. Note: `vlt update` re-resolves from the registry \
-         and drops these redirects."
-            .to_string()
-    }
+        return None;
+    };
+    Some(with_optional_kept(detail, tally.optional_left, held))
+}
+
+fn takeover_detail(tally: &HealTally, vendored: usize) -> Option<String> {
+    let held = "copies of the hosted artifacts of optional dependencies";
+    let detail = if tally.stale_left > 0 {
+        format!(
+            "vendored {vendored} hosted-pinned packages, but node_modules still holds {} copies \
+             of the hosted artifacts; run `vlt install` (or re-run without \
+             --no-vlt-install-cleanup)",
+            tally.stale_left
+        )
+    } else if tally.undeterminable > 0 {
+        undeterminable_detail(tally.undeterminable)
+    } else if tally.invalidated > 0 && tally.optional_left > 0 {
+        format!(
+            "vendored {vendored} hosted-pinned packages; removed {} hosted installed copies, so \
+             node_modules is incomplete until you run `vlt install`",
+            tally.invalidated
+        )
+    } else if tally.invalidated > 0 {
+        format!(
+            "vendored {vendored} hosted-pinned packages; removed their hosted installed copies, \
+             so node_modules is incomplete until you run `vlt install`"
+        )
+    } else if tally.optional_left > 0 {
+        return Some(format!(
+            "vendored {vendored} hosted-pinned packages, but node_modules still holds {} {held}; \
+             {OPTIONAL_KEPT}",
+            tally.optional_left
+        ));
+    } else {
+        return None;
+    };
+    Some(with_optional_kept(detail, tally.optional_left, held))
 }
 
 fn undeterminable_detail(n: usize) -> String {
@@ -439,33 +537,10 @@ pub(crate) async fn rollback_heal(
         .collect();
     let tally = heal_targets(common, &classified, Expected::Pristine).await;
     let restored: BTreeSet<&str> = targets.iter().map(|t| t.purl.as_str()).collect();
-    let detail = if tally.stale_left > 0 {
-        format!(
-            "restored registry pins for {} packages, but node_modules still holds {} patched \
-             copies and `vlt install` will not refresh them; run `vlt ci` (or re-run without \
-             --no-vlt-install-cleanup)",
-            restored.len(),
-            tally.stale_left + tally.optional_left
-        )
-    } else if tally.optional_left > 0 {
-        format!(
-            "restored registry pins for {} packages, but node_modules still holds {} patched \
-             copies of optional dependencies; {OPTIONAL_KEPT}",
-            restored.len(),
-            tally.optional_left
-        )
-    } else if tally.undeterminable > 0 {
-        undeterminable_detail(tally.undeterminable)
-    } else if tally.invalidated > 0 {
-        format!(
-            "restored registry pins for {} packages; removed the patched installed copies, so \
-             node_modules is incomplete until you run `vlt install` (or `vlt ci`)",
-            restored.len()
-        )
-    } else {
-        return Vec::new();
-    };
-    vec![(REINSTALL_REQUIRED.to_string(), detail)]
+    rollback_detail(&tally, restored.len())
+        .map(|detail| (REINSTALL_REQUIRED.to_string(), detail))
+        .into_iter()
+        .collect()
 }
 
 /// The hosted→vendored heal (DESIGN §4.10 step 4): once a purl is
@@ -497,32 +572,7 @@ pub(crate) async fn takeover_heal(
         .collect();
     let tally = heal_targets(common, &classified, Expected::Pristine).await;
     let vendored: BTreeSet<&str> = targets.iter().map(|t| t.purl.as_str()).collect();
-    let detail = if tally.stale_left > 0 {
-        format!(
-            "vendored {} hosted-pinned packages, but node_modules still holds {} copies of the \
-             hosted artifacts; run `vlt install` (or re-run without --no-vlt-install-cleanup)",
-            vendored.len(),
-            tally.stale_left + tally.optional_left
-        )
-    } else if tally.optional_left > 0 {
-        format!(
-            "vendored {} hosted-pinned packages, but node_modules still holds {} copies of the \
-             hosted artifacts of optional dependencies; {OPTIONAL_KEPT}",
-            vendored.len(),
-            tally.optional_left
-        )
-    } else if tally.undeterminable > 0 {
-        undeterminable_detail(tally.undeterminable)
-    } else if tally.invalidated > 0 {
-        format!(
-            "vendored {} hosted-pinned packages; removed their hosted installed copies, so \
-             node_modules is incomplete until you run `vlt install`",
-            vendored.len()
-        )
-    } else {
-        return None;
-    };
-    Some(detail)
+    takeover_detail(&tally, vendored.len())
 }
 
 #[cfg(test)]
@@ -548,11 +598,100 @@ mod tests {
         assert!(reinstall_detail(&tally).contains("socket-patch removed 2 stale installed copies"));
         tally.undeterminable = 1;
         assert!(reinstall_detail(&tally).contains("could not check 1 installed copies"));
-        tally.optional_left = 2;
-        assert!(reinstall_detail(&tally)
-            .contains("still holds 2 unpatched copies of optional dependencies; socket-patch"));
         tally.stale_left = 3;
-        assert!(reinstall_detail(&tally).contains("still holds 5 unpatched copies and"));
+        assert!(reinstall_detail(&tally).contains("still holds 3 unpatched copies and"));
+    }
+
+    #[test]
+    fn kept_optional_copies_are_reported_alongside_every_variant() {
+        let optional = |invalidated, stale_left, undeterminable| HealTally {
+            invalidated,
+            stale_left,
+            optional_left: 2,
+            undeterminable,
+            ..HealTally::default()
+        };
+        let also = |held: &str| format!("node_modules also still holds 2 {held}; {OPTIONAL_KEPT}");
+        let unpatched = also("unpatched copies of optional dependencies");
+        let patched = also("patched copies of optional dependencies");
+        let hosted = also("copies of the hosted artifacts of optional dependencies");
+
+        assert_eq!(
+            reinstall_detail(&optional(0, 0, 0)),
+            format!(
+                "vlt-lock.json pins Socket-patched packages, but node_modules still holds 2 \
+                 unpatched copies of optional dependencies; {OPTIONAL_KEPT}"
+            )
+        );
+        assert_eq!(
+            reinstall_detail(&optional(3, 0, 0)),
+            format!(
+                "vlt-lock.json pins Socket-patched packages; socket-patch removed 3 stale \
+                 installed copies (node_modules/.vlt-lock.json and node_modules/.vlt entries), \
+                 so node_modules is incomplete until you run `vlt install` (or `vlt ci`), which \
+                 installs the patched packages. {unpatched}{VLT_UPDATE_NOTE}"
+            )
+        );
+        assert_eq!(
+            reinstall_detail(&optional(0, 1, 0)),
+            format!(
+                "vlt-lock.json pins Socket-patched packages, but node_modules still holds 1 \
+                 unpatched copies and `vlt install` will not refresh them; run `vlt ci` (or \
+                 re-run without --no-vlt-install-cleanup). {unpatched}"
+            )
+        );
+        assert_eq!(
+            reinstall_detail(&optional(0, 0, 1)),
+            format!("{} {unpatched}", undeterminable_detail(1))
+        );
+
+        assert_eq!(
+            rollback_detail(&optional(0, 0, 0), 1).unwrap(),
+            format!(
+                "restored registry pins for 1 packages, but node_modules still holds 2 patched \
+                 copies of optional dependencies; {OPTIONAL_KEPT}"
+            )
+        );
+        assert_eq!(
+            rollback_detail(&optional(1, 0, 0), 2).unwrap(),
+            format!(
+                "restored registry pins for 2 packages; removed 1 patched installed copies, so \
+                 node_modules is incomplete until you run `vlt install` (or `vlt ci`). {patched}"
+            )
+        );
+        assert_eq!(
+            rollback_detail(&optional(0, 1, 0), 2).unwrap(),
+            format!(
+                "restored registry pins for 2 packages, but node_modules still holds 1 patched \
+                 copies and `vlt install` will not refresh them; run `vlt ci` (or re-run \
+                 without --no-vlt-install-cleanup). {patched}"
+            )
+        );
+        assert_eq!(rollback_detail(&HealTally::default(), 1), None);
+
+        assert_eq!(
+            takeover_detail(&optional(0, 0, 0), 1).unwrap(),
+            format!(
+                "vendored 1 hosted-pinned packages, but node_modules still holds 2 copies of the \
+                 hosted artifacts of optional dependencies; {OPTIONAL_KEPT}"
+            )
+        );
+        assert_eq!(
+            takeover_detail(&optional(1, 0, 0), 2).unwrap(),
+            format!(
+                "vendored 2 hosted-pinned packages; removed 1 hosted installed copies, so \
+                 node_modules is incomplete until you run `vlt install`. {hosted}"
+            )
+        );
+        assert_eq!(
+            takeover_detail(&optional(0, 1, 0), 2).unwrap(),
+            format!(
+                "vendored 2 hosted-pinned packages, but node_modules still holds 1 copies of the \
+                 hosted artifacts; run `vlt install` (or re-run without \
+                 --no-vlt-install-cleanup). {hosted}"
+            )
+        );
+        assert_eq!(takeover_detail(&HealTally::default(), 1), None);
     }
 
     fn left_pad_dep(url: &str) -> DepOverride {

@@ -193,20 +193,31 @@ async fn vlt_rollback_of_a_pristine_tree_keeps_it() {
 /// A hosted scan of a project whose left-pad node is optional (`flags`),
 /// followed by vlt's warm install of the pin.
 async fn hosted_optional_project(root: &Path, flags: u8) -> MockServer {
+    hosted_flagged_project(root, &[(TILDE_ID, flags)]).await
+}
+
+/// A hosted scan of a project with left-pad instances `nodes` (each
+/// `(DepID, flags)`), followed by vlt's warm install of the pins.
+async fn hosted_flagged_project(root: &Path, nodes: &[(&str, u8)]) -> MockServer {
     let server = MockServer::start().await;
     mock_all(&server).await;
     write_vlt_project(root, Era::V1);
-    let registry = with_flags(&registry_node(TILDE_ID), flags);
-    std::fs::write(root.join("vlt-lock.json"), vlt_lock(Era::V1, &[registry])).unwrap();
+    let registry: Vec<String> = nodes
+        .iter()
+        .map(|(id, flags)| with_flags(&registry_node(id), *flags))
+        .collect();
+    std::fs::write(root.join("vlt-lock.json"), vlt_lock(Era::V1, &registry)).unwrap();
     let (_, doc) = scan_hosted(root, &server, &[], &[]);
     assert_eq!(redirected(&doc), 1, "{doc:#}");
-    let pinned = with_flags(&pinned_node(TILDE_ID, &server), flags);
-    assert_eq!(
-        read(root, "vlt-lock.json"),
-        vlt_lock(Era::V1, std::slice::from_ref(&pinned))
-    );
-    install_store(root, TILDE_ID, PATCHED);
-    write_hidden_lock(root, &[pinned]);
+    let pinned: Vec<String> = nodes
+        .iter()
+        .map(|(id, flags)| with_flags(&pinned_node(id, &server), *flags))
+        .collect();
+    assert_eq!(read(root, "vlt-lock.json"), vlt_lock(Era::V1, &pinned));
+    for (id, _) in nodes {
+        install_store(root, id, PATCHED);
+    }
+    write_hidden_lock(root, &pinned);
     server
 }
 
@@ -243,6 +254,67 @@ async fn vlt_rollback_keeps_a_patched_optional_copy() {
             "{verb} flags={flags}"
         );
         assert!(root.join("node_modules/.vlt-lock.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn vlt_rollback_removes_the_prod_copy_keeps_the_optional_one() {
+    let optional = "~npm~left-pad@1.3.0~peer.2";
+    let nodes = [(TILDE_ID, 0), (optional, 1)];
+    let also = also_optional_kept(1, "patched copies of optional dependencies");
+    let removed = format!(
+        "restored registry pins for 1 packages; removed 1 patched installed copies, so \
+         node_modules is incomplete until you run `vlt install` (or `vlt ci`). {also}"
+    );
+    let skipped = format!(
+        "restored registry pins for 1 packages, but node_modules still holds 1 patched copies \
+         and `vlt install` will not refresh them; run `vlt ci` (or re-run without \
+         --no-vlt-install-cleanup). {also}"
+    );
+    for (verb, extra, cleaned) in [
+        ("rollback", &[][..], true),
+        ("rollback", &["--no-vlt-install-cleanup"][..], false),
+        ("remove", &[PURL][..], true),
+        ("remove", &[PURL, "--no-vlt-install-cleanup"][..], false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let _server = hosted_flagged_project(root, &nodes).await;
+        let expected = if cleaned { &removed } else { &skipped };
+
+        let (_, doc) = run_verb(root, verb, extra);
+
+        assert_eq!(
+            read(root, "vlt-lock.json"),
+            vlt_lock(
+                Era::V1,
+                &[
+                    registry_node(TILDE_ID),
+                    with_flags(&registry_node(optional), 1)
+                ]
+            ),
+            "{verb} {extra:?}"
+        );
+        assert_eq!(
+            advisory_details(&doc),
+            [expected.clone()],
+            "{verb} {extra:?}: {doc:#}"
+        );
+        assert_eq!(
+            store_dir(root, TILDE_ID).exists(),
+            !cleaned,
+            "{verb} {extra:?}"
+        );
+        assert_eq!(
+            root.join("node_modules/.vlt-lock.json").exists(),
+            !cleaned,
+            "{verb} {extra:?}"
+        );
+        assert_eq!(
+            std::fs::read(store_dir(root, optional).join("index.js")).unwrap(),
+            PATCHED,
+            "the optional copy is kept: {verb} {extra:?}"
+        );
     }
 }
 

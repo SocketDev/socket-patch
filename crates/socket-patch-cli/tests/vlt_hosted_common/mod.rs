@@ -69,14 +69,21 @@ pub fn advisory_undeterminable(n: usize) -> String {
 /// Why the heal keeps stale optional copies, shared by every heal's detail.
 pub const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt install` does \
      not reinstall a removed optional dependency. Run `vlt ci` (or delete node_modules and run \
-     `vlt install`); vlt releases before 1.0.5 install no optional dependency from the lock of \
-     a project that declares only optional dependencies.";
+     `vlt install`). vlt releases before 1.0.5 install no optional dependency from the lock of a \
+     project that declares only optional dependencies, so there both commands remove the \
+     installed copy: upgrade vlt to 1.0.5 or later first.";
 
 pub fn advisory_optional_kept(n: usize) -> String {
     format!(
         "vlt-lock.json pins Socket-patched packages, but node_modules still holds {n} unpatched \
          copies of optional dependencies; {OPTIONAL_KEPT}"
     )
+}
+
+/// The sentence a heal's detail gains for `n` kept optional copies
+/// (`held` names them).
+pub fn also_optional_kept(n: usize, held: &str) -> String {
+    format!("node_modules also still holds {n} {held}; {OPTIONAL_KEPT}")
 }
 
 /// `line` (a [`node`]) with slot [0] set to `flags`.

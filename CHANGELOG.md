@@ -305,7 +305,9 @@ into the new version's section — see docs/releasing.md.
   `SOCKET_NO_VLT_INSTALL_CLEANUP` keeps them, and the
   `redirect_vlt_reinstall_required` advisory says what to run. A stale
   copy of an optional dependency is never removed, because `vlt install`
-  would not put it back; the advisory says to run `vlt ci` instead. A
+  would not put it back; the advisory says to run `vlt ci` instead
+  (after upgrading to vlt 1.0.5 or later when every dependency is
+  optional, since older releases would drop the installed copy). A
   same-run `--vex` does not attest a vlt package whose installed copy is
   stale or unchecked, whose lock a vlt release may ignore, or which also
   resolves from a non-default registry. vlt ledgers require the socket-patch

@@ -989,7 +989,12 @@ async fn scan_redirect_vlt_heal_removes_the_prod_instance_keeps_the_optional_one
         std::fs::read(store_dir(tmp.path(), optional).join("index.js")).unwrap(),
         PRISTINE
     );
-    assert_eq!(warning_detail(&doc, ADVISORY), advisory_optional_kept(1));
+    let also = also_optional_kept(1, "unpatched copies of optional dependencies");
+    assert_eq!(
+        warning_detail(&doc, ADVISORY),
+        advisory_invalidated(1).replace(" Note:", &format!(" {also} Note:")),
+        "the removal and the kept optional copy are both reported"
+    );
 
     let (_, skipped) = {
         let tmp = tempfile::tempdir().unwrap();
@@ -998,8 +1003,8 @@ async fn scan_redirect_vlt_heal_removes_the_prod_instance_keeps_the_optional_one
     };
     assert_eq!(
         warning_detail(&skipped, ADVISORY),
-        advisory_cleanup_skipped(2),
-        "a skipped cleanup counts every unpatched copy"
+        format!("{} {also}", advisory_cleanup_skipped(1)),
+        "a skipped cleanup counts the removable copy and reports the optional one"
     );
 }
 
