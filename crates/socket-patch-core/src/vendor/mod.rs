@@ -92,6 +92,8 @@ pub(crate) mod service_fetch;
 pub(crate) mod test_support;
 mod toml_surgery;
 pub(crate) mod verify;
+#[allow(dead_code)]
+pub(crate) mod vlt_lock_text;
 pub(crate) mod yarn_berry_lock;
 pub(crate) mod yarn_classic_lock;
 #[cfg(test)]
