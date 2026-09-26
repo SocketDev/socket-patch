@@ -28,9 +28,13 @@
 //! patch purl the bare `6.4.1` or padded `3.0.2.0`) but the lock's own
 //! `version` string is never rewritten.
 //!
-//! Serialization mirrors composer's own writer: 4-space indent
-//! (`JSON_PRETTY_PRINT`) + trailing newline; serde_json does not escape `/`
-//! (matching `JSON_UNESCAPED_SLASHES`).
+//! Only the rewritten entry's text is replaced (`lock_text`), rendered in
+//! the indentation, line terminator and escaping of the text it replaces, so
+//! every other byte of the lock is untouched and `--revert` restores it
+//! byte for byte. A lock whose entry is not on lines of its own (compact
+//! JSON) is re-serialized whole the way composer writes it: 4-space indent
+//! (`JSON_PRETTY_PRINT`) + trailing newline, `/` unescaped
+//! (`JSON_UNESCAPED_SLASHES`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -65,6 +69,7 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
+mod lock_text;
 mod mirror_filters;
 
 /// Project-relative lockfile this backend wires.
@@ -464,7 +469,7 @@ pub async fn vendor_composer<'a>(
         .is_some_and(|p| p.eco == "composer");
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
-    let write_result = match composer_lock_bytes(&lock, &lock_text) {
+    let write_result = match lock_bytes_with_entry(&lock, &lock_text, section, idx) {
         Ok(bytes) => match atomic_write_bytes_preserving_mode(&lock_path, &bytes).await {
             // The bytes now on disk and the doc they came from: the next
             // package in this run reads them back and skips the parse.
@@ -1036,6 +1041,22 @@ fn reseed_memo(memo: &ParseMemo<Value>, bytes: Vec<u8>, lock: Value) {
     }
 }
 
+/// The lock bytes after `lock[section][idx]` (already set in `lock`)
+/// replaced the entry at that position of `current`, the text on disk: a
+/// splice of that entry alone, or the whole document when the entry cannot
+/// be located on its own lines.
+fn lock_bytes_with_entry(
+    lock: &Value,
+    current: &str,
+    section: &str,
+    idx: usize,
+) -> std::io::Result<Vec<u8>> {
+    match lock_text::replace_entry(current, section, idx, &lock[section][idx]) {
+        Some(text) => Ok(text.into_bytes()),
+        None => composer_lock_bytes(lock, current),
+    }
+}
+
 /// The `<section>:<lowercase pkg>` keys this entry can actually put back:
 /// a recognized wiring kind, a well-formed key, and a recorded `original`.
 fn restorable_keys(entry: &VendorEntry) -> HashSet<String> {
@@ -1130,7 +1151,8 @@ async fn restore_lock_entry(
     if !dry_run {
         let mut lock = (*lock).clone();
         lock[section][idx] = original;
-        let bytes = composer_lock_bytes(&lock, &lock_text).map_err(|e| e.to_string())?;
+        let bytes =
+            lock_bytes_with_entry(&lock, &lock_text, section, idx).map_err(|e| e.to_string())?;
         atomic_write_bytes_preserving_mode(lock_path, &bytes)
             .await
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
@@ -2079,6 +2101,80 @@ mod tests {
         reseed_memo(&memo, escaped.clone(), lock);
         assert!(memo.get(&escaped).is_none());
         assert!(memo.get(&render).is_none());
+    }
+
+    /// Vendor then `--revert` on `lock_bytes`, asserting the revert
+    /// restores them byte for byte; returns the vendored lock text.
+    async fn vendor_and_revert_round_trip(lock: &Value, lock_bytes: &[u8]) -> String {
+        let (dir, blobs, installed, record) = fixture(lock).await;
+        let root = dir.path();
+        tokio::fs::write(root.join(COMPOSER_LOCK), lock_bytes)
+            .await
+            .unwrap();
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let vendored = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        let wired: Value = serde_json::from_str(&vendored).unwrap();
+        assert_eq!(wired["packages"][0]["dist"]["type"], "path");
+        let outcome = revert_composer(&entry.unwrap(), root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "lock restored byte-identically"
+        );
+        vendored
+    }
+
+    /// A lock that spells slashes `\/` (older writers) keeps that spelling
+    /// on every line, the vendored entry's included, and reverts
+    /// byte-identically.
+    #[tokio::test]
+    async fn escaped_slash_lock_keeps_its_escaping_and_reverts_byte_identical() {
+        let mut lock = lock_value("psr/log", "3.0.2", false);
+        lock["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(psr_log_entry("monolog/monolog", "2.9.1"));
+        let text = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        let escaped = text.replace('/', "\\/");
+        let vendored = vendor_and_revert_round_trip(&lock, escaped.as_bytes()).await;
+        assert!(
+            !vendored.replace("\\/", "").contains('/'),
+            "every slash stays escaped: {vendored}"
+        );
+        assert!(
+            vendored.contains(&format!(
+                "\".socket\\/vendor\\/composer\\/{UUID}\\/psr\\/log@3.0.2\""
+            )),
+            "{vendored}"
+        );
+        let bystander = &escaped[escaped.find("\"name\": \"monolog").unwrap()..];
+        assert!(
+            vendored.ends_with(bystander),
+            "untouched entries keep their bytes"
+        );
+    }
+
+    /// A lock mixing CRLF and LF keeps every line outside the vendored
+    /// entry as it was, and reverts byte-identically.
+    #[tokio::test]
+    async fn mixed_line_ending_lock_keeps_untouched_lines_and_reverts_byte_identical() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let text = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        let packages = text.find("\"packages\"").unwrap();
+        let mixed = format!(
+            "{}{}",
+            text[..packages].replace('\n', "\r\n"),
+            &text[packages..]
+        );
+        assert_eq!(LineEndings::of(&mixed), LineEndings::Mixed);
+        let vendored = vendor_and_revert_round_trip(&lock, mixed.as_bytes()).await;
+        assert!(vendored.starts_with(&mixed[..packages]), "{vendored:?}");
+        assert_eq!(LineEndings::of(&vendored), LineEndings::Mixed);
     }
 
     #[test]
