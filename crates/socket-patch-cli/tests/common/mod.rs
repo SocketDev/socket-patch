@@ -227,11 +227,14 @@ pub fn cargo_run(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Outpu
 /// or an explicit `process.exit`) the hook closes those children's stdin,
 /// as the exit would (0.0.0-1 never ends it), and exits only after they
 /// have. Children are spawned exactly as vlt asks. One still running after
-/// 120 s is no longer awaited.
+/// 120 s (`SOCKET_PATCH_VLT_SETTLE_CAP_MS`) is no longer awaited, and the
+/// hook says so on stderr: a leg that then sees a half-finished tree names
+/// the child it stopped waiting for.
 const VLT_SETTLE_JS: &str = r#"import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 const spawn = cp.spawn;
 const pending = new Set();
+const capMs = Number(process.env.SOCKET_PATCH_VLT_SETTLE_CAP_MS) || 120000;
 let spawned = 0;
 let settled = -1;
 cp.spawn = function (file, args, opts) {
@@ -240,7 +243,10 @@ cp.spawn = function (file, args, opts) {
   if (!o || !o.detached || child.pid === undefined) return child;
   spawned++;
   pending.add(child);
-  const cap = setTimeout(() => pending.delete(child), 120000);
+  const cap = setTimeout(() => {
+    pending.delete(child);
+    process.stderr.write(`vlt-settle: stopped waiting for detached child ${child.pid} (${file} ${Array.isArray(args) ? args.join(' ') : ''}) after ${capMs} ms\n`);
+  }, capMs);
   cap.unref();
   child.once('exit', () => { clearTimeout(cap); pending.delete(child); });
   return child;

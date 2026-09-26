@@ -762,3 +762,65 @@ async fn vlt_pinned_matrix_setup_hook_abort_leaves_no_staging() {
     assert!(!out.stdout.contains(".VLT.DELETE"), "{out}");
     fx.leg.ran();
 }
+
+// ── harness ───────────────────────────────────────────────────────────────
+
+/// A stand-in `vlt.js` that spawns one detached child living `child_ms`
+/// and exits at once, as vlt's cache unzip does.
+fn fake_vlt(dir: &Path, child_ms: u64) -> std::path::PathBuf {
+    let js = dir.join("fake-vlt.mjs");
+    std::fs::write(
+        &js,
+        format!(
+            "import cp from 'node:child_process';\n\
+             const child = cp.spawn(process.execPath, ['-e', 'setTimeout(() => {{}}, \
+             {child_ms})'], {{ detached: true, stdio: 'ignore' }});\n\
+             child.unref();\n\
+             process.exit(0);\n"
+        ),
+    )
+    .unwrap();
+    js
+}
+
+/// The settle hook awaits a detached child that finishes, silently, and
+/// gives up on one past its cap with a stderr line naming it.
+#[test]
+fn vlt_settle_hook_reports_the_child_it_stops_waiting_for() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map_or(true, |o| !o.status.success())
+    {
+        eprintln!("skip: no node on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = "vlt-settle: stopped waiting for detached child";
+
+    let quick = fake_vlt(tmp.path(), 200);
+    let out = vlt_e2e_common::common::vlt_run(tmp.path(), &quick, &[], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains(marker), "{stderr}");
+
+    let slow = fake_vlt(tmp.path(), 4000);
+    let start = std::time::Instant::now();
+    let out = vlt_e2e_common::common::vlt_run(
+        tmp.path(),
+        &slow,
+        &[],
+        &[("SOCKET_PATCH_VLT_SETTLE_CAP_MS", "300")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(3500),
+        "the capped child is not awaited: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        stderr.contains(marker) && stderr.contains("after 300 ms"),
+        "{stderr}"
+    );
+}
