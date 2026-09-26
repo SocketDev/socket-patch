@@ -59,6 +59,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
     // VexArgs / VexEmbedArgs
     "SOCKET_VEX",
     "SOCKET_VEX_OUTPUT",
@@ -217,6 +218,7 @@ struct Snap {
     no_telemetry: bool,
     no_trust_lockfile_config: bool,
     no_npm_allow_remote_config: bool,
+    no_vlt_install_cleanup: bool,
     output: Option<PathBuf>,
     product: Option<String>,
     no_verify: bool,
@@ -251,6 +253,7 @@ fn snapshot(a: &VexArgs) -> Snap {
         no_telemetry: a.common.no_telemetry,
         no_trust_lockfile_config: a.common.no_trust_lockfile_config,
         no_npm_allow_remote_config: a.common.no_npm_allow_remote_config,
+        no_vlt_install_cleanup: a.common.no_vlt_install_cleanup,
         output: a.output.clone(),
         product: a.product.clone(),
         no_verify: a.no_verify,
@@ -292,6 +295,7 @@ fn expected_defaults() -> Snap {
         no_telemetry: false,
         no_trust_lockfile_config: false,
         no_npm_allow_remote_config: false,
+        no_vlt_install_cleanup: false,
         output: None,
         product: None,
         no_verify: false,
@@ -353,6 +357,21 @@ fn bare_flags_still_parse_without_env() {
             assert!(a.no_verify);
             assert!(a.compact);
         }
+        _ => panic!("expected Vex"),
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn no_vlt_install_cleanup_env_is_accepted_silently_by_vex() {
+    let cli = parse_with_env(
+        "SOCKET_NO_VLT_INSTALL_CLEANUP",
+        "1",
+        &["socket-patch", "vex"],
+    )
+    .expect("SOCKET_NO_VLT_INSTALL_CLEANUP=1 must parse on vex");
+    match cli.command {
+        Commands::Vex(a) => assert!(a.common.no_vlt_install_cleanup),
         _ => panic!("expected Vex"),
     }
 }

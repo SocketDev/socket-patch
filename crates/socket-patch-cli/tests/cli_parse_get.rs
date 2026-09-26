@@ -56,6 +56,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
     // GetArgs-specific
     "SOCKET_SAVE_ONLY",
     "SOCKET_ONE_OFF",
@@ -681,4 +682,15 @@ fn scrub_covers_every_global_env_var_clap_consults() {
             "ambient {var}=garbage leaked into the scrubbed parse",
         );
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn no_vlt_install_cleanup_flag_parses_for_hosted_get() {
+    assert!(!parse_get(&["some-id"]).common.no_vlt_install_cleanup);
+    assert!(
+        parse_get(&["some-id", "--mode", "hosted", "--no-vlt-install-cleanup"])
+            .common
+            .no_vlt_install_cleanup
+    );
 }

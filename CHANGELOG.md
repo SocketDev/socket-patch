@@ -287,6 +287,27 @@ into the new version's section — see docs/releasing.md.
   slot, CRLF re-saved as LF). A node vlt has since re-locked away is
   already reverted; any other change refuses with the `vlt-lock.json`
   remedy. Peer and modifier variants are claimed per `name@version`.
+- **`scan --mode hosted` and `get --mode hosted` redirect vlt projects.**
+  `vlt-lock.json` default-registry nodes of a patched `name@version` (every
+  peer and modifier variant, in every DepID era and CRLF lock) keep their
+  DepID and get the patched sha512 and hosted URL; `vlt.json` is read only.
+  vlt drives confirmation when its install state is present or no other
+  npm-family lock is; otherwise both locks are rewritten
+  (`redirect_vlt_sibling_lockfiles`). Before anything is written, each
+  artifact is fetched as vlt fetches it: a response vlt would reject
+  (re-gzipped, wrong sha512, HTTP error, unreachable) withholds the dep
+  (`redirect_vlt_artifact_unverifiable`) instead of pinning a lock `vlt ci`
+  cannot install. After the write, stale installed copies of the
+  Socket-owned nodes (`node_modules/.vlt-lock.json` and their
+  `node_modules/.vlt/<DepID>` entries) are removed so the next `vlt install`
+  extracts the patched packages; `rollback` and `remove` do the same for
+  the registry bytes. New `--no-vlt-install-cleanup` /
+  `SOCKET_NO_VLT_INSTALL_CLEANUP` keeps them, and the
+  `redirect_vlt_reinstall_required` advisory says what to run. A same-run
+  `--vex` does not attest a vlt package whose installed copy is stale or
+  unchecked, whose lock a vlt release may ignore, or which also resolves
+  from a non-default registry. vlt ledgers require the socket-patch
+  release that adds vlt support.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

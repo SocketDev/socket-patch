@@ -362,6 +362,22 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub no_npm_allow_remote_config: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
+    /// hosted redirects): do NOT remove stale vlt installed copies
+    /// (`node_modules/.vlt-lock.json` and the stale `node_modules/.vlt`
+    /// entries) after `vlt-lock.json` is repointed or restored. vlt never
+    /// refreshes an installed copy on its own, so opting out means running
+    /// `vlt ci` instead (the run's `redirect_vlt_reinstall_required`
+    /// advisory says so). Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "no-vlt-install-cleanup",
+        env = "SOCKET_NO_VLT_INSTALL_CLEANUP",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_vlt_install_cleanup: bool,
 }
 
 impl GlobalArgs {
@@ -550,6 +566,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
 ];
 
 /// Every env var a **subcommand-local** flag binds (one per `env = "..."`
@@ -642,6 +659,7 @@ impl Default for GlobalArgs {
             no_telemetry: false,
             no_trust_lockfile_config: false,
             no_npm_allow_remote_config: false,
+            no_vlt_install_cleanup: false,
         }
     }
 }

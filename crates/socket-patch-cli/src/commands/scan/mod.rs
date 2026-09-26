@@ -49,6 +49,7 @@ pub(crate) use self::discovery::unsupported_layout_warnings;
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
+pub(crate) use self::hosted::vlt_rollback_heal;
 pub(crate) use self::vendor_flow::{
     boxed_scan_vendor_step, preview_vendor_json, print_dry_run_refusals,
 };
@@ -183,7 +184,11 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         return Err(format!(
             "{} cannot be used with --mode hosted: global installs have no project \
              lockfile to redirect",
-            if args.common.global { "--global" } else { "--global-prefix" },
+            if args.common.global {
+                "--global"
+            } else {
+                "--global-prefix"
+            },
         ));
     }
     if args.detached && args.mode != Some(ScanMode::Vendored) {
@@ -396,7 +401,10 @@ async fn embed_vex_human(
     // Dry-run twin of the JSON guard above: no generation, no file write.
     if common.dry_run {
         if !common.silent {
-            println!("{}", crate::commands::vex::format_vex_dry_run_skip("applied"));
+            println!(
+                "{}",
+                crate::commands::vex::format_vex_dry_run_skip("applied")
+            );
         }
         return base_code;
     }
@@ -756,7 +764,8 @@ fn overlap_from_states(
     // machinery blind to exactly that degraded ledger, so fall back to
     // matching the vendored purls against the recorded edit keys — npm
     // `node_modules/<name>` (possibly nested), pnpm/yarn/cargo/uv
-    // `<name>@<version>`, bun `<prefix>/<name>`, gem/composer/pypi bare
+    // `<name>@<version>` (vlt `<name>@<version>~<extra>` for a peer or
+    // modifier variant), bun `<prefix>/<name>`, gem/composer/pypi bare
     // `<name>`. Name-level matching can over-claim across versions, but the
     // direction gate in `classify_overlap_takeover` still requires the live
     // lock to prove one side before anything is reported.
@@ -776,6 +785,7 @@ fn overlap_from_states(
                 .any(|key| {
                     key == name
                         || key == format!("{name}@{version}")
+                        || key.starts_with(&format!("{name}@{version}~"))
                         || key.ends_with(&format!("/{name}"))
                 })
         })
@@ -1671,7 +1681,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     } else {
                         format!("{excluded_supplements} lockfile-only/vendor-ledger packages have")
                     },
-                    if excluded_supplements == 1 { "was" } else { "were" },
+                    if excluded_supplements == 1 {
+                        "was"
+                    } else {
+                        "were"
+                    },
                 ),
             ));
         }
@@ -2465,9 +2479,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
 
         // The rule is as wide as the table, but never wraps a terminal.
         let header = render::table_header(purl_w);
-        let cap = std::io::stdout()
-            .is_terminal()
-            .then(ui::stdout_width);
+        let cap = std::io::stdout().is_terminal().then(ui::stdout_width);
         let rule = render::ruler(
             std::iter::once(header.as_str()).chain(rows.iter().map(String::as_str)),
             cap,
@@ -2708,8 +2720,10 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             println!("\nPatches to apply:\n");
         }
         for patch in &selected {
-            let severity =
-                ui::severity(render::highest_severity(patch).unwrap_or("unknown"), use_color);
+            let severity = ui::severity(
+                render::highest_severity(patch).unwrap_or("unknown"),
+                use_color,
+            );
             // The manifest already records a different patch for this
             // package: say so, and warn when the new one fixes less. Agent
             // mode only: vendored mode never writes the manifest.
@@ -2841,10 +2855,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Download, then apply in place — or vendor (vendored mode, where the
     // download only saves and the vendor step below does the rest).
     let params = download_params(
-        &args,
-        /*save_only=*/ vendor,
-        /*json=*/ false,
-        silent,
+        &args, /*save_only=*/ vendor, /*json=*/ false, silent,
     );
 
     let code = if vendor {
@@ -3963,6 +3974,31 @@ mod tests {
             "the vendored takeover of a degraded redirect ledger must be flagged"
         );
         assert!(takeover.redirect.is_empty(), "{takeover:?}");
+    }
+
+    #[tokio::test]
+    async fn degraded_ledger_matches_a_vlt_variant_key_at_the_tilde_boundary() {
+        for (key, overlaps) in [
+            ("minimist@1.2.2~peer.2", true),
+            ("minimist@1.2.2~_croot_s_g_s#a", true),
+            ("minimist@1.2.20~peer.2", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let mut edit = redirect_edit("vlt-lock.json", key);
+            edit.kind = socket_patch_core::patch::redirect::vlt::KIND.to_string();
+            write_redirect_ledger_with_edits(root, &[], vec![edit]).await;
+            write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
+            assert_eq!(
+                overlapping_ledger_purls(root).await,
+                if overlaps {
+                    vec!["pkg:npm/minimist@1.2.2".to_string()]
+                } else {
+                    Vec::new()
+                },
+                "{key}"
+            );
+        }
     }
 
     #[tokio::test]

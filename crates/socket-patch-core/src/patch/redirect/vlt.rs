@@ -69,12 +69,12 @@ fn lock_unsupported(detail: &str) -> RewriteWarning {
 }
 
 /// A lock that passed the lock-level parse, with its nodes section located.
-struct HostedLock {
+pub(super) struct HostedLock {
     parsed: ParsedLock,
     nodes: Option<SectionSpan>,
 }
 
-fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning> {
+pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning> {
     let parsed = match sniff_lock(text) {
         LockSniff::Readable(parsed) => parsed,
         LockSniff::Bom => {
@@ -123,6 +123,35 @@ fn registry_instance(
     let dep_id = split_dep_id(id)?;
     (dep_id.registry_identity()? == (name, version))
         .then(|| is_default_registry(&dep_id.first, options))
+}
+
+/// The default-registry and the foreign registry node ids of
+/// `name@version`, in the lock's key order.
+fn partition_instances<'a>(
+    nodes: &'a Map<String, Value>,
+    name: &str,
+    version: &str,
+    options: Option<&Map<String, Value>>,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let mut defaults = Vec::new();
+    let mut foreign = Vec::new();
+    for id in nodes.keys() {
+        match registry_instance(id, name, version, options) {
+            Some(true) => defaults.push(id.as_str()),
+            Some(false) => foreign.push(id.as_str()),
+            None => {}
+        }
+    }
+    (defaults, foreign)
+}
+
+/// The default-registry node ids of `dep` in a lock that passed the
+/// lock-level parse.
+pub(super) fn default_instances<'a>(lock: &'a HostedLock, dep: &DepOverride) -> Vec<&'a str> {
+    let Some(nodes) = lock.parsed.nodes() else {
+        return Vec::new();
+    };
+    partition_instances(nodes, &full_name(dep), &dep.version, lock.parsed.options()).0
 }
 
 fn is_old_lockfile_ignored(lock: &HostedLock, files: &BTreeMap<String, String>) -> bool {
@@ -230,6 +259,21 @@ fn ledger_key(name: &str, version: &str, extra: Option<&str>) -> String {
     }
 }
 
+/// The DepID a [`KIND`] ledger edit records, from its `original` entry
+/// text.
+pub fn edit_dep_id(edit: &FileEdit) -> Option<String> {
+    let text = edit.original.as_ref()?.as_str()?;
+    parse_node_entry_text(text).map(|entry| entry.key.to_string())
+}
+
+/// The node ids of a readable `vlt-lock.json`.
+pub fn lock_node_ids(text: &str) -> Option<std::collections::BTreeSet<String>> {
+    match sniff_lock(text) {
+        LockSniff::Readable(lock) => Some(lock.nodes()?.keys().cloned().collect()),
+        _ => None,
+    }
+}
+
 /// Does a ledger edit of [`KIND`] belong to `name@version`? Claims are by
 /// key, with a `~` boundary before a variant's extra segment.
 pub(crate) fn claims_key(key: &str, name: &str, version: &str) -> bool {
@@ -261,7 +305,12 @@ fn instance_line(
 }
 
 /// The residual gate: re-parsed, every instance carries the patched slots.
-fn every_instance_pinned(text: &str, ids: &[&str], sha512: &str, url: &str) -> Option<()> {
+pub(super) fn every_instance_pinned(
+    text: &str,
+    ids: &[&str],
+    sha512: &str,
+    url: &str,
+) -> Option<()> {
     let json: Value = serde_json::from_str(text).ok()?;
     let nodes = json.get("nodes")?.as_object()?;
     ids.iter()
@@ -306,16 +355,9 @@ fn rewrite_dep(
     let empty = Map::new();
     let nodes = lock.parsed.nodes().unwrap_or(&empty);
 
-    let mut defaults: Vec<&str> = Vec::new();
-    let mut foreign: Vec<&str> = Vec::new();
-    for id in nodes.keys() {
-        match registry_instance(id, &name, version, options) {
-            Some(true) => defaults.push(id),
-            Some(false) => foreign.push(id),
-            None => {}
-        }
-    }
+    let (defaults, foreign) = partition_instances(nodes, &name, version, options);
     if !foreign.is_empty() {
+        result.vlt_foreign_uuids.insert(dep.patch_uuid.clone());
         result.warnings.push(RewriteWarning {
             code: "redirect_vlt_custom_registry_skipped".into(),
             detail: format!(

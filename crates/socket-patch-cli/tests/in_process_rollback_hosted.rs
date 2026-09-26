@@ -26,6 +26,10 @@ use std::path::Path;
 mod vex_e2e_common;
 #[path = "vex_pipenv_pip_steps/mod.rs"]
 mod vex_pipenv_pip_steps;
+#[path = "in_process_rollback_hosted/vlt.rs"]
+mod vlt;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
 
 use serde_json::Value;
 use serial_test::serial;

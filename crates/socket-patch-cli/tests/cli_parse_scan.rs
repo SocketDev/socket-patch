@@ -44,6 +44,7 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_MANIFEST_PATH",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
     "SOCKET_OFFLINE",
     "SOCKET_ORG_SLUG",
     "SOCKET_PATCH_SERVER_URL",
@@ -934,4 +935,30 @@ fn detached_flag_is_hidden_from_help() {
     // Still parsed (compatibility), still folded under vendored mode.
     let folded = parse_and_resolve(&["--mode", "vendored", "--detached"]).expect("fold ok");
     assert!(folded.detached);
+}
+
+#[test]
+#[serial_test::serial]
+fn no_vlt_install_cleanup_flag_and_env_parse() {
+    assert!(
+        !parse_scan(&["--mode", "hosted"])
+            .common
+            .no_vlt_install_cleanup
+    );
+    assert!(
+        parse_scan(&["--mode", "hosted", "--no-vlt-install-cleanup"])
+            .common
+            .no_vlt_install_cleanup
+    );
+    let from_env = with_clean_env(|| {
+        std::env::set_var("SOCKET_NO_VLT_INSTALL_CLEANUP", "1");
+        let cli = Cli::try_parse_from(["socket-patch", "scan", "--mode", "hosted"]);
+        std::env::remove_var("SOCKET_NO_VLT_INSTALL_CLEANUP");
+        cli
+    })
+    .expect("parse");
+    match from_env.command {
+        Commands::Scan(a) => assert!(a.common.no_vlt_install_cleanup),
+        _ => panic!("expected Scan"),
+    }
 }

@@ -43,6 +43,8 @@ mod staged;
 mod state;
 mod takeover;
 pub mod vlt;
+pub mod vlt_heal;
+pub mod vlt_preflight;
 pub use replay::{revert_remaining_redirect_edits, GroupRefusal, ReplayOutcome};
 pub use state::{
     drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
@@ -228,6 +230,9 @@ pub struct RewriteResult {
     /// the node grammar, a failed residual gate). Never confirmed, whichever
     /// lock drives.
     pub refused_vlt_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids with a same-`name@version` vlt node under a named alias,
+    /// a scoped registry or jsr, which hosted mode leaves unpatched.
+    pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
     /// [`vlt::vlt_drives`] over the rewriter's input files and the
     /// caller's `bun_lockb_present`.
     pub vlt_drives: bool,
@@ -336,6 +341,28 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
 ) -> RewriteResult {
+    rewrite_registry_redirect_withholding_vlt(
+        files,
+        overrides,
+        python_metadata,
+        pipenv_major,
+        bun_lockb_present,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// [`rewrite_registry_redirect_with_pipenv_version`] with the patch uuids
+/// in `vlt_withheld` kept out of the vlt rewrite only: their artifact
+/// failed vlt's preflight while another npm-family lock may be the one the
+/// project installs from.
+pub fn rewrite_registry_redirect_withholding_vlt(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    python_metadata: &BTreeMap<String, String>,
+    pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
+    vlt_withheld: &std::collections::BTreeSet<String>,
+) -> RewriteResult {
     let mut result = RewriteResult::default();
     // pdm runs FIRST, but only when `pdm.lock` is the project's PyPI install
     // driver (see [`pdm_drives`]). When it does, a patch it refuses is
@@ -356,7 +383,12 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     rewrite_yarn_classic(files, overrides, &mut result);
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
-    vlt::rewrite_vlt_lock(files, overrides, bun_lockb_present, &mut result);
+    vlt::rewrite_vlt_lock(
+        files,
+        &withhold(overrides, vlt_withheld),
+        bun_lockb_present,
+        &mut result,
+    );
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
     requirements::rewrite(files, overrides, &mut result);
     rewrite_hatch(files, overrides, &mut result);
