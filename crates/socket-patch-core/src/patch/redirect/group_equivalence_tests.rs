@@ -381,3 +381,46 @@ fn group_oracle_detects_hatch_split_from_requirements() {
     let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &split));
     assert_ne!(merged, Some(serial));
 }
+
+/// A group whose thread the OS refuses runs on the calling thread, in order:
+/// same result, same first-panic-in-order.
+#[test]
+fn parallel_groups_run_inline_when_a_thread_is_refused() {
+    struct Refuse;
+    impl Drop for Refuse {
+        fn drop(&mut self) {
+            REFUSE_GROUP_THREADS.with(|c| c.set(false));
+        }
+    }
+    REFUSE_GROUP_THREADS.with(|c| c.set(true));
+    let _reset = Refuse;
+
+    let metadata = wheel_metadata();
+    for (label, files, overrides) in python_cases() {
+        assert_same_with_metadata(label, &files, &overrides, &metadata);
+    }
+    let groups: Vec<RewriterGroup<'static>> = vec![
+        Box::new(|r: &mut RewriteResult| r.warnings.push(warn("a"))),
+        Box::new(|r: &mut RewriteResult| {
+            r.files.insert("b".into(), "2".into());
+        }),
+        Box::new(|r: &mut RewriteResult| r.warnings.push(warn("c"))),
+    ];
+    let prefix = RewriteResult::default();
+    assert_eq!(
+        rewrite_groups_parallel(prefix.clone(), &groups),
+        rewrite_groups_serial(prefix.clone(), &groups)
+    );
+    assert!(merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups)).is_some());
+
+    let panicking: Vec<RewriterGroup<'static>> = vec![
+        Box::new(|_: &mut RewriteResult| {}),
+        Box::new(|_: &mut RewriteResult| panic!("first")),
+        Box::new(|_: &mut RewriteResult| panic!("second")),
+    ];
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rewrite_groups_parallel(RewriteResult::default(), &panicking)
+    }))
+    .expect_err("a group panicked");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"first"));
+}
