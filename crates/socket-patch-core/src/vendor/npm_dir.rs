@@ -707,8 +707,51 @@ async fn prune_staged_node_modules(
                 ),
             )));
         }
+        let gyp = tokio::fs::symlink_metadata(stage.join(BINDING_GYP))
+            .await
+            .is_ok();
+        let steps = vlt_build_steps(&pkg, gyp);
+        if !steps.is_empty() {
+            return Err(Box::new(refused(
+                BUILD_STEPS_UNSUPPORTED,
+                build_steps_detail(name, version, &steps),
+            )));
+        }
     }
     Ok(())
+}
+
+pub(crate) const BUILD_STEPS_UNSUPPORTED: &str = "vendor_vlt_build_scripts_unsupported";
+pub(crate) const BINDING_GYP: &str = "binding.gyp";
+
+/// What `vlt build` runs in a package's own directory: its `preinstall`,
+/// `install`, `postinstall` and `prepare` scripts, and node-gyp for a
+/// `binding.gyp`. vlt builds a registry copy in the untracked store, but a
+/// vendored `file:` dependency in place, inside the committed artifact.
+pub(crate) fn vlt_build_steps(pkg: &Value, has_binding_gyp: bool) -> Vec<String> {
+    let scripts = pkg.get("scripts").and_then(Value::as_object);
+    let mut steps: Vec<String> = ["preinstall", "install", "postinstall", "prepare"]
+        .iter()
+        .filter(|k| {
+            scripts
+                .and_then(|s| s.get(**k))
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.trim().is_empty())
+        })
+        .map(|k| format!("a `{k}` script"))
+        .collect();
+    if has_binding_gyp {
+        steps.push(format!("node-gyp for its {BINDING_GYP}"));
+    }
+    steps
+}
+
+pub(crate) fn build_steps_detail(name: &str, version: &str, steps: &[String]) -> String {
+    format!(
+        "{name}@{version} has {}, which `vlt build` runs inside a vendored package's committed \
+         directory, rewriting the artifact; use --mode hosted",
+        steps.join(" and ")
+    )
 }
 
 async fn read_manifest(dir: &Path) -> Result<Value, String> {
@@ -1052,6 +1095,35 @@ mod tests {
                     .unwrap_err();
             assert!(err.contains("not a regular file"), "{kind:?}: {err}");
         }
+    }
+
+    #[test]
+    fn vlt_build_steps_name_every_script_vlt_build_runs_in_place() {
+        let pkg = serde_json::json!({
+            "scripts": {
+                "postinstall": "node install.js",
+                "prepare": "husky",
+                "install": " ",
+                "test": "tap",
+                "build": "tsc"
+            }
+        });
+        assert_eq!(
+            vlt_build_steps(&pkg, true),
+            [
+                "a `postinstall` script",
+                "a `prepare` script",
+                "node-gyp for its binding.gyp"
+            ]
+        );
+        assert!(vlt_build_steps(&serde_json::json!({"scripts": {"test": "x"}}), false).is_empty());
+        assert!(vlt_build_steps(&serde_json::json!({}), false).is_empty());
+        assert_eq!(
+            build_steps_detail("esbuild", "0.20.2", &vlt_build_steps(&pkg, false)),
+            "esbuild@0.20.2 has a `postinstall` script and a `prepare` script, which `vlt build` \
+             runs inside a vendored package's committed directory, rewriting the artifact; use \
+             --mode hosted"
+        );
     }
 
     #[test]

@@ -739,6 +739,19 @@ pub async fn vlt_vendor_preflight(
                     format!("{name}@{version} declares bundleDependencies; vendoring would drop its bundled node_modules and break installs"),
                 ));
             }
+            let gyp = match store.parent() {
+                Some(dir) => tokio::fs::symlink_metadata(dir.join(super::npm_dir::BINDING_GYP))
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            let steps = super::npm_dir::vlt_build_steps(&pkg, gyp);
+            if !steps.is_empty() {
+                return Err((
+                    super::npm_dir::BUILD_STEPS_UNSUPPORTED,
+                    super::npm_dir::build_steps_detail(&name, &version, &steps),
+                ));
+            }
         }
         if let Err(SpanError::Duplicate(_)) = super::npm_dir::strip_dev_dependencies(&text) {
             return Err((
@@ -3241,6 +3254,31 @@ mod tests {
         assert_eq!(code, "vendor_bundled_deps_unsupported");
         tokio::fs::write(
             store.join(PACKAGE_JSON),
+            "{\"scripts\":{\"postinstall\":\"node install.js\"}}",
+        )
+        .await
+        .unwrap();
+        let (code, detail) = vlt_vendor_preflight(&fx.root, PURL, UUID)
+            .await
+            .unwrap_err();
+        assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
+        assert!(detail.contains("a `postinstall` script"), "{detail}");
+        tokio::fs::write(store.join(PACKAGE_JSON), "{}")
+            .await
+            .unwrap();
+        tokio::fs::write(store.join("binding.gyp"), "{}")
+            .await
+            .unwrap();
+        let (code, detail) = vlt_vendor_preflight(&fx.root, PURL, UUID)
+            .await
+            .unwrap_err();
+        assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
+        assert!(detail.contains("node-gyp"), "{detail}");
+        tokio::fs::remove_file(store.join("binding.gyp"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            store.join(PACKAGE_JSON),
             "{\"devDependencies\":{},\"devDependencies\":{}}",
         )
         .await
@@ -3899,6 +3937,22 @@ mod tests {
         .unwrap();
         let (code, _) = refusal(run(&fx, UUID, false).await);
         assert_eq!(code, "vendor_bundled_deps_unsupported");
+        assert!(!fx.root.join(".socket").exists());
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+    }
+
+    #[tokio::test]
+    async fn a_package_vlt_would_build_in_place_refuses_on_the_local_build() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        tokio::fs::write(
+            fx.installed.join(PACKAGE_JSON),
+            "{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"scripts\":{\"install\":\"node-gyp rebuild\"}}",
+        )
+        .await
+        .unwrap();
+        let (code, detail) = refusal(run(&fx, UUID, false).await);
+        assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
+        assert!(detail.ends_with("use --mode hosted"), "{detail}");
         assert!(!fx.root.join(".socket").exists());
         assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
     }
