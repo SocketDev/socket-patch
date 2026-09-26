@@ -1116,6 +1116,39 @@ mod tests {
         assert_eq!(out.get("pkg:npm/foo@1.0.0"), Some(&pkg_dir));
     }
 
+    /// The dispatch wiring over a vlt store: a direct dep resolves at its
+    /// importer link, a transitive-only dep at its `.vlt/<DepID>` store
+    /// copy (here a legacy-era modifier-extra id), and both come back keyed
+    /// by the exact PURLs handed in.
+    #[tokio::test]
+    async fn find_packages_for_purls_maps_npm_purl_to_vlt_store_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        let store = nm.join(".vlt");
+        let direct = write_npm_package(&store.join("~npm~foo@1.0.0"), "foo", "1.0.0");
+        let transitive = write_npm_package(
+            &store.join("··ms@2.1.3·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"),
+            "ms",
+            "2.1.3",
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&direct, nm.join("foo")).unwrap();
+
+        let purls = [
+            "pkg:npm/foo@1.0.0".to_string(),
+            "pkg:npm/ms@2.1.3".to_string(),
+        ];
+        let partitioned = partition_purls(&purls, None);
+        let out =
+            find_packages_for_purls(&partitioned, &local_options(tmp.path().to_path_buf()), true)
+                .await;
+        #[cfg(unix)]
+        assert_eq!(out.get("pkg:npm/foo@1.0.0"), Some(&nm.join("foo")));
+        #[cfg(not(unix))]
+        assert_eq!(out.get("pkg:npm/foo@1.0.0"), Some(&direct));
+        assert_eq!(out.get("pkg:npm/ms@2.1.3"), Some(&transitive));
+    }
+
     /// Multi-copy P0 at the dispatch layer: `find_all_packages_for_purls`
     /// must carry EVERY physical copy of a duplicated npm PURL (a root copy
     /// plus a nested duplicate), root-copy-first — the second path the old

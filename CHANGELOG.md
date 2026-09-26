@@ -263,6 +263,22 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **`apply` and `rollback` patch vlt installs in place.** A project
+  installed by vlt (`node_modules/.vlt/` or `node_modules/.vlt-lock.json`)
+  is detected as vlt ahead of any sibling bun, pnpm, yarn or npm marker,
+  and `apply` prints `Note: vlt layout detected…` in human mode. `scan`,
+  `get`, `apply`, `rollback` and `vex` find every package in vlt's store
+  (`node_modules/.vlt/<DepID>/node_modules/<name>`) in every DepID era,
+  including transitive-only packages, aliases, git/remote/`file:` entries
+  and workspace members' link-only trees. `apply` and `rollback` reach
+  every store copy of a patched `name@version` (vlt's `~peer.<n>`,
+  hashed-peer and modifier variants, and the legacy `··` / `·npm·` pair),
+  and every write replaces the file rather than writing through it, so
+  vlt 1.2's machine-wide store (hardlinked on Linux) stays untouched. The
+  store-copy failure note is now `store copy <path> failed to patch` /
+  `failed to roll back` for pnpm and vlt alike. `--update` in a vlt
+  project suggests `vlt install @socketsecurity/socket-patch@latest`, and
+  in vlx's cache `vlx -y -- @socketsecurity/socket-patch@latest …`.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

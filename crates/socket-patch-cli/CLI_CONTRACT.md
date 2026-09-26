@@ -967,7 +967,7 @@ Honored global flags: `--json`, `--silent` (errors only), `--yes` (skip the conf
 
 | Detected channel | Hint |
 |---|---|
-| npm (`node_modules` path component) | project-local (the directory holding the outermost `node_modules` has a `package.json`, and it is not directly under `lib`/`npm` or below a yarn/pnpm `global` store): `npm install @socketsecurity/socket-patch@latest`; otherwise global (including version-manager prefixes such as nvm-windows and fnm): `npm update -g @socketsecurity/socket-patch` |
+| npm (`node_modules` path component) | project-local (the directory holding the outermost `node_modules` has a `package.json`, and it is not directly under `lib`/`npm` or below a yarn/pnpm `global` store): `npm install @socketsecurity/socket-patch@latest`, or `vlt install @socketsecurity/socket-patch@latest` when that directory holds `vlt-lock.json`, or `vlx -y -- @socketsecurity/socket-patch@latest …` when its `package.json` is vlx's (`"name": "vlx"`, the vlx cache); otherwise global (including version-manager prefixes such as nvm-windows and fnm): `npm update -g @socketsecurity/socket-patch` |
 | PyPI wheel (`site-packages`/`dist-packages`) | `pip install --upgrade socket-patch` |
 | `cargo install` (`$CARGO_HOME/bin`, `~/.cargo/bin`) | `cargo install socket-patch-cli` |
 | gem launcher cache (`<cache>/socket-patch/bin/…`) | `gem update socket-patch` |

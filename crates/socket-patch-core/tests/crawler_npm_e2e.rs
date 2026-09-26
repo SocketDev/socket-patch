@@ -2346,3 +2346,721 @@ async fn find_by_purls_resolves_bundled_only_target_via_fallback_pass() {
         host_nm.join("host").join("node_modules").join("leaf")
     );
 }
+
+// ── vlt store (.vlt), staged from captured real layouts ────────
+
+/// The eras with a captured `vlt install` layout under
+/// `tests/fixtures/vlt-trees/<version>/listing.json`: legacy `··` (0.0.0-32),
+/// legacy `·npm·` with `ṗ` peers (rc.14), and tilde with hashed peers
+/// (1.0.10, 1.2.0).
+#[cfg(unix)]
+const VLT_TREES: [&str; 4] = ["0.0.0-32", "1.0.0-rc.14", "1.0.10", "1.2.0"];
+
+#[cfg(unix)]
+fn vlt_listing(tree: &str) -> serde_json::Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/vlt-trees")
+        .join(tree)
+        .join("listing.json");
+    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+}
+
+/// `(path relative to the entry's node_modules, name, version)` of every
+/// real package dir in a listed `node_modules`.
+#[cfg(unix)]
+fn listed_packages(modules: &serde_json::Value) -> Vec<(String, String, String)> {
+    modules
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter_map(|(rel, desc)| {
+            let pkg = desc.get("pkg")?;
+            Some((
+                rel.clone(),
+                pkg["name"].as_str().unwrap().to_string(),
+                pkg["version"].as_str().unwrap().to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Recreate one listed `node_modules`: real package dirs (a package.json
+/// with the captured identity), other real dirs, and the captured relative
+/// links, byte for byte.
+#[cfg(unix)]
+async fn stage_listed_modules(nm: &Path, modules: &serde_json::Value) {
+    tokio::fs::create_dir_all(nm).await.unwrap();
+    for (rel, desc) in modules.as_object().unwrap() {
+        let path = nm.join(rel);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        if let Some(pkg) = desc.get("pkg") {
+            stage_pkg_dir(
+                &path,
+                pkg["name"].as_str().unwrap(),
+                pkg["version"].as_str().unwrap(),
+            )
+            .await;
+        } else if let Some(target) = desc.get("link").and_then(|t| t.as_str()) {
+            std::os::unix::fs::symlink(target, &path).unwrap();
+        } else if desc.get("dir").is_some() {
+            tokio::fs::create_dir_all(&path).await.unwrap();
+        } else {
+            tokio::fs::write(&path, b"").await.unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn stage_pkg_dir(dir: &Path, name: &str, version: &str) {
+    tokio::fs::create_dir_all(dir).await.unwrap();
+    tokio::fs::write(
+        dir.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+    )
+    .await
+    .unwrap();
+}
+
+/// Stage a captured vlt layout under `root` and return its root
+/// `node_modules`: the `.vlt` store (entries, hoist dir, `vlt.json`), the
+/// hidden lock, the importer links, workspace members' link-only
+/// `node_modules`, and the non-store dirs importer links point at.
+#[cfg(unix)]
+async fn stage_vlt_tree(root: &Path, listing: &serde_json::Value) -> std::path::PathBuf {
+    let nm = root.join("node_modules");
+    let store = nm.join(".vlt");
+    tokio::fs::create_dir_all(&store).await.unwrap();
+    tokio::fs::write(nm.join(".vlt-lock.json"), b"{}")
+        .await
+        .unwrap();
+    for file in listing["storeFiles"].as_array().unwrap() {
+        tokio::fs::write(store.join(file.as_str().unwrap()), b"{}")
+            .await
+            .unwrap();
+    }
+    stage_listed_modules(&store.join("node_modules"), &listing["hoist"]).await;
+    for entry in listing["store"].as_array().unwrap() {
+        let id = entry["id"].as_str().unwrap();
+        stage_listed_modules(&store.join(id).join("node_modules"), &entry["node_modules"]).await;
+    }
+    stage_listed_modules(&nm, &listing["importers"]).await;
+    for (member, modules) in listing["members"].as_object().unwrap() {
+        stage_listed_modules(&root.join(member).join("node_modules"), modules).await;
+    }
+    for (dir, pkg) in listing["linkTargets"].as_object().unwrap() {
+        stage_pkg_dir(
+            &root.join(dir),
+            pkg["name"].as_str().unwrap(),
+            pkg["version"].as_str().unwrap(),
+        )
+        .await;
+    }
+    nm
+}
+
+#[cfg(unix)]
+fn npm_purl(name: &str, version: &str) -> String {
+    format!("pkg:npm/{name}@{version}")
+}
+
+/// Every real package dir of a staged listing, keyed by purl: the store
+/// copies (`.vlt/<DepID>/node_modules/<name>`) and the non-store link
+/// targets (`file:` directory deps, workspace members).
+#[cfg(unix)]
+fn vlt_real_copies(
+    root: &Path,
+    listing: &serde_json::Value,
+) -> std::collections::BTreeMap<String, Vec<std::path::PathBuf>> {
+    let store = root.join("node_modules/.vlt");
+    let mut out: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> =
+        std::collections::BTreeMap::new();
+    for entry in listing["store"].as_array().unwrap() {
+        let entry_nm = store
+            .join(entry["id"].as_str().unwrap())
+            .join("node_modules");
+        for (rel, name, version) in listed_packages(&entry["node_modules"]) {
+            out.entry(npm_purl(&name, &version))
+                .or_default()
+                .push(entry_nm.join(rel));
+        }
+    }
+    for (dir, pkg) in listing["linkTargets"].as_object().unwrap() {
+        out.entry(npm_purl(
+            pkg["name"].as_str().unwrap(),
+            pkg["version"].as_str().unwrap(),
+        ))
+        .or_default()
+        .push(root.join(dir));
+    }
+    out
+}
+
+/// The importer-root key an importer link for `purl` is installed under,
+/// when its key IS the package name (aliases like `lp-alias` are not).
+#[cfg(unix)]
+fn vlt_importer_key(listing: &serde_json::Value, root: &Path, purl: &str) -> Option<String> {
+    let nm = root.join("node_modules");
+    listing["importers"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .find(|key| {
+            let Ok(text) = std::fs::read_to_string(nm.join(key).join("package.json")) else {
+                return false;
+            };
+            let pkg: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let (name, version) = (
+                pkg["name"].as_str().unwrap(),
+                pkg["version"].as_str().unwrap(),
+            );
+            name == key.as_str() && npm_purl(name, version) == purl
+        })
+        .cloned()
+}
+
+#[cfg(unix)]
+fn canonical(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Every installed package of every captured era resolves: direct deps at
+/// their importer-root link (BFS root-first), transitive-only packages
+/// (`ms` under `debug`, the whole git dependency's dev tree) at their store
+/// copy, aliases (`lp-alias` → `left-pad@1.1.3`) through the store entry
+/// named after the real package, and each resolved path is a real copy of
+/// exactly that `name@version`.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_resolves_vlt_store_transitives() {
+    for tree in VLT_TREES {
+        let tmp = tempfile::tempdir().unwrap();
+        let listing = vlt_listing(tree);
+        let nm = stage_vlt_tree(tmp.path(), &listing).await;
+        let copies = vlt_real_copies(tmp.path(), &listing);
+        let purls: Vec<String> = copies.keys().cloned().collect();
+        assert!(purls.len() > 200, "{tree}: the capture is the full tree");
+
+        let result = NpmCrawler.find_by_purls(&nm, &purls).await.unwrap();
+        for purl in &purls {
+            let found = result
+                .get(purl)
+                .unwrap_or_else(|| panic!("{tree}: {purl} must resolve"));
+            let allowed: Vec<_> = copies[purl].iter().map(|p| canonical(p)).collect();
+            for pkg in found {
+                assert!(
+                    allowed.contains(&canonical(&pkg.path)),
+                    "{tree}: {purl} resolved to {} which is no copy of it",
+                    pkg.path.display()
+                );
+            }
+            if let Some(key) = vlt_importer_key(&listing, tmp.path(), purl) {
+                assert_eq!(
+                    found[0].path,
+                    nm.join(&key),
+                    "{tree}: the importer link wins for {purl}"
+                );
+            }
+        }
+        let ms = &result["pkg:npm/ms@2.1.3"];
+        assert!(
+            ms.iter().any(|p| p
+                .path
+                .strip_prefix(nm.join(".vlt"))
+                .is_ok_and(|rel| rel.to_string_lossy().contains("debug"))),
+            "{tree}: the modifier-extra ms entry must resolve; got {ms:?}"
+        );
+        let alias = &result["pkg:npm/left-pad@1.1.3"];
+        assert_eq!(
+            alias[0].path.parent().unwrap().parent().unwrap().parent(),
+            Some(nm.join(".vlt").as_path()),
+            "{tree}: the alias resolves through its own store entry"
+        );
+    }
+}
+
+/// Scan twin: `crawl_all` inventories every package of every captured era
+/// exactly once. Importer links win the `seen` dedup at their importer
+/// path, everything else is recorded at its REAL store dir (a dependency
+/// link inside another entry never double-counts), and the internal hoist
+/// dir never contributes a path.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_inventories_vlt_store_exactly_once() {
+    for tree in VLT_TREES {
+        let tmp = tempfile::tempdir().unwrap();
+        let listing = vlt_listing(tree);
+        let nm = stage_vlt_tree(tmp.path(), &listing).await;
+        let copies = vlt_real_copies(tmp.path(), &listing);
+
+        let result = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+        let mut purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+        purls.sort_unstable();
+        let before = purls.len();
+        purls.dedup();
+        assert_eq!(before, purls.len(), "{tree}: every purl once");
+        assert_eq!(
+            purls,
+            copies.keys().map(String::as_str).collect::<Vec<_>>(),
+            "{tree}: exactly the installed packages"
+        );
+
+        let importer_links: Vec<std::path::PathBuf> = listing["importers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| nm.join(key))
+            .collect();
+        for pkg in &result {
+            assert!(
+                !pkg.path.starts_with(nm.join(".vlt/node_modules")),
+                "{tree}: the hoist dir is never scanned: {}",
+                pkg.path.display()
+            );
+            if importer_links.contains(&pkg.path) {
+                continue;
+            }
+            assert!(
+                copies[&pkg.purl].contains(&pkg.path),
+                "{tree}: {} must be recorded at a real copy, got {}",
+                pkg.purl,
+                pkg.path.display()
+            );
+        }
+    }
+}
+
+/// Store entries whose DepID carries an extra (a modifier `%3Aroot…` /
+/// `~_croot…`, a legacy `ṗ` peer `%E1%B9%97%3A<n>`, a hashed `~peer.<hex>`)
+/// decode to their package and resolve for a transitive-only target.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_resolves_vlt_store_entry_with_peer_extra() {
+    for tree in VLT_TREES {
+        let tmp = tempfile::tempdir().unwrap();
+        let listing = vlt_listing(tree);
+        let nm = stage_vlt_tree(tmp.path(), &listing).await;
+        let delimiter = if listing["lockfileVersion"] == 1 {
+            '~'
+        } else {
+            '·'
+        };
+
+        let mut checked = 0;
+        for entry in listing["store"].as_array().unwrap() {
+            let id = entry["id"].as_str().unwrap();
+            if !id.starts_with(delimiter) || id.split(delimiter).count() != 4 {
+                continue;
+            }
+            for (rel, name, version) in listed_packages(&entry["node_modules"]) {
+                let purl = npm_purl(&name, &version);
+                if vlt_importer_key(&listing, tmp.path(), &purl).is_some() {
+                    continue;
+                }
+                let result = NpmCrawler
+                    .find_by_purls(&nm, std::slice::from_ref(&purl))
+                    .await
+                    .unwrap();
+                let want = nm.join(".vlt").join(id).join("node_modules").join(rel);
+                assert!(
+                    result
+                        .get(&purl)
+                        .is_some_and(|found| found.iter().any(|p| p.path == want)),
+                    "{tree}: {purl} must resolve to {}; got {result:?}",
+                    want.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "{tree}: the capture holds extra-bearing entries"
+        );
+    }
+}
+
+/// git, remote and `file:` tarball store entries (`git~…`, `remote·…`,
+/// `file~vendor+ms-2.1.2.tgz`) and a registry-shaped id that does not
+/// decode (`%ZZ`) reveal no identity from their names, so they stay
+/// probeable and the package inside resolves by its package.json.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_probes_undecodable_vlt_store_entry() {
+    for tree in VLT_TREES {
+        let tmp = tempfile::tempdir().unwrap();
+        let listing = vlt_listing(tree);
+        let nm = stage_vlt_tree(tmp.path(), &listing).await;
+        let store = nm.join(".vlt");
+        let bad = store.join("·npm·wanted%ZZ@1.0.0").join("node_modules");
+        stage_pkg_dir(&bad.join("wanted"), "wanted", "1.0.0").await;
+
+        let find = |purl: &'static str| {
+            let nm = nm.clone();
+            async move {
+                NpmCrawler
+                    .find_by_purls(&nm, &[purl.to_string()])
+                    .await
+                    .unwrap()
+                    .remove(purl)
+                    .unwrap_or_default()
+            }
+        };
+        let remote = find("pkg:npm/left-pad@1.2.0").await;
+        assert!(
+            remote
+                .iter()
+                .any(|p| p.path.to_string_lossy().contains("remote")),
+            "{tree}: the remote tarball entry must be probed; got {remote:?}"
+        );
+        let file = find("pkg:npm/ms@2.1.2").await;
+        assert!(
+            file.iter()
+                .any(|p| p.path.to_string_lossy().contains("ms-2.1.2.tgz")),
+            "{tree}: the file: tarball entry must be probed; got {file:?}"
+        );
+        let wanted = find("pkg:npm/wanted@1.0.0").await;
+        assert_eq!(
+            wanted.iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
+            vec![bad.join("wanted")],
+            "{tree}: an undecodable id stays probeable"
+        );
+    }
+}
+
+/// What the traversal must never read inside `.vlt`: the hoist dir
+/// `node_modules` (links plus real `@scope` dirs), the `vlt.json` file,
+/// `.VLT.DELETE.<key>.<DepID>` rollback staging, an entry dir without its
+/// own `node_modules`, an entry reached through a link, and an entry's
+/// `.bin`. Decoy packages sit in each; none may resolve or be scanned.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_and_crawl_all_skip_vlt_hoist_dir_and_vlt_json_and_delete_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listing = vlt_listing("1.2.0");
+    let nm = stage_vlt_tree(tmp.path(), &listing).await;
+    let store = nm.join(".vlt");
+    assert!(store.join("vlt.json").is_file());
+    assert!(store.join("node_modules/@babel").is_dir());
+
+    stage_pkg_dir(
+        &store.join("node_modules/hoist-decoy"),
+        "hoist-decoy",
+        "9.9.9",
+    )
+    .await;
+    stage_pkg_dir(
+        &store.join("node_modules/@babel/scoped-decoy"),
+        "@babel/scoped-decoy",
+        "9.9.9",
+    )
+    .await;
+    stage_pkg_dir(
+        &store.join(".VLT.DELETE.4f2a.~npm~ghost@1.0.0/node_modules/ghost"),
+        "ghost",
+        "1.0.0",
+    )
+    .await;
+    stage_pkg_dir(&store.join("~npm~bare@1.0.0/bare"), "bare", "1.0.0").await;
+    let outside = tempfile::tempdir().unwrap();
+    stage_pkg_dir(
+        &outside.path().join("node_modules/linked"),
+        "linked",
+        "1.0.0",
+    )
+    .await;
+    std::os::unix::fs::symlink(outside.path(), store.join("~npm~linked@1.0.0")).unwrap();
+    stage_pkg_dir(
+        &store.join("~npm~left-pad@1.3.0/node_modules/.bin/bin-decoy"),
+        "bin-decoy",
+        "9.9.9",
+    )
+    .await;
+
+    let decoys = [
+        "pkg:npm/hoist-decoy@9.9.9",
+        "pkg:npm/@babel/scoped-decoy@9.9.9",
+        "pkg:npm/ghost@1.0.0",
+        "pkg:npm/bare@1.0.0",
+        "pkg:npm/linked@1.0.0",
+        "pkg:npm/bin-decoy@9.9.9",
+    ];
+    let purls: Vec<String> = decoys.iter().map(|p| p.to_string()).collect();
+    let result = NpmCrawler.find_by_purls(&nm, &purls).await.unwrap();
+    assert!(result.is_empty(), "no decoy resolves; got {result:?}");
+
+    let scanned = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+    for decoy in decoys {
+        assert!(
+            !scanned.iter().any(|p| p.purl == decoy),
+            "{decoy} must not be scanned"
+        );
+    }
+    assert_eq!(
+        scanned.len(),
+        vlt_real_copies(tmp.path(), &listing).len(),
+        "the real packages are still all scanned"
+    );
+}
+
+/// A vlt workspace (rc.22 capture): the root store is scanned once, and
+/// the members' `node_modules` (links only, found by the unchanged
+/// workspace walk) add only what the root does not link: the
+/// workspace-to-workspace link `@scope/b`.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_inventories_vlt_workspace_root_store_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listing = vlt_listing("1.0.0-rc.22-workspace");
+    let nm = stage_vlt_tree(tmp.path(), &listing).await;
+
+    let mut roots = NpmCrawler
+        .get_node_modules_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    roots.sort();
+    assert_eq!(
+        roots,
+        vec![
+            nm.clone(),
+            tmp.path().join("packages/a/node_modules"),
+            tmp.path().join("packages/b/node_modules"),
+        ]
+    );
+
+    let result = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+    let mut purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    purls.sort_unstable();
+    let copies = vlt_real_copies(tmp.path(), &listing);
+    assert_eq!(purls, copies.keys().map(String::as_str).collect::<Vec<_>>());
+    let b = result
+        .iter()
+        .find(|p| p.purl == "pkg:npm/@scope/b@1.0.0")
+        .unwrap();
+    assert_eq!(b.path, tmp.path().join("packages/a/node_modules/@scope/b"));
+    let react17 = result
+        .iter()
+        .find(|p| p.purl == "pkg:npm/react@17.0.2")
+        .unwrap();
+    assert_eq!(
+        react17.path,
+        nm.join(".vlt/~npm~react@17.0.2/node_modules/react"),
+        "store copies are scanned once, from the root store"
+    );
+}
+
+/// The apply fixture shared by the vlt fan-out tests: one patched file
+/// `package/index.js` and the blobs to apply and roll it back.
+#[cfg(unix)]
+struct VltPatch {
+    files: std::collections::HashMap<String, socket_patch_core::manifest::schema::PatchFileInfo>,
+    blobs: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+const VLT_ORIGINAL: &[u8] = b"module.exports = 'vulnerable';\n";
+#[cfg(unix)]
+const VLT_PATCHED: &[u8] = b"module.exports = 'fixed';\n";
+
+#[cfg(unix)]
+async fn vlt_patch(root: &Path) -> VltPatch {
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    use socket_patch_core::manifest::schema::PatchFileInfo;
+
+    let before_hash = compute_git_sha256_from_bytes(VLT_ORIGINAL);
+    let after_hash = compute_git_sha256_from_bytes(VLT_PATCHED);
+    let blobs = root.join("blobs");
+    tokio::fs::create_dir_all(&blobs).await.unwrap();
+    tokio::fs::write(blobs.join(&after_hash), VLT_PATCHED)
+        .await
+        .unwrap();
+    tokio::fs::write(blobs.join(&before_hash), VLT_ORIGINAL)
+        .await
+        .unwrap();
+    let files = std::collections::HashMap::from([(
+        "package/index.js".to_string(),
+        PatchFileInfo {
+            before_hash,
+            after_hash,
+        },
+    )]);
+    VltPatch { files, blobs }
+}
+
+#[cfg(unix)]
+async fn vlt_apply(
+    purl: &str,
+    primary: &Path,
+    patch: &VltPatch,
+) -> socket_patch_core::patch::apply::ApplyResult {
+    use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
+    let sources = PatchSources {
+        blobs_path: &patch.blobs,
+        packages_path: None,
+        diffs_path: None,
+        mem_blobs: None,
+    };
+    apply_package_patch(
+        purl,
+        primary,
+        &patch.files,
+        &sources,
+        None,
+        false,
+        MismatchPolicy::Warn,
+    )
+    .await
+}
+
+/// Every physical store copy of one `name@version` is patched and rolled
+/// back from a single primary: the rc.22 capture's real `~peer.2` /
+/// `~peer.3` entries of use-sync-external-store (primary = the member's
+/// link), a legacy-era `··left-pad@1.3.0` / `·npm·left-pad@1.3.0` pair
+/// (vlt #1328), and a modifier twin of `ms@2.1.3` beside the captured
+/// `~_croot…` entry. Every copy hardlinks one "global store" file, which
+/// must never change (copy-on-write per copy).
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn apply_and_rollback_reach_every_vlt_variant_copy() {
+    use socket_patch_core::patch::rollback::rollback_package_patch;
+
+    struct Case {
+        tree: &'static str,
+        purl: &'static str,
+        name: &'static str,
+        primary: &'static str,
+        twins: &'static [&'static str],
+    }
+    let cases = [
+        Case {
+            tree: "1.0.0-rc.22-workspace",
+            purl: "pkg:npm/use-sync-external-store@1.2.0",
+            name: "use-sync-external-store",
+            primary: "packages/a/node_modules/use-sync-external-store",
+            twins: &[],
+        },
+        Case {
+            tree: "0.0.0-32",
+            purl: "pkg:npm/left-pad@1.3.0",
+            name: "left-pad",
+            primary: "node_modules/left-pad",
+            twins: &["·npm·left-pad@1.3.0"],
+        },
+        Case {
+            tree: "1.2.0",
+            purl: "pkg:npm/ms@2.1.3",
+            name: "ms",
+            primary: "node_modules/.vlt/~npm~ms@2.1.3~_croot_s_g_s#debug_s_g_s#ms/node_modules/ms",
+            twins: &["~npm~ms@2.1.3"],
+        },
+    ];
+    for case in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let listing = vlt_listing(case.tree);
+        let nm = stage_vlt_tree(tmp.path(), &listing).await;
+        let version = case.purl.rsplit_once('@').unwrap().1;
+        for twin in case.twins {
+            stage_pkg_dir(
+                &nm.join(".vlt")
+                    .join(twin)
+                    .join("node_modules")
+                    .join(case.name),
+                case.name,
+                version,
+            )
+            .await;
+        }
+        let copies = vlt_real_copies(tmp.path(), &listing)[case.purl].clone();
+        let mut copies: Vec<_> = copies
+            .into_iter()
+            .chain(
+                case.twins
+                    .iter()
+                    .map(|t| nm.join(".vlt").join(t).join("node_modules").join(case.name)),
+            )
+            .collect();
+        copies.retain(|c| c.starts_with(nm.join(".vlt")));
+        assert!(copies.len() >= 2, "{}: several copies", case.tree);
+
+        let cas = tmp.path().join("cas-index.js");
+        tokio::fs::write(&cas, VLT_ORIGINAL).await.unwrap();
+        for copy in &copies {
+            std::fs::hard_link(&cas, copy.join("index.js")).unwrap();
+        }
+        let patch = vlt_patch(tmp.path()).await;
+        let primary = tmp.path().join(case.primary);
+        assert!(primary.join("package.json").is_file(), "{}", case.tree);
+
+        let result = vlt_apply(case.purl, &primary, &patch).await;
+        assert!(result.success, "{}: {:?}", case.tree, result.error);
+        for copy in &copies {
+            assert_eq!(
+                tokio::fs::read(copy.join("index.js")).await.unwrap(),
+                VLT_PATCHED,
+                "{}: every store copy is patched ({})",
+                case.tree,
+                copy.display()
+            );
+        }
+        assert_eq!(tokio::fs::read(&cas).await.unwrap(), VLT_ORIGINAL);
+
+        let rb =
+            rollback_package_patch(case.purl, &primary, &patch.files, &patch.blobs, false).await;
+        assert!(rb.success, "{}: {:?}", case.tree, rb.error);
+        for copy in &copies {
+            assert_eq!(
+                tokio::fs::read(copy.join("index.js")).await.unwrap(),
+                VLT_ORIGINAL,
+                "{}: every store copy is restored ({})",
+                case.tree,
+                copy.display()
+            );
+        }
+        assert_eq!(tokio::fs::read(&cas).await.unwrap(), VLT_ORIGINAL);
+    }
+}
+
+/// Healing half: an earlier single-copy apply left the `~peer.2` primary
+/// patched and the `~peer.3` twin vulnerable. The rerun reports the primary
+/// AlreadyPatched and must still patch the twin.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn apply_heals_unpatched_vlt_twin_when_primary_already_patched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listing = vlt_listing("1.0.0-rc.22-workspace");
+    let nm = stage_vlt_tree(tmp.path(), &listing).await;
+    let store = nm.join(".vlt");
+    let primary_copy = store
+        .join("~npm~use-sync-external-store@1.2.0~peer.2/node_modules/use-sync-external-store");
+    let twin = store
+        .join("~npm~use-sync-external-store@1.2.0~peer.3/node_modules/use-sync-external-store");
+    tokio::fs::write(primary_copy.join("index.js"), VLT_PATCHED)
+        .await
+        .unwrap();
+    tokio::fs::write(twin.join("index.js"), VLT_ORIGINAL)
+        .await
+        .unwrap();
+    let patch = vlt_patch(tmp.path()).await;
+
+    let result = vlt_apply(
+        "pkg:npm/use-sync-external-store@1.2.0",
+        &tmp.path()
+            .join("packages/a/node_modules/use-sync-external-store"),
+        &patch,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        tokio::fs::read(twin.join("index.js")).await.unwrap(),
+        VLT_PATCHED,
+        "an AlreadyPatched primary must not mask a still-vulnerable twin"
+    );
+}

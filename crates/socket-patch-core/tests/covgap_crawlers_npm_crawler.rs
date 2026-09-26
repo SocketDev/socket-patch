@@ -2,14 +2,14 @@
 //! never-executed skip/fallback regions of the store walkers
 //! (`collect_nested_node_modules`, `collect_nested_store_entries`,
 //! `scan_scoped_packages`) and every reject/fallback gate of
-//! `find_pnpm_peer_variant_copies`. Each test stages the real on-disk shape
+//! `find_store_peer_variant_copies` (pnpm and vlt stores). Each test stages the real on-disk shape
 //! that reaches its region and asserts resolver/scan OUTPUT, not just
 //! survival. Companion to `crawler_npm_e2e.rs` (helpers mirrored from
 //! there).
 
 use std::path::Path;
 
-use socket_patch_core::crawlers::npm_crawler::find_pnpm_peer_variant_copies;
+use socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies;
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
 
@@ -188,7 +188,7 @@ async fn crawl_all_dedups_scoped_root_linked_pnpm_direct_dep_and_skips_symlink_d
     );
 }
 
-// ── find_pnpm_peer_variant_copies: probe gates ─────────────────
+// ── find_store_peer_variant_copies: pnpm probe gates ────────────
 
 /// All four reject/fallback gates of the peer-variant store probe, in one
 /// staged store:
@@ -203,7 +203,7 @@ async fn crawl_all_dedups_scoped_root_linked_pnpm_direct_dep_and_skips_symlink_d
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
-async fn find_pnpm_peer_variant_copies_probe_gates() {
+async fn find_store_peer_variant_copies_probe_gates() {
     use std::os::unix::fs::symlink;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -258,7 +258,7 @@ async fn find_pnpm_peer_variant_copies_probe_gates() {
     )
     .await;
 
-    let copies = find_pnpm_peer_variant_copies(&primary).await;
+    let copies = find_store_peer_variant_copies(&primary).await;
 
     let got: std::collections::HashSet<_> = copies.iter().cloned().collect();
     let want: std::collections::HashSet<_> = [twin.clone(), undecodable_copy.clone()]
@@ -277,7 +277,7 @@ async fn find_pnpm_peer_variant_copies_probe_gates() {
 /// still handled by the caller).
 #[tokio::test]
 #[serial_test::parallel]
-async fn find_pnpm_peer_variant_copies_unreadable_primary_returns_empty() {
+async fn find_store_peer_variant_copies_unreadable_primary_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
     let store = nm.join(".pnpm");
@@ -294,11 +294,72 @@ async fn find_pnpm_peer_variant_copies_unreadable_primary_returns_empty() {
     )
     .await;
 
-    let copies = find_pnpm_peer_variant_copies(&primary).await;
+    let copies = find_store_peer_variant_copies(&primary).await;
     assert!(
         copies.is_empty(),
         "unreadable primary identity ⇒ no twins reported; got {copies:?}"
     );
+}
+
+// ── find_store_peer_variant_copies: vlt probe gates ─────────────
+
+/// vlt's fan-out from a workspace member's link: the store lives beside
+/// the ROOT `node_modules`, reachable only on the link's canonical chain.
+/// Real copies whose DepID decodes to the primary's `name@version` are
+/// returned (a `~peer.<n>` twin); a git dependency of the same
+/// `name@version` is a different artifact (its own bytes), never a
+/// variant, and a store entry reached through a link is not a store entry.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_store_peer_variant_copies_vlt_member_link_and_git_copy() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+    let entry = |id: &str| store.join(id).join("node_modules");
+    stage_npm_pkg(&entry("~npm~foo@1.0.0~peer.2"), "foo", "1.0.0").await;
+    stage_npm_pkg(&entry("~npm~foo@1.0.0~peer.3"), "foo", "1.0.0").await;
+    stage_npm_pkg(&entry("git~github_cu+foo~v1.0.0"), "foo", "1.0.0").await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    stage_npm_pkg(&elsewhere.path().join("node_modules"), "foo", "1.0.0").await;
+    symlink(elsewhere.path(), store.join("~npm~foo@1.0.0~peer.4")).unwrap();
+
+    let member_nm = tmp.path().join("packages/a/node_modules");
+    tokio::fs::create_dir_all(&member_nm).await.unwrap();
+    symlink(
+        "../../../node_modules/.vlt/~npm~foo@1.0.0~peer.2/node_modules/foo",
+        member_nm.join("foo"),
+    )
+    .unwrap();
+
+    let copies = find_store_peer_variant_copies(&member_nm.join("foo")).await;
+    assert_eq!(
+        copies
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap())
+            .collect::<Vec<_>>(),
+        vec![std::fs::canonicalize(entry("~npm~foo@1.0.0~peer.3").join("foo")).unwrap()],
+        "exactly the peer twin; got {copies:?}"
+    );
+}
+
+/// Fail-safe gate on the vlt side too: an unreadable primary identity
+/// reports no twins.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_store_peer_variant_copies_vlt_unreadable_primary_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+    let primary = store.join("~npm~foo@1.0.0~peer.2/node_modules/foo");
+    tokio::fs::create_dir_all(&primary).await.unwrap();
+    stage_npm_pkg(
+        &store.join("~npm~foo@1.0.0~peer.3").join("node_modules"),
+        "foo",
+        "1.0.0",
+    )
+    .await;
+    assert!(find_store_peer_variant_copies(&primary).await.is_empty());
 }
 
 // ── pnpm<=3 legacy store: stray node_modules + depth-1 home ────

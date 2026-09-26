@@ -725,9 +725,10 @@ async fn chown_blocking(
 /// pipeline to per-file blobs only — equivalent to pre-2.2 behavior.
 ///
 /// For npm packages, one on-disk `pkg_path` is not necessarily the only
-/// physical home of `package@version`: pnpm materializes a separate
-/// virtual-store copy per peer-dependency combination
-/// (`.pnpm/foo@1.0.0(react@17…)/` and `…(react@18…)/` are both real,
+/// physical home of `package@version`: pnpm and vlt materialize a separate
+/// store copy per peer-dependency (or vlt modifier) combination
+/// (`.pnpm/foo@1.0.0(react@17…)/` and `…(react@18…)/`, or
+/// `.vlt/~npm~foo@1.0.0~peer.2/` and `~peer.3/`, are all real,
 /// runtime-loaded dirs), and the purl-keyed resolver hands apply exactly
 /// one primary path. After the primary succeeds, the same verify+patch
 /// pipeline is re-run against every other physical copy — including when
@@ -749,10 +750,10 @@ pub async fn apply_package_patch(
 ) -> ApplyResult {
     let mut result =
         apply_package_patch_at(package_key, pkg_path, files, sources, uuid, dry_run, policy).await;
-    // Only npm purls can name pnpm store copies; everything else skips the
+    // Only npm purls can name pnpm or vlt store copies; everything else skips the
     // (already cheap) discovery outright.
     if result.success && package_key.starts_with("pkg:npm/") {
-        for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
+        for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
             let copy_result =
                 apply_package_patch_at(package_key, &copy, files, sources, uuid, dry_run, policy)
                     .await;
@@ -762,8 +763,8 @@ pub async fn apply_package_patch(
     result
 }
 
-/// Merge one pnpm store copy's result into the primary's. A failed copy
-/// fails the whole result with a `pnpm store copy <path> failed to patch: …`
+/// Merge one pnpm or vlt store copy's result into the primary's. A failed
+/// copy fails the whole result with a `store copy <path> failed to patch: …`
 /// note. A copy that patched fine but could not put file ownership back
 /// (`success: true, error: Some("<path>: patched, but ownership could not
 /// be restored…")`) keeps `success` and appends that advisory verbatim (it
@@ -780,7 +781,7 @@ fn fold_copy_result(result: &mut ApplyResult, copy: &Path, copy_result: ApplyRes
     } else {
         result.success = false;
         format!(
-            "pnpm store copy {} failed to patch: {}",
+            "store copy {} failed to patch: {}",
             copy.display(),
             copy_result
                 .error
@@ -3573,8 +3574,8 @@ mod tests {
         );
     }
 
-    /// The pnpm fan-out merge: a failed copy fails the whole result with the
-    /// `pnpm store copy … failed to patch` note; a copy that patched fine but
+    /// The store fan-out merge: a failed copy fails the whole result with the
+    /// `store copy … failed to patch` note; a copy that patched fine but
     /// could not restore ownership keeps `success` and appends the advisory
     /// verbatim (it already names the copy's file path); a copy's `--force`
     /// all-skipped note is NOT carried (it describes the copy alone).
@@ -3638,7 +3639,7 @@ mod tests {
         assert!(!primary.success);
         assert_eq!(
             primary.error.as_deref(),
-            Some("pnpm store copy /store/pkg@1.0.0_peer failed to patch: boom")
+            Some("store copy /store/pkg@1.0.0_peer failed to patch: boom")
         );
     }
 }

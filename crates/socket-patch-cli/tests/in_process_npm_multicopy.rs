@@ -225,7 +225,11 @@ fn rollback_restores_every_on_disk_copy_of_a_duplicated_package() {
     let (code, _v) = run_apply(&root);
     assert_eq!(code, 0);
     for f in [&index_a, &index_b] {
-        assert_eq!(std::fs::read(f).unwrap(), patched, "precondition: patched {f:?}");
+        assert_eq!(
+            std::fs::read(f).unwrap(),
+            patched,
+            "precondition: patched {f:?}"
+        );
     }
 
     // Now roll back and assert EVERY copy is restored to pristine bytes.
@@ -258,4 +262,118 @@ fn rollback_restores_every_on_disk_copy_of_a_duplicated_package() {
     }
     // Guard against the fixture asserting nothing.
     assert_ne!(before_hash, after_hash);
+}
+
+/// vlt twin: rc.15–1.0.7 materialize one store entry per peer context
+/// (`.vlt/~npm~dupvuln@1.0.0~peer.2/` and `~peer.3/`), both real and
+/// runtime-loaded. The importer links ONE of them, so the resolver hands
+/// apply one primary and the store fan-out must reach the other; rollback
+/// restores both. Returns `(root, primary index.js, twin index.js)`.
+fn build_vlt_peer_variant_tree(tmp: &Path, link_importer: bool) -> (PathBuf, PathBuf, PathBuf) {
+    let name = "dupvuln";
+    let purl = "pkg:npm/dupvuln@1.0.0";
+    let original = b"module.exports = function(){ return 'VULNERABLE'; };\n";
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    std::fs::write(
+        tmp.join("package.json"),
+        r#"{ "name": "vlt-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("vlt-lock.json"),
+        r#"{"lockfileVersion":1,"options":{},"nodes":{},"edges":{}}"#,
+    )
+    .unwrap();
+    let store = tmp.join("node_modules").join(".vlt");
+    let entry = |id: &str| store.join(id).join("node_modules").join(name);
+    let primary = write_copy(&entry("~npm~dupvuln@1.0.0~peer.2"), name, "1.0.0", original);
+    let twin = write_copy(&entry("~npm~dupvuln@1.0.0~peer.3"), name, "1.0.0", original);
+    std::fs::write(tmp.join("node_modules").join(".vlt-lock.json"), "{}").unwrap();
+    if link_importer {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            ".vlt/~npm~dupvuln@1.0.0~peer.2/node_modules/dupvuln",
+            tmp.join("node_modules").join(name),
+        )
+        .unwrap();
+    }
+    stage_manifest_and_blob(
+        tmp,
+        purl,
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    );
+    std::fs::write(
+        tmp.join(".socket").join("blobs").join(git_sha256(original)),
+        original,
+    )
+    .unwrap();
+    (tmp.to_path_buf(), primary, twin)
+}
+
+fn run_rollback(root: &Path) -> (i32, serde_json::Value) {
+    let out = Command::new(binary())
+        .args([
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "--ecosystems",
+            "npm",
+            "--cwd",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run rollback");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("rollback must emit JSON: {e}; stdout={stdout}"));
+    (out.status.code().unwrap_or(-1), v)
+}
+
+/// Each copy holds exactly the patched bytes (`patched`) or exactly the
+/// original bytes.
+fn assert_vlt_copies(copies: [&Path; 2], patched: bool, stage: &str) {
+    let mut want = b"module.exports = function(){ return 'VULNERABLE'; };\n".to_vec();
+    if patched {
+        want.extend_from_slice(b"// SOCKET-PATCHED-MULTICOPY\n");
+    }
+    for f in copies {
+        assert_eq!(std::fs::read(f).unwrap(), want, "{stage}: {f:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_and_rollback_reach_both_vlt_peer_variant_copies_from_an_importer_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, primary, twin) = build_vlt_peer_variant_tree(tmp.path(), true);
+
+    let (code, v) = run_apply(&root);
+    assert_eq!(code, 0, "apply must succeed; envelope={v}");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_vlt_copies([&primary, &twin], true, "after apply");
+
+    let (code, v) = run_rollback(&root);
+    assert_eq!(code, 0, "rollback must succeed; envelope={v}");
+    assert_vlt_copies([&primary, &twin], false, "after rollback");
+}
+
+/// Without an importer link (a transitive-only dependency) both store
+/// copies are found by the resolver itself; each is patched exactly once
+/// and both are restored.
+#[test]
+fn apply_and_rollback_reach_both_transitive_only_vlt_store_copies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, primary, twin) = build_vlt_peer_variant_tree(tmp.path(), false);
+
+    let (code, v) = run_apply(&root);
+    assert_eq!(code, 0, "apply must succeed; envelope={v}");
+    assert_vlt_copies([&primary, &twin], true, "after apply");
+
+    let (code, v) = run_rollback(&root);
+    assert_eq!(code, 0, "rollback must succeed; envelope={v}");
+    assert_vlt_copies([&primary, &twin], false, "after rollback");
 }

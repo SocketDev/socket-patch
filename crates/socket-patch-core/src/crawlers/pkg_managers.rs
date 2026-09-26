@@ -1,5 +1,6 @@
 //! Detect which Node.js package manager produced the layout in a
-//! project root (`npm`, `pnpm`, `yarn` classic, or yarn-berry PnP).
+//! project root (`npm`, `pnpm`, `vlt`, `bun`, `yarn` classic, or yarn-berry
+//! PnP).
 //!
 //! The apply pipeline cares about this for two reasons:
 //!
@@ -20,6 +21,12 @@
 //!    operation than rewriting bytes in `node_modules/`. The right
 //!    move is to refuse with a clear error and point the user at
 //!    `yarn patch <pkg>`.
+//!
+//! vlt keeps every installed package in a per-project store
+//! (`node_modules/.vlt/<DepID>/node_modules/<name>`, hardlinked from vlt's
+//! machine-wide cache on Linux) and links importers into it, which is the
+//! pnpm situation again: the rename-over write keeps the shared cache
+//! untouched and the detector only drives the CLI's notice.
 //!
 //! Classic yarn (`yarn.lock` + a real `node_modules/`) behaves like
 //! npm at the filesystem level, so no special handling is needed.
@@ -51,6 +58,11 @@ pub enum NpmPkgManager {
     /// The operator gets a heads-up event so it's clear which package
     /// manager the patch landed against.
     Bun,
+    /// vlt install state: the `node_modules/.vlt/` store directory or the
+    /// hidden `node_modules/.vlt-lock.json`. Every package lives in the
+    /// store, one real copy per DepID; a committed `vlt-lock.json` alone
+    /// does not count, since another manager may have installed the tree.
+    Vlt,
     /// No discernible package manager — empty or non-Node project.
     Unknown,
 }
@@ -65,13 +77,17 @@ pub enum NpmPkgManager {
 ///    unless the tree is pnpm's own `node-linker=pnp` layout (see
 ///    [`pnpm_pnp_layout`]), which also writes a `.pnp.cjs` but keeps
 ///    real package dirs in the pnpm virtual store → pnpm.
-/// 2. `bun.lock` or `bun.lockb` (+ `node_modules/`) → bun.
-/// 3. `node_modules/.modules.yaml` or `node_modules/.pnpm/` → pnpm.
-/// 4. `yarn.lock` (without PnP markers) + `node_modules/` → yarn classic.
-/// 5. `node_modules/` exists → npm.
-/// 6. Otherwise → unknown.
+/// 2. `node_modules/.vlt/` is a directory, or `node_modules/.vlt-lock.json`
+///    is a file → vlt.
+/// 3. `bun.lock` or `bun.lockb` (+ `node_modules/`) → bun.
+/// 4. `node_modules/.modules.yaml` or `node_modules/.pnpm/` → pnpm.
+/// 5. `yarn.lock` (without PnP markers) + `node_modules/` → yarn classic.
+/// 6. `node_modules/` exists → npm.
+/// 7. Otherwise → unknown.
 ///
-/// Bun comes before pnpm in the precedence because bun's isolated
+/// vlt wins over every other lockfile or store marker: its install state
+/// only exists after a vlt install, while a sibling `bun.lock`,
+/// `pnpm-lock.yaml` or `yarn.lock` may be stale. Bun comes before pnpm in the precedence because bun's isolated
 /// linker (v1.3.2+ default) populates `node_modules/.bun/` which
 /// superficially resembles pnpm's `.pnpm/` content store. The
 /// lockfile filename disambiguates cleanly.
@@ -101,7 +117,17 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         return NpmPkgManager::YarnBerryPnP;
     }
 
-    // 2. bun — `bun.lock` (text, current default in v1.2+) or
+    if project_root
+        .join(crate::constants::npm_family::VLT_STORE_DIR)
+        .is_dir()
+        || project_root
+            .join(crate::constants::npm_family::VLT_HIDDEN_LOCK_REL)
+            .is_file()
+    {
+        return NpmPkgManager::Vlt;
+    }
+
+    // 3. bun — `bun.lock` (text, current default in v1.2+) or
     //    `bun.lockb` (binary, legacy). Like the yarn-classic check
     //    below, we require `node_modules/` to actually exist —
     //    a bare lockfile without an install is a fresh checkout.
@@ -112,12 +138,12 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         return NpmPkgManager::Bun;
     }
 
-    // 3. pnpm — markers live inside node_modules/.
+    // 4. pnpm — markers live inside node_modules/.
     if node_modules.join(".modules.yaml").is_file() || node_modules.join(".pnpm").is_dir() {
         return NpmPkgManager::Pnpm;
     }
 
-    // 4. yarn classic — yarn.lock + node_modules. We only return
+    // 5. yarn classic — yarn.lock + node_modules. We only return
     //    YarnClassic if node_modules actually exists, because a bare
     //    yarn.lock without node_modules is a fresh checkout where
     //    nothing has been installed yet.
@@ -125,7 +151,7 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         return NpmPkgManager::YarnClassic;
     }
 
-    // 5. npm — any node_modules/ at all.
+    // 6. npm — any node_modules/ at all.
     if node_modules.is_dir() {
         return NpmPkgManager::Npm;
     }
@@ -520,5 +546,90 @@ mod tests {
         std::os::unix::fs::symlink(&real, d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::YarnClassic);
+    }
+
+    #[test]
+    fn vlt_via_store_dir() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.vlt")).unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Vlt);
+    }
+
+    #[test]
+    fn vlt_via_hidden_lock() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        std::fs::write(d.path().join("node_modules/.vlt-lock.json"), "{}").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Vlt);
+    }
+
+    /// A committed `vlt-lock.json` is not install state: the tree beside it
+    /// was installed by something else (here npm), or not at all.
+    #[test]
+    fn vlt_lockfile_without_vlt_install_state_falls_through() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("vlt-lock.json"), "{}").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Npm);
+
+        std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+    }
+
+    #[test]
+    fn yarn_berry_pnp_priority_over_vlt() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.vlt")).unwrap();
+        std::fs::write(d.path().join("node_modules/.vlt-lock.json"), "{}").unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// vlt install state outranks every sibling lockfile and store marker,
+    /// each of which may be left over from another manager.
+    #[test]
+    fn vlt_priority_over_bun_pnpm_yarn_npm() {
+        for marker in ["node_modules/.vlt", "node_modules/.vlt-lock.json"] {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
+            std::fs::write(d.path().join("node_modules/.modules.yaml"), "").unwrap();
+            for lock in ["bun.lock", "bun.lockb", "yarn.lock", "package-lock.json"] {
+                std::fs::write(d.path().join(lock), "").unwrap();
+            }
+            if marker.ends_with(".json") {
+                std::fs::write(d.path().join(marker), "{}").unwrap();
+            } else {
+                std::fs::create_dir_all(d.path().join(marker)).unwrap();
+            }
+            assert_eq!(
+                detect_npm_pkg_manager(d.path()),
+                NpmPkgManager::Vlt,
+                "{marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_modules_as_file_is_not_misclassified_vlt() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("node_modules"), "not a dir").unwrap();
+        std::fs::write(d.path().join("vlt-lock.json"), "{}").unwrap();
+        std::fs::write(d.path().join("vlt.json"), "{}").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+    }
+
+    /// Robustness: `.vlt` as a regular file, and the hidden lock as a
+    /// directory, are not vlt install state.
+    #[test]
+    fn store_dir_as_file_is_not_vlt() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.vlt-lock.json")).unwrap();
+        std::fs::write(d.path().join("node_modules/.vlt"), "not a dir").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Npm);
     }
 }
