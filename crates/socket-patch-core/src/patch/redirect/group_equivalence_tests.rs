@@ -81,12 +81,21 @@ fn read_tree(base: &Path) -> BTreeMap<String, String> {
 }
 
 fn assert_same(label: &str, files: &BTreeMap<String, String>, overrides: &[DepOverride]) {
+    assert_same_with_metadata(label, files, overrides, &BTreeMap::new());
+}
+
+fn assert_same_with_metadata(
+    label: &str,
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    python_metadata: &BTreeMap<String, String>,
+) {
     for pipenv_major in [None, Some(2023), Some(2026)] {
-        let want = serial_oracle(files, overrides, &BTreeMap::new(), pipenv_major);
+        let want = serial_oracle(files, overrides, python_metadata, pipenv_major);
         let got = rewrite_registry_redirect_with_pipenv_version(
             files,
             overrides,
-            &BTreeMap::new(),
+            python_metadata,
             pipenv_major,
         );
         assert_eq!(got, want, "{label} (pipenv {pipenv_major:?})");
@@ -100,8 +109,7 @@ fn assert_same(label: &str, files: &BTreeMap<String, String>, overrides: &[DepOv
         let overrides = withhold(overrides, &prefix.refused_pdm_uuids);
         pipenv::rewrite(files, &overrides, pipenv_major, &mut prefix);
         let overrides = withhold(&overrides, &prefix.refused_pipenv_uuids);
-        let metadata = BTreeMap::new();
-        let groups = rewriter_groups(files, &overrides, &metadata);
+        let groups = rewriter_groups(files, &overrides, python_metadata);
         let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups));
         assert_eq!(
             merged.as_ref(),
@@ -253,4 +261,123 @@ fn parallel_groups_reraise_the_first_panic_in_serial_order() {
     }))
     .expect_err("a group panicked");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"first"));
+}
+
+fn pypi_dep(name: &str, uuid: &str) -> DepOverride {
+    DepOverride {
+        ecosystem: "pypi".into(),
+        name: name.into(),
+        namespace: None,
+        version: "1.0.0".into(),
+        token: String::new(),
+        patch_uuid: uuid.into(),
+        artifact_url: format!("https://patch.test/{name}-1.0.0-py3-none-any.whl"),
+        berry_zip_url: None,
+        registry_override: None,
+        integrity: Integrity {
+            sha256: Some("a".repeat(64)),
+            ..Default::default()
+        },
+    }
+}
+
+/// The Python projects whose rewriters read one another's output or the
+/// wheel metadata — none of which the golden fixtures carry: a hatch project
+/// confirmed through a pinned `requirements.txt` (hatch reads the requirements
+/// rewriter's confirmations), a native uv project fed wheel metadata, and a
+/// PEP 723 script lock.
+fn python_cases() -> Vec<(&'static str, BTreeMap<String, String>, Vec<DepOverride>)> {
+    let alpha = pypi_dep("alpha", "alpha-uuid");
+    let bravo = pypi_dep("bravo", "bravo-uuid");
+    let hatch = BTreeMap::from([
+        (
+            "pyproject.toml".to_string(),
+            "[project]\nname='p'\ndependencies=['alpha==1.0.0']\n[build-system]\nrequires=['hatchling']\nbuild-backend='hatchling.build'\n"
+                .to_string(),
+        ),
+        (
+            "requirements.txt".to_string(),
+            "alpha==1.0.0\nbravo==1.0.0\n".to_string(),
+        ),
+    ]);
+    let uv_native = BTreeMap::from([
+        (
+            "pyproject.toml".to_string(),
+            "[project]\nname = 'project'\nversion = '1'\ndependencies = ['alpha==1.0.0']\n"
+                .to_string(),
+        ),
+        (
+            "uv.lock".to_string(),
+            "version = 1\nrevision = 3\n[[package]]\nname = 'project'\nversion = '1'\nsource = {virtual='.'}\ndependencies=[{name='alpha'}]\n[package.metadata]\nrequires-dist=[{name='alpha',specifier='==1.0.0'}]\n[[package]]\nname='alpha'\nversion='1.0.0'\nsource={registry='https://pypi.org/simple'}\nwheels=[{url='https://pypi.org/alpha-1.0.0-py3-none-any.whl',hash='sha256:original'}]\n"
+                .to_string(),
+        ),
+    ]);
+    let mut script_lock = "version = 1\nrevision = 3\n\n[manifest]\nrequirements = [{ name = \"alpha\", specifier = \"==1.0.0\" }, { name = \"bravo\", specifier = \"==1.0.0\" }]\n".to_string();
+    for name in ["alpha", "bravo"] {
+        script_lock.push_str(&format!("\n[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\nwheels = [{{ url = \"https://pypi.org/{name}-1.0.0-py3-none-any.whl\", hash = \"sha256:original\" }}]\n"));
+    }
+    let script = BTreeMap::from([
+        ("example.py.lock".to_string(), script_lock),
+        (
+            "example.py".to_string(),
+            "# /// script\n# dependencies = [\"alpha==1.0.0\", \"bravo==1.0.0\"]\n# ///\nprint('x')\n"
+                .to_string(),
+        ),
+    ]);
+    let both = vec![alpha.clone(), bravo];
+    vec![
+        ("hatch + requirements.txt", hatch, both.clone()),
+        ("native uv", uv_native, vec![alpha]),
+        ("uv script lock", script, both),
+    ]
+}
+
+fn wheel_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        pypi_dep("alpha", "alpha-uuid").artifact_url,
+        "[package.metadata]\nrequires-dist = []\nprovides-extras = ['testing']\n".to_string(),
+    )])
+}
+
+/// The cross-rewriter reads inside the python group, and the wheel metadata,
+/// survive the parallel merge.
+#[test]
+fn parallel_groups_match_the_serial_chain_on_python_cross_reads() {
+    let metadata = wheel_metadata();
+    for (label, files, overrides) in python_cases() {
+        for md in [&BTreeMap::new(), &metadata] {
+            assert_same_with_metadata(label, &files, &overrides, md);
+        }
+    }
+    // The hatch case really exercises the requirements → hatch read.
+    let (_, files, overrides) = &python_cases()[0];
+    let result = rewrite_registry_redirect(files, overrides);
+    assert!(
+        result.confirmed_hatch_uuids.contains("alpha-uuid"),
+        "{result:?}"
+    );
+    // And the metadata reaches the uv lock.
+    let (_, files, overrides) = &python_cases()[1];
+    let with = rewrite_registry_redirect_with_python_metadata(files, overrides, &metadata);
+    let without = rewrite_registry_redirect(files, overrides);
+    assert!(with.warnings.is_empty(), "{:?}", with.warnings);
+    assert_ne!(with.files.get("uv.lock"), without.files.get("uv.lock"));
+}
+
+/// The oracle catches a regrouping that splits a real dependency: hatch in a
+/// group of its own no longer sees the requirements rewriter's
+/// confirmations, and the merge differs from the serial chain.
+#[test]
+fn group_oracle_detects_hatch_split_from_requirements() {
+    let (_, files, overrides) = &python_cases()[0];
+    let files = files.clone();
+    let overrides = overrides.clone();
+    let prefix = RewriteResult::default();
+    let split: Vec<RewriterGroup<'_>> = vec![
+        Box::new(|r: &mut RewriteResult| requirements::rewrite(&files, &overrides, r)),
+        Box::new(|r: &mut RewriteResult| rewrite_hatch(&files, &overrides, r)),
+    ];
+    let serial = rewrite_groups_serial(prefix.clone(), &split);
+    let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &split));
+    assert_ne!(merged, Some(serial));
 }
