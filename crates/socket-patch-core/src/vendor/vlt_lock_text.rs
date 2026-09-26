@@ -9,9 +9,11 @@
 //! in the tests are shared verbatim with depscan's `vlt-dep-id.test.ts`.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 use crate::patch::path_safety::is_canonical_uuid;
@@ -282,41 +284,51 @@ static SEMVER_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("semver regex")
 });
 
-const NPM_NAME_MAX_LENGTH: usize = 214;
+const NPM_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
+
+const NPM_BLOCKED_NAMES: [&str; 2] = ["node_modules", "favicon.ico"];
 
 /// The semver.org 2.0.0 grammar exactly (build metadata allowed; no `v`,
-/// `=`, ranges or leading zeros), the same regex as the TS twin.
-pub(crate) fn is_strict_semver(version: &str) -> bool {
-    SEMVER_RE.is_match(version)
+/// `=`, ranges or leading zeros) with major, minor and patch at most
+/// node-semver's `Number.MAX_SAFE_INTEGER`; the TS twin's `isNpmSemver`.
+/// A numeric prerelease identifier stays unbounded.
+pub(crate) fn is_npm_semver(version: &str) -> bool {
+    SEMVER_RE.captures(version).is_some_and(|caps| {
+        (1..=3).all(|i| {
+            caps[i]
+                .parse::<u64>()
+                .is_ok_and(|n| n <= NPM_SAFE_INTEGER_MAX)
+        })
+    })
 }
 
-fn is_npm_name_part(part: &str) -> bool {
-    let unreserved = |c: char| c.is_ascii_alphanumeric() || "-~!*'()".contains(c);
-    let mut chars = part.chars();
-    chars.next().is_some_and(unreserved) && chars.all(|c| unreserved(c) || c == '.' || c == '_')
+fn is_npm_url_safe(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.!~*'()".contains(c))
 }
 
-/// npm's name rule for existing packages: an optional `@scope/` plus a name,
-/// URL-safe characters only, no leading `.` or `_`, at most 214 chars.
+/// validate-npm-package-name's `validForOldPackages`, the TS twin's
+/// `isNpmPackageName`: `@<scope>/<pkg>` with both parts URL-safe, or a
+/// URL-safe name without a leading `.` or `_` that is not a blocked name.
+/// No length cap, since published packages exceed 214 chars.
 pub(crate) fn is_registry_package_name(name: &str) -> bool {
-    if name.len() > NPM_NAME_MAX_LENGTH {
-        return false;
+    if let Some((scope, bare)) = name.strip_prefix('@').and_then(|s| s.split_once('/')) {
+        return is_npm_url_safe(scope) && is_npm_url_safe(bare);
     }
-    match name.strip_prefix('@') {
-        None => is_npm_name_part(name),
-        Some(scoped) => scoped
-            .split_once('/')
-            .is_some_and(|(scope, bare)| is_npm_name_part(scope) && is_npm_name_part(bare)),
-    }
+    is_npm_url_safe(name)
+        && !name.starts_with(['.', '_'])
+        && !NPM_BLOCKED_NAMES.contains(&name.to_ascii_lowercase().as_str())
 }
 
 /// `(name, version)` from a registry id's decoded `name@version`, split at
 /// the last `@` past index 0. The DepID version is authoritative for
-/// identity, so a non-semver version gives `None`.
+/// identity, so a version npm could not have published gives `None`.
 pub(crate) fn registry_name_version(second: &str) -> Option<(&str, &str)> {
     let at = second.rfind('@').filter(|&i| i > 0)?;
     let (name, version) = (&second[..at], &second[at + 1..]);
-    (is_registry_package_name(name) && is_strict_semver(version)).then_some((name, version))
+    (is_registry_package_name(name) && is_npm_semver(version)).then_some((name, version))
 }
 
 /// The store decoder: `(full name, version)` of a `.vlt/<DepID>` entry,
@@ -413,8 +425,13 @@ pub(crate) enum LockSniff {
     /// which JS `JSON.parse` would accept.
     NotJsonObject,
     /// `lockfileVersion` is present but not the integer token `0` or `1`
-    /// (`1.0`, `1e0`, `"1"`, `2`, `null`, ...), rendered as JSON.
+    /// (`1.0`, `1e0`, `"1"`, `2`, `null`, ...), as its raw JSON token.
     UnsupportedVersion(String),
+}
+
+fn raw_top_level_token(text: &str, key: &str) -> Option<String> {
+    let members: HashMap<String, &RawValue> = serde_json::from_str(text).ok()?;
+    members.get(key).map(|raw| raw.get().to_string())
 }
 
 pub(crate) fn sniff_lock(text: &str) -> LockSniff {
@@ -428,7 +445,10 @@ pub(crate) fn sniff_lock(text: &str) -> LockSniff {
         None => None,
         Some(v) => match v.as_u64() {
             Some(n @ (0 | 1)) => Some(n),
-            _ => return LockSniff::UnsupportedVersion(v.to_string()),
+            _ => {
+                let raw = raw_top_level_token(text, "lockfileVersion");
+                return LockSniff::UnsupportedVersion(raw.unwrap_or_else(|| v.to_string()));
+            }
         },
     };
     LockSniff::Readable(ParsedLock { version, json })
@@ -847,7 +867,7 @@ pub(crate) struct VendoredPath {
 fn leaf_version<'l>(bare: &str, leaf: &'l str) -> Option<&'l str> {
     leaf.strip_prefix(bare)?
         .strip_prefix('-')
-        .filter(|v| is_strict_semver(v))
+        .filter(|v| is_npm_semver(v))
 }
 
 /// A decoded `file` path of the vendored directory shape, with the name
@@ -1177,6 +1197,36 @@ mod tests {
             row("~npm~a·b@1.0.0", reg(Tilde, "npm", "a·b@1.0.0"), None),
             row("~npm~a_@1.0.0", reg(Tilde, "npm", "a_@1.0.0"), Some(("a_", "1.0.0"))),
             row("~npm~_1f_0a_zz_@1.0.0", reg(Tilde, "npm", "\u{1f}\n_zz_@1.0.0"), None),
+            row(
+                "~npm~@__koii+web3.js@0.1.11",
+                reg(Tilde, "npm", "@_koii/web3.js@0.1.11"),
+                Some(("@_koii/web3.js", "0.1.11")),
+            ),
+            row(
+                "·npm·@_koii§web3.js@0.1.11",
+                reg(Legacy, "npm", "@_koii/web3.js@0.1.11"),
+                Some(("@_koii/web3.js", "0.1.11")),
+            ),
+            row(
+                "git~github_cu+p~v1~peer.1",
+                Some((Tilde, Git, "github:u/p", Some("v1"), Some("peer.1"))),
+                None,
+            ),
+            row(
+                "git·github%3Au§p·v1·peer.1",
+                Some((Legacy, Git, "github:u/p", Some("v1"), Some("peer.1"))),
+                None,
+            ),
+            row(
+                "remote~https_c++e.com+r.tgz~peer.1",
+                Some((Tilde, Remote, "https://e.com/r.tgz", None, Some("peer.1"))),
+                None,
+            ),
+            row(
+                "workspace~packages+a~peer.1",
+                Some((Tilde, Workspace, "packages/a", None, Some("peer.1"))),
+                None,
+            ),
             row("·npm·a@1.0.0%ZZ", None, None),
             row("·npm·a@1.0.0%4", None, None),
             row("·npm·a@1.0.0%C3", None, None),
@@ -1184,6 +1234,9 @@ mod tests {
             row("·npm%zz·a@1.0.0", None, None),
             row("··ms@2.1.3·%ZZ", None, None),
             row("file·.socket%2", None, None),
+            row("file·a·%ZZ", None, None),
+            row("workspace·a·%ZZ", None, None),
+            row("remote·https%3A§§e.com§r.tgz·%ZZ", None, None),
             row("git·github%3Auser·v1%G0", None, None),
             row("npm~foo@1.0.0", None, None),
             row("foo@1.0.0", None, None),
@@ -1248,7 +1301,8 @@ mod tests {
 
     #[test]
     fn recovers_name_and_version_from_a_registry_second() {
-        let long = format!("{}@1.0.0", "a".repeat(215));
+        let long_name = "a".repeat(215);
+        let long = format!("{long_name}@1.0.0");
         let rows: Vec<(&str, Option<(&str, &str)>)> = vec![
             ("a@1.0.0", Some(("a", "1.0.0"))),
             ("@s/p@1.0.0-rc.1+b.2", Some(("@s/p", "1.0.0-rc.1+b.2"))),
@@ -1266,22 +1320,46 @@ mod tests {
             ("a@1.0", None),
             ("a@1.0.0 ", None),
             ("a@^1.0.0", None),
+            ("a@1.0.0-01", None),
+            (
+                "a@9007199254740991.0.0",
+                Some(("a", "9007199254740991.0.0")),
+            ),
+            ("a@9007199254740992.0.0", None),
+            ("a@99999999999999999999.0.0", None),
+            ("a@1.9007199254740992.0", None),
+            ("a@1.0.9007199254740992", None),
+            (
+                "a@1.0.0-99999999999999999999",
+                Some(("a", "1.0.0-99999999999999999999")),
+            ),
             (".a@1.0.0", None),
             ("_a@1.0.0", None),
-            ("@s/.p@1.0.0", None),
-            ("@_s/p@1.0.0", None),
+            ("@s/.p@1.0.0", Some(("@s/.p", "1.0.0"))),
+            ("@_s/p@1.0.0", Some(("@_s/p", "1.0.0"))),
+            ("@s/_p@1.0.0", Some(("@s/_p", "1.0.0"))),
+            ("@.s/p@1.0.0", Some(("@.s/p", "1.0.0"))),
+            ("@_koii/web3.js@0.1.11", Some(("@_koii/web3.js", "0.1.11"))),
+            ("a~'!()*@1.0.0", Some(("a~'!()*", "1.0.0"))),
+            ("node_modules@1.0.0", None),
+            ("Node_Modules@1.0.0", None),
+            ("favicon.ico@1.0.0", None),
+            ("@s/node_modules@1.0.0", Some(("@s/node_modules", "1.0.0"))),
+            ("@/p@1.0.0", None),
+            ("@s/@1.0.0", None),
+            ("@s/p/q@1.0.0", None),
+            ("@s/p q@1.0.0", None),
             ("a b@1.0.0", None),
             ("a/b@1.0.0", None),
-            (long.as_str(), None),
+            (long.as_str(), Some((long_name.as_str(), "1.0.0"))),
         ];
         for (second, expected) in rows {
             assert_eq!(registry_name_version(second), expected, "{second}");
         }
-        assert!(is_strict_semver("99999999999999999999.0.0"));
-        assert!(is_strict_semver("1.0.0-0a.01b+001"));
-        assert!(!is_strict_semver("1.0.0-01"));
-        assert!(!is_strict_semver("1.0.0\n"));
-        assert!(!is_strict_semver("١.0.0"));
+        assert!(is_npm_semver("1.0.0-0a.01b+001"));
+        assert!(!is_npm_semver("1.0.0\n"));
+        assert!(!is_npm_semver("١.0.0"));
+        assert!(!is_npm_semver("18446744073709551616.0.0"));
     }
 
     #[test]
@@ -1495,6 +1573,13 @@ mod tests {
         }
         let not_a_url = options(r#"{"registry":"corp"}"#);
         assert!(!is_default_registry("corp", Some(&not_a_url)));
+        for registry in ["file:///r/", "ftp://h/", "git+https://h/"] {
+            let not_http = options(&format!(r#"{{"registry":"{registry}"}}"#));
+            assert!(
+                !is_default_registry(registry, Some(&not_http)),
+                "{registry}"
+            );
+        }
     }
 
     fn readable(text: &str) -> ParsedLock {
@@ -1515,22 +1600,37 @@ mod tests {
         assert_eq!(readable(r#"{"lockfileVersion":1}"#).new_id_era(), Tilde);
         assert_eq!(readable(r#"{"lockfileVersion":0}"#).new_id_era(), Legacy);
         assert_eq!(readable("{}").new_id_era(), Legacy);
-        for (token, rendered) in [
-            ("1.0", "1.0"),
-            ("1e0", "1.0"),
-            ("1.0000000000000001", "1.0"),
-            ("\"1\"", "\"1\""),
-            ("2", "2"),
-            ("-1", "-1"),
-            ("-0", "-0.0"),
-            ("null", "null"),
-            ("true", "true"),
+        for token in [
+            "1.0",
+            "1e0",
+            "1E0",
+            "1.0000000000000001",
+            "\"1\"",
+            "\"\\u0031\"",
+            "2",
+            "-1",
+            "-0",
+            "null",
+            "true",
+            "[1]",
+            "{\"v\": 1}",
         ] {
-            match sniff_lock(&format!("{{\"lockfileVersion\":{token}}}")) {
-                LockSniff::UnsupportedVersion(v) => assert_eq!(v, rendered, "{token}"),
-                other => panic!("{token} sniffed as {other:?}"),
+            for text in [
+                format!("{{\"lockfileVersion\":{token}}}"),
+                format!("{{\n  \"lockfileVersion\" :  {token} ,\n  \"nodes\": {{}}\n}}"),
+                format!("{{\"options\":{{\"lockfileVersion\":1}},\"lockfileVersion\":{token}}}"),
+                format!("{{\"lockfileVersion\":1,\"lockfileVersion\":{token}}}"),
+            ] {
+                match sniff_lock(&text) {
+                    LockSniff::UnsupportedVersion(v) => assert_eq!(v, token, "{text}"),
+                    other => panic!("{text} sniffed as {other:?}"),
+                }
             }
         }
+        assert_eq!(
+            readable(r#"{"lockfileVersion":2,"lockfileVersion":1}"#).version,
+            Some(1)
+        );
     }
 
     #[test]
@@ -2179,6 +2279,12 @@ mod tests {
             VendoredShape::Dir,
         );
         expect(
+            &dir(".socket/vendor/npm/<u>/@_koii/web3.js-0.1.11/node_modules/@_koii/web3.js"),
+            "@_koii/web3.js",
+            "0.1.11",
+            VendoredShape::Dir,
+        );
+        expect(
             &dir(".socket/vendor/npm/<u>/left-pad-1.3.0.tgz"),
             "left-pad",
             "1.3.0",
@@ -2255,6 +2361,19 @@ mod tests {
                 "left-pad",
             ),
             (".socket/vendor/npm/<u>/.a-1.0.0/node_modules/.a", ".a"),
+            (
+                ".socket/vendor/npm/<u>/node_modules-1.0.0/node_modules/node_modules",
+                "node_modules",
+            ),
+            (
+                ".socket/vendor/npm/<u>/favicon.ico-1.0.0.tgz",
+                "favicon.ico",
+            ),
+            (
+                ".socket/vendor/npm/<u>/a-9007199254740992.0.0/node_modules/a",
+                "a",
+            ),
+            (".socket/vendor/npm/<u>/a-1.0.9007199254740992.tgz", "a"),
             (
                 "vendor/npm/<u>/left-pad-1.3.0/node_modules/left-pad",
                 "left-pad",

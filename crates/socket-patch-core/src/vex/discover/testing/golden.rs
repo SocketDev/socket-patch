@@ -482,9 +482,12 @@ mod tests {
     #[test]
     fn table_fixture_dirs_are_not_corpus_projects() {
         let corpus = corpus();
-        for skipped in ["vlt/", "vlt-trees/", "vendor/"] {
+        for skipped in ["vlt", "vlt-trees", "vendor"] {
+            let nested = format!("{skipped}/");
             assert!(
-                corpus.iter().all(|(name, _, _)| !name.starts_with(skipped)),
+                corpus
+                    .iter()
+                    .all(|(name, _, _)| name != skipped && !name.starts_with(&nested)),
                 "{skipped} fixtures joined the corpus"
             );
         }
