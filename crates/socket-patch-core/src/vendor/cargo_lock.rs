@@ -108,6 +108,21 @@ impl std::fmt::Display for LockEditError {
 /// [`ParseMemo`] for why keeping the read while reusing the parse is safe.
 static LOCK_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
 
+/// The run's [`locked_packages`] of `Cargo.lock`, keyed on the lock bytes
+/// like [`LOCK_MEMO`]: the per-crate probes ([`probe_lock_entry_for`],
+/// [`count_lock_entries`]) each re-derived the whole package list — a few
+/// thousand entries on a workspace lock — several times per patched crate.
+static PACKAGES_MEMO: ParseMemo<Vec<LockedPackage>> = ParseMemo::new();
+
+/// [`read_lock`]'s parse as its [`locked_packages`], memoized per lock bytes
+/// (the list is a pure function of the document, itself one of the bytes).
+async fn read_locked_packages(
+    project_root: &Path,
+) -> Result<Arc<Vec<LockedPackage>>, LockEditError> {
+    let (_path, doc, content) = read_lock(project_root).await?;
+    Ok(PACKAGES_MEMO.parse_infallible(content.as_bytes(), || locked_packages(&doc)))
+}
+
 /// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`]
 /// (the lock inventory reads the lock through it too).
 ///
@@ -830,6 +845,67 @@ pub async fn probe_lock_entry_for(
     version: &str,
     uuid: Option<&str>,
 ) -> LockEntryProbe {
+    let packages = match read_locked_packages(project_root).await {
+        Ok(packages) => packages,
+        Err(LockEditError::NoLockfile) => return LockEntryProbe::NoLockfile,
+        Err(_) => return LockEntryProbe::Unreadable,
+    };
+    match packages
+        .iter()
+        .filter(|p| p.name == name)
+        .filter_map(|p| entry_rank(&p.version, p.source.is_some(), version, uuid).map(|r| (r, p)))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, p)| p)
+    {
+        None => LockEntryProbe::EntryMissing,
+        Some(LockedPackage {
+            source: Some(source),
+            ..
+        }) => LockEntryProbe::Source(source.clone()),
+        Some(p) => LockEntryProbe::Detached(cargo_tag::tag_uuid(&p.version).map(str::to_string)),
+    }
+}
+
+/// Number of `[[package]]` entries matching `name`+`version`. More than one
+/// means the lock resolves the same name+version from multiple sources (e.g.
+/// registry + git fork), the shape whose `dependencies` arrays use full
+/// package-id strings that [`detach_lock_entry`]'s surgery would dangle —
+/// callers refuse to vendor it. A missing/unparseable lock (or one without a
+/// `[[package]]` array) counts zero: the same "no usable lock" treatment as
+/// [`read_locked_versions`].
+///
+/// An untagged sourceless entry beside a Socket-tagged sourceless one does
+/// not count: it is a user's same-version path crate that cargo locks next
+/// to the vendored copy (dependents name each by its distinct version), and
+/// the only lock edits a vendored crate still needs — a retag between tags —
+/// never touch it.
+pub async fn count_lock_entries(project_root: &Path, name: &str, version: &str) -> usize {
+    let Ok(packages) = read_locked_packages(project_root).await else {
+        return 0;
+    };
+    let hits: Vec<&LockedPackage> = packages
+        .iter()
+        .filter(|p| p.name == name && cargo_tag::denotes(&p.version, version))
+        .collect();
+    let untagged_detached =
+        |p: &LockedPackage| p.source.is_none() && cargo_tag::tag_uuid(&p.version).is_none();
+    let tagged_detached = hits
+        .iter()
+        .any(|p| p.source.is_none() && cargo_tag::tag_uuid(&p.version).is_some());
+    hits.iter()
+        .filter(|p| !(tagged_detached && untagged_detached(p)))
+        .count()
+}
+
+/// The pre-memo [`probe_lock_entry_for`] (a fresh [`locked_packages`] per
+/// call), kept as the equivalence oracle.
+#[cfg(test)]
+async fn probe_lock_entry_for_unmemoized(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+    uuid: Option<&str>,
+) -> LockEntryProbe {
     let doc = match read_lock(project_root).await {
         Ok((_path, doc, _)) => doc,
         Err(LockEditError::NoLockfile) => return LockEntryProbe::NoLockfile,
@@ -851,20 +927,9 @@ pub async fn probe_lock_entry_for(
     }
 }
 
-/// Number of `[[package]]` entries matching `name`+`version`. More than one
-/// means the lock resolves the same name+version from multiple sources (e.g.
-/// registry + git fork), the shape whose `dependencies` arrays use full
-/// package-id strings that [`detach_lock_entry`]'s surgery would dangle —
-/// callers refuse to vendor it. A missing/unparseable lock (or one without a
-/// `[[package]]` array) counts zero: the same "no usable lock" treatment as
-/// [`read_locked_versions`].
-///
-/// An untagged sourceless entry beside a Socket-tagged sourceless one does
-/// not count: it is a user's same-version path crate that cargo locks next
-/// to the vendored copy (dependents name each by its distinct version), and
-/// the only lock edits a vendored crate still needs — a retag between tags —
-/// never touch it.
-pub async fn count_lock_entries(project_root: &Path, name: &str, version: &str) -> usize {
+/// The pre-memo [`count_lock_entries`], kept as the equivalence oracle.
+#[cfg(test)]
+async fn count_lock_entries_unmemoized(project_root: &Path, name: &str, version: &str) -> usize {
     let Ok((_path, doc, _)) = read_lock(project_root).await else {
         return 0;
     };
@@ -2189,5 +2254,57 @@ mod tests {
                 .is_err(),
             "the registry entry outranks the fork: nothing sourceless to retag"
         );
+    }
+
+    /// V-7: the memoized package list answers every probe exactly as the
+    /// per-call [`locked_packages`] did — over a lock carrying registry,
+    /// tagged, other-tagged, untagged-sourceless and duplicate entries, a
+    /// v1 `[metadata]` lock, a missing lock and a corrupt one, and after
+    /// the lock is rewritten between two probes (the memo must miss).
+    #[tokio::test]
+    async fn memoized_lock_probes_match_the_per_call_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let names = ["cfg-if", "app", "serde", "nope"];
+        let versions = ["1.0.4", "0.1.0", "1.0.0", "9.9.9"];
+        let uuids = [None, Some(UUID), Some(UUID2)];
+        async fn check(root: &Path, names: &[&str], versions: &[&str], uuids: &[Option<&str>]) {
+            for name in names {
+                for version in versions {
+                    assert_eq!(
+                        count_lock_entries(root, name, version).await,
+                        count_lock_entries_unmemoized(root, name, version).await,
+                        "count {name}@{version}"
+                    );
+                    for uuid in uuids {
+                        assert_eq!(
+                            probe_lock_entry_for(root, name, version, *uuid).await,
+                            probe_lock_entry_for_unmemoized(root, name, version, *uuid).await,
+                            "probe {name}@{version} {uuid:?}"
+                        );
+                    }
+                }
+            }
+        }
+        check(root, &names, &versions, &uuids).await;
+        let busy = format!(
+            "{}\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4+socket.{UUID}\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4+socket.{UUID2}\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"{SOURCE}\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"git+https://x\"\n",
+            lock_body()
+        );
+        for body in [
+            lock_body(),
+            busy,
+            lock_in_format(1),
+            "not = [toml".to_string(),
+        ] {
+            std::fs::write(root.join("Cargo.lock"), &body).unwrap();
+            check(root, &names, &versions, &uuids).await;
+            // Twice: the second pass is the one the memo answers.
+            check(root, &names, &versions, &uuids).await;
+        }
     }
 }

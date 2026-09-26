@@ -1506,6 +1506,11 @@ fn is_socket_patch_registry_name(value: &str) -> bool {
 /// (`package = "<crate>"` under any key). Readers that probe for a LIVE
 /// hosted redirect use this rather than a single-line regex, which saw only
 /// the inline spelling and read the other three as "not redirected".
+///
+/// The live readers use [`CargoRegistryPins`], which extracts every crate's
+/// pin in this same scan once per manifest; this per-crate scan is its
+/// equivalence oracle.
+#[cfg(test)]
 pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Option<String> {
     let lines: Vec<&str> = content.split('\n').collect();
     let socket_value = |text: &str| -> Option<String> {
@@ -1609,6 +1614,120 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
         }
     }
     None
+}
+
+/// Every Socket registry pin a manifest carries, as `(crate, registry)` in
+/// file order — [`cargo_socket_registry_pin`] for all crates at once. That
+/// scan's per-crate test is always "the declaration's owning crate (its
+/// `package` rename, else its key) equals the crate asked about", and
+/// everything else it computes is independent of the crate asked about, so
+/// the first pin recorded here for a crate is exactly the one it returns.
+pub(crate) struct CargoRegistryPins(Vec<(String, String)>);
+
+impl CargoRegistryPins {
+    pub(crate) fn of(content: &str) -> Self {
+        let lines: Vec<&str> = content.split('\n').collect();
+        let socket_value = |text: &str| -> Option<String> {
+            CARGO_TOML_REGISTRY_VAL_RE
+                .captures(text)
+                .map(|c| c[1].to_string())
+                .filter(|v| is_socket_patch_registry_name(v))
+        };
+        let mut pins = Vec::new();
+        let mut section = CargoTomlSection::Other;
+        for (idx, raw) in lines.iter().enumerate() {
+            let trimmed = raw.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+                section = match CARGO_TOML_HEADER_RE.captures(trimmed) {
+                    Some(c) => classify_cargo_section(
+                        c.get(1)
+                            .expect("header_re always captures group 1 (section name)")
+                            .as_str(),
+                    ),
+                    None => CargoTomlSection::Other,
+                };
+                let CargoTomlSection::DepEntry { key, .. } = section.clone() else {
+                    continue;
+                };
+                let end = lines
+                    .iter()
+                    .enumerate()
+                    .skip(idx + 1)
+                    .find(|(_, l)| l.trim_start().starts_with('['))
+                    .map_or(lines.len(), |(j, _)| j);
+                let block: Vec<&str> = (idx + 1..end)
+                    .map(|j| lines[j].trim_start())
+                    .filter(|t| !t.is_empty() && !t.starts_with('#'))
+                    .collect();
+                let value_of = |name: &str| -> Option<String> {
+                    block.iter().find_map(|t| {
+                        let (k, rest) = parse_cargo_entry_key(t)?;
+                        if k != name {
+                            return None;
+                        }
+                        let v = rest.trim_start().strip_prefix('=')?.trim();
+                        Some(
+                            v.strip_prefix('"')
+                                .and_then(|s| s.split('"').next())
+                                .unwrap_or(v)
+                                .to_string(),
+                        )
+                    })
+                };
+                let owner = value_of("package").unwrap_or(key);
+                if let Some(reg) = value_of("registry").filter(|v| is_socket_patch_registry_name(v))
+                {
+                    pins.push((owner, reg));
+                }
+                continue;
+            }
+            let CargoTomlSection::DepTable { .. } = section else {
+                continue;
+            };
+            let Some((key, rest)) = parse_cargo_entry_key(trimmed) else {
+                continue;
+            };
+            let rest_trim = rest.trim_start();
+            if let Some(dotted) = rest_trim.strip_prefix('.') {
+                if parse_cargo_entry_key(dotted).is_some_and(|(k, _)| k == "registry") {
+                    if let Some(reg) = socket_value(trimmed) {
+                        pins.push((key, reg));
+                    }
+                }
+                continue;
+            }
+            let Some(value) = rest_trim.strip_prefix('=').map(str::trim_start) else {
+                continue;
+            };
+            if !value.starts_with('{') {
+                continue;
+            }
+            let Some(close) = value.find('}') else {
+                continue;
+            };
+            let inner = &value[1..close];
+            let owner = match CARGO_TOML_PACKAGE_RE.captures(inner) {
+                Some(c) => c[1].to_string(),
+                None => key,
+            };
+            if let Some(reg) = socket_value(inner) {
+                pins.push((owner, reg));
+            }
+        }
+        CargoRegistryPins(pins)
+    }
+
+    /// [`cargo_socket_registry_pin`]`(content, crate_name)` for the
+    /// `content` these pins were extracted from.
+    pub(crate) fn pin_for(&self, crate_name: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(owner, _)| owner == crate_name)
+            .map(|(_, reg)| reg.clone())
+    }
 }
 
 /// Split a TOML table-header path into dot segments, respecting quoted
