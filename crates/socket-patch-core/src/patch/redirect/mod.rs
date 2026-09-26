@@ -37,6 +37,8 @@ mod composer_equivalence_tests;
 mod golang_equivalence_tests;
 pub mod golang_local;
 #[cfg(test)]
+mod group_equivalence_tests;
+#[cfg(test)]
 mod lock_index_equivalence_tests;
 pub mod npmrc;
 mod pdm;
@@ -181,13 +183,13 @@ pub struct FileEdit {
     pub new: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RewriteWarning {
     pub code: String,
     pub detail: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
     pub files: BTreeMap<String, String>,
@@ -349,23 +351,224 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     // rewriters too (see `pipenv::rewrite`).
     pipenv::rewrite(files, &overrides, pipenv_major, &mut result);
     let overrides = withhold(&overrides, &result.refused_pipenv_uuids);
-    let overrides: &[DepOverride] = &overrides;
-    rewrite_npm_lock(files, overrides, &mut result);
-    rewrite_pnpm_lock(files, overrides, &mut result);
-    rewrite_yarn_classic(files, overrides, &mut result);
-    rewrite_yarn_berry(files, overrides, &mut result);
-    rewrite_bun_lock(files, overrides, &mut result);
-    requirements::rewrite(files, overrides, &mut result);
-    rewrite_hatch(files, overrides, &mut result);
-    rewrite_uv_lock(files, overrides, python_metadata, &mut result);
-    poetry::rewrite_poetry(files, overrides, &mut result);
-    rewrite_cargo(files, overrides, &mut result);
-    rewrite_composer_lock(files, overrides, &mut result);
-    rewrite_nuget(files, overrides, &mut result);
-    rewrite_gem(files, overrides, &mut result);
-    rewrite_maven_pom(files, overrides, &mut result);
-    rewrite_golang(files, overrides, &mut result);
+    let groups = rewriter_groups(files, &overrides, python_metadata);
+    rewrite_groups_parallel(result, &groups)
+}
+
+/// One rewriter group: rewriters that must run in this order on one result.
+type RewriterGroup<'a> = Box<dyn Fn(&mut RewriteResult) + Send + Sync + 'a>;
+
+/// The rewriters that run after the pdm / pipenv withholding, in the serial
+/// order, split into groups that never read one another's output: each
+/// rewriter only appends to the result, and the only result fields any of
+/// them reads are its own group's (`rewrite_hatch` reads the requirements
+/// rewriter's confirmations, `rewrite_uv_lock` the python lock sets and a
+/// metadata file an earlier python rewriter may have written) or the
+/// withholding prefix's. Every group sees the full withheld override slice,
+/// exactly as the serial chain did.
+fn rewriter_groups<'a>(
+    files: &'a BTreeMap<String, String>,
+    overrides: &'a [DepOverride],
+    python_metadata: &'a BTreeMap<String, String>,
+) -> Vec<RewriterGroup<'a>> {
+    vec![
+        Box::new(move |result| {
+            rewrite_npm_lock(files, overrides, result);
+            rewrite_pnpm_lock(files, overrides, result);
+            rewrite_yarn_classic(files, overrides, result);
+            rewrite_yarn_berry(files, overrides, result);
+            rewrite_bun_lock(files, overrides, result);
+        }),
+        Box::new(move |result| {
+            requirements::rewrite(files, overrides, result);
+            rewrite_hatch(files, overrides, result);
+            rewrite_uv_lock(files, overrides, python_metadata, result);
+            poetry::rewrite_poetry(files, overrides, result);
+        }),
+        Box::new(move |result| rewrite_cargo(files, overrides, result)),
+        Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
+        Box::new(move |result| rewrite_nuget(files, overrides, result)),
+        Box::new(move |result| rewrite_gem(files, overrides, result)),
+        Box::new(move |result| rewrite_maven_pom(files, overrides, result)),
+        Box::new(move |result| rewrite_golang(files, overrides, result)),
+    ]
+}
+
+/// The serial chain: every group, in order, on one result.
+fn rewrite_groups_serial(mut result: RewriteResult, groups: &[RewriterGroup<'_>]) -> RewriteResult {
+    for group in groups {
+        group(&mut result);
+    }
     result
+}
+
+/// What one group added on top of the withholding `prefix` it started from:
+/// the appended edits and warnings, the files it wrote (new keys, or prefix
+/// keys it changed), and its set entries. `None` when the group did anything
+/// other than append (changed or dropped a prefix edit, warning or file) —
+/// the merge cannot replay that, so the caller falls back to the serial chain.
+fn group_delta(prefix: &RewriteResult, mut out: RewriteResult) -> Option<RewriteResult> {
+    fn changed_entries<V: PartialEq>(
+        prefix: &BTreeMap<String, V>,
+        out: BTreeMap<String, V>,
+    ) -> Option<BTreeMap<String, V>> {
+        if prefix.keys().any(|k| !out.contains_key(k)) {
+            return None;
+        }
+        Some(
+            out.into_iter()
+                .filter(|(k, v)| prefix.get(k) != Some(v))
+                .collect(),
+        )
+    }
+    if out.edits.len() < prefix.edits.len()
+        || out.edits[..prefix.edits.len()] != prefix.edits[..]
+        || out.warnings.len() < prefix.warnings.len()
+        || out.warnings[..prefix.warnings.len()] != prefix.warnings[..]
+    {
+        return None;
+    }
+    out.edits.drain(..prefix.edits.len());
+    out.warnings.drain(..prefix.warnings.len());
+    out.files = changed_entries(&prefix.files, out.files)?;
+    out.binary_files = changed_entries(&prefix.binary_files, out.binary_files)?;
+    Some(out)
+}
+
+/// Fold one group's delta into the running result, as the serial chain's
+/// appends would have: edits and warnings in order, files by key, sets by
+/// union (order-free).
+fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
+    let RewriteResult {
+        files,
+        binary_files,
+        confirmed_bun_binary_uuids,
+        mut edits,
+        mut warnings,
+        confirmed_cargo_uuids,
+        confirmed_golang_uuids,
+        confirmed_pipenv_uuids,
+        refused_pipenv_uuids,
+        confirmed_pdm_uuids,
+        refused_pdm_uuids,
+        refused_pnpm_uuids,
+        python_lock_uuids,
+        confirmed_python_lock_uuids,
+        refused_python_lock_uuids,
+        hatch_uuids,
+        confirmed_hatch_uuids,
+        confirmed_requirements_uuids,
+    } = delta;
+    result.files.extend(files);
+    result.binary_files.extend(binary_files);
+    result.edits.append(&mut edits);
+    result.warnings.append(&mut warnings);
+    result
+        .confirmed_bun_binary_uuids
+        .extend(confirmed_bun_binary_uuids);
+    result.confirmed_cargo_uuids.extend(confirmed_cargo_uuids);
+    result.confirmed_golang_uuids.extend(confirmed_golang_uuids);
+    result.confirmed_pipenv_uuids.extend(confirmed_pipenv_uuids);
+    result.refused_pipenv_uuids.extend(refused_pipenv_uuids);
+    result.confirmed_pdm_uuids.extend(confirmed_pdm_uuids);
+    result.refused_pdm_uuids.extend(refused_pdm_uuids);
+    result.refused_pnpm_uuids.extend(refused_pnpm_uuids);
+    result.python_lock_uuids.extend(python_lock_uuids);
+    result
+        .confirmed_python_lock_uuids
+        .extend(confirmed_python_lock_uuids);
+    result
+        .refused_python_lock_uuids
+        .extend(refused_python_lock_uuids);
+    result.hatch_uuids.extend(hatch_uuids);
+    result.confirmed_hatch_uuids.extend(confirmed_hatch_uuids);
+    result
+        .confirmed_requirements_uuids
+        .extend(confirmed_requirements_uuids);
+}
+
+/// [`rewrite_groups_serial`], with the groups run concurrently under
+/// `std::thread::scope`. Each group starts from its own copy of `prefix` (the
+/// pdm / pipenv withholding result), so it sees exactly the state the serial
+/// chain showed it — no group reads another group's output (see
+/// [`rewriter_groups`]) — and the deltas are merged in serial order.
+///
+/// Byte-identical to the serial chain by construction: when a group did
+/// anything but append, or two groups wrote the same file, or a group wrote a
+/// file the prefix already carried (the serial chain's last writer would
+/// depend on the order), the parallel outputs are discarded and the serial
+/// chain runs instead. A panicking group re-raises the first panic in serial
+/// order, as the serial chain would have.
+fn rewrite_groups_parallel(prefix: RewriteResult, groups: &[RewriterGroup<'_>]) -> RewriteResult {
+    let outs = run_groups_concurrently(&prefix, groups);
+    match merge_group_outputs(&prefix, outs) {
+        Some(result) => result,
+        None => rewrite_groups_serial(prefix, groups),
+    }
+}
+
+/// Every group on its own copy of `prefix`, concurrently; outputs in group
+/// order. The first group runs on the calling thread.
+fn run_groups_concurrently(
+    prefix: &RewriteResult,
+    groups: &[RewriterGroup<'_>],
+) -> Vec<RewriteResult> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = groups
+            .iter()
+            .skip(1)
+            .map(|group| {
+                scope.spawn(move || {
+                    let mut out = prefix.clone();
+                    group(&mut out);
+                    out
+                })
+            })
+            .collect();
+        let first = groups.first().map(|group| {
+            let mut out = prefix.clone();
+            group(&mut out);
+            out
+        });
+        first
+            .into_iter()
+            .chain(handles.into_iter().map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            }))
+            .collect()
+    })
+}
+
+/// The groups' outputs merged in group order onto `prefix`, or `None` when
+/// the merge could differ from the serial chain (see
+/// [`rewrite_groups_parallel`]).
+fn merge_group_outputs(prefix: &RewriteResult, outs: Vec<RewriteResult>) -> Option<RewriteResult> {
+    let deltas: Vec<RewriteResult> = outs
+        .into_iter()
+        .map(|out| group_delta(prefix, out))
+        .collect::<Option<_>>()?;
+    let mut written: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let disjoint = deltas.iter().all(|delta| {
+        delta
+            .files
+            .keys()
+            .chain(delta.binary_files.keys())
+            .all(|k| {
+                !prefix.files.contains_key(k)
+                    && !prefix.binary_files.contains_key(k)
+                    && written.insert(k.as_str())
+            })
+    });
+    if !disjoint {
+        return None;
+    }
+    let mut result = prefix.clone();
+    for delta in deltas {
+        merge_group_delta(&mut result, delta);
+    }
+    Some(result)
 }
 
 fn rewrite_hatch(

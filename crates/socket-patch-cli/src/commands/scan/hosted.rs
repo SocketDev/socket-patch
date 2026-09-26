@@ -2101,12 +2101,23 @@ pub(crate) async fn run_redirect_selected(
         .filter(|o| !(binary_content.as_ref().is_some_and(Result::is_err) && o.ecosystem == "npm"))
         .cloned()
         .collect();
-    let mut rewrite = rewrite_registry_redirect_with_pipenv_version(
-        &files,
-        &rewrite_overrides,
-        &python_metadata,
-        pipenv_major,
-    );
+    // Pure CPU over every lock text (the independent rewriter groups run
+    // concurrently inside), so it runs on the blocking pool rather than on a
+    // runtime worker; `files` comes back for the confirmation probe below.
+    let (files, mut rewrite) = tokio::task::spawn_blocking(move || {
+        let rewrite = rewrite_registry_redirect_with_pipenv_version(
+            &files,
+            &rewrite_overrides,
+            &python_metadata,
+            pipenv_major,
+        );
+        (files, rewrite)
+    })
+    .await
+    .unwrap_or_else(|e| match e.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(e) => panic!("hosted rewrite task failed: {e}"),
+    });
     if let Some(content) = binary_content {
         rewrite
             .warnings
