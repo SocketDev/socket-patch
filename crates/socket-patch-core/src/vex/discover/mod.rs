@@ -1723,8 +1723,9 @@ pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uui
 }
 
 /// The root files a vendored `eco` artifact can be wired from — every
-/// vendor backend's lockfile / wiring config for that ecosystem (npm: all
-/// five npm-family locks; cargo: the `[patch.crates-io]` config; maven /
+/// vendor backend's lockfile / wiring config for that ecosystem (npm: every
+/// npm-family lock the `vendor_probe` table flags, `vlt-lock.json`
+/// included; cargo: the `[patch.crates-io]` config; maven /
 /// nuget: the repository / source that serves the vendored dir). Manifests
 /// such as package.json are deliberately absent: the lock is what the
 /// install consumes.

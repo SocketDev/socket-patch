@@ -343,7 +343,10 @@ fn matrix<F: FnOnce(&Path)>(project: &Path, scratch: &Path, case: &VltVexCase<'_
 fn nested_link_dirs_are_left_out_of_the_checkout() {
     for (rel, nested) in [
         ("node_modules", false),
-        (".socket/vendor/npm/u/a-1.0.0/node_modules/a/node_modules", true),
+        (
+            ".socket/vendor/npm/u/a-1.0.0/node_modules/a/node_modules",
+            true,
+        ),
         (
             ".socket/vendor/npm/u/@s/a-1.0.0/node_modules/@s/a/node_modules",
             true,

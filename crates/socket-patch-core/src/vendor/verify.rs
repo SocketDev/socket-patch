@@ -12,7 +12,8 @@
 //! Fail-closed order (each failure is a stable snake_case routing tag):
 //! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
 //! `vendor_artifact_missing` → `vendor_artifact_unreadable` /
-//! `file_not_found` / `vendor_hash_mismatch` / `vendor_inventory_mismatch`
+//! `file_not_found` / `vendor_hash_mismatch` / `vendor_inventory_mismatch` /
+//! `vendor_manifest_unverifiable`
 //! (dir-shaped artifacts with a recorded [`file_inventory`] additionally
 //! verify their FULL file tree — missing, extra and modified unpatched
 //! files all fail; entries without one keep member-only verification).
@@ -24,7 +25,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-use crate::manifest::schema::PatchRecord;
+use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{normalize_file_path, verify_file_patch, VerifyStatus};
 use crate::patch::package::read_archive_to_map;
 
@@ -205,6 +206,8 @@ async fn verify_vlt_dir(
                 }
                 return Err("vendor_hash_mismatch".to_string());
             }
+            unpinned_vlt_manifest(project_root, dir, file_name, info).await?;
+            continue;
         }
         match verify_file_patch(dir, file_name, info).await.status {
             VerifyStatus::AlreadyPatched => {}
@@ -256,12 +259,18 @@ pub(crate) async fn vlt_installed_copy_matches(
         .and_then(|inv| inv.get("package.json"));
     for (file_name, info) in &record.files {
         if normalize_file_path(file_name) == "package.json" {
-            if let Some(pin) = pin {
-                if !vlt_manifest_matches(project_root, installed, pin, &info.after_hash).await {
-                    return false;
+            let matches = match pin {
+                Some(pin) => {
+                    vlt_manifest_matches(project_root, installed, pin, &info.after_hash).await
                 }
-                continue;
+                None => unpinned_vlt_manifest(project_root, installed, file_name, info)
+                    .await
+                    .is_ok(),
+            };
+            if !matches {
+                return false;
             }
+            continue;
         }
         if verify_file_patch(installed, file_name, info).await.status
             != VerifyStatus::AlreadyPatched
@@ -290,6 +299,46 @@ async fn vlt_manifest_matches(
     if !hex::encode(Sha256::digest(&on_disk)).eq_ignore_ascii_case(pin) {
         return false;
     }
+    let Some(blob) = local_after_blob(project_root, after_hash).await else {
+        return true;
+    };
+    stripped_manifest(blob)
+        .is_some_and(|stripped| hex::encode(Sha256::digest(&stripped)).eq_ignore_ascii_case(pin))
+}
+
+/// The vlt manifest exemption for an entry with no inventory pin (one
+/// built from `vlt-lock.json` alone): `package.json` verifies at its
+/// afterHash, or as the local afterHash blob with its devDependencies
+/// stripped. Without that blob a transformed manifest cannot be judged
+/// (`vendor_manifest_unverifiable`).
+async fn unpinned_vlt_manifest(
+    project_root: &Path,
+    dir: &Path,
+    file_name: &str,
+    info: &PatchFileInfo,
+) -> Result<(), String> {
+    match verify_file_patch(dir, file_name, info).await.status {
+        VerifyStatus::AlreadyPatched => return Ok(()),
+        VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+        VerifyStatus::Ready | VerifyStatus::HashMismatch => {}
+    }
+    let Some(blob) = local_after_blob(project_root, &info.after_hash).await else {
+        return Err("vendor_manifest_unverifiable".to_string());
+    };
+    let Ok(on_disk) = crate::utils::fs::read_regular_to_bytes(&dir.join("package.json")).await
+    else {
+        return Err("vendor_artifact_unreadable".to_string());
+    };
+    if stripped_manifest(blob).is_some_and(|stripped| stripped == on_disk) {
+        Ok(())
+    } else {
+        Err("vendor_hash_mismatch".to_string())
+    }
+}
+
+/// The afterHash blob from the local blob store, when present, bounded and
+/// intact.
+async fn local_after_blob(project_root: &Path, after_hash: &str) -> Option<Vec<u8>> {
     let blob_path = project_root.join(".socket/blobs").join(after_hash);
     let blob = match tokio::fs::metadata(&blob_path).await {
         Ok(meta) if meta.is_file() && meta.len() <= MAX_MANIFEST_BLOB_BYTES => {
@@ -299,20 +348,18 @@ async fn vlt_manifest_matches(
         }
         _ => None,
     };
-    let Some(blob) =
-        blob.filter(|b| compute_git_sha256_from_bytes(b).eq_ignore_ascii_case(after_hash))
-    else {
-        return true;
-    };
-    let Ok(text) = String::from_utf8(blob) else {
-        return false;
-    };
-    let stripped = match super::npm_dir::strip_dev_dependencies(&text) {
-        Ok(Some(stripped)) => stripped,
-        Ok(None) => text,
-        Err(_) => return false,
-    };
-    hex::encode(Sha256::digest(stripped.as_bytes())).eq_ignore_ascii_case(pin)
+    blob.filter(|b| compute_git_sha256_from_bytes(b).eq_ignore_ascii_case(after_hash))
+}
+
+/// `blob` with its top-level devDependencies stripped (§4.4); `None` when
+/// the transform refuses it.
+fn stripped_manifest(blob: Vec<u8>) -> Option<Vec<u8>> {
+    let text = String::from_utf8(blob).ok()?;
+    match super::npm_dir::strip_dev_dependencies(&text) {
+        Ok(Some(stripped)) => Some(stripped.into_bytes()),
+        Ok(None) => Some(text.into_bytes()),
+        Err(_) => None,
+    }
 }
 
 /// Does the cargo copy's `Cargo.toml`, Socket tag dropped, hash to

@@ -6,7 +6,7 @@
 //!
 //! | shape | written by | recognized node | ref |
 //! |---|---|---|---|
-//! | hosted | `patch::redirect::vlt` (`scan --mode hosted`, the depscan twin) | a registry node (any segment) whose slot [3] is a Socket-hosted URL whose leaf is `<bare>-<version>.tgz` of the DepID's `name@version`, slot [1] == name, slot [2] a `sha512-` SRI | `Hosted { purl, uuid, integrity: slot [2] }` |
+//! | hosted | `patch::redirect::vlt` (`scan --mode hosted`, the depscan twin) | a registry node (any segment) whose slot [3] is a Socket-hosted `/patch/npm/…` URL whose leaf is `<bare>-<version>.tgz` of the DepID's `name@version` and whose embedded `<name>/<version>` (when the URL has them) is that `name@version`, slot [1] == name, slot [2] a `sha512-` SRI | `Hosted { purl, uuid, integrity: slot [2] }` |
 //! | vendored | `vendor::vlt_lock` (`vendor`, `scan --mode vendored`) | a `file` node whose decoded path is `.socket/vendor/npm/<uuid>/[@s/]<bare>-<version>/node_modules/[@s/]<bare>`, slot [1] == name, slot [3] (when a string) == the path | `Vendored { purl, uuid, path }` |
 //! | vendored (read-only) | a user's `vlt install` of an npm-flavor artifact | a `file` node whose decoded path is `.socket/vendor/npm/<uuid>/[@s/]<bare>-<version>.tgz`, same slot rules | `Vendored { purl, uuid, path }` |
 //!
@@ -35,7 +35,8 @@
 //! default-registry instance. An instance of the same `name@version` that
 //! still resolves from a registry (a named alias or scoped registry the
 //! rewriter skips with `redirect_vlt_custom_registry_skipped`) installs the
-//! unpatched package for its dependents:
+//! unpatched package for its dependents, and a Socket-shaped instance that
+//! is diagnosed ([`DIAG_REF_INVALID`]) installs bytes no ref vouches for:
 //!
 //! * a hosted ref beside it keeps no lock pin, so the not-installed
 //!   lockfile basis never attests it (every installed copy must verify
@@ -48,9 +49,10 @@
 //!
 //! ## Parsing
 //!
-//! A BOM-prefixed (never stripped), non-object or unknown-`lockfileVersion`
-//! lock is one vlt cannot read: [`DIAG_LOCKFILE_UNPARSEABLE`], no refs, and
-//! whatever it mentions is recognized as unwired (rule 11). The canonical
+//! A BOM-prefixed (never stripped), unparseable, non-object or
+//! unknown-`lockfileVersion` lock is not read (a BOM or an unknown version
+//! is one vlt cannot read either): [`DIAG_LOCKFILE_UNPARSEABLE`], no refs,
+//! and whatever it mentions is recognized as unwired (rule 11). The canonical
 //! one-entry-per-line layout is not required here (the writers check it).
 //!
 //! Non-goals: nested `*/vlt-lock.json` (a separate project, DESIGN D3), the
@@ -66,6 +68,7 @@ use super::{
 use crate::constants::npm_family::VLT_LOCK;
 use crate::patch::redirect::hosted_url_names;
 use crate::utils::digest::is_sri_pin;
+use crate::utils::purl::percent_decode_purl_component;
 use crate::vendor::lock_inventory::vlt::{vlt_lock_model, VltLockNode};
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::vlt_lock_text::{parse_vendored_path, DepIdKind};
@@ -80,16 +83,19 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             out.diag(
                 DIAG_LOCKFILE_UNPARSEABLE,
                 VLT_LOCK,
-                format!("{VLT_LOCK} {why}; vlt cannot read it, so nothing in it is wired"),
+                format!("{VLT_LOCK} {why}, so nothing in it is wired"),
             );
             return;
         }
     };
     let classified: Vec<Classified> = lock.nodes.iter().map(|n| classify(ctx, n)).collect();
-    let registry: BTreeSet<&str> = classified
+    let unattested: BTreeSet<&str> = classified
         .iter()
         .filter_map(|c| match c {
-            Classified::Registry(purl) => Some(purl.as_str()),
+            Classified::Registry(purl)
+            | Classified::Invalid {
+                purl: Some(purl), ..
+            } => Some(purl.as_str()),
             _ => None,
         })
         .collect();
@@ -102,7 +108,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 url,
                 integrity,
             } => {
-                let pin = (!registry.contains(purl.as_str()))
+                let pin = (!unattested.contains(purl.as_str()))
                     .then(|| LockIntegrity::Sri(integrity.clone()));
                 out.push(PatchedRef::hosted(
                     purl.clone(),
@@ -113,15 +119,17 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                     true,
                 ));
             }
-            Classified::Vendored { purl, path } if registry.contains(purl.as_str()) => {
+            Classified::Vendored { purl, path } if unattested.contains(purl.as_str()) => {
                 out.diag(
                     DIAG_REF_UNATTRIBUTABLE,
                     VLT_LOCK,
                     format!(
-                        "{VLT_LOCK}: {}: {purl} is wired to {path}, but the lock also resolves \
-                         the same version from a registry for other dependents, so the \
-                         vendored patch is not attested; re-run `socket-patch vendor` or \
-                         `vlt install`",
+                        "{VLT_LOCK}: {}: {purl} is wired to {path}, but the lock also installs \
+                         the same version for other dependents from a node this patch does not \
+                         wire (a registry resolution or a diagnosed Socket-shaped node), so the \
+                         vendored patch is not attested; `socket-patch scan --mode hosted` \
+                         pins every default-registry instance, otherwise remove the \
+                         dependents that resolve the other instance",
                         node.key
                     ),
                 );
@@ -131,7 +139,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                     out.push(PatchedRef::vendored(purl.clone(), &vref, VLT_LOCK, None));
                 }
             }
-            Classified::Invalid(why) => {
+            Classified::Invalid { why, .. } => {
                 out.diag(DIAG_REF_INVALID, VLT_LOCK, format!("{VLT_LOCK}: {why}"));
             }
             Classified::Other => {}
@@ -153,8 +161,12 @@ enum Classified {
         purl: String,
         path: String,
     },
-    /// Socket-shaped, but not what a Socket writer produces.
-    Invalid(String),
+    /// Socket-shaped, but not what a Socket writer produces; `purl` is the
+    /// instance's identity when its coordinates parse.
+    Invalid {
+        why: String,
+        purl: Option<String>,
+    },
     /// Git, remote, workspace and non-Socket file nodes.
     Other,
 }
@@ -182,16 +194,21 @@ fn classify_registry(ctx: &DiscoverCtx<'_>, node: &VltLockNode) -> Classified {
             _ => Classified::Other,
         };
     };
+    let invalid = |why: String| Classified::Invalid {
+        why,
+        purl: npm_purl(name, version),
+    };
     if node.name != name {
-        return Classified::Invalid(format!(
+        return invalid(format!(
             "{key}: names {:?} in slot [1] but its DepID is {name}@{version}; it is ignored",
             node.name
         ));
     }
-    if !hosted_url_names(url, name, version) {
-        return Classified::Invalid(format!(
+    if !hosted_url_names(url, name, version) || !embedded_identity_agrees(url, name, version) {
+        return invalid(format!(
             "{key}: {url:?} is not an artifact of {name}@{version} (its leaf must be the \
-             package's own <name>-<version>.tgz); it is ignored"
+             package's own <name>-<version>.tgz and its path must embed that name and \
+             version, if any); it is ignored"
         ));
     }
     let Some(integrity) = node
@@ -199,13 +216,13 @@ fn classify_registry(ctx: &DiscoverCtx<'_>, node: &VltLockNode) -> Classified {
         .as_deref()
         .filter(|sri| sri.starts_with("sha512-") && is_sri_pin(sri))
     else {
-        return Classified::Invalid(format!(
+        return invalid(format!(
             "{key}: is wired to {url:?} without the sha512 the hosted rewriter always writes; \
              it is ignored"
         ));
     };
     let Some(purl) = npm_purl(name, version) else {
-        return Classified::Invalid(format!(
+        return invalid(format!(
             "{key}: Socket-wired node {name:?}@{version:?} has unsafe coordinates"
         ));
     };
@@ -217,6 +234,34 @@ fn classify_registry(ctx: &DiscoverCtx<'_>, node: &VltLockNode) -> Classified {
     }
 }
 
+/// Whether the Socket artifact path `url` (`/patch/npm/<name>/<version>/
+/// <token>/<uuid>/<leaf>`, the name spelled over one or more segments,
+/// each percent-decoded) embeds `name@version`. The token-only
+/// `/patch/npm/<token>/<uuid>/<leaf>` shape embeds neither and agrees; any
+/// other path does not.
+fn embedded_identity_agrees(url: &str, name: &str, version: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(segments) = parsed.path_segments() else {
+        return false;
+    };
+    let segments: Vec<String> = segments
+        .map(|s| percent_decode_purl_component(s).into_owned())
+        .collect();
+    let Some(rest) = segments
+        .strip_prefix(&["patch".to_string(), "npm".to_string()])
+        .filter(|rest| rest.len() == 3 || rest.len() >= 5)
+    else {
+        return false;
+    };
+    if rest.len() == 3 {
+        return true;
+    }
+    let (embedded_name, tail) = rest.split_at(rest.len() - 4);
+    embedded_name.join("/") == name && tail[0] == version
+}
+
 fn classify_file(node: &VltLockNode) -> Classified {
     let key = &node.key;
     let path = node.dep_id.first.as_str();
@@ -224,26 +269,39 @@ fn classify_file(node: &VltLockNode) -> Classified {
         return Classified::Other;
     }
     let Some(vendored) = parse_vendored_path(path, &node.name) else {
-        return Classified::Invalid(format!(
-            "{key}: {path:?} is not a vendored vlt artifact of {:?} (.socket/vendor/npm/<uuid>/\
-             <name>-<version>/node_modules/<name>); it is ignored",
-            node.name
-        ));
+        return Classified::Invalid {
+            why: format!(
+                "{key}: {path:?} is not a vendored vlt artifact of {:?} (.socket/vendor/npm/\
+                 <uuid>/<name>-<version>/node_modules/<name>); it is ignored",
+                node.name
+            ),
+            purl: None,
+        };
     };
+    let purl = npm_purl(&vendored.name, &vendored.version);
     if node.location.as_deref().is_some_and(|slot| slot != path) {
-        return Classified::Invalid(format!(
-            "{key}: records location {:?} for the vendored path {path:?}; it is ignored",
-            node.location.as_deref().unwrap_or_default()
-        ));
+        return Classified::Invalid {
+            why: format!(
+                "{key}: records location {:?} for the vendored path {path:?}; it is ignored",
+                node.location.as_deref().unwrap_or_default()
+            ),
+            purl,
+        };
     }
-    let Some(purl) = npm_purl(&vendored.name, &vendored.version) else {
-        return Classified::Invalid(format!(
-            "{key}: vendored node {:?}@{:?} has unsafe coordinates",
-            vendored.name, vendored.version
-        ));
+    let Some(purl) = purl else {
+        return Classified::Invalid {
+            why: format!(
+                "{key}: vendored node {:?}@{:?} has unsafe coordinates",
+                vendored.name, vendored.version
+            ),
+            purl: None,
+        };
     };
     if vendor_ref(path).is_none() {
-        return Classified::Invalid(format!("{key}: {path:?} is not a safe vendored path"));
+        return Classified::Invalid {
+            why: format!("{key}: {path:?} is not a safe vendored path"),
+            purl: Some(purl),
+        };
     }
     Classified::Vendored {
         purl,
@@ -477,6 +535,60 @@ mod tests {
                 true,
             ),
             (
+                "wrong-url-name",
+                node(
+                    id,
+                    "left-pad",
+                    Some(SRI),
+                    Some(&hosted_url(
+                        "npm",
+                        "right-pad",
+                        "1.3.0",
+                        UUID_A,
+                        "left-pad-1.3.0.tgz",
+                    )),
+                ),
+                true,
+            ),
+            (
+                "wrong-url-version",
+                node(
+                    id,
+                    "left-pad",
+                    Some(SRI),
+                    Some(&hosted_url(
+                        "npm",
+                        "left-pad",
+                        "9.9.9",
+                        UUID_A,
+                        "left-pad-1.3.0.tgz",
+                    )),
+                ),
+                true,
+            ),
+            (
+                "neither the token-only nor the name-embedding path",
+                node(
+                    id,
+                    "left-pad",
+                    Some(SRI),
+                    Some(&format!(
+                        "https://patch.socket.dev/patch/npm/1.3.0/{TOKEN}/{UUID_A}/left-pad-1.3.0.tgz"
+                    )),
+                ),
+                true,
+            ),
+            (
+                "not under /patch/npm/",
+                node(
+                    id,
+                    "left-pad",
+                    Some(SRI),
+                    Some(&good.replace("/patch/npm/", "/patch/pypi/")),
+                ),
+                true,
+            ),
+            (
                 "missing sha512",
                 node(id, "left-pad", None, Some(&good)),
                 true,
@@ -505,6 +617,33 @@ mod tests {
                 "{what}: {:?}",
                 out.diagnostics
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_embedded_name_keeps_its_scope() {
+        let purl = "pkg:npm/@a/b@1.0.0";
+        let at = |name: &str| hosted_url("npm", name, "1.0.0", UUID_A, "b-1.0.0.tgz");
+        let token_only = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID_A}/b-1.0.0.tgz");
+        for (what, location, wired) in [
+            ("scope as two segments", at("@a/b"), true),
+            ("scope percent-encoded", at("%40a%2Fb"), true),
+            ("token-only", token_only, true),
+            ("wrong-url-scope", at("@c/b"), false),
+            ("scope dropped", at("b"), false),
+        ] {
+            let out = discover(&lock(
+                Some(1),
+                &[node("~npm~@a+b@1.0.0", "@a/b", Some(SRI), Some(&location))],
+            ))
+            .await;
+            if wired {
+                assert_refs(&out, &[(purl, UUID_A, WiringMode::Hosted)]);
+                assert!(out.diagnostics.is_empty(), "{what}: {:?}", out.diagnostics);
+            } else {
+                assert!(out.refs.is_empty(), "{what}: {:?}", out.refs);
+                assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID], "{what}");
+            }
         }
     }
 
@@ -639,6 +778,44 @@ mod tests {
         ))
         .await;
         assert_refs(&out, &[(PURL, UUID_B, WiringMode::Vendored)]);
+    }
+
+    #[tokio::test]
+    async fn a_diagnosed_same_version_instance_withholds_the_lock_basis() {
+        let hosted = url(UUID_A, "left-pad-1.3.0.tgz");
+        let out = discover(&lock(
+            Some(1),
+            &[
+                node("~npm~left-pad@1.3.0", "left-pad", Some(SRI), Some(&hosted)),
+                node(
+                    "~npm~left-pad@1.3.0~peer.0df72515a50372ba",
+                    "left-pad",
+                    Some(SRI),
+                    Some(&url(UUID_A, "left-pad-1.4.0.tgz")),
+                ),
+            ],
+        ))
+        .await;
+        assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+        assert_eq!(out.refs[0].locked_integrity, None);
+        assert!(!out.refs[0].lockfile_basis_ok());
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
+
+        let path = dir_path(UUID_B);
+        let out = discover(&lock(
+            Some(1),
+            &[
+                node(&file_id(&path), "left-pad", None, Some(&path)),
+                node("~npm~left-pad@1.3.0", "right-pad", Some(SRI), Some(&hosted)),
+            ],
+        ))
+        .await;
+        assert!(out.refs.is_empty(), "{:?}", out.refs);
+        assert_eq!(
+            diag_codes(&out),
+            vec![DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE]
+        );
+        assert_eq!(out.vendored_claim(PURL, UUID_B, &path), Some(false));
     }
 
     #[tokio::test]

@@ -341,8 +341,13 @@ into the new version's section — see docs/releasing.md.
   installed link. A lock vlt cannot read (BOM, other `lockfileVersion`)
   wires nothing. A hosted npm package is now judged by every store variant
   of its installed copies (pnpm and vlt peer, modifier and registry-alias
-  instances), and a same-version instance on another registry keeps a vlt
-  hosted pin from attesting before install. `setup.manual` accepts `vlt`.
+  instances), and a same-version instance on another registry (or a
+  Socket-shaped one that does not verify) keeps a vlt hosted pin from
+  attesting before install. A vendored vlt directory verified without its
+  vendor ledger checks a devDependencies-stripped `package.json` against
+  the patched blob in `.socket/blobs`, and is omitted as
+  `vendor_manifest_unverifiable` when that blob is absent. `setup.manual`
+  accepts `vlt`.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

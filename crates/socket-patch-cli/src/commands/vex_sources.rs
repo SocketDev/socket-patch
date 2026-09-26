@@ -772,7 +772,8 @@ fn vendored_entry_for(cand: &Cand, vref: &PatchedRef) -> VendorEntry {
         lock: None,
         took_over_go_patches: false,
         // Bun's workspace-mirror integrity check and the vlt package-dir
-        // verifier (structure rule, manifest exemption) key off the flavor.
+        // verifier (structure rule, manifest exemption by the local blob,
+        // since there is no inventory pin) key off the flavor.
         flavor: match source.as_ref() {
             "bun.lock" | "bun.lockb" => Some("bun".to_string()),
             "vlt-lock.json" => Some("vlt".to_string()),

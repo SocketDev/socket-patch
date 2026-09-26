@@ -2266,6 +2266,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_ledgerless_entry_verifies_a_stripped_manifest_by_its_blob() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let patched_pkg =
+            b"{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"devDependencies\":{\"t\":\"1\"},\"main\":\"i.js\"}";
+        let stripped = "{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"main\":\"i.js\"}";
+        let after_hash = compute_git_sha256_from_bytes(patched_pkg);
+        tokio::fs::write(fx.blobs.join(&after_hash), patched_pkg)
+            .await
+            .unwrap();
+        let mut rec = record(UUID);
+        rec.files.insert(
+            "package/package.json".into(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: after_hash.clone(),
+            },
+        );
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_vlt(
+            PURL,
+            &fx.installed,
+            &fx.root,
+            &rec,
+            &sources,
+            "t",
+            false,
+            true,
+            None,
+        )
+        .await;
+        let (mut entry, _) = entry_of(outcome);
+        entry.artifact.file_inventory = None;
+        let copy = fx.root.join("copy");
+        tokio::fs::create_dir_all(&copy).await.unwrap();
+        tokio::fs::write(copy.join("index.js"), PATCHED)
+            .await
+            .unwrap();
+        tokio::fs::write(copy.join(PACKAGE_JSON), stripped)
+            .await
+            .unwrap();
+        let verify = || crate::vendor::verify::verify_vendored_patch_record(&fx.root, &entry, &rec);
+        let copy_matches =
+            || crate::vendor::verify::vlt_installed_copy_matches(&fx.root, &copy, &entry, &rec);
+        assert_eq!(
+            verify().await,
+            Err("vendor_manifest_unverifiable".to_string())
+        );
+        assert!(!copy_matches().await);
+
+        let local_blobs = fx.root.join(".socket/blobs");
+        tokio::fs::create_dir_all(&local_blobs).await.unwrap();
+        tokio::fs::write(local_blobs.join(&after_hash), patched_pkg)
+            .await
+            .unwrap();
+        assert_eq!(verify().await, Ok(()));
+        assert!(copy_matches().await);
+
+        tokio::fs::write(
+            fx.root.join(&entry.artifact.path).join(PACKAGE_JSON),
+            "{\"name\":\"left-pad\",\"version\":\"6.6.6\"}",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(copy.join(PACKAGE_JSON), patched_pkg)
+            .await
+            .unwrap();
+        assert_eq!(verify().await, Err("vendor_hash_mismatch".to_string()));
+        assert!(
+            copy_matches().await,
+            "the untransformed manifest is at its afterHash"
+        );
+    }
+
+    #[tokio::test]
     async fn the_preflight_decides_every_refusal_without_writing() {
         let fx = fx(
             &render(

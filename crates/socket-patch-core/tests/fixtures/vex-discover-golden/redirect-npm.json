@@ -1165,7 +1165,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json starts with a UTF-8 BOM, which vlt cannot read; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json starts with a UTF-8 BOM, which vlt cannot read, so nothing in it is wired"
       }
     ],
     "recognized": [],
@@ -4196,7 +4196,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json is not a JSON object; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json is not a JSON object socket-patch can parse, so nothing in it is wired"
       }
     ],
     "recognized": [],
@@ -4883,7 +4883,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json has lockfileVersion 1e0; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json has lockfileVersion 1e0, which this socket-patch does not read, so nothing in it is wired"
       }
     ],
     "recognized": [],
@@ -4897,7 +4897,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json has lockfileVersion 1.0; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json has lockfileVersion 1.0, which this socket-patch does not read, so nothing in it is wired"
       }
     ],
     "recognized": [],
@@ -4911,7 +4911,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json has lockfileVersion \"1\"; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json has lockfileVersion \"1\", which this socket-patch does not read, so nothing in it is wired"
       }
     ],
     "recognized": [],
@@ -4925,7 +4925,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json has lockfileVersion 2; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json has lockfileVersion 2, which this socket-patch does not read, so nothing in it is wired"
       }
     ],
     "recognized": [],
@@ -4939,7 +4939,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json is not a JSON object; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json is not a JSON object socket-patch can parse, so nothing in it is wired"
       }
     ],
     "recognized": [],
@@ -5263,7 +5263,7 @@
       {
         "code": "lockfile_unparseable",
         "file": "vlt-lock.json",
-        "detail": "vlt-lock.json is not a JSON object; vlt cannot read it, so nothing in it is wired"
+        "detail": "vlt-lock.json is not a JSON object socket-patch can parse, so nothing in it is wired"
       }
     ],
     "recognized": [],

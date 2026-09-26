@@ -34,19 +34,25 @@ pub(crate) struct VltLock {
     pub(crate) nodes: Vec<VltLockNode>,
 }
 
-/// The nodes of a lock vlt itself can read; `None` for a BOM-prefixed,
-/// unparseable or unknown-version lock (never BOM-stripped).
+/// The nodes of a readable lock; `None` for a BOM-prefixed, unparseable or
+/// unknown-version lock (never BOM-stripped).
 pub(crate) fn vlt_lock_nodes(text: &str) -> Option<VltLock> {
     vlt_lock_model(text).ok()
 }
 
-/// [`vlt_lock_nodes`], with why vlt cannot read the lock as the error.
+/// [`vlt_lock_nodes`], with why the lock is not read as the error.
 pub(crate) fn vlt_lock_model(text: &str) -> Result<VltLock, String> {
     let lock = match sniff_lock(text) {
         LockSniff::Readable(lock) => lock,
         LockSniff::Bom => return Err("starts with a UTF-8 BOM, which vlt cannot read".into()),
-        LockSniff::NotJsonObject => return Err("is not a JSON object".into()),
-        LockSniff::UnsupportedVersion(raw) => return Err(format!("has lockfileVersion {raw}")),
+        LockSniff::NotJsonObject => {
+            return Err("is not a JSON object socket-patch can parse".into())
+        }
+        LockSniff::UnsupportedVersion(raw) => {
+            return Err(format!(
+                "has lockfileVersion {raw}, which this socket-patch does not read"
+            ))
+        }
     };
     let string_slot = |tuple: &[Value], i: usize| {
         tuple
