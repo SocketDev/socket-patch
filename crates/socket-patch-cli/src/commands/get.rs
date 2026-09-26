@@ -1408,7 +1408,10 @@ async fn filter_to_installed_releases(
                 // release's files and store that response under this
                 // uuid for the download engine.
                 _ => {
-                    debug_assert!(false, "variant view prefetch plan out of step at {}", s.uuid);
+                    debug_assert!(
+                        false,
+                        "variant view prefetch plan out of step with the variants"
+                    );
                     api_client.fetch_patch(&s.uuid).await
                 }
             };
@@ -1949,7 +1952,10 @@ async fn fetch_selected_patches(
                 // Unreachable (the plan mirrors this loop's checks); a
                 // live fetch keeps the outcome right regardless.
                 _ => {
-                    debug_assert!(false, "view prefetch plan out of step at {uuid}");
+                    debug_assert!(
+                        false,
+                        "view prefetch plan out of step with the download loop"
+                    );
                     api_client.fetch_patch(uuid).await
                 }
             },

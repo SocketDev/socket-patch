@@ -78,20 +78,21 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
 
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
-    if is_debug_enabled() {
-        let line = format!("[socket-patch debug] {}", message);
-        let mut line = Some(line);
-        let deferred = DEFERRED_DEBUG.try_with(|lines| {
-            if let Some(line) = line.take() {
-                lines.borrow_mut().push(line);
-            }
-        });
-        if deferred.is_err() {
-            if let Some(line) = line {
-                eprintln!("{line}");
-            }
-        }
+    if is_debug_enabled() && !defer_debug_line(message) {
+        eprintln!("[socket-patch debug] {}", message);
     }
+}
+
+/// Hold `message` back for [`with_deferred_debug`]'s caller when the current
+/// task runs inside it; `false` (print it now) otherwise.
+fn defer_debug_line(message: &str) -> bool {
+    DEFERRED_DEBUG
+        .try_with(|lines| {
+            lines
+                .borrow_mut()
+                .push(format!("[socket-patch debug] {}", message));
+        })
+        .is_ok()
 }
 
 tokio::task_local! {

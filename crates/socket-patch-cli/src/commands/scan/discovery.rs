@@ -367,8 +367,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
                     _ => {
                         debug_assert!(
                             false,
-                            "baseline view prefetch plan out of step at {}",
-                            patch.uuid
+                            "baseline view prefetch plan out of step with the patches"
                         );
                         api_client.fetch_patch(&patch.uuid).await
                     }

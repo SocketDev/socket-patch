@@ -593,7 +593,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                 // return `Ready` with blobs missing and nothing in
                 // `failed`.
                 _ => {
-                    debug_assert!(false, "view prefetch plan out of step at {uuid}");
+                    debug_assert!(false, "view prefetch plan out of step with the fetch list");
                     client.fetch_patch(uuid).await
                 }
             };
