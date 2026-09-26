@@ -1,8 +1,9 @@
-# npm ecosystem test image: base + Node.js + npm + bun.
+# npm ecosystem test image: base + Node.js + npm + bun + vlt.
 #
-# Pinned to Node 20 LTS via the NodeSource apt repo. The setup_20.x script
-# installs the latest 20.x at image-build time; for reproducibility CI
-# rebuilds the image whenever this Dockerfile or the base changes.
+# Pinned to Node 22 LTS via the NodeSource apt repo. The setup_22.x script
+# installs the latest 22.x at image-build time (vlt 1.2.0 needs >= 22.22);
+# for reproducibility CI rebuilds the image whenever this Dockerfile or the
+# base changes.
 #
 # bun is installed via the official install script (the Debian apt repo
 # isn't published reliably). The script downloads a self-contained
@@ -10,8 +11,8 @@
 # test scripts can call `bun` without PATH gymnastics.
 FROM socket-patch-test-base:latest
 
-# Install Node.js 20 LTS from NodeSource.
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+# Install Node.js 22 LTS from NodeSource.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs unzip \
  && rm -rf /var/lib/apt/lists/*
 
@@ -29,10 +30,10 @@ RUN for i in 1 2 3; do \
     done \
  && ln -s /root/.bun/bin/bun /usr/local/bin/bun
 
-# Enable pnpm and yarn via corepack (bundled with Node 20). The
-# setup-matrix suite (tests/setup_matrix/) drives all four npm-family
-# package managers — npm, yarn, pnpm, bun — through the `socket-patch
-# setup` install-hook flow. `corepack prepare … --activate` pins and
+# Enable pnpm and yarn via corepack (bundled with Node 22). The
+# setup-matrix suite (tests/setup_matrix/) drives the npm-family
+# package managers — npm, yarn, pnpm, bun and (installed below) vlt —
+# through the `socket-patch setup` install-hook flow. `corepack prepare … --activate` pins and
 # activates a known version so the binaries resolve without a network
 # round-trip at test time. Additive: the existing docker_e2e_npm tests
 # are unaffected.
@@ -43,10 +44,22 @@ RUN corepack enable \
 # Corepack defaults to fetching the LATEST package manager at run time for
 # projects with no `packageManager` field (COREPACK_DEFAULT_TO_LATEST=1),
 # silently overriding the activations above — which is how test runs
-# started downloading pnpm 11.x (requires Node >= 22) onto this Node 20
-# image and crashing with ERR_UNKNOWN_BUILTIN_MODULE(node:sqlite). Pin
-# runtime resolution to the activated versions.
+# started downloading pnpm 11.x onto the (then Node 20) image and crashing
+# with ERR_UNKNOWN_BUILTIN_MODULE(node:sqlite). Pin runtime resolution to
+# the activated versions.
 ENV COREPACK_DEFAULT_TO_LATEST=0
+
+# vlt, for the setup-matrix `pm: vlt` cases (non-gating extras: the
+# gating vlt setup assertions live in the real-vlt capstones). Retried like
+# bun: one registry blip must not fail the image build. Its telemetry is
+# off for every test run.
+RUN for i in 1 2 3; do \
+      npm install -g --no-audit --no-fund vlt@1.2.0 && break; \
+      [ "$i" = 3 ] && exit 1; \
+      echo "vlt install attempt $i failed; retrying in $((i * 10))s"; \
+      sleep $((i * 10)); \
+    done
+ENV VLT_TELEMETRY=0
 
 # Cache yarn berry 4.x in corepack WITHOUT activating it: the global `yarn`
 # stays 1.22.22 (classic), and berry fixtures opt in per-project via
@@ -61,6 +74,8 @@ RUN corepack prepare yarn@4.12.0
 # dispatches yarn 4 there while the global yarn stays classic.
 RUN node --version && npm --version && bun --version \
  && pnpm --version && yarn --version && socket-patch --version \
+ && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 22) ? 0 : 1)' \
+ && test "$(vlt --version)" = "1.2.0" \
  && ( cd /tmp && mkdir berrycheck && cd berrycheck \
       && echo '{"packageManager":"yarn@4.12.0"}' > package.json \
       && test "$(yarn --version)" = "4.12.0" \

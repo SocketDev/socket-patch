@@ -5,8 +5,8 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
 use socket_patch_core::package_json::find::{
-    detect_package_manager, find_package_json_files, PackageJsonFindResult, PackageJsonLocation,
-    WorkspaceType,
+    detect_package_manager, find_package_json_files, legacy_vlt_lock, LegacyVltLock,
+    PackageJsonFindResult, PackageJsonLocation, WorkspaceType,
 };
 use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
@@ -22,9 +22,11 @@ use socket_patch_core::setup::pypi::edit::{
     PthEditResult, PthStatus,
 };
 use socket_patch_core::telemetry::track_patch_setup;
+use socket_patch_core::utils::process::{command_for, resolve_tool};
 use socket_patch_core::vex::applied_patches_with_vendor;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -36,6 +38,92 @@ fn manager_name(pm: PackageManager) -> &'static str {
     match pm {
         PackageManager::Npm => "npm",
         PackageManager::Pnpm => "pnpm",
+        PackageManager::Vlt => "vlt",
+    }
+}
+
+const VLT_ROOT_SCRIPTS_NOT_RUN: &str = "vlt_root_scripts_not_run";
+const VLT_ROOT_SCRIPTS_REMEDY: &str = "vlt before 1.0.0-rc.13 does not run the root postinstall \
+                                       hook; upgrade vlt or run `socket-patch apply` after `vlt ci`";
+/// The first vlt release that runs a root `postinstall` without an
+/// `install` script.
+const VLT_ROOT_SCRIPTS_FLOOR: &str = "1.0.0-rc.13";
+const VLT_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What `vlt --version` said, when a `vlt` resolved on PATH and exited 0
+/// within [`VLT_VERSION_TIMEOUT`].
+#[derive(Debug, Clone, PartialEq)]
+enum VltVersionProbe {
+    Reported(String),
+    Unavailable,
+}
+
+async fn probe_vlt_version(cwd: &Path) -> VltVersionProbe {
+    let Some(program) = resolve_tool("vlt") else {
+        return VltVersionProbe::Unavailable;
+    };
+    let mut cmd = tokio::process::Command::from(command_for(&program));
+    cmd.arg("--version")
+        .env("VLT_TELEMETRY", "0")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(VLT_VERSION_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            VltVersionProbe::Reported(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        _ => VltVersionProbe::Unavailable,
+    }
+}
+
+/// The `vlt_root_scripts_not_run` detail, if any. A reported version
+/// decides alone (an unparseable one never warns); without one, a lock
+/// only an old vlt writes makes the warning a "may".
+fn vlt_root_scripts_advisory(
+    probe: &VltVersionProbe,
+    lock: Option<LegacyVltLock>,
+) -> Option<String> {
+    match probe {
+        VltVersionProbe::Reported(raw) => {
+            let floor = semver::Version::parse(VLT_ROOT_SCRIPTS_FLOOR).ok()?;
+            let version = semver::Version::parse(raw).ok()?;
+            (version < floor)
+                .then(|| format!("{VLT_ROOT_SCRIPTS_REMEDY} (`vlt --version` reports {raw})"))
+        }
+        VltVersionProbe::Unavailable => lock.map(|lock| {
+            let version = match lock {
+                LegacyVltLock::NoVersion => "has no lockfileVersion",
+                LegacyVltLock::VersionZero => "has lockfileVersion 0",
+            };
+            format!(
+                "{VLT_ROOT_SCRIPTS_REMEDY} (vlt-lock.json {version}, so this project may be \
+                 installed by such a vlt)"
+            )
+        }),
+    }
+}
+
+/// The run's `(code, detail)` advisories for a vlt project `setup` wires.
+async fn vlt_setup_advisories(cwd: &Path) -> Vec<(&'static str, String)> {
+    let probe = probe_vlt_version(cwd).await;
+    let lock = match probe {
+        VltVersionProbe::Reported(_) => None,
+        VltVersionProbe::Unavailable => legacy_vlt_lock(cwd).await,
+    };
+    vlt_root_scripts_advisory(&probe, lock)
+        .map(|detail| (VLT_ROOT_SCRIPTS_NOT_RUN, detail))
+        .into_iter()
+        .collect()
+}
+
+/// `Warning (<code>): <detail>` on stderr in human mode; `--json` carries
+/// them in the envelope's `warnings` and `--silent` mutes them.
+fn print_advisories(common: &GlobalArgs, advisories: &[(&str, String)]) {
+    if common.json || common.silent {
+        return;
+    }
+    for (code, detail) in advisories {
+        eprintln!("Warning ({code}): {detail}");
     }
 }
 
@@ -168,7 +256,7 @@ fn warn_unmatched_excludes(common: &GlobalArgs, unmatched: &[String]) {
     }
 }
 
-/// Apply the pnpm root-only rule and drop excluded members.
+/// Apply the pnpm/vlt root-only rule and drop excluded members.
 fn select_members(
     found: PackageJsonFindResult,
     cwd: &Path,
@@ -176,9 +264,13 @@ fn select_members(
 ) -> Vec<PackageJsonLocation> {
     // For pnpm monorepos, only update root package.json. pnpm runs root
     // postinstall on `pnpm install`, so workspace-level postinstall scripts are
-    // unnecessary and would fail under pnpm's strict module isolation.
+    // unnecessary and would fail under pnpm's strict module isolation. vlt
+    // has one root store and runs the root hook once per install, even one
+    // started from a member directory.
     let files: Vec<PackageJsonLocation> = match found.workspace_type {
-        WorkspaceType::Pnpm => found.files.into_iter().filter(|loc| loc.is_root).collect(),
+        WorkspaceType::Pnpm | WorkspaceType::Vlt => {
+            found.files.into_iter().filter(|loc| loc.is_root).collect()
+        }
         _ => found.files,
     };
 
@@ -1999,6 +2091,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     let extra_preview = merge_outcomes(gem_preview, composer_preview);
 
     let npm_pm = detect_package_manager(&common.cwd).await;
+    let advisories = if npm_pm == PackageManager::Vlt && !npm_files.is_empty() {
+        vlt_setup_advisories(&common.cwd).await
+    } else {
+        Vec::new()
+    };
 
     // `patch_setup` telemetry ("a successful setup") fires only on the two
     // exit-0, non-dry-run paths below — never for a dry run, an aborted
@@ -2045,6 +2142,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             )
         );
     }
+    print_advisories(common, &advisories);
 
     let preview_errors = npm_preview
         .iter()
@@ -2083,6 +2181,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 npm_pm,
                 py_plan.as_ref(),
                 &warnings,
+                &advisories,
             );
         } else if !common.silent {
             if preview_errors > 0 {
@@ -2122,6 +2221,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 npm_pm,
                 py_plan.as_ref(),
                 &[],
+                &advisories,
             );
         } else if !common.silent {
             println!("\nSummary (dry run):");
@@ -2210,6 +2310,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             npm_pm,
             py_plan.as_ref(),
             &warnings,
+            &advisories,
         );
     } else if !common.silent {
         let updated = npm_results
@@ -2344,6 +2445,7 @@ fn print_setup_envelope(
     npm_pm: PackageManager,
     py_plan: Option<&PythonPlan>,
     warnings: &[String],
+    advisories: &[(&str, String)],
 ) {
     let updated = npm
         .iter()
@@ -2410,6 +2512,15 @@ fn print_setup_envelope(
     if let Some(plan) = py_plan {
         obj["pythonPackageManager"] = serde_json::json!(plan.pm.as_str());
     }
+    let warnings: Vec<String> = warnings
+        .iter()
+        .cloned()
+        .chain(
+            advisories
+                .iter()
+                .map(|(code, detail)| format!("{code}: {detail}")),
+        )
+        .collect();
     if !warnings.is_empty() {
         obj["warnings"] = serde_json::json!(warnings);
     }
@@ -2745,6 +2856,88 @@ mod tests {
         assert!(
             out.ends_with("Gemfile\n"),
             "no trailing blank line: {out:?}"
+        );
+    }
+
+    #[test]
+    fn vlt_is_its_own_telemetry_and_envelope_manager() {
+        assert_eq!(manager_name(PackageManager::Vlt), "vlt");
+        assert_eq!(
+            telemetry_manager_str(true, true, false, false, PackageManager::Vlt),
+            "vlt+pypi"
+        );
+    }
+
+    #[test]
+    fn vlt_root_scripts_advisory_is_definite_only_below_rc13() {
+        let reported = |v: &str| VltVersionProbe::Reported(v.to_string());
+        for old in [
+            "0.0.0-1",
+            "0.0.0-0.1733957343934",
+            "0.0.0-32",
+            "1.0.0-rc.9",
+            "1.0.0-rc.12",
+        ] {
+            assert_eq!(
+                vlt_root_scripts_advisory(&reported(old), None).as_deref(),
+                Some(
+                    format!(
+                        "vlt before 1.0.0-rc.13 does not run the root postinstall hook; \
+                         upgrade vlt or run `socket-patch apply` after `vlt ci` (`vlt \
+                         --version` reports {old})"
+                    )
+                    .as_str()
+                ),
+                "{old}"
+            );
+        }
+        for new in ["1.0.0-rc.13", "1.0.0-rc.14", "1.0.0", "1.2.0"] {
+            for lock in [None, Some(LegacyVltLock::VersionZero)] {
+                assert_eq!(
+                    vlt_root_scripts_advisory(&reported(new), lock),
+                    None,
+                    "{new}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vlt_root_scripts_advisory_never_fires_on_an_unparseable_version() {
+        for raw in [
+            "",
+            "vlt 1.0.0-rc.12",
+            "v0.0.0-32",
+            "rc.12",
+            "1.0.0-rc.12\nextra",
+        ] {
+            assert_eq!(
+                vlt_root_scripts_advisory(
+                    &VltVersionProbe::Reported(raw.to_string()),
+                    Some(LegacyVltLock::NoVersion)
+                ),
+                None,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vlt_root_scripts_advisory_falls_back_to_a_may_from_the_lock() {
+        let probe = VltVersionProbe::Unavailable;
+        assert_eq!(vlt_root_scripts_advisory(&probe, None), None);
+        assert_eq!(
+            vlt_root_scripts_advisory(&probe, Some(LegacyVltLock::VersionZero)).as_deref(),
+            Some(
+                "vlt before 1.0.0-rc.13 does not run the root postinstall hook; upgrade vlt \
+                 or run `socket-patch apply` after `vlt ci` (vlt-lock.json has lockfileVersion \
+                 0, so this project may be installed by such a vlt)"
+            )
+        );
+        assert!(
+            vlt_root_scripts_advisory(&probe, Some(LegacyVltLock::NoVersion))
+                .unwrap()
+                .contains("(vlt-lock.json has no lockfileVersion, so this project may")
         );
     }
 }

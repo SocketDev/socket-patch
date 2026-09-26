@@ -663,7 +663,9 @@ pub async fn track_patch_repair_failed(
 }
 
 /// Track a successful `setup`. Reports the detected package manager so
-/// we can tell which install hooks are exercised in the wild.
+/// we can tell which install hooks are exercised in the wild: the
+/// `+`-joined in-scope tags, where the npm-family tag is `npm`, `pnpm` or
+/// `vlt` (e.g. `vlt+pypi`), or `none`.
 pub async fn track_patch_setup(manager: &str, api_token: Option<&str>, org_slug: Option<&str>) {
     fire(
         PatchTelemetryEventType::PatchSetup,

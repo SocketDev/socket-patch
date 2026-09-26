@@ -2,14 +2,29 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::detect::{strip_bom, PackageManager};
+use crate::constants::npm_family;
 use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries, read_regular_to_string};
+use crate::vendor::vlt_lock_text::{sniff_lock, LockSniff};
 
 /// Detect the package manager based on lockfiles in the project root.
-/// The accepted pnpm marker spellings (including the `pnpm-lock.yml`
-/// variant no other subsystem accepts) live in the shared
-/// [`npm_family`](crate::constants::npm_family) table.
+/// vlt's markers ([`VLT_SETUP_MARKERS`](npm_family::VLT_SETUP_MARKERS)) win
+/// over pnpm's, and only the start directory is consulted: an ancestor
+/// `vlt.json` does not make a nested package a vlt project. The accepted
+/// pnpm marker spellings (including the `pnpm-lock.yml` variant no other
+/// subsystem accepts) live in the shared [`npm_family`] table.
 pub async fn detect_package_manager(start_path: &Path) -> PackageManager {
-    for name in crate::constants::npm_family::names_with(|r| r.detects_pnpm) {
+    for name in npm_family::VLT_SETUP_MARKERS {
+        let path = start_path.join(name);
+        let present = if name == npm_family::VLT_STORE_DIR {
+            is_dir(&path).await
+        } else {
+            fs::metadata(&path).await.is_ok()
+        };
+        if present {
+            return PackageManager::Vlt;
+        }
+    }
+    for name in npm_family::names_with(|r| r.detects_pnpm) {
         if fs::metadata(start_path.join(name)).await.is_ok() {
             return PackageManager::Pnpm;
         }
@@ -17,11 +32,40 @@ pub async fn detect_package_manager(start_path: &Path) -> PackageManager {
     PackageManager::Npm
 }
 
+/// A `vlt-lock.json` written by a vlt that may predate 1.0.0-rc.13, the
+/// first release that runs a root `postinstall` without an `install`
+/// script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyVltLock {
+    /// No `lockfileVersion` key (vlt <= 0.0.0-18).
+    NoVersion,
+    /// `lockfileVersion: 0` (vlt < 1.0.0-rc.15; rc.13 and rc.14 included).
+    VersionZero,
+}
+
+/// The start directory's `vlt-lock.json`, when its `lockfileVersion` is
+/// absent or `0`. Any other lock, an unreadable one or none yields `None`.
+pub async fn legacy_vlt_lock(start_path: &Path) -> Option<LegacyVltLock> {
+    let text = read_regular_to_string(&start_path.join(npm_family::VLT_LOCK))
+        .await
+        .ok()?;
+    match sniff_lock(&text) {
+        LockSniff::Readable(lock) => match lock.version {
+            None => Some(LegacyVltLock::NoVersion),
+            Some(0) => Some(LegacyVltLock::VersionZero),
+            Some(_) => None,
+        },
+        _ => None,
+    }
+}
+
 /// Workspace configuration type.
 #[derive(Debug, Clone)]
 pub enum WorkspaceType {
     Npm,
     Pnpm,
+    /// vlt.json `workspaces` (or vlt <= 0.0.0-12's `vlt-workspaces.json`).
+    Vlt,
     None,
 }
 
@@ -121,6 +165,12 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     // JSONC, or simply broken) root manifest would wrongly demote a real pnpm
     // workspace to "no workspace".
     let dir = package_json_path.parent().unwrap_or(Path::new("."));
+    if let Some(patterns) = vlt_workspace_patterns(dir).await {
+        return WorkspaceConfig {
+            ws_type: WorkspaceType::Vlt,
+            patterns,
+        };
+    }
     let pnpm_workspace = dir.join("pnpm-workspace.yaml");
     // Every manifest/config read here lives inside the (untrusted) project
     // tree — and the workspace walk reads the package.json of *every*
@@ -171,6 +221,55 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     }
 
     default
+}
+
+/// vlt's workspace globs for `dir`: vlt.json `workspaces` (vlt >= 0.0.0-13)
+/// or, without one, the legacy `vlt-workspaces.json` (vlt <= 0.0.0-12; the
+/// two eras never read each other's file). vlt never reads package.json
+/// `workspaces`. `None` when neither file declares workspaces.
+async fn vlt_workspace_patterns(dir: &Path) -> Option<Vec<String>> {
+    if let Some(workspaces) = read_json_config(&dir.join(npm_family::VLT_CONFIG))
+        .await
+        .and_then(|mut config| config.get_mut("workspaces").map(serde_json::Value::take))
+        .filter(|workspaces| !workspaces.is_null())
+    {
+        return Some(parse_vlt_workspaces(&workspaces));
+    }
+    read_json_config(&dir.join(npm_family::VLT_LEGACY_WORKSPACES))
+        .await
+        .filter(|legacy| !legacy.is_null())
+        .map(|legacy| parse_vlt_workspaces(&legacy))
+}
+
+/// A JSON config file inside the project (FIFO-safe read, BOM stripped), or
+/// `None` when it is missing, unreadable or not JSON.
+async fn read_json_config(path: &Path) -> Option<serde_json::Value> {
+    let text = read_regular_to_string(path).await.ok()?;
+    serde_json::from_str(strip_bom(&text)).ok()
+}
+
+/// vlt's workspace declaration: a glob, a list of globs, or an object of
+/// named groups whose values are either. Non-string entries are ignored.
+fn parse_vlt_workspaces(value: &serde_json::Value) -> Vec<String> {
+    fn globs(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(glob) => out.push(glob.clone()),
+            serde_json::Value::Array(items) => {
+                out.extend(items.iter().filter_map(|v| v.as_str().map(String::from)))
+            }
+            _ => {}
+        }
+    }
+    let mut patterns = Vec::new();
+    match value {
+        serde_json::Value::Object(groups) => {
+            for group in groups.values() {
+                globs(group, &mut patterns);
+            }
+        }
+        other => globs(other, &mut patterns),
+    }
+    patterns
 }
 
 /// Simple parser for pnpm-workspace.yaml packages field.
@@ -1715,5 +1814,283 @@ mod tests {
         .unwrap();
         let pm = detect_package_manager(dir.path()).await;
         assert_eq!(pm, PackageManager::Pnpm);
+    }
+
+    // ── vlt ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_detect_vlt_from_each_setup_marker() {
+        for marker in npm_family::VLT_SETUP_MARKERS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(marker);
+            if marker == npm_family::VLT_STORE_DIR {
+                fs::create_dir_all(&path).await.unwrap();
+            } else {
+                fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+                fs::write(&path, "{}").await.unwrap();
+            }
+            assert_eq!(
+                detect_package_manager(dir.path()).await,
+                PackageManager::Vlt,
+                "{marker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detect_vlt_store_marker_must_be_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("node_modules"))
+            .await
+            .unwrap();
+        fs::write(dir.path().join(npm_family::VLT_STORE_DIR), "")
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_package_manager(dir.path()).await,
+            PackageManager::Npm
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_vlt_wins_over_pnpm_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: 9.0\n")
+            .await
+            .unwrap();
+        fs::write(dir.path().join("pnpm-workspace.yaml"), "packages:\n")
+            .await
+            .unwrap();
+        fs::write(dir.path().join("vlt-lock.json"), "{}")
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_package_manager(dir.path()).await,
+            PackageManager::Vlt
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_vlt_ignores_an_ancestor_vlt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("vlt.json"), "{}").await.unwrap();
+        let nested = dir.path().join("packages").join("a");
+        fs::create_dir_all(&nested).await.unwrap();
+        assert_eq!(detect_package_manager(&nested).await, PackageManager::Npm);
+    }
+
+    async fn vlt_workspace_root(vlt_json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        fs::write(dir.path().join("vlt.json"), vlt_json)
+            .await
+            .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_vlt_shapes() {
+        for (vlt_json, want) in [
+            (r#"{"workspaces":"packages/*"}"#, vec!["packages/*"]),
+            (
+                r#"{"workspaces":["packages/*","apps/*",7]}"#,
+                vec!["packages/*", "apps/*"],
+            ),
+            (
+                r#"{"workspaces":{"libs":"libs/*","apps":["apps/*","tools/x"],"bad":1}}"#,
+                vec!["libs/*", "apps/*", "tools/x"],
+            ),
+            (
+                "\u{feff}{\"workspaces\":[\"packages/*\"]}",
+                vec!["packages/*"],
+            ),
+            (r#"{"workspaces":[]}"#, vec![]),
+        ] {
+            let dir = vlt_workspace_root(vlt_json).await;
+            let config = detect_workspaces(&dir.path().join("package.json")).await;
+            assert!(
+                matches!(config.ws_type, WorkspaceType::Vlt),
+                "{vlt_json}: {config:?}"
+            );
+            assert_eq!(config.patterns, want, "{vlt_json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_vlt_json_without_workspaces_falls_through() {
+        for vlt_json in [
+            r#"{"config":{"registry":"https://registry.npmjs.org/"}}"#,
+            r#"{"workspaces":null}"#,
+            "not json",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(
+                dir.path().join("package.json"),
+                r#"{"workspaces":["packages/*"]}"#,
+            )
+            .await
+            .unwrap();
+            fs::write(dir.path().join("vlt.json"), vlt_json)
+                .await
+                .unwrap();
+            let config = detect_workspaces(&dir.path().join("package.json")).await;
+            assert!(
+                matches!(config.ws_type, WorkspaceType::Npm),
+                "{vlt_json}: {config:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_vlt_wins_over_pnpm_and_bad_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{ // jsonc\n}")
+            .await
+            .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - pnpm/*",
+        )
+        .await
+        .unwrap();
+        fs::write(dir.path().join("vlt.json"), r#"{"workspaces":"vlt/*"}"#)
+            .await
+            .unwrap();
+        let config = detect_workspaces(&dir.path().join("package.json")).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Vlt), "{config:?}");
+        assert_eq!(config.patterns, vec!["vlt/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_legacy_vlt_workspaces_json() {
+        for (legacy, want) in [
+            (r#"{"packages":"packages/*"}"#, vec!["packages/*"]),
+            (
+                r#"{"packages":["packages/*","apps/*"]}"#,
+                vec!["packages/*", "apps/*"],
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+                .await
+                .unwrap();
+            fs::write(dir.path().join("vlt-workspaces.json"), legacy)
+                .await
+                .unwrap();
+            let config = detect_workspaces(&dir.path().join("package.json")).await;
+            assert!(matches!(config.ws_type, WorkspaceType::Vlt), "{legacy}");
+            assert_eq!(config.patterns, want, "{legacy}");
+        }
+
+        let dir = vlt_workspace_root(r#"{"workspaces":"current/*"}"#).await;
+        fs::write(
+            dir.path().join("vlt-workspaces.json"),
+            r#"{"packages":"legacy/*"}"#,
+        )
+        .await
+        .unwrap();
+        let config = detect_workspaces(&dir.path().join("package.json")).await;
+        assert_eq!(config.patterns, vec!["current/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_find_vlt_workspaces_discovers_members_with_the_shared_matcher() {
+        let dir =
+            vlt_workspace_root(r#"{"workspaces":{"a":"packages/*","b":["!packages/skip"]}}"#).await;
+        for member in ["packages/a", "packages/b", "packages/skip"] {
+            let path = dir.path().join(member);
+            fs::create_dir_all(&path).await.unwrap();
+            fs::write(path.join("package.json"), "{}").await.unwrap();
+        }
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Vlt));
+        let mut members: Vec<String> = result
+            .files
+            .iter()
+            .filter(|f| f.is_workspace)
+            .map(|f| {
+                f.path
+                    .parent()
+                    .unwrap()
+                    .strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        members.sort();
+        assert_eq!(members, vec!["packages/a", "packages/b"]);
+        assert!(result.files[0].is_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vlt_json_fifo_does_not_wedge_discovery() {
+        for name in ["vlt.json", "vlt-workspaces.json"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(
+                dir.path().join("package.json"),
+                r#"{"workspaces": ["packages/*"]}"#,
+            )
+            .await
+            .unwrap();
+            let fifo = dir.path().join(name);
+            mkfifo(&fifo);
+            let deadline = std::time::Duration::from_secs(5);
+            let Ok(result) =
+                tokio::time::timeout(deadline, find_package_json_files(dir.path())).await
+            else {
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("discovery must complete promptly with a FIFO {name}");
+            };
+            assert!(
+                matches!(result.workspace_type, WorkspaceType::Npm),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_legacy_vlt_lock_reads_only_version_zero_or_absent() {
+        for (lock, want) in [
+            (None, None),
+            (
+                Some(r#"{"nodes":{},"edges":{}}"#),
+                Some(LegacyVltLock::NoVersion),
+            ),
+            (
+                Some(r#"{"lockfileVersion":0,"nodes":{}}"#),
+                Some(LegacyVltLock::VersionZero),
+            ),
+            (Some(r#"{"lockfileVersion":1,"nodes":{}}"#), None),
+            (Some(r#"{"lockfileVersion":"0"}"#), None),
+            (Some("\u{feff}{\"lockfileVersion\":0}"), None),
+            (Some("[]"), None),
+            (Some("not json"), None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(lock) = lock {
+                fs::write(dir.path().join("vlt-lock.json"), lock)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(legacy_vlt_lock(dir.path()).await, want, "{lock:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_legacy_vlt_lock_fifo_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("vlt-lock.json");
+        mkfifo(&fifo);
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, legacy_vlt_lock(dir.path())).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("the lock sniff must not wedge on a FIFO vlt-lock.json");
+        };
+        assert_eq!(result, None);
     }
 }

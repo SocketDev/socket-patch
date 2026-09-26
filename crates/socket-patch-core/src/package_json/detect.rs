@@ -5,12 +5,18 @@ use crate::vendor::common::JsonLayout;
 pub enum PackageManager {
     Npm,
     Pnpm,
+    Vlt,
 }
 
 /// Get the socket-patch apply command for the given package manager.
+/// vlt gets npm's `npx` hook: npx ships with every vlt install (vlt is
+/// distributed through npm), while `vlx`'s argument parsing changed at
+/// 1.0.0-rc.28 in a way that breaks either spelling on one side.
 fn socket_patch_command(pm: PackageManager) -> &'static str {
     match pm {
-        PackageManager::Npm => "npx @socketsecurity/socket-patch apply --silent --ecosystems npm",
+        PackageManager::Npm | PackageManager::Vlt => {
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm"
+        }
         PackageManager::Pnpm => {
             "pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm"
         }
@@ -584,6 +590,18 @@ mod tests {
         assert_eq!(
             generate_updated_script("", PackageManager::Pnpm),
             "pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm"
+        );
+    }
+
+    #[test]
+    fn test_generate_empty_vlt() {
+        assert_eq!(
+            generate_updated_script("", PackageManager::Vlt),
+            generate_updated_script("", PackageManager::Npm),
+        );
+        assert_eq!(
+            generate_updated_script("echo done", PackageManager::Vlt),
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm && echo done"
         );
     }
 
@@ -1230,5 +1248,20 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("pnpm dlx"));
+    }
+
+    #[test]
+    fn test_update_content_vlt_round_trips_through_remove() {
+        let content = "{\n  \"name\": \"test\"\n}\n";
+        let (modified, updated, _, new_pi, _, new_dep) =
+            update_package_json_content(content, PackageManager::Vlt).unwrap();
+        assert!(modified);
+        let npx = "npx @socketsecurity/socket-patch apply --silent --ecosystems npm";
+        assert_eq!(new_pi, npx);
+        assert_eq!(new_dep, npx);
+        assert!(!is_setup_configured_str(&updated).needs_update);
+        let (removed, restored, _) = remove_package_json_content(&updated).unwrap();
+        assert!(removed);
+        assert_eq!(restored, content);
     }
 }

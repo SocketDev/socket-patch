@@ -151,7 +151,8 @@ impl Case {
     /// are the surface `setup` actually configures today — the only cases
     /// where the check/remove round-trip is expected to do real work.
     fn is_npm_family(&self) -> bool {
-        matches!(self.pm.as_str(), "npm" | "yarn" | "pnpm" | "bun") || self.layout == "monorepo"
+        matches!(self.pm.as_str(), "npm" | "yarn" | "pnpm" | "bun" | "vlt")
+            || self.layout == "monorepo"
     }
 
     fn sm_env(&self) -> Vec<(String, String)> {

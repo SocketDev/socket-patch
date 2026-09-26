@@ -1072,3 +1072,288 @@ fn setup_gem_materialization_honors_manifest_path() {
          the default `.socket/manifest.json`; stdout=\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// vlt: npm's npx hook, root-only workspaces, and the
+// `vlt_root_scripts_not_run` advisory. Every run pins PATH to a directory
+// holding at most a fake `vlt`, so the host's own vlt never decides.
+// ---------------------------------------------------------------------------
+
+const NPX_HOOK: &str = "npx @socketsecurity/socket-patch apply --silent --ecosystems npm";
+const VLT_ADVISORY_PREFIX: &str = "vlt_root_scripts_not_run: vlt before 1.0.0-rc.13 does not run \
+                                   the root postinstall hook; upgrade vlt or run `socket-patch \
+                                   apply` after `vlt ci`";
+
+/// A PATH directory with a `vlt` that runs `unix` (a `/bin/sh` body) or,
+/// on Windows, `windows` (a `vlt.cmd` body). `None` leaves it empty.
+fn vlt_path(bodies: Option<(&str, &str)>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    if let Some((unix, windows)) = bodies {
+        if cfg!(windows) {
+            write(
+                &dir.path().join("vlt.cmd"),
+                &format!("@echo off\r\n{windows}\r\n"),
+            );
+        } else {
+            let shim = dir.path().join("vlt");
+            write(&shim, &format!("#!/bin/sh\n{unix}\n"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod shim");
+            }
+        }
+    }
+    dir
+}
+
+/// A `vlt --version` that reports `version`, but only when the probe
+/// disabled vlt's telemetry for the child.
+fn vlt_reporting(version: &str) -> tempfile::TempDir {
+    vlt_path(Some((
+        &format!("if [ \"$VLT_TELEMETRY\" = 0 ]; then echo {version}; else echo telemetry-on; fi"),
+        &format!("if \"%VLT_TELEMETRY%\"==\"0\" (echo {version}) else (echo telemetry-on)"),
+    )))
+}
+
+fn run_setup_with_path(cwd: &Path, path: &Path, extra: &[&str]) -> (i32, serde_json::Value) {
+    let mut args = vec!["setup", "--json"];
+    args.extend_from_slice(extra);
+    let out = setup_command(cwd, &args)
+        .env("PATH", path)
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be JSON ({e}); stdout=\n{stdout}\nstderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().unwrap_or(-1), v)
+}
+
+fn warnings(v: &serde_json::Value) -> Vec<String> {
+    v["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .map(|s| s.as_str().expect("warning string").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn vlt_project(lock: Option<&str>) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        "{ \"name\": \"vlt-proj\", \"version\": \"1.0.0\" }\n",
+    );
+    match lock {
+        Some(lock) => write(&tmp.path().join("vlt-lock.json"), lock),
+        None => write(&tmp.path().join("vlt.json"), "{}\n"),
+    }
+    tmp
+}
+
+const VLT_LOCK_V1: &str =
+    "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {},\n  \"edges\": {}\n}\n";
+const VLT_LOCK_V0: &str =
+    "{\n  \"lockfileVersion\": 0,\n  \"options\": {},\n  \"nodes\": {},\n  \"edges\": {}\n}\n";
+
+fn assert_npx_hooks(root: &Path) {
+    let pkg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("package.json")).unwrap()).unwrap();
+    assert_eq!(pkg["scripts"]["postinstall"], NPX_HOOK, "{pkg}");
+    assert_eq!(pkg["scripts"]["dependencies"], NPX_HOOK, "{pkg}");
+}
+
+#[test]
+fn setup_detects_vlt_from_lockfile() {
+    let tmp = vlt_project(Some(VLT_LOCK_V1));
+    let path = vlt_path(None);
+    let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+    assert_npx_hooks(tmp.path());
+    assert!(
+        warnings(&v).is_empty(),
+        "no vlt on PATH and a v1 lock: no advisory; {v}"
+    );
+}
+
+#[test]
+fn setup_detects_vlt_from_vlt_json() {
+    let tmp = vlt_project(None);
+    // pnpm markers lose to vlt's.
+    write(
+        &tmp.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    );
+    let path = vlt_path(None);
+    let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+    assert_npx_hooks(tmp.path());
+    assert!(warnings(&v).is_empty(), "{v}");
+}
+
+#[test]
+fn setup_detects_vlt_from_install_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        "{ \"name\": \"vlt-proj\", \"version\": \"1.0.0\" }\n",
+    );
+    std::fs::create_dir_all(tmp.path().join("node_modules/.vlt")).unwrap();
+    let path = vlt_path(None);
+    let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+    assert_npx_hooks(tmp.path());
+}
+
+#[test]
+fn setup_vlt_workspace_only_updates_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        "{ \"name\": \"vlt-root\", \"version\": \"1.0.0\" }\n",
+    );
+    write(
+        &tmp.path().join("vlt.json"),
+        "{ \"workspaces\": { \"apps\": \"packages/*\" } }\n",
+    );
+    let members = ["packages/a/package.json", "packages/b/package.json"];
+    for member in members {
+        write(
+            &tmp.path().join(member),
+            "{ \"name\": \"m\", \"version\": \"1.0.0\" }\n",
+        );
+    }
+    let path = vlt_path(None);
+    let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+    assert_eq!(v["updated"], 1, "{v}");
+    let files = v["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "{v}");
+    assert_npx_hooks(tmp.path());
+    for member in members {
+        let content = std::fs::read_to_string(tmp.path().join(member)).unwrap();
+        assert!(!content.contains("socket-patch"), "{member}: {content}");
+    }
+
+    let out = setup_command(tmp.path(), &["setup", "--check", "--json"])
+        .env("PATH", path.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let check: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(check["status"], "configured", "{check}");
+    assert_eq!(check["configured"], 1, "root only: {check}");
+}
+
+#[test]
+fn setup_vlt_before_rc13_emits_the_definite_advisory() {
+    let tmp = vlt_project(Some(VLT_LOCK_V1));
+    let path = vlt_reporting("1.0.0-rc.12");
+    let definite = format!("{VLT_ADVISORY_PREFIX} (`vlt --version` reports 1.0.0-rc.12)");
+    for extra in [&["--dry-run"][..], &["--yes"], &["--yes"]] {
+        let (code, v) = run_setup_with_path(tmp.path(), path.path(), extra);
+        assert_eq!(code, 0, "{extra:?}: {v}");
+        assert_eq!(warnings(&v), vec![definite.clone()], "{extra:?}: {v}");
+    }
+    assert_npx_hooks(tmp.path());
+}
+
+#[test]
+fn setup_vlt_rc13_and_later_emits_no_advisory_even_with_a_v0_lock() {
+    for version in ["1.0.0-rc.13", "1.2.0"] {
+        let tmp = vlt_project(Some(VLT_LOCK_V0));
+        let path = vlt_reporting(version);
+        let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+        assert_eq!(code, 0, "{version}: {v}");
+        assert!(warnings(&v).is_empty(), "{version}: {v}");
+    }
+}
+
+#[test]
+fn setup_vlt_unparseable_version_emits_no_advisory() {
+    let tmp = vlt_project(Some(VLT_LOCK_V0));
+    let path = vlt_reporting("not-a-version");
+    let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(warnings(&v).is_empty(), "{v}");
+}
+
+#[test]
+fn setup_vlt_without_a_usable_vlt_reads_the_lock() {
+    let may_v0 = format!(
+        "{VLT_ADVISORY_PREFIX} (vlt-lock.json has lockfileVersion 0, so this project may be \
+         installed by such a vlt)"
+    );
+    let may_a0 = format!(
+        "{VLT_ADVISORY_PREFIX} (vlt-lock.json has no lockfileVersion, so this project may be \
+         installed by such a vlt)"
+    );
+    let failing = vlt_path(Some((
+        "echo 1.0.0-rc.12; exit 3",
+        "echo 1.0.0-rc.12\r\nexit /b 3",
+    )));
+    let missing = vlt_path(None);
+    for (path, lock, want) in [
+        (&missing, VLT_LOCK_V0, Some(&may_v0)),
+        (&missing, "{\"nodes\":{},\"edges\":{}}\n", Some(&may_a0)),
+        (&missing, VLT_LOCK_V1, None),
+        (&failing, VLT_LOCK_V0, Some(&may_v0)),
+        (&failing, VLT_LOCK_V1, None),
+    ] {
+        let tmp = vlt_project(Some(lock));
+        let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+        assert_eq!(code, 0, "{lock}: {v}");
+        let want: Vec<String> = want.into_iter().cloned().collect();
+        assert_eq!(warnings(&v), want, "{lock}: {v}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_vlt_version_probe_times_out_to_the_lock_sniff() {
+    let tmp = vlt_project(Some(VLT_LOCK_V0));
+    let path = vlt_path(Some(("exec /bin/sleep 60", "")));
+    let started = std::time::Instant::now();
+    let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(5)
+            && elapsed < std::time::Duration::from_secs(30),
+        "the probe must wait out its 5 s budget and no longer: {elapsed:?}"
+    );
+    assert_eq!(
+        warnings(&v),
+        vec![format!(
+            "{VLT_ADVISORY_PREFIX} (vlt-lock.json has lockfileVersion 0, so this project may \
+             be installed by such a vlt)"
+        )],
+        "{v}"
+    );
+}
+
+#[test]
+fn setup_npm_project_never_probes_vlt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        "{ \"name\": \"npm-proj\", \"version\": \"1.0.0\" }\n",
+    );
+    let path = vlt_reporting("1.0.0-rc.12");
+    let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["packageManager"], "npm", "{v}");
+    assert!(warnings(&v).is_empty(), "{v}");
+}

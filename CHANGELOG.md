@@ -375,6 +375,18 @@ into the new version's section — see docs/releasing.md.
   the patched blob in `.socket/blobs`, and is omitted as
   `vendor_manifest_unverifiable` when that blob is absent. `setup.manual`
   accepts `vlt`.
+- **`setup` wires vlt projects.** A `vlt-lock.json`, `vlt.json`,
+  `node_modules/.vlt-lock.json` or `node_modules/.vlt/` directory in the
+  project root makes `setup` treat it as vlt, ahead of any pnpm marker. The
+  hook is npm's `npx @socketsecurity/socket-patch apply --silent --ecosystems
+  npm`, and a vlt workspace (vlt.json `workspaces`, or vlt <= 0.0.0-12's
+  `vlt-workspaces.json`) is wired at the root only, because vlt runs the
+  root hook once per install. The `setup --json` `packageManager` and the
+  `patch_setup` telemetry `manager` report `vlt`. vlt before 1.0.0-rc.13
+  never runs a root `postinstall`: `setup` still wires the project and
+  warns `vlt_root_scripts_not_run` — definitely when the `vlt` on `PATH`
+  reports such a version, and as a "may" when no usable `vlt` is found and
+  `vlt-lock.json` has `lockfileVersion` 0 or none.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

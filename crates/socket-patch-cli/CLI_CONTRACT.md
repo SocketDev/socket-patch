@@ -364,7 +364,7 @@ still show up in VEX).
 
 | Ecosystem | Hook `setup` installs | Repatch trigger | Notes |
 |---|---|---|---|
-| npm / yarn / pnpm / bun | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`) | pnpm: root package only |
+| npm / yarn / pnpm / bun / vlt | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`); vlt: every install that changes the graph (`vlt install`, `install <pkg>`, `vlt ci`), never a no-op install | pnpm and vlt: root package only. vlt gets npm's `npx` hook (never `vlx`) and is detected by `vlt-lock.json`, `vlt.json`, `node_modules/.vlt-lock.json` or a `node_modules/.vlt/` directory in `--cwd` (before the pnpm markers; an ancestor `vlt.json` is ignored). vlt < 1.0.0-rc.13 never runs a root `postinstall`: `setup` still wires it and warns `vlt_root_scripts_not_run`. A failing hook aborts and rolls back the whole `vlt install`, so `apply --silent` exits 0 when there is nothing to do (no manifest); a manifest whose only patch targets a package that is not installed exits 1 and aborts the install, as it fails `npm install` |
 | pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
 | gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | the plugin is `path:`-sourced (a `git:` dir source is uncloneable — the generated dir is not a git repo — and fails `bundle install`); the dir must be committed so clones/CI have it; CLI must be on `PATH`. Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
 | composer | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH` |
@@ -396,8 +396,11 @@ in `setup.manual` for VEX attestation.
 How `setup` (and the underlying `scan`/`apply` crawlers) find subprojects differs by ecosystem, and
 the model is **not uniform** today:
 
-- **Workspace-aware (walk members):** npm / yarn / pnpm / bun (`workspaces` / `pnpm-workspace.yaml`).
-  One repo-root invocation discovers and configures every member. *Single level only* — see property
+- **Workspace-aware (walk members):** npm / yarn / pnpm / bun / vlt (`workspaces` / `pnpm-workspace.yaml` /
+  vlt.json `workspaces` — a glob, a list, or named groups of either — or vlt <= 0.0.0-12's
+  `vlt-workspaces.json`; vlt's declaration wins over the others and vlt never reads package.json
+  `workspaces`). One repo-root invocation discovers and configures every member (pnpm and vlt: the
+  root package only — vlt runs the root hook once per install, even one started from a member). *Single level only* — see property
   9's nested-workspace gap.
 - **cwd-only (single project):** gem, pypi, composer. The crawler inspects only the project
   rooted at `--cwd` (pypi looks at `$VIRTUAL_ENV`, `<cwd>/.venv` / `venv`, then a Poetry project's out-of-tree virtualenv(s) under Poetry's `virtualenvs.path`; composer at the vendor tree); it does **not**
@@ -474,11 +477,11 @@ plugin — emitted only when a registration existed; `status: error` carries the
   "updated":            0,
   "alreadyConfigured":  0,
   "errors":             0,
-  "packageManager":      "npm" | "pnpm",                 // always emitted; defaults to "npm", only meaningful when npm files were found
+  "packageManager":      "npm" | "pnpm" | "vlt",         // always emitted; defaults to "npm", only meaningful when npm files were found ("vlt" is additive)
   "pythonPackageManager":"pip" | "uv" | "poetry" | "pdm" | "hatch",  // present only when Python detected
   "dryRun":   true,                                      // only on status=dry_run
   "wouldUpdate": 0,                                      // only on status=dry_run
-  "warnings": [ "..." ],                                 // only when non-empty (e.g. lockfile refresh)
+  "warnings": [ "..." ],                                 // only when non-empty (e.g. lockfile refresh; "vlt_root_scripts_not_run: <detail>")
   "files": [
     { "kind": "package_json", "path": "...", "status": "updated" | "already_configured" | "error",
       "error": null | "..." }
@@ -1298,6 +1301,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `redirect_vlt_no_lockfile` | `redirect.warnings[]` (warning) | scan/get `--mode hosted` (vlt): `vlt.json` or vlt's install state is present without `vlt-lock.json`; replaces `redirect_npm_no_lockfile` for vlt projects. |
 | `redirect_vlt_artifact_unverifiable` | `redirect.warnings[]` (warning), `redirect.skipped[].reason` | scan/get `--mode hosted` (vlt): before any takeover or rewrite (dry runs included), each granted artifact with a default-registry instance in `vlt-lock.json` (or, for a purl a `flavor: "vlt"` vendored entry claims, its vendored node, probed before the takeover reverts it) is fetched once as vlt fetches it (`accept-encoding: gzip;q=1.0, identity;q=0.5`, no `Authorization`, up to 10 redirects) and must return 200 with no content encoding (or `identity`) and the granted sha512. On failure (`content-encoding <v>`, `sha512 mismatch`, `http <status>`, `fetch error <e>`, `offline`) the dep is withheld from every rewriter when vlt drives or it is vlt-vendored (which also keeps it vendored), and from the vlt rewrite only otherwise (detail "…; vlt-lock.json was not changed for {purl}"; only the sibling lock this run rewrote can confirm it). A lock already pinned by an earlier run is left pinned, and neither confirmed nor attested. Projects without `vlt-lock.json` make no such request. Exit 0. |
 | `redirect_vlt_reinstall_required` | `redirect.warnings[]` (advisory); rollback/remove `warnings[]` (+ human stderr) | vlt: `vlt-lock.json` pins (or, after rollback/remove, no longer pins) Socket-patched packages, and vlt never refreshes an installed copy. The heal removes `node_modules/.vlt-lock.json` and each stale `node_modules/.vlt/<DepID>` of a Socket-owned node (never a link's target, never outside the project, never a copy it cannot judge) unless `--no-vlt-install-cleanup` or `--dry-run`; the detail says whether copies were removed, left stale, could not be checked, or none were stale. Stale or unchecked copies are not attested by the run's `--vex`, nor is a confirmed vlt pin the heal did not check (a URL on a host other than patch.socket.dev and the configured `--patch-server-url`/`--api-url`). A hidden lock that cannot be removed keeps every store entry. Invalidation failures only warn. |
+| `vlt_root_scripts_not_run` | setup `warnings[]` entry `vlt_root_scripts_not_run: <detail>` (advisory; human: `Warning (vlt_root_scripts_not_run): <detail>` on stderr, muted by `--silent`) | setup (vlt project, npm in scope, every non-`no_files` run incl. `--dry-run` and already-configured): vlt before 1.0.0-rc.13 never runs a root `postinstall`, so the wired hook would not fire. Definite when the `vlt` on `PATH` (absolute entries only; spawned with `VLT_TELEMETRY=0`, 5 s budget) reports a semver below 1.0.0-rc.13 (the detail ends in "(`vlt --version` reports <v>)"); an unparseable `--version` never warns. Without a usable `vlt` (absent, non-zero exit, timeout) it is a "may" when `vlt-lock.json` has `lockfileVersion` `0` or none. Remedy: upgrade vlt or run `socket-patch apply` after `vlt ci`. The hook is still written. |
 | `vendor_prebuilt_stub_invalid` | `failed` / `skipped` (warning) | vendor (gem, `--vendor-source`): the served stub gemspec fails the rubygems `summary`/`authors` bar, so bundler would refuse the vendored path source at install time. `service`: refusal naming the missing attributes; `auto`: loud warning + local-build fallback — or, when the gem is also not installed locally (no stub to derive), a refusal naming the served defect and the install-the-gem remedy. |
 | `gem_spec_invalid` | `failed` | vendor (gem): the LOCAL `specifications/` stub gemspec fails the same rubygems `summary`/`authors` bar (a corrupted or hand-edited gem home); the refusal names the file — reinstall the gem (`gem pristine <name>` / fresh `bundle install`). |
 | `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
