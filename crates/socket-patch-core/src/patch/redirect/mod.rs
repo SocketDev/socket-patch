@@ -41,6 +41,7 @@ mod lock_index_equivalence_tests;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
+pub mod presence;
 // pub(crate): manifest-less VEX discovery (`vex::discover::npm`) reads
 // hosted pnpm locks with the SAME grammar this rewriter writes them in.
 pub(crate) mod pnpm;
@@ -4364,6 +4365,14 @@ fn rewrite_uv_lock(
 /// `vex` had nothing to attest.
 pub fn artifact_url_present(text: &str, artifact_url: &str) -> bool {
     text.contains(artifact_url) || text.contains(&artifact_url.replace('/', "\\/"))
+}
+
+/// The needles [`artifact_url_present`] searches for, in the same order: the
+/// raw url, then its `\/`-escaped spelling. A multi-needle probe
+/// ([`presence::groups_present`]) built from these answers exactly what
+/// `artifact_url_present` answers for every text.
+pub fn artifact_url_spellings(artifact_url: &str) -> [String; 2] {
+    [artifact_url.to_string(), artifact_url.replace('/', "\\/")]
 }
 
 /// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
