@@ -43,6 +43,7 @@ use super::common::{
     refuse_symlinked, refused, service_offline_conflict, stage_dir_for, swap_stage_into_place,
     synthesized_result,
 };
+use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_tgz};
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -239,6 +240,20 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
 /// Registry indexes are matched against the config-declared
 /// `[registries.socket-patch-*]` URLs, not a hardcoded host, so test
 /// registries are recognised too. `Some(description)` when residue is found.
+/// The run's parse of the workspace-root `Cargo.toml` for the per-crate
+/// pre-flight, which only reads it: a cargo vendor run asks it about every
+/// patched crate, and on an in-sync re-run the manifest never changes. See
+/// [`ParseMemo`] — the read still happens every time, and bytes that moved
+/// are parsed afresh ([`cargo_manifest::parse_manifest`] is a pure function
+/// of them).
+static MANIFEST_MEMO: ParseMemo<toml_edit::DocumentMut> = ParseMemo::new();
+
+/// The Socket registry pins of each manifest [`hosted_redirect_residue`]
+/// reads (the root one and every member's), extracted once per manifest
+/// bytes: the residue check runs once per patched crate over the same few
+/// manifests. One slot per manifest a workspace commonly has.
+static PIN_MEMO: ParseMemo<crate::patch::redirect::CargoRegistryPins, 8> = ParseMemo::new();
+
 async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str) -> Option<String> {
     let socket_indexes = cargo_config::socket_registry_indexes(project_root).await;
     if let cargo_lock::LockEntryProbe::Source(src) =
@@ -275,7 +290,10 @@ async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str)
         // (`legacy = { package = "<crate>", … }`) — shapes a
         // `<name> = { … }` regex reads as "not redirected", which is exactly
         // the half-reverted state this guard exists for.
-        if let Some(reg) = crate::patch::redirect::cargo_socket_registry_pin(&toml, name) {
+        let pins = PIN_MEMO.parse_infallible(toml.as_bytes(), || {
+            crate::patch::redirect::CargoRegistryPins::of(&toml)
+        });
+        if let Some(reg) = pins.pin_for(name) {
             return Some(format!(
                 "{rel} pins `{name}` to the socket-patch hosted registry `{reg}`"
             ));
@@ -642,10 +660,12 @@ pub async fn vendor_cargo_crate<'a>(
         return refused(code, detail);
     }
     let manifest_doc = match cargo_manifest::read_manifest(project_root).await {
-        Ok(text) => match cargo_manifest::parse_manifest(&text) {
-            Ok(doc) => doc,
-            Err(e) => return refused(e.code(), e.detail().to_string()),
-        },
+        Ok(text) => {
+            match MANIFEST_MEMO.parse(text.as_bytes(), || cargo_manifest::parse_manifest(&text)) {
+                Ok(doc) => doc,
+                Err(e) => return refused(e.code(), e.detail().to_string()),
+            }
+        }
         Err(e) => {
             return refused(
                 e.code(),
@@ -6480,5 +6500,73 @@ mod tests {
             "the local build"
         );
         assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
+    }
+
+    /// V-7: the per-manifest pin extraction answers
+    /// [`crate::patch::redirect::cargo_socket_registry_pin`] for every crate
+    /// — over manifests mixing every declaration shape (inline, table,
+    /// dotted, renamed, quoted, target and workspace tables), several pins
+    /// for one crate (the first wins), foreign registries, comments,
+    /// array-of-tables headers and non-dependency tables.
+    #[test]
+    fn extracted_registry_pins_match_the_per_crate_scan() {
+        use crate::patch::redirect::{cargo_socket_registry_pin, CargoRegistryPins};
+        let ours = |n: u8| format!("socket-patch-{n:08x}-1d3a-4f6b-8c2d-7e5a9b1c3d5f");
+        let pieces: Vec<String> = vec![
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n".into(),
+            format!("[dependencies]\nserde = {{ version = \"1\", registry = \"{}\" }}\n", ours(1)),
+            format!(
+                "[dependencies]\nlegacy = {{ package = \"serde\", registry = \"{}\" }}\n",
+                ours(2)
+            ),
+            format!("[dependencies.serde]\nversion = \"1\"\nregistry = \"{}\"\n", ours(3)),
+            format!(
+                "[dev-dependencies.old]\npackage = \"cfg-if\"\n# c\nregistry = \"{}\"\n",
+                ours(4)
+            ),
+            format!("[dependencies]\nserde.registry = \"{}\"\n", ours(5)),
+            format!("[dependencies]\n\"cfg-if\" = {{ registry = \"{}\" }}\n", ours(6)),
+            format!(
+                "[target.'cfg(unix)'.dependencies]\nlibc = {{ version = \"0.2\", registry = \"{}\" }}\n",
+                ours(7)
+            ),
+            format!(
+                "[workspace.dependencies.libc]\nversion = \"0.2\"\nregistry = \"{}\"\n",
+                ours(8)
+            ),
+            "[dependencies]\nserde = { version = \"1\", registry = \"corp-mirror\" }\n".into(),
+            format!("[[bin]]\nname = \"x\"\nregistry = \"{}\"\n", ours(9)),
+            format!("[features]\nserde = {{ registry = \"{}\" }}\n", ours(10)),
+            "[dependencies]\nserde = \"1\"\n# serde = { registry = \"socket-patch-x\" }\n".into(),
+            format!(
+                "[target.x86_64-unknown-linux-gnu.build-dependencies.cc]\nregistry = \"{}\"\n",
+                ours(11)
+            ),
+            format!("[dependencies]\nlibc = {{ registry = \"{}\"\n", ours(12)),
+        ];
+        let crates = [
+            "serde", "legacy", "cfg-if", "old", "libc", "cc", "x", "app", "nope",
+        ];
+        let mut seed = 7u64;
+        let mut found = 0usize;
+        for round in 0..400 {
+            let mut manifest = String::new();
+            for _ in 0..(round % 9) {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                manifest.push_str(&pieces[(seed >> 33) as usize % pieces.len()]);
+                manifest.push('\n');
+            }
+            let pins = CargoRegistryPins::of(&manifest);
+            for name in crates {
+                let scan = cargo_socket_registry_pin(&manifest, name);
+                found += usize::from(scan.is_some());
+                assert_eq!(
+                    pins.pin_for(name),
+                    scan,
+                    "round {round} crate {name}:\n{manifest}"
+                );
+            }
+        }
+        assert!(found > 500, "the manifests must carry pins: {found}");
     }
 }
