@@ -510,3 +510,59 @@ async fn vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store() {
     );
     assert!(!root.join("node_modules/.vlt-lock.json").exists());
 }
+
+/// An optional hosted pin taken over by `scan --mode vendored`: the
+/// hosted store copy stays (vlt would not reinstall a removed optional
+/// node), and the advisory says how to refresh it.
+#[tokio::test(flavor = "multi_thread")]
+async fn vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let lock = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    {}\n  }},\n  \
+         \"edges\": {{\n    \"file~_d left-pad\": \"optional 1.3.0 {TILDE_ID}\"\n  }}\n}}\n",
+        hosted::with_flags(&hosted::registry_node(TILDE_ID), 1)
+    );
+    std::fs::write(root.join("vlt-lock.json"), &lock).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"consumer\",\n  \"optionalDependencies\": {\n    \"left-pad\": \
+         \"1.3.0\"\n  }\n}\n",
+    )
+    .unwrap();
+    hosted::install_importer(root, PRISTINE);
+    let (code, env, stderr) = scan(root, &server, "hosted", &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(hosted::redirected(&env), 1, "{env:#}");
+    hosted::install_store(root, TILDE_ID, PATCHED);
+    hosted::write_hidden_lock(
+        root,
+        &[hosted::with_flags(
+            &hosted::pinned_node(TILDE_ID, &server),
+            1,
+        )],
+    );
+
+    let (code, env, stderr) = scan(root, &server, "vendored", &[]);
+
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert!(
+        hosted::read(root, "vlt-lock.json").contains(&rel()),
+        "{env:#}"
+    );
+    assert_eq!(
+        detail_of(&env, "redirect_vlt_reinstall_required"),
+        format!(
+            "vendored 1 hosted-pinned packages, but node_modules still holds 1 copies of the \
+             hosted artifacts of optional dependencies; {}",
+            hosted::OPTIONAL_KEPT
+        )
+    );
+    assert_eq!(
+        std::fs::read(hosted::store_dir(root, TILDE_ID).join("index.js")).unwrap(),
+        PATCHED
+    );
+    assert!(root.join("node_modules/.vlt-lock.json").exists());
+}

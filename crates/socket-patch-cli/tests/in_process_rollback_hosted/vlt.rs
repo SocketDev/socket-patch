@@ -190,6 +190,94 @@ async fn vlt_rollback_of_a_pristine_tree_keeps_it() {
     assert!(root.join("node_modules/.vlt-lock.json").exists());
 }
 
+/// A hosted scan of a project whose left-pad node is optional (`flags`),
+/// followed by vlt's warm install of the pin.
+async fn hosted_optional_project(root: &Path, flags: u8) -> MockServer {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    write_vlt_project(root, Era::V1);
+    let registry = with_flags(&registry_node(TILDE_ID), flags);
+    std::fs::write(root.join("vlt-lock.json"), vlt_lock(Era::V1, &[registry])).unwrap();
+    let (_, doc) = scan_hosted(root, &server, &[], &[]);
+    assert_eq!(redirected(&doc), 1, "{doc:#}");
+    let pinned = with_flags(&pinned_node(TILDE_ID, &server), flags);
+    assert_eq!(
+        read(root, "vlt-lock.json"),
+        vlt_lock(Era::V1, std::slice::from_ref(&pinned))
+    );
+    install_store(root, TILDE_ID, PATCHED);
+    write_hidden_lock(root, &[pinned]);
+    server
+}
+
+fn optional_kept(restored: usize, kept: usize) -> String {
+    format!(
+        "restored registry pins for {restored} packages, but node_modules still holds {kept} \
+         patched copies of optional dependencies; {OPTIONAL_KEPT}"
+    )
+}
+
+#[tokio::test]
+async fn vlt_rollback_keeps_a_patched_optional_copy() {
+    for (verb, flags) in [("rollback", 1), ("rollback", 3), ("remove", 1)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let _server = hosted_optional_project(root, flags).await;
+        let targets: &[&str] = if verb == "remove" { &[PURL] } else { &[] };
+
+        let (_, doc) = run_verb(root, verb, targets);
+
+        assert_eq!(
+            read(root, "vlt-lock.json"),
+            vlt_lock(Era::V1, &[with_flags(&registry_node(TILDE_ID), flags)]),
+            "{verb} flags={flags}"
+        );
+        assert_eq!(
+            advisory_details(&doc),
+            [optional_kept(1, 1)],
+            "{verb} flags={flags}: {doc:#}"
+        );
+        assert_eq!(
+            std::fs::read(store_dir(root, TILDE_ID).join("index.js")).unwrap(),
+            PATCHED,
+            "{verb} flags={flags}"
+        );
+        assert!(root.join("node_modules/.vlt-lock.json").exists());
+    }
+}
+
+/// Once vlt re-locked the package, the healed DepID is gone from the lock,
+/// so the heal goes by the flags the ledger recorded for it.
+#[tokio::test]
+async fn vlt_rollback_after_relock_goes_by_the_recorded_flags() {
+    for flags in [0, 1] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let _server = hosted_optional_project(root, flags).await;
+        let relocked = vlt_lock(
+            Era::V1,
+            &[with_flags(&registry_node(TILDE_ID), flags).replace("1.3.0", "1.3.1")],
+        );
+        std::fs::write(root.join("vlt-lock.json"), &relocked).unwrap();
+        write_hidden_lock(root, &[]);
+
+        let (_, doc) = run_verb(root, "rollback", &[]);
+
+        assert_eq!(read(root, "vlt-lock.json"), relocked);
+        let (advisory, kept) = if flags == 0 {
+            (RESTORED.to_string(), false)
+        } else {
+            (optional_kept(1, 1), true)
+        };
+        assert_eq!(advisory_details(&doc), [advisory], "flags={flags}: {doc:#}");
+        assert_eq!(
+            store_dir(root, TILDE_ID).join("index.js").exists(),
+            kept,
+            "flags={flags}"
+        );
+    }
+}
+
 const OTHER: &str = "right-pad";
 const OTHER_UUID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 

@@ -5,8 +5,9 @@
 //! hidden lock as they are. A store entry whose bytes are not the ones the
 //! lock now pins is invalidated (the entry plus `node_modules/.vlt-lock.json`)
 //! so the next install extracts the pinned artifact. An entry whose state
-//! cannot be determined is never removed, and nothing outside the project
-//! root is ever touched.
+//! cannot be determined is never removed, nor is one vlt would not
+//! reinstall (an optional node), and nothing outside the project root is
+//! ever touched.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -81,6 +82,8 @@ pub struct OwnedInstance {
     pub patch_uuid: String,
     pub url: String,
     pub sha512: Option<String>,
+    /// Slot [0]: 0 prod, 1 optional, 2 dev, 3 dev+optional.
+    pub flags: Option<u64>,
 }
 
 /// A store entry to classify.
@@ -94,6 +97,8 @@ pub struct Target<'a> {
     pub record: Option<&'a PatchRecord>,
     /// The artifact bytes the preflight downloaded.
     pub artifact: Option<&'a [u8]>,
+    /// Slot [0] of the node, see [`reinstalls_after_removal`].
+    pub flags: Option<u64>,
 }
 
 /// A ledger vlt node of one purl, for the rollback heal.
@@ -103,6 +108,8 @@ pub struct LedgerTarget {
     pub dep_id: String,
     pub name: String,
     pub record: Option<PatchRecord>,
+    /// Slot [0] of the recorded pristine entry.
+    pub flags: Option<u64>,
 }
 
 /// What invalidation removed and what it could not.
@@ -156,6 +163,7 @@ pub fn socket_owned_instances(lock_text: &str, origins: &[String]) -> Vec<OwnedI
             patch_uuid,
             url: url.to_string(),
             sha512: tuple.get(2).and_then(Value::as_str).map(str::to_string),
+            flags: tuple.get(0).and_then(Value::as_u64),
         });
     }
     out
@@ -171,6 +179,24 @@ pub fn lock_sha512(lock_text: &str, dep_id: &str) -> Option<String> {
         .get(2)?
         .as_str()
         .map(str::to_string)
+}
+
+/// Slot [0] of `dep_id`'s node in `lock_text`.
+pub fn lock_flags(lock_text: &str, dep_id: &str) -> Option<u64> {
+    let LockSniff::Readable(lock) = sniff_lock(lock_text) else {
+        return None;
+    };
+    lock.nodes()?.get(dep_id)?.get(0)?.as_u64()
+}
+
+/// Whether `vlt install` puts a node's store entry back once the heal has
+/// removed it. Only prod and dev nodes: vlt treats a missing optional node
+/// (flags 1 or 3) as a skipped optional dependency, so every release from
+/// 0.0.0-32 to 1.2.0 leaves it missing (its importer link dangling) unless
+/// the same install also reinstalls a non-optional node; `vlt ci` restores
+/// it. Unknown flags are not guaranteed either.
+pub fn reinstalls_after_removal(flags: Option<u64>) -> bool {
+    matches!(flags, Some(0 | 2))
 }
 
 /// vlt's `isDepID` path-safety rule: the id is used as one path segment.
@@ -474,6 +500,7 @@ pub fn ledger_targets(state: &RedirectState, purls: &[String]) -> Vec<LedgerTarg
                 dep_id: entry.key.to_string(),
                 name: name.clone(),
                 record: record.clone(),
+                flags: entry.elems[0].parse().ok(),
             });
         }
     }
@@ -538,6 +565,7 @@ mod tests {
             lock_sha512: Some(LOCK_SHA),
             record,
             artifact,
+            flags: Some(0),
         }
     }
 
@@ -955,5 +983,67 @@ mod tests {
         let ids: Vec<&str> = targets.iter().map(|t| t.dep_id.as_str()).collect();
         assert_eq!(ids, ["~npm~left-pad@1.3.0", "~npm~left-pad@1.3.0~peer.2"]);
         assert!(targets.iter().all(|t| t.record.is_some()));
+        assert!(targets.iter().all(|t| t.flags == Some(0)));
+    }
+
+    #[test]
+    fn ledger_targets_carry_the_recorded_flags() {
+        let mut state = RedirectState::new();
+        state.edits = [
+            (0, "~npm~left-pad@1.3.0"),
+            (3, "~npm~left-pad@1.3.0~peer.1"),
+        ]
+        .into_iter()
+        .map(|(flags, id)| FileEdit {
+            path: "vlt-lock.json".into(),
+            kind: vlt::KIND.into(),
+            action: "rewritten".into(),
+            key: Some(id.trim_start_matches("~npm~").into()),
+            original: Some(Value::String(format!("\"{id}\": [{flags},\"left-pad\"]"))),
+            new: None,
+        })
+        .collect();
+        let flags: Vec<Option<u64>> = ledger_targets(&state, &["pkg:npm/left-pad@1.3.0".into()])
+            .iter()
+            .map(|t| t.flags)
+            .collect();
+        assert_eq!(flags, [Some(0), Some(3)]);
+    }
+
+    #[test]
+    fn only_prod_and_dev_nodes_are_reinstalled_after_removal() {
+        assert!(reinstalls_after_removal(Some(0)));
+        assert!(reinstalls_after_removal(Some(2)));
+        for flags in [Some(1), Some(3), Some(4), None] {
+            assert!(!reinstalls_after_removal(flags), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn owned_instances_and_lock_flags_read_slot_zero() {
+        let lock = r#"{
+  "lockfileVersion": 1,
+  "options": {},
+  "nodes": {
+    "~npm~fsevents@2.3.3": [1,"fsevents","sha512-F","https://patch.socket.dev/patch/npm/t/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/fsevents-2.3.3.tgz",null,null,null,{"os":["darwin"]}],
+    "~npm~ms@2.1.2": [3,"ms","sha512-M","https://patch.socket.dev/patch/npm/t/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/ms-2.1.2.tgz"],
+    "~npm~semver@7.6.0": [2,"semver"]
+  },
+  "edges": {}
+}
+"#;
+        let flags: Vec<(String, Option<u64>)> = socket_owned_instances(lock, &[])
+            .into_iter()
+            .map(|i| (i.dep_id, i.flags))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("~npm~fsevents@2.3.3".to_string(), Some(1)),
+                ("~npm~ms@2.1.2".to_string(), Some(3)),
+            ]
+        );
+        assert_eq!(lock_flags(lock, "~npm~semver@7.6.0"), Some(2));
+        assert_eq!(lock_flags(lock, "~npm~absent@1.0.0"), None);
     }
 }

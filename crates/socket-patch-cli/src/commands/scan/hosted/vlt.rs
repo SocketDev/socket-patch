@@ -208,14 +208,17 @@ fn cleanup_disabled(common: &crate::args::GlobalArgs) -> bool {
 struct HealTally {
     invalidated: usize,
     stale_left: usize,
+    /// Stale optional copies the heal never removes (see
+    /// [`vlt_heal::reinstalls_after_removal`]).
+    optional_left: usize,
     undeterminable: usize,
     stale_uuids: BTreeSet<String>,
     undeterminable_uuids: BTreeSet<String>,
 }
 
 /// Classify `targets` against `expected` and invalidate the stale ones
-/// unless cleanup is off. `(dep_id, name, lock sha512, record, artifact,
-/// uuid)` per target.
+/// vlt reinstalls, unless cleanup is off; `(target, uuid or purl)` per
+/// target.
 async fn heal_targets(
     common: &crate::args::GlobalArgs,
     targets: &[(Target<'_>, &str)],
@@ -229,6 +232,10 @@ async fn heal_targets(
     let mut stale: Vec<(String, &str)> = Vec::new();
     for (target, uuid) in targets {
         match classify_target(&state, &common.cwd, target, expected).await {
+            TargetState::Stale if !vlt_heal::reinstalls_after_removal(target.flags) => {
+                tally.optional_left += 1;
+                tally.stale_uuids.insert((*uuid).to_string());
+            }
             TargetState::Stale => stale.push((target.dep_id.to_string(), uuid)),
             TargetState::Undeterminable => {
                 tally.undeterminable += 1;
@@ -265,13 +272,25 @@ async fn heal_targets(
     tally
 }
 
+/// Why the heal keeps stale optional copies, and what refreshes them.
+const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt install` does not \
+     reinstall a removed optional dependency. Run `vlt ci` (or delete node_modules and run `vlt \
+     install`); vlt releases before 1.0.5 install no optional dependency from the lock of a \
+     project that declares only optional dependencies.";
+
 fn reinstall_detail(tally: &HealTally) -> String {
     if tally.stale_left > 0 {
         format!(
             "vlt-lock.json pins Socket-patched packages, but node_modules still holds {} \
              unpatched copies and `vlt install` will not refresh them; run `vlt ci` (or re-run \
              without --no-vlt-install-cleanup).",
-            tally.stale_left
+            tally.stale_left + tally.optional_left
+        )
+    } else if tally.optional_left > 0 {
+        format!(
+            "vlt-lock.json pins Socket-patched packages, but node_modules still holds {} \
+             unpatched copies of optional dependencies; {OPTIONAL_KEPT}",
+            tally.optional_left
         )
     } else if tally.undeterminable > 0 {
         undeterminable_detail(tally.undeterminable)
@@ -345,6 +364,7 @@ pub(super) async fn heal_after_rewrite(
                         lock_sha512: i.sha512.as_deref(),
                         record,
                         artifact: inputs.preflight.artifacts.get(&i.url).map(Vec::as_slice),
+                        flags: i.flags,
                     },
                     i.patch_uuid.as_str(),
                 )
@@ -390,17 +410,20 @@ pub(crate) async fn rollback_heal(
     let lock = socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join(VLT_LOCK))
         .await
         .ok();
-    let shas: Vec<Option<String>> = targets
+    let slots: Vec<(Option<String>, Option<u64>)> = targets
         .iter()
-        .map(|t| {
-            lock.as_deref()
-                .and_then(|l| vlt_heal::lock_sha512(l, &t.dep_id))
+        .map(|t| match lock.as_deref() {
+            Some(l) => (
+                vlt_heal::lock_sha512(l, &t.dep_id),
+                vlt_heal::lock_flags(l, &t.dep_id).or(t.flags),
+            ),
+            None => (None, t.flags),
         })
         .collect();
     let classified: Vec<(Target<'_>, &str)> = targets
         .iter()
-        .zip(&shas)
-        .map(|(t, sha)| {
+        .zip(&slots)
+        .map(|(t, (sha, flags))| {
             (
                 Target {
                     dep_id: &t.dep_id,
@@ -408,6 +431,7 @@ pub(crate) async fn rollback_heal(
                     lock_sha512: sha.as_deref(),
                     record: t.record.as_ref(),
                     artifact: None,
+                    flags: *flags,
                 },
                 t.purl.as_str(),
             )
@@ -421,7 +445,14 @@ pub(crate) async fn rollback_heal(
              copies and `vlt install` will not refresh them; run `vlt ci` (or re-run without \
              --no-vlt-install-cleanup)",
             restored.len(),
-            tally.stale_left
+            tally.stale_left + tally.optional_left
+        )
+    } else if tally.optional_left > 0 {
+        format!(
+            "restored registry pins for {} packages, but node_modules still holds {} patched \
+             copies of optional dependencies; {OPTIONAL_KEPT}",
+            restored.len(),
+            tally.optional_left
         )
     } else if tally.undeterminable > 0 {
         undeterminable_detail(tally.undeterminable)
@@ -458,6 +489,7 @@ pub(crate) async fn takeover_heal(
                     lock_sha512: None,
                     record: t.record.as_ref(),
                     artifact: None,
+                    flags: t.flags,
                 },
                 t.purl.as_str(),
             )
@@ -470,7 +502,14 @@ pub(crate) async fn takeover_heal(
             "vendored {} hosted-pinned packages, but node_modules still holds {} copies of the \
              hosted artifacts; run `vlt install` (or re-run without --no-vlt-install-cleanup)",
             vendored.len(),
-            tally.stale_left
+            tally.stale_left + tally.optional_left
+        )
+    } else if tally.optional_left > 0 {
+        format!(
+            "vendored {} hosted-pinned packages, but node_modules still holds {} copies of the \
+             hosted artifacts of optional dependencies; {OPTIONAL_KEPT}",
+            vendored.len(),
+            tally.optional_left
         )
     } else if tally.undeterminable > 0 {
         undeterminable_detail(tally.undeterminable)
@@ -509,8 +548,11 @@ mod tests {
         assert!(reinstall_detail(&tally).contains("socket-patch removed 2 stale installed copies"));
         tally.undeterminable = 1;
         assert!(reinstall_detail(&tally).contains("could not check 1 installed copies"));
+        tally.optional_left = 2;
+        assert!(reinstall_detail(&tally)
+            .contains("still holds 2 unpatched copies of optional dependencies; socket-patch"));
         tally.stale_left = 3;
-        assert!(reinstall_detail(&tally).contains("still holds 3 unpatched copies"));
+        assert!(reinstall_detail(&tally).contains("still holds 5 unpatched copies and"));
     }
 
     fn left_pad_dep(url: &str) -> DepOverride {

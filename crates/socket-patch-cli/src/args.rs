@@ -369,7 +369,8 @@ pub struct GlobalArgs {
     /// entries) after `vlt-lock.json` is repointed or restored. vlt never
     /// refreshes an installed copy on its own, so opting out means running
     /// `vlt ci` instead (the run's `redirect_vlt_reinstall_required`
-    /// advisory says so). Other subcommands accept it silently.
+    /// advisory says so). Optional dependencies' copies are never removed.
+    /// Other subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "no-vlt-install-cleanup",

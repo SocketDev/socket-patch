@@ -303,10 +303,12 @@ into the new version's section — see docs/releasing.md.
   extracts the patched packages; `rollback` and `remove` do the same for
   the registry bytes. New `--no-vlt-install-cleanup` /
   `SOCKET_NO_VLT_INSTALL_CLEANUP` keeps them, and the
-  `redirect_vlt_reinstall_required` advisory says what to run. A same-run
-  `--vex` does not attest a vlt package whose installed copy is stale or
-  unchecked, whose lock a vlt release may ignore, or which also resolves
-  from a non-default registry. vlt ledgers require the socket-patch
+  `redirect_vlt_reinstall_required` advisory says what to run. A stale
+  copy of an optional dependency is never removed, because `vlt install`
+  would not put it back; the advisory says to run `vlt ci` instead. A
+  same-run `--vex` does not attest a vlt package whose installed copy is
+  stale or unchecked, whose lock a vlt release may ignore, or which also
+  resolves from a non-default registry. vlt ledgers require the socket-patch
   release that adds vlt support.
 - **`vendor` wires vlt projects.** A `vlt-lock.json` (lockfileVersion 0
   or 1) routes npm vendoring to the new vlt backend ahead of every other

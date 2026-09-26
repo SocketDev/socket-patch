@@ -924,6 +924,85 @@ async fn scan_redirect_vlt_heal_rule_c_no_record_uses_artifact_bytes() {
     );
 }
 
+/// A warm install of `nodes` (each `(DepID, flags)`) holding `index`, with
+/// a hidden lock recording their registry integrity.
+fn write_installed_flagged(root: &Path, nodes: &[(&str, u8)], index: &[u8]) {
+    write_vlt_project(root, Era::V1);
+    let lines: Vec<String> = nodes
+        .iter()
+        .map(|(id, flags)| with_flags(&registry_node(id), *flags))
+        .collect();
+    std::fs::write(root.join("vlt-lock.json"), lock_with(Era::V1, &lines)).unwrap();
+    for (id, _) in nodes {
+        install_store(root, id, index);
+    }
+    write_hidden_lock(root, &lines);
+}
+
+#[tokio::test]
+async fn scan_redirect_vlt_heal_keeps_stale_optional_instance() {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    for flags in [1, 3] {
+        for extra in [&[][..], &["--no-vlt-install-cleanup"][..]] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_installed_flagged(tmp.path(), &[(TILDE_ID, flags)], PRISTINE);
+
+            let (_, doc) = scan_hosted(tmp.path(), &server, extra, &[]);
+
+            assert_eq!(
+                read(tmp.path(), "vlt-lock.json"),
+                lock_with(
+                    Era::V1,
+                    &[with_flags(&pinned_node(TILDE_ID, &server), flags)]
+                ),
+                "flags={flags} {extra:?}"
+            );
+            assert_eq!(
+                std::fs::read(store_dir(tmp.path(), TILDE_ID).join("index.js")).unwrap(),
+                PRISTINE,
+                "an optional store entry is never removed: flags={flags} {extra:?}"
+            );
+            assert!(tmp.path().join("node_modules/.vlt-lock.json").exists());
+            assert_eq!(
+                warning_detail(&doc, ADVISORY),
+                advisory_optional_kept(1),
+                "flags={flags} {extra:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn scan_redirect_vlt_heal_removes_the_prod_instance_keeps_the_optional_one() {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let optional = "~npm~left-pad@1.3.0~peer.2";
+    write_installed_flagged(tmp.path(), &[(TILDE_ID, 0), (optional, 1)], PRISTINE);
+
+    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
+
+    assert!(!tmp.path().join("node_modules/.vlt").join(TILDE_ID).exists());
+    assert!(!tmp.path().join("node_modules/.vlt-lock.json").exists());
+    assert_eq!(
+        std::fs::read(store_dir(tmp.path(), optional).join("index.js")).unwrap(),
+        PRISTINE
+    );
+    assert_eq!(warning_detail(&doc, ADVISORY), advisory_optional_kept(1));
+
+    let (_, skipped) = {
+        let tmp = tempfile::tempdir().unwrap();
+        write_installed_flagged(tmp.path(), &[(TILDE_ID, 0), (optional, 1)], PRISTINE);
+        scan_hosted(tmp.path(), &server, &["--dry-run"], &[])
+    };
+    assert_eq!(
+        warning_detail(&skipped, ADVISORY),
+        advisory_cleanup_skipped(2),
+        "a skipped cleanup counts every unpatched copy"
+    );
+}
+
 #[cfg(unix)]
 fn link_node_modules_outside(root: &Path, outside: &Path) {
     let real = outside.join("node_modules");
@@ -1223,6 +1302,37 @@ async fn scan_redirect_vlt_no_cleanup_vex_not_attested() {
     assert!(
         healed_attested,
         "the invalidated tree attests from the ledger"
+    );
+}
+
+#[tokio::test]
+async fn scan_redirect_vlt_kept_optional_instance_vex_not_attested() {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    let stale = tempfile::tempdir().unwrap();
+    write_installed_flagged(stale.path(), &[(TILDE_ID, 1)], PRISTINE);
+    let healthy = tempfile::tempdir().unwrap();
+    write_installed_flagged(healthy.path(), &[(TILDE_ID, 1)], PATCHED);
+    write_hidden_lock(
+        healthy.path(),
+        &[with_flags(&pinned_node(TILDE_ID, &server), 1)],
+    );
+
+    let (_, doc, attested) = scan_with_vex(stale.path(), &server, &[]);
+    let (_, healthy_doc, healthy_attested) = scan_with_vex(healthy.path(), &server, &[]);
+
+    assert_eq!(redirected(&doc), 1);
+    assert!(
+        !attested,
+        "a kept stale optional copy is not attested: {doc:#}"
+    );
+    assert_eq!(
+        warning_detail(&healthy_doc, ADVISORY),
+        ADVISORY_NOTHING_STALE
+    );
+    assert!(
+        healthy_attested,
+        "a patched optional copy attests: {healthy_doc:#}"
     );
 }
 

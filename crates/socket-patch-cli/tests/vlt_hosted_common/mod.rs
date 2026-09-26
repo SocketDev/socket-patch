@@ -66,6 +66,24 @@ pub fn advisory_undeterminable(n: usize) -> String {
     )
 }
 
+/// Why the heal keeps stale optional copies, shared by every heal's detail.
+pub const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt install` does \
+     not reinstall a removed optional dependency. Run `vlt ci` (or delete node_modules and run \
+     `vlt install`); vlt releases before 1.0.5 install no optional dependency from the lock of \
+     a project that declares only optional dependencies.";
+
+pub fn advisory_optional_kept(n: usize) -> String {
+    format!(
+        "vlt-lock.json pins Socket-patched packages, but node_modules still holds {n} unpatched \
+         copies of optional dependencies; {OPTIONAL_KEPT}"
+    )
+}
+
+/// `line` (a [`node`]) with slot [0] set to `flags`.
+pub fn with_flags(line: &str, flags: u8) -> String {
+    line.replacen("[0,", &format!("[{flags},"), 1)
+}
+
 pub fn git_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
