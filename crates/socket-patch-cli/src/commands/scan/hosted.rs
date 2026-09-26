@@ -5477,15 +5477,40 @@ mod probe_equivalence_tests {
             all_overrides.extend(overrides);
         }
         text_sets.push(Vec::new());
+        // Texts that carry ONE needle kind and nothing else — no golden
+        // fixture has the maven suffixed version or the registry index URL
+        // without the artifact URL beside it, so a needle dropped from
+        // `candidate_presence_needles` would otherwise go unnoticed.
+        let mut lone_suffixed: Vec<usize> = Vec::new();
+        for o in all_overrides
+            .iter()
+            .filter_map(|d| d.registry_override.as_ref())
+        {
+            text_sets.push(vec![format!("<url>{}</url>\n", o.index_url)]);
+            if let Some(sv) = o.identifiers.maven_suffixed_version.as_deref() {
+                lone_suffixed.push(text_sets.len());
+                text_sets.push(vec![format!("<version>{sv}</version>\n")]);
+            }
+        }
+        assert!(
+            !lone_suffixed.is_empty(),
+            "no maven suffixed-version override"
+        );
 
         let groups: Vec<Vec<String>> = all_overrides
             .iter()
             .map(candidate_presence_needles)
             .collect();
         let (mut hits, mut misses) = (0usize, 0usize);
-        for texts in &text_sets {
+        for (set, texts) in text_sets.iter().enumerate() {
             let refs: Vec<&String> = texts.iter().collect();
             let fast = groups_present(&refs, &groups);
+            if lone_suffixed.contains(&set) {
+                assert!(
+                    fast.iter().any(|hit| *hit),
+                    "a lone suffixed version confirms its maven override"
+                );
+            }
             for (dep, got) in all_overrides.iter().zip(&fast) {
                 let want = candidate_present_oracle(&refs, dep);
                 assert_eq!(
