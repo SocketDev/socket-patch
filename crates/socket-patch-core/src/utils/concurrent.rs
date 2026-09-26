@@ -27,9 +27,13 @@ use futures_util::stream::{self, Stream, StreamExt};
 
 use crate::utils::env_compat::is_debug_enabled;
 
-/// In-flight request cap for the authenticated patch API. Measured with
-/// no 429s up to 32 in flight; 8 already makes the loops latency-flat.
-pub const API_CONCURRENCY: usize = 8;
+/// In-flight request cap for the authenticated patch API: the ceiling a
+/// large window reaches ([`api_concurrency_for`]), and the whole cap for
+/// the windows that do not size themselves. Measured with no 429s up to
+/// 32 in flight; on a monorepo hosted scan at 100 ms of latency, 32
+/// instead of 8 cut the wall from ~20 s to ~9 s with identical output,
+/// the network having run at ~7 of 8 slots.
+pub const API_CONCURRENCY: usize = 32;
 
 /// Floor of the authenticated API's per-window cap
 /// ([`api_concurrency_for`]): a window never runs fewer requests in flight

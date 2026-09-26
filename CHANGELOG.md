@@ -1233,6 +1233,20 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **`scan` sends up to 32 patch-API requests at once on the authenticated
+  API, up from 8.** Each step sizes its window from the requests it has to
+  make: a quarter of them, between 8 and 32 — the batch queries, the
+  per-package patch lists, the hosted and vendored record views, discovery's
+  baseline views and `get`'s views. A step with 32 or fewer requests still
+  runs 8 at once; one with 128 or more runs 32. The fixed-size windows
+  follow the new cap up to their own ceilings: `vex` / `scan --vex` record
+  fetches now run up to 10 at once (was 8), wheel metadata stays at 4 and the
+  vendored archive prefetch at 4. The public proxy stays at 4.
+  `SOCKET_API_CONCURRENCY=<n>` still replaces all of it (1-32; on the proxy
+  it can only lower the cap). Output is unchanged — every window folds its
+  answers in request order — but a large monorepo's hosted scan at 100 ms of
+  latency drops from ~20 s to ~9 s.
+
 - **The `node_modules` walk runs on 4 threads by default.** The crawl's
   walk pool used one thread per logical CPU (up to 16), but the walk is
   bound by the kernel's directory cache: on a 14-core Mac and on Linux

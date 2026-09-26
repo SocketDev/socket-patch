@@ -532,9 +532,11 @@ cloned repo must never be able to redirect where patches come from or spend your
 (Full rationale: [docs/design/configuration.md](docs/design/configuration.md).)
 
 One more env-only knob tunes *pacing* rather than routing. `scan` queries the patch API
-with several requests in flight (8 against the authenticated endpoint, 4 against the
-public proxy, which shares one server-side limit across anonymous callers); so do the
-patch-record fetches behind `vex` and `scan --vex`.
+with several requests in flight: against the authenticated endpoint, a quarter of the
+requests a step has to make, between 8 and 32 (so a step with 128 or more requests runs
+32 at once, one with 32 or fewer runs 8); against the public proxy, which shares one
+server-side limit across anonymous callers, 4. The patch-record fetches behind `vex` and
+`scan --vex` run up to 10 at once (4 on the proxy).
 `SOCKET_API_CONCURRENCY=<n>` overrides that, clamped to `1`-`32`; on the public proxy it
 can only lower it. Set it when an endpoint in front of the API caps in-flight requests
 per client — a self-hosted `--api-url`, a corporate reverse proxy, a WAF or a CDN — and
