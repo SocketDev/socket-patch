@@ -17,7 +17,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -1054,18 +1054,64 @@ async fn stale_links<'t>(project_root: &Path, target: &'t Target) -> Vec<&'t Imp
     };
     let mut stale = Vec::new();
     for edge in &target.importers {
-        let link = project_root
-            .join(&edge.dir)
-            .join("node_modules")
-            .join(&edge.dep);
-        if tokio::fs::canonicalize(&link)
+        if importer_link_target(project_root, edge)
             .await
-            .is_ok_and(|real| real.starts_with(&store))
+            .is_some_and(|real| real.starts_with(&store))
         {
             stale.push(edge);
         }
     }
     stale
+}
+
+async fn importer_link_target(project_root: &Path, edge: &ImporterEdge) -> Option<PathBuf> {
+    let link = project_root
+        .join(&edge.dir)
+        .join("node_modules")
+        .join(&edge.dep);
+    tokio::fs::canonicalize(&link).await.ok()
+}
+
+/// Importer links that resolve into another uuid's vendored dir, which a
+/// re-vendor to `uuid` removes: they dangle until vlt relinks them.
+async fn superseded_links<'t>(
+    project_root: &Path,
+    target: &'t Target,
+    uuid: &str,
+) -> Vec<&'t ImporterEdge> {
+    let Some(vendor_npm) = super::path::vendor_uuid_dir_rel("npm", uuid)
+        .and_then(|rel| Path::new(&rel).parent().map(Path::to_path_buf))
+    else {
+        return Vec::new();
+    };
+    let Ok(vendor_npm) = tokio::fs::canonicalize(project_root.join(vendor_npm)).await else {
+        return Vec::new();
+    };
+    let current = vendor_npm.join(uuid);
+    let mut superseded = Vec::new();
+    for edge in &target.importers {
+        if importer_link_target(project_root, edge)
+            .await
+            .is_some_and(|real| real.starts_with(&vendor_npm) && !real.starts_with(&current))
+        {
+            superseded.push(edge);
+        }
+    }
+    superseded
+}
+
+fn link_names(edges: &[&ImporterEdge]) -> String {
+    edges
+        .iter()
+        .map(|e| {
+            if e.dir.is_empty() {
+                format!("node_modules/{}", e.dep)
+            } else {
+                format!("{}/node_modules/{}", e.dir, e.dep)
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// `vendor_vlt_reinstall_required`: from 0.0.0-30 a plain `vlt install`
@@ -1076,12 +1122,15 @@ async fn reinstall_advisory(
     project_root: &Path,
     name: &str,
     version: &str,
+    uuid: &str,
     target: &Target,
     rewired: bool,
 ) -> Option<VendorWarning> {
     let stale = stale_links(project_root, target).await;
+    let superseded = superseded_links(project_root, target, uuid).await;
     let optional = target.importers.iter().any(|e| {
-        e.edge_type == "optional" && (rewired || stale.iter().any(|s| s.index == e.index))
+        e.edge_type == "optional"
+            && (rewired || stale.iter().chain(&superseded).any(|s| s.index == e.index))
     });
     if optional {
         return Some(VendorWarning::new(
@@ -1096,25 +1145,28 @@ async fn reinstall_advisory(
             ),
         ));
     }
-    if stale.is_empty() {
+    let mut details = Vec::new();
+    if !stale.is_empty() {
+        details.push(format!(
+            "{} still links {name}@{version} to its installed upstream copy",
+            link_names(&stale)
+        ));
+    }
+    if !superseded.is_empty() {
+        details.push(format!(
+            "{} links {name}@{version} to the vendored dir of the patch this one replaces, \
+             which is removed, so requiring it fails",
+            link_names(&superseded)
+        ));
+    }
+    if details.is_empty() {
         return None;
     }
-    let links: Vec<String> = stale
-        .iter()
-        .map(|e| {
-            if e.dir.is_empty() {
-                format!("node_modules/{}", e.dep)
-            } else {
-                format!("{}/node_modules/{}", e.dir, e.dep)
-            }
-        })
-        .collect();
     Some(VendorWarning::new(
         REINSTALL_REQUIRED,
         format!(
-            "{} still links {name}@{version} to its installed upstream copy; run `vlt install` \
-             (or `vlt ci`) to link the vendored copy",
-            links.join(", ")
+            "{}; run `vlt install` (or `vlt ci`) to link the vendored copy",
+            details.join("; ")
         ),
     ))
 }
@@ -1163,6 +1215,7 @@ pub(crate) async fn vendor_vlt(
         project_root,
         name,
         version,
+        &record.uuid,
         &analysis.target,
         wiring.is_some(),
     )
@@ -2791,6 +2844,29 @@ mod tests {
         assert!(out.success && out.warnings.is_empty(), "{out:?}");
         assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
         assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
+    }
+
+    #[tokio::test]
+    async fn a_new_uuid_warns_about_links_into_the_replaced_dir() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (first, _) = entry_of(run(&fx, UUID, false).await);
+        persist(&fx, &first).await;
+        link(
+            &fx.root.join(&first.artifact.path),
+            &fx.root.join("node_modules/left-pad"),
+        );
+        let (_, warnings) = entry_of(run(&fx, UUID2, false).await);
+        let advisory: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == REINSTALL_REQUIRED)
+            .collect();
+        assert_eq!(advisory.len(), 1, "{warnings:?}");
+        assert_eq!(
+            advisory[0].detail,
+            "node_modules/left-pad links left-pad@1.3.0 to the vendored dir of the patch this \
+             one replaces, which is removed, so requiring it fails; run `vlt install` (or `vlt \
+             ci`) to link the vendored copy"
+        );
     }
 
     #[tokio::test]
