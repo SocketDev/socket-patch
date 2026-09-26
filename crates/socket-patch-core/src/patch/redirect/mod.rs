@@ -509,36 +509,66 @@ fn rewrite_groups_parallel(prefix: RewriteResult, groups: &[RewriterGroup<'_>]) 
 
 /// Every group on its own copy of `prefix`, concurrently; outputs in group
 /// order. The first group runs on the calling thread.
+///
+/// A group whose thread the OS refuses (a pids cgroup or `RLIMIT_NPROC` cap)
+/// runs on the calling thread instead, in its place in group order — the
+/// rewrite needed no threads before the groups existed, so a thread cap must
+/// not turn it into a panic. Every group starts from its own `prefix` clone,
+/// so where it runs cannot change its output.
 fn run_groups_concurrently(
     prefix: &RewriteResult,
     groups: &[RewriterGroup<'_>],
 ) -> Vec<RewriteResult> {
+    let run = |group: &RewriterGroup<'_>| {
+        let mut out = prefix.clone();
+        group(&mut out);
+        out
+    };
     std::thread::scope(|scope| {
         let handles: Vec<_> = groups
             .iter()
             .skip(1)
             .map(|group| {
-                scope.spawn(move || {
-                    let mut out = prefix.clone();
-                    group(&mut out);
-                    out
-                })
+                let handle = spawn_group_thread(scope, move || run(group)).ok();
+                (group, handle)
             })
             .collect();
-        let first = groups.first().map(|group| {
-            let mut out = prefix.clone();
-            group(&mut out);
-            out
-        });
+        let first = groups.first().map(run);
         first
             .into_iter()
-            .chain(handles.into_iter().map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            .chain(handles.into_iter().map(|(group, handle)| {
+                match handle {
+                    Some(handle) => handle
+                        .join()
+                        .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
+                    None => run(group),
+                }
             }))
             .collect()
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make every [`spawn_group_thread`] on this thread fail, as
+    /// an OS thread cap would.
+    static REFUSE_GROUP_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `Builder::spawn_scoped`, which reports a refused thread instead of
+/// panicking as `Scope::spawn` does.
+fn spawn_group_thread<'scope, 'env, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, RewriteResult>>
+where
+    F: FnOnce() -> RewriteResult + Send + 'scope,
+{
+    #[cfg(test)]
+    if REFUSE_GROUP_THREADS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("thread refused (test hook)"));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, f)
 }
 
 /// The groups' outputs merged in group order onto `prefix`, or `None` when
