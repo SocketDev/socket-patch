@@ -207,8 +207,20 @@ async fn run_scan_vendor_step(
             (manifest, false, has_errors)
         }
     };
+    let mut source_manifest = manifest.clone();
+    source_manifest.patches.retain(|purl, _| {
+        socket_patch_core::vendor::is_vendorable(purl)
+            && crate::commands::vendor::ecosystem_in_scope(
+                common,
+                purl.strip_prefix("pkg:")
+                    .and_then(|p| p.split('/').next())
+                    .unwrap_or(""),
+            )
+    });
     let staged =
-        match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
+        match stage_vendor_sources_in_memory(common, &source_manifest, socket_dir, &common.cwd)
+            .await
+        {
             MemStageOutcome::Ready(s) => s,
             MemStageOutcome::Unavailable => {
                 // The reconcile above may have already reverted dropped
@@ -246,12 +258,12 @@ async fn run_scan_vendor_step(
         &mut env,
     )
     .await;
-    drop(guard);
     if has_errors {
         env.mark_partial_failure();
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
     note_vendor_supersedes_redirect(&mut env, &common.cwd, common).await;
+    drop(guard);
     Ok((has_errors, env))
 }
 
@@ -745,6 +757,35 @@ fn boxed_vendor_records<'a>(
 mod service_config_tests {
     use super::*;
     use crate::args::GlobalArgs;
+
+    #[tokio::test]
+    async fn scan_vendor_stages_only_in_scope_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        let manifest_path = socket.join("manifest.json");
+        let manifest = serde_json::json!({"patches": {
+            "pkg:npm/demo@1.0": {"uuid": "patch", "exportedAt": "", "files": {
+                "index.js": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}
+            }, "vulnerabilities": {}, "description": "", "license": "", "tier": "free"}
+        }});
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .await
+            .unwrap();
+        let common = GlobalArgs {
+            cwd: root.path().to_path_buf(),
+            offline: true,
+            json: true,
+            silent: true,
+            ecosystems: Some(vec!["cargo".to_string()]),
+            ..Default::default()
+        };
+        let (has_errors, _) = run_scan_vendor_step(&common, &manifest_path, &socket, None)
+            .await
+            .unwrap();
+        assert!(!has_errors);
+        assert!(!socket.join("blobs").exists());
+    }
 
     fn common_with_source(source: &str) -> GlobalArgs {
         GlobalArgs {

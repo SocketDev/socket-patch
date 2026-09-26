@@ -114,14 +114,7 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
 /// on Unix, rejecting FIFOs/devices/directories (see its docs) — same as the
 /// npm/composer/python/ruby crawlers. Shared with `update.rs`, which reads
 /// the same discovered manifests back for editing.
-pub(super) async fn read_project_file_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
+pub(super) use crate::utils::fs::read_regular_to_string as read_project_file_to_string;
 
 /// Detect workspace configuration from package.json.
 async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
@@ -846,10 +839,7 @@ mod tests {
         // below); if the team decides such values should degrade to
         // WorkspaceType::None (npm semantics), update detect_workspaces and
         // flip these assertions together.
-        for spelling in [
-            r#"{"workspaces": "packages/*"}"#,
-            r#"{"workspaces": null}"#,
-        ] {
+        for spelling in [r#"{"workspaces": "packages/*"}"#, r#"{"workspaces": null}"#] {
             let dir = tempfile::tempdir().unwrap();
             let pkg = dir.path().join("package.json");
             fs::write(&pkg, spelling).await.unwrap();

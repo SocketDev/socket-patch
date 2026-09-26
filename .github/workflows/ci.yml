@@ -528,17 +528,17 @@ jobs:
         run: |
           # Vendor build-proof capstones ride the same image as their
           # ecosystem's main suite (extend the case as new vendor suites land).
-          EXTRA=""
+          EXTRA=()
           case "${{ matrix.ecosystem }}" in
-            composer) EXTRA="--test docker_e2e_vendor_composer" ;;
-            gem)      EXTRA="--test docker_e2e_vendor_gem" ;;
-            maven)    EXTRA="--test docker_e2e_vendor_maven" ;;
-            nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
+            composer) EXTRA=(--test docker_e2e_vendor_composer) ;;
+            gem)      EXTRA=(--test docker_e2e_vendor_gem) ;;
+            maven)    EXTRA=(--test docker_e2e_vendor_maven) ;;
+            nuget)    EXTRA=(--test docker_e2e_vendor_nuget) ;;
           esac
           cargo llvm-cov \
             --features docker-e2e \
             --no-report \
-            --test docker_e2e_${{ matrix.ecosystem }} $EXTRA
+            --test docker_e2e_${{ matrix.ecosystem }} "${EXTRA[@]}"
 
       - name: Generate per-ecosystem lcov
         run: |
@@ -1242,9 +1242,12 @@ jobs:
           # transient 503 does not block merges through a required check.
           for attempt in 1 2 3; do
             echo "::group::hosted-e2e attempt $attempt"
-            cargo test -p socket-patch-cli --test e2e_hosted_production -- \
-              --ignored --nocapture --test-threads=4
-            status=$?
+            if cargo test -p socket-patch-cli --test e2e_hosted_production -- \
+              --ignored --nocapture --test-threads=4; then
+              status=0
+            else
+              status=$?
+            fi
             echo "::endgroup::"
             if [ "$status" -eq 0 ]; then
               exit 0
@@ -1254,4 +1257,3 @@ jobs:
           done
           echo "::error title=hosted-e2e::suite failed on all 3 attempts"
           exit 1
-          if-no-files-found: warn

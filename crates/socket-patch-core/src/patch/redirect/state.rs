@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::FileEdit;
 use crate::manifest::schema::PatchRecord;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::{atomic_write_bytes, read_regular_to_bytes};
 
 /// Repo-relative path of the redirect ledger.
 pub const REDIRECT_STATE_REL: &str = ".socket/vendor/redirect-state.json";
@@ -141,7 +141,7 @@ pub async fn load_redirect_state(
     project_root: &Path,
 ) -> Result<Option<RedirectState>, CorruptRedirectState> {
     let path = project_root.join(REDIRECT_STATE_REL);
-    let bytes = match read_ledger_bytes(&path).await {
+    let bytes = match read_regular_to_bytes(&path).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
@@ -160,21 +160,6 @@ pub async fn load_redirect_state(
             quarantined_to: None,
         }),
     }
-}
-
-/// Read the ledger bytes from the (untrusted) project tree. Opens via
-/// [`open_regular_file`](crate::utils::fs::open_regular_file) — non-blocking
-/// on Unix, rejecting FIFOs/devices/directories — so a planted special file
-/// fails loudly instead of wedging every flow that consults the ledger
-/// (scan, vex, list, vendor) on a FIFO `open(2)` that waits forever for a
-/// writer; same guard as package_json discovery and the npm/composer/
-/// python/ruby crawlers.
-async fn read_ledger_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
 }
 
 /// Persist the redirect ledger atomically (stage + fsync + rename, the same

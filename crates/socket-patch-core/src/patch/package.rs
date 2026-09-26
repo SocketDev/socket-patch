@@ -63,6 +63,13 @@ pub enum ArchiveError {
 /// extraction step itself — the on-disk write site is the single,
 /// hash-verified path inside `apply_file_patch`.
 pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    read_archive_matching(archive_path, |_| true)
+}
+
+fn read_archive_matching(
+    archive_path: &Path,
+    keep: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     // Open non-blockingly and require a regular file. A plain `open(2)` of a
     // FIFO planted at the archive path waits for a writer that may never
     // come — wedging the whole apply run before any parsing happens (the
@@ -167,6 +174,14 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
             });
         }
 
+        // Validate every entry, but only allocate buffers for requested files.
+        // Drain ignored entries so truncation and decompression errors still
+        // surface, including when the final entry is filtered out.
+        if !keep(&normalized) {
+            std::io::copy(&mut entry, &mut std::io::sink())?;
+            continue;
+        }
+
         // `size` is bounded above by MAX_ENTRY_BYTES (16 MiB), so the
         // cast to `usize` is safe on all targets we support.
         let mut bytes = Vec::with_capacity(size as usize);
@@ -185,16 +200,12 @@ pub fn read_archive_filtered(
     archive_path: &Path,
     expected_files: &HashMap<String, PatchFileInfo>,
 ) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
-    let allowed: std::collections::HashSet<String> = expected_files
+    let allowed: std::collections::HashSet<&str> = expected_files
         .keys()
-        .map(|k| normalize_file_path(k).to_string())
+        .map(|k| normalize_file_path(k))
         .collect();
 
-    let all = read_archive_to_map(archive_path)?;
-    Ok(all
-        .into_iter()
-        .filter(|(k, _)| allowed.contains(k))
-        .collect())
+    read_archive_matching(archive_path, |path| allowed.contains(path))
 }
 
 #[cfg(test)]
@@ -561,6 +572,22 @@ mod tests {
         assert!(map.contains_key("index.js"));
         assert!(map.contains_key("lib/util.js"));
         assert!(!map.contains_key("bonus/extra.js"));
+    }
+
+    #[test]
+    fn filtered_archives_still_validate_ignored_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_raw_archive(&archive, b"../outside", b"unwanted");
+        assert!(matches!(
+            read_archive_filtered(&archive, &HashMap::new()),
+            Err(ArchiveError::UnsafePath(_))
+        ));
+        write_raw_tar_gz(&archive, &[raw_entry(b"ignored", MAX_ENTRY_BYTES + 1, b"")]);
+        assert!(matches!(
+            read_archive_filtered(&archive, &HashMap::new()),
+            Err(ArchiveError::EntryTooLarge { .. })
+        ));
     }
 
     #[test]

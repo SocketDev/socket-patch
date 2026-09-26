@@ -28,12 +28,37 @@ pub(crate) async fn fresh_copy(
     dst: &Path,
     skip_file_name: Option<&'static str>,
 ) -> std::io::Result<()> {
+    fresh_copy_filtered(src, dst, skip_file_name, None).await
+}
+
+/// Copy a package without visiting the named entry at its root (for example,
+/// npm's installed `node_modules` dependency tree).
+pub(crate) async fn fresh_copy_except_root(
+    src: &Path,
+    dst: &Path,
+    skip_root_name: &'static str,
+) -> std::io::Result<()> {
+    fresh_copy_filtered(src, dst, None, Some(skip_root_name)).await
+}
+
+async fn fresh_copy_filtered(
+    src: &Path,
+    dst: &Path,
+    skip_file_name: Option<&'static str>,
+    skip_root_name: Option<&'static str>,
+) -> std::io::Result<()> {
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
     tokio::task::spawn_blocking(move || {
         force_remove_dir_all(&dst)?;
         std::fs::create_dir_all(&dst)?;
-        for entry in walkdir::WalkDir::new(&src).follow_links(false) {
+        let entries = walkdir::WalkDir::new(&src)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() != 1 || skip_root_name.is_none_or(|skip| entry.file_name() != skip)
+            });
+        for entry in entries {
             let entry = entry.map_err(to_io)?;
             let rel = entry.path().strip_prefix(&src).map_err(to_io)?;
             if rel.as_os_str().is_empty() {
@@ -153,6 +178,46 @@ mod tests {
         assert!(!d.join(".cargo-checksum.json").exists());
         assert!(!d.join("sub/.cargo-checksum.json").exists());
         assert!(d.join("sub/keep.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn skips_root_dependency_tree_but_preserves_nested_names() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let d = dst.path().join("copy");
+        fs::create_dir_all(src.path().join("node_modules/dep")).unwrap();
+        fs::create_dir_all(src.path().join("fixtures/node_modules/dep")).unwrap();
+        fs::write(src.path().join("node_modules/dep/index.js"), b"dependency").unwrap();
+        fs::write(
+            src.path().join("fixtures/node_modules/dep/index.js"),
+            b"fixture",
+        )
+        .unwrap();
+        fs::write(src.path().join("index.js"), b"package").unwrap();
+
+        // An unreadable excluded directory proves the walker prunes traversal,
+        // rather than copying its children and deleting them afterward.
+        #[cfg(unix)]
+        fs::set_permissions(
+            src.path().join("node_modules"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let result = fresh_copy_except_root(src.path(), &d, "node_modules").await;
+        #[cfg(unix)]
+        fs::set_permissions(
+            src.path().join("node_modules"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        result.unwrap();
+        assert!(!d.join("node_modules").exists());
+        assert_eq!(
+            fs::read(d.join("fixtures/node_modules/dep/index.js")).unwrap(),
+            b"fixture"
+        );
+        assert_eq!(fs::read(d.join("index.js")).unwrap(), b"package");
     }
 
     #[cfg(unix)]

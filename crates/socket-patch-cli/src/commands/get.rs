@@ -277,7 +277,7 @@ async fn write_blob_entry(
     }
     let decoded =
         base64_decode(b64).map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
-    tokio::fs::write(blobs_dir.join(hash), &decoded)
+    socket_patch_core::utils::fs::atomic_write_bytes(&blobs_dir.join(hash), &decoded)
         .await
         .map_err(|e| format!("Failed to write {label} for {file_path}: {e}"))
 }
@@ -683,6 +683,8 @@ pub(crate) fn select_patches(
 /// Download parameters shared between get and scan commands.
 pub struct DownloadParams {
     pub cwd: PathBuf,
+    /// Maximum wait for the manifest/blob save lock, in seconds.
+    pub lock_timeout: Option<u64>,
     /// Resolved manifest location (`GlobalArgs::resolved_manifest_path`).
     /// The blobs directory is its parent's `blobs/` — the same layout
     /// apply/rollback resolve from — so `--manifest-path` is honored here
@@ -1171,9 +1173,6 @@ async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::clie
         .0
 }
 
-/// Download and apply a set of selected patches.
-///
-/// Used by both `get` and `scan` commands. Returns (exit_code, json_result).
 /// Download patches and their blobs WITHOUT touching the manifest, and
 /// return the fetched records keyed by purl — the `scan --vendor
 /// --detached` download phase, where the vendor ledger (not the manifest)
@@ -1181,7 +1180,8 @@ async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::clie
 /// [`download_and_apply_patches`]. A purl already vendored DETACHED at the
 /// selected uuid skips the network fetch and reuses the ledger's embedded
 /// record, so idempotent re-runs stay cheap (mirrors what
-/// `decide_patch_action` does for the manifest-tracked flow).
+/// `decide_patch_action` does for the manifest-tracked flow). Returns JSON
+/// to the caller; only the outer command writes the terminal envelope.
 pub(crate) async fn download_patch_records(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
@@ -1197,7 +1197,9 @@ pub(crate) async fn download_patch_records(
     if params.persist_blobs {
         if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
             let err = format!("Failed to create blobs directory: {}", e);
-            report_error(params.json, &err);
+            if !params.json {
+                report_error(false, &err);
+            }
             return (
                 1,
                 serde_json::json!({"status": "error", "error": err}),
@@ -1461,6 +1463,7 @@ async fn run_nested_apply(
     strict: bool,
     api: socket_patch_core::api::client::ApiClientEnvOverrides,
     ecosystems: Option<Vec<String>>,
+    lock_timeout: Option<u64>,
 ) -> bool {
     // Apply re-resolves a relative manifest path against ITS `--cwd`
     // (`resolved_manifest_path`), but ours is already cwd-resolved —
@@ -1487,6 +1490,7 @@ async fn run_nested_apply(
             // apply the WHOLE manifest, mutating other ecosystems' packages
             // the user filtered out.
             ecosystems,
+            lock_timeout,
             ..crate::args::GlobalArgs::default()
         },
         force: false,
@@ -1500,6 +1504,35 @@ async fn run_nested_apply(
     code == 0
 }
 
+fn acquire_download_lock(
+    socket_dir: &Path,
+    timeout: Option<u64>,
+    json: bool,
+) -> Result<socket_patch_core::patch::apply_lock::LockGuard, serde_json::Value> {
+    use socket_patch_core::patch::apply_lock::{acquire, LockError};
+    acquire(
+        socket_dir,
+        std::time::Duration::from_secs(timeout.unwrap_or(0)),
+    )
+    .map_err(|error| {
+        let code = match &error {
+            LockError::Held => "lock_held",
+            LockError::Io { .. } => "lock_io",
+        };
+        let result = serde_json::json!({
+            "status": "error", "errorCode": code, "error": error.to_string(),
+        });
+        if !json {
+            report_error(false, error);
+        }
+        result
+    })
+}
+
+/// Download and apply selected patches for `get` or `scan`.
+///
+/// Returns (exit_code, json_result) without printing JSON. The outer command
+/// owns its terminal envelope, including hard errors from this phase.
 pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
@@ -1515,17 +1548,25 @@ pub async fn download_and_apply_patches(
 
     if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
         let err = format!("Failed to create .socket directory: {}", e);
-        report_error(params.json, &err);
+        if !params.json {
+            report_error(false, &err);
+        }
         return (1, serde_json::json!({"status": "error", "error": err}));
     }
     if params.persist_blobs {
         if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
             let err = format!("Failed to create blobs directory: {}", e);
-            report_error(params.json, &err);
+            if !params.json {
+                report_error(false, &err);
+            }
             return (1, serde_json::json!({"status": "error", "error": err}));
         }
     }
 
+    let save_lock = match acquire_download_lock(&socket_dir, params.lock_timeout, params.json) {
+        Ok(guard) => guard,
+        Err(error) => return (1, error),
+    };
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => PatchManifest::new(),
@@ -1534,7 +1575,9 @@ pub async fn download_and_apply_patches(
         // replace the file and destroy every tracked patch record.
         Err(e) => {
             let err = format!("Failed to read manifest: {e}");
-            report_error(params.json, &err);
+            if !params.json {
+                report_error(false, &err);
+            }
             return (1, serde_json::json!({"status": "error", "error": err}));
         }
     };
@@ -1744,9 +1787,7 @@ pub async fn download_and_apply_patches(
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
         let msg = format!("Error writing manifest: {e}");
         let err_json = serde_json::json!({ "status": "error", "error": &msg });
-        if params.json {
-            print_json(&err_json);
-        } else {
+        if !params.json {
             eprintln!("{msg}");
         }
         return (1, err_json);
@@ -1781,6 +1822,9 @@ pub async fn download_and_apply_patches(
         }
     }
 
+    // The nested apply acquires its own lock and re-reads the saved manifest.
+    drop(save_lock);
+
     // Auto-apply unless --save-only
     let mut apply_succeeded = false;
     if !params.save_only && patches_downloaded > 0 {
@@ -1797,6 +1841,7 @@ pub async fn download_and_apply_patches(
             params.strict,
             resolved_api_overrides(params),
             params.ecosystems.clone(),
+            params.lock_timeout,
         )
         .await;
     }
@@ -1827,6 +1872,59 @@ pub async fn download_and_apply_patches(
     }
 
     (exit_code, result_json)
+}
+
+/// Preview agent-mode changes without creating caches, taking locks, or applying files.
+async fn preview_agent_get(
+    args: &GetArgs,
+    selected: &[PatchSearchResult],
+    narrow_skips: &[serde_json::Value],
+    warnings: &[(String, String)],
+) -> i32 {
+    let manifest = match read_manifest(&args.common.resolved_manifest_path()).await {
+        Ok(manifest) => manifest.unwrap_or_else(PatchManifest::new),
+        Err(error) => {
+            report_error(
+                args.common.json,
+                format!("Failed to read manifest: {error}"),
+            );
+            return 1;
+        }
+    };
+    let patches: Vec<_> = selected
+        .iter()
+        .map(|patch| {
+            let mut value = serde_json::json!({"purl": patch.purl, "uuid": patch.uuid});
+            match decide_patch_action(&manifest, &patch.purl, &patch.uuid) {
+                PatchAction::Added => value["action"] = serde_json::json!("added"),
+                PatchAction::Updated { old_uuid } => {
+                    value["action"] = serde_json::json!("updated");
+                    value["oldUuid"] = serde_json::json!(old_uuid);
+                }
+                PatchAction::Skipped => value["action"] = serde_json::json!("skipped"),
+            }
+            value
+        })
+        .collect();
+    if args.common.json {
+        let mut result = serde_json::json!({
+            "status": "success", "dryRun": true,
+            "found": selected.len(), "downloaded": 0, "applied": 0, "failed": 0,
+            "added": patches.iter().filter(|p| p["action"] == "added").count(),
+            "updated": patches.iter().filter(|p| p["action"] == "updated").count(),
+            "skipped": patches.iter().filter(|p| p["action"] == "skipped").count(),
+            "patches": patches,
+        });
+        fold_narrowing_into_result(&mut result, narrow_skips, warnings);
+        print_json(&result);
+    } else if !args.common.silent {
+        println!(
+            "[dry-run] Would download{} {} patch(es). No changes made.",
+            if args.save_only { "" } else { " and apply" },
+            selected.len()
+        );
+    }
+    0
 }
 
 pub async fn run(args: GetArgs) -> i32 {
@@ -2011,6 +2109,10 @@ pub async fn run(args: GetArgs) -> i32 {
                 // UUID is exempt from installed narrowing (exact intent).
                 return match mode {
                     // Save to manifest and apply in place (today's flow).
+                    super::scan::ScanMode::Agent if args.common.dry_run => {
+                        preview_agent_get(&args, &[search_result_from_response(&patch)], &[], &[])
+                            .await
+                    }
                     super::scan::ScanMode::Agent => save_and_apply_patch(&args, &patch).await,
                     super::scan::ScanMode::Hosted => {
                         let selected = vec![search_result_from_response(&patch)];
@@ -2123,12 +2225,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     if args.common.global {
                         println!("No global packages found.");
                     } else {
-                        #[allow(unused_mut)]
-                        let mut install_cmds = String::from("npm/yarn/pnpm/pip");
-                        install_cmds.push_str("/cargo");
-                        install_cmds.push_str("/go");
-                        install_cmds.push_str("/mvn");
-                        install_cmds.push_str("/composer");
+                        let install_cmds = "npm/yarn/pnpm/pip/cargo/go/mvn/composer";
                         println!("No packages found. Run {install_cmds} install first.");
                     }
                 }
@@ -2323,9 +2420,37 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
-    // Confirm before acting (default YES), with mode-appropriate wording.
-    // Hosted/vendored dry-runs skip the prompt — nothing mutates (scan's
-    // dry-run posture); agent mode keeps today's behavior.
+    let params = DownloadParams {
+        lock_timeout: args.common.lock_timeout,
+        cwd: args.common.cwd.clone(),
+        manifest_path: args.common.resolved_manifest_path(),
+        org: args.common.org.clone(),
+        save_only: args.save_only,
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
+        json: args.common.json,
+        silent: args.common.silent,
+        download_mode: args.common.download_mode.clone(),
+        api_overrides: args.common.api_client_overrides(),
+        all_releases: args.all_releases,
+        strict: args.common.strict,
+        ecosystems: args.common.ecosystems.clone(),
+        persist_blobs: true,
+    };
+
+    if mode == super::scan::ScanMode::Agent && args.common.dry_run {
+        let (selected, variant_warnings) =
+            filter_to_installed_releases(&selected, &params, &api_client).await;
+        let mut warnings = narrow_warnings;
+        warnings.extend(
+            variant_warnings
+                .into_iter()
+                .map(|warning| ("release_narrowing".to_string(), warning)),
+        );
+        return preview_agent_get(&args, &selected, &narrow_skips, &warnings).await;
+    }
+
+    // Confirm before acting (default YES). Dry-run previews never prompt.
     let prompt = match mode {
         super::scan::ScanMode::Agent => format!("Download {} patch(es)?", selected.len()),
         super::scan::ScanMode::Vendored => {
@@ -2356,6 +2481,7 @@ pub async fn run(args: GetArgs) -> i32 {
             // bases keep all variants with a warning; --all-releases
             // passes through.
             let filter_params = DownloadParams {
+                lock_timeout: args.common.lock_timeout,
                 cwd: args.common.cwd.clone(),
                 manifest_path: args.common.resolved_manifest_path(),
                 org: args.common.org.clone(),
@@ -2403,33 +2529,13 @@ pub async fn run(args: GetArgs) -> i32 {
         super::scan::ScanMode::Agent => {}
     }
 
-    // Download and apply (agent mode)
-    let params = DownloadParams {
-        cwd: args.common.cwd.clone(),
-        manifest_path: args.common.resolved_manifest_path(),
-        org: args.common.org.clone(),
-        save_only: args.save_only,
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-        json: args.common.json,
-        silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
-        api_overrides: args.common.api_client_overrides(),
-        all_releases: args.all_releases,
-        strict: args.common.strict,
-        ecosystems: args.common.ecosystems.clone(),
-        persist_blobs: true,
-    };
-
     let (code, mut result_json) = download_and_apply_patches(&selected, &params).await;
-    // A download-phase HARD error (unreadable manifest, unwritable
-    // .socket, failed manifest write) is an `error`-status envelope the
-    // engine has ALREADY printed — printing below would put a second JSON
-    // document on stdout (get's `--json` contract is exactly one per
-    // run; `run_get_vendored_search` has the same guard). Per-patch
-    // failures are NOT this case: they ride a success-shaped
-    // (`partial_failure`) envelope the engine leaves for us to print.
+    // Hard phase errors abort before the ordinary result fold. This outer
+    // command owns stdout; scan embeds the same returned error in its result.
     if result_json["status"] == "error" {
+        if args.common.json {
+            print_json(&result_json);
+        }
         return code;
     }
     fold_narrowing_into_result(&mut result_json, &narrow_skips, &narrow_warnings);
@@ -2544,6 +2650,14 @@ async fn save_patch_record(
         );
         return Err(1);
     }
+
+    let _save_lock = acquire_download_lock(&socket_dir, args.common.lock_timeout, args.common.json)
+        .map_err(|error| {
+            if args.common.json {
+                print_json(&error);
+            }
+            1
+        })?;
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
@@ -2686,6 +2800,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
             args.common.strict,
             args.common.api_client_overrides(),
             args.common.ecosystems.clone(),
+            args.common.lock_timeout,
         )
         .await;
     }
@@ -2885,6 +3000,7 @@ async fn run_get_vendored_search(
     // Download phase — scan's vendored posture: manifest-only writes, blobs
     // held in memory, the nested apply never runs (save_only).
     let params = DownloadParams {
+        lock_timeout: args.common.lock_timeout,
         cwd: args.common.cwd.clone(),
         manifest_path: manifest_path.clone(),
         org: args.common.org.clone(),
@@ -2901,15 +3017,13 @@ async fn run_get_vendored_search(
         persist_blobs: false,
     };
     let (dl_code, mut result) = boxed_download_and_apply(selected, &params).await;
-    // A download-phase HARD error (unreadable manifest, unwritable
-    // .socket, failed manifest write — an `error`-status envelope the
-    // engine has ALREADY printed) aborts before the vendor step: get's
-    // `--json` contract is exactly one JSON document per run, and the
-    // vendor step would only re-fail on the same broken state and print a
-    // second, different document. Per-patch failures are NOT this case —
-    // they ride a success-shaped envelope and the vendor step still runs
-    // (scan parity: previously-recorded patches still (re)vendor).
+    // Hard phase errors abort before vendoring and have one terminal
+    // envelope here. Per-patch failures still allow previously recorded
+    // patches to vendor, matching scan.
     if result["status"] == "error" {
+        if args.common.json {
+            print_json(&result);
+        }
         return dl_code;
     }
     let mut has_errors = dl_code != 0;
@@ -4400,6 +4514,7 @@ mod tests {
 
     fn dl_params_for_org(org: Option<String>, org_slug: Option<String>) -> DownloadParams {
         DownloadParams {
+            lock_timeout: None,
             cwd: PathBuf::from("."),
             manifest_path: PathBuf::from(".socket/manifest.json"),
             org,
@@ -4527,6 +4642,7 @@ mod tests {
 
     fn detached_params(root: &Path, server_url: String) -> DownloadParams {
         DownloadParams {
+            lock_timeout: None,
             cwd: root.to_path_buf(),
             manifest_path: root.join(".socket/manifest.json"),
             org: Some("test-org".to_string()),
@@ -4547,6 +4663,64 @@ mod tests {
             ecosystems: None,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_save_refuses_held_lock_before_reading_manifest() {
+        let server = wiremock::MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let params = detached_params(root.path(), server.uri());
+        let socket_dir = params.manifest_path.parent().unwrap();
+        tokio::fs::create_dir_all(socket_dir).await.unwrap();
+        // Invalid JSON distinguishes refusing the lock from reading first.
+        tokio::fs::write(&params.manifest_path, b"do not touch")
+            .await
+            .unwrap();
+        let guard =
+            socket_patch_core::patch::apply_lock::acquire(socket_dir, std::time::Duration::ZERO)
+                .unwrap();
+        let (code, result) = download_and_apply_patches(&[], &params).await;
+        assert_eq!(code, 1);
+        assert_eq!(result["errorCode"], "lock_held");
+        assert_eq!(
+            tokio::fs::read(&params.manifest_path).await.unwrap(),
+            b"do not touch"
+        );
+        drop(guard);
+
+        tokio::fs::remove_file(&params.manifest_path).await.unwrap();
+        let (code, _) = download_and_apply_patches(&[], &params).await;
+        assert_eq!(code, 0);
+        assert!(read_manifest(&params.manifest_path)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_blob_entry_replaces_shared_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = root.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        let outside = root.path().join("original");
+        tokio::fs::write(&outside, b"original").await.unwrap();
+        let hash = "a".repeat(64);
+        for symlink in [false, true] {
+            let path = blobs.join(&hash);
+            if symlink {
+                std::os::unix::fs::symlink(&outside, &path).unwrap();
+            } else {
+                std::fs::hard_link(&outside, &path).unwrap();
+            }
+            write_blob_entry(&blobs, BLOB_B64, &hash, "index.js", "blob")
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&outside).await.unwrap(), b"original");
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), b"patched\n");
+            tokio::fs::remove_file(path).await.unwrap();
         }
     }
 

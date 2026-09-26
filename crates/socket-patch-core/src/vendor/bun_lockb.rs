@@ -175,7 +175,9 @@ impl BunLockb {
         };
         // All strings exposed to inventory/editing must be valid before a
         // caller can stage any changes to the lockfile.
-        lock.packages()?;
+        for id in 0..lock.count {
+            lock.package(id)?;
+        }
         Ok(lock)
     }
 

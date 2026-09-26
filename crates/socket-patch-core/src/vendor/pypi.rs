@@ -15,6 +15,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::toml_edit_ext::has_table;
 
@@ -132,20 +133,6 @@ pub async fn fetch_hosted_wheel_metadata(
 const SETUP_ALTERNATIVE: &str =
     "use the `socket-patch setup` .pth install hook instead, which patches installed \
      site-packages without lockfile edits";
-
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted as `pyproject.toml` fails fast — read as "no pyproject",
-/// falling through to the requirements routing — instead of wedging flavor
-/// detection (and every lockless-project vendor run) forever in an `open(2)`
-/// that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
@@ -359,14 +346,15 @@ enum MetaSlot {
     None,
 }
 
-/// The uuid dir holds a wheel artifact — the cheap, flavor-agnostic
-/// presence probe for the in-sync hot path (one uuid owns one wheel).
-async fn uuid_dir_has_wheel(uuid_dir: &Path) -> bool {
+/// Legacy fallback for locks and ledgers that carry no wheel digest.
+async fn uuid_dir_has_wheel(uuid_dir: &Path, record: &PatchRecord) -> bool {
     let Ok(mut rd) = tokio::fs::read_dir(uuid_dir).await else {
         return false;
     };
     while let Ok(Some(e)) = rd.next_entry().await {
-        if e.file_name().to_string_lossy().ends_with(".whl") {
+        if e.file_name().to_string_lossy().ends_with(".whl")
+            && super::common::zip_matches_after_hashes(&e.path(), &record.files).await
+        {
             return true;
         }
     }
@@ -746,31 +734,6 @@ pub async fn vendor_pypi_with_pipenv_version(
     };
 
     let in_sync = matches!(plan, WiringPlan::InSync);
-    if in_sync {
-        // Wired to this uuid already. Intact artifact → the classic in-sync
-        // skip: nothing is built or recorded — the first run's ledger entry
-        // holds the only copy of the originals (and no dist lookup, so a
-        // not-installed re-run stays green). Missing artifact → rebuild the
-        // wheel only; the wiring is correct and re-running it would re-record
-        // live vendored fragments as pre-vendor originals.
-        let artifact_present = if flavor == PypiFlavor::Hatch {
-            if let Some((wheel, _)) = &wired_pin {
-                project_root.join(wheel).is_file()
-            } else {
-                false
-            }
-        } else {
-            uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await
-        };
-        if artifact_present || dry_run {
-            return done(
-                already_patched_result(base, Path::new(""), &record.files),
-                None,
-                warnings,
-            );
-        }
-    }
-
     // The in-sync probes key only on the patch uuid in the wired path, so
     // the lockfile still pins the FIRST vendor's exact wheel path + sha256.
     // An artifact-only rebuild is safe only when it reproduces those exact
@@ -795,6 +758,23 @@ pub async fn vendor_pypi_with_pipenv_version(
     } else {
         None
     };
+
+    if in_sync {
+        let artifact_present = if let Some((wheel, sha256)) = &expected_pin {
+            super::verify::file_sha256_hex(&project_root.join(wheel))
+                .await
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(sha256))
+        } else {
+            uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel), record).await
+        };
+        if artifact_present || dry_run {
+            return done(
+                already_patched_result(base, Path::new(""), &record.files),
+                None,
+                warnings,
+            );
+        }
+    }
 
     // Acquire the patched wheel: prefer the prebuilt service artifact (which
     // skips needing the package installed), else build it locally. A refusal /
@@ -891,7 +871,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         warnings.push(VendorWarning::new(
             "vendor_artifact_rebuilt",
             format!(
-                "the committed vendored wheel for {canon_name}=={version} was missing; \
+                "the committed vendored wheel for {canon_name}=={version} was missing or stale; \
                  rebuilt at {rel_wheel} (lockfile untouched)"
             ),
         ));
@@ -3447,7 +3427,12 @@ wheels = [
                 !outcome.success,
                 "{flavor}: revert under an unlistable root must refuse: {outcome:?}"
             );
-            assert_eq!(outcome.warnings.len(), 1, "{flavor}: {:?}", outcome.warnings);
+            assert_eq!(
+                outcome.warnings.len(),
+                1,
+                "{flavor}: {:?}",
+                outcome.warnings
+            );
             assert_eq!(
                 outcome.warnings[0].code,
                 "vendor_wiring_unknown_revert_blocked"
@@ -3522,8 +3507,7 @@ wheels = [
                 "vendor_wiring_unknown_revert_blocked"
             );
             assert!(
-                outcome
-                    .warnings[0]
+                outcome.warnings[0]
                     .detail
                     .contains(&format!("{lock_name} exists but could not be read")),
                 "{lock_name}: {}",
@@ -3639,7 +3623,9 @@ wheels = [
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         let include = format!(
             "./{rel_wheel} --hash=sha256:{}  # socket-patch vendor: six==1.16.0\n",
             "0".repeat(64)
@@ -3773,7 +3759,9 @@ wheels = [
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
         let (wiring2, _meta2) = wire_pipenv(
-            &load_pipenv_project(root).await.unwrap_or_else(|e| panic!("{e:?}")),
+            &load_pipenv_project(root)
+                .await
+                .unwrap_or_else(|e| panic!("{e:?}")),
             root,
             "six",
             &rel_wheel,
@@ -3797,15 +3785,25 @@ wheels = [
         let entry = revert_entry("pipenv", &rel_wheel, wiring2);
         let outcome = revert_pypi(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(!outcome.drift_skipped() && !outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            !outcome.drift_skipped() && !outcome.kept_artifact,
+            "{:?}",
+            outcome.warnings
+        );
         let restored: serde_json::Value = serde_json::from_str(
             &tokio::fs::read_to_string(root.join("Pipfile.lock"))
                 .await
                 .unwrap(),
         )
         .unwrap();
-        assert!(restored["default"]["six"].get("file").is_none(), "{restored}");
-        assert_eq!(restored["default"]["six"]["version"], serde_json::json!("==1.16.0"));
+        assert!(
+            restored["default"]["six"].get("file").is_none(),
+            "{restored}"
+        );
+        assert_eq!(
+            restored["default"]["six"]["version"],
+            serde_json::json!("==1.16.0")
+        );
 
         // Foreign file reference → still drift, still kept.
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
@@ -3820,7 +3818,11 @@ wheels = [
         let entry = revert_entry("pipenv", &rel_wheel, wiring);
         let outcome = revert_pypi(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.drift_skipped() && outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome.drift_skipped() && outcome.kept_artifact,
+            "{:?}",
+            outcome.warnings
+        );
         assert!(wheel.is_file());
     }
 
@@ -4800,6 +4802,43 @@ wheels = [
         );
         assert!(wheel.is_file(), "wheel rebuilt at the recorded path");
         assert_eq!(read_requirements(&fx).await, wired);
+    }
+
+    #[tokio::test]
+    async fn in_sync_requires_the_pinned_wheel_and_its_original_bytes() {
+        for corrupt in [false, true] {
+            let fx = e2e_fixture().await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("first vendor must be Done");
+            };
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            let wheel = fx.root.join(&entry.artifact.path);
+            let original_bytes = tokio::fs::read(&wheel).await.unwrap();
+            let wired = read_requirements(&fx).await;
+            if corrupt {
+                tokio::fs::write(&wheel, b"corrupt wheel").await.unwrap();
+            } else {
+                tokio::fs::rename(&wheel, wheel.with_file_name("unrelated.whl"))
+                    .await
+                    .unwrap();
+            }
+            let VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("rebuild must be Done");
+            };
+            assert!(result.success, "{:?}", result.error);
+            assert!(entry.is_none());
+            assert!(warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"));
+            assert_eq!(tokio::fs::read(&wheel).await.unwrap(), original_bytes);
+            assert_eq!(read_requirements(&fx).await, wired);
+        }
     }
 
     // ───────────── marker write failures (fresh + rebuild paths) ─────────────
@@ -5947,9 +5986,25 @@ mod hatch_routing_tests {
     async fn hatchling_with_requirements_preserves_pip_routing() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(dir.path().join("pyproject.toml"), "[build-system]\nbuild-backend=\"hatchling.build\"\n[project]\ndependencies=[\"urllib3==1.26.18\"]\n").await.unwrap();
-        tokio::fs::write(dir.path().join("requirements.txt"), "urllib3==1.26.18\n").await.unwrap();
-        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Requirements);
-        tokio::fs::remove_file(dir.path().join("requirements.txt")).await.unwrap();
-        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Hatch);
+        tokio::fs::write(dir.path().join("requirements.txt"), "urllib3==1.26.18\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18")))
+                .await
+                .unwrap()
+                .0,
+            PypiFlavor::Requirements
+        );
+        tokio::fs::remove_file(dir.path().join("requirements.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18")))
+                .await
+                .unwrap()
+                .0,
+            PypiFlavor::Hatch
+        );
     }
 }

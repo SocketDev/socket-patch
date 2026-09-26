@@ -33,6 +33,7 @@ use tokio::fs;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::read_regular_to_string;
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
@@ -85,19 +86,6 @@ pub async fn drop_patch_entry(
     dry_run: bool,
 ) -> Result<bool, String> {
     edit_config(project_root, dry_run, |c| remove_patch_entry(c, name)).await
-}
-
-/// Guarded read shared in shape with the vendor/cargo.rs + setup twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted as `.cargo/config(.toml)` fails fast instead of wedging
-/// scan / vendor apply forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Read all `[patch.crates-io]` entries. Read-only; a missing or malformed

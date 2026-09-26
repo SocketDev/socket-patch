@@ -448,8 +448,8 @@ async fn repair_keeps_corrupt_artifact_when_no_rebuild_source_exists() {
     );
 }
 
-/// 4. A tampered ledger sha can never be satisfied: the rebuild is removed
-///    and the run fails loudly rather than leaving unverifiable bytes.
+/// 4. A tampered ledger sha can never be satisfied: reject the rebuild,
+///    restore the previous artifact, and retain the ledger for diagnosis.
 #[tokio::test]
 async fn repair_fails_closed_on_tampered_ledger_sha() {
     let mock = MockServer::start().await;
@@ -461,12 +461,14 @@ async fn repair_fails_closed_on_tampered_ledger_sha() {
         "sha512-orig==",
     );
     let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    let original_artifact = std::fs::read(&tgz).unwrap();
 
     let state_path = tmp.path().join(".socket/vendor/state.json");
     let state = std::fs::read_to_string(&state_path).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&state).unwrap();
     v["entries"][PURL]["artifact"]["sha256"] = serde_json::json!("0".repeat(64));
-    std::fs::write(&state_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let tampered_state = serde_json::to_vec_pretty(&v).unwrap();
+    std::fs::write(&state_path, &tampered_state).unwrap();
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
@@ -477,9 +479,15 @@ async fn repair_fails_closed_on_tampered_ledger_sha() {
             .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_artifact_rebuild_failed"),
         "envelope={env}"
     );
-    assert!(
-        !tgz.exists(),
-        "an unverifiable rebuild must not be left on disk"
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        original_artifact,
+        "rejecting the rebuild must preserve the previous artifact"
+    );
+    assert_eq!(
+        std::fs::read(&state_path).unwrap(),
+        tampered_state,
+        "failed verification must not replace the ledger's trust anchor"
     );
 }
 

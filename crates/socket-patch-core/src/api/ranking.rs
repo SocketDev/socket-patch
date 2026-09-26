@@ -57,11 +57,11 @@ use crate::api::types::{BatchPatchInfo, PatchSearchResult};
 /// `low`, so a patch with no severity information never outranks one that
 /// has some.
 pub fn severity_order(severity: Option<&str>) -> u8 {
-    match severity.map(|s| s.to_ascii_lowercase()).as_deref() {
-        Some("critical") => 0,
-        Some("high") => 1,
-        Some("medium") | Some("moderate") => 2,
-        Some("low") => 3,
+    match severity {
+        Some(s) if s.eq_ignore_ascii_case("critical") => 0,
+        Some(s) if s.eq_ignore_ascii_case("high") => 1,
+        Some(s) if s.eq_ignore_ascii_case("medium") || s.eq_ignore_ascii_case("moderate") => 2,
+        Some(s) if s.eq_ignore_ascii_case("low") => 3,
         _ => 4,
     }
 }

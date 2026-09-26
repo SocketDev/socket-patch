@@ -13,12 +13,12 @@ use std::time::Duration;
 
 use super::get::short_uuid;
 use super::rollback::{all_files_already_original, pin_before_hash_blobs, rollback_patches};
-use super::vendor::{dispatch_revert_one, dispatch_revert_one_opts};
+use super::vendor::dispatch_revert_one_opts;
 use crate::args::{apply_env_toggles, GlobalArgs};
-use socket_patch_core::vendor::RevertOpts;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
+use socket_patch_core::vendor::RevertOpts;
 
 /// A remove/rollback identifier matches a patch by PURL for `pkg:`
 /// identifiers (a base PURL matches every release variant of that
@@ -33,15 +33,25 @@ pub(crate) fn patch_matches(purl: &str, uuid: &str, identifier: &str) -> bool {
 }
 
 /// Vendor-ledger entries matching a remove identifier: by ledger key or
-/// base purl (mirroring the manifest matching). Sorted by key for
-/// deterministic event order.
-fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
+/// base purl, including the manifest keys the identifier resolved to. The
+/// ledger may still hold an older patch UUID for the same package. Qualified
+/// keys stay exact so selecting one release variant never reverts its sibling.
+/// Sorted by key for deterministic event order.
+fn vendor_entries_matching(
+    state: &VendorState,
+    identifier: &str,
+    manifest_purls: &[&str],
+) -> Vec<(String, VendorEntry)> {
     let mut matches: Vec<(String, VendorEntry)> = state
         .entries
         .iter()
         .filter(|(key, entry)| {
             patch_matches(key, &entry.uuid, identifier)
                 || patch_matches(&entry.base_purl, &entry.uuid, identifier)
+                || manifest_purls.iter().any(|purl| {
+                    purl_matches_identifier(key, purl)
+                        || purl_matches_identifier(&entry.base_purl, purl)
+                })
         })
         .map(|(k, e)| (k.clone(), e.clone()))
         .collect();
@@ -149,7 +159,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
 
-    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    let manifest_missing = matches!(tokio::fs::metadata(&manifest_path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     if manifest_missing {
         // A pure-detached project (`scan --vendor --detached`) has a
         // vendor ledger but deliberately no manifest, and `remove` is the
@@ -160,7 +171,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         let has_detached_match = load_state(&args.common.cwd)
             .await
             .map(|s| {
-                vendor_entries_matching(&s, &args.identifier)
+                vendor_entries_matching(&s, &args.identifier, &[])
                     .iter()
                     .any(|(_, e)| e.detached)
             })
@@ -168,17 +179,16 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // Hosted redirects likewise live outside the manifest (the
         // redirect ledger is the only persistence), so a hosted-only
         // project's `remove` proceeds manifest-less too.
-        let has_hosted_match = socket_patch_core::patch::redirect::load_redirect_state(
-            &args.common.cwd,
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|st| {
-            st.records
-                .iter()
-                .any(|(purl, rec)| patch_matches(purl, &rec.uuid, &args.identifier))
-        });
+        let has_hosted_match =
+            socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|st| {
+                    st.records
+                        .iter()
+                        .any(|(purl, rec)| patch_matches(purl, &rec.uuid, &args.identifier))
+                });
         if !has_detached_match && !has_hosted_match {
             emit_error_envelope(
                 args.common.json,
@@ -210,11 +220,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // Read manifest to show what will be removed and confirm. On the
     // pure-detached path there is no manifest to read or mutate; an empty
     // view routes the flow to the detached-only removal below.
-    let manifest = if manifest_missing {
-        PatchManifest::new()
-    } else {
+    let manifest = {
         match read_manifest(&manifest_path).await {
             Ok(Some(m)) => m,
+            Ok(None) if manifest_missing => PatchManifest::new(),
             Ok(None) => {
                 emit_error_envelope(
                     args.common.json,
@@ -255,7 +264,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // through to `not_found`: nothing is mutated on that path.
         let detached_state = load_state(&args.common.cwd).await.unwrap_or_default();
         let detached: Vec<(String, VendorEntry)> =
-            vendor_entries_matching(&detached_state, &args.identifier)
+            vendor_entries_matching(&detached_state, &args.identifier, &[])
                 .into_iter()
                 .filter(|(_, e)| e.detached)
                 .collect();
@@ -464,7 +473,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
             return 1;
         }
     };
-    let vendored_matches = vendor_entries_matching(&vendor_state, &args.identifier);
+    let manifest_purls: Vec<&str> = matching.iter().map(|(purl, _)| purl.as_str()).collect();
+    let vendored_matches =
+        vendor_entries_matching(&vendor_state, &args.identifier, &manifest_purls);
     // Reverted entries ride the final envelope as Removed/vendor_reverted
     // events WITHOUT bumping summary.removed (that count stays "manifest
     // entries deleted", same as the blob-sweep carrier). Retained/warning
@@ -475,8 +486,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // EXCLUDED from the removal below (dropping a record whose vendored
     // state survives would hand `vendor`'s reconcile a revert with no
     // backing record).
-    let mut vendor_kept_purls: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut vendor_kept_purls: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
             for (key, _) in &vendored_matches {
@@ -642,8 +652,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         .records
                         .keys()
                         .all(|p| hosted_matches.contains(p));
-                    let before =
-                        (redirect_state.edits.len(), redirect_state.records.len());
+                    let before = (redirect_state.edits.len(), redirect_state.records.len());
                     let leg = super::rollback::run_hosted_leg(
                         &args.common,
                         &hosted_matches,
@@ -659,12 +668,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     if !args.common.dry_run
                         && (redirect_state.edits.len(), redirect_state.records.len()) != before
                     {
-                        if let Err(e) =
-                            socket_patch_core::patch::redirect::persist_redirect_state(
-                                &args.common.cwd,
-                                &redirect_state,
-                            )
-                            .await
+                        if let Err(e) = socket_patch_core::patch::redirect::persist_redirect_state(
+                            &args.common.cwd,
+                            &redirect_state,
+                        )
+                        .await
                         {
                             emit_error_envelope(
                                 args.common.json,
@@ -1025,7 +1033,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                          record retained); re-run `scan --mode vendored` to normalize, then \
                          remove again",
                         vendor_kept_purls.len(),
-                        if vendor_kept_purls.len() == 1 { "y was" } else { "ies were" }
+                        if vendor_kept_purls.len() == 1 {
+                            "y was"
+                        } else {
+                            "ies were"
+                        }
                     );
                 }
                 1
@@ -1110,8 +1122,7 @@ async fn remove_hosted_only(
     // Persist FIRST, failure or not (see the main-flow hosted leg): the
     // per-purl reverts already flushed lockfile writes, so the on-disk
     // ledger must reflect them even when a later match failed.
-    if !args.common.dry_run
-        && (redirect_state.edits.len(), redirect_state.records.len()) != before
+    if !args.common.dry_run && (redirect_state.edits.len(), redirect_state.records.len()) != before
     {
         if let Err(e) = socket_patch_core::patch::redirect::persist_redirect_state(
             &args.common.cwd,
@@ -1129,12 +1140,7 @@ async fn remove_hosted_only(
         }
     }
     if !leg.unsupported.is_empty() {
-        track_patch_remove_failed(
-            "hosted redirect revert unsupported",
-            api_token,
-            org_slug,
-        )
-        .await;
+        track_patch_remove_failed("hosted redirect revert unsupported", api_token, org_slug).await;
         emit_error_envelope(
             args.common.json,
             args.common.dry_run,
@@ -1167,12 +1173,10 @@ async fn remove_hosted_only(
     };
     // Human per-purl lines already printed inside `run_hosted_leg`.
     for purl in &leg.reverted {
-        env.record(
-            PatchEvent::new(action, purl.clone()).with_reason(
-                "hosted_reverted",
-                "hosted lockfile redirect unwound on remove",
-            ),
-        );
+        env.record(PatchEvent::new(action, purl.clone()).with_reason(
+            "hosted_reverted",
+            "hosted lockfile redirect unwound on remove",
+        ));
     }
     if args.common.json {
         println!("{}", env.to_pretty_json());
@@ -1225,8 +1229,18 @@ async fn remove_detached_only(
 
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
+    let mut removed_count = 0;
+    let mut kept = false;
     for (key, entry) in &detached {
-        let outcome = dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
+        let outcome = dispatch_revert_one_opts(
+            entry,
+            &args.common.cwd,
+            RevertOpts {
+                dry_run: args.common.dry_run,
+                keep_artifact: args.preserve_state,
+            },
+        )
+        .await;
         for w in &outcome.warnings {
             if !args.common.json && !args.common.silent {
                 eprintln!("Warning ({}): {}", w.code, w.detail);
@@ -1254,6 +1268,16 @@ async fn remove_detached_only(
             );
             return 1;
         }
+        if outcome.kept_artifact {
+            kept = true;
+            env.record(
+                PatchEvent::new(PatchAction::Skipped, key.clone()).with_reason(
+                    "vendor_revert_kept",
+                    "lockfile wiring drifted; vendored state retained",
+                ),
+            );
+            continue;
+        }
         if args.common.dry_run {
             if !args.common.json && !args.common.silent {
                 println!("Would revert vendoring for {key}");
@@ -1266,6 +1290,18 @@ async fn remove_detached_only(
                     "vendoring would be reverted on remove",
                 ),
             );
+            continue;
+        }
+        if args.preserve_state {
+            env.record(
+                PatchEvent::new(PatchAction::Skipped, key.clone()).with_reason(
+                    "vendor_state_preserved",
+                    "lockfile unwired; artifact and ledger entry preserved (--preserve-state)",
+                ),
+            );
+            if !args.common.json && !args.common.silent {
+                println!("Unwired vendoring for {key} (artifact preserved)");
+            }
             continue;
         }
         state.entries.remove(key);
@@ -1281,18 +1317,25 @@ async fn remove_detached_only(
         if !args.common.json && !args.common.silent {
             println!("Reverted vendoring for {key}");
         }
+        removed_count += 1;
         env.record(
             PatchEvent::new(PatchAction::Removed, key.clone())
                 .with_reason("vendor_reverted", "vendoring reverted on remove"),
         );
     }
+    if kept {
+        env.mark_partial_failure();
+        if !args.common.json {
+            eprintln!("Error: vendored wiring drifted; the affected artifact and ledger entry were retained");
+        }
+    }
     if args.common.json {
         println!("{}", env.to_pretty_json());
     }
     if !args.common.dry_run {
-        track_patch_removed(detached.len(), api_token, org_slug).await;
+        track_patch_removed(removed_count, api_token, org_slug).await;
     }
-    0
+    i32::from(kept)
 }
 
 async fn remove_patch_from_manifest(
@@ -1347,6 +1390,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vendor_matching_uses_manifest_identity_without_expanding_qualified_variants() {
+        let mut state = VendorState::new();
+        let base = "pkg:pypi/six@1.16.0";
+        let first = format!("{base}?artifact_id=wheel-cp311");
+        let second = format!("{base}?artifact_id=wheel-cp312");
+        for (key, uuid) in [(&first, "old-cp311"), (&second, "old-cp312")] {
+            state.entries.insert(
+                key.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "ecosystem": "pypi", "basePurl": base, "uuid": uuid,
+                    "artifact": {"path": format!(".socket/vendor/pypi/{uuid}/six.whl")},
+                    "wiring": []
+                }))
+                .unwrap(),
+            );
+        }
+        assert!(vendor_entries_matching(&state, "new-cp311", &[]).is_empty());
+        let matches = vendor_entries_matching(&state, "new-cp311", &[&first]);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, first);
+        assert_eq!(matches[0].1.uuid, "old-cp311");
+        assert_eq!(
+            vendor_entries_matching(&state, "new-base", &[base]).len(),
+            2
+        );
+        assert_eq!(
+            vendor_entries_matching(&state, "old-cp312", &[])[0].0,
+            second
+        );
+    }
+
     /// Write a manifest with three PyPI release variants of one
     /// package@version plus an unrelated npm package, returning the
     /// temp dir (kept alive) and the manifest path.
@@ -1380,9 +1455,10 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path, &Default::default())
-            .await
-            .expect("remove ok");
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path, &Default::default())
+                .await
+                .expect("remove ok");
 
         // All three release variants removed; the npm package untouched.
         assert_eq!(removed.len(), 3);
@@ -1397,10 +1473,13 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) =
-            remove_patch_from_manifest("pkg:pypi/six@1.16.0?artifact_id=sdist", &manifest_path, &Default::default())
-                .await
-                .expect("remove ok");
+        let (removed, manifest) = remove_patch_from_manifest(
+            "pkg:pypi/six@1.16.0?artifact_id=sdist",
+            &manifest_path,
+            &Default::default(),
+        )
+        .await
+        .expect("remove ok");
 
         // Only the sdist variant removed; the two wheels + npm remain.
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=sdist"]);
@@ -1416,9 +1495,10 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) = remove_patch_from_manifest("uuid-cp312", &manifest_path, &Default::default())
-            .await
-            .expect("remove ok");
+        let (removed, manifest) =
+            remove_patch_from_manifest("uuid-cp312", &manifest_path, &Default::default())
+                .await
+                .expect("remove ok");
 
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=wheel-cp312"]);
         assert_eq!(manifest.patches.len(), 3);
@@ -1443,9 +1523,10 @@ mod tests {
             .await
             .expect("write manifest");
 
-        let (removed, manifest) = remove_patch_from_manifest("pkg:npm/foo@1.0", &manifest_path, &Default::default())
-            .await
-            .expect("remove ok");
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:npm/foo@1.0", &manifest_path, &Default::default())
+                .await
+                .expect("remove ok");
 
         assert_eq!(removed, vec!["pkg:npm/foo@1.0"]);
         assert_eq!(manifest.patches.len(), 1);
@@ -1463,10 +1544,13 @@ mod tests {
         let manifest_path = tmp.path().join("manifest.json");
         let before_bytes = tokio::fs::read(&manifest_path).await.expect("read before");
 
-        let (removed, manifest) =
-            remove_patch_from_manifest("pkg:npm/not-here@9.9.9", &manifest_path, &Default::default())
-                .await
-                .expect("remove ok");
+        let (removed, manifest) = remove_patch_from_manifest(
+            "pkg:npm/not-here@9.9.9",
+            &manifest_path,
+            &Default::default(),
+        )
+        .await
+        .expect("remove ok");
 
         assert!(removed.is_empty(), "nothing should match");
         assert_eq!(manifest.patches.len(), 4, "manifest left intact");
@@ -1500,9 +1584,10 @@ mod tests {
             .await
             .expect("write manifest");
 
-        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path, &Default::default())
-            .await
-            .expect("remove ok");
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path, &Default::default())
+                .await
+                .expect("remove ok");
 
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=sdist"]);
         assert_eq!(manifest.patches.len(), 1);

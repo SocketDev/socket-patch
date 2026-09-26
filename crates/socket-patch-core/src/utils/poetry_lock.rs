@@ -15,6 +15,7 @@
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::utils::python_lock::{is_prior_hosted_url, next_header_end};
 
 /// The lock generation: `"0"`, `"1.0"`, `"1.1"`, or any `"2.<minor>"` (Poetry
 /// bumps the minor additively — 2.0 → 2.1 kept every shape we rewrite, and the
@@ -39,7 +40,10 @@ pub fn lock_version(lock: &DocumentMut) -> Result<&str, String> {
         {
             Ok("0")
         }
-        None => Err("poetry.lock has neither a [metadata] lock-version nor a [metadata.hashes] table".into()),
+        None => Err(
+            "poetry.lock has neither a [metadata] lock-version nor a [metadata.hashes] table"
+                .into(),
+        ),
     }
 }
 
@@ -62,32 +66,6 @@ pub fn generated_by_version(lock_text: &str) -> Option<(u64, u64)> {
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     Some((major, minor))
-}
-
-/// Whether `existing` is an earlier hosted redirect of the SAME artifact:
-/// same origin (`scheme://host[:port]`) and same trailing filename as the
-/// current artifact URL, fragments ignored. Grant tokens and patch uuids live
-/// in the path between them, so a rotated token or a republished patch is
-/// superseded in place instead of stranding the pin on a URL that no longer
-/// serves (the bun / requirements / cargo rewriters make the same call).
-fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
-    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return None;
-        }
-        let url = url.split('#').next()?;
-        let scheme_end = url.find("://")? + 3;
-        let path_start = url[scheme_end..].find('/')? + scheme_end;
-        let leaf = url[path_start..]
-            .rsplit('/')
-            .next()
-            .filter(|leaf| !leaf.is_empty())?;
-        Some((&url[..path_start], leaf))
-    }
-    match (origin_and_leaf(existing), origin_and_leaf(current)) {
-        (Some(old), Some(new)) => old == new,
-        _ => false,
-    }
 }
 
 /// Rewrite the `[[package]]` for `name`@`version` to install the wheel at
@@ -242,28 +220,6 @@ pub fn rewrite_poetry_lock(
         result = result.replacen(&original, &replacement, 1);
     }
     Ok(Some(result))
-}
-
-/// End (exclusive, before its line break) of the first top-level TOML header
-/// line at or after `from`, skipping blank lines; `text.len()` at EOF; `from`
-/// itself when the next non-blank line is not a header (a shape Poetry never
-/// writes — the fragment then ends where it used to).
-fn next_header_end(text: &str, from: usize) -> usize {
-    let mut pos = from;
-    for line in text[from..].split_inclusive('\n') {
-        let content = line.trim_end_matches(['\r', '\n']);
-        // Blank lines and comments sit between units (toml_edit clones carry
-        // the file's leading comment as decor); they belong to the boundary.
-        if content.trim().is_empty() || content.trim_start().starts_with('#') {
-            pos += line.len();
-            continue;
-        }
-        if content.starts_with('[') {
-            return pos + content.len();
-        }
-        return from;
-    }
-    text.len()
 }
 
 /// The verbatim `(original, replacement)` fragments that turn `original` into
@@ -426,7 +382,15 @@ mod tests {
                 Ok(other) => panic!("{label}: expected a refusal, got {other:?}"),
             }
             // The vendored (file-source) spelling takes the same guarded path.
-            match rewrite_poetry_lock(&text, "urllib3", "1.26.18", "file", ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl", WHEEL, &sha()) {
+            match rewrite_poetry_lock(
+                &text,
+                "urllib3",
+                "1.26.18",
+                "file",
+                ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+                WHEEL,
+                &sha(),
+            ) {
                 Err(err) => assert!(!err.is_empty(), "{label}"),
                 Ok(other) => panic!("{label}: expected a refusal, got {other:?}"),
             }
@@ -444,7 +408,10 @@ mod tests {
         assert!(rewritten.contains(URL));
         assert!(rewritten.contains("lock-version = \"2.2\""));
         for bad in ["3.0", "2", "2.x", "1.2"] {
-            let lock = fixture("2.4.3").replace("lock-version = \"2.1\"", &format!("lock-version = \"{bad}\""));
+            let lock = fixture("2.4.3").replace(
+                "lock-version = \"2.1\"",
+                &format!("lock-version = \"{bad}\""),
+            );
             let err = hosted(&lock).unwrap_err();
             assert!(err.contains(bad), "{bad}: {err}");
         }
@@ -467,28 +434,47 @@ mod tests {
         // Poetry 1.0 carries a `#sha256=…&` fragment; the comparison ignores it.
         let lock10 = fixture("1.0.10");
         let first10 = hosted(&lock10).unwrap().unwrap();
-        let second10 = rewrite_poetry_lock(&first10, "urllib3", "1.26.18", "url", &rotated, WHEEL, &"b".repeat(64))
-            .unwrap()
-            .unwrap();
+        let second10 = rewrite_poetry_lock(
+            &first10,
+            "urllib3",
+            "1.26.18",
+            "url",
+            &rotated,
+            WHEEL,
+            &"b".repeat(64),
+        )
+        .unwrap()
+        .unwrap();
         assert!(second10.contains(&format!("{rotated}#sha256={}&", "b".repeat(64))));
         // A user's own url source on another origin stays untouched.
         let foreign = first.replace("https://patch.socket.dev", "https://mirror.example");
-        assert!(hosted(&foreign).unwrap_err().contains("existing Poetry source"));
+        assert!(hosted(&foreign)
+            .unwrap_err()
+            .contains("existing Poetry source"));
         // A vendored file source is never taken over by the hosted path here.
-        let vendored = rewrite_poetry_lock(&lock, "urllib3", "1.26.18", "file", ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl", WHEEL, &sha())
-            .unwrap()
-            .unwrap();
-        assert!(hosted(&vendored).unwrap_err().contains("existing Poetry source"));
+        let vendored = rewrite_poetry_lock(
+            &lock,
+            "urllib3",
+            "1.26.18",
+            "file",
+            ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+            WHEEL,
+            &sha(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(hosted(&vendored)
+            .unwrap_err()
+            .contains("existing Poetry source"));
     }
 
     #[test]
     fn sha256_is_written_lowercase() {
         let lock = fixture("2.4.3");
         let upper = "A".repeat(64);
-        let rewritten =
-            rewrite_poetry_lock(&lock, "urllib3", "1.26.18", "url", URL, WHEEL, &upper)
-                .unwrap()
-                .unwrap();
+        let rewritten = rewrite_poetry_lock(&lock, "urllib3", "1.26.18", "url", URL, WHEEL, &upper)
+            .unwrap()
+            .unwrap();
         assert!(rewritten.contains(&format!("sha256:{}", "a".repeat(64))));
         assert!(!rewritten.contains(&upper));
     }
@@ -508,7 +494,10 @@ mod tests {
         let lock = format!("{lock}{sibling}");
         let rewritten = hosted(&lock).unwrap().unwrap();
         assert!(rewritten.contains(URL));
-        assert!(rewritten.contains(&sibling), "sibling entry must survive verbatim");
+        assert!(
+            rewritten.contains(&sibling),
+            "sibling entry must survive verbatim"
+        );
         let edits = poetry_lock_edits(&lock, &rewritten, "urllib3").unwrap();
         assert_eq!(edits.len(), 2);
         assert!(edits[1].0.starts_with('\n'));
@@ -529,7 +518,10 @@ mod tests {
                 "{version}: {original:?}"
             );
             assert!(new.ends_with("[metadata]") || new.ends_with("[extras]"));
-            assert!(!new.contains(original.as_str()), "{version}: pristine must not be a prefix of new");
+            assert!(
+                !new.contains(original.as_str()),
+                "{version}: pristine must not be a prefix of new"
+            );
             // A relock that keeps `[package.source]` but drops the inserted
             // `files` line must NOT contain the pristine fragment either.
             let drifted: String = rewritten
@@ -543,12 +535,20 @@ mod tests {
         // header, the second starts with it; both splice independently.
         let lock = fixture("2.4.3");
         let mut doc: DocumentMut = lock.parse().unwrap();
-        let mut second = doc["package"].as_array_of_tables().unwrap().get(0).unwrap().clone();
+        let mut second = doc["package"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .clone();
         second["name"] = value("six");
         second["version"] = value("1.16.0");
         second.set_position(None);
         second.remove("extras");
-        doc["package"].as_array_of_tables_mut().unwrap().push(second);
+        doc["package"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .push(second);
         let two = doc.to_string();
         let first = hosted(&two).unwrap().unwrap();
         let edits = poetry_lock_edits(&two, &first, "urllib3").unwrap();
@@ -560,11 +560,29 @@ mod tests {
     fn absent_or_other_version_yields_none_not_error() {
         let lock = fixture("2.4.3");
         assert_eq!(
-            rewrite_poetry_lock(&lock, "six", "1.16.0", "url", &URL.replace("urllib3", "six").replace("1.26.18", "1.16.0"), "six-1.16.0-py2.py3-none-any.whl", &sha()).unwrap(),
+            rewrite_poetry_lock(
+                &lock,
+                "six",
+                "1.16.0",
+                "url",
+                &URL.replace("urllib3", "six").replace("1.26.18", "1.16.0"),
+                "six-1.16.0-py2.py3-none-any.whl",
+                &sha()
+            )
+            .unwrap(),
             None
         );
         assert_eq!(
-            rewrite_poetry_lock(&lock, "urllib3", "1.26.17", "url", &URL.replace("1.26.18", "1.26.17"), "urllib3-1.26.17-py2.py3-none-any.whl", &sha()).unwrap(),
+            rewrite_poetry_lock(
+                &lock,
+                "urllib3",
+                "1.26.17",
+                "url",
+                &URL.replace("1.26.18", "1.26.17"),
+                "urllib3-1.26.17-py2.py3-none-any.whl",
+                &sha()
+            )
+            .unwrap(),
             None
         );
     }

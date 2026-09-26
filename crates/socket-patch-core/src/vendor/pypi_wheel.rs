@@ -21,6 +21,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{
     is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
 };
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::fs::{atomic_write_bytes, list_dir_entries};
 
 use super::common::{failed_result, is_executable, write_zip_entries};
@@ -49,20 +50,6 @@ pub struct WheelArtifact {
     /// `hash = "sha256:..."` verify).
     pub sha256_hex: String,
     pub size: u64,
-}
-
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted in the dist-info (or squatting a RECORD member)
-/// fails fast — surfacing as the same unreadable-file refusal/failure as a
-/// missing file — instead of wedging the vendor run forever in an `open(2)`
-/// that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Byte-reading twin of [`read_regular_to_string`], also handing back the
@@ -1234,7 +1221,10 @@ mod tests {
             record: vec![],
             wheel_tags: vec!["py3-none-any".into()],
         };
-        assert_eq!(wheel_file_name(&dist).unwrap(), "pkg-1!2.0-py3-none-any.whl");
+        assert_eq!(
+            wheel_file_name(&dist).unwrap(),
+            "pkg-1!2.0-py3-none-any.whl"
+        );
     }
 
     /// `mkfifo(2)` directly instead of shelling out to the binary — the

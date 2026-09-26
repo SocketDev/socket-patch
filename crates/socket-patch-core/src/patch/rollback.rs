@@ -314,6 +314,53 @@ pub async fn rollback_package_patch(
     blobs_path: &Path,
     dry_run: bool,
 ) -> RollbackResult {
+    // Discovery reads package.json, which rollback itself may restore or
+    // remove. Keep the physical peers before changing the primary copy.
+    let copies = if package_key.starts_with("pkg:npm/") {
+        crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies_for_patch(
+            pkg_path,
+            package_key,
+            files,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    let mut result =
+        rollback_package_patch_at(package_key, pkg_path, files, blobs_path, dry_run).await;
+    // Verify each physical copy independently, even if the primary is already
+    // original. This also removes patch-added files from every pnpm copy.
+    if result.success {
+        for copy in copies {
+            let copy_result =
+                rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
+            if !copy_result.success {
+                result.success = false;
+                let copy_err = copy_result
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string());
+                let note = format!(
+                    "pnpm store copy {} failed to roll back: {}",
+                    copy.display(),
+                    copy_err
+                );
+                result.error = Some(match result.error.take() {
+                    Some(prev) => format!("{prev}; {note}"),
+                    None => note,
+                });
+            }
+        }
+    }
+    result
+}
+
+async fn rollback_package_patch_at(
+    package_key: &str,
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    blobs_path: &Path,
+    dry_run: bool,
+) -> RollbackResult {
     let mut result = RollbackResult {
         package_key: package_key.to_string(),
         package_path: pkg_path.display().to_string(),
@@ -356,14 +403,12 @@ pub async fn rollback_package_patch(
     }
 
     // Rollback files that need it
-    for (file_name, file_info) in files {
-        let already_original = result
-            .files_verified
-            .iter()
-            .any(|v| v.file == *file_name && v.status == VerifyRollbackStatus::AlreadyOriginal);
-        if already_original {
+    for verify_result in &result.files_verified {
+        if verify_result.status == VerifyRollbackStatus::AlreadyOriginal {
             continue;
         }
+        let file_name = &verify_result.file;
+        let file_info = &files[file_name];
 
         // New files (empty beforeHash): delete instead of restoring.
         if file_info.before_hash.is_empty() {
@@ -513,6 +558,139 @@ pub async fn rollback_package_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rollback_discovers_pnpm_peers_before_removing_package_json() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("node_modules/.pnpm");
+        let primary = store.join("example@1.0.0(peer@1.0.0)/node_modules/example");
+        let peer = store.join("example@1.0.0(peer@2.0.0)/node_modules/example");
+        let patched = br#"{"name":"example","version":"1.0.0"}"#;
+        for path in [&primary, &peer] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("package.json"), patched).unwrap();
+        }
+        let files = HashMap::from([(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(patched),
+            },
+        )]);
+
+        let result = rollback_package_patch(
+            "pkg:npm/example@1.0.0",
+            &primary,
+            &files,
+            root.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(!primary.join("package.json").exists());
+        assert!(!peer.join("package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_pnpm_peer_copies_are_verified_independently() {
+        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        for (primary_content, peer_content, dry_run, success) in [
+            ("original", "patched", false, true),
+            ("patched", "modified locally", false, false),
+            ("original", "modified locally", true, false),
+            ("original", "patched", true, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = dir.path().join("node_modules/.pnpm");
+            let primary = store.join("example@1.0.0(peer@1.0.0)/node_modules/example");
+            let peer = store.join("example@1.0.0(peer@2.0.0)/node_modules/example");
+            let blobs = dir.path().join("blobs");
+            std::fs::create_dir(&blobs).unwrap();
+            for (path, content) in [(&primary, primary_content), (&peer, peer_content)] {
+                std::fs::create_dir_all(path).unwrap();
+                std::fs::write(
+                    path.join("package.json"),
+                    r#"{"name":"example","version":"1.0.0"}"#,
+                )
+                .unwrap();
+                std::fs::write(path.join("index.js"), content).unwrap();
+            }
+            let before_hash = compute_git_sha256_from_bytes(b"original");
+            std::fs::write(blobs.join(&before_hash), "original").unwrap();
+            let files = HashMap::from([(
+                "package/index.js".to_string(),
+                PatchFileInfo {
+                    before_hash,
+                    after_hash: compute_git_sha256_from_bytes(b"patched"),
+                },
+            )]);
+
+            let result =
+                rollback_package_patch("pkg:npm/example@1.0.0", &primary, &files, &blobs, dry_run)
+                    .await;
+
+            assert_eq!(result.success, success, "{:?}", result.error);
+            let expected_peer = if dry_run || !success {
+                peer_content
+            } else {
+                "original"
+            };
+            assert_eq!(
+                std::fs::read_to_string(peer.join("index.js")).unwrap(),
+                expected_peer
+            );
+            assert_eq!(
+                std::fs::read_to_string(primary.join("index.js")).unwrap(),
+                if dry_run { primary_content } else { "original" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_removes_new_files_from_pnpm_peer_copies() {
+        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        // Include the already-removed primary case: it must not hide a peer
+        // that still contains the patch-added file.
+        for primary_exists in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = dir.path().join("node_modules/.pnpm");
+            let primary = store.join("example@1.0.0(peer@1.0.0)/node_modules/example");
+            let peer = store.join("example@1.0.0(peer@2.0.0)/node_modules/example");
+            for path in [&primary, &peer] {
+                std::fs::create_dir_all(path).unwrap();
+                std::fs::write(
+                    path.join("package.json"),
+                    r#"{"name":"example","version":"1.0.0"}"#,
+                )
+                .unwrap();
+            }
+            std::fs::write(peer.join("shim.js"), "patched").unwrap();
+            if primary_exists {
+                std::fs::write(primary.join("shim.js"), "patched").unwrap();
+            }
+            let files = HashMap::from([(
+                "package/shim.js".to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: compute_git_sha256_from_bytes(b"patched"),
+                },
+            )]);
+            let result = rollback_package_patch(
+                "pkg:npm/example@1.0.0",
+                &primary,
+                &files,
+                &dir.path().join("blobs"),
+                false,
+            )
+            .await;
+            assert!(result.success, "{:?}", result.error);
+            assert!(!primary.join("shim.js").exists());
+            assert!(!peer.join("shim.js").exists());
+        }
+    }
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     // The rollback write path IS `apply_file_patch` (see the restore loop in
     // `rollback_package_patch`); these tests pin the guarantees rollback
@@ -2087,12 +2265,9 @@ mod tests {
             .await
             .unwrap();
         // Blob whose CONTENT does not match its name — verifies Ready.
-        tokio::fs::write(
-            blobs_dir.path().join(&before_hash),
-            b"corrupted blob bytes",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&before_hash), b"corrupted blob bytes")
+            .await
+            .unwrap();
 
         let mut files = HashMap::new();
         files.insert(

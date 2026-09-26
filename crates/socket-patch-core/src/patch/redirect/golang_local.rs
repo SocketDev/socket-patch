@@ -391,7 +391,7 @@ pub async fn reconcile_go_redirects(
     // Re-read after (a)'s drops so the dangling-directive probe below sees the
     // current file.
     let entries = read_replace_entries(project_root).await;
-    for (purl, dir) in collect_copy_modules(&project_root.join(GO_PATCHES_DIR)).await {
+    for (purl, dir) in collect_copy_modules(project_root).await {
         if !desired_bases.contains(purl.as_str()) {
             // A go-patches directive still targeting THIS copy dangles once the
             // copy is pruned — loop (a) keeps it whenever the module is desired
@@ -638,9 +638,19 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
 /// returning `(purl, dir)`. A module dir is identified by an `@` in its final
 /// path component (`github.com/foo/bar@v1.4.2`); descent stops there (the
 /// module's own contents are not scanned). Returns empty if the root is absent.
-async fn collect_copy_modules(go_patches_root: &Path) -> Vec<(String, PathBuf)> {
+async fn collect_copy_modules(project_root: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
-    let mut pending = vec![(go_patches_root.to_path_buf(), String::new())];
+    // The caller deletes discovered copies. Never discover them through a
+    // symlinked root or .socket parent into an external tree.
+    for rel in [".socket", GO_PATCHES_DIR] {
+        if !tokio::fs::symlink_metadata(project_root.join(rel))
+            .await
+            .is_ok_and(|meta| meta.is_dir())
+        {
+            return out;
+        }
+    }
+    let mut pending = vec![(project_root.join(GO_PATCHES_DIR), String::new())];
     while let Some((dir, prefix)) = pending.pop() {
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
@@ -1996,6 +2006,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_does_not_delete_through_symlinked_copy_ancestors() {
+        for ancestor in [".socket", GO_PATCHES_DIR] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let copies = if ancestor == ".socket" {
+                outside.path().join("go-patches")
+            } else {
+                outside.path().to_path_buf()
+            };
+            let file = copies.join("example.com/module@v1.0.0/keep.go");
+            tokio::fs::create_dir_all(file.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&file, b"keep").await.unwrap();
+            let link = root.path().join(ancestor);
+            tokio::fs::create_dir_all(link.parent().unwrap())
+                .await
+                .unwrap();
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+            let removed = reconcile_go_redirects(root.path(), &HashSet::new(), false).await;
+            assert!(removed.is_empty(), "{ancestor}");
+            assert_eq!(tokio::fs::read(file).await.unwrap(), b"keep");
+        }
+    }
+
     /// The `WrongReplacePath` and `OrphanReplace` `Display` arms are printed
     /// verbatim by `apply --check` (the CLI calls `d.to_string()` for every
     /// drift) — pin the user-facing shape: both paths and the UNPATCHED
@@ -2177,7 +2215,10 @@ mod tests {
 
         // Parity: the real run removes exactly what the dry run reported.
         let removed_wet = reconcile_go_redirects(root, &HashSet::new(), false).await;
-        assert_eq!(removed_wet, removed, "dry-run report must match the real run");
+        assert_eq!(
+            removed_wet, removed,
+            "dry-run report must match the real run"
+        );
         assert!(!copy_dir.exists(), "real run prunes the copy");
         assert!(read_replace_entries(root).await.is_empty());
     }

@@ -6,6 +6,7 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::read_regular_to_string;
 
 use super::common::{
     item_get, lock_units_named, pep621_declared_names, record, revert_lock_fragment_splice_atomic,
@@ -21,22 +22,6 @@ const LOCK_FILE: &str = "poetry.lock";
 
 /// The `WiringRecord.kind` discriminator this backend owns.
 const KIND_LOCK_PACKAGE: &str = "poetry_lock_package";
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `poetry.lock` (or the diagnostics-only
-/// `pyproject.toml`) fails fast instead of wedging every poetry-project
-/// vendor run forever in an `open(2)` that waits for a writer — the
-/// flavor-routing probes ahead of the load are metadata-only, so these are
-/// the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// A loaded-and-guard-checked poetry project.
 #[derive(Debug)]
@@ -940,14 +925,19 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             Some("x".into()),
             "y".into(),
         ));
-        let outcome = revert_poetry(&entry_for(wiring.clone(), meta.clone()), tmp.path(), false).await;
+        let outcome =
+            revert_poetry(&entry_for(wiring.clone(), meta.clone()), tmp.path(), false).await;
         assert!(outcome.success);
         assert_eq!(outcome.warnings.len(), 2, "{:?}", outcome.warnings);
         assert!(outcome
             .warnings
             .iter()
             .all(|w| w.code == "vendor_lock_entry_drifted"));
-        assert_eq!(read_lock(tmp.path()).await, native, "known fragments restored");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            native,
+            "known fragments restored"
+        );
 
         // Re-wire, then drift one fragment: now the atomic write must hold.
         let project = load_poetry_project(tmp.path()).await.unwrap();

@@ -204,12 +204,6 @@ pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, 
                     format!("cannot rewrite bun.lockb: {detail}"),
                 )
             })?;
-            lock.packages().map_err(|detail| {
-                (
-                    "vendor_bun_lockb_invalid",
-                    format!("cannot parse bun.lockb: {detail}"),
-                )
-            })?;
             return Ok(());
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
@@ -392,10 +386,13 @@ pub(crate) async fn vendor_bun(
     // ── 3. Pre-flight: at least one rewritable instance ──────────────────
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(name, version);
-    let has_match = entries
+    let targets: Vec<_> = entries
         .iter()
-        .any(|e| classify(e, &target_spec, name, &target_leaf).is_some());
-    if !has_match {
+        .filter_map(|entry| {
+            classify(entry, &target_spec, name, &target_leaf).map(|shape| (entry, shape))
+        })
+        .collect();
+    if targets.is_empty() {
         return refused(
             "vendor_lock_entry_not_found",
             format!(
@@ -415,12 +412,9 @@ pub(crate) async fn vendor_bun(
     // refused every maintenance verb and `repair` leaves the lock pointing
     // at a tarball it declined to rebuild. Still ahead of staging, so the
     // refusal precedes every write.
-    let writes_new_local_tuple = entries.iter().any(|e| {
-        matches!(
-            classify(e, &target_spec, name, &target_leaf),
-            Some(TupleShape::Registry)
-        )
-    });
+    let writes_new_local_tuple = targets
+        .iter()
+        .any(|(_, shape)| matches!(shape, TupleShape::Registry));
     if writes_new_local_tuple {
         if let Err((code, detail)) = check_workspace_compatibility(&lock_text, &entries) {
             return refused(code, detail);
@@ -434,8 +428,12 @@ pub(crate) async fn vendor_bun(
     // missing or non-regular path (a `repair` rebuild after deletion, a
     // FIFO) yields `None`, which the in-sync check below treats as "not
     // provably the same bytes".
-    let prior_artifact_integrity: Option<String> = {
-        let abs = project_root.join(&coords.uuid_dir_rel).join(&target_leaf);
+    let target_tgz = format!("{}/{}", coords.uuid_dir_rel, target_leaf);
+    let needs_prior_integrity = targets.iter().any(|(entry, shape)| {
+        entry.elems.len() == 2 && matches!(shape, TupleShape::Ours { path } if path == &target_tgz)
+    });
+    let prior_artifact_integrity: Option<String> = if needs_prior_integrity {
+        let abs = project_root.join(&target_tgz);
         match tokio::fs::metadata(&abs).await {
             Ok(meta) if meta.is_file() => tokio::fs::read(&abs).await.ok().map(|bytes| {
                 format!(
@@ -445,6 +443,8 @@ pub(crate) async fn vendor_bun(
             }),
             _ => None,
         }
+    } else {
+        None
     };
 
     // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
@@ -504,10 +504,7 @@ pub(crate) async fn vendor_bun(
     // spellings — so the run stays an AlreadyPatched no-op for the ledger
     // while ≥ 1.3.10 consumers of the committed lock regain verification.
     let mut healed = false;
-    for entry in &entries {
-        let Some(shape) = classify(entry, &target_spec, name, &target_leaf) else {
-            continue;
-        };
+    for (entry, shape) in targets {
         let original_line = lines[entry.line_idx].clone();
         // Lines come from a bare `split('\n')`, so a CRLF lock's lines carry
         // a trailing `\r` (the grammar trims it away when parsing). Re-emit
@@ -756,7 +753,7 @@ pub(crate) async fn revert_bun_opts(
 
     let mut lines: Option<Vec<String>> = None;
     if touches_lock {
-        match tokio::fs::read_to_string(project_root.join(BUN_LOCK)).await {
+        match read_regular_to_string(&project_root.join(BUN_LOCK)).await {
             Ok(text) => lines = Some(text.split('\n').map(str::to_string).collect()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
@@ -3320,5 +3317,40 @@ mod tests {
                 .exists(),
             "the re-run converges and removes the uuid dir"
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_refuses_fifo_lock_without_blocking_or_removing_artifact() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let lock = root.path().join(BUN_LOCK);
+        let fifo_name = std::ffi::CString::new(lock.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let artifact = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        std::fs::create_dir_all(root.path().join(&artifact).parent().unwrap()).unwrap();
+        std::fs::write(root.path().join(&artifact), b"keep").unwrap();
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm", "basePurl": "pkg:npm/left-pad@1.3.0", "uuid": UUID,
+            "artifact": {"path": artifact}, "flavor": "bun",
+            "wiring": [{"file": BUN_LOCK, "kind": KIND_LOCK_PACKAGE,
+                "action": "rewritten", "key": "left-pad", "original": "old", "new": "new"}]
+        }))
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            revert_bun_opts(&entry, root.path(), RevertOpts::new(false)),
+        )
+        .await;
+        // Release any blocked opener before failing the regression so the
+        // runtime can shut down even if an unguarded read is reintroduced.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&lock);
+        let outcome = result.expect("revert must not block on a FIFO");
+        assert!(!outcome.success);
+        assert!(outcome.error.unwrap().contains("cannot read bun.lock"));
+        assert_eq!(std::fs::read(root.path().join(&artifact)).unwrap(), b"keep");
     }
 }

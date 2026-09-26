@@ -7,7 +7,8 @@
 //!   (a) delete the vendored tarball  → `repair` rebuilds it byte-identically,
 //!       the flavor's install wiring (lock rewrite) is left intact;
 //!   (b) corrupt the vendored tarball → detected (ledger sha) and rebuilt;
-//!   (c) tamper the ledger sha        → fail-closed, exit 1, artifact removed;
+//!   (c) tamper the ledger sha        → fail-closed, exit 1, prior artifact and
+//!       ledger preserved;
 //!   (d) delete the ledger wholesale  → RECONSTRUCTED from the lockfile's
 //!       vendored-tarball reference (`scan_vendor_references` tokenizes the
 //!       pnpm/yarn/bun locks) and the artifact rebuilt.
@@ -571,12 +572,14 @@ async fn tampered_ledger_fails_closed(flavor: Flavor) {
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path(), flavor);
     let tgz = vendor_project(tmp.path(), &mock.uri(), flavor);
+    let original_artifact = std::fs::read(&tgz).unwrap();
 
     let state_path = tmp.path().join(".socket/vendor/state.json");
     let state = std::fs::read_to_string(&state_path).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&state).unwrap();
     v["entries"][PURL]["artifact"]["sha256"] = serde_json::json!("0".repeat(64));
-    std::fs::write(&state_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let tampered_state = serde_json::to_vec_pretty(&v).unwrap();
+    std::fs::write(&state_path, &tampered_state).unwrap();
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "{}: stdout={stdout} stderr={stderr}", flavor.tag());
@@ -588,9 +591,16 @@ async fn tampered_ledger_fails_closed(flavor: Flavor) {
         "{}: envelope={env}",
         flavor.tag()
     );
-    assert!(
-        !tgz.exists(),
-        "{}: an unverifiable rebuild must not be left on disk",
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        original_artifact,
+        "{}: rejecting the rebuild must preserve the previous artifact",
+        flavor.tag()
+    );
+    assert_eq!(
+        std::fs::read(&state_path).unwrap(),
+        tampered_state,
+        "{}: failed verification must not replace the ledger's trust anchor",
         flavor.tag()
     );
 }

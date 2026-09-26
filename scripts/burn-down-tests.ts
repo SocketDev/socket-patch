@@ -300,7 +300,7 @@ async function gitDirtyFiles(): Promise<string[]> {
 }
 
 async function gitDiffHead(): Promise<string> {
-  const { out } = await sh("git diff HEAD");
+  const { out } = await sh("git diff --binary HEAD");
   return out;
 }
 
@@ -335,9 +335,12 @@ function ensureGitIgnoredOutput(outDirRel: string): void {
 }
 
 async function gitCommit(message: string): Promise<string> {
-  await sh("git add -A");
-  await sh(`git commit --no-verify -m ${shq(message)}`);
-  const { out } = await sh("git rev-parse HEAD");
+  for (const command of ["git add -A", `git commit --no-verify -m ${shq(message)}`]) {
+    const { code, out } = await sh(command);
+    if (code !== 0) throw new Error(`Commit failed: ${out.trim()}`);
+  }
+  const { code, out } = await sh("git rev-parse HEAD");
+  if (code !== 0) throw new Error(`Cannot resolve committed HEAD: ${out.trim()}`);
   return out.trim();
 }
 
@@ -394,17 +397,21 @@ function parseTestOutput(raw: string): {
 async function runCargo(cmd: string, timeoutSec?: number): Promise<CargoResult> {
   const { code, out } = await sh(cmd, { timeoutSec });
   const { failing, detail, compiled } = parseTestOutput(out);
-  return { failing, detail, compiled, raw: out, exitCode: code };
+  // A crash, timeout or late build error may follow successful test output.
+  // Never treat a nonzero run with no reported test failures as a green suite.
+  const completed = code !== null && (code === 0 || failing.length > 0)
+    && !/^error: could not compile /m.test(out);
+  return { failing, detail, compiled: compiled && completed, raw: out, exitCode: code };
 }
 
 function suiteCommand(args: Args): string {
   if (args.testCmd) return args.testCmd;
-  const feat = args.features ? ` --features ${args.features}` : "";
+  const feat = args.features ? ` --features ${shq(args.features)}` : "";
   return `cargo test --workspace${feat} --no-fail-fast`;
 }
 
 function singleTestCommand(args: Args, test: string): string {
-  const feat = args.features ? ` --features ${args.features}` : "";
+  const feat = args.features ? ` --features ${shq(args.features)}` : "";
   return `cargo test ${shq(test)}${feat} -- --exact`;
 }
 
@@ -539,7 +546,7 @@ function runAgent(
       if (timedOut) {
         result.ok = false;
         result.reason = `timed out after ${timeoutSec}s`;
-      } else if (code !== 0 && !result.ok) {
+      } else if (code !== 0) {
         result.ok = false;
         result.reason =
           `exited with code ${code}` +
@@ -876,7 +883,10 @@ async function main(): Promise<void> {
     // ----- cargo verification: target passes -----
     console.log(`  → verifying ${test} passes…`);
     const single = await runCargo(singleTestCommand(args, test), args.timeoutSec);
-    if (!single.compiled || single.failing.includes(test) || single.failing.length) {
+    const targetPassed = single.raw.split("\n").some(
+      (line) => line.trim() === `test ${test} ... ok`,
+    );
+    if (!single.compiled || single.exitCode !== 0 || !targetPassed) {
       await recordFailedAttempt(
         !single.compiled ? "fix broke the build" : "target test still fails",
       );
@@ -919,6 +929,7 @@ async function main(): Promise<void> {
     if (args.review) {
       console.log("  → reviewing fix for reward hacking…");
       const dirtyBefore = await gitDirtyFiles();
+      const diffBefore = await gitDiffHead();
       const reviewPrompt = reviewRenderer({
         test,
         failureDetail: detail.get(test) ?? "",
@@ -952,7 +963,8 @@ async function main(): Promise<void> {
 
       // Guard: the read-only reviewer must not have mutated the tree.
       const dirtyAfter = await gitDirtyFiles();
-      if (JSON.stringify(dirtyAfter) !== JSON.stringify(dirtyBefore)) {
+      if (JSON.stringify(dirtyAfter) !== JSON.stringify(dirtyBefore)
+          || await gitDiffHead() !== diffBefore) {
         await recordFailedAttempt(
           "review agent modified the working tree (must be read-only)",
         );

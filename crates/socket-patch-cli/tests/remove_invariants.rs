@@ -192,7 +192,10 @@ fn remove_with_schema_invalid_manifest_emits_manifest_invalid() {
     std::fs::write(socket.join("manifest.json"), r#"{"not_patches": {}}"#).unwrap();
 
     let (code, stdout) = run_remove(tmp.path(), "pkg:npm/foo@1.0.0", &[]);
-    assert_eq!(code, 1, "schema-invalid manifest must exit 1; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "schema-invalid manifest must exit 1; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
     assert_eq!(
@@ -546,8 +549,6 @@ fn write_vendored_ledger(root: &Path, ledger_uuid: &str) -> PathBuf {
 /// Fully offline: no files in the record, vendor-owned purl (so the
 /// rollback returns before the before-blob gate), empty wiring.
 #[test]
-#[ignore = "RED: pins a ledger-generation matching fix in remove.rs that was not \
-            part of this change."]
 fn remove_by_uuid_reverts_vendoring_when_ledger_generation_is_older() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = write_vendored_manifest(tmp.path(), MANIFEST_UUID);

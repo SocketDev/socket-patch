@@ -359,3 +359,32 @@ async fn crawl_all_legacy_store_skips_stray_node_modules_and_probes_depth1_home(
         "a stray node_modules child of the store host must be skipped"
     );
 }
+
+#[tokio::test]
+async fn peer_variant_names_cannot_escape_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules/.pnpm");
+    let primary = store.join("primary/node_modules/foo");
+    let peer_nm = store.join("undecodable/node_modules");
+    let outside = tmp.path().join("outside");
+    for dir in [&primary, &peer_nm, &outside] {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+    }
+    // Undecodable store names force the metadata probe. Both a relative
+    // escape and an absolute name used to nominate this outside directory.
+    for name in [
+        "../../../../outside".to_string(),
+        outside.to_string_lossy().into_owned(),
+    ] {
+        let json = serde_json::json!({"name": name, "version": "1.0.0"}).to_string();
+        for dir in [&primary, &outside] {
+            tokio::fs::write(dir.join("package.json"), &json)
+                .await
+                .unwrap();
+        }
+        assert!(
+            find_pnpm_peer_variant_copies(&primary).await.is_empty(),
+            "{name}"
+        );
+    }
+}

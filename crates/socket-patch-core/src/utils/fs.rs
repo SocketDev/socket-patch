@@ -329,7 +329,7 @@ pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 /// sibling file, fsync it, then rename over the target (atomic on the same
 /// filesystem), so a reader or recovering process only ever sees the complete
 /// old or the complete new bytes.
-pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
     atomic_write_bytes_as(path, content, None).await
 }
 

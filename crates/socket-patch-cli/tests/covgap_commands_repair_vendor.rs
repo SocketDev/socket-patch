@@ -432,10 +432,8 @@ fn warnings_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 fn read_state(root: &Path) -> serde_json::Value {
-    serde_json::from_str(
-        &std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap()
+    serde_json::from_str(&std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap())
+        .unwrap()
 }
 
 fn write_state(root: &Path, state: &serde_json::Value) {
@@ -508,7 +506,11 @@ async fn repair_skips_entry_dropped_from_manifest() {
         .unwrap()
         .remove(PURL)
         .expect("the vendored patch must be in the manifest");
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     std::fs::remove_file(&tgz).unwrap();
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
@@ -544,9 +546,12 @@ async fn repair_skips_when_manifest_uuid_moved_on() {
     let manifest_path = tmp.path().join(".socket/manifest.json");
     let mut manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
-    manifest["patches"][PURL]["uuid"] =
-        serde_json::json!("99999999-9999-4999-8999-999999999999");
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    manifest["patches"][PURL]["uuid"] = serde_json::json!("99999999-9999-4999-8999-999999999999");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 
     let (code, stdout, stderr) = run_cli(
         tmp.path(),
@@ -866,7 +871,9 @@ async fn repair_dry_run_previews_gem_wiring_backfill() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "dry run must not persist the backfilled wiring: {state}"
     );
@@ -953,7 +960,9 @@ async fn repair_backfill_failure_warns_wiring_unknown() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "an unreconstructable wiring stays empty: {state}"
     );
@@ -1006,7 +1015,9 @@ async fn repair_reconstruction_without_gemfile_warns_wiring_unknown() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "no guessed wiring on the re-synthesized entry: {state}"
     );
@@ -1455,11 +1466,8 @@ async fn repair_ecosystems_scope_skips_out_of_scope_entries() {
     let tgz = vendor_project(tmp.path(), &mock.uri());
     std::fs::remove_file(&tgz).unwrap();
 
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--ecosystems", "gem"],
-    );
+    let (code, stdout, stderr) =
+        run_cli(tmp.path(), &mock.uri(), &["repair", "--ecosystems", "gem"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
@@ -1471,11 +1479,8 @@ async fn repair_ecosystems_scope_skips_out_of_scope_entries() {
         "repair --ecosystems gem must not touch the npm artifact"
     );
 
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--ecosystems", "npm"],
-    );
+    let (code, stdout, stderr) =
+        run_cli(tmp.path(), &mock.uri(), &["repair", "--ecosystems", "npm"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
@@ -1849,7 +1854,11 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     let mut jsr_record = manifest["patches"][PURL].clone();
     jsr_record["uuid"] = serde_json::json!(JSR_UUID);
     manifest["patches"][JSR_PURL] = jsr_record;
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 
     // Ledger entry for the jsr purl with a CORRUPT committed artifact.
     let corrupt_rel = format!(".socket/vendor/npm/{JSR_UUID}/left-pad-1.3.0.tgz");
@@ -1870,9 +1879,7 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     // deno.json project marker.
     std::fs::write(tmp.path().join("deno.json"), b"{}\n").unwrap();
     let deno_home = tempfile::tempdir().unwrap();
-    let jsr_pkg = deno_home
-        .path()
-        .join("npm/jsr.io/@std/path/0.220.0");
+    let jsr_pkg = deno_home.path().join("npm/jsr.io/@std/path/0.220.0");
     std::fs::create_dir_all(&jsr_pkg).unwrap();
     std::fs::write(jsr_pkg.join("index.js"), AFTER).unwrap();
 
@@ -1931,10 +1938,11 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
         "envelope={v}"
     );
     assert!(
-        !corrupt_abs.exists() && !tmp
-            .path()
-            .join(format!(".socket/vendor/npm/{JSR_UUID}.pre-rebuild"))
-            .exists(),
+        !corrupt_abs.exists()
+            && !tmp
+                .path()
+                .join(format!(".socket/vendor/npm/{JSR_UUID}.pre-rebuild"))
+                .exists(),
         "a missing artifact stays missing: nothing is invented or set aside"
     );
 }
@@ -1987,7 +1995,9 @@ async fn repair_reconstruction_renamed_leaf_fails_closed_and_restores_lock() {
         "the unreadable reconstructed path is the named cause: {failed}"
     );
     assert!(
-        !tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
         "nothing is kept from the rejected rebuild"
     );
     assert_eq!(
@@ -1997,16 +2007,11 @@ async fn repair_reconstruction_renamed_leaf_fails_closed_and_restores_lock() {
     );
 }
 
-// ────────── set-aside degrades to removal when the rename is blocked ──────────
-
-/// The eco level (`.socket/vendor/npm/`) is read-only, so the set-aside
-/// rename cannot create `<uuid>.pre-rebuild`: it degrades to plain removal
-/// (best-effort — the uuid dir itself survives empty, its unlink needs the
-/// same read-only parent) and the rebuild trigger still fires — the corrupt
-/// artifact is replaced, not wedged.
+/// If the existing artifact cannot be preserved, repair must refuse before
+/// replacing or deleting any of its bytes.
 #[cfg(unix)]
 #[tokio::test]
-async fn repair_set_aside_blocked_rename_degrades_to_removal() {
+async fn repair_set_aside_blocked_rename_preserves_live_artifact() {
     use std::os::unix::fs::PermissionsExt;
     if is_root() {
         eprintln!("skipped: read-only-dir contraption is inert as root");
@@ -2021,7 +2026,6 @@ async fn repair_set_aside_blocked_rename_degrades_to_removal() {
         "sha512-orig==",
     );
     let tgz = vendor_project(tmp.path(), &mock.uri());
-    let vendored_bytes = std::fs::read(&tgz).unwrap();
     std::fs::write(&tgz, b"corrupt bytes").unwrap();
 
     let eco_dir = tmp.path().join(".socket/vendor/npm");
@@ -2030,18 +2034,18 @@ async fn repair_set_aside_blocked_rename_degrades_to_removal() {
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     // Restore perms first so the tempdir always cleans up.
     std::fs::set_permissions(&eco_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
-        events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
-        "the blocked set-aside must not block the rebuild: {v}"
+        events_of(&v).iter().any(|e| e["action"] == "failed"
+            && e["purl"] == PURL
+            && e["errorCode"] == "vendor_artifact_unrepairable"),
+        "the blocked set-aside must refuse the rebuild: {v}"
     );
     assert_eq!(
         std::fs::read(&tgz).unwrap(),
-        vendored_bytes,
-        "the rebuild replaces the corrupt bytes"
+        b"corrupt bytes",
+        "the failed backup must preserve the original bytes"
     );
     assert!(
         !eco_dir.join(format!("{UUID}.pre-rebuild")).exists(),
@@ -2125,7 +2129,9 @@ async fn repair_backfill_persist_failure_stays_loud() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "the committed ledger still has the empty wiring: {state}"
     );
@@ -2219,8 +2225,7 @@ async fn repair_soft_persist_failure_skips_downstream_ladder() {
     assert_eq!(failed[0]["errorCode"], "vendor_state_write_failed", "{v}");
     assert!(
         !events_of(&v).iter().any(|e| e["purl"] == GEM_PURL
-            && (e["action"] == "rebuilt"
-                || e["errorCode"] == "vendor_inventory_unverified")),
+            && (e["action"] == "rebuilt" || e["errorCode"] == "vendor_inventory_unverified")),
         "no restore is claimed and no fingerprint advisory rides a dead restore: {v}"
     );
     assert_eq!(
@@ -2281,8 +2286,9 @@ async fn repair_unavailable_staging_skips_unpersistable_soft_candidate() {
         "the non-soft candidate still fails on the missing source: {v}"
     );
     assert!(
-        !events_of(&v).iter().any(|e| e["action"] == "rebuilt"
-            || e["errorCode"] == "vendor_inventory_unverified"),
+        !events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "rebuilt" || e["errorCode"] == "vendor_inventory_unverified"),
         "no restore is claimed for the unpersistable candidate: {v}"
     );
 }

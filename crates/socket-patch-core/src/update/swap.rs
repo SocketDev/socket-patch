@@ -51,7 +51,7 @@ pub fn acquire_update_lock() -> Result<Option<UpdateLock>, UpdateError> {
     // forever waiting for a reader; O_NONBLOCK makes it return immediately
     // (ENXIO, or a handle the is_file check below rejects). A no-op for the
     // regular file this normally is — the fd is only ever flock(2)ed, never
-    // read or written. Same guard as state.rs's read_state_bytes.
+    // read or written. Same guard as state.rs's shared regular-file reader.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -272,7 +272,7 @@ mod tests {
     /// A FIFO planted at the lock path must not wedge the updater: a plain
     /// `O_WRONLY` open(2) of a FIFO waits forever for a reader that never
     /// comes, hanging `--update` with no output before it does anything.
-    /// Same class as the `read_state_bytes` guard one file over in
+    /// Same class as the regular-file read guard one file over in
     /// state.rs — same directory, even.
     #[cfg(unix)]
     #[test]

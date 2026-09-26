@@ -33,8 +33,8 @@ use super::state::VendorEntry;
 
 /// Hard cap on decompressed wheel bytes, mirroring
 /// `patch::package`'s bomb posture for patch archives.
-const MAX_WHEEL_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_WHEEL_ENTRIES: usize = 10_000;
+pub(super) const MAX_WHEEL_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_WHEEL_ENTRIES: usize = 10_000;
 
 /// Validate `entry.artifact.path` and resolve it under `project_root`.
 ///

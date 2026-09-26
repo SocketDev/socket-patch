@@ -19,10 +19,9 @@
 //! never unlink a lock they hold (or one a live process might hold):
 //! a competitor keeping or taking an advisory lock on the orphaned
 //! inode while a fresh acquire locks its replacement defeats mutual
-//! exclusion. The one sanctioned deletion is `socket-patch repair`,
-//! which removes the leftover file as its final housekeeping step —
-//! after releasing its own guard — so a finished repair leaves a
-//! clean `.socket/` tree. A leftover file from a crashed run needs no
+//! exclusion. Even deleting after releasing our own guard is unsafe:
+//! another caller may have acquired the file in the meantime. All
+//! commands, including repair, retain it. A crashed run needs no
 //! removal to unblock anything: the kernel released the dead
 //! process's advisory lock with its file handle, so the next acquire
 //! reclaims the file in place.
@@ -93,27 +92,20 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
     // while still capping each sleep at 100 ms so the loop stays
     // responsive and `ZERO` keeps its non-blocking try-once semantics.
     let deadline = Instant::now().checked_add(timeout);
+    // Keep one handle throughout retries. Every cooperating command retains
+    // the inode after releasing its guard, so waiters and new callers always
+    // contend on the same file without repeating open(2) on every attempt.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| LockError::Io {
+            path: path.clone(),
+            source,
+        })?;
     loop {
-        // Open (or create) the lock file. `create(true)` is idempotent
-        // if it already exists; we never write to the file, only flock
-        // it. The open lives INSIDE the retry loop on purpose: `repair`
-        // may unlink `apply.lock` (and a fresh acquire recreate it)
-        // while we are parked waiting, and re-flocking a handle opened
-        // before the loop would lock the orphaned pre-deletion inode —
-        // handing out a second live guard alongside whoever locked the
-        // replacement file. Re-opening keeps every attempt bound to the
-        // inode the path names now.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LockError::Io {
-                path: path.clone(),
-                source,
-            })?;
-
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(LockGuard { _file: file }),
             // Only a genuine "someone else holds it" signal counts as
@@ -342,130 +334,6 @@ mod tests {
         releaser.join().unwrap();
     }
 
-    /// Regression: a waiter parked in the retry loop must not keep
-    /// locking the *old* inode across `repair`'s sanctioned lock-file
-    /// deletion.
-    ///
-    /// `repair` drops its guard and then unlinks `apply.lock` as its
-    /// final housekeeping step. It justifies that with a "residual
-    /// window of microseconds" between the drop and the unlink — true
-    /// for a fresh acquire (open, then immediately flock), but false
-    /// for a waiter: `acquire` used to open the lock file exactly once,
-    /// *before* the loop, then re-flock that same handle for the whole
-    /// `--lock-timeout` budget. So a waiter parked for minutes would
-    /// eventually flock the unlinked, orphaned inode and report success
-    /// while the next command created a fresh `apply.lock` and locked
-    /// that — two simultaneous holders of the "exclusive" apply lock,
-    /// i.e. exactly the concurrent manifest/package-file corruption the
-    /// lock exists to prevent. Re-opening the path on every retry keeps
-    /// the waiter honest about whatever file `apply.lock` names now.
-    ///
-    /// The choreography below can lose benign races on a loaded runner
-    /// (observed on macOS and Windows CI), so it retries: the
-    /// regressed bug double-holds on essentially every iteration, while
-    /// the benign losses need an unlucky deschedule and almost never
-    /// repeat. One clean iteration proves the re-open behavior; a full
-    /// run of iterations without one is statistically the bug.
-    #[test]
-    fn waiter_does_not_lock_orphaned_inode_after_lock_file_deleted() {
-        use std::sync::mpsc;
-
-        const ATTEMPTS: usize = 5;
-        let mut benign = Vec::new();
-        for _ in 0..ATTEMPTS {
-            let dir = tempfile::tempdir().unwrap();
-            let lock_path = dir.path().join("apply.lock");
-
-            // A `repair` run holds the lock; this is the inode the
-            // waiter will open below.
-            let repair_guard = acquire(dir.path(), Duration::ZERO).unwrap();
-
-            // The waiter: a concurrent `apply --lock-timeout 1` that
-            // parks in the retry loop while repair finishes.
-            let (started_tx, started_rx) = mpsc::channel();
-            let waiter_dir = dir.path().to_path_buf();
-            let waiter = std::thread::spawn(move || {
-                started_tx.send(()).unwrap();
-                acquire(&waiter_dir, Duration::from_millis(600))
-            });
-
-            // Let the waiter open the lock file and burn its first
-            // (contended) attempt, so its handle is on the pre-deletion
-            // inode. Being late here is harmless — it just means the
-            // waiter burns another attempt on the same handle.
-            started_rx.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(50));
-
-            // repair's tail: release the guard, then unlink the lock
-            // file. The next mutating command comes along and takes the
-            // lock on a brand-new inode.
-            drop(repair_guard);
-            std::fs::remove_file(&lock_path).unwrap();
-            let fresh = acquire(dir.path(), Duration::ZERO);
-
-            let waiter_result = waiter.join().unwrap();
-            match (fresh, waiter_result) {
-                // The interleaving under test: the fresh acquire won
-                // the post-unlink window, and the waiter — re-opening
-                // the path every retry — saw the new inode held and
-                // gave up. Under the bug this outcome is unreachable
-                // (the waiter flocks its orphaned pre-loop handle and
-                // returns a guard), so one clean iteration is proof.
-                (Ok(_fresh_guard), Err(LockError::Held)) => return,
-                // Benign race: the waiter's retry landed between the
-                // unlink and the fresh acquire, while the lock was
-                // genuinely free — it recreated the file and is a
-                // legitimate sole holder, and the fresh try-once
-                // correctly reported Held. Mutual exclusion held; retry
-                // for the interleaving under test.
-                (Err(LockError::Held), Ok(_waiter_guard)) => {
-                    benign.push("waiter won the free-lock window");
-                }
-                // Both hold "the" lock at once. For the fixed,
-                // re-opening waiter this needs the sanctioned
-                // microsecond window between its open() and flock()
-                // straddling repair's drop+unlink — vanishingly rare
-                // twice. The old one-handle waiter lands here on every
-                // iteration, so repeats fail below.
-                (Ok(_fresh_guard), Ok(_waiter_guard)) => {
-                    benign.push("double hold via the open->flock window");
-                }
-                // Windows can keep an unlinked file delete-pending until
-                // its last handle closes. CreateFile then returns
-                // ERROR_ACCESS_DENIED (5), including when the waiter is
-                // reopening while the fresh acquire races that cleanup.
-                // Neither an I/O refusal nor Held grants a second lock.
-                // Retry this choreography; still require a clean Held
-                // iteration above, and never relax acquire's I/O errors.
-                // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
-                #[cfg(windows)]
-                (Ok(_) | Err(LockError::Held), Err(LockError::Io { source, .. }))
-                | (Err(LockError::Io { source, .. }), Ok(_) | Err(LockError::Held))
-                    if source.raw_os_error() == Some(5) =>
-                {
-                    benign.push("open raced Windows delete-pending handle");
-                }
-                #[cfg(windows)]
-                (
-                    Err(LockError::Io { source: first, .. }),
-                    Err(LockError::Io { source: second, .. }),
-                ) if first.raw_os_error() == Some(5) && second.raw_os_error() == Some(5) => {
-                    benign.push("both opens raced Windows delete-pending handle");
-                }
-                (fresh, waiter_result) => panic!(
-                    "unexpected lock outcome: fresh={:?} waiter={:?}",
-                    fresh.map(|_| "Ok(guard)"),
-                    waiter_result.map(|_| "Ok(guard)")
-                ),
-            }
-        }
-        panic!(
-            "waiter must not acquire the apply lock while another holder is live \
-             (it locked the orphaned pre-deletion inode): no clean iteration in \
-             {ATTEMPTS} attempts — {benign:?}"
-        );
-    }
-
     /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
     /// flakes under heavy parallel load (fork/exec starvation) and the
     /// syscall needs no process at all.
@@ -518,9 +386,9 @@ mod tests {
                     fs2::lock_contended_error().raw_os_error()
                 );
             }
-            LockError::Held => panic!(
-                "a genuine flock fault must not be mislabelled as contention"
-            ),
+            LockError::Held => {
+                panic!("a genuine flock fault must not be mislabelled as contention")
+            }
         }
         // The fault arm returns without ever entering the retry/backoff
         // path: nowhere near the 5 s budget (the old funnel-everything-
@@ -552,9 +420,9 @@ mod tests {
                     fs2::lock_contended_error().raw_os_error()
                 );
             }
-            LockError::Held => panic!(
-                "try-once mode must not mislabel a genuine flock fault as Held"
-            ),
+            LockError::Held => {
+                panic!("try-once mode must not mislabel a genuine flock fault as Held")
+            }
         }
     }
 

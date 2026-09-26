@@ -146,7 +146,8 @@ pub(crate) fn classify_target(token: &str) -> RollbackTarget {
     if token.starts_with("pkg:") {
         return RollbackTarget::Identifier(token.to_string());
     }
-    let path_shaped = token.contains('/')
+    let path_shaped = token == "."
+        || token.contains('/')
         || token.contains('\\')
         || token.contains(['*', '?', '['])
         || Path::new(token).is_absolute();
@@ -218,7 +219,7 @@ enum InnerSelection<'a> {
 // Local go rolls back by dropping the project-local redirect (go's `replace`
 // directive) + the patched copy — no in-place restore, no before-blob. Cargo
 // patches in place (vendored or registry cache), so it rolls back in place from
-// before-blobs like npm/pypi. The helper is an inert stub without `golang`.
+// before-blobs like npm/pypi.
 // `is_local_go` is shared with `apply`, which creates the same redirects.
 
 /// True when `purl` rolls back by dropping a project-local redirect (local-mode
@@ -226,11 +227,7 @@ enum InnerSelection<'a> {
 /// this to skip those PURLs — they read no blobs, so a missing before-blob must
 /// not block (or trigger a needless download for) an offline redirect rollback.
 fn is_local_redirect(purl: &str, common: &GlobalArgs) -> bool {
-    if is_local_go(purl, common) {
-        return true;
-    }
-    let _ = (purl, common);
-    false
+    is_local_go(purl, common)
 }
 
 /// Copy of `manifest` with local-redirect PURLs (local-mode go) removed — used
@@ -360,12 +357,10 @@ pub(crate) fn all_files_already_original(result: &RollbackResult) -> bool {
 /// mirroring apply's dry-run split — to avoid double-counting them
 /// against "can be rolled back".
 fn can_rollback_count(results: &[RollbackResult]) -> usize {
-    let successful = results.iter().filter(|r| r.success).count();
-    let already_original = results
+    results
         .iter()
-        .filter(|r| r.success && all_files_already_original(r))
-        .count();
-    successful.saturating_sub(already_original)
+        .filter(|r| r.success && !all_files_already_original(r))
+        .count()
 }
 
 fn result_to_json(result: &RollbackResult) -> serde_json::Value {
@@ -617,7 +612,8 @@ async fn run_vendored_leg(
         } else {
             state.entries.remove(key);
             if let Err(e) = save_state(&common.cwd, state).await {
-                out.failed.push((key.clone(), format!("vendor ledger write failed: {e}")));
+                out.failed
+                    .push((key.clone(), format!("vendor ledger write failed: {e}")));
                 continue;
             }
             if !common.json && !common.silent {
@@ -702,12 +698,16 @@ pub(crate) async fn run_hosted_leg(
             let files: Vec<&str> = refusal.files.iter().map(String::as_str).collect();
             let why = format!("{} ({})", refusal.reason, files.join(", "));
             if !common.json {
-                eprintln!("Cannot unwind hosted redirect edits ({}): {why}", refusal.group);
+                eprintln!(
+                    "Cannot unwind hosted redirect edits ({}): {why}",
+                    refusal.group
+                );
             }
             out.failed.push((format!("group:{}", refusal.group), why));
         }
         out.warnings.extend(replay.warnings.iter().cloned());
-        out.edited_files.extend(replay.reverted_files.iter().cloned());
+        out.edited_files
+            .extend(replay.reverted_files.iter().cloned());
         // Deferred purls succeeded iff the replay dropped their records.
         for purl in deferred_to_replay {
             if replay.dropped_records.iter().any(|p| p == &purl) {
@@ -797,15 +797,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // themselves are LOADED UNDER the apply lock below: this run persists
     // mutated clones of the ledgers, so a pre-lock snapshot could clobber
     // a concurrent run's writes with stale state.
-    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    let manifest_missing = matches!(tokio::fs::metadata(&manifest_path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     let vendor_ledger_exists = tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
         .await
         .is_ok();
-    let redirect_ledger_exists = tokio::fs::metadata(
-        cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL),
-    )
-    .await
-    .is_ok();
+    let redirect_ledger_exists =
+        tokio::fs::metadata(cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL))
+            .await
+            .is_ok();
 
     if manifest_missing && !vendor_ledger_exists && !redirect_ledger_exists {
         // Ledger-less but still wired? (a deleted/uncommitted state.json
@@ -858,17 +858,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     // Load the state stores UNDER the lock (see the discovery note above).
     let vendor_state_result = socket_patch_core::vendor::load_state(&cwd).await;
-    let redirect_state_result =
-        socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
+    let redirect_state_result = socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
     let vendor_corrupt = vendor_state_result.is_err();
     let redirect_corrupt = redirect_state_result.is_err();
 
     // ── scope resolution ────────────────────────────────────────────────
-    let manifest = if manifest_missing {
-        PatchManifest::new()
-    } else {
+    let manifest = {
         match read_manifest(&manifest_path).await {
             Ok(Some(m)) => m,
+            Ok(None) if manifest_missing => PatchManifest::new(),
             Ok(None) => {
                 track_patch_rollback_failed(
                     "Invalid manifest",
@@ -881,8 +879,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
             Err(e) => {
                 let msg = e.to_string();
-                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref())
-                    .await;
+                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
                 emit_rollback_error(args.common.json, &msg);
                 return 1;
             }
@@ -996,13 +993,19 @@ pub async fn run(args: RollbackArgs) -> i32 {
             args.common.silent || args.common.json,
         )
         .await;
+        let single_scopes: Vec<_> = path_scope
+            .raw()
+            .iter()
+            .map(|raw| {
+                crate::path_scope::PathScope::parse(std::slice::from_ref(raw))
+                    .expect("already parsed above")
+            })
+            .collect();
         let mut matched_patterns: HashSet<usize> = HashSet::new();
         let mut path_selected: HashSet<String> = HashSet::new();
         for (purl, paths) in &discovered {
             for path in paths {
-                for (idx, raw) in path_scope.raw().iter().enumerate() {
-                    let single = crate::path_scope::PathScope::parse(std::slice::from_ref(raw))
-                        .expect("already parsed above");
+                for (idx, single) in single_scopes.iter().enumerate() {
                     if single.matches(&cwd, path) {
                         matched_patterns.insert(idx);
                         path_selected.insert(purl.clone());
@@ -1053,8 +1056,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 })
         });
         hosted_scope.retain(|purl| {
-            Ecosystem::from_purl(purl)
-                .is_some_and(|e| crate::commands::vendor::ecosystem_in_scope(&args.common, e.cli_name()))
+            Ecosystem::from_purl(purl).is_some_and(|e| {
+                crate::commands::vendor::ecosystem_in_scope(&args.common, e.cli_name())
+            })
         });
     }
 
@@ -1088,7 +1092,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
             format!(
                 "cannot read .socket/vendor/state.json: {} — the vendored leg, manifest \
                  cleanup, and GC were skipped",
-                vendor_state_result.as_ref().expect_err("checked corrupt above")
+                vendor_state_result
+                    .as_ref()
+                    .expect_err("checked corrupt above")
             ),
         ));
     }
@@ -1150,10 +1156,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             clauses.push(clause);
         }
         if !hosted_scope.is_empty() {
-            clauses.push(format!(
-                "unwind {} hosted redirect(s)",
-                hosted_scope.len()
-            ));
+            clauses.push(format!("unwind {} hosted redirect(s)", hosted_scope.len()));
         } else if hosted_leftover_edits > 0 {
             clauses.push(format!(
                 "replay {hosted_leftover_edits} leftover hosted redirect edit(s)"
@@ -1218,7 +1221,6 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // detection itself needs the ledger) — it surfaces via the
             // `vendor_state_unreadable` warning and exit 1 instead.
             let vendored: Vec<String> = Vec::new();
-            let _ = &vendored_excluded;
 
             // ── hosted leg ───────────────────────────────────────────────
             let mut hosted_leg = HostedLegOutcome::default();
@@ -1231,8 +1233,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     if !purls.is_empty() || (replay_eligible && !st.edits.is_empty()) {
                         hosted_leg =
                             run_hosted_leg(&args.common, &purls, &mut st, replay_eligible).await;
-                        let changed =
-                            (st.edits.len(), st.records.len()) != before;
+                        let changed = (st.edits.len(), st.records.len()) != before;
                         if !args.common.dry_run && changed {
                             if let Err(e) =
                                 socket_patch_core::patch::redirect::persist_redirect_state(
@@ -1359,10 +1360,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         removed_blobs = r.blobs_removed;
                         gc_bytes_freed += r.bytes_freed;
                     }
-                    Err(e) => run_warnings.push((
-                        "cleanup_failed".into(),
-                        format!("blob cleanup failed: {e}"),
-                    )),
+                    Err(e) => run_warnings
+                        .push(("cleanup_failed".into(), format!("blob cleanup failed: {e}"))),
                 }
                 for (dir, slot) in [
                     ("diffs", &mut removed_diffs),
@@ -1431,7 +1430,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                             "rollback restores every installed copy of a selected patch; \
                              {} restored cop{} outside the given paths",
                             out_of_scope.len(),
-                            if out_of_scope.len() == 1 { "y lives" } else { "ies live" }
+                            if out_of_scope.len() == 1 {
+                                "y lives"
+                            } else {
+                                "ies live"
+                            }
                         ),
                     ));
                 }
@@ -1732,6 +1735,90 @@ pub async fn run(args: RollbackArgs) -> i32 {
     }
 }
 
+type InstalledRollbackTarget<'a> = (&'a String, &'a PathBuf);
+
+/// Select each installed copy's matching release variants independently.
+/// Different environments can install different distributions of the same PURL.
+async fn select_rollback_targets<'a>(
+    all_packages_multi: &'a HashMap<String, Vec<PathBuf>>,
+    manifest: &PatchManifest,
+) -> (Vec<InstalledRollbackTarget<'a>>, Vec<String>) {
+    let mut rollback_targets = Vec::new();
+    let mut groups: HashMap<(String, &PathBuf), Vec<InstalledRollbackTarget<'_>>> = HashMap::new();
+    for (purl, pkg_paths) in all_packages_multi {
+        if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
+            for pkg_path in pkg_paths {
+                groups
+                    .entry((strip_purl_qualifiers(purl).to_string(), pkg_path))
+                    .or_default()
+                    .push((purl, pkg_path));
+            }
+        } else {
+            for pkg_path in pkg_paths {
+                rollback_targets.push((purl, pkg_path));
+            }
+        }
+    }
+
+    // Resolve which variant(s) each base PURL will actually roll back,
+    // BEFORE the before-blob gate below, so the gate covers only them.
+    // Narrowed-away sibling variants (same base, distribution NOT on disk)
+    // are collected so the CLI boundary's manifest-cleanup default can
+    // drop them alongside their attempted siblings — a rolled-back
+    // package must not leave half its variant group in the manifest
+    // (remove's identifier flow drops the whole group the same way).
+    let mut narrowed_out: Vec<String> = Vec::new();
+    for ((_base, _path), entries) in groups {
+        let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
+            entries
+        } else {
+            // All variants in a group resolve to the same installed path.
+            let pkg_path = entries[0].1;
+            let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = entries
+                .iter()
+                .filter_map(|(purl, _)| {
+                    manifest
+                        .patches
+                        .get(*purl)
+                        .map(|p| (purl.as_str(), &p.files))
+                })
+                .collect();
+            let matched = select_installed_variants(pkg_path, &candidates).await;
+            if matched.is_empty() {
+                // No variant matches the installed distribution (e.g. a
+                // locally-modified file). Fall back to attempting every
+                // variant so the per-file verification surfaces the
+                // mismatch rather than silently skipping the package.
+                entries
+            } else {
+                let winners: HashSet<String> = matched
+                    .iter()
+                    .map(|&i| candidates[i].0.to_string())
+                    .collect();
+                narrowed_out.extend(
+                    entries
+                        .iter()
+                        .filter(|(p, _)| !winners.contains(*p))
+                        .map(|(p, _)| (*p).clone()),
+                );
+                entries
+                    .into_iter()
+                    .filter(|(p, _)| winners.contains(*p))
+                    .collect()
+            }
+        };
+        rollback_targets.extend(to_rollback);
+    }
+    narrowed_out.sort();
+    narrowed_out.dedup();
+    let attempted: HashSet<&str> = rollback_targets
+        .iter()
+        .map(|(purl, _)| purl.as_str())
+        .collect();
+    narrowed_out.retain(|purl| !attempted.contains(purl.as_str()));
+    (rollback_targets, narrowed_out)
+}
+
 async fn rollback_patches_inner(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -1746,7 +1833,10 @@ async fn rollback_patches_inner(
     // The Scope selection tolerates a missing manifest (ledger-only
     // projects reach here with hosted/vendored work and no manifest);
     // the Identifier selection keeps the legacy hard requirement.
-    let manifest = match read_manifest(manifest_path).await.map_err(|e| e.to_string())? {
+    let manifest = match read_manifest(manifest_path)
+        .await
+        .map_err(|e| e.to_string())?
+    {
         Some(m) => m,
         None => match &selection {
             InnerSelection::Identifier(_) => return Err("Invalid manifest".to_string()),
@@ -1915,90 +2005,8 @@ async fn rollback_patches_inner(
         .cloned()
         .collect();
 
-    // Group discovered packages by base PURL. A release-variant
-    // `package@version` (PyPI/RubyGems/Maven) may have several variants
-    // in the manifest that `merge_qualified` resolves to the same
-    // installed package dir. Rolling back a variant that is *not* present
-    // on disk would HashMismatch and report a spurious failure, so —
-    // mirroring apply — we collapse each group to the variant(s) whose
-    // hashes actually match the installed bytes. PyPI/RubyGems yield one
-    // such variant; Maven's coexisting classifier jars may yield several.
-    //
-    // Non-variant ecosystems (npm/cargo/go/…) have no qualifiers, but npm
-    // does have genuine MULTIPLE physical copies of one `name@version`
-    // (nested dupes, diamonds, `file:` dups). Those must NOT be collapsed
-    // into a release-variant group — each copy is restored independently —
-    // so they are pushed straight to `rollback_targets`. Only the
-    // release-variant ecosystems (whose multiple qualified PURLs share ONE
-    // install dir) go through the group + narrow path.
-    let mut rollback_targets: Vec<(&String, &PathBuf)> = Vec::new();
-    let mut groups: HashMap<String, Vec<(&String, &PathBuf)>> = HashMap::new();
-    for (purl, pkg_paths) in &all_packages_multi {
-        if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
-            for pkg_path in pkg_paths {
-                groups
-                    .entry(strip_purl_qualifiers(purl).to_string())
-                    .or_default()
-                    .push((purl, pkg_path));
-            }
-        } else {
-            for pkg_path in pkg_paths {
-                rollback_targets.push((purl, pkg_path));
-            }
-        }
-    }
-
-    // Resolve which variant(s) each base PURL will actually roll back,
-    // BEFORE the before-blob gate below, so the gate covers only them.
-    // Narrowed-away sibling variants (same base, distribution NOT on disk)
-    // are collected so the CLI boundary's manifest-cleanup default can
-    // drop them alongside their attempted siblings — a rolled-back
-    // package must not leave half its variant group in the manifest
-    // (remove's identifier flow drops the whole group the same way).
-    let mut narrowed_out: Vec<String> = Vec::new();
-    for (_base, entries) in groups {
-        let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
-            entries
-        } else {
-            // All variants in a group resolve to the same installed path.
-            let pkg_path = entries[0].1;
-            let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = entries
-                .iter()
-                .filter_map(|(purl, _)| {
-                    filtered_manifest
-                        .patches
-                        .get(*purl)
-                        .map(|p| (purl.as_str(), &p.files))
-                })
-                .collect();
-            let matched = select_installed_variants(pkg_path, &candidates).await;
-            if matched.is_empty() {
-                // No variant matches the installed distribution (e.g. a
-                // locally-modified file). Fall back to attempting every
-                // variant so the per-file verification surfaces the
-                // mismatch rather than silently skipping the package.
-                entries
-            } else {
-                let winners: HashSet<String> = matched
-                    .iter()
-                    .map(|&i| candidates[i].0.to_string())
-                    .collect();
-                narrowed_out.extend(
-                    entries
-                        .iter()
-                        .filter(|(p, _)| !winners.contains(*p))
-                        .map(|(p, _)| (*p).clone()),
-                );
-                entries
-                    .into_iter()
-                    .filter(|(p, _)| winners.contains(*p))
-                    .collect()
-            }
-        };
-        rollback_targets.extend(to_rollback);
-    }
-    narrowed_out.sort();
-    narrowed_out.dedup();
+    let (rollback_targets, narrowed_out) =
+        select_rollback_targets(&all_packages_multi, &filtered_manifest).await;
 
     // Check for missing beforeHash blobs — AFTER discovery and variant
     // narrowing, so the gate covers ONLY the packages this run will
@@ -2280,14 +2288,8 @@ async fn rollback_patches_inner(
         let result = match try_rollback_local_go(purl, pkg_path, patch, common).await {
             Some(r) => r,
             None => {
-                rollback_package_patch(
-                    purl,
-                    pkg_path,
-                    &patch.files,
-                    &blobs_path,
-                    common.dry_run,
-                )
-                .await
+                rollback_package_patch(purl, pkg_path, &patch.files, &blobs_path, common.dry_run)
+                    .await
             }
         };
 
@@ -2315,8 +2317,7 @@ async fn rollback_patches_inner(
         let Some(patch) = scoped_manifest.patches.get(purl) else {
             continue;
         };
-        let Some(result) = try_rollback_local_go(purl, &common.cwd, patch, common).await
-        else {
+        let Some(result) = try_rollback_local_go(purl, &common.cwd, patch, common).await else {
             continue;
         };
         if !result.success {
@@ -2404,6 +2405,57 @@ pub(crate) async fn rollback_patches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rollback_selects_variants_for_each_installed_copy() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        tokio::fs::create_dir_all(&first).await.unwrap();
+        tokio::fs::create_dir_all(&second).await.unwrap();
+        tokio::fs::write(first.join("index.py"), b"first patched")
+            .await
+            .unwrap();
+        tokio::fs::write(second.join("index.py"), b"second patched")
+            .await
+            .unwrap();
+        let mut manifest = PatchManifest::new();
+        let mut packages = HashMap::new();
+        for (variant, content) in [
+            ("first", b"first patched".as_slice()),
+            ("second", b"second patched".as_slice()),
+        ] {
+            let purl = format!("pkg:pypi/demo@1.0?artifact_id={variant}");
+            let mut record = make_record(variant);
+            record.files.insert(
+                "index.py".into(),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(b"original"),
+                    after_hash: compute_git_sha256_from_bytes(content),
+                },
+            );
+            manifest.patches.insert(purl.clone(), record);
+            packages.insert(purl, vec![first.clone(), second.clone()]);
+        }
+        let (targets, narrowed_out) = select_rollback_targets(&packages, &manifest).await;
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        for (purl, path) in targets {
+            assert_eq!(
+                path.file_name().unwrap().to_str().unwrap(),
+                purl.split('=').next_back().unwrap()
+            );
+        }
+        assert!(narrowed_out.is_empty());
+    }
+
+    #[test]
+    fn current_directory_is_a_path_target() {
+        assert_eq!(
+            classify_target("."),
+            RollbackTarget::PathGlob(".".to_string())
+        );
+    }
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
 

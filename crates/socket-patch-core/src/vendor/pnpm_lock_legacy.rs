@@ -54,6 +54,7 @@
 //! revert; peer-suffixed / aliased reference spellings refuse before any
 //! write.
 
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use std::path::Path;
 
 use serde_json::Value;
@@ -70,9 +71,9 @@ use super::npm_common::{
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
     apply_pkg_override, check_lock_override, classify_pkg_override, commit_surfaces, drifted,
-    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line, read_regular,
-    read_regular_string, revert_overrides_line, revert_pkg_record, section_bounds, split_lines,
-    value_lines, vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
+    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line,
+    revert_overrides_line, revert_pkg_record, section_bounds, split_lines, value_lines,
+    vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
 };
 use super::state::{
     write_marker, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -303,7 +304,7 @@ pub async fn vendor_pnpm_legacy(
     let override_key = format!("{name}@{version}");
 
     // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let pkg_bytes = match read_regular(&project_root.join(PACKAGE_JSON)).await {
+    let pkg_bytes = match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
         Ok(bytes) => bytes,
         Err(e) => {
             return refused(
@@ -325,7 +326,7 @@ pub async fn vendor_pnpm_legacy(
             );
         }
     };
-    let lock_text = match read_regular_string(&project_root.join(PNPM_LOCK)).await {
+    let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
             return refused(
@@ -670,7 +671,7 @@ pub async fn vendor_pnpm_legacy(
 /// (the `overrides:` declaration alone never counts); `None` when
 /// undeterminable — callers keep the entry, fail-safe.
 pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let text = read_regular_string(&project_root.join(PNPM_LOCK))
+    let text = read_regular_to_string(&project_root.join(PNPM_LOCK))
         .await
         .ok()?;
     match sniff_lock_grammar(&text) {
@@ -1319,7 +1320,7 @@ pub async fn revert_pnpm_legacy_opts(
 
     let mut lock_lines: Option<Vec<String>> = None;
     if touches_lock {
-        match read_regular_string(&project_root.join(PNPM_LOCK)).await {
+        match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
             Ok(text) => lock_lines = Some(split_lines(&text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
@@ -1332,7 +1333,7 @@ pub async fn revert_pnpm_legacy_opts(
     }
     let mut pkg_state: Option<(Value, String)> = None;
     if touches_pkg {
-        match read_regular(&project_root.join(PACKAGE_JSON)).await {
+        match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(doc) if doc.is_object() => {
                     let indent = detect_indent(&String::from_utf8_lossy(&bytes));
@@ -1670,10 +1671,10 @@ fn revert_package_block(
             i = block.end;
             continue;
         }
-        let live: Vec<String> = lines[block.header..block.end].to_vec();
+        let live = &lines[block.header..block.end];
         let key_is_ours =
             parse_vendor_path(&new_key).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
-        if live != new_lines && !key_is_ours {
+        if live != new_lines.as_slice() && !key_is_ours {
             warnings.push(drifted(format!(
                 "packages entry `{new_key}` was changed since vendoring; left alone"
             )));
@@ -2960,7 +2961,11 @@ packages:
             fx.root().join(fx.rel_tgz()).exists(),
             "the CRLF lock still resolves through the tarball; deleting it bricks installs"
         );
-        assert_eq!(fx.read(PNPM_LOCK).await, crlf, "the drifted lock is left alone");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            crlf,
+            "the drifted lock is left alone"
+        );
     }
 
     /// LIVENESS CONTRACT ([`RevertOutcome::drift_skipped`]): a pair already
@@ -3330,7 +3335,9 @@ packages:
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the wiring itself succeeds");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_dep_manifest_stale"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_dep_manifest_stale"),
             "{warnings:?}"
         );
     }
@@ -3594,7 +3601,10 @@ packages:
             let entry = entry.unwrap();
             let after = fx.read(PNPM_LOCK).await;
 
-            assert!(after.contains(untouched), "{tag}: root dep untouched:\n{after}");
+            assert!(
+                after.contains(untouched),
+                "{tag}: root dep untouched:\n{after}"
+            );
             assert!(
                 !after.contains(&fx.canon_root_str()),
                 "{tag}: no machine path may be written:\n{after}"
@@ -3706,7 +3716,8 @@ packages:
         let ours_block = format!(
             "  file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz:\n    resolution: {{integrity: {SPIKE_INTEGRITY}, tarball: file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz}}\n    name: left-pad\n    version: 1.3.0\n    dev: false\n\n"
         );
-        let both = T7_BEFORE_LOCK.replace("  file:consumer:", &format!("{ours_block}  file:consumer:"));
+        let both =
+            T7_BEFORE_LOCK.replace("  file:consumer:", &format!("{ours_block}  file:consumer:"));
         assert_ne!(both, T7_BEFORE_LOCK);
         // (b) the registry entry has no resolution: line.
         let no_resolution = T7_BEFORE_LOCK.replace(
@@ -3798,7 +3809,11 @@ packages:
             outcome.warnings
         );
         assert!(!outcome.kept_artifact);
-        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK, "lock byte-restored");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            T7_BEFORE_LOCK,
+            "lock byte-restored"
+        );
         assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
         assert!(
             !fx.root()
@@ -3833,7 +3848,11 @@ packages:
             "foreign ours values are not drift: {:?}",
             outcome.warnings
         );
-        assert_eq!(fx.read(PNPM_LOCK).await, T8_BEFORE_LOCK, "lock byte-restored");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            T8_BEFORE_LOCK,
+            "lock byte-restored"
+        );
         assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
     }
 
@@ -3875,7 +3894,13 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(&fx, &entry, "specifiers entry `left-pad` no longer exists", 1).await;
+        assert_drift_keep(
+            &fx,
+            &entry,
+            "specifiers entry `left-pad` no longer exists",
+            1,
+        )
+        .await;
         rewire(&fx, &wired_pkg, &wired).await;
 
         // (c) the consumer's dep ref re-resolved.
@@ -4125,13 +4150,19 @@ packages:
         let outcome = revert_pnpm_legacy(&misflavored, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
-                && w.detail.contains("non-allowlisted")
-                && w.detail.contains("pnpm-workspace.yaml")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("non-allowlisted")
+                    && w.detail.contains("pnpm-workspace.yaml")),
             "{:?}",
             outcome.warnings
         );
-        assert!(outcome.kept_artifact, "an allowlist skip keeps the artifact");
+        assert!(
+            outcome.kept_artifact,
+            "an allowlist skip keeps the artifact"
+        );
         assert!(
             !fx.root().join("pnpm-workspace.yaml").exists(),
             "the non-allowlisted file is never written"
@@ -4198,11 +4229,10 @@ packages:
             T7_BEFORE_LOCK,
             "the lock is still restored"
         );
-        assert!(
-            !fx.root()
-                .join(format!(".socket/vendor/npm/{UUID}"))
-                .exists()
-        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
 
         // (c) non-object package.json: hard failure, nothing written.
         let (fx, entry) = vendored(T7_BEFORE_LOCK).await;
@@ -4211,7 +4241,10 @@ packages:
             .await
             .unwrap();
         let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
-        assert!(!outcome.success, "a broken package.json must fail the revert");
+        assert!(
+            !outcome.success,
+            "a broken package.json must fail the revert"
+        );
         assert!(
             outcome
                 .error
@@ -4468,7 +4501,9 @@ packages:
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the wiring itself succeeded");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert_eq!(fx.read(PACKAGE_JSON).await, T_AFTER_PKG);
@@ -4670,8 +4705,7 @@ packages:
         assert!(err.contains("vanished mid-rewrite"), "{err}");
         assert!(wiring.is_empty(), "a failed edit records no wiring");
 
-        let mut lines =
-            split_lines("lockfileVersion: 5.4\n\ndependencies:\n  left-pad: 1.3.0\n");
+        let mut lines = split_lines("lockfileVersion: 5.4\n\ndependencies:\n  left-pad: 1.3.0\n");
         assert_eq!(edit_pkg_dep_refs(&mut lines, &ctx, &mut wiring), Ok(false));
         assert!(wiring.is_empty());
     }

@@ -23,6 +23,7 @@ use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
+use crate::utils::fs::read_regular_to_string;
 
 use super::pnpm_lock_legacy::PnpmLockGrammar;
 use super::state::VendorEntry;
@@ -253,21 +254,6 @@ pub(crate) async fn detect_npm_lock_flavor(
         }
     }
     Ok((detected, warnings))
-}
-
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (lock_inventory.rs, cargo_lock.rs, gem.rs): `open_regular_file` opens
-/// with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted as a
-/// sniffed lockfile fails fast instead of wedging the flavor probe (every
-/// npm `vendor`), the in-use probe, and the unwired-revert guard forever in
-/// an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Read a lockfile for content-sniffing. An unreadable-but-present file maps
@@ -1269,10 +1255,8 @@ mod tests {
             (
                 detect_npm_lock_flavor(pnpm_dir.path()).await,
                 detect_npm_lock_flavor(yarn_dir.path()).await,
-                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path())
-                    .await,
-                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path())
-                    .await,
+                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path()).await,
+                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path()).await,
                 vendored_entry_in_use(&probe_entry(Some("bun")), in_use_dir.path()).await,
             )
         };

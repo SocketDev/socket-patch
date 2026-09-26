@@ -25,7 +25,6 @@ thiserror = "=2.0.18"
 walkdir = "=2.5.0"
 uuid = { version = "=1.21.0", features = ["v4"] }
 dialoguer = "=0.11.0"
-indicatif = "=0.17.11"
 tempfile = "=3.26.0"
 regex = "=1.12.3"
 glob = "=0.3.4"

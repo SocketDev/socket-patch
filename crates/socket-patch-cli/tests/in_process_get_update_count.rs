@@ -56,6 +56,7 @@ fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
 
 fn params(root: &Path, server: &MockServer) -> DownloadParams {
     DownloadParams {
+        lock_timeout: None,
         cwd: root.to_path_buf(),
         manifest_path: root.join(".socket/manifest.json"),
         org: Some(ORG.to_string()),

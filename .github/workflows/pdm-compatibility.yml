@@ -118,12 +118,16 @@ jobs:
           versions="$PDM_VERSION"
           if [ -n "$VERSIONS_OVERRIDE" ]; then versions="$VERSIONS_OVERRIDE"; fi
           shapes_arg=()
-          if [ -n "$SHAPES_OVERRIDE" ]; then shapes_arg=(--shapes $SHAPES_OVERRIDE); fi
+          if [ -n "$SHAPES_OVERRIDE" ]; then
+            read -r -a shapes <<< "$SHAPES_OVERRIDE"
+            shapes_arg=(--shapes "${shapes[@]}")
+          fi
+          read -r -a run_versions <<< "$versions"
           python3 scripts/backtest-pdm.py \
             --socket-patch "$cli" \
             --socket-patch-revision "$GITHUB_SHA" \
             --output native-pdm \
-            --versions $versions \
+            --versions "${run_versions[@]}" \
             --modes hosted vendored agent \
             "${shapes_arg[@]}" \
             --jobs 3

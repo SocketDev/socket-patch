@@ -131,7 +131,7 @@ def _fingerprint(site_dir):
                     try:
                         mtime = entry.stat().st_mtime_ns
                     except OSError:
-                        mtime = 0
+                        return "?"
                     items.append("%s:%d" % (name, mtime))
         items.sort()
         return hashlib.sha1(
@@ -276,7 +276,7 @@ def run():
         site_dir = _site_packages_dir()
         fp = _fingerprint(site_dir)
         stamp_path = _stamp_path(site_dir)
-        if _read_stamp(stamp_path) == fp:
+        if fp != "?" and _read_stamp(stamp_path) == fp:
             return  # nothing installed/reinstalled since the last apply
         binary = _resolve_binary()
         if not binary:
@@ -286,7 +286,7 @@ def run():
         # dirs), so storing the pre-apply value is correct -- and gating on
         # success means a lock-contended / failed apply is retried next start
         # rather than being silently marked as handled.
-        if _apply(binary, project_root):
+        if _apply(binary, project_root) and fp != "?":
             _write_stamp(stamp_path, fp)
     except Exception:
         # Final backstop. The .pth wrapper also guards, but a raise here would

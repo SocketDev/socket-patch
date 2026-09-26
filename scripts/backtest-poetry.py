@@ -162,9 +162,9 @@ def base_env():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cli", required=True, type=Path)
-    ap.add_argument("--cli-revision", required=True)
-    ap.add_argument("--output", required=True, type=Path)
+    ap.add_argument("--cli", type=Path)
+    ap.add_argument("--cli-revision")
+    ap.add_argument("--output", type=Path)
     ap.add_argument("--versions", nargs="+", default=VERSIONS)
     ap.add_argument("--modes", nargs="+", default=MODES, choices=MODES)
     ap.add_argument("--shapes", nargs="+", default=["direct", "populated", "crlf"], choices=SHAPES)
@@ -177,6 +177,8 @@ def main():
         print()
         print(render_table(summary))
         return
+    if not (args.cli and args.cli_revision and args.output):
+        ap.error("--cli, --cli-revision and --output are required")
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
     cli = args.cli.resolve()
@@ -629,6 +631,7 @@ def main():
         return row
 
     prepared = {}
+    results, errors = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = {pool.submit(prepare_tool, v): v for v in args.versions}
         for f in concurrent.futures.as_completed(futs):
@@ -638,6 +641,7 @@ def main():
                 say("bootstrapped poetry", v)
             except Exception as e:
                 say("BOOTSTRAP FAILED", v, str(e)[-800:])
+                errors.append({"poetry": v, "phase": "bootstrap", "error": str(e)[-3000:]})
 
     def wanted(version, shape, mode):
         v = vtuple(version)
@@ -659,7 +663,6 @@ def main():
 
     jobs = [(v, s, m) for v in args.versions for s in args.shapes for m in args.modes if wanted(v, s, m)]
     say(f"{len(jobs)} cases")
-    results, errors = [], []
     # Generate native locks serially per version first (the pool would race on the shared dir).
     for v in args.versions:
         if v in prepared:
@@ -682,7 +685,8 @@ def main():
                 errors.append({"poetry": job[0], "shape": job[1], "mode": job[2], "error": str(e)[-3000:], "trace": traceback.format_exc()[-1500:]})
                 say(*job, "ERROR", str(e)[-300:].replace("\n", " "))
             save(root / "summary.json", {"provenance": provenance, "results": sorted(results, key=lambda r: (vtuple(r["poetry"]), r["shape"], r["mode"])), "errors": errors})
-    summary = json.loads((root / "summary.json").read_text()) if (root / "summary.json").exists() else {"provenance": provenance, "results": results, "errors": errors}
+    summary = {"provenance": provenance, "results": sorted(results, key=lambda r: (vtuple(r["poetry"]), r["shape"], r["mode"])), "errors": errors}
+    save(root / "summary.json", summary)
     (root / "summary.md").write_text(render_table(summary))
     say(render_table(summary))
     if errors or any(not r["passed"] for r in results):

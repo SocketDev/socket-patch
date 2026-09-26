@@ -59,7 +59,19 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 /// Assemble a UTC (Y, M, D, h, m, s) tuple into epoch seconds, rejecting
 /// out-of-range fields and pre-1970 instants.
 fn to_epoch_secs(year: i64, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> Option<u64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Wire timestamps use four-digit years. Bound the year before the
+    // civil-date arithmetic so an untrusted i64-sized year cannot overflow.
+    if !(0..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
         return None;
     }
     // Leap seconds arrive as `:60`; clamping beats rejecting the record.
@@ -138,12 +150,20 @@ fn parse_numeric_offset(zone: &str) -> Option<i64> {
         b'-' => (-1i64, &zone[1..]),
         _ => return None,
     };
-    let digits: String = digits.chars().filter(|c| *c != ':').collect();
-    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let (hours, mins) = match digits.as_bytes() {
+        [h1, h2, m1, m2] | [h1, h2, b':', m1, m2]
+            if [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()) =>
+        {
+            (
+                ((h1 - b'0') * 10 + h2 - b'0') as i64,
+                ((m1 - b'0') * 10 + m2 - b'0') as i64,
+            )
+        }
+        _ => return None,
+    };
+    if hours > 23 || mins > 59 {
         return None;
     }
-    let hours: i64 = digits[..2].parse().ok()?;
-    let mins: i64 = digits[2..].parse().ok()?;
     Some(sign * (hours * 3600 + mins * 60))
 }
 
@@ -454,6 +474,34 @@ mod tests {
             "2026-03-27T19:12:42Zjunk",  // trailing junk after Z
         ] {
             assert_eq!(parse_timestamp_secs(s), None, "should reject: {s:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_impossible_dates_and_overflowing_years() {
+        for date in [
+            "2023-02-29",
+            "2100-02-29",
+            "2024-02-30",
+            "2026-04-31",
+            "31 Apr 2026",
+            "29 Feb 2100",
+            "9223372036854775807-01-01",
+            "01 Jan -9223372036854775808",
+            "01 Mar 9223372036854775807",
+        ] {
+            assert_eq!(parse_timestamp_secs(date), None, "{date}");
+        }
+        assert!(parse_timestamp_secs("2000-02-29").is_some());
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_misplaced_offset_fields() {
+        for offset in ["+24:00", "+00:60", "+99:99", "+0:200", "+02::00"] {
+            assert_eq!(
+                parse_timestamp_secs(&format!("2026-03-27T19:12:42{offset}")),
+                None
+            );
         }
     }
 

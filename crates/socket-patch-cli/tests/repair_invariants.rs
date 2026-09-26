@@ -563,7 +563,7 @@ fn repair_cleanup_failure_is_reported_in_json_and_silent_modes() {
 }
 
 // ---------------------------------------------------------------------------
-// Advisory-lock cleanup — repair owns the old `unlock --release` behavior
+// Advisory-lock lifecycle — retain the inode and release the OS lock
 // ---------------------------------------------------------------------------
 
 /// Take an exclusive flock on the binary's lock file path (the same
@@ -584,28 +584,39 @@ fn take_external_lock(socket_dir: &Path) -> std::fs::File {
     file
 }
 
-/// A leftover `apply.lock` from an earlier (or crashed) run is removed
-/// by a successful repair — the fold-in of the old `unlock --release`.
+/// Repair must preserve handles opened by waiting processes. A fresh
+/// acquire and a pre-repair handle must still refer to the same lock.
 #[test]
-fn repair_deletes_leftover_lock_file_on_success() {
+fn repair_preserves_lock_inode_and_releases_guard() {
+    use fs2::FileExt;
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"patched content");
-    std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
+    let lock_path = socket.join("apply.lock");
+    std::fs::write(&lock_path, b"leftover").unwrap();
+    let waiting_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
 
     let (code, stdout) = run_repair(tmp.path(), &[]);
     assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
-    assert!(
-        !socket.join("apply.lock").exists(),
-        "repair must delete the leftover apply.lock"
+    assert_eq!(std::fs::read(&lock_path).unwrap(), b"leftover");
+    let fresh = take_external_lock(&socket);
+    let error = waiting_handle.try_lock_exclusive().unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        fs2::lock_contended_error().raw_os_error()
     );
+    drop(fresh);
+    waiting_handle.try_lock_exclusive().unwrap();
 }
 
-/// Even with no pre-existing lock file, the acquire creates one
-/// (`create(true)`); repair must clean up after itself so a finished
-/// run leaves no lock file either way.
+/// A newly created lock stays reusable after the repair guard drops.
 #[test]
-fn repair_deletes_probe_created_lock_file() {
+fn repair_retains_new_lock_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"patched content");
@@ -613,10 +624,8 @@ fn repair_deletes_probe_created_lock_file() {
 
     let (code, stdout) = run_repair(tmp.path(), &[]);
     assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
-    assert!(
-        !socket.join("apply.lock").exists(),
-        "repair must leave no apply.lock behind"
-    );
+    assert!(socket.join("apply.lock").is_file());
+    let _guard = take_external_lock(&socket);
 }
 
 /// `--dry-run` mutates nothing — including the lock file.
@@ -656,11 +665,9 @@ fn repair_refuses_and_keeps_lock_when_live_holder() {
     );
 }
 
-/// The lock-file cleanup is housekeeping that runs on every completion
-/// path, not a success reward: a repair that fails past the lock (here:
-/// an unparseable manifest → `repair_failed`) still deletes the file.
+/// Failure releases the guard while preserving the shared lock inode.
 #[test]
-fn repair_deletes_lock_file_even_when_repair_fails() {
+fn repair_releases_lock_even_when_repair_fails() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
@@ -671,10 +678,11 @@ fn repair_deletes_lock_file_even_when_repair_fails() {
     assert_eq!(code, 1, "expected repair_failed exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
     assert_eq!(v["error"]["code"], "repair_failed");
-    assert!(
-        !socket.join("apply.lock").exists(),
-        "the lock-file cleanup must run on the failure path too"
+    assert_eq!(
+        std::fs::read(socket.join("apply.lock")).unwrap(),
+        b"leftover"
     );
+    let _guard = take_external_lock(&socket);
 }
 
 // ---------------------------------------------------------------------------

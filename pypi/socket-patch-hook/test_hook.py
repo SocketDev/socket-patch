@@ -99,6 +99,27 @@ class TestRunSpawning(HookTestBase):
             hook.run()
         self.assertEqual(run.call_count, 2, "a failed apply must be retried next start")
 
+    def test_unknown_fingerprint_is_never_cached(self):
+        root = self._make_project()
+        with mock.patch.object(hook, "_find_project_root", return_value=root), \
+                mock.patch.object(hook, "_fingerprint", return_value="?"), \
+                mock.patch.object(hook, "_read_stamp", return_value="?"), \
+                mock.patch.object(hook, "_write_stamp") as write_stamp, \
+                mock.patch.object(hook, "_resolve_binary", return_value="/fake/socket-patch"), \
+                mock.patch("subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+            hook.run()
+            hook.run()
+        self.assertEqual(run.call_count, 2)
+        write_stamp.assert_not_called()
+
+    def test_unreadable_distribution_metadata_makes_fingerprint_unknown(self):
+        entry = mock.Mock(name="distribution")
+        entry.name = "example-1.0.dist-info"
+        entry.stat.side_effect = OSError("unreadable metadata")
+        with mock.patch("os.scandir") as scandir:
+            scandir.return_value.__enter__.return_value = iter([entry])
+            self.assertEqual(hook._fingerprint("/fake/site-packages"), "?")
+
     def test_noop_without_manifest(self):
         with mock.patch.object(hook, "_find_project_root", return_value=None), \
                 mock.patch.object(hook, "_resolve_binary", return_value="/fake/socket-patch"), \

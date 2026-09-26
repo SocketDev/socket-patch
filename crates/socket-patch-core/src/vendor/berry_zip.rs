@@ -41,6 +41,8 @@ use std::io::Read;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha512};
 
+use super::registry_fetch::{MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_TOTAL_DECOMPRESSED_BYTES};
+
 /// DOS time 21:50:00 — yarn `SAFE_TIME` 456789000 rendered as UTC.
 const SAFE_DOS_TIME: u16 = 0xAE40;
 /// DOS date 1984-06-22 — the other half of `SAFE_TIME`.
@@ -133,11 +135,17 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
         Ok(())
     }
 
-    let mut archive = tar::Archive::new(GzDecoder::new(tgz_bytes));
+    // This rebuild also verifies downloads BEFORE the capped extraction
+    // pass runs, so it must bound inflation itself (including tar metadata).
+    let mut archive =
+        tar::Archive::new(GzDecoder::new(tgz_bytes).take(MAX_TOTAL_DECOMPRESSED_BYTES));
     let iter = archive
         .entries()
         .map_err(|e| format!("cannot read tarball: {e}"))?;
-    for entry in iter {
+    for (count, entry) in iter.enumerate() {
+        if count >= MAX_ENTRIES {
+            return Err(format!("tarball exceeds {MAX_ENTRIES} entries"));
+        }
         let mut entry = entry.map_err(|e| format!("cannot read tarball entry: {e}"))?;
         let raw_name = String::from_utf8(entry.path_bytes().into_owned())
             .map_err(|_| "tar entry name is not UTF-8".to_string())?;
@@ -211,6 +219,11 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
                 }
                 let parent = target.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
                 mkdirp(parent, &mut seen_dirs, &seen_files, &mut entries)?;
+                if entry.size() > MAX_ENTRY_BYTES {
+                    return Err(format!(
+                        "tar entry `{raw_name}` exceeds the {MAX_ENTRY_BYTES}-byte cap"
+                    ));
+                }
                 let mut data = Vec::new();
                 entry
                     .read_to_end(&mut data)
@@ -652,5 +665,23 @@ mod tests {
 
         // Bad idents.
         assert!(berry_cache_checksum_10c0(&[], "").is_err());
+    }
+    #[test]
+    fn cache_checksum_refuses_oversized_entry_before_inflation() {
+        use std::io::Write;
+
+        // A declared oversize entry with no body exercises the early cap
+        // without allocating a large fixture or waiting for decompression.
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/large.bin").unwrap();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(MAX_ENTRY_BYTES + 1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(header.as_bytes()).unwrap();
+        let tgz = gzip.finish().unwrap();
+        let error = berry_cache_checksum_10c0(&tgz, "pkg").unwrap_err();
+        assert!(error.contains("byte cap"), "{error}");
     }
 }

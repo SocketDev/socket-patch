@@ -160,9 +160,10 @@ async fn probe_machine_bundler(project: &BundlerProject) -> Option<String> {
     // so the child can never block waiting for input; bounded by
     // [`BUNDLE_VERSION_TIMEOUT`] (with `kill_on_drop` so a timed-out child is
     // reaped, not leaked) so a wedged bundler degrades to `Unknown`.
+    let command = crate::utils::process::tool_command("bundle")?;
     let output = tokio::time::timeout(
         BUNDLE_VERSION_TIMEOUT,
-        tokio::process::Command::new("bundle")
+        tokio::process::Command::from(command)
             .arg("--version")
             .current_dir(&project.root)
             .stdin(std::process::Stdio::null())

@@ -138,15 +138,19 @@ pub fn remove_exact_module_version_lines(
 /// ownership markers, so removal — like ownership — keys on the socket-hosted
 /// module namespace. Returns the new content, or `None` when nothing matched.
 pub fn remove_module_prefix_lines(content: &str, module_prefix: &str) -> Option<String> {
+    let mut removed = false;
     let kept: Vec<&str> = content
         .lines()
         .filter(|l| {
-            l.split_whitespace()
+            let matches = l
+                .split_whitespace()
                 .next()
-                .is_none_or(|m| !m.starts_with(module_prefix))
+                .is_some_and(|m| m.starts_with(module_prefix));
+            removed |= matches;
+            !matches
         })
         .collect();
-    if kept.len() == content.lines().count() {
+    if !removed {
         return None;
     }
     if kept.is_empty() {

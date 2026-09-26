@@ -1177,6 +1177,7 @@ def main():
     results, errors = [], []
     for v in args.versions:
         if not tool_environments.get(v, {}).get("ok"):
+            errors.append({"pdm": v, "phase": "bootstrap", "error": tool_environments.get(v, {}).get("error", "tool bootstrap failed")})
             for s in args.shapes:
                 for m in args.modes:
                     if wanted(v, s, m):

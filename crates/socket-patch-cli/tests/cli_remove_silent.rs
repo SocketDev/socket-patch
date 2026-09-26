@@ -371,7 +371,10 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
     // a partialFailure — nothing was removed. The error line still prints
     // under --silent ("errors only, never nothing"); the backend WARNING
     // chatter stays suppressed, which is what this test pins.
-    assert_eq!(code, 1, "all-kept remove is a partialFailure; stderr={stderr:?}");
+    assert_eq!(
+        code, 1,
+        "all-kept remove is a partialFailure; stderr={stderr:?}"
+    );
     assert!(
         stderr.contains("drift-kept"),
         "the drift-kept error must print even under --silent; got {stderr:?}"
@@ -509,8 +512,27 @@ fn remove_silent_suppresses_detached_revert_warnings() {
     std::fs::write(socket.join("manifest.json"), r#"{ "patches": {} }"#).expect("write manifest");
     write_vendor_state_wired(tmp.path(), purl, uuid, true, DRIFTED_WIRING);
 
-    let (code, _stdout, stderr) = run_remove(tmp.path(), &[purl, "--silent", "--yes"]);
-    assert_eq!(code, 0, "detached remove must succeed; stderr={stderr:?}");
+    let state_before = std::fs::read(socket.join("vendor/state.json")).unwrap();
+    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--silent", "--yes"]);
+    assert_eq!(
+        code, 1,
+        "drift-kept vendoring must report incomplete removal; stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must suppress informational output"
+    );
+    assert!(
+        stderr.contains("Error: vendored wiring drifted"),
+        "--silent must retain the failure: {stderr:?}"
+    );
+    assert_eq!(
+        std::fs::read(socket.join("vendor/state.json")).unwrap(),
+        state_before
+    );
+    assert!(socket
+        .join(format!("vendor/npm/{uuid}/package.tgz"))
+        .exists());
     assert!(
         !stderr.contains("Warning ("),
         "--silent must suppress detached revert warnings; got {stderr:?}"
@@ -523,7 +545,7 @@ fn remove_silent_suppresses_detached_revert_warnings() {
     std::fs::write(socket2.join("manifest.json"), r#"{ "patches": {} }"#).expect("write manifest");
     write_vendor_state_wired(tmp2.path(), purl, uuid, true, DRIFTED_WIRING);
     let (loud_code, _loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
-    assert_eq!(loud_code, 0);
+    assert_eq!(loud_code, 1);
     assert!(
         loud_stderr.contains("Warning (vendor_lock_entry_drifted)"),
         "non-silent detached run must print the backend warning; got {loud_stderr:?}"

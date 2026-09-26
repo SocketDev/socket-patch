@@ -182,6 +182,19 @@ fn split_name_version(leaf: &str) -> Option<(&str, &str)> {
     Some((name, version))
 }
 
+/// Recover an npm/Cargo SemVer suffix without treating a numeric prerelease
+/// as part of the package name. More than one valid split is ambiguous (npm
+/// names can themselves contain dotted versions), so leave that unit to the
+/// ledger instead of inventing an identity for the orphan sweep.
+fn split_semver_name_version(leaf: &str) -> Option<(&str, &str)> {
+    let mut candidates = leaf.match_indices('-').filter_map(|(i, _)| {
+        let (name, version) = (&leaf[..i], &leaf[i + 1..]);
+        (!name.is_empty() && semver::Version::parse(version).is_ok()).then_some((name, version))
+    });
+    let result = candidates.next()?;
+    candidates.next().is_none().then_some(result)
+}
+
 /// Split a `<…>@<version>` leaf at the LAST `@` in its FINAL path component
 /// (golang modules nest directories; composer leaves are `vendor/name@ver`).
 fn split_at_version(leaf: &str) -> Option<(&str, &str)> {
@@ -227,11 +240,11 @@ fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
     match eco {
         "npm" => {
             let stem = leaf.strip_suffix(".tgz")?;
-            let (name, version) = split_name_version(stem)?;
+            let (name, version) = split_semver_name_version(stem)?;
             Some(format!("pkg:npm/{name}@{version}"))
         }
         "cargo" => {
-            let (name, version) = split_name_version(leaf)?;
+            let (name, version) = split_semver_name_version(leaf)?;
             Some(format!("pkg:cargo/{name}@{version}"))
         }
         "gem" => {
@@ -327,6 +340,15 @@ pub struct SweptVendorDir {
 pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
     let mut out = Vec::new();
     let vendor_root = project_root.join(VENDOR_DIR);
+    // Check every project-relative ancestor before reading through it. An
+    // ecosystem directory can be real even when `.socket` or `vendor` is a
+    // symlink, and callers may delete the UUID directories we return.
+    for rel in [".socket", VENDOR_DIR] {
+        match tokio::fs::symlink_metadata(project_root.join(rel)).await {
+            Ok(meta) if meta.is_dir() => {}
+            _ => return out,
+        }
+    }
     for eco in ECOSYSTEM_DIRS {
         let eco_root = vendor_root.join(eco);
         // Symlink-strict at the eco level too (lstat, not stat): staging
@@ -369,6 +391,12 @@ async fn collect_leaf_purls(eco: &str, uuid_dir: &Path) -> Vec<String> {
     let mut stack: Vec<(PathBuf, String)> = vec![(uuid_dir.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
         for entry in list_dir_entries(&dir).await {
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_file() && !file_type.is_dir() {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let leaf = if prefix.is_empty() {
                 name.clone()
@@ -384,8 +412,7 @@ async fn collect_leaf_purls(eco: &str, uuid_dir: &Path) -> Vec<String> {
             // depth bound. Symlink-strict like the go-patches walker: a
             // symlink in a committed unit is never ours and must not pull
             // out-of-tree paths into the walk.
-            let is_real_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-            if is_real_dir && leaf.matches('/').count() < 8 {
+            if file_type.is_dir() && leaf.matches('/').count() < 8 {
                 stack.push((entry.path(), leaf));
             }
         }
@@ -813,5 +840,55 @@ mod tests {
             swept.is_empty(),
             "a symlinked eco dir must not be swept (callers delete through it): {swept:?}"
         );
+    }
+    #[test]
+    fn semver_leaf_recovery_preserves_numeric_prereleases() {
+        for eco in ["npm", "cargo"] {
+            let extension = if eco == "npm" { ".tgz" } else { "" };
+            for version in ["1.0.0-2026", "1.0.0-beta-1", "1.0.0+build-123"] {
+                let leaf = format!("base-64-{version}{extension}");
+                assert_eq!(
+                    leaf_to_purl(eco, &leaf),
+                    Some(format!("pkg:{eco}/base-64@{version}"))
+                );
+            }
+            assert!(leaf_to_purl(eco, &format!("x-1.0.0-2.0.0{extension}")).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_never_follows_symlinked_vendor_ancestors() {
+        for ancestor in [".socket", VENDOR_DIR] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target_vendor = if ancestor == ".socket" {
+                outside.path().join("vendor")
+            } else {
+                outside.path().to_path_buf()
+            };
+            let unit = target_vendor.join("npm").join(UUID);
+            std::fs::create_dir_all(&unit).unwrap();
+            std::fs::write(unit.join("lodash-4.17.21.tgz"), b"x").unwrap();
+            let link = root.path().join(ancestor);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(outside.path(), link).unwrap();
+            assert!(
+                sweep_vendor_dirs(root.path()).await.is_empty(),
+                "{ancestor}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_does_not_identify_symlinked_package_leaves() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join(format!("{VENDOR_DIR}/npm/{UUID}"));
+        std::fs::create_dir_all(&unit).unwrap();
+        std::os::unix::fs::symlink("missing", unit.join("lodash-4.17.21.tgz")).unwrap();
+        let swept = sweep_vendor_dirs(root.path()).await;
+        assert_eq!(swept.len(), 1);
+        assert!(swept[0].purls.is_empty());
     }
 }

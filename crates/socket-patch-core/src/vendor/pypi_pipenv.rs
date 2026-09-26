@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::read_regular_to_string;
 
 use super::common::serialize_json;
 use super::path::parse_vendor_path;
@@ -28,21 +29,6 @@ fn category_names(lock: &Value) -> Vec<String> {
         .filter(|key| key.as_str() != "_meta")
         .cloned()
         .collect()
-}
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `Pipfile.lock` fails fast instead of wedging
-/// every pipenv-project vendor run (and revert) forever in an `open(2)` that
-/// waits for a writer — the flavor-routing probes ahead of the load are
-/// metadata-only, so these are the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Pipfile.lock entry keys that mark a user-declared non-registry source.
@@ -186,12 +172,18 @@ pub(super) fn check_target_guards(
                 Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => {
                     let filename = file_ref.rsplit('/').next().unwrap_or("");
                     let mut fields = filename.split('-');
-                    let matches_identity = fields.next().is_some_and(|name| canonicalize_pypi_name(name) == canon_name) && fields.next() == Some(version);
-                    let conflicting_source = NON_REGISTRY_KEYS.iter().filter(|key| **key != "path").any(|key| obj.contains_key(*key))
+                    let matches_identity = fields
+                        .next()
+                        .is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
+                        && fields.next() == Some(version);
+                    let conflicting_source = NON_REGISTRY_KEYS
+                        .iter()
+                        .filter(|key| **key != "path")
+                        .any(|key| obj.contains_key(*key))
                         || (obj.contains_key("file") && obj.contains_key("path"))
-                        || obj.contains_key("version") || obj.contains_key("index");
-                    if matches_identity && !conflicting_source
-                    {
+                        || obj.contains_key("version")
+                        || obj.contains_key("index");
+                    if matches_identity && !conflicting_source {
                         continue;
                     }
                     return Err((
@@ -1221,8 +1213,7 @@ mod tests {
         mkfifo(&fifo);
 
         // Load must refuse fast.
-        let Ok(res) = tokio::time::timeout(deadline, load_pipenv_project(tmp.path())).await
-        else {
+        let Ok(res) = tokio::time::timeout(deadline, load_pipenv_project(tmp.path())).await else {
             let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
             panic!("load_pipenv_project must complete promptly with a FIFO Pipfile.lock");
         };
@@ -1252,7 +1243,11 @@ mod tests {
         };
         assert!(!outcome.success, "FIFO lock must fail the revert");
         assert!(
-            outcome.error.as_deref().unwrap_or("").contains("cannot read"),
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot read"),
             "{:?}",
             outcome.error
         );

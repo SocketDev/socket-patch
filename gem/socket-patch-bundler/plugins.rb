@@ -47,6 +47,7 @@
 require "digest"
 require "fileutils"
 require "json"
+require "tempfile"
 
 module SocketPatch
   # Bundler evaluates this file twice in a bootstrap install (registration +
@@ -109,38 +110,58 @@ module SocketPatch
     File.join(socket_dir, STAMP_NAME)
   end
 
+  # Non-blocking open plus fstat prevents a named pipe from hanging Bundler,
+  # including when an input is replaced between discovery and the read.
+  def read_regular_file(path)
+    File.open(path, File::RDONLY | File::NONBLOCK) do |file|
+      raise IOError, "not a regular file: #{path}" unless file.stat.file?
+      file.binmode
+      file.read
+    end
+  end
+
+  def safe_path_segment?(value)
+    !value.empty? && value != "." && value != ".." && !value.match?(%r{[/\\:\x00]})
+  end
+
   # The on-disk files the manifest's gem patches target:
   # <bundle_path>/gems/<name>-<version>[-<platform>]/<file key sans package/>.
   # Paths are collected whether or not the file exists — `current_digest`
   # folds an absence marker, so a gem appearing or vanishing flips the digest.
   def patch_target_files
     records = begin
-      JSON.parse(File.read(manifest_path)).fetch("patches", {})
+      JSON.parse(read_regular_file(manifest_path)).fetch("patches", {})
     rescue StandardError
       return []
     end
     return [] unless records.is_a?(Hash)
     gems_dir = File.join(bundle_path, "gems")
-    # Dir.glob treats `\` as an escape on EVERY platform, so a Windows-style
-    # bundle path (Bundler.bundle_path carries backslash separators through
-    # verbatim) would never match the platform-gem wildcard below: platform
-    # installs (nokogiri-1.15.0-x64-mingw-ucrt) drop out of the digest and a
-    # `bundle pristine` reversion of them leaves the stamp matching. Forward
-    # slashes are valid separators on Windows, so normalize the GLOB BASE
-    # only — the direct join below is not a pattern and stays byte-faithful.
+    # Normalize Windows separators for directory enumeration. Match package
+    # prefixes literally: manifest names and file keys are not glob patterns.
     glob_gems_dir = gems_dir.tr("\\", "/")
+    installed_names = begin
+      Dir.children(glob_gems_dir)
+    rescue StandardError
+      []
+    end
     targets = []
     records.each do |purl, record|
       next unless purl.is_a?(String) && purl.start_with?("pkg:gem/")
-      coordinate = purl.split("pkg:gem/", 2).last.split("?", 2).first
+      coordinate = purl.split("pkg:gem/", 2).last.split(/[?#]/, 2).first
       name, at, version = coordinate.rpartition("@")
-      next if at.empty? || name.empty? || version.empty?
+      next if at.empty? || !safe_path_segment?(name) || !safe_path_segment?(version)
       files = record.is_a?(Hash) ? record["files"] : nil
       next unless files.is_a?(Hash)
       files.each_key do |key|
-        rel = key.to_s.sub(%r{\Apackage/}, "")
+        next unless key.is_a?(String)
+        rel = key.sub(%r{\Apackage/}, "")
+        next if rel.empty?
+        next unless rel.split("/", -1).all? { |part| safe_path_segment?(part) }
         targets << File.join(gems_dir, "#{name}-#{version}", rel)
-        targets.concat(Dir.glob(File.join(glob_gems_dir, "#{name}-#{version}-*", rel)))
+        prefix = "#{name}-#{version}-"
+        installed_names.each do |installed|
+          targets << File.join(glob_gems_dir, installed, rel) if installed.start_with?(prefix)
+        end
       end
     end
     targets.uniq.sort
@@ -168,12 +189,14 @@ module SocketPatch
     digest_inputs.each do |path|
       d.update(path)
       d.update("\0")
-      d.update(File.file?(path) ? "+" : "-")
       begin
-        d.update(File.binread(path))
+        content = read_regular_file(path)
+        d.update("+")
+        d.update(content)
       rescue StandardError
-        # Unreadable now -> contributes only its path + absence marker; a later
-        # readable state changes the digest and forces a reapply.
+        # Missing, unreadable or non-regular inputs contribute an absence
+        # marker. Becoming readable later forces a reapply.
+        d.update("-")
       end
       d.update("\0")
     end
@@ -181,14 +204,19 @@ module SocketPatch
   end
 
   def stamped?(digest)
-    File.file?(stamp_path) && File.read(stamp_path).strip == digest
+    read_regular_file(stamp_path).strip == digest
   rescue StandardError
     false
   end
 
   def write_stamp(digest)
     FileUtils.mkdir_p(File.dirname(stamp_path))
-    File.write(stamp_path, digest)
+    # Replace the directory entry, never an existing FIFO or a shared inode.
+    Tempfile.create([".gem-plugin-stamp-", ".tmp"], File.dirname(stamp_path)) do |file|
+      file.write(digest)
+      file.close
+      File.rename(file.path, stamp_path)
+    end
   rescue StandardError
     # Best-effort: a missing/unwritable stamp just means we re-probe next time.
   end

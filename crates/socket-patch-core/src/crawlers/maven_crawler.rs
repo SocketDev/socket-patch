@@ -519,7 +519,7 @@ impl MavenCrawler {
             };
 
             // Try POM parsing first, fall back to directory path parsing
-            let coords = std::fs::read_to_string(path)
+            let coords = crate::utils::fs::read_regular_to_string_sync(path)
                 .ok()
                 .and_then(|content| parse_pom_group_artifact_version(&content))
                 .or_else(|| parse_path_coordinates(version_dir, repo_path));

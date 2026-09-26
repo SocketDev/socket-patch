@@ -14,6 +14,7 @@
 //! bytes — no error, no patch. Every rewrite therefore carries the packed
 //! tarball's own hash, never an inherited one.
 
+use crate::utils::fs::read_regular_to_bytes;
 use std::path::Path;
 
 use serde_json::Value;
@@ -539,7 +540,7 @@ pub async fn revert_npm_opts(
 
     for lock_name in lock_files {
         let lock_path = project_root.join(lock_name);
-        let lock_bytes = match read_regular(&lock_path).await {
+        let lock_bytes = match read_regular_to_bytes(&lock_path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // The lock is gone (user regenerated the project?); the
@@ -964,24 +965,9 @@ fn revert_one_record(
 // ───────────────────────────── small helpers ─────────────────────────────
 // (the flavor-agnostic coordinate/staging helpers live in `npm_common`)
 
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (npm_flavor.rs, lock_inventory.rs, cargo_lock.rs): `open_regular_file`
-/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
-/// as a lockfile fails fast instead of wedging vendor (flavor detection is
-/// existence-only for the npm locks, so [`select_lockfile`]'s read is the
-/// FIRST open) or revert forever in an `open(2)` waiting for a writer.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
 async fn select_lockfile(project_root: &Path) -> std::io::Result<Option<(String, Vec<u8>)>> {
     for lock_name in [SHRINKWRAP, PACKAGE_LOCK] {
-        match read_regular(&project_root.join(lock_name)).await {
+        match read_regular_to_bytes(&project_root.join(lock_name)).await {
             Ok(bytes) => return Ok(Some((lock_name.to_string(), bytes))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),

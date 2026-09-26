@@ -471,7 +471,7 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
 /// The file is a JSON object with a `packageFolders` key containing
 /// folder paths as keys, e.g.: `{"packageFolders": {"/home/user/.nuget/packages/": {}}}`.
 async fn parse_project_assets_package_folders(path: &Path) -> Option<Vec<PathBuf>> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let content = crate::utils::fs::read_regular_to_string(path).await.ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let folders = json.get("packageFolders")?.as_object()?;
     Some(folders.keys().map(PathBuf::from).collect())
@@ -479,6 +479,27 @@ async fn parse_project_assets_package_folders(path: &Path) -> Option<Vec<PathBuf
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assets_fifo_does_not_hang_discovery() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("project.assets.json");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let Ok(result) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            parse_project_assets_package_folders(&fifo),
+        )
+        .await
+        else {
+            // Release a regressed blocking opener so the runtime can exit.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("discovery blocked on a FIFO");
+        };
+        assert!(result.is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -748,7 +769,9 @@ mod tests {
     async fn test_scan_package_dir_dedups_same_package_across_two_scans() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_dir = dir.path().join("newtonsoft.json").join("13.0.3");
-        tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = NuGetCrawler::new();
         let mut seen = HashSet::new();

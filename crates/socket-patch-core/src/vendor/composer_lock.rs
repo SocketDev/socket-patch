@@ -38,6 +38,7 @@ use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 
 use super::common::{
@@ -54,20 +55,6 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
-
-/// Guarded read shared in shape with the Cargo.lock / .cargo/config.toml
-/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `composer.lock` fails fast instead of wedging
-/// every caller (vendor's presence read, revert's stranded scan and restore)
-/// forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Wiring-record discriminator. The record's `key` is
 /// `"<section>:<vendor>/<name>"` where `<section>` is `packages` or
@@ -1587,7 +1574,9 @@ mod tests {
 
         // Drift the committed copy so the rerun takes the rebuild path…
         let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
-        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+        tokio::fs::write(&drifted, b"<?php // drifted\n")
+            .await
+            .unwrap();
         // …and make the rebuild fail: the patch bytes cannot be sourced.
         let empty = root.join("empty-blobs");
         tokio::fs::create_dir_all(&empty).await.unwrap();
@@ -2265,7 +2254,9 @@ mod tests {
         assert!(e1.is_some());
 
         let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
-        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+        tokio::fs::write(&drifted, b"<?php // drifted\n")
+            .await
+            .unwrap();
 
         // Integrity-valid garbage: the download verifies, the extract fails.
         let garbage = b"not a zip at all".to_vec();
@@ -2453,7 +2444,9 @@ mod tests {
         );
         assert!(entry.is_some(), "the wiring is live, the entry is recorded");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         // The surgery really landed despite the marker failure.
@@ -2494,10 +2487,8 @@ mod tests {
     impl Drop for ModeGuard {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.path,
-                std::fs::Permissions::from_mode(self.mode),
-            );
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
         }
     }
 
@@ -2562,7 +2553,9 @@ mod tests {
             PATCHED
         );
         assert!(
-            warnings.iter().all(|w| !w.code.starts_with("vendor_prebuilt")),
+            warnings
+                .iter()
+                .all(|w| !w.code.starts_with("vendor_prebuilt")),
             "build source must never touch the service: {warnings:?}"
         );
     }
@@ -2721,7 +2714,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_prebuilt_unavailable"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_unavailable"),
             "the fallback must record why the service was skipped: {warnings:?}"
         );
         assert_eq!(
@@ -2901,8 +2896,7 @@ mod tests {
             vec!["psr/log".to_string()]
         );
         // The same entry is no longer stranded once a record can restore it.
-        let restorable: HashSet<String> =
-            std::iter::once("packages:psr/log".to_string()).collect();
+        let restorable: HashSet<String> = std::iter::once("packages:psr/log".to_string()).collect();
         assert!(stranded_wired_packages(&lock_path, UUID, &restorable)
             .await
             .is_empty());
@@ -2937,7 +2931,8 @@ mod tests {
             outcome.error
         );
         assert!(
-            root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            root.join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
             "fail-closed: nothing deleted"
         );
         assert_eq!(
@@ -3060,8 +3055,11 @@ mod tests {
         .await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
-                && w.detail.contains("unrecognized wiring kind")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("unrecognized wiring kind")),
             "{:?}",
             outcome.warnings
         );
@@ -3182,7 +3180,9 @@ mod tests {
                 "strip_section={strip_section}: drifted lock left alone"
             );
             assert!(
-                !root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+                !root
+                    .join(format!(".socket/vendor/composer/{UUID}"))
+                    .exists(),
                 "strip_section={strip_section}: uuid dir still removed"
             );
         }
@@ -3231,7 +3231,8 @@ mod tests {
             "the lock restore lands BEFORE the failed deletion"
         );
         assert!(
-            root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            root.join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
             "the undeletable uuid dir is still there"
         );
     }
@@ -3296,7 +3297,10 @@ mod tests {
             stage_dir_for(Path::new("/")),
             PathBuf::from("/.socket-stage")
         );
-        assert_eq!(backup_dir_for(Path::new("/")), PathBuf::from("/.socket-old"));
+        assert_eq!(
+            backup_dir_for(Path::new("/")),
+            PathBuf::from("/.socket-old")
+        );
     }
 
     /// A swap whose stage is gone (crash window / concurrent cleanup) must
@@ -3345,7 +3349,9 @@ mod tests {
             .unwrap();
         let stage = stage_dir_for(&copy);
         tokio::fs::create_dir_all(&stage).await.unwrap();
-        tokio::fs::write(stage.join("new.php"), b"rebuilt").await.unwrap();
+        tokio::fs::write(stage.join("new.php"), b"rebuilt")
+            .await
+            .unwrap();
 
         let guard = ModeGuard::set(&hold, 0o555);
         let result = swap_stage_into_place(&stage, &copy).await;
@@ -3383,7 +3389,9 @@ mod tests {
 
         // Drift the committed copy (a hand edit); the rerun rebuilds it.
         let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
-        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+        tokio::fs::write(&drifted, b"<?php // drifted\n")
+            .await
+            .unwrap();
 
         let (r2, e2, w2) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);

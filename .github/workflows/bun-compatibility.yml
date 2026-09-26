@@ -233,7 +233,8 @@ jobs:
           requested="$MATRIX_BUN"
           if [ -n "$VERSIONS_OVERRIDE" ]; then requested="$VERSIONS_OVERRIDE"; fi
           run_versions=""
-          for version in $requested; do
+          read -r -a requested_versions <<< "$requested"
+          for version in "${requested_versions[@]}"; do
             if [ "$system" = windows ] && before_windows_builds "$version"; then
               echo "::notice::skipping Bun ${version} on Windows: no bun-windows-x64.zip before 1.1.0"
             else
@@ -248,7 +249,8 @@ jobs:
           if [ -n "$run_versions" ] && { [ -z "$SHAPES_OVERRIDE" ] || [[ " $SHAPES_OVERRIDE " == *" legacy-lockb "* ]]; }; then
             stage="${stage} 1.1.38"
           fi
-          for version in $(printf '%s\n' $stage | awk 'NF && !seen[$0]++'); do
+          read -r -a staged_versions <<< "$stage"
+          while IFS= read -r version; do
             base="https://github.com/oven-sh/bun/releases/download/bun-v${version}"
             dir="native-bun/tools/${version}"
             mkdir -p "$dir"
@@ -278,7 +280,7 @@ jobs:
               echo "::error::expected bun ${version} at ${binary}, got ${actual}"
               exit 1
             fi
-          done
+          done < <(printf '%s\n' "${staged_versions[@]}" | awk 'NF && !seen[$0]++')
 
       - name: Install, verify patched bytes, reject corruption, and roll back
         shell: bash
@@ -311,15 +313,20 @@ jobs:
           modes="hosted vendored vendored-detached"
           if [ -n "$MODES_OVERRIDE" ]; then modes="$MODES_OVERRIDE"; fi
           shapes_arg=()
-          if [ -n "$SHAPES_OVERRIDE" ]; then shapes_arg=(--shapes $SHAPES_OVERRIDE); fi
+          if [ -n "$SHAPES_OVERRIDE" ]; then
+            read -r -a shapes <<< "$SHAPES_OVERRIDE"
+            shapes_arg=(--shapes "${shapes[@]}")
+          fi
+          read -r -a run_versions <<< "$BUN_VERSIONS"
+          read -r -a run_modes <<< "$modes"
           python3 scripts/backtest-bun.py \
             --cli "$cli" \
             --cli-revision "$CLI_REVISION" \
             --cli-build-sha "$CLI_BUILD_SHA" \
             --output native-bun \
             --tools native-bun/tools \
-            --versions $BUN_VERSIONS \
-            --modes $modes \
+            --versions "${run_versions[@]}" \
+            --modes "${run_modes[@]}" \
             "${shapes_arg[@]}" \
             --jobs 3
 

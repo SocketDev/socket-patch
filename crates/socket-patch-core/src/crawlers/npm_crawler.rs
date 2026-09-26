@@ -32,18 +32,14 @@ struct PackageJsonPartial {
 
 /// Read and parse a `package.json` file, returning `(name, version)` if valid.
 pub async fn read_package_json(pkg_json_path: &Path) -> Option<(String, String)> {
-    use tokio::io::AsyncReadExt;
-
     // The path lives inside the (untrusted) package tree: a planted FIFO
     // would make a plain `read_to_string` open block forever waiting for a
     // writer, wedging scan (crawl_all) and apply (find_by_purls). Open via
     // `open_regular_file` — non-blocking on Unix, rejecting
     // FIFOs/devices/directories (see its docs).
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(pkg_json_path)
+    let content = crate::utils::fs::read_regular_to_string(pkg_json_path)
         .await
         .ok()?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await.ok()?;
     // npm and Node both tolerate a leading UTF-8 BOM in package.json
     // (Windows-authored packages ship them), but serde_json rejects it —
     // a BOM'd install would be invisible to scan and unpatchable.
@@ -1350,6 +1346,46 @@ impl Default for NpmCrawler {
 /// which breaks content-store hardlinks per copy — CoW safety holds for
 /// every copy independently.
 pub async fn find_pnpm_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
+    find_pnpm_peer_variant_copies_inner(pkg_path, None).await
+}
+
+struct PeerPatchIdentity<'a> {
+    name: String,
+    version: String,
+    package_json: &'a crate::manifest::schema::PatchFileInfo,
+}
+
+/// A patch may change or remove package.json's identity fields. Its PURL
+/// still identifies the immutable pnpm store directories; each returned
+/// copy goes through the caller's independent file-hash verification.
+pub(crate) async fn find_pnpm_peer_variant_copies_for_patch(
+    pkg_path: &Path,
+    purl: &str,
+    files: &HashMap<String, crate::manifest::schema::PatchFileInfo>,
+) -> Vec<PathBuf> {
+    let package_json = files.iter().find_map(|(path, info)| {
+        (crate::patch::apply::normalize_file_path(path).trim_start_matches("./") == "package.json")
+            .then_some(info)
+    });
+    let identity = package_json.and_then(|package_json| {
+        let (scope, name, version) = NpmCrawler::parse_purl_components(purl)?;
+        let name = match scope {
+            Some(scope) => format!("{scope}/{name}"),
+            None => name,
+        };
+        Some(PeerPatchIdentity {
+            name,
+            version,
+            package_json,
+        })
+    });
+    find_pnpm_peer_variant_copies_inner(pkg_path, identity.as_ref()).await
+}
+
+async fn find_pnpm_peer_variant_copies_inner(
+    pkg_path: &Path,
+    patch_identity: Option<&PeerPatchIdentity<'_>>,
+) -> Vec<PathBuf> {
     // 1. Candidate stores from both ancestor chains (cheap stats only —
     //    no file reads until a store is actually found).
     let canonical_pkg = tokio::fs::canonicalize(pkg_path).await.ok();
@@ -1384,17 +1420,33 @@ pub async fn find_pnpm_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
     //    as the resolver. Unreadable/invalid ⇒ no safe way to identify
     //    twins ⇒ none reported (the primary itself is still handled by
     //    the caller).
-    let Some((full_name, version)) = read_package_json(&pkg_path.join("package.json")).await else {
-        return Vec::new();
+    let (full_name, version) = match patch_identity {
+        Some(identity) => (identity.name.clone(), identity.version.clone()),
+        None => match read_package_json(&pkg_path.join("package.json")).await {
+            Some(identity) => identity,
+            None => return Vec::new(),
+        },
     };
+
+    // package.json is untrusted too: an absolute or traversing name must
+    // never turn a peer-copy lookup into a patch target outside the store.
+    let (namespace, name) = parse_package_name(&full_name);
+    if !is_safe_npm_component(&name)
+        || namespace
+            .as_deref()
+            .is_some_and(|scope| scope.len() < 2 || !is_safe_npm_component(scope))
+    {
+        return Vec::new();
+    }
 
     let mut copies: Vec<PathBuf> = Vec::new();
     let mut seen_copies: HashSet<PathBuf> = HashSet::new();
     for store in stores {
         for (entry_name, entry_nm) in NpmCrawler::list_pnpm_store_entries(&store).await {
             // Fast advertisement filter; undecodable names stay probeable.
-            if let Some((n, v)) = decode_pnpm_store_entry_name(&entry_name) {
-                if n != full_name || v != version {
+            let store_identity = decode_pnpm_store_entry_name(&entry_name);
+            if let Some((n, v)) = &store_identity {
+                if n != &full_name || v != &version {
                     continue;
                 }
             }
@@ -1409,9 +1461,33 @@ pub async fn find_pnpm_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
             if !meta.is_dir() {
                 continue;
             }
-            match read_package_json(&candidate.join("package.json")).await {
-                Some((n, v)) if n == full_name && v == version => {}
-                _ => continue,
+            // A known store identity is sufficient when this patch owns the
+            // metadata itself. Requiring its old name/version would hide
+            // already-patched and drifted peers from apply/rollback checks.
+            if patch_identity.is_none() || store_identity.is_none() {
+                let metadata_matches = matches!(
+                    read_package_json(&candidate.join("package.json")).await,
+                    Some((n, v)) if n == full_name && v == version
+                );
+                if !metadata_matches {
+                    // Older/hashed store names cannot prove identity. Exact
+                    // patch metadata bytes can still identify those copies.
+                    let Some(identity) = patch_identity else {
+                        continue;
+                    };
+                    let Ok(hash) = crate::patch::file_hash::compute_file_git_sha256(
+                        &candidate.join("package.json"),
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if hash != identity.package_json.before_hash
+                        && hash != identity.package_json.after_hash
+                    {
+                        continue;
+                    }
+                }
             }
             let canon = tokio::fs::canonicalize(&candidate)
                 .await

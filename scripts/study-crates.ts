@@ -475,7 +475,7 @@ function runOne(
       if (timedOut) {
         result.ok = false;
         result.reason = `timed out after ${args.timeoutSec}s`;
-      } else if (code !== 0 && !result.ok) {
+      } else if (code !== 0) {
         result.ok = false;
         result.reason =
           `exited with code ${code}` +

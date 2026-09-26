@@ -660,11 +660,16 @@ async fn deno_hosted_grant_lands_nothing() {
             DENO_LOCK,
             "{purl}: deno.lock must stay byte-identical"
         );
-        assert!(
-            !tmp.path().join(".socket").exists(),
-            "{purl}: nothing may be persisted — no ledger record (the patch \
-             is not pinned anywhere, so recording it would attest a no-op), \
-             no manifest, no blobs"
+        let socket_entries: Vec<_> = std::fs::read_dir(tmp.path().join(".socket"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            socket_entries,
+            [std::ffi::OsString::from("apply.lock")],
+            "{purl}: only the advisory lock may remain — no ledger record \
+             (the patch is not pinned anywhere, so recording it would attest \
+             a no-op), no manifest, no blobs"
         );
 
         // Anti-vacuity: the engine really ran the grant flow — the reference

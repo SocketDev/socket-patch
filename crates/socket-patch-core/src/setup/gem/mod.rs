@@ -170,14 +170,7 @@ fn stamp_gitignore_path(root: &Path) -> PathBuf {
 /// wedging `setup`/`--check`/`--remove` forever in an `open(2)` that waits
 /// for a writer — the same guard as the composer/npm setup twins and the
 /// crawlers.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
+use crate::utils::fs::read_regular_to_string;
 
 /// Whether `.socket/.gitignore` is missing the stamp entry (so `setup` still
 /// has a write to make). Shared by [`add_plugin_files`] and
@@ -231,7 +224,7 @@ async fn remove_stamp_artifacts(root: &Path) {
     if kept.iter().all(|l| l.trim().is_empty()) {
         let _ = fs::remove_file(&path).await;
     } else {
-        let _ = fs::write(&path, format!("{}\n", kept.join("\n"))).await;
+        let _ = write_file(&path, &format!("{}\n", kept.join("\n"))).await;
     }
 }
 
@@ -547,7 +540,16 @@ async fn remove_plugin_registration_at(
             .components()
             .all(|c| !matches!(c, std::path::Component::ParentDir));
         if traversal_free && dir.starts_with(&plugin_root) && dir != &plugin_root {
-            let _ = fs::remove_dir_all(dir).await;
+            // An intermediate symlink can escape the same lexical boundary.
+            // Resolve both paths before recursively deleting the recorded dir.
+            if let (Ok(boundary), Ok(resolved)) = (
+                fs::canonicalize(&plugin_root).await,
+                fs::canonicalize(dir).await,
+            ) {
+                if resolved.starts_with(&boundary) && resolved != boundary {
+                    let _ = fs::remove_dir_all(dir).await;
+                }
+            }
         }
     }
     let write_result = if stripped.plugins_remain {
@@ -903,6 +905,38 @@ mod tests {
         // refuses to load the plugin ("plugin paths don't exist: .../lib")
         // and silently continues without it.
         assert!(GEMSPEC.contains("s.require_paths = [\".\"]"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_template_and_published_gem_reject_unsafe_inputs() {
+        let Some(ruby) = crate::utils::process::tool_command("ruby") else {
+            eprintln!("skip plugin safety runtime test: ruby not on PATH");
+            return;
+        };
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for plugin in [
+            crate_dir.join("src/setup/gem/templates/plugins.rb.tmpl"),
+            crate_dir.join("../../gem/socket-patch-bundler/plugins.rb"),
+        ] {
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::process::Command::new(ruby.get_program())
+                    .arg(crate_dir.join("tests/fixtures/gem_plugin_safety.rb"))
+                    .arg(&plugin)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("plugin must not block on FIFOs")
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}: {}",
+                plugin.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -1621,6 +1655,37 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_registration_preserves_directory_behind_escaping_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plugin_root = root.join(".bundle/plugin");
+        let victim = root.join("outside/socket-patch");
+        fs::create_dir_all(&plugin_root).await.unwrap();
+        write(&victim.join("precious.txt"), "keep").await;
+        std::os::unix::fs::symlink(root.join("outside"), plugin_root.join("gems")).unwrap();
+        let recorded = plugin_root.join("gems/socket-patch");
+        write(
+            &plugin_root.join("index"),
+            &format!(
+                "---\nplugin_paths:\n  socket-patch: \"{}\"\n",
+                recorded.display()
+            ),
+        )
+        .await;
+        assert!(matches!(
+            remove_plugin_registration_at(root, None, false).await,
+            GemRegistrationCleanup::Cleaned { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(victim.join("precious.txt"))
+                .await
+                .unwrap(),
+            "keep"
+        );
+    }
+
     #[tokio::test]
     async fn test_discover_skips_directory_named_gemfile() {
         // Bundler's own resolution (`SharedHelpers.find_file`) gates every
@@ -2063,7 +2128,8 @@ mod tests {
         let root = dir.path();
         let plugin_root = root.join(".bundle/plugin");
         let index = plugin_root.join("index");
-        let body = "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
+        let body =
+            "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
              load_paths:\n  other:\n  - \"/x/other/.\"\n  socket-patch:\n  - \"/proj/p/.\"\n\
              plugin_paths:\n  other: \"/x/other\"\n  socket-patch: \"/proj/p\"\nsources:\n";
         write(&index, body).await;
@@ -2132,7 +2198,11 @@ mod tests {
         .await;
 
         let r = add_plugin_files(root, false).await;
-        assert_eq!(r.status, GemSetupStatus::Updated, "stale plugins.rb resynced");
+        assert_eq!(
+            r.status,
+            GemSetupStatus::Updated,
+            "stale plugins.rb resynced"
+        );
         assert_eq!(
             fs::read_to_string(plugins_rb_path(root)).await.unwrap(),
             PLUGINS_RB

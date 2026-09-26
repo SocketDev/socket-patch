@@ -6,6 +6,7 @@ use toml_edit::{DocumentMut, Item, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::read_regular_to_string;
 
 use super::common::{
     item_get, lock_units_named, pep508_name, pep621_declared_names, record,
@@ -40,21 +41,6 @@ async fn refuse_symlinked_lock(root: &Path) -> Result<(), (&'static str, String)
         ));
     }
     Ok(())
-}
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `pdm.lock` (or the diagnostics-only
-/// `pyproject.toml`) fails fast instead of wedging every pdm-project vendor
-/// run forever in an `open(2)` that waits for a writer — the flavor-routing
-/// probes ahead of the load are metadata-only, so these are the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// A loaded-and-guard-checked pdm project.
@@ -1468,9 +1454,11 @@ distribution = false
         std::os::unix::fs::symlink(&real, root.join("pdm.lock")).unwrap();
 
         let p = load_pdm_project(&root).await.unwrap();
-        let err = wire_pdm(&p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID)
-            .await
-            .unwrap_err();
+        let err = wire_pdm(
+            &p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_pdm_symlink_unsupported");
         // The link is intact and its target is byte-unchanged.
         assert!(std::fs::symlink_metadata(root.join("pdm.lock"))

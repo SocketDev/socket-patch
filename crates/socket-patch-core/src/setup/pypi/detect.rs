@@ -70,14 +70,7 @@ impl PythonPackageManager {
 /// instead of wedging `setup`/`--check` forever in an `open(2)` that waits
 /// for a writer — the `is_python_project` gate ahead of detection is
 /// metadata-only and does not filter these.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
+use crate::utils::fs::read_regular_to_string;
 
 /// Detect the dependency manager from lockfiles and `pyproject.toml` tables.
 ///

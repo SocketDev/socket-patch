@@ -383,6 +383,83 @@ fn warning_detail<'a>(doc: &'a Value, code: &str) -> &'a str {
 
 // ───────────────────── reference-skip reasons (835-844) ─────────────────────
 
+#[tokio::test]
+async fn hosted_lock_contention_prevents_rewrites_and_corrupt_ledger_quarantine() {
+    use socket_patch_core::patch::apply_lock::acquire;
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+
+    for corrupt in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_npm_project(tmp.path(), NAME);
+        let socket = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket.join("vendor")).unwrap();
+        let ledger = socket.join("vendor/redirect-state.json");
+        if corrupt {
+            std::fs::write(&ledger, "{broken").unwrap();
+        }
+        let before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+        let _holder = acquire(&socket, Duration::ZERO).unwrap();
+
+        let (code, doc) =
+            scan_hosted_json(tmp.path(), &server.uri(), &["--lock-timeout", "0"], &[]);
+        assert_eq!(
+            code, 1,
+            "a held project lock must refuse hosted writes: {doc:#}"
+        );
+        assert_eq!(doc["errorCode"], "lock_held");
+        assert_eq!(doc["status"], "error");
+        assert_eq!(doc["redirect"]["mode"], "hosted");
+        assert_eq!(
+            std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+            before
+        );
+        if corrupt {
+            assert_eq!(std::fs::read_to_string(&ledger).unwrap(), "{broken");
+            assert!(!ledger.with_extension("json.corrupt").exists());
+        } else {
+            assert!(
+                !ledger.exists(),
+                "contention must not create a redirect ledger"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hosted_dry_run_does_not_create_or_contend_on_project_lock() {
+    use socket_patch_core::patch::apply_lock::acquire;
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    let before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let socket = tmp.path().join(".socket");
+
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(
+        !socket.exists(),
+        "preview must not create the lock directory"
+    );
+
+    std::fs::create_dir(&socket).unwrap();
+    let _holder = acquire(&socket, Duration::ZERO).unwrap();
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "preview must not contend with a writer: {doc:#}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        before
+    );
+    assert!(!socket.join("vendor/redirect-state.json").exists());
+}
+
 /// A granted reference whose purl fails `parse_purl_simple` is skipped with
 /// reason `bad_purl` — never redirected, never recorded — and the project is
 /// left byte-untouched.

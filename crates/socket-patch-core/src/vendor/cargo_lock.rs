@@ -35,6 +35,7 @@ use toml_edit::{DocumentMut, Item, Table};
 
 use super::state::CargoLockOriginal;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::read_regular_to_string;
 
 /// Why a lock edit could not be performed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,9 +45,11 @@ pub enum LockEditError {
     NoLockfile,
     /// No `[[package]]` entry matches the name+version.
     EntryMissing,
-    /// The entry has no `source` (a workspace/path/git dependency) — there is
+    /// The entry has no `source` (a workspace/path dependency) — there is
     /// nothing registry-shaped to detach; callers refuse upstream.
     NotRegistry,
+    /// A source exists but cannot be redirected by a registry path patch.
+    NonRegistrySource(String),
     Io(String),
     Parse(String),
 }
@@ -60,24 +63,16 @@ impl std::fmt::Display for LockEditError {
                 f,
                 "the Cargo.lock entry is not a registry dependency (no `source`)"
             ),
+            Self::NonRegistrySource(source) => {
+                write!(
+                    f,
+                    "the Cargo.lock entry has a non-registry source: {source}"
+                )
+            }
             Self::Io(e) => write!(f, "Cargo.lock I/O error: {e}"),
             Self::Parse(e) => write!(f, "Cargo.lock parse error: {e}"),
         }
     }
-}
-
-/// Guarded read shared in shape with the Cargo.toml / .cargo/config.toml
-/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `Cargo.lock` fails fast instead of wedging
-/// every caller (scan's probe, vendor mode detection, wet detach/restore)
-/// forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`].
@@ -140,10 +135,11 @@ pub async fn detach_lock_entry(
     let (path, mut doc) = read_lock(project_root).await?;
     let table = find_package_mut(&mut doc, name, version).ok_or(LockEditError::EntryMissing)?;
 
-    // A workspace/path/git dependency has no `source` — vendoring it would be
+    // A workspace/path dependency has no `source` — vendoring it would be
     // wrong (the user already controls those bytes); refuse.
     let source = match table.get("source").and_then(Item::as_str) {
-        Some(s) => s.to_string(),
+        Some(s) if s.starts_with("registry+") || s.starts_with("sparse+") => s.to_string(),
+        Some(s) => return Err(LockEditError::NonRegistrySource(s.to_string())),
         None => return Err(LockEditError::NotRegistry),
     };
     let checksum = table
@@ -404,6 +400,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detach_git_source_is_refused_without_changing_lock() {
+        let dir = fixture().await;
+        let source = "git+https://github.com/example/cfg-if#abcdef";
+        let original = lock_body().replace(SOURCE, source);
+        let path = dir.path().join("Cargo.lock");
+        tokio::fs::write(&path, &original).await.unwrap();
+        for dry_run in [false, true] {
+            let err = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", dry_run)
+                .await
+                .unwrap_err();
+            assert_eq!(err, LockEditError::NonRegistrySource(source.to_string()));
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
     async fn detach_dry_run_reports_but_does_not_write() {
         let dir = fixture().await;
         let orig = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", true)
@@ -525,18 +537,18 @@ mod tests {
 
     #[tokio::test]
     async fn restore_entry_without_checksum() {
-        // Some sources (git pins) have no checksum; restore must not invent one.
+        // An older ledger may carry a detached git pin; restore must not invent a checksum.
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(
             dir.path().join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\nsource = \"git+https://example.com/x#abc\"\n",
+            "version = 4\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n",
         )
         .await
         .unwrap();
-        let orig = detach_lock_entry(dir.path(), "x", "1.0.0", false)
-            .await
-            .unwrap();
-        assert_eq!(orig.checksum, None);
+        let orig = CargoLockOriginal {
+            source: "git+https://example.com/x#abc".to_string(),
+            checksum: None,
+        };
         assert!(restore_lock_entry(dir.path(), "x", "1.0.0", &orig, false)
             .await
             .unwrap());

@@ -1090,6 +1090,7 @@ def main():
 
     # ------------------------------------------------------------ schedule
     prepared = {}
+    bootstrap_errors = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = {pool.submit(prepare_tool, v): v for v in args.versions}
         for f in concurrent.futures.as_completed(futs):
@@ -1098,6 +1099,7 @@ def main():
                 prepared[v] = f.result()
                 say("bootstrapped pipenv", v)
             except Exception as e:
+                bootstrap_errors.append({"pipenv": v, "phase": "bootstrap", "error": str(e)[-3000:]})
                 say("BOOTSTRAP FAILED", v, str(e)[-800:])
 
     def wanted(version, shape, mode, invocation):
@@ -1123,7 +1125,7 @@ def main():
                     if wanted(v, s, m, inv):
                         groups.setdefault((v, s), []).append((m, inv))
     say(f"{sum(len(ms) for ms in groups.values())} cases in {len(groups)} jobs")
-    results, errors = [], []
+    results, errors = [], bootstrap_errors
 
     def run_group(key):
         v, s = key
@@ -1196,12 +1198,6 @@ def render_doc_table(summary):
         ok = sum(1 for c in cases if c["passed"])
         shapes = ",".join(sorted({c["shape"] for c in cases}))
         return ("pass" if ok == len(cases) else f"{ok}/{len(cases)}") + f" ({shapes})"
-
-    def yes_no(cases, key, sub):
-        vals = {c["info"][key][sub] for c in cases if isinstance(c.get("info", {}).get(key), dict)}
-        if not vals:
-            return "n/a"
-        return "/".join("yes" if v else "no" for v in sorted(vals, key=lambda x: not x))
 
     for version in sorted(by, key=vtuple):
         cs = by[version]

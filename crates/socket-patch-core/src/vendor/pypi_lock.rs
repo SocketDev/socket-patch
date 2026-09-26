@@ -429,10 +429,13 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
 }
 
 fn restore_value(live: &mut Value, original: &Value, new: &Value) -> bool {
-    if original.to_string() == new.to_string() || live.to_string() == original.to_string() {
+    let original_text = original.to_string();
+    let new_text = new.to_string();
+    let live_text = live.to_string();
+    if original_text == new_text || live_text == original_text {
         return false;
     }
-    if live.to_string() == new.to_string() {
+    if live_text == new_text {
         *live = original.clone();
         return false;
     }
@@ -462,10 +465,13 @@ fn restore_value(live: &mut Value, original: &Value, new: &Value) -> bool {
 }
 
 fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
-    if item_text(original) == item_text(new) || item_text(live) == item_text(original) {
+    let original_text = item_text(original);
+    let new_text = item_text(new);
+    let live_text = item_text(live);
+    if original_text == new_text || live_text == original_text {
         return false;
     }
-    if item_text(live) == item_text(new) {
+    if live_text == new_text {
         *live = original.clone();
         return false;
     }
@@ -886,8 +892,7 @@ mod tests {
         let other = "lock-version = \"1.0\"\n\n[[packages]]\nname = \"other\"\nversion = \"9\"\nwheels = [{url = \"https://example.test/other.whl\", hashes = {sha256 = \"other\"}}]\n";
         std::fs::create_dir_all(root.join("shared")).unwrap();
         write_pylock(root, "shared/pylock.dev.toml", other).await;
-        std::os::unix::fs::symlink("shared/pylock.dev.toml", root.join("pylock.dev.toml"))
-            .unwrap();
+        std::os::unix::fs::symlink("shared/pylock.dev.toml", root.join("pylock.dev.toml")).unwrap();
 
         let paths = python_lock_paths(root).unwrap();
         assert_eq!(
@@ -922,11 +927,9 @@ mod tests {
             vec!["pylock.toml"],
             "only the regular lock that contains the target is wired"
         );
-        assert!(
-            std::fs::read_to_string(root.join("pylock.toml"))
-                .unwrap()
-                .contains("one-1-py3-none-any.whl")
-        );
+        assert!(std::fs::read_to_string(root.join("pylock.toml"))
+            .unwrap()
+            .contains("one-1-py3-none-any.whl"));
         assert!(
             std::fs::symlink_metadata(root.join("pylock.dev.toml"))
                 .unwrap()
@@ -1051,12 +1054,10 @@ mod tests {
         )
         .await;
         symlink_refusal_names(&result, "example.py");
-        assert!(
-            std::fs::symlink_metadata(root.join("example.py"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(std::fs::symlink_metadata(root.join("example.py"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(
             std::fs::read_to_string(root.join("shared/example.py")).unwrap(),
             script
@@ -1080,7 +1081,8 @@ mod tests {
         let root = temp.path();
         write_pylock(root, "pylock.toml", LOCK).await;
         let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
-        let wheel = ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl";
+        let wheel =
+            ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl";
         let records = wire_python_locks(&project, root, "one", "1", wheel, &"a".repeat(64))
             .await
             .unwrap();
@@ -1165,7 +1167,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(new.contains("\r\n"), "the rewriter keeps the CRLF convention");
+        assert!(
+            new.contains("\r\n"),
+            "the rewriter keeps the CRLF convention"
+        );
         let live = new.replace("\r\n", "\n");
         let (restored, drifted) = restore_document(&live, &original, &new).unwrap();
         assert!(!drifted);

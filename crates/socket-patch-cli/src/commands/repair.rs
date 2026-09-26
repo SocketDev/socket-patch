@@ -69,7 +69,9 @@ pub async fn run(args: RepairArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
 
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
+    if matches!(tokio::fs::metadata(&manifest_path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
         // Hosted (redirect) mode leaves no local artifacts to repair: the
         // lockfiles point at patch.socket.dev URLs, not `.socket/vendor/...`,
         // and there is no manifest or vendor ledger. A project whose only
@@ -131,7 +133,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     // same `.socket/` directory. See `apply_lock`. A live holder makes
     // repair refuse with `lock_held` — it never steals the lock.
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let lock = match acquire_or_emit(
+    let _lock = match acquire_or_emit(
         socket_dir,
         Command::Repair,
         args.common.json,
@@ -188,33 +190,6 @@ pub async fn run(args: RepairArgs) -> i32 {
         }
     };
 
-    // Clean slate: repair owns the lock-file cleanup (the mutating
-    // commands deliberately leave `apply.lock` behind between runs).
-    // Drop our guard FIRST so the unlink races nothing we hold, then
-    // best-effort delete. A live holder never reaches here — contention
-    // already returned above. The residual window (a competitor that
-    // acquires between the drop and the unlink gets its file orphaned)
-    // is microseconds at the tail of a finished repair and worth the
-    // trade; see `apply_lock`'s module doc.
-    drop(lock);
-    if !args.common.dry_run {
-        let lock_file = socket_dir.join("apply.lock");
-        match std::fs::remove_file(&lock_file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                // Housekeeping only: a leftover lock file is harmless, so
-                // a failed delete warns (human mode) without flipping the
-                // exit code of an otherwise-finished repair.
-                if !args.common.silent && !args.common.json {
-                    eprintln!(
-                        "Warning: could not remove lock file {}: {e}",
-                        lock_file.display()
-                    );
-                }
-            }
-        }
-    }
     exit_code
 }
 

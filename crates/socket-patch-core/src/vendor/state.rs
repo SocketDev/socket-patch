@@ -23,6 +23,7 @@
 //! flavor strings they have no backend for. Both keep an old binary safe
 //! against a newer project checkout.
 
+use crate::utils::fs::read_regular_to_bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -448,7 +449,7 @@ fn state_path(project_root: &Path) -> PathBuf {
 /// data by construction, so nothing is guessed.
 pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     let path = state_path(project_root);
-    match read_state_bytes(&path).await {
+    match read_regular_to_bytes(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).or_else(|e| {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if value.get("mode").is_some() && value.get("entries").is_none() {
@@ -463,20 +464,6 @@ pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(VendorState::new()),
         Err(e) => Err(e),
     }
-}
-
-/// Read the ledger bytes from the (untrusted) project tree. Opens via
-/// [`open_regular_file`](crate::utils::fs::open_regular_file) — non-blocking
-/// on Unix, rejecting FIFOs/devices/directories — so a planted special file
-/// fails loudly instead of wedging every vendor-adjacent command (`vendor`,
-/// `remove`, `repair`) on a FIFO `open(2)` that waits forever for a writer;
-/// same guard as the sibling redirect ledger.
-async fn read_state_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
 }
 
 /// Persist the ledger atomically with sorted keys + 2-space indent + trailing

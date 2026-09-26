@@ -19,6 +19,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::is_safe_single_segment;
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
 
 use super::cargo_config::{self, LEGACY_CARGO_PATCHES_DIR};
@@ -95,18 +96,6 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
             Some(wired)
         }
     }
-}
-
-/// Guarded read shared in shape with the setup/crawler twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO fails fast instead of wedging the caller forever.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
@@ -1486,36 +1475,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_detach_failure_unwinds_config_and_copy() {
-        let (dir, blobs, pristine, record) = fixture().await;
-        let root = dir.path();
-        // The lock entry exists at the right version but is NOT registry-shaped
-        // (no `source` — e.g. an existing user path-dep): pre-flight passes,
-        // detach errs with NotRegistry AFTER the config write → must unwind.
-        tokio::fs::write(
-            root.join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
-        )
-        .await
-        .unwrap();
-
-        let (result, entry, _warnings) =
-            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
-        assert!(!result.success);
-        assert!(entry.is_none());
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("Cargo.lock"),
-            "error names the lock: {:?}",
-            result.error
-        );
-        // Unwound: config entry gone (file pruned), copy gone, lock unchanged.
-        assert!(cargo_config::read_patch_entries(root).await.is_empty());
-        assert!(!root.join(copy_rel()).exists());
-        assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock"))
+        // Neither a path dependency nor a git dependency can be redirected
+        // by the [patch.crates-io] entry written before detaching the lock.
+        for source in [
+            "",
+            "source = \"git+https://github.com/example/cfg-if#abcdef\"\n",
+        ] {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            let original = format!(
+                "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n{source}"
+            );
+            tokio::fs::write(root.join("Cargo.lock"), &original)
                 .await
-                .unwrap(),
-            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n"
-        );
+                .unwrap();
+
+            let (result, entry, _warnings) =
+                expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+            assert!(!result.success);
+            assert!(entry.is_none());
+            assert!(
+                result.error.as_deref().unwrap_or("").contains("Cargo.lock"),
+                "error names the lock: {:?}",
+                result.error
+            );
+            assert!(cargo_config::read_patch_entries(root).await.is_empty());
+            assert!(!root.join(copy_rel()).exists());
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("Cargo.lock"))
+                    .await
+                    .unwrap(),
+                original
+            );
+        }
     }
 
     /// AUDIT B1: a failed hot-path artifact rebuild must never destroy the
@@ -3061,9 +3053,9 @@ mod tests {
     async fn marker_write_failure_warns_but_vendor_succeeds() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        tokio::fs::create_dir_all(root.join(format!(
-            ".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}"
-        )))
+        tokio::fs::create_dir_all(
+            root.join(format!(".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}")),
+        )
         .await
         .unwrap();
 
@@ -3103,7 +3095,10 @@ mod tests {
         let out = revert_cargo_vendor(&entry, root, false).await;
         assert!(!out.success);
         assert!(
-            out.error.as_deref().unwrap_or("").contains("not a cargo purl"),
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a cargo purl"),
             "{:?}",
             out.error
         );

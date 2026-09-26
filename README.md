@@ -406,7 +406,7 @@ and repair; pick by what you want back:
 | [`remove`](#remove) | Everything `rollback` does, **plus** it deletes the manifest entry and reverts any vendoring — **permanent**, the patch is fully gone in one command |
 | [`vendor --revert`](#vendor) | **Un-vendors wholesale**: restores the recorded original lockfile fragments byte-for-byte and removes the `.socket/vendor/` artifacts — works without a manifest |
 | [`scan --prune`](#scan) | **Reconciles, doesn't reverse**: drops manifest entries for packages that have left the project and garbage-collects orphan blob/diff/archive files — installed patches stay |
-| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, cleans up unused ones, and removes the leftover `apply.lock` file (housekeeping — mutating commands leave it behind after every run) |
+| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, and cleans up unused ones |
 
 And `setup --remove` reverts the install hooks that `setup` added.
 
@@ -430,7 +430,7 @@ And `setup --remove` reverts the install hooks that `setup` added.
 | [`get`](#get) | Fetch and apply a patch by UUID / CVE / GHSA / PURL / name (alias: `download`) |
 | [`list`](#list) | List all patches in the local manifest |
 | [`remove`](#remove) | Remove a patch: roll back files + delete the manifest entry |
-| [`repair`](#repair) | Download missing blobs, clean up unused ones, tidy lock state (alias: `gc`) |
+| [`repair`](#repair) | Download missing blobs and clean up unused ones (alias: `gc`) |
 
 ### Global options
 
@@ -1043,7 +1043,7 @@ socket-patch remove "pkg:npm/lodash@4.17.20" --json
 
 ### `repair`
 
-Download missing blobs, clean up unused blobs, and reset the advisory lock state.
+Download missing blobs and clean up unused blobs.
 
 Alias: `gc`
 
@@ -1053,12 +1053,12 @@ free space. It also rebuilds missing or corrupt vendored artifacts. For the comb
 workflow (discover + apply + GC in one pass), use
 `scan --json --mode agent --prune --yes` instead.
 
-As its final step, `repair` removes the leftover `.socket/apply.lock` file that mutating
-commands retain between runs (skipped under `--dry-run`). A leftover file from a crashed
-run never blocks anything — the OS releases a dead process's lock automatically — so this
-is pure housekeeping. If another `socket-patch` process is actively running, `repair`
-refuses up front with `lock_held` (exit 1); it never steals a live lock — wait for the
-other process to finish, or budget a wait with `--lock-timeout`.
+Like the other mutating commands, `repair` retains `.socket/apply.lock` after releasing
+its OS-level lock. Keeping the same file prevents concurrent callers from locking
+different inodes. A file left by a crashed run never blocks anything: the OS releases
+the dead process's lock automatically. If another `socket-patch` process is actively
+running, `repair` refuses with `lock_held` (exit 1); wait for it to finish or use
+`--lock-timeout` to budget a wait.
 
 **Usage:**
 ```bash

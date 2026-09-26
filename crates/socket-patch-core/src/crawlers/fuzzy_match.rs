@@ -65,16 +65,16 @@ pub fn fuzzy_match_packages(
     limit: usize,
 ) -> Vec<CrawledPackage> {
     let query = query.trim().to_lowercase();
-    if query.is_empty() {
+    if query.is_empty() || limit == 0 {
         return Vec::new();
     }
 
-    let mut matches: Vec<(MatchType, String, CrawledPackage)> = packages
+    let mut matches: Vec<(MatchType, String, &CrawledPackage)> = packages
         .iter()
         .filter_map(|pkg| {
             let full_name = get_full_name(pkg).to_lowercase();
             let match_type = get_match_type(&full_name, &pkg.name.to_lowercase(), &query)?;
-            Some((match_type, full_name, pkg.clone()))
+            Some((match_type, full_name, pkg))
         })
         .collect();
 
@@ -85,7 +85,11 @@ pub fn fuzzy_match_packages(
     // package lands at `matches[0]`.
     matches.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
 
-    matches.into_iter().take(limit).map(|m| m.2).collect()
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|m| m.2.clone())
+        .collect()
 }
 
 #[cfg(test)]

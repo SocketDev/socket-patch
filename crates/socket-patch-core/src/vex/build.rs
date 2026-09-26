@@ -63,7 +63,6 @@ pub fn build_document(
     redirected: &[String],
     opts: &BuildOptions,
 ) -> Option<Document> {
-    let timestamp = now_rfc3339();
     let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
     let vendored_set: HashSet<&str> = vendored.iter().map(String::as_str).collect();
     let redirected_set: HashSet<&str> = redirected.iter().map(String::as_str).collect();
@@ -98,6 +97,7 @@ pub fn build_document(
         return None;
     }
 
+    let timestamp = now_rfc3339();
     let mut statements = Vec::with_capacity(grouped.len());
     for (vuln_id, group) in grouped {
         let subcomponents = group
@@ -110,22 +110,14 @@ pub fn build_document(
             })
             .collect();
 
-        // The empty-parts branch is unreachable from the public
-        // API: the loop above inserts one entry per applied
-        // (purl, vuln) pair, so every group present in `grouped`
-        // has ≥1 entry. The defensive `None` arm stays in case a
-        // future refactor decouples grouping from impact tracking.
-        let impact_statement = if group.impact_parts.is_empty() {
-            None
-        } else {
-            Some(
-                group
-                    .impact_parts
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )
-        };
+        // Every group contains at least one applied (purl, vulnerability) pair.
+        let impact_statement = Some(
+            group
+                .impact_parts
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
 
         statements.push(Statement {
             id: None,

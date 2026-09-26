@@ -1856,3 +1856,55 @@ async fn scan_vendored_bun_silent_human_names_code_on_stderr() {
     );
     assert!(!tmp.path().join(".socket/vendor").exists());
 }
+
+#[tokio::test]
+async fn scan_download_lock_failure_emits_one_json_document() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    for mode in ["--apply", "--vendor"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path());
+        let socket = tmp.path().join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        let _guard =
+            socket_patch_core::patch::apply_lock::acquire(&socket, std::time::Duration::ZERO)
+                .unwrap();
+        let (code, stdout, stderr) = run_cli_env(
+            tmp.path(),
+            &[
+                "scan",
+                mode,
+                "--json",
+                "--yes",
+                "--api-url",
+                &mock.uri(),
+                "--api-token",
+                "fake-token",
+                "--org",
+                ORG_SLUG,
+            ],
+            &[],
+        );
+        assert_eq!(code, 1, "mode={mode}; stdout={stdout}; stderr={stderr}");
+        let result: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("mode={mode}; expected one JSON document: {e}; stdout={stdout}")
+        });
+        let phase = if mode == "--vendor" {
+            "download"
+        } else {
+            "apply"
+        };
+        assert_eq!(result[phase]["errorCode"], "lock_held", "{result}");
+        assert!(!socket.join("manifest.json").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/left-pad/index.js")).unwrap(),
+            BEFORE
+        );
+    }
+    assert!(mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| !r.url.path().contains("/patches/view/")));
+}

@@ -224,41 +224,53 @@ pub(crate) async fn zip_matches_after_hashes(
 ) -> bool {
     use std::io::Read as _;
 
-    use tokio::io::AsyncReadExt as _;
-
+    use super::verify::{MAX_WHEEL_DECOMPRESSED_BYTES, MAX_WHEEL_ENTRIES};
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file check): a
     // FIFO planted at the archive path must read as out-of-sync, not wedge
     // the probe forever in an `open(2)` waiting for a writer.
-    let Ok((mut file, metadata)) = open_regular_file(archive_path).await else {
+    let Ok((file, _)) = open_regular_file(archive_path).await else {
         return false;
     };
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if file.read_to_end(&mut bytes).await.is_err() {
-        return false;
-    }
-    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
-        return false;
-    };
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never look up a key that escapes the package dir — treat
-        // it as out-of-sync (the full pipeline would refuse it anyway).
-        if !is_safe_relative_subpath(normalized) {
-            return false;
-        }
-        let Ok(mut entry) = archive.by_name(normalized) else {
+    let file = file.into_std().await;
+    let files = files.clone();
+    // ZIP seeks and decompression are synchronous. Read from the file handle
+    // on the blocking pool instead of copying the whole compressed archive
+    // into memory and decompressing on the async executor.
+    tokio::task::spawn_blocking(move || {
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
             return false;
         };
-        let mut content = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut content).is_err() {
+        if archive.len() > MAX_WHEEL_ENTRIES {
             return false;
         }
-        if compute_git_sha256_from_bytes(&content) != info.after_hash {
-            return false;
+        let mut remaining = MAX_WHEEL_DECOMPRESSED_BYTES;
+        for (file_name, info) in &files {
+            let normalized = normalize_file_path(file_name);
+            if !is_safe_relative_subpath(normalized) {
+                return false;
+            }
+            let Ok(entry) = archive.by_name(normalized) else {
+                return false;
+            };
+            if !entry.is_file() || entry.size() > remaining {
+                return false;
+            }
+            // Bound actual inflated bytes too: ZIP header lengths are
+            // untrusted and must never control an unchecked allocation.
+            let mut content = Vec::new();
+            if entry.take(remaining + 1).read_to_end(&mut content).is_err()
+                || content.len() as u64 > remaining
+                || compute_git_sha256_from_bytes(&content) != info.after_hash
+            {
+                return false;
+            }
+            remaining -= content.len() as u64;
         }
-    }
-    true
+        true
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Shared helper the vendor backends (and `go_redirect`) delegate to: true
@@ -396,10 +408,7 @@ pub(crate) async fn revert_lock_fragment_splice(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
-    revert_lock_fragment_splice_inner(
-        entry, root, dry_run, lock_file, kind, flavor, false,
-    )
-    .await
+    revert_lock_fragment_splice_inner(entry, root, dry_run, lock_file, kind, flavor, false).await
 }
 
 /// [`revert_lock_fragment_splice`] for backends whose records are COUPLED
@@ -417,10 +426,7 @@ pub(crate) async fn revert_lock_fragment_splice_atomic(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
-    revert_lock_fragment_splice_inner(
-        entry, root, dry_run, lock_file, kind, flavor, true,
-    )
-    .await
+    revert_lock_fragment_splice_inner(entry, root, dry_run, lock_file, kind, flavor, true).await
 }
 
 async fn revert_lock_fragment_splice_inner(
@@ -542,8 +548,9 @@ mod tests {
     fn in_sync_jar_fixture(
         dir: &Path,
     ) -> (std::path::PathBuf, HashMap<String, PatchFileInfo>, Vec<u8>) {
-        let zip_bytes = write_zip_entries(&[("lib/a.js".to_string(), b"patched\n".to_vec(), 0o644)])
-            .expect("fixture zip");
+        let zip_bytes =
+            write_zip_entries(&[("lib/a.js".to_string(), b"patched\n".to_vec(), 0o644)])
+                .expect("fixture zip");
         let jar = dir.join("pkg.jar");
         std::fs::write(&jar, &zip_bytes).unwrap();
         let files = HashMap::from([(
@@ -566,6 +573,21 @@ mod tests {
             zip_matches_after_hashes(&jar, &files).await,
             "an archive matching every afterHash must read as in-sync"
         );
+    }
+
+    #[tokio::test]
+    async fn zip_matches_after_hashes_rejects_oversized_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jar, files, mut bytes) = in_sync_jar_fixture(dir.path());
+        let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        let declared =
+            (super::super::verify::MAX_WHEEL_DECOMPRESSED_BYTES as u32 + 1).to_le_bytes();
+        // Keep the payload and CRC intact but forge its advertised size.
+        bytes[22..26].copy_from_slice(&declared);
+        bytes[central + 24..central + 28].copy_from_slice(&declared);
+        std::fs::write(&jar, bytes).unwrap();
+
+        assert!(!zip_matches_after_hashes(&jar, &files).await);
     }
 
     /// Bytes that aren't a zip archive at all (a truncated or clobbered

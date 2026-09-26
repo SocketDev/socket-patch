@@ -9,12 +9,8 @@ import argparse
 import csv
 import hashlib
 import io
-import os
 import re
-import stat
-import subprocess
 import sys
-import tempfile
 import zipfile
 from base64 import urlsafe_b64encode
 from pathlib import Path
@@ -91,7 +87,6 @@ TARGETS = {
 }
 
 DIST_NAME = "socket_patch"
-PKG_NAME = "socket-patch"
 
 
 def sha256_digest(data: bytes) -> str:
@@ -154,8 +149,27 @@ def read_init_py(pyproject_dir: Path) -> bytes:
     return init_path.read_bytes()
 
 
+def write_wheel(wheel_path: Path, dist_info: str, files: list) -> Path:
+    """Write deterministic wheel entries and their RECORD in one shared path."""
+    record_name = f"{dist_info}/RECORD"
+    record = io.StringIO(newline="")
+    rows = csv.writer(record, lineterminator="\n")
+    for name, data, _ in files:
+        rows.writerow((name, sha256_digest(data), len(data)))
+    rows.writerow((record_name, "", ""))
+    entries = [*files, (record_name, record.getvalue().encode(), False)]
+
+    with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data, executable in entries:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3  # Unix permission bits on every build host.
+            info.external_attr = (0o755 if executable else 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, data)
+    return wheel_path
+
+
 def build_wheel(
-    target: str,
     info: dict,
     version: str,
     metadata: dict,
@@ -217,29 +231,7 @@ def build_wheel(
     ).encode()
     files.append((f"{dist_info}/entry_points.txt", entry_points_content, False))
 
-    # Build RECORD (must be last, references all other files)
-    record_lines = []
-    for name, data, _ in files:
-        record_lines.append(f"{name},{sha256_digest(data)},{len(data)}")
-    # RECORD itself has no hash
-    record_name = f"{dist_info}/RECORD"
-    record_lines.append(f"{record_name},,")
-    record_content = "\n".join(record_lines).encode()
-    files.append((record_name, record_content, False))
-
-    # Write the zip
-    with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, data, is_exec in files:
-            info_obj = zipfile.ZipInfo(name)
-            # Set external_attr for executable files (unix permissions)
-            if is_exec:
-                info_obj.external_attr = (stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH) << 16
-            else:
-                info_obj.external_attr = (stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH) << 16
-            info_obj.compress_type = zipfile.ZIP_DEFLATED
-            zf.writestr(info_obj, data)
-
-    return wheel_path
+    return write_wheel(wheel_path, dist_info, files)
 
 
 DIST_NAME_HOOK = "socket_patch_hook"
@@ -252,8 +244,8 @@ def build_hook_wheel(version: str, hook_dir: Path, dist_dir: Path) -> Path:
     Unlike the platform wheels, this ships no binary. It contains the
     ``socket_patch_hook`` package and — crucially — a top-level
     ``socket_patch_hook.pth`` that pip installs into the site-packages root, so
-    Python executes it at interpreter startup. It depends on ``socket-patch``
-    (the binary wheel) for the actual ``apply``.
+    Python executes it at interpreter startup. It finds the separately
+    provisioned ``socket-patch`` CLI on PATH for the actual ``apply``.
     """
     init_path = hook_dir / "socket_patch_hook" / "__init__.py"
     pth_path = hook_dir / "socket_patch_hook.pth"
@@ -296,23 +288,7 @@ def build_hook_wheel(version: str, hook_dir: Path, dist_dir: Path) -> Path:
     ).encode()
     files.append((f"{dist_info}/WHEEL", wheel_content, False))
 
-    record_lines = []
-    for name, data, _ in files:
-        record_lines.append(f"{name},{sha256_digest(data)},{len(data)}")
-    record_name = f"{dist_info}/RECORD"
-    record_lines.append(f"{record_name},,")
-    files.append((record_name, "\n".join(record_lines).encode(), False))
-
-    with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, data, _ in files:
-            info_obj = zipfile.ZipInfo(name)
-            info_obj.external_attr = (
-                stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH
-            ) << 16
-            info_obj.compress_type = zipfile.ZIP_DEFLATED
-            zf.writestr(info_obj, data)
-
-    return wheel_path
+    return write_wheel(wheel_path, dist_info, files)
 
 
 def main():
@@ -395,7 +371,6 @@ def main():
         print(f"Building wheel for {target} ({info['platform_tag']})...")
         binary_data = extract_binary(artifacts_dir, target, info)
         wheel_path = build_wheel(
-            target=target,
             info=info,
             version=args.version,
             metadata=metadata,

@@ -28,6 +28,7 @@
 //! entry without its lock counterpart would make a plain `yarn install`
 //! re-resolve and rewrite the lock underneath the user.
 
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use std::path::Path;
 
 use serde_json::Value;
@@ -49,9 +50,8 @@ use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, lines_to_json, pattern_real_name, read_regular, read_regular_to_string,
-    read_yarn_lock, replace_block, revert_recorded_block, scan_blocks, split_key_patterns,
-    split_pattern, LockBlock,
+    body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
+    revert_recorded_block, scan_blocks, split_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -161,7 +161,7 @@ pub async fn vendor_yarn_berry(
 
     // ── 5. package.json + user-override conflict gate ─────────────────────
     let pkg_path = project_root.join(PACKAGE_JSON);
-    let pkg_bytes = match read_regular(&pkg_path).await {
+    let pkg_bytes = match read_regular_to_bytes(&pkg_path).await {
         Ok(b) => b,
         Err(e) => {
             return refused(
@@ -621,7 +621,7 @@ pub async fn revert_yarn_berry_opts(
     // package.json resolutions entries.
     if !pkg_recs.is_empty() {
         let pkg_path = project_root.join(PACKAGE_JSON);
-        match read_regular(&pkg_path).await {
+        match read_regular_to_bytes(&pkg_path).await {
             Ok(bytes) => {
                 let mut pkg: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
@@ -2009,7 +2009,9 @@ __metadata:
         tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
             .await
             .unwrap();
-        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes)
+            .await
+            .unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!fx.tgz_path().exists(), "orphaned artifact removed");
@@ -2026,7 +2028,9 @@ __metadata:
         let mut entry = entry.unwrap();
         entry.wiring.clear();
         tokio::fs::remove_file(fx.lock_path()).await.unwrap();
-        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes)
+            .await
+            .unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!fx.tgz_path().exists(), "no lock, no reference");
@@ -2317,16 +2321,24 @@ __metadata:
         let lock = B3_BEFORE_LOCK.replace("__metadata:\n  version: 8\n  cacheKey: 10c0\n\n", "");
         assert_ne!(lock, B3_BEFORE_LOCK, "the fixture edit must hit");
         let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
-        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
         assert!(detail.contains("__metadata"), "{detail}");
         fx.assert_untouched().await;
 
         // No root `<name>@workspace:.` entry: the locator cannot be built.
-        let lock = B3_BEFORE_LOCK
-            .replace("vendor-spike@workspace:.", "vendor-spike@workspace:packages/a");
+        let lock = B3_BEFORE_LOCK.replace(
+            "vendor-spike@workspace:.",
+            "vendor-spike@workspace:packages/a",
+        );
         assert_ne!(lock, B3_BEFORE_LOCK, "the fixture edit must hit");
         let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
-        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
         assert!(detail.contains("@workspace:."), "{detail}");
         fx.assert_untouched().await;
 
@@ -2484,7 +2496,10 @@ __metadata:
             .iter()
             .find(|w| w.code == "vendor_lockfile_missing")
             .unwrap_or_else(|| {
-                panic!("expected the missing-manifest warning: {:?}", outcome.warnings)
+                panic!(
+                    "expected the missing-manifest warning: {:?}",
+                    outcome.warnings
+                )
             });
         assert!(warning.detail.contains(PACKAGE_JSON), "{}", warning.detail);
         assert_eq!(
@@ -2644,7 +2659,9 @@ __metadata:
             outcome.warnings
         );
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "the re-run converges and removes the uuid dir"
         );
     }
@@ -2741,13 +2758,17 @@ __metadata:
         let fx = fixture_with(&pkg_before, B3_BEFORE_LOCK).await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
-        tokio::fs::write(fx.pkg_path(), B3_BEFORE_PKG).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), B3_BEFORE_PKG)
+            .await
+            .unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(
-                |w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("no longer exists")
-            ),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("no longer exists")),
             "{:?}",
             outcome.warnings
         );
@@ -2778,9 +2799,11 @@ __metadata:
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(
-                |w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("no longer exists")
-            ),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("no longer exists")),
             "{:?}",
             outcome.warnings
         );

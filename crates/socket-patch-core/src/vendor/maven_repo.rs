@@ -68,6 +68,7 @@ use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode};
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 
 use super::common::{
@@ -135,32 +136,6 @@ fn group_id_to_path(group_id: &str) -> String {
 /// `is_safe_maven_coordinate` group half. Fails closed on tampered coordinates.
 fn is_safe_group_id(group_id: &str) -> bool {
     group_id.split('.').all(is_safe_single_segment)
-}
-
-/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
-/// composer_lock.rs …): `open_regular_file` opens with `O_NONBLOCK` and
-/// rejects non-regular files, so a FIFO planted at any of this backend's read
-/// paths — the committed vendored tree, the project `pom.xml`, the `~/.m2`
-/// cache — fails fast instead of wedging the caller forever in an `open(2)`
-/// waiting for a writer that never comes.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
-/// matching `tokio::fs::read_to_string`).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
@@ -722,7 +697,7 @@ async fn acquire_upstream_pom(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<Vec<u8>, String> {
     let local = installed_dir.join(format!("{artifact_id}-{version}.pom"));
-    match read_regular(&local).await {
+    match read_regular_to_bytes(&local).await {
         Ok(bytes) => return Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("unreadable local pom {}: {e}", local.display())),
@@ -765,7 +740,7 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
@@ -773,17 +748,24 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("read body of {url}: {e}"))?;
-    if bytes.len() > MAX_POM_BYTES {
-        return Err(format!(
-            "pom at {url} is {} bytes (cap {MAX_POM_BYTES})",
-            bytes.len()
-        ));
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_POM_BYTES as u64)
+    {
+        return Err(format!("pom at {url} exceeds the {MAX_POM_BYTES}-byte cap"));
     }
-    Ok(bytes.to_vec())
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("read body of {url}: {e}"))?
+    {
+        if chunk.len() > MAX_POM_BYTES - bytes.len() {
+            return Err(format!("pom at {url} exceeds the {MAX_POM_BYTES}-byte cap"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Dry-run verify-only: extract the local jar to a private stage and run the
@@ -841,7 +823,7 @@ async fn dry_run_verify(
 /// entry fail-closed. Returns the live [`tempfile::TempDir`] (the caller holds
 /// it for the stage's lifetime).
 async fn extract_jar_to_stage(src_jar: &Path) -> Result<tempfile::TempDir, String> {
-    let bytes = read_regular(src_jar)
+    let bytes = read_regular_to_bytes(src_jar)
         .await
         .map_err(|e| format!("cannot read {}: {e}", src_jar.display()))?;
     let stage = tempfile::tempdir().map_err(|e| format!("cannot create stage dir: {e}"))?;
@@ -893,7 +875,7 @@ async fn artifact_in_sync(
 
 /// True when `<leaf>.sha1` exists and equals the hex sha1 of `<leaf>`'s bytes.
 async fn sidecar_matches(leaf_dir: &Path, leaf: &str) -> bool {
-    let Ok(bytes) = read_regular(&leaf_dir.join(leaf)).await else {
+    let Ok(bytes) = read_regular_to_bytes(&leaf_dir.join(leaf)).await else {
         return false;
     };
     let Ok(recorded) = read_regular_to_string(&leaf_dir.join(format!("{leaf}.sha1"))).await else {
@@ -1022,10 +1004,15 @@ fn find_outside(text: &str, needle: &str, from: usize, spans: &[(usize, usize)])
 /// newline-terminated) at the start of the line containing `at`.
 fn insert_block_at(haystack: &str, at: usize, insertion: &str) -> String {
     let line_start = haystack[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    let insert_at = if haystack[line_start..at].trim().is_empty() {
+        line_start
+    } else {
+        at
+    };
     let mut out = String::with_capacity(haystack.len() + insertion.len());
-    out.push_str(&haystack[..line_start]);
+    out.push_str(&haystack[..insert_at]);
     out.push_str(insertion);
-    out.push_str(&haystack[line_start..]);
+    out.push_str(&haystack[insert_at..]);
     out
 }
 
@@ -2581,8 +2568,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (r2, e2, _w2) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r2, e2, _w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(!r2.success, "a blob-less rebuild cannot succeed");
         assert!(r2.error.is_some(), "the failure carries a detail");
         assert!(e2.is_none(), "a failed rebuild must not re-record");
@@ -2760,7 +2746,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the vendor is recorded despite the marker");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "the marker failure is surfaced as a warning: {warnings:?}"
         );
         let pom_xml = tokio::fs::read_to_string(root.join(PROJECT_POM))
@@ -2955,7 +2943,9 @@ mod tests {
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(result.success);
         let entry = entry.unwrap();
-        tokio::fs::remove_file(root.join(PROJECT_POM)).await.unwrap();
+        tokio::fs::remove_file(root.join(PROJECT_POM))
+            .await
+            .unwrap();
 
         let outcome = revert_maven(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -3075,7 +3065,9 @@ mod tests {
             unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert!(result.success, "{:?}", result.error);
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
             "the service download is surfaced: {warnings:?}"
         );
         assert_eq!(
@@ -3105,10 +3097,13 @@ mod tests {
     async fn service_mode_offline_refuses_before_any_write() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
-        let cfg = service_cfg(None, crate::vendor::VendorSource::Service, /*offline=*/ true);
-        let (code, _d) = unwrap_refused(
-            run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await,
+        let cfg = service_cfg(
+            None,
+            crate::vendor::VendorSource::Service,
+            /*offline=*/ true,
         );
+        let (code, _d) =
+            unwrap_refused(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_service_offline_conflict");
         assert!(!root.join(".socket").exists(), "refusal writes nothing");
         let pom_xml = tokio::fs::read_to_string(root.join(PROJECT_POM))
@@ -3126,7 +3121,9 @@ mod tests {
         let uuid_dir = root.join(format!(".socket/vendor/maven/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         // create_dir_all of <uuid>/org/... fails on the planted regular file.
-        tokio::fs::write(uuid_dir.join("org"), b"squatter").await.unwrap();
+        tokio::fs::write(uuid_dir.join("org"), b"squatter")
+            .await
+            .unwrap();
 
         let (result, entry, _w) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
@@ -3210,13 +3207,19 @@ mod tests {
         let (dir, blobs, installed, record) =
             fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
         let root = dir.path();
-        let cfg = service_cfg(Some(&server.uri()), crate::vendor::VendorSource::Auto, false);
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
+        );
         let (result, entry, warnings) =
             unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_maven_pom_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_maven_pom_downloaded"),
             "the pom download is surfaced: {warnings:?}"
         );
         let vendored_pom = root.join(format!("{}/commons-text-1.10.0.pom", leaf_rel()));
@@ -3225,10 +3228,9 @@ mod tests {
             UPSTREAM_POM,
             "the downloaded pom is vendored verbatim"
         );
-        let pom_sha1 = tokio::fs::read_to_string(root.join(format!(
-            "{}/commons-text-1.10.0.pom.sha1",
-            leaf_rel()
-        )))
+        let pom_sha1 = tokio::fs::read_to_string(
+            root.join(format!("{}/commons-text-1.10.0.pom.sha1", leaf_rel())),
+        )
         .await
         .unwrap();
         assert_eq!(pom_sha1.trim(), sha1_hex(UPSTREAM_POM));
@@ -3254,10 +3256,13 @@ mod tests {
         let (dir, blobs, installed, record) =
             fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
         let root = dir.path();
-        let cfg = service_cfg(Some(&server.uri()), crate::vendor::VendorSource::Auto, false);
-        let (code, detail) = unwrap_refused(
-            run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await,
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
         );
+        let (code, detail) =
+            unwrap_refused(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_maven_pom_unavailable");
         assert!(
             detail.contains("registry fetch failed"),
@@ -3288,6 +3293,23 @@ mod tests {
         assert!(err.contains("HTTP 404"), "{err}");
     }
 
+    #[test]
+    fn inline_pom_keeps_repository_inside_project() {
+        for original in [
+            "<project><modelVersion>4.0.0</modelVersion></project>",
+            "<project><repositories></repositories></project>",
+        ] {
+            let edited =
+                build_repo_edit(original, "socket-test", ".socket/vendor/maven/test").unwrap();
+            assert!(edited.starts_with("<project>"), "{edited}");
+            assert!(edited.ends_with("</project>"), "{edited}");
+            let repositories = edited.find("<repositories>").unwrap();
+            let repository = edited.find("<repository>").unwrap();
+            let close = edited.find("</repositories>").unwrap();
+            assert!(repositories < repository && repository < close, "{edited}");
+        }
+    }
+
     /// fetch_pom_bytes rejects a body over MAX_POM_BYTES (a mirror serving the
     /// wrong thing) with the cap in the error.
     #[tokio::test]
@@ -3299,9 +3321,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(pom_route))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_POM_BYTES + 1]),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_POM_BYTES + 1]))
             .mount(&server)
             .await;
         let err = fetch_pom_bytes(&format!("{}{pom_route}", server.uri()))
@@ -3390,8 +3410,10 @@ mod tests {
     #[test]
     fn profiles_masking_edge_branches() {
         // Decoy: <profilesX> is not <profiles> — the real section is wireable.
-        let decoy = "<project><profilesX>x</profilesX>\n  <repositories>\n  </repositories>\n</project>\n";
-        let out = build_repo_edit(decoy, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
+        let decoy =
+            "<project><profilesX>x</profilesX>\n  <repositories>\n  </repositories>\n</project>\n";
+        let out =
+            build_repo_edit(decoy, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
         assert!(out.contains("<id>socket-patch-vendor-x</id>"));
         assert_eq!(
             out.matches("</repositories>").count(),
@@ -3492,7 +3514,9 @@ mod tests {
             "  <properties>\n  </properties>\n</project>",
             1,
         );
-        tokio::fs::write(root.join(PROJECT_POM), &edited).await.unwrap();
+        tokio::fs::write(root.join(PROJECT_POM), &edited)
+            .await
+            .unwrap();
 
         let outcome = revert_maven(&entry, root, /*dry_run=*/ true).await;
         assert!(outcome.success, "{:?}", outcome.error);

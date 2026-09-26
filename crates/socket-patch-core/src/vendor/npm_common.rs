@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::{fresh_copy_except_root, remove_tree};
 use crate::patch::package::read_archive_to_map;
 use crate::patch::path_safety;
 use crate::utils::fs::atomic_write_bytes;
@@ -188,23 +188,16 @@ pub(super) async fn stage_patch_pack(
         }
     };
     let stage = stage_tmp.path().join("stage");
-    if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+    // Skip the installed dependency tree during traversal: it is not part
+    // of this package's tarball and can dwarf the package itself.
+    if let Err(e) = fresh_copy_except_root(installed_dir, &stage, "node_modules").await {
         return Err(Box::new(done_failure(
             purl,
             format!("cannot stage a copy of the installed package: {e}"),
         )));
     }
-    // The tarball must carry ONLY the package's own files: a nested
-    // node_modules (hoisting leftovers, file:-dep installs) would balloon
-    // the artifact and shadow the lock's own resolution.
-    if let Err(e) = remove_tree(&stage.join("node_modules")).await {
-        return Err(Box::new(done_failure(
-            purl,
-            format!("cannot prune staged node_modules: {e}"),
-        )));
-    }
-    // Bundled dependencies ship INSIDE the package tarball; since we just
-    // dropped nested node_modules, repacking would produce a tarball npm
+    // Bundled dependencies ship INSIDE the package tarball; since we skip
+    // nested node_modules, repacking would produce a tarball npm
     // cannot satisfy those deps from. Refuse before patching.
     if let Ok(bytes) = tokio::fs::read(stage.join("package.json")).await {
         // npm and Node tolerate a leading UTF-8 BOM in package.json (and the
@@ -785,9 +778,8 @@ mod tests {
     /// pruned.
     #[test]
     fn declares_bundled_deps_matches_npm_value_shapes() {
-        let with = |key: &str, v: serde_json::Value| {
-            declares_bundled_deps(&serde_json::json!({ key: v }))
-        };
+        let with =
+            |key: &str, v: serde_json::Value| declares_bundled_deps(&serde_json::json!({ key: v }));
         for key in ["bundleDependencies", "bundledDependencies"] {
             assert!(with(key, serde_json::json!(true)), "{key}: true = all deps");
             assert!(!with(key, serde_json::json!(false)), "{key}: false");
@@ -1268,7 +1260,8 @@ mod tests {
     async fn service_bytes_integrity_string_guard_fires_before_any_write() {
         let tmp = tempfile::tempdir().unwrap();
         let record = record_with_uuid(UUID);
-        let err = expect_err(service_bytes(tmp.path(), &record, b"tarball bytes", "sha512-AAAA").await);
+        let err =
+            expect_err(service_bytes(tmp.path(), &record, b"tarball bytes", "sha512-AAAA").await);
         let error = expect_done_failure(err, "disagrees with the service integrity sha512-AAAA");
         assert!(error.contains("recomputed integrity"), "{error}");
         assert!(
@@ -1449,8 +1442,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
         expect_done_error(outcome, "boom");
         assert!(!failed_dir.exists(), "the failed artifact dir is removed");
         assert!(
@@ -1474,8 +1466,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
         expect_done_error(outcome, "boom");
         assert!(
             !root.join(".socket/vendor").exists(),
@@ -1504,7 +1495,9 @@ mod tests {
         let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, true).await;
         expect_done_error(outcome, "boom");
         assert_eq!(
-            tokio::fs::read(dir.join("left-pad-1.3.0.tgz")).await.unwrap(),
+            tokio::fs::read(dir.join("left-pad-1.3.0.tgz"))
+                .await
+                .unwrap(),
             b"live artifact",
             "a pre-existing (possibly live) artifact dir survives untouched"
         );

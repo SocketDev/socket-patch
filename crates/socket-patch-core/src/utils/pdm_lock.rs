@@ -2,6 +2,7 @@ use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::preserve_line_endings;
+use crate::utils::python_lock::{is_prior_hosted_url, next_header_end};
 
 pub fn lock_version(lock: &DocumentMut) -> Result<&str, String> {
     let version = lock
@@ -118,32 +119,6 @@ pub fn wheel_matches(filename: &str, name: &str, version: &str) -> bool {
         && parts[1] == version
 }
 
-/// Whether `existing` is an earlier hosted redirect of the SAME artifact:
-/// same origin (`scheme://host[:port]`) and same trailing wheel filename as the
-/// current artifact URL, fragments ignored. Grant tokens and patch uuids live
-/// in the path between them, so a rotated token or a superseded patch (new
-/// uuid) takes over the stale pin in place instead of being refused as a
-/// foreign source (the poetry / bun rewriters make the same call).
-fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
-    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return None;
-        }
-        let url = url.split('#').next()?;
-        let scheme_end = url.find("://")? + 3;
-        let path_start = url[scheme_end..].find('/')? + scheme_end;
-        let leaf = url[path_start..]
-            .rsplit('/')
-            .next()
-            .filter(|leaf| !leaf.is_empty())?;
-        Some((&url[..path_start], leaf))
-    }
-    match (origin_and_leaf(existing), origin_and_leaf(current)) {
-        (Some(old), Some(new)) => old == new,
-        _ => false,
-    }
-}
-
 pub fn rewrite_pdm_lock(
     text: &str,
     name: &str,
@@ -196,9 +171,11 @@ pub fn rewrite_pdm_lock(
         .filter_map(|&index| packages.get(index)?.get("version").and_then(Item::as_str))
         .collect();
     if locked_versions.len() > 1 {
-        return Err("PDM lock resolves this package at multiple versions (a marker or \
+        return Err(
+            "PDM lock resolves this package at multiple versions (a marker or \
                     multi-target fork); patching one fork would leave the others unpatched"
-            .into());
+                .into(),
+        );
     }
     let mut variants = std::collections::BTreeSet::new();
     let mut edits = Vec::new();
@@ -288,27 +265,8 @@ pub fn rewrite_pdm_lock(
     Ok(result)
 }
 
-/// End (exclusive, before its line break) of the first top-level TOML header
-/// line at or after `from`, skipping blank/comment lines; `text.len()` at EOF;
-/// `from` itself when the next non-blank line is not a header (a shape PDM never
-/// writes — the fragment then ends where it used to). Kept local, like this
-/// module's own `extend_span`.
-fn next_header_end(text: &str, from: usize) -> usize {
-    let mut pos = from;
-    for line in text[from..].split_inclusive('\n') {
-        let content = line.trim_end_matches(['\r', '\n']);
-        if content.trim().is_empty() || content.trim_start().starts_with('#') {
-            pos += line.len();
-            continue;
-        }
-        if content.starts_with('[') {
-            return pos + content.len();
-        }
-        return from;
-    }
-    text.len()
-}
-
+/// Collect unambiguous verbatim replacements for a package and its legacy
+/// integrity entries, preserving unrelated lockfile text.
 pub fn pdm_lock_edits(
     original: &str,
     rewritten: &str,
@@ -622,7 +580,10 @@ mod tests {
             &"a".repeat(64),
         )
         .unwrap();
-        assert!(rewired.contains(&fresh) && !rewired.contains(&stale), "{rewired}");
+        assert!(
+            rewired.contains(&fresh) && !rewired.contains(&stale),
+            "{rewired}"
+        );
         // A foreign (non-Socket) existing url is still refused.
         let foreign = fixture("2.29.2").replace(
             "name = \"urllib3\"",

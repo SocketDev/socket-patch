@@ -379,12 +379,7 @@ pub fn plan(
         }
     }
     if let Some(document) = documents.get_mut("hatch.toml") {
-        let mut hatch = Item::Table(document.as_table().clone());
-        matched += rewrite_environments(&mut hatch, &name, version, url)?;
-        *document.as_table_mut() = hatch
-            .as_table()
-            .ok_or("invalid Hatch configuration")?
-            .clone();
+        matched += rewrite_environments(document.as_item_mut(), &name, version, url)?;
     }
     if matched == 0 {
         return Err(format!("{name}=={version} has no explicit Hatch declaration; transitive-only dependencies require the install hook"));

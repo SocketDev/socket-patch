@@ -389,13 +389,9 @@ fn normalize_config_vendor_dir(raw: &str) -> Option<String> {
 /// installed.json is: the manifest belongs to the untrusted project, and
 /// a FIFO planted at that path would wedge a plain read forever.
 async fn read_config_vendor_dir(manifest_path: &Path) -> Option<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(manifest_path)
+    let content = crate::utils::fs::read_regular_to_string(manifest_path)
         .await
         .ok()?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await.ok()?;
     parse_config_vendor_dir(&content)
 }
 
@@ -528,8 +524,6 @@ fn is_safe_composer_name(name: &str) -> bool {
 /// `version`, or extra unexpected fields) is skipped rather than
 /// discarding every package in the file.
 async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
-    use tokio::io::AsyncReadExt;
-
     let installed_path = vendor_path.join("composer").join("installed.json");
 
     // The path lives inside the (untrusted) vendor tree: a planted FIFO
@@ -542,14 +536,9 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
     // Open via `open_regular_file` — non-blocking on Unix, rejecting
     // FIFOs/devices/directories (see its docs). Twin of the npm
     // crawler's `read_package_json` guard.
-    let Ok((mut file, metadata)) = crate::utils::fs::open_regular_file(&installed_path).await
-    else {
+    let Ok(content) = crate::utils::fs::read_regular_to_string(&installed_path).await else {
         return Vec::new();
     };
-    let mut content = String::with_capacity(metadata.len() as usize);
-    if file.read_to_string(&mut content).await.is_err() {
-        return Vec::new();
-    }
 
     let root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,

@@ -311,7 +311,9 @@ impl CargoCrawler {
         seen: &mut HashSet<String>,
     ) -> Option<CrawledPackage> {
         let cargo_toml_path = crate_path.join("Cargo.toml");
-        let content = tokio::fs::read_to_string(&cargo_toml_path).await.ok()?;
+        let content = crate::utils::fs::read_regular_to_string(&cargo_toml_path)
+            .await
+            .ok()?;
 
         // Fallback: parse directory name as <name>-<version>
         let (name, version) = parse_cargo_toml_name_version(&content)
@@ -335,7 +337,7 @@ impl CargoCrawler {
     /// name and version.
     async fn verify_crate_at_path(&self, path: &Path, name: &str, version: &str) -> bool {
         let cargo_toml_path = path.join("Cargo.toml");
-        let content = match tokio::fs::read_to_string(&cargo_toml_path).await {
+        let content = match crate::utils::fs::read_regular_to_string(&cargo_toml_path).await {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -429,6 +431,29 @@ impl Default for CargoCrawler {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_metadata_fifo_does_not_hang_discovery() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("demo-1.0.0");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        let fifo = pkg.join("Cargo.toml");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let Ok(result) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            CargoCrawler::new().find_by_purls(tmp.path(), &["pkg:cargo/demo@1.0.0".to_string()]),
+        )
+        .await
+        else {
+            // Release a regressed blocking opener so the runtime can exit.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("discovery blocked on a FIFO");
+        };
+        assert!(result.unwrap().is_empty());
+    }
+
     use super::*;
 
     #[test]

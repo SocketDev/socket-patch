@@ -61,6 +61,7 @@ use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_trailing_options;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 
 use super::common::{
@@ -79,20 +80,6 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
-
-/// Guarded read shared in shape with the composer.lock / Cargo.lock twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted as the Gemfile, Gemfile.lock, or a stub gemspec fails
-/// fast instead of wedging vendor's pair read, revert's restore readers, or
-/// the ledger reconstruction forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Wiring-record discriminators (`key` is the gem name for all three).
 ///
@@ -334,14 +321,14 @@ pub async fn vendor_gem(
     // stub that fails the required-attribute bar routes into the artifact
     // rebuild below (which re-materialises a valid stub) instead of the
     // silent `already_vendored` no-op.
-    let copy_stub_ok = match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await
-    {
-        Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
-        Err(_) => false,
-    };
-    let copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await && copy_stub_ok;
     if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
+            let copy_stub_ok =
+                match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await {
+                    Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
+                    Err(_) => false,
+                };
+            let copy_ok = copy_stub_ok && copy_matches_after_hashes(&copy_dir, &record.files).await;
             if copy_ok {
                 return done(
                     already_patched_result(purl, &copy_dir, &record.files),
@@ -1182,8 +1169,7 @@ async fn materialise_patched_copy(
             }
             // The stage is freshly created and not yet referenced by
             // anything, so a plain write suffices for the gemspec.
-            if let Err(e) =
-                tokio::fs::write(stage.join(format!("{name}.gemspec")), spec_text).await
+            if let Err(e) = tokio::fs::write(stage.join(format!("{name}.gemspec")), spec_text).await
             {
                 cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 return Ok(synthesized_result(
@@ -1210,8 +1196,7 @@ async fn materialise_patched_copy(
             if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
                 cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 result.success = false;
-                result.error =
-                    Some(format!("failed to move the rebuilt copy into place: {e}"));
+                result.error = Some(format!("failed to move the rebuilt copy into place: {e}"));
                 return Ok(result);
             }
             Ok(result)
@@ -5263,8 +5248,7 @@ mod tests {
 
         let empty = root.join(".socket/empty-blobs");
         tokio::fs::create_dir_all(&empty).await.unwrap();
-        let (r2, e2, _) =
-            unwrap_done(run_vendor(&root, &empty, &installed, &record, false).await);
+        let (r2, e2, _) = unwrap_done(run_vendor(&root, &empty, &installed, &record, false).await);
         assert!(!r2.success, "rebuild must fail without patch content");
         assert!(e2.is_none());
 
@@ -6027,7 +6011,10 @@ mod tests {
         assert_eq!(code, "unsafe_coordinates");
         assert!(detail.contains("unsafe gem coordinates"), "{detail}");
 
-        assert!(!root.join(".socket").exists(), "refusals must write nothing");
+        assert!(
+            !root.join(".socket").exists(),
+            "refusals must write nothing"
+        );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             GEMFILE_DIRECT
@@ -6313,7 +6300,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "a marker failure must not drop the entry");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         // The pair edit went through normally.
@@ -6473,8 +6462,7 @@ mod tests {
             gem_service_cfg("http://127.0.0.1:1", VendorSource::Build, false),
             gem_service_cfg("http://127.0.0.1:1", VendorSource::Auto, true),
         ] {
-            let (_tmp, root, installed, blobs, record) =
-                fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+            let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
             let (result, entry, warnings) =
                 unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
             assert!(result.success, "{:?}: {:?}", cfg.source, result.error);
@@ -6690,10 +6678,7 @@ mod tests {
         let (code, detail) =
             unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_prebuilt_write_failed");
-        assert!(
-            detail.contains("cannot write the stub gemspec"),
-            "{detail}"
-        );
+        assert!(detail.contains("cannot write the stub gemspec"), "{detail}");
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
@@ -7032,9 +7017,18 @@ mod tests {
         }
         let cases: [(&str, fn(&mut VendorEntry)); 5] = [
             ("gemfile record without `new`", t_gemfile_new_none),
-            ("rewritten gemfile record without `original`", t_gemfile_original_none),
-            ("lock record with non-array `original`", t_lock_original_not_array),
-            ("lock record whose `new` lost its remote line", t_lock_new_remote_tampered),
+            (
+                "rewritten gemfile record without `original`",
+                t_gemfile_original_none,
+            ),
+            (
+                "lock record with non-array `original`",
+                t_lock_original_not_array,
+            ),
+            (
+                "lock record whose `new` lost its remote line",
+                t_lock_new_remote_tampered,
+            ),
             ("checksum record without `new`", t_checksum_new_none),
         ];
         for (label, tamper) in cases {
@@ -7485,8 +7479,13 @@ mod tests {
             Some("gem \"rack\", \"3.2.6\"")
         );
         assert_eq!(
-            devendored_gem_line(&format!("{with_path}, require: false"), "rack", "3.2.6", &rel)
-                .as_deref(),
+            devendored_gem_line(
+                &format!("{with_path}, require: false"),
+                "rack",
+                "3.2.6",
+                &rel
+            )
+            .as_deref(),
             Some("gem \"rack\", \"3.2.6\", require: false")
         );
         assert_eq!(
@@ -7495,7 +7494,12 @@ mod tests {
             "trailing `, ` (empty opts) is fail-closed"
         );
         assert_eq!(
-            devendored_gem_line(&format!("{with_path}, source: \"x\""), "rack", "3.2.6", &rel),
+            devendored_gem_line(
+                &format!("{with_path}, source: \"x\""),
+                "rack",
+                "3.2.6",
+                &rel
+            ),
             None,
             "a source-selecting trailing option is fail-closed"
         );

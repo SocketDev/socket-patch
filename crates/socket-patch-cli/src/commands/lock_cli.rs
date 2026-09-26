@@ -38,8 +38,7 @@ use crate::json_envelope::{Command, Envelope, EnvelopeError};
 /// unlinked here — an unlink defeats mutual exclusion, because a
 /// competitor (live holder or mid-acquire racer) can keep or take an
 /// advisory lock on the orphaned inode while a fresh acquire locks
-/// its replacement. The only sanctioned deletion is `repair`'s final
-/// cleanup, which runs after its own guard is released.
+/// its replacement. Every command, including `repair`, retains the file.
 pub(crate) fn acquire_or_emit(
     socket_dir: &Path,
     command: Command,
@@ -71,7 +70,7 @@ pub(crate) fn acquire_or_emit(
 /// Human-readable description of a `lock_held` contention for the given
 /// wait budget. A zero budget means the historical non-blocking
 /// try-once, so we omit the "(waited …)" clause entirely.
-fn held_message(timeout: Duration) -> String {
+pub(crate) fn held_message(timeout: Duration) -> String {
     if timeout > Duration::ZERO {
         format!(
             "another socket-patch process is operating in this directory (waited {})",

@@ -55,6 +55,7 @@ use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries};
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 
 use super::common::{
@@ -103,7 +104,7 @@ const NUGET_ORG_SOURCE_URL: &str = "https://api.nuget.org/v3/index.json";
 /// two MUST stay in sync so the vendored feed filename, the
 /// `packageSourceMapping` version match, and the server-side registry paths
 /// agree. Mirrors `NuGetVersion.ToNormalizedString().ToLowerInvariant()`.
-fn normalize_nuget_version(version: &str) -> String {
+pub(crate) fn normalize_nuget_version(version: &str) -> String {
     // Build metadata is not part of package identity — drop it first.
     let without_build = match version.find('+') {
         Some(i) => &version[..i],
@@ -145,32 +146,6 @@ fn is_plain_nuget_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
-}
-
-/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
-/// maven_repo.rs …): `open_regular_file` opens with `O_NONBLOCK` and rejects
-/// non-regular files, so a FIFO planted at any of this backend's read paths —
-/// the committed vendored tree, the project `nuget.config` /
-/// `packages.lock.json`, the `~/.nuget` cache — fails fast instead of wedging
-/// the caller forever in an `open(2)` waiting for a writer that never comes.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
-/// matching `tokio::fs::read_to_string`).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Vendor a NuGet package: rebuild a patched `.nupkg` under
@@ -275,7 +250,7 @@ pub async fn vendor_nuget(
         let nupkg_ok = zip_matches_after_hashes(&nupkg_path, &record.files).await;
         let lock_ok = match &lock_text {
             None => true,
-            Some(text) => match read_regular(&nupkg_path).await {
+            Some(text) => match read_regular_to_bytes(&nupkg_path).await {
                 Ok(bytes) => {
                     let expected = content_hash(&bytes);
                     // Pinned at our bytes, or no matching resolved entry at
@@ -756,7 +731,7 @@ async fn local_rebuild(
             ),
         )));
     };
-    let bytes = match read_regular(&src_nupkg).await {
+    let bytes = match read_regular_to_bytes(&src_nupkg).await {
         Ok(b) => b,
         Err(e) => {
             return Ok((
@@ -1053,10 +1028,15 @@ fn blank_comments(text: &str) -> String {
 /// view, which shares offsets with `text`.
 fn insert_at_line(text: &str, at: usize, insertion: &str) -> String {
     let line_start = text[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    let insert_at = if text[line_start..at].trim().is_empty() {
+        line_start
+    } else {
+        at
+    };
     let mut out = String::with_capacity(text.len() + insertion.len());
-    out.push_str(&text[..line_start]);
+    out.push_str(&text[..insert_at]);
     out.push_str(insertion);
-    out.push_str(&text[line_start..]);
+    out.push_str(&text[insert_at..]);
     out
 }
 
@@ -1604,6 +1584,33 @@ mod tests {
         assert!(t.contains("<package pattern=\"Newtonsoft.Json\" />"));
         // Exactly one catch-all (the user's) — we didn't add another.
         assert_eq!(t.matches("<package pattern=\"*\" />").count(), 1);
+    }
+
+    #[test]
+    fn inline_config_keeps_sources_and_mapping_inside_configuration() {
+        for original in [
+            "<configuration></configuration>",
+            "<configuration><packageSources></packageSources></configuration>",
+        ] {
+            let edited = build_config_edit(
+                Some(original),
+                "socket-test",
+                ".socket/vendor/nuget/test",
+                "Example",
+            )
+            .unwrap()
+            .new_text;
+            assert!(edited.starts_with("<configuration>"), "{edited}");
+            assert!(edited.ends_with("</configuration>"), "{edited}");
+            let sources = edited.find("<packageSources>").unwrap();
+            let add = edited.find("<add key=\"socket-test\"").unwrap();
+            let close = edited.find("</packageSources>").unwrap();
+            assert!(sources < add && add < close, "{edited}");
+            assert!(
+                close < edited.find("<packageSourceMapping>").unwrap(),
+                "{edited}"
+            );
+        }
     }
 
     #[test]
@@ -3843,7 +3850,9 @@ mod tests {
         let root = dir.path();
         let parent = root.join(".socket/vendor/nuget");
         tokio::fs::create_dir_all(&parent).await.unwrap();
-        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter")
+            .await
+            .unwrap();
 
         let (result, entry, _w) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
@@ -4106,17 +4115,11 @@ mod tests {
         // original missing → drift, and the file is never touched.
         let w = lock_wiring(None, Some("OURS=="));
         assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
-        assert_eq!(
-            tokio::fs::read_to_string(&lock_path).await.unwrap(),
-            text
-        );
+        assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
         // new missing → same drift.
         let w = lock_wiring(Some("OLD=="), None);
         assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
-        assert_eq!(
-            tokio::fs::read_to_string(&lock_path).await.unwrap(),
-            text
-        );
+        assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
     }
 
     #[tokio::test]
@@ -4447,7 +4450,9 @@ mod tests {
         let root = dir.path();
         let parent = root.join(".socket/vendor/nuget");
         tokio::fs::create_dir_all(&parent).await.unwrap();
-        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter")
+            .await
+            .unwrap();
 
         let server = MockServer::start().await;
         let served = make_nupkg(PATCHED);

@@ -886,8 +886,8 @@ def variant_status(observations, name, mode):
 
     Returns None when the lane did not run (uv < 0.2.35), 'unsupported' when
     the binary cannot lock the fixture shape, 'refused' when the CLI left the
-    lock unpatched, 'pass' when every executed install delivered the patched
-    bytes and the `--locked` install left the lock untouched, otherwise
+    lock unpatched, 'pass' when at least one install ran and every executed
+    install delivered patched bytes and kept a `--locked` lock untouched, otherwise
     ('fail', [failing install labels]).
     """
     prefix = 'variant-' + name + '-' + mode + '-'
@@ -902,20 +902,24 @@ def variant_status(observations, name, mode):
     if lock is None or lock.get('formatSupported') is False or lock['exitCode']:
         return 'unsupported'
     scan = rows.get('socket-patch')
-    if scan is None or scan['exitCode']:
+    if scan is None or scan['exitCode'] or scan.get('outputError'):
         return ('fail', ['scan'])
     if scan.get('patchInLock') is False:
         return 'refused'
     failed = []
+    installs = 0
     for label in VARIANT_INSTALLS:
         item = rows.get(label + '-sync')
         if item is None:
             continue
+        installs += 1
         ok = item['exitCode'] == 0 and item.get('installedPatch') is True
         if label == 'locked' and item.get('lockUnchanged') is not True:
             ok = False
         if not ok:
             failed.append(label)
+    if not installs:
+        return ('fail', ['missing installs'])
     return 'pass' if not failed else ('fail', failed)
 
 
@@ -987,27 +991,33 @@ def write_summary():
                         row['installedResponseSha256'] == patched_response
                     )
                 if key.endswith('socket-patch'):
-                    payload = json.loads(row['stdout'])
-                    redirect = payload.get('redirect')
-                    vendor = payload.get('vendor')
-                    if redirect:
-                        item['rewrittenFiles'] = redirect.get('rewrittenFiles', [])
-                        item['redirected'] = redirect.get('redirected', 0)
-                        item['warnings'] = [
-                            warning['code'] for warning in redirect.get('warnings', [])
-                        ]
-                    if vendor:
-                        item['vendorSummary'] = {
-                            key: vendor.get('summary', {}).get(key)
-                            for key in ['applied', 'failed']
-                        }
-                        item['vendorErrors'] = [
-                            event
-                            for event in vendor.get('events', [])
-                            if event.get('action') == 'failed'
-                        ]
-                elif item['exitCode']:
-                    item['diagnostic'] = row['stderr'].replace(str(ROOT), '<output>')[
+                    try:
+                        payload = json.loads(row['stdout'])
+                        redirect = payload.get('redirect')
+                        vendor = payload.get('vendor')
+                        if redirect:
+                            item['rewrittenFiles'] = redirect.get('rewrittenFiles', [])
+                            item['redirected'] = redirect.get('redirected', 0)
+                            item['warnings'] = [
+                                warning['code'] for warning in redirect.get('warnings', [])
+                            ]
+                        if vendor:
+                            item['vendorSummary'] = {
+                                key: vendor.get('summary', {}).get(key)
+                                for key in ['applied', 'failed']
+                            }
+                            item['vendorErrors'] = [
+                                event
+                                for event in vendor.get('events', [])
+                                if event.get('action') == 'failed'
+                            ]
+                    except (ValueError, TypeError, AttributeError, KeyError) as error:
+                        # Keep the real process status and diagnostics even if
+                        # it crashed, timed out, or emitted a malformed envelope.
+                        item['outputError'] = f'invalid CLI JSON output: {error}'
+                        item['stdout'] = str(row.get('stdout', '')).replace(str(ROOT), '<output>')[:1000]
+                if item['exitCode'] or item.get('outputError'):
+                    item['diagnostic'] = row.get('stderr', '').replace(str(ROOT), '<output>')[
                         :1000
                     ]
                 observations.append(item)
@@ -1117,6 +1127,8 @@ def render_doc_table(results):
         if not scans:
             return None
         scan = scans[0]
+        if scan.get('outputError'):
+            return 'Fail'
         if scan['exitCode'] == 0 and not scan.get('vendorErrors'):
             return False
         if scan.get('vendorErrors') or scan.get('warnings'):

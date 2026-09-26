@@ -42,6 +42,9 @@ pub struct ApiClientOptions {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     client: reqwest::Client,
+    // Reuse the anonymous connection pool across blob and artifact downloads.
+    // It is separate from the authenticated client's default headers.
+    anonymous_client: std::sync::Arc<std::sync::OnceLock<reqwest::Client>>,
     api_url: String,
     api_token: Option<String>,
     use_public_proxy: bool,
@@ -85,8 +88,13 @@ impl ApiClient {
         );
         default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
 
-        if let Some(ref token) = options.api_token {
-            if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {}", token)) {
+        if let Some(token) = options
+            .api_token
+            .as_ref()
+            .filter(|_| !options.use_public_proxy)
+        {
+            if let Ok(mut hv) = HeaderValue::from_str(&format!("Bearer {}", token)) {
+                hv.set_sensitive(true);
                 default_headers.insert(header::AUTHORIZATION, hv);
             }
         }
@@ -98,6 +106,7 @@ impl ApiClient {
 
         Self {
             client,
+            anonymous_client: Default::default(),
             api_url,
             api_token: options.api_token,
             use_public_proxy: options.use_public_proxy,
@@ -116,6 +125,10 @@ impl ApiClient {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
+
+    fn anonymous_client(&self) -> &reqwest::Client {
+        self.anonymous_client.get_or_init(plain_client)
+    }
 
     /// Internal GET that deserialises JSON. Returns `Ok(None)` on 404.
     async fn get_json<T: serde::de::DeserializeOwned>(
@@ -430,43 +443,38 @@ impl ApiClient {
     /// proxy gained `POST /patch/batch`, this is the legacy path for
     /// deployments that predate it.
     ///
-    /// Processes PURLs in batches of `CONCURRENCY_LIMIT` to avoid
-    /// overwhelming the server while remaining efficient.
+    /// Keeps at most `CONCURRENCY_LIMIT` requests in flight, replacing each
+    /// completed request immediately so slow responses do not stall a batch.
     async fn search_patches_batch_via_individual_queries(
         &self,
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
         const CONCURRENCY_LIMIT: usize = 10;
 
-        // Collect all (purl, response) pairs
-        let mut all_results: Vec<(String, Option<SearchResponse>)> = Vec::new();
-
-        for chunk in purls.chunks(CONCURRENCY_LIMIT) {
-            // Use tokio::JoinSet for concurrent execution within each chunk
-            let mut join_set = tokio::task::JoinSet::new();
-
-            for purl in chunk {
+        let mut all_results = Vec::with_capacity(purls.len());
+        let mut pending = purls.iter();
+        let mut join_set = tokio::task::JoinSet::new();
+        loop {
+            // Refill each freed slot immediately: a slow request must not
+            // stall the next nine requests behind a chunk boundary.
+            while join_set.len() < CONCURRENCY_LIMIT {
+                let Some(purl) = pending.next() else { break };
                 let purl = purl.clone();
                 let client = self.clone();
                 join_set.spawn(async move {
-                    let resp = client.search_patches_by_package(None, &purl).await;
-                    match resp {
-                        Ok(r) => (purl, Some(r)),
-                        Err(e) => {
-                            debug_log(&format!("Error fetching patches for {}: {}", purl, e));
+                    match client.search_patches_by_package(None, &purl).await {
+                        Ok(response) => (purl, Some(response)),
+                        Err(error) => {
+                            debug_log(&format!("Error fetching patches for {purl}: {error}"));
                             (purl, None)
                         }
                     }
                 });
             }
-
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok(pair) => all_results.push(pair),
-                    Err(e) => {
-                        debug_log(&format!("Task join error: {}", e));
-                    }
-                }
+            match join_set.join_next().await {
+                Some(Ok(pair)) => all_results.push(pair),
+                Some(Err(error)) => debug_log(&format!("Task join error: {error}")),
+                None => break,
             }
         }
 
@@ -579,9 +587,9 @@ impl ApiClient {
         // self.api_url), use a plain client without auth headers to avoid
         // leaking credentials to the proxy.
         let client = if use_auth {
-            self.client.clone()
+            &self.client
         } else {
-            plain_client()
+            self.anonymous_client()
         };
         let resp = client
             .get(&url)
@@ -810,7 +818,7 @@ impl ApiClient {
                 .await
         } else {
             // Plain (no-auth) client: never leak the bearer to the proxy.
-            plain_client()
+            self.anonymous_client()
                 .post(&url)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json")
@@ -850,7 +858,8 @@ impl ApiClient {
             )));
         }
         debug_log(&format!("GET vendor package {url}"));
-        let resp = match plain_client()
+        let resp = match self
+            .anonymous_client()
             .get(url)
             .header(header::ACCEPT, "application/octet-stream")
             .send()
@@ -1477,7 +1486,6 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
     }
 
     cve_ids.sort();
-    ghsa_ids.sort();
 
     BatchPatchInfo {
         uuid: patch.uuid,
@@ -3162,7 +3170,13 @@ mod vendor_package_tests {
             .mount(&server)
             .await;
 
-        let map = proxy_client(server.uri())
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: Some("must-not-reach-the-public-proxy".into()),
+            use_public_proxy: true,
+            org_slug: None,
+        });
+        let map = client
             .fetch_registry_references(&[UUID.to_string()])
             .await
             .expect("proxy package-reference resolution must succeed");

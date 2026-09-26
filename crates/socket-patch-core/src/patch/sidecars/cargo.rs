@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::patch::apply::{apply_file_patch, is_safe_relative_subpath, normalize_file_path};
-use crate::utils::fs::open_regular_file;
+use crate::utils::fs::read_regular_to_bytes;
 
 use super::{SidecarError, SidecarFile, SidecarFileAction, SidecarPayload};
 
@@ -85,7 +85,7 @@ async fn sync_checksum(
     let checksum_path = pkg_path.join(CHECKSUM_FILE);
 
     // Read the existing file. NotFound is fine — no checksums to update.
-    let raw = match read_regular_file(&checksum_path).await {
+    let raw = match read_regular_to_bytes(&checksum_path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(None);
@@ -210,7 +210,7 @@ async fn update_entries(
         }
 
         let on_disk = pkg_path.join(&normalized);
-        let bytes = match read_regular_file(&on_disk).await {
+        let bytes = match read_regular_to_bytes(&on_disk).await {
             Ok(bytes) => bytes,
             Err(e) if remove_missing && e.kind() == std::io::ErrorKind::NotFound => {
                 // Rollback deleted this patch-added file; drop the entry
@@ -237,26 +237,6 @@ async fn update_entries(
         );
     }
     Ok(())
-}
-
-/// Read a whole file, refusing anything that isn't a regular file.
-///
-/// Both call sites read paths inside the (untrusted) package tree, so
-/// the open goes through [`open_regular_file`] — non-blocking on Unix,
-/// rejecting FIFOs/devices/directories — to keep a planted special
-/// file from hanging the patch engine (see its docs). Loading the
-/// whole file is fine: cargo source files are bounded (the registry
-/// rejects crates whose `.crate` tarball exceeds ~10MB unpacked), and
-/// the open error passes through untouched, which the
-/// `dispatch_fixup_cargo_sha256_file_failure_arm` integration test
-/// drives via a non-existent path.
-async fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
 }
 
 #[cfg(test)]

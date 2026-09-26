@@ -166,7 +166,9 @@ fn build_wheel(name: &str, version: &str) -> (Vec<u8>, String) {
             .start_file(format!("{name}-{version}.dist-info/METADATA"), opts)
             .unwrap();
         writer
-            .write_all(format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n").as_bytes())
+            .write_all(
+                format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n").as_bytes(),
+            )
             .unwrap();
         writer.finish().unwrap();
     }
@@ -257,7 +259,10 @@ fn symlink_away(root: &Path, shared: &Path, name: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(shared).unwrap();
     let target = shared.join(name);
     std::fs::rename(root.join(name), &target).unwrap();
-    let rel = format!("../{}/{name}", shared.file_name().unwrap().to_str().unwrap());
+    let rel = format!(
+        "../{}/{name}",
+        shared.file_name().unwrap().to_str().unwrap()
+    );
     std::os::unix::fs::symlink(&rel, root.join(name)).unwrap();
     assert!(is_symlink(&root.join(name)) && root.join(name).exists());
     target
@@ -317,7 +322,10 @@ fn assert_refused_untouched(
     target: &Path,
     target_before: &[u8],
 ) {
-    assert_eq!(code, 1, "a symlinked rewrite target must fail the run: {doc:#}");
+    assert_eq!(
+        code, 1,
+        "a symlinked rewrite target must fail the run: {doc:#}"
+    );
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert_eq!(doc["errorCode"], CODE, "{doc:#}");
     let message = doc["error"].as_str().unwrap_or_else(|| panic!("{doc:#}"));
@@ -385,9 +393,14 @@ async fn hosted_refuses_symlinked_lock_before_ledger_write() {
         "the regular sibling in the same plan must not be written either: hosted \
          rewrites are transactional"
     );
-    assert!(
-        !root.join(".socket").exists(),
-        "nothing under .socket/ may be created by a refused rewrite"
+    let socket_entries: Vec<_> = std::fs::read_dir(root.join(".socket"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        socket_entries,
+        [std::ffi::OsString::from("apply.lock")],
+        "a refused rewrite may only leave its retained advisory lock file"
     );
 }
 
@@ -459,11 +472,9 @@ async fn hosted_rewrites_the_same_lock_once_it_is_a_regular_file() {
     let (code, doc, stderr) = scan_hosted_json(&root, &server.uri());
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
     assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
-    assert!(
-        std::fs::read_to_string(root.join("package-lock.json"))
-            .unwrap()
-            .contains(NPM_HOSTED_URL)
-    );
+    assert!(std::fs::read_to_string(root.join("package-lock.json"))
+        .unwrap()
+        .contains(NPM_HOSTED_URL));
     assert!(root.join(LEDGER_REL).exists());
 }
 

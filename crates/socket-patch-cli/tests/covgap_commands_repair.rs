@@ -276,7 +276,8 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
         "offline missing artifacts are a warning, not a failure; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Warning: 12 file artifact(s) are missing (offline mode - not downloading)"),
+        stdout
+            .contains("Warning: 12 file artifact(s) are missing (offline mode - not downloading)"),
         "the warning header must carry the full missing count; stdout=\n{stdout}"
     );
     let items = item_lines(&stdout);
@@ -497,7 +498,10 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
             panic!("json: envelope must record the failed archive cleanup; got events={events:?}")
         });
     assert!(
-        skip["reason"].as_str().unwrap_or("").contains("diff cleanup failed"),
+        skip["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("diff cleanup failed"),
         "the skip reason must name the failing archive pass; got {skip}"
     );
     // The packages pass still swept its orphan: one batched removal event.
@@ -517,20 +521,14 @@ fn stdout_reports_package_sweep(stdout: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Lock-file unlink failure (housekeeping stays non-fatal)
+// A retained lock file does not require directory write permission
 // ---------------------------------------------------------------------------
 
-/// A failed `apply.lock` unlink at the tail of a finished repair is
-/// housekeeping: human mode warns on stderr WITHOUT flipping the exit code.
-/// Unix-only: unlink needs write on the parent dir, so a 0o555 `.socket`
-/// makes the delete fail deterministically while opening the pre-created
-/// lock file (no dir write needed) and reading the manifest still work.
-/// Same chmod choreography as `repair_cleanup_failure_is_reported_in_json_
-/// and_silent_modes` in `repair_invariants.rs` (running as root would let
-/// the unlink through and fail this test loudly, not vacuously).
+/// Repair retains the lock inode. An otherwise read-only `.socket` therefore
+/// permits a no-op repair when the existing lock file is writable.
 #[cfg(unix)]
 #[test]
-fn repair_warns_but_exits_zero_when_lock_file_unremovable() {
+fn repair_retains_lock_without_unlink_warning_in_readonly_directory() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -555,16 +553,15 @@ fn repair_warns_but_exits_zero_when_lock_file_unremovable() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "a failed lock-file delete must not flip the exit code of a \
-         finished repair; stdout=\n{stdout}\nstderr=\n{stderr}"
+        "read-only directory must permit a no-op repair; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: could not remove lock file"),
-        "human mode must warn about the undeletable lock file; stderr=\n{stderr}"
+        !stderr.contains("Warning: could not remove lock file"),
+        "repair must not attempt lock-file removal; stderr=\n{stderr}"
     );
     assert!(
         socket.join("apply.lock").exists(),
-        "the lock file survives the failed delete"
+        "the lock file must be retained"
     );
     assert!(
         stdout.contains("Repair complete."),
@@ -702,7 +699,14 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str], json: bool) -> (i32, Stri
     if json {
         cmd.arg("--json");
     }
-    cmd.args(["--api-url", mock_uri, "--api-token", "fake-token", "--org", ORG_SLUG]);
+    cmd.args([
+        "--api-url",
+        mock_uri,
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG_SLUG,
+    ]);
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");
     (
@@ -731,7 +735,10 @@ async fn repair_offline_rebuild_human_mode_prints_rebuilt_summary() {
         &["scan", "--vendor", "--yes"],
         true,
     );
-    assert_eq!(code, 0, "vendor setup failed: stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor setup failed: stdout={stdout} stderr={stderr}"
+    );
     let tgz = tmp
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));

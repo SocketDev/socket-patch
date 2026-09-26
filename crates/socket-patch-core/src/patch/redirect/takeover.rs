@@ -91,7 +91,10 @@ pub async fn revert_redirect_purl(
 
 /// Read a project file, distinguishing missing (`Ok(None)`) from unreadable.
 async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, String> {
-    match tokio::fs::read_to_string(project_root.join(rel)).await {
+    if !super::replay::safe_rel_path(rel) {
+        return Err(format!("unsafe ledger path: {rel}"));
+    }
+    match crate::utils::fs::read_regular_to_string(&project_root.join(rel)).await {
         Ok(c) => Ok(Some(c)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read {rel}: {e}")),
@@ -99,9 +102,12 @@ async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, Stri
 }
 
 async fn write_rel(project_root: &Path, rel: &str, content: &str) -> Result<(), String> {
-    tokio::fs::write(project_root.join(rel), content)
-        .await
-        .map_err(|e| format!("write {rel}: {e}"))
+    crate::utils::fs::atomic_write_bytes_preserving_mode(
+        &project_root.join(rel),
+        content.as_bytes(),
+    )
+    .await
+    .map_err(|e| format!("write {rel}: {e}"))
 }
 
 /// Files the unwind has decided but not yet written: `Some(content)` to
@@ -129,6 +135,9 @@ async fn staged_read(
 /// remaining way to stop mid-set, and it surfaces as `Err` with the write
 /// already reported by path.
 async fn flush_staged(project_root: &Path, staged: &Staged) -> Result<(), String> {
+    for rel in staged.keys() {
+        super::replay::validate_write_path(project_root, rel).await?;
+    }
     for (rel, pending) in staged {
         let Some(content) = pending else {
             let path = project_root.join(rel);
@@ -1106,6 +1115,79 @@ mod tests {
         );
         assert!(state.records.is_empty(), "record dropped");
         assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    #[tokio::test]
+    async fn cargo_revert_refuses_escaping_ledger_path_before_writing() {
+        let (tmp, mut state) = redirected_fixture().await;
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("Cargo.lock");
+        let hosted = std::fs::read(tmp.path().join("Cargo.lock")).unwrap();
+        std::fs::write(&external, &hosted).unwrap();
+        for edit in &mut state.edits {
+            if edit.path == "Cargo.lock" {
+                edit.path = external.to_string_lossy().into_owned();
+            }
+        }
+        let ledger_before = serde_json::to_value(&state).unwrap();
+        let manifest_before = std::fs::read(tmp.path().join("Cargo.toml")).unwrap();
+
+        let error = revert_cargo_redirect_purl(tmp.path(), &mut state, PURL, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("unsafe ledger path"), "{error}");
+        assert_eq!(std::fs::read(external).unwrap(), hosted);
+        assert_eq!(
+            std::fs::read(tmp.path().join("Cargo.toml")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(serde_json::to_value(&state).unwrap(), ledger_before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_revert_preserves_mode_and_hardlinked_original() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, mut state) = redirected_fixture().await;
+        let manifest = tmp.path().join("Cargo.toml");
+        let sibling = tmp.path().join("original.toml");
+        let hosted = std::fs::read(&manifest).unwrap();
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&manifest, &sibling).unwrap();
+
+        revert_cargo_redirect_purl(tmp.path(), &mut state, PURL, false)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(sibling).unwrap(), hosted);
+        assert_eq!(
+            std::fs::metadata(manifest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_revert_refuses_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tmp, mut state) = redirected_fixture().await;
+        let lock = tmp.path().join("Cargo.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let path = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            revert_cargo_redirect_purl(tmp.path(), &mut state, PURL, false),
+        )
+        .await;
+        let Ok(result) = result else {
+            // Release a regressed blocking reader before failing the test.
+            let _ = std::fs::OpenOptions::new().write(true).open(&lock);
+            panic!("rollback must not block on a FIFO");
+        };
+        assert!(result.unwrap_err().contains("not a regular file"));
+        assert!(!state.edits.is_empty());
     }
 
     #[tokio::test]

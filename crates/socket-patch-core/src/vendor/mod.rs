@@ -107,6 +107,7 @@ use crate::patch::apply::{
     apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
     VerifyStatus,
 };
+use crate::utils::fs::read_regular_to_string_sync as read_regular_file_to_string;
 use crate::utils::purl::strip_purl_qualifiers;
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
@@ -124,39 +125,6 @@ impl VendorWarning {
             detail: detail.into(),
         }
     }
-}
-
-/// Read a UTF-8 file, requiring a regular file — the sync twin of
-/// [`crate::utils::fs::open_regular_file`] for the advisory probe below.
-/// The probe runs unconditionally at envelope-finalize time on every
-/// vendor / scan --vendor run, and a plain `open(2)` of a FIFO planted at
-/// `yarn.lock` or `package.json` waits for a writer that may never come —
-/// wedging the whole run after all the real work already happened.
-/// `O_NONBLOCK` makes the open return immediately; the handle-based
-/// `is_file` check then rejects FIFOs/devices/directories so the probe
-/// degrades to its unreadable-file behavior.
-fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    let mut s = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut s)?;
-    Ok(s)
 }
 
 /// Advisory probe: is this project one `yarn install` away from silently
@@ -401,7 +369,7 @@ pub async fn harvest_artifact_blobs(
     }
 
     for (purl, record) in manifest_patches {
-        let needed: HashSet<&str> = record
+        let mut needed: HashSet<&str> = record
             .files
             .values()
             .map(|f| f.after_hash.as_str())
@@ -435,8 +403,11 @@ pub async fn harvest_artifact_blobs(
             if let Ok(map) = crate::patch::package::read_archive_to_map(&artifact) {
                 for bytes in map.into_values() {
                     let h = compute_git_sha256_from_bytes(&bytes);
-                    if needed.contains(h.as_str()) {
+                    if needed.remove(h.as_str()) {
                         out.insert(h, bytes);
+                        if needed.is_empty() {
+                            break;
+                        }
                     }
                 }
             }
@@ -493,8 +464,11 @@ pub async fn harvest_artifact_blobs(
                     continue;
                 }
                 let h = compute_git_sha256_from_bytes(&content);
-                if needed.contains(h.as_str()) {
+                if needed.remove(h.as_str()) {
                     out.insert(h, content);
+                    if needed.is_empty() {
+                        break;
+                    }
                 }
             }
             continue;
@@ -1394,7 +1368,9 @@ mod harvest_tests {
         let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "a corrupt zip-shaped artifact contributes nothing"
         );
     }
@@ -1436,7 +1412,9 @@ mod harvest_tests {
         let (k, r) = record("pkg:npm/left-pad@1.3.0", UUID, "package/index.js", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an un-vendored record must not harvest another package's artifact"
         );
     }
@@ -1455,7 +1433,9 @@ mod harvest_tests {
         let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an unreadable ledger contributes nothing"
         );
     }
@@ -1474,7 +1454,9 @@ mod harvest_tests {
         r.files.get_mut("package/index.js").unwrap().after_hash = String::new();
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "a deletion-only record needs no blobs, even with a readable artifact"
         );
     }
@@ -1525,16 +1507,14 @@ mod harvest_tests {
         std::fs::create_dir_all(tmp.path().join(&rel)).unwrap();
         write_ledger(tmp.path(), purl, UUID, &rel);
         // <artifact>/../../outside.rs resolves here:
-        std::fs::write(
-            tmp.path().join(".socket/vendor/cargo/outside.rs"),
-            PATCHED,
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".socket/vendor/cargo/outside.rs"), PATCHED).unwrap();
 
         let (k, r) = record(purl, UUID, "../../outside.rs", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an escaping record key must never be resolved against the artifact dir"
         );
     }
@@ -1703,10 +1683,7 @@ mod berry_migration_risk_tests {
     /// `open(2)` forever — and the probe runs unconditionally at
     /// envelope-finalize time on EVERY vendor / scan --vendor run.
     #[cfg(unix)]
-    fn probe_with_timeout(
-        root: &Path,
-        fifo: &Path,
-    ) -> Option<VendorWarning> {
+    fn probe_with_timeout(root: &Path, fifo: &Path) -> Option<VendorWarning> {
         let root = root.to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

@@ -236,12 +236,17 @@ pub(super) fn replace_fragment(
     orig: Option<&str>,
 ) -> Option<String> {
     let (new, orig) = (new?, orig?);
-    text.contains(new).then(|| text.replacen(new, orig, 1))
+    let start = text.find(new)?;
+    let mut out = String::with_capacity(text.len() - new.len() + orig.len());
+    out.push_str(&text[..start]);
+    out.push_str(orig);
+    out.push_str(&text[start + new.len()..]);
+    Some(out)
 }
 
 /// Remove the first exact occurrence of `needle`; `None` when absent.
 pub(super) fn remove_substring(text: &str, needle: &str) -> Option<String> {
-    text.contains(needle).then(|| text.replacen(needle, "", 1))
+    replace_fragment(text, Some(needle), Some(""))
 }
 
 /// Remove the first line that equals `line` exactly; `None` when absent.
@@ -509,7 +514,8 @@ mod tests {
         // mixed-ending file, so the removal helpers must never normalize:
         // every byte outside the removed segment survives verbatim (the
         // go_mod/go_sum CRLF-churn class).
-        let wired = "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\nfoo = { path = \"w.whl\" }\n";
+        let wired =
+            "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\nfoo = { path = \"w.whl\" }\n";
         let after = remove_exact_line(wired, "foo = { path = \"w.whl\" }").unwrap();
         assert_eq!(after, "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\n");
         assert_eq!(

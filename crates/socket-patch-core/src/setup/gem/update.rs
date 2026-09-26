@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+#[cfg(test)]
 use tokio::fs;
 
 use super::version::{probe_bundler, unsupported_bundler_message, BundlerProbe};
@@ -166,7 +167,7 @@ fn gemfile_remove(content: &str) -> Option<String> {
 /// `kind = "gemfile"`.
 async fn edit_gemfile_add(gemfile: &Path, dry_run: bool) -> GemEditResult {
     let result = async {
-        let content = fs::read_to_string(gemfile)
+        let content = super::read_regular_to_string(gemfile)
             .await
             .map_err(|e| e.to_string())?;
         match gemfile_add(&content) {
@@ -195,7 +196,7 @@ async fn edit_gemfile_add(gemfile: &Path, dry_run: bool) -> GemEditResult {
 /// `AlreadyConfigured`); a missing Gemfile is a no-op.
 async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
     let result = async {
-        let content = match fs::read_to_string(gemfile).await {
+        let content = match super::read_regular_to_string(gemfile).await {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.to_string()),
@@ -254,7 +255,7 @@ pub async fn add_plugin_directive(project: &BundlerProject, dry_run: bool) -> Ve
         // An ALREADY-wired project (wired before the floor existed, or on
         // another machine) gets the recovery path by name — "Not wiring this
         // project" alone would be misleading when the wiring is the problem.
-        if let Ok(content) = fs::read_to_string(&project.gemfile).await {
+        if let Ok(content) = super::read_regular_to_string(&project.gemfile).await {
             if is_plugin_directive_present(&content) {
                 message.push_str(
                     ". This project is already wired: run `socket-patch setup --remove` \
@@ -1170,11 +1171,8 @@ mod tests {
         // runtime waits for on shutdown; connect a writer to release it so
         // the test can FAIL instead of hanging the whole suite.
         let deadline = std::time::Duration::from_secs(5);
-        let Ok(results) = tokio::time::timeout(
-            deadline,
-            remove_plugin_directive_at(&project, None, false),
-        )
-        .await
+        let Ok(results) =
+            tokio::time::timeout(deadline, remove_plugin_directive_at(&project, None, false)).await
         else {
             let _ = std::fs::OpenOptions::new().write(true).open(&index);
             panic!("remove must complete promptly with a FIFO index");

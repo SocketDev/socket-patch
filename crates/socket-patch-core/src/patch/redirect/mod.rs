@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -274,31 +275,27 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     if pdm_drives {
         pdm::rewrite(files, overrides, &mut result);
     }
-    let usable: Vec<_> = overrides
-        .iter()
-        .filter(|dep| !result.refused_pdm_uuids.contains(&dep.patch_uuid))
-        .cloned()
-        .collect();
-    let overrides = if pdm_drives {
-        usable.as_slice()
-    } else {
-        overrides
-    };
+    let mut usable = std::borrow::Cow::Borrowed(overrides);
+    if !result.refused_pdm_uuids.is_empty() {
+        usable
+            .to_mut()
+            .retain(|dep| !result.refused_pdm_uuids.contains(&dep.patch_uuid));
+    }
     // Pipenv next: a CONFLICT in a live Pipfile.lock vetoes the sibling pypi
     // rewriters too (see `pipenv::rewrite`).
-    pipenv::rewrite(files, overrides, pipenv_major, &mut result);
-    let overrides: Vec<_> = overrides
-        .iter()
-        .filter(|dep| !result.refused_pipenv_uuids.contains(&dep.patch_uuid))
-        .cloned()
-        .collect();
-    let overrides = overrides.as_slice();
+    pipenv::rewrite(files, &usable, pipenv_major, &mut result);
+    if !result.refused_pipenv_uuids.is_empty() {
+        usable
+            .to_mut()
+            .retain(|dep| !result.refused_pipenv_uuids.contains(&dep.patch_uuid));
+    }
+    let overrides = usable.as_ref();
     rewrite_npm_lock(files, overrides, &mut result);
     rewrite_pnpm_lock(files, overrides, &mut result);
     rewrite_yarn_classic(files, overrides, &mut result);
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
-    rewrite_pypi_requirements(files, overrides, &mut result);
+    requirements::rewrite(files, overrides, &mut result);
     rewrite_hatch(files, overrides, &mut result);
     rewrite_uv_lock(files, overrides, python_metadata, &mut result);
     poetry::rewrite_poetry(files, overrides, &mut result);
@@ -643,14 +640,6 @@ fn rewrite_npm_v2_deps(
 }
 
 // ── pip requirements.txt ────────────────────────────────────────────────────
-fn rewrite_pypi_requirements(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
-    requirements::rewrite(files, overrides, result);
-}
-
 // ── cargo (Cargo.toml + .cargo/config.toml + Cargo.lock) ─────────────────────
 //
 // TRANSACTIONAL per dependency: a dep is redirected ONLY if its Cargo.toml pin
@@ -1075,20 +1064,27 @@ fn plan_cargo_toml(
     reg: &str,
 ) -> Result<CargoTomlPlan, CargoTomlPlanError> {
     let lines: Vec<&str> = content.split('\n').collect();
-    let header_re =
-        Regex::new(r"^\[([^\]]+)\]\s*(?:#.*)?$").expect("static section-header regex is valid");
-    let package_re =
-        Regex::new(r#"\bpackage\s*=\s*"([^"]*)""#).expect("static package-key regex is valid");
-    let registry_val_re =
-        Regex::new(r#"\bregistry\s*=\s*"([^"]*)""#).expect("static registry-value regex is valid");
-    let registry_key_re =
-        Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid");
-    let registry_index_re =
-        Regex::new(r"\bregistry-index\s*=").expect("static registry-index probe regex is valid");
-    let workspace_key_re =
-        Regex::new(r"\bworkspace\s*=").expect("static workspace-key probe regex is valid");
-    let path_git_re =
-        Regex::new(r"\b(?:path|git)\s*=").expect("static path/git probe regex is valid");
+    static HEADER_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^\[([^\]]+)\]\s*(?:#.*)?$").expect("static section-header regex is valid")
+    });
+    static PACKAGE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"\bpackage\s*=\s*"([^"]*)""#).expect("static package-key regex is valid")
+    });
+    static REGISTRY_VAL_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"\bregistry\s*=\s*"([^"]*)""#).expect("static registry-value regex is valid")
+    });
+    static REGISTRY_KEY_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid")
+    });
+    static REGISTRY_INDEX_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\bregistry-index\s*=").expect("static registry-index probe regex is valid")
+    });
+    static WORKSPACE_KEY_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\bworkspace\s*=").expect("static workspace-key probe regex is valid")
+    });
+    static PATH_GIT_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\b(?:path|git)\s*=").expect("static path/git probe regex is valid")
+    });
 
     // A pending occurrence: what was found, resolved to an action in pass 2
     // (workspace-inheriting entries need the whole file scanned first).
@@ -1109,10 +1105,10 @@ fn plan_cargo_toml(
             continue;
         }
         if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            section = match header_re.captures(trimmed) {
+            section = match HEADER_RE.captures(trimmed) {
                 Some(c) => classify_cargo_section(
                     c.get(1)
-                        .expect("header_re always captures group 1 (section name)")
+                        .expect("HEADER_RE always captures group 1 (section name)")
                         .as_str(),
                 ),
                 None => CargoTomlSection::Other,
@@ -1183,7 +1179,7 @@ fn plan_cargo_toml(
                         }
                     } else if is_socket_patch_registry_name(&value) {
                         let old_line = lines[line_idx];
-                        let new_text = registry_val_re
+                        let new_text = REGISTRY_VAL_RE
                             .replace(old_line, format!("registry = \"{reg}\"").as_str())
                             .into_owned();
                         pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
@@ -1231,7 +1227,7 @@ fn plan_cargo_toml(
                     ));
                 }
             } else if sub.as_deref() == Some("package")
-                && package_re
+                && PACKAGE_RE
                     .captures(trimmed)
                     .is_some_and(|c| &c[1] == crate_name)
             {
@@ -1258,7 +1254,7 @@ fn plan_cargo_toml(
                 continue;
             };
             let inner = &value[1..close];
-            let package_val = package_re.captures(inner).map(|c| c[1].to_string());
+            let package_val = PACKAGE_RE.captures(inner).map(|c| c[1].to_string());
             let is_ours = match &package_val {
                 Some(p) => p == crate_name,
                 None => key == crate_name,
@@ -1266,13 +1262,13 @@ fn plan_cargo_toml(
             if !is_ours {
                 continue;
             }
-            if workspace_key_re.is_match(inner) {
+            if WORKSPACE_KEY_RE.is_match(inner) {
                 pending.push(Pending::NeedsWorkspacePin);
-            } else if path_git_re.is_match(inner) {
+            } else if PATH_GIT_RE.is_match(inner) {
                 pending.push(Pending::Refuse(
                     "declared as a path/git dependency".to_string(),
                 ));
-            } else if let Some(c) = registry_val_re.captures(inner) {
+            } else if let Some(c) = REGISTRY_VAL_RE.captures(inner) {
                 let value = c[1].to_string();
                 if value == reg {
                     pending.push(Pending::Action(CargoTomlAction::Already));
@@ -1280,7 +1276,7 @@ fn plan_cargo_toml(
                         workspace_pinned = true;
                     }
                 } else if is_socket_patch_registry_name(&value) {
-                    let new_text = registry_val_re
+                    let new_text = REGISTRY_VAL_RE
                         .replace(raw, format!("registry = \"{reg}\"").as_str())
                         .into_owned();
                     pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
@@ -1295,7 +1291,7 @@ fn plan_cargo_toml(
                         "pinned to another registry (\"{value}\")"
                     )));
                 }
-            } else if registry_key_re.is_match(inner) || registry_index_re.is_match(inner) {
+            } else if REGISTRY_KEY_RE.is_match(inner) || REGISTRY_INDEX_RE.is_match(inner) {
                 pending.push(Pending::Refuse("pinned to another registry".to_string()));
             } else {
                 // Rebuild the line: everything through `{`, the trimmed
@@ -1476,25 +1472,29 @@ fn plan_cargo_lock(
     }
     let original = content[block_start..block_end].to_string();
     let mut body = content[body_start..block_end].to_string();
-    let source_re =
-        Regex::new(r#"(?m)^source = "[^"]*"$"#).expect("static lock source-line regex is valid");
-    if source_re.is_match(&body) {
-        body = source_re
+    static SOURCE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?m)^source = "[^"]*"$"#).expect("static lock source-line regex is valid")
+    });
+    if SOURCE_RE.is_match(&body) {
+        body = SOURCE_RE
             .replace(&body, format!("source = \"{index_url}\"").as_str())
             .to_string();
     } else {
         body = format!("source = \"{index_url}\"\n{body}");
     }
-    let checksum_re = Regex::new(r#"(?m)^checksum = "[^"]*"$"#)
-        .expect("static lock checksum-line regex is valid");
-    if checksum_re.is_match(&body) {
-        body = checksum_re
+    static CHECKSUM_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?m)^checksum = "[^"]*"$"#).expect("static lock checksum-line regex is valid")
+    });
+    if CHECKSUM_RE.is_match(&body) {
+        body = CHECKSUM_RE
             .replace(&body, format!("checksum = \"{cksum}\"").as_str())
             .to_string();
     } else {
-        let after_source = Regex::new(r#"(?m)^(source = "[^"]*"\n)"#)
-            .expect("static source-line anchor regex is valid");
-        body = after_source
+        static AFTER_SOURCE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"(?m)^(source = "[^"]*"\n)"#)
+                .expect("static source-line anchor regex is valid")
+        });
+        body = AFTER_SOURCE
             .replace(&body, format!("${{1}}checksum = \"{cksum}\"\n").as_str())
             .to_string();
     }
@@ -3373,6 +3373,37 @@ fn rewrite_nuget(
             .nuget_id_lower
             .clone()
             .unwrap_or_else(|| dep.name.to_lowercase());
+        let resolved = ov
+            .identifiers
+            .nuget_version_norm
+            .clone()
+            .unwrap_or_else(|| crate::vendor::nuget_feed::normalize_nuget_version(&dep.version));
+        // Source mappings select an ID across every target framework. A
+        // single-version patch cannot replace a different framework's version.
+        let mismatched_version = lock
+            .as_ref()
+            .and_then(|value| value.get("dependencies"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|frameworks| frameworks.values())
+            .filter_map(Value::as_object)
+            .flat_map(|entries| entries.iter())
+            .filter(|(id, _)| id.eq_ignore_ascii_case(&id_lower))
+            .filter_map(|(_, entry)| entry.get("resolved").and_then(Value::as_str))
+            .find(|version| {
+                crate::vendor::nuget_feed::normalize_nuget_version(version) != resolved
+            });
+        if let Some(version) = mismatched_version {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_version_mismatch".into(),
+                detail: format!(
+                    "{} resolves to {version} in packages.lock.json, but this patch targets \
+                     {resolved}; redirect skipped because source mappings apply to every framework",
+                    dep.name
+                ),
+            });
+            continue;
+        }
 
         if !config.contains(&format!("key=\"{reg}\"")) {
             // A failed insert skips the WHOLE dep (no edit record, no lock
@@ -3413,11 +3444,6 @@ fn rewrite_nuget(
                         for (id, entry) in fw.iter_mut() {
                             if id.to_lowercase() == id_lower {
                                 if let Some(obj) = entry.as_object_mut() {
-                                    let resolved = ov
-                                        .identifiers
-                                        .nuget_version_norm
-                                        .clone()
-                                        .unwrap_or_else(|| dep.version.clone());
                                     // Already redirected (re-run): no edit.
                                     if obj.get("resolved").and_then(Value::as_str)
                                         == Some(resolved.as_str())
@@ -4371,13 +4397,11 @@ struct MavenDependencyMatch {
 /// Inner-text byte range of the first `<tag>…</tag>` inside `pom[from, to)`, or
 /// None. Offsets are into the FULL `pom`.
 fn maven_tag_inner_range(pom: &str, tag: &str, from: usize, to: usize) -> Option<(usize, usize)> {
-    let re = Regex::new(&format!("(?s)<{tag}>(.*?)</{tag}>"))
-        .expect("tag regex is valid — callers pass literal tag names");
-    let caps = re.captures(&pom[from..to])?;
-    let inner = caps
-        .get(1)
-        .expect("tag regex always captures group 1 (inner text)");
-    Some((from + inner.start(), from + inner.end()))
+    let scope = &pom[from..to];
+    let open = format!("<{tag}>");
+    let start = scope.find(&open)? + open.len();
+    let end = start + scope[start..].find(&format!("</{tag}>"))?;
+    Some((from + start, from + end))
 }
 
 /// Trimmed text of the first `<tag>…</tag>` inside `pom[from, to)`, or None.
@@ -4398,10 +4422,12 @@ fn find_maven_dependency_matches(
     group_id: &str,
     artifact_id: &str,
 ) -> Vec<MavenDependencyMatch> {
-    let dep_re = Regex::new(r"(?s)<dependency\b[^>]*>.*?</dependency>")
-        .expect("static dependency-block regex is valid");
+    static DEP_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?s)<dependency\b[^>]*>.*?</dependency>")
+            .expect("static dependency-block regex is valid")
+    });
     let mut matches = vec![];
-    for m in dep_re.find_iter(pom) {
+    for m in DEP_RE.find_iter(pom) {
         let (dep_open, dep_close) = (m.start(), m.end());
         let g = maven_tag_text_in(pom, "groupId", dep_open, dep_close);
         let a = maven_tag_text_in(pom, "artifactId", dep_open, dep_close);
@@ -4627,12 +4653,9 @@ fn rewrite_maven_pom(
             .collect();
         to_rewrite.sort_by(|a, b| b.0.cmp(&a.0));
         for (start, end) in &to_rewrite {
-            let mut rebuilt = pom
-                .as_ref()
+            pom.as_mut()
                 .expect("pom is Some — the is_none() guard above continues")
-                .clone();
-            rebuilt.replace_range(*start..*end, &suffixed_version);
-            pom = Some(rebuilt);
+                .replace_range(*start..*end, &suffixed_version);
             pom_changed = true;
             pin_landed = true;
             result.edits.push(FileEdit {
@@ -12714,6 +12737,49 @@ packages:
     /// DEFAULT config from scratch: nuget.org source kept, socket source
     /// added, socket mapping first, `*` catch-all fanned to nuget.org — and
     /// the lock is still re-pinned in the same run.
+    #[test]
+    fn nuget_refuses_conflicting_framework_versions() {
+        let lock = json!({
+            "version": 1,
+            "dependencies": {
+                "net8.0": { "Newtonsoft.Json": {
+                    "resolved": "13.0.3", "contentHash": "ORIGINAL"
+                }},
+                "net6.0": { "Newtonsoft.Json": {
+                    "resolved": "12.0.3", "contentHash": "OTHER"
+                }}
+            }
+        });
+        let files = BTreeMap::from([("packages.lock.json".into(), lock.to_string())]);
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(
+            r.files.is_empty(),
+            "neither source mapping nor lock may change"
+        );
+        assert!(r.edits.is_empty());
+        assert!(warning_codes(&r).contains(&"redirect_nuget_version_mismatch"));
+    }
+
+    #[test]
+    fn nuget_accepts_equivalent_normalized_framework_versions() {
+        let lock = json!({
+            "version": 1,
+            "dependencies": {
+                "net8.0": { "Newtonsoft.Json": {
+                    "resolved": "13.0.3.0", "contentHash": "ORIGINAL"
+                }}
+            }
+        });
+        let files = BTreeMap::from([("packages.lock.json".into(), lock.to_string())]);
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let changed: Value = serde_json::from_str(&r.files["packages.lock.json"]).unwrap();
+        assert_eq!(
+            changed["dependencies"]["net8.0"]["Newtonsoft.Json"]["resolved"],
+            "13.0.3"
+        );
+        assert!(r.warnings.is_empty());
+    }
+
     #[test]
     fn nuget_missing_config_authors_default_and_pins_lock() {
         let mut files = BTreeMap::new();

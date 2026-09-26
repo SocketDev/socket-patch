@@ -219,30 +219,52 @@ impl ReplayOutcome {
 /// Ledger paths are written by this tool as plain repo-relative slash
 /// paths; anything else (absolute, `..`, empty) refuses fail-closed
 /// rather than letting a tampered ledger write outside the project.
-fn safe_rel_path(path: &str) -> bool {
+pub(super) fn safe_rel_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
-        && !path.starts_with('\\')
+        && !path.contains('\\')
         && !path.contains(':')
-        && !path.split(['/', '\\']).any(|c| c == "..")
+        && !path.contains('\0')
+        && !path.split('/').any(|c| c == "..")
+}
+
+/// Validate every destination component before flushing any file in a group.
+/// The project root may itself be a resolved workspace symlink; ledger paths
+/// beneath it must not traverse symlinks into another tree.
+pub(super) async fn validate_write_path(project_root: &Path, rel: &str) -> Result<(), String> {
+    if !safe_rel_path(rel) {
+        return Err(format!("unsafe ledger path: {rel}"));
+    }
+    let mut path = project_root.to_path_buf();
+    let mut segments = rel.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        path.push(segment);
+        let last = segments.peek().is_none();
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if last && !meta.is_file() => {
+                return Err(format!("{rel} is not a regular file"));
+            }
+            Ok(meta) if !last && !meta.is_dir() => {
+                return Err(format!("{rel} has a non-directory or symlink ancestor"));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("stat {rel}: {e}")),
+        }
+    }
+    Ok(())
 }
 
 /// FIFO-guarded read: a planted FIFO squatting a lockfile path must fail
 /// fast (`InvalidInput`) instead of wedging the replay on a blocking open
 /// — the same posture as every other raw read in the patch engine.
 async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, String> {
-    use tokio::io::AsyncReadExt;
     let path = project_root.join(rel);
-    let (mut file, _) = match crate::utils::fs::open_regular_file(&path).await {
-        Ok(pair) => pair,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("read {rel}: {e}")),
-    };
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .await
-        .map_err(|e| format!("read {rel}: {e}"))?;
-    Ok(Some(content))
+    match crate::utils::fs::read_regular_to_string(&path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {rel}: {e}")),
+    }
 }
 
 /// Files the group's unwind has decided but not yet written:
@@ -704,19 +726,23 @@ pub async fn revert_remaining_redirect_edits(
         // some files may already have landed (the same residual exposure
         // the per-purl reverts document) — and keeps its ledger entries.
         if !dry_run {
+            for rel in staged.keys().chain(staged_bytes.keys()) {
+                if let Err(error) = validate_write_path(project_root, rel).await {
+                    refuse(error, &mut outcome);
+                    refused_groups.insert(group);
+                    continue 'group;
+                }
+            }
             for (rel, pending) in &staged {
                 let path = project_root.join(rel);
-                // FIFO/device guard on the write side too: writing to a
-                // planted FIFO blocks forever. Refuse the group instead.
-                if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
-                    if !meta.is_file() {
-                        refuse(format!("{rel} is not a regular file"), &mut outcome);
-                        refused_groups.insert(group);
-                        continue 'group;
-                    }
-                }
                 let write_result = match pending {
-                    Some(content) => tokio::fs::write(&path, content).await,
+                    Some(content) => {
+                        crate::utils::fs::atomic_write_bytes_preserving_mode(
+                            &path,
+                            content.as_bytes(),
+                        )
+                        .await
+                    }
                     None => match tokio::fs::remove_file(&path).await {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                         other => other,
@@ -731,14 +757,9 @@ pub async fn revert_remaining_redirect_edits(
             // Commit native binary package restores atomically.
             for (rel, bytes) in &staged_bytes {
                 let path = project_root.join(rel);
-                if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
-                    if !meta.is_file() {
-                        refuse(format!("{rel} is not a regular file"), &mut outcome);
-                        refused_groups.insert(group);
-                        continue 'group;
-                    }
-                }
-                if let Err(e) = crate::utils::fs::atomic_write_bytes(&path, bytes).await {
+                if let Err(e) =
+                    crate::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
+                {
                     refuse(format!("write {rel}: {e}"), &mut outcome);
                     refused_groups.insert(group);
                     continue 'group;
@@ -754,11 +775,14 @@ pub async fn revert_remaining_redirect_edits(
     outcome.warnings.append(&mut pending_warnings);
 
     if !dry_run {
-        // Drop replayed edits (reverse index order keeps indices valid).
-        for &idx in drop_indices.iter().rev() {
-            state.edits.remove(idx);
-            outcome.dropped_edits += 1;
-        }
+        // Compact once instead of shifting the tail after each removal.
+        outcome.dropped_edits = drop_indices.len();
+        let mut idx = 0;
+        state.edits.retain(|_| {
+            let keep = !drop_indices.contains(&idx);
+            idx += 1;
+            keep
+        });
         // Drop each record whose every possible group ended clean.
         let record_purls: Vec<String> = state.records.keys().cloned().collect();
         for purl in record_purls {
@@ -1756,7 +1780,13 @@ mod tests {
     #[tokio::test]
     async fn unsafe_ledger_path_refuses() {
         let dir = TempDir::new().unwrap();
-        for bad in ["/etc/passwd", "../outside", "a/../../b", "c:\\windows\\x"] {
+        for bad in [
+            "/etc/passwd",
+            "../outside",
+            "a/../../b",
+            "c:\\windows\\x",
+            "nested\\Cargo.lock",
+        ] {
             let mut state = state_with(
                 vec![edit(
                     bad,
@@ -2273,6 +2303,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn symlinked_ancestor_refuses_before_writing_any_group_file() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let patched = "https://patch.example/a\n";
+        write(dir.path(), "a.lock", patched).await;
+        write(outside.path(), "composer.lock", patched).await;
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("nested")).unwrap();
+        let mut state = state_with(
+            ["a.lock", "nested/composer.lock"]
+                .into_iter()
+                .map(|path| {
+                    edit(
+                        path,
+                        "redirect_composer_dist",
+                        "rewritten",
+                        Some("https://upstream.example/a"),
+                        Some("https://patch.example/a"),
+                    )
+                })
+                .collect(),
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1);
+        assert_eq!(read(dir.path(), "a.lock").await, patched);
+        assert_eq!(read(outside.path(), "composer.lock").await, patched);
+        assert_eq!(state.edits.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn symlinked_lockfile_reads_fine_but_refuses_at_flush() {
         // open_regular_file follows the symlink at read time (open+fstat),
         // but the flush-side symlink_metadata guard does not — a symlinked
@@ -2319,10 +2380,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         write(dir.path(), "composer.lock", "https://patch.example/a\n").await;
-        let path = dir.path().join("composer.lock");
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o444);
-        std::fs::set_permissions(&path, perms).unwrap();
+        // Atomic replacement needs directory write permission, even when the
+        // destination itself is writable. Block staging, not the old inode.
+        let original_perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut state = state_with(
             vec![edit(
                 "composer.lock",
@@ -2334,6 +2395,7 @@ mod tests {
             &[],
         );
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        std::fs::set_permissions(dir.path(), original_perms).unwrap();
         assert_eq!(out.refusals.len(), 1, "{out:?}");
         assert!(
             out.refusals[0].reason.starts_with("write composer.lock:"),

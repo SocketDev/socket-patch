@@ -904,24 +904,18 @@ fn write_package_archive(packages: &Path, uuid: &str, entries: &[(&str, &[u8])])
         .unwrap();
 }
 
-/// A cached `.socket/packages/<uuid>.tar.gz` is a complete source for the
-/// patch: the same tree applies fine under `--offline`. Going online must
-/// not make it FAIL — but the stage step used to bail whenever the
-/// (default) diff fetch and the blob fallback both reported failures,
-/// without checking whether any patch was actually left without a source.
-/// A server that serves no archives and no longer has the blob (GC'd,
-/// entitlement change, dead network) therefore turned a fully satisfiable
-/// apply into a whole-run abort.
+/// A cached `.socket/packages/<uuid>.tar.gz` supplies the whole patch.
+/// Online apply must reuse it without fetching redundant diff or blob sources.
 #[tokio::test]
-async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
+async fn apply_online_reuses_cached_package_archive_without_downloads() {
     let before = b"pkgcache before\n";
     let after = b"pkgcache after\n";
     let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
     let uuid = "44444444-4444-4444-8444-444444444444";
 
-    // Nothing is served: diff, package and blob endpoints all 404 (wiremock
-    // default for unmounted routes), i.e. every download attempt fails.
+    // Nothing is served: all requests would fail, but the complete local
+    // archive means apply should not need any downloads.
     let mock = MockServer::start().await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -946,9 +940,7 @@ async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
     assert_eq!(
         code, 0,
-        "a cached package archive is a usable source; failed downloads for \
-         artifacts we don't need must not abort the run; \
-         stdout={stdout}\nstderr={stderr}"
+        "a cached package archive must supply the patch; stdout={stdout}\nstderr={stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
@@ -961,13 +953,10 @@ async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
     let content = std::fs::read(tmp.path().join("node_modules/pkgcache/index.js")).unwrap();
     assert_eq!(content, after, "file must carry the patched content");
 
-    // Keep the test honest: the downloads really were attempted and really
-    // did fail (otherwise this would pass for the wrong reason).
     let requests = mock.received_requests().await.unwrap_or_default();
-    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
     assert!(
-        requests.iter().any(|r| r.url.path() == blob_path),
-        "the (404ing) blob fetch must have been attempted; got {:?}",
+        requests.iter().all(|r| !r.url.path().contains("/patches/")),
+        "a complete cached archive must avoid redundant downloads; got {:?}",
         requests
             .iter()
             .map(|r| r.url.path().to_string())
@@ -1075,10 +1064,7 @@ async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
         v["summary"]["applied"], 1,
         "the drifted nested copy must be warn-overwritten.\nstdout={v:#}"
     );
-    assert_eq!(
-        v["summary"]["failed"], 0,
-        "no copy may fail.\nstdout={v:#}"
-    );
+    assert_eq!(v["summary"]["failed"], 0, "no copy may fail.\nstdout={v:#}");
 
     // The nested copy's blob was fetched on demand…
     let requests = mock.received_requests().await.unwrap();

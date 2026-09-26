@@ -391,7 +391,10 @@ pub async fn run(args: VendorArgs) -> i32 {
     // `--revert` derives everything from state.json + the vendor tree; it
     // must work after the manifest was deleted. Plain vendor needs the
     // manifest and exits clean without one (same contract as apply).
-    if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
+    if !args.revert
+        && matches!(tokio::fs::metadata(&manifest_path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
         if args.common.json {
             let mut env = Envelope::new(Command::Vendor);
             env.status = Status::NoManifest;
@@ -549,8 +552,16 @@ async fn run_vendor(
     // Vendor stages patch content IN MEMORY: existing .socket artifacts are
     // read in place, missing content is fetched per patch — vendoring never
     // writes blobs or temp files (the committed artifact is the patch).
+    let mut source_manifest = manifest.clone();
+    source_manifest.patches.retain(|purl, _| {
+        vendor::is_vendorable(purl)
+            && Ecosystem::from_purl(purl)
+                .is_some_and(|eco| ecosystem_in_scope(common, eco.cli_name()))
+    });
     let staged =
-        match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
+        match stage_vendor_sources_in_memory(common, &source_manifest, socket_dir, &common.cwd)
+            .await
+        {
             MemStageOutcome::Ready(s) => s,
             MemStageOutcome::Unavailable => {
                 env.mark_error(EnvelopeError::new(
@@ -778,6 +789,14 @@ pub(crate) async fn vendor_records(
         return has_errors;
     }
 
+    let mut state = match load_state(&common.cwd).await {
+        Ok(s) => s,
+        Err(e) => {
+            env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
+            return true;
+        }
+    };
+
     let vendorable_partition: HashMap<Ecosystem, Vec<String>> = partitioned
         .into_iter()
         .map(|(eco, purls)| {
@@ -865,9 +884,8 @@ pub(crate) async fn vendor_records(
             // already-vendored purl with no installed copy (fresh clone)
             // stages from its own committed artifact, sha256-verified
             // against the ledger — offline-safe, no registry traffic.
-            let ledger = load_state(&common.cwd).await.unwrap_or_default();
             for purl in &missing {
-                let ledger_entry = lookup_entry(&ledger.entries, purl);
+                let ledger_entry = lookup_entry(&state.entries, purl);
                 if let Some(entry) = ledger_entry
                     .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
                 {
@@ -983,14 +1001,6 @@ pub(crate) async fn vendor_records(
     }
 
     let vendored_at = now_rfc3339();
-    let mut state = match load_state(&common.cwd).await {
-        Ok(s) => s,
-        Err(e) => {
-            env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
-            return true;
-        }
-    };
-
     // Bun vendored preflight (see `crate::commands::bun_preflight`), run
     // ONCE per run over the in-scope npm records and consulted per
     // candidate in the dispatch loop BEFORE the hosted→vendored takeover.
@@ -1818,12 +1828,11 @@ pub(crate) async fn run_vendor_gc(
     dry_run: bool,
 ) -> VendorGcSummary {
     let mut out = VendorGcSummary::default();
-    let mut state = match load_state(&common.cwd).await {
-        Ok(s) if !s.entries.is_empty() => s,
-        // No ledger (or unreadable): only the orphan sweep could apply, and
-        // without a trustworthy ledger it must not delete anything.
-        _ => return out,
-    };
+    // Probe only existence before locking. The read-modify-write snapshot
+    // must be loaded under the guard or it can overwrite a concurrent run.
+    if !common.cwd.join(vendor::VENDOR_STATE_REL).exists() {
+        return out;
+    }
 
     let socket_dir = manifest_path
         .parent()
@@ -1841,6 +1850,13 @@ pub(crate) async fn run_vendor_gc(
                 return out;
             }
         }
+    };
+
+    let mut state = match load_state(&common.cwd).await {
+        Ok(s) if !s.entries.is_empty() => s,
+        // No ledger (or unreadable): only the orphan sweep could apply, and
+        // without a trustworthy ledger it must not delete anything.
+        _ => return out,
     };
 
     // (a) manifest-dropped entries. Everything (a) touches is excluded from
@@ -1949,6 +1965,53 @@ pub(crate) async fn run_vendor_gc(
 mod dispatch_tests {
     use super::*;
     use socket_patch_core::vendor::VendorSource;
+
+    #[tokio::test]
+    async fn offline_vendor_ignores_sources_outside_ecosystem_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join(".socket/manifest.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let manifest: PatchManifest = serde_json::from_value(serde_json::json!({
+            "patches": { "pkg:npm/foo@1.0.0": {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)
+                }},
+                "vulnerabilities": {}, "description": "", "license": "MIT", "tier": "free"
+            }}
+        }))
+        .unwrap();
+        write_manifest(&manifest_path, &manifest).await.unwrap();
+        let args = VendorArgs {
+            common: GlobalArgs {
+                cwd: tmp.path().to_path_buf(),
+                ecosystems: Some(vec!["cargo".into()]),
+                offline: true,
+                dry_run: true,
+                json: true,
+                ..Default::default()
+            },
+            force: false,
+            revert: false,
+            vex: VexEmbedArgs::default(),
+        };
+        let service = VendorServiceConfig {
+            source: VendorSource::Build,
+            client: None,
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: true,
+        };
+        let mut env = Envelope::new(Command::Vendor);
+        assert_eq!(
+            run_vendor(&args, &manifest_path, &mut env, &service).await,
+            0
+        );
+        assert!(env.error.is_none(), "out-of-scope blobs are not required");
+        assert!(!tmp.path().join(".socket/blobs").exists());
+    }
 
     /// Fail-closed `--vendor-source=service` must not refuse maven at the
     /// dispatch gate: the maven backend has a full service path (prebuilt
@@ -2935,7 +2998,9 @@ mod gc_tests {
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join("requirements/base.txt"),
             format!(

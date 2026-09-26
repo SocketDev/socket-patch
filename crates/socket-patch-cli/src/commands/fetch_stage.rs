@@ -185,39 +185,21 @@ pub(crate) async fn stage_patch_sources(
         &missing_package_archives,
     );
 
-    if common.offline {
-        // Offline: bail only if some patch has no usable local source.
-        // Note: with `--force`, the patch pipeline can short-circuit
-        // verification on its own; we still surface the no-source
-        // diagnosis so the user runs `repair` before retrying.
-        if !no_source_purls.is_empty() {
-            report_offline_missing(common, &no_source_purls);
-            return Ok(StageOutcome::Unavailable);
-        }
-    }
-
-    // Decide what (if anything) needs downloading.
-    //
-    // The patch pipeline tries sources in the order package → diff → blob
-    // locally. We honor `--download-mode` for the primary fetch when there's
-    // actually a gap to close. Skip the archive fetch entirely when all file
-    // blobs are already present locally — the pipeline will succeed via the
-    // blob path, and the archive endpoints would just 404 (current server
-    // doesn't serve them yet).
-    let download_needed = !common.offline
-        && match download_mode {
-            DownloadMode::File => !missing_blobs.is_empty(),
-            DownloadMode::Diff if missing_blobs.is_empty() => false,
-            DownloadMode::Diff => !missing_diff_archives.is_empty(),
-        };
-
-    if !download_needed {
+    // Any complete local source satisfies the patch pipeline, independently
+    // of the preferred download mode. Downloading a second representation
+    // wastes requests and temp-file work (including in mixed blob/archive
+    // caches). Mismatched installed files get their full blobs on demand.
+    if no_source_purls.is_empty() {
         return Ok(StageOutcome::Ready(StagedSources {
             blobs: socket_blobs_path,
             diffs: socket_diffs_path,
             packages: socket_packages_path,
             _stage: None,
         }));
+    }
+    if common.offline {
+        report_offline_missing(common, &no_source_purls);
+        return Ok(StageOutcome::Unavailable);
     }
 
     // Stage a transient overlay tempdir that hardlinks every existing
@@ -639,14 +621,10 @@ mod tests {
         }
     }
 
-    /// A local package archive is a usable source (the pipeline's Strategy 1,
-    /// and exactly what the offline gate rules), so an online run whose
-    /// downloads all fail must still be Ready when the package archive covers
-    /// every patch. Regression: the failure gate used aggregate fetch
-    /// counters and never consulted package archives, so this cache state was
-    /// Unavailable online while succeeding with --offline.
+    /// A local package archive satisfies the patch without staging or
+    /// downloading another representation, even in online diff mode.
     #[tokio::test]
-    async fn stage_online_fetch_failure_accepts_local_package_archive() {
+    async fn stage_online_reuses_local_package_archive_without_staging() {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
         std::fs::create_dir_all(socket_dir.join("packages")).unwrap();
@@ -663,17 +641,19 @@ mod tests {
         )
         .await
         .expect("no hard failure");
+        let StageOutcome::Ready(staged) = outcome else {
+            panic!("a local package archive covers the patch");
+        };
         assert!(
-            matches!(outcome, StageOutcome::Ready(_)),
-            "a local package archive covers the patch even when every download fails"
+            staged._stage.is_none(),
+            "a usable source needs no download overlay"
         );
     }
 
-    /// Same coverage rule in file mode: a local diff archive is a usable
-    /// source (pinned offline by `stage_offline_accepts_diff_archive_as_sole_source`),
-    /// so a failed blob download must not flip the outcome to Unavailable.
+    /// The preferred download mode does not require redundant downloads
+    /// when a different local representation already satisfies the patch.
     #[tokio::test]
-    async fn stage_online_file_mode_blob_failure_accepts_local_diff_archive() {
+    async fn stage_online_file_mode_reuses_local_diff_archive_without_staging() {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
         std::fs::create_dir_all(socket_dir.join("diffs")).unwrap();
@@ -690,9 +670,12 @@ mod tests {
         let outcome = stage_patch_sources(&args, &manifest_with_one_patch(), &socket_dir)
             .await
             .expect("no hard failure");
+        let StageOutcome::Ready(staged) = outcome else {
+            panic!("a local diff archive covers the patch");
+        };
         assert!(
-            matches!(outcome, StageOutcome::Ready(_)),
-            "a local diff archive covers the patch even when the blob download fails"
+            staged._stage.is_none(),
+            "a usable source needs no download overlay"
         );
     }
 

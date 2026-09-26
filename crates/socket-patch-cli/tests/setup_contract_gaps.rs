@@ -707,3 +707,113 @@ fn setup_exclude_covers_manifests_nested_below_the_excluded_member() {
         "no manifest under the excluded member may appear in the envelope:\n{stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn offline_setup_does_not_spawn_a_network_capable_lock_refresh() {
+    use std::os::unix::fs::PermissionsExt;
+    let proj = tempfile::tempdir().unwrap();
+    let bin = proj.path().join("bin");
+    let marker = proj.path().join("lock-command-ran");
+    write(
+        &proj.path().join("pyproject.toml"),
+        "[project]\nname = 'demo'\nversion = '1.0.0'\ndependencies = []\n",
+    );
+    write(&proj.path().join("uv.lock"), "version = 1\n");
+    write(
+        &bin.join("uv"),
+        "#!/bin/sh\nprintf ran > \"$SETUP_PM_MARKER\"\n",
+    );
+    std::fs::set_permissions(bin.join("uv"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(binary())
+        .args(["setup", "--yes", "--json", "--offline"])
+        .current_dir(proj.path())
+        .env_clear()
+        .env("PATH", &bin)
+        .env("HOME", proj.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SETUP_PM_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!marker.exists(), "offline setup must not invoke uv lock");
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        result["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains("offline mode"))),
+        "{result}"
+    );
+    assert!(std::fs::read_to_string(proj.path().join("pyproject.toml"))
+        .unwrap()
+        .contains("socket-patch"));
+}
+
+#[test]
+fn already_configured_setup_reports_exclude_persistence_failure() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    );
+    assert_eq!(
+        run(proj.path(), home.path(), &["setup", "--yes", "--json"]).0,
+        0
+    );
+    write(
+        &proj.path().join(".socket/manifest.json"),
+        "broken manifest",
+    );
+    let (code, output) = run(
+        proj.path(),
+        home.path(),
+        &["setup", "--yes", "--json", "--exclude", "packages/b"],
+    );
+    assert_eq!(code, 0);
+    let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(result["status"], "already_configured");
+    assert!(
+        result["warnings"].as_array().unwrap().iter().any(|v| v
+            .as_str()
+            .is_some_and(|s| s.contains("not persisting --exclude"))),
+        "{result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.path().join(".socket/manifest.json")).unwrap(),
+        "broken manifest"
+    );
+}
+
+#[test]
+fn setup_does_not_overwrite_manifest_while_another_mutator_holds_the_lock() {
+    use socket_patch_core::patch::apply_lock::acquire;
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    );
+    let manifest = r#"{"patches":{}}"#;
+    write(&proj.path().join(".socket/manifest.json"), manifest);
+    let _guard = acquire(&proj.path().join(".socket"), std::time::Duration::ZERO).unwrap();
+    let (code, output) = run(
+        proj.path(),
+        home.path(),
+        &["setup", "--yes", "--json", "--exclude", "packages/b"],
+    );
+    assert_eq!(code, 0);
+    let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert!(
+        result["warnings"].as_array().unwrap().iter().any(|v| v
+            .as_str()
+            .is_some_and(|s| s.contains("not persisting --exclude"))),
+        "{result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.path().join(".socket/manifest.json")).unwrap(),
+        manifest
+    );
+}

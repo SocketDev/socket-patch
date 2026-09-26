@@ -75,7 +75,9 @@ pub fn python_lock_paths(root: &Path) -> std::io::Result<Vec<String>> {
 /// half-converted.
 pub fn preserve_line_endings(original: &str, rendered: String) -> String {
     let uses_crlf = original.contains("\r\n");
-    let has_bare_lf = original.replace("\r\n", "").contains('\n');
+    let has_bare_lf = original
+        .split_inclusive('\n')
+        .any(|line| line.ends_with('\n') && !line.ends_with("\r\n"));
     if !uses_crlf || has_bare_lf {
         return rendered;
     }
@@ -303,6 +305,10 @@ pub fn check_python_lock_source_scope(text: &str, name: &str, version: &str) -> 
     let document: DocumentMut = text
         .parse()
         .map_err(|error| format!("invalid Python lock: {error}"))?;
+    check_source_scope(&document, name, version)
+}
+
+fn check_source_scope(document: &DocumentMut, name: &str, version: &str) -> Result<(), String> {
     let name = canonicalize_pypi_name(name);
     for collection in ["package", "distribution"] {
         if let Some(packages) = document.get(collection).and_then(Item::as_array_of_tables) {
@@ -489,7 +495,7 @@ pub fn rewrite_python_lock(
         .and_then(Item::as_table_like)
         .is_some_and(|manifest| manifest.contains_key("requirements"))
     {
-        check_python_lock_source_scope(text, name, version)?;
+        check_source_scope(&document, name, version)?;
     }
     let pep751 = document.get("lock-version").is_some();
     let legacy = document.get("distribution").is_some();
@@ -665,6 +671,46 @@ pub fn rewrite_python_lock(
         rewrite_manifest(&mut document, &name, artifact);
     }
     Ok(Some(preserve_line_endings(text, document.to_string())))
+}
+
+/// Whether two hosted artifacts have the same origin and filename. Grant paths may differ.
+pub(crate) fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
+    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return None;
+        }
+        let url = url.split('#').next()?;
+        let scheme_end = url.find("://")? + 3;
+        let path_start = url[scheme_end..].find('/')? + scheme_end;
+        let leaf = url[path_start..]
+            .rsplit('/')
+            .next()
+            .filter(|leaf| !leaf.is_empty())?;
+        Some((&url[..path_start], leaf))
+    }
+    match (origin_and_leaf(existing), origin_and_leaf(current)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
+}
+
+/// Include the next TOML header after a package span, preserving the intervening whitespace.
+pub(crate) fn next_header_end(text: &str, from: usize) -> usize {
+    let mut pos = from;
+    for line in text[from..].split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        // Blank lines and comments sit between units (toml_edit clones carry
+        // the file's leading comment as decor); they belong to the boundary.
+        if content.trim().is_empty() || content.trim_start().starts_with('#') {
+            pos += line.len();
+            continue;
+        }
+        if content.starts_with('[') {
+            return pos + content.len();
+        }
+        return from;
+    }
+    text.len()
 }
 
 #[cfg(test)]
@@ -848,7 +894,9 @@ wheels = [
             "{rewritten}"
         );
         assert!(
-            rewritten.contains(&format!("{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}")),
+            rewritten.contains(&format!(
+                "{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}"
+            )),
             "{rewritten}"
         );
         assert!(!rewritten.contains("direct+"), "{rewritten}");
@@ -916,12 +964,17 @@ wheels = [{ url = "https://files.pythonhosted.org/urllib3-1.26.18-py2.py3-none-a
             "{rewritten}"
         );
         assert!(
-            rewritten.contains(&format!("wheels = [{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}]")),
+            rewritten.contains(&format!(
+                "wheels = [{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}]"
+            )),
             "{rewritten}"
         );
         assert!(!rewritten.contains("[[distribution.wheel]]"), "{rewritten}");
         assert!(!rewritten.contains("sdist"), "{rewritten}");
-        assert!(rewritten.contains("[[distribution.dependencies]]\nname = \"urllib3\""), "{rewritten}");
+        assert!(
+            rewritten.contains("[[distribution.dependencies]]\nname = \"urllib3\""),
+            "{rewritten}"
+        );
         assert_eq!(
             rewrite_python_lock(
                 &rewritten,
@@ -1062,7 +1115,11 @@ hash = "sha256:certifi"
             Some(&*format!("sha256:{SHA256}"))
         );
         assert!(entry.get("wheels").is_none(), "{rewritten}");
-        assert_eq!(rewritten.matches("[[distribution.wheel]]").count(), 2, "{rewritten}");
+        assert_eq!(
+            rewritten.matches("[[distribution.wheel]]").count(),
+            2,
+            "{rewritten}"
+        );
         assert!(!rewritten.contains("wheels = ["), "{rewritten}");
         // The sibling's own artifact is untouched.
         assert!(rewritten.contains("certifi-2024.2.2-py3-none-any.whl"));
@@ -1109,7 +1166,9 @@ wheels = [{{ url = "https://files.pythonhosted.org/certifi-2024.2.2-py3-none-any
         assert_eq!(entry["wheels"][0]["url"].as_str(), Some(URL));
         assert!(entry.get("wheel").is_none(), "{rewritten}");
         assert!(
-            rewritten.contains(&format!("wheels = [{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}]")),
+            rewritten.contains(&format!(
+                "wheels = [{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}]"
+            )),
             "{rewritten}"
         );
         assert!(!rewritten.contains("[[distribution.wheel]]"), "{rewritten}");
@@ -1397,15 +1456,10 @@ wheels = [
     { url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:old", size = 123 },
 ]
 "#;
-        let rewritten = rewrite_python_lock(
-            text,
-            "urllib3",
-            "1.26.18",
-            ArtifactSource::Url(URL),
-            SHA256,
-        )
-        .unwrap()
-        .unwrap();
+        let rewritten =
+            rewrite_python_lock(text, "urllib3", "1.26.18", ArtifactSource::Url(URL), SHA256)
+                .unwrap()
+                .unwrap();
         let document: toml_edit::DocumentMut = rewritten.parse().unwrap();
         let manifest = &document["manifest"];
         let constraint = manifest["constraints"][0].as_inline_table().unwrap();
@@ -1414,7 +1468,10 @@ wheels = [
         let build = manifest["build-constraints"].as_array().unwrap();
         let foreign = build.get(0).unwrap().as_inline_table().unwrap();
         assert_eq!(foreign["specifier"].as_str(), Some("==1.0"));
-        assert!(foreign.get("url").is_none(), "a foreign constraint is untouched");
+        assert!(
+            foreign.get("url").is_none(),
+            "a foreign constraint is untouched"
+        );
         let ours = build.get(1).unwrap().as_inline_table().unwrap();
         assert_eq!(ours["url"].as_str(), Some(URL));
         assert!(ours.get("specifier").is_none(), "{rewritten}");

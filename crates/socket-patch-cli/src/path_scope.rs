@@ -45,7 +45,7 @@ pub struct PathScope {
 /// separator the match side uses.
 fn normalize_pattern(raw: &str) -> String {
     let mut p = raw.replace('\\', "/");
-    while let Some(stripped) = p.strip_prefix("./") {
+    while let Some(stripped) = p.strip_prefix("./").filter(|s| !s.is_empty()) {
         p = stripped.to_string();
     }
     while p.len() > 1 && p.ends_with('/') {
@@ -121,7 +121,9 @@ impl PathScope {
                 rel.as_deref()
             };
             match target {
-                Some(t) => matches_path_or_ancestor(pattern, t),
+                // `.` is the cwd itself, an ancestor of every relative
+                // candidate, including cwd's empty relative path.
+                Some(t) => pattern.as_str() == "." || matches_path_or_ancestor(pattern, t),
                 // A relative pattern can never match a path outside cwd.
                 None => false,
             }
@@ -179,24 +181,15 @@ mod tests {
     fn directory_pattern_scopes_its_subtree() {
         // No `/**` needed: matching an ancestor is enough.
         let s = scope(&["packages/foo"]);
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
-        assert!(!s.matches(
-            &cwd(),
-            Path::new("/proj/packages/bar/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
+        assert!(!s.matches(&cwd(), Path::new("/proj/packages/bar/node_modules/lodash")));
     }
 
     #[test]
     fn star_does_not_cross_separators() {
         let s = scope(&["packages/*"]);
         // `packages/*` matches the ancestor `packages/foo`, scoping its tree…
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
         // …but `nested/*` must not match a deeper path component-wise.
         let s2 = scope(&["*"]);
         assert!(s2.matches(&cwd(), Path::new("/proj/anything")));
@@ -207,10 +200,7 @@ mod tests {
     #[test]
     fn double_star_spans_directories() {
         let s = scope(&["packages/**/lodash"]);
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
         assert!(!s.matches(&cwd(), Path::new("/proj/apps/foo/node_modules/lodash")));
     }
 
@@ -231,6 +221,22 @@ mod tests {
     fn leading_dot_slash_and_trailing_slash_are_normalized() {
         let s = scope(&["./packages/foo/"]);
         assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/nested")));
+    }
+
+    #[test]
+    fn current_directory_scopes_its_whole_subtree() {
+        for pattern in [".", "./", "././", ".\\"] {
+            let s = scope(&[pattern]);
+            assert!(s.matches(&cwd(), &cwd()), "{pattern}");
+            assert!(
+                s.matches(&cwd(), Path::new("/proj/node_modules/foo")),
+                "{pattern}"
+            );
+            assert!(
+                !s.matches(&cwd(), Path::new("/elsewhere/node_modules/foo")),
+                "{pattern}"
+            );
+        }
     }
 
     #[test]

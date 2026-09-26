@@ -180,9 +180,16 @@ pub(super) async fn run_apply_gc(
         manifest.patches.remove(purl);
     }
     if !prunable.is_empty() {
-        // If pruning failed mid-write the manifest may be stale, but the
-        // file-level cleanup below still operates on the in-memory copy.
-        let _ = write_manifest(manifest_path, &manifest).await;
+        // Only the persisted manifest authorizes deleting its sources.
+        // A failed atomic write leaves the old records live on disk.
+        if let Err(error) = write_manifest(manifest_path, &manifest).await {
+            if !common.json {
+                eprintln!("Warning: could not prune manifest; skipping artifact cleanup: {error}");
+            }
+            let mut gc = GcSummary::default();
+            gc.absorb_vendor_gc(vendor_gc);
+            return gc;
+        }
     }
     let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await;
     gc.absorb_vendor_gc(vendor_gc);
@@ -638,6 +645,43 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_apply_gc_keeps_sources_when_manifest_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root bypasses directory write permissions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir, blob_path) =
+            seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &"a".repeat(64));
+        // The existing lock remains writable while atomic manifest replacement
+        // fails because its parent cannot accept a temporary file.
+        std::fs::write(socket_dir.join("apply.lock"), b"").unwrap();
+        let permissions = std::fs::metadata(&socket_dir).unwrap().permissions();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let gc = run_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&[]),
+            &no_vendored(),
+        )
+        .await;
+        std::fs::set_permissions(&socket_dir, permissions).unwrap();
+
+        assert!(gc.pruned.is_empty());
+        assert_eq!(gc.blobs.blobs_removed, 0);
+        assert!(
+            blob_path.exists(),
+            "a persisted record still references this blob"
+        );
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(manifest.patches.contains_key("pkg:npm/gone@1.0.0"));
+    }
+
     #[tokio::test]
     async fn run_apply_gc_skips_prune_and_sweep_while_apply_lock_is_held() {
         // A live holder of `<socket_dir>/apply.lock` (a concurrent `get`,
@@ -947,8 +991,7 @@ mod tests {
         socket_patch_core::vendor::save_state(tmp.path(), &state)
             .await
             .unwrap();
-        let state_before =
-            std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
+        let state_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
 
         let vendored: HashSet<String> = [PURL.to_string()].into_iter().collect();
         let gc = preview_apply_gc(

@@ -80,8 +80,7 @@ pub enum Commands {
     /// Remove a patch from the manifest by PURL or UUID (rolls back files first)
     Remove(commands::remove::RemoveArgs),
 
-    /// Download missing blobs, clean up unused blobs, and reset the
-    /// advisory lock state.
+    /// Download missing blobs and clean up unused blobs.
     ///
     /// `repair` (alias `gc`) is a first-class command for cleaning up
     /// the `.socket/` directory without running a scan. For the

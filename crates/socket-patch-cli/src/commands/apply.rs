@@ -676,7 +676,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
 
     // Check if manifest exists - exit successfully if no .socket folder is set up
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
+    if matches!(tokio::fs::metadata(&manifest_path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
         // A yarn-PnP layout refuses loudly even with no manifest: scan
         // cannot discover PnP packages (they live inside .yarn/cache zips),
         // so it never writes one — without this hoisted check the layout
@@ -1192,13 +1194,28 @@ async fn apply_patches_inner(
         .flat_map(|purls| purls.iter().cloned())
         .collect();
 
-    // In-scope view of the manifest for source probing and fetching. The
-    // apply loop keeps using the full `manifest` for per-PURL lookups —
-    // those are already scoped by `partitioned`.
+    // Vendor ownership wins for EVERY ecosystem: a purl recorded in
+    // `.socket/vendor/state.json` is managed by the explicit `vendor`
+    // action — apply must not re-patch its installed tree (or repoint a
+    // vendor-owned go `replace` back at `.socket/go-patches/`). Matchable
+    // by ledger key, resolved base purl, or qualifier-stripped key so
+    // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
+    // unreadable state degrades to "nothing vendored" (fail-open).
+    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let is_vendored =
+        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+    let (mut results, mut matched_manifest_purls, vendored_bases) =
+        synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
+
+    // Fetch only sources the apply loop can consume. Vendor-owned packages
+    // use their committed artifacts and intentionally have no blob cache.
+    // Requiring those blobs before the vendor skip breaks offline runs and
+    // downloads unused content online.
     let mut scoped_manifest = manifest.clone();
-    scoped_manifest
-        .patches
-        .retain(|purl, _| target_manifest_purls.contains(purl));
+    scoped_manifest.patches.retain(|purl, _| {
+        target_manifest_purls.contains(purl)
+            && !vendored_bases.contains(strip_purl_qualifiers(purl))
+    });
 
     let mut staged = match stage_patch_sources(&args.common, &scoped_manifest, socket_dir).await? {
         StageOutcome::Ready(s) => s,
@@ -1212,19 +1229,6 @@ async fn apply_patches_inner(
             })
         }
     };
-
-    // Vendor ownership wins for EVERY ecosystem: a purl recorded in
-    // `.socket/vendor/state.json` is managed by the explicit `vendor`
-    // action — apply must not re-patch its installed tree (or repoint a
-    // vendor-owned go `replace` back at `.socket/go-patches/`). Matchable
-    // by ledger key, resolved base purl, or qualifier-stripped key so
-    // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
-    // unreadable state degrades to "nothing vendored" (fail-open).
-    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
-    let is_vendored =
-        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
-    let (mut results, mut matched_manifest_purls, vendored_bases) =
-        synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
 
     // Local go: prune `replace`-redirects whose patches were dropped from the
     // manifest (orphans). Done here — before the crawl + the "no packages

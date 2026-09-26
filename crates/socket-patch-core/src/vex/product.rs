@@ -20,8 +20,7 @@
 use std::path::Path;
 
 // npm/Node strip a BOM from package.json, cargo accepts one in Cargo.toml, and
-// git reads a BOM'd `.git/config`, but serde_json and the line scanners all
-// reject it — without this, files the user's own toolchain accepts yield no
+// git reads a BOM'd `.git/config`, but serde_json rejects it and manifest parsing must handle it explicitly — without this, files the user's own toolchain accepts yield no
 // PURL.
 use crate::package_json::detect::strip_bom;
 
@@ -69,7 +68,7 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
         }
         present.push(name);
         if result.purl.is_none() {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            if let Ok(content) = crate::utils::fs::read_regular_to_string(&path).await {
                 if let Some(purl) = parse(&content) {
                     result.purl = Some(purl);
                     selected = Some(name);
@@ -111,67 +110,32 @@ fn parse_pyproject(content: &str) -> Option<String> {
     // not a buildable Python project and must keep yielding None.
     // PEP 621 `[project]` takes precedence (newer projects favor it),
     // then fall back to Poetry's `[tool.poetry]` for legacy layouts.
-    let (name, version) = scan_toml_section(content, "project")
-        .or_else(|| scan_toml_section(content, "tool.poetry"))?;
+    if content.starts_with('\u{feff}') {
+        return None;
+    }
+    let (name, version) = parse_toml_metadata(content, &["project", "tool.poetry"])?;
     Some(format!("pkg:pypi/{name}@{version}"))
 }
 
 fn parse_cargo_toml(content: &str) -> Option<String> {
-    let (name, version) = scan_toml_section(strip_bom(content), "package")?;
+    let (name, version) = parse_toml_metadata(strip_bom(content), &["package"])?;
     Some(format!("pkg:cargo/{name}@{version}"))
 }
 
-/// Minimal line-based TOML scanner for `[<section>]` blocks. Reads
-/// `name = "..."` and `version = "..."` from the named section and
-/// stops at the next `[` header. Robust enough for the well-formed
-/// `pyproject.toml` / `Cargo.toml` files we expect at the top level —
-/// no full TOML parser dependency.
-///
-/// Returns `None` if either key is missing, both keys appear outside
-/// the section, the value is empty, or the value is `version.workspace
-/// = true` (matches the cargo crawler's behavior of skipping workspace
-/// inheritance).
-fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
-    let mut in_section = false;
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+/// Read the first section with a non-empty string name and version. Use the
+/// existing TOML parser so multiline values cannot impersonate table headers,
+/// and quoted/dotted keys and escaped strings follow the manifest's syntax.
+fn parse_toml_metadata(content: &str, sections: &[&str]) -> Option<(String, String)> {
+    let document = content.parse::<toml_edit::DocumentMut>().ok()?;
+    sections.iter().find_map(|section| {
+        let mut item = document.as_item();
+        for key in section.split('.') {
+            item = item.get(key)?;
         }
-        if let Some(rest) = line.strip_prefix('[') {
-            // A header may carry a trailing comment (`[package] # x`)
-            // and whitespace inside the brackets (`[ package ]`) —
-            // both valid TOML that cargo and tomllib accept. Anything
-            // else after the closing bracket means a different (or
-            // malformed) section.
-            in_section = match rest.split_once(']') {
-                Some((inner, after)) => {
-                    let after = after.trim_start();
-                    (after.is_empty() || after.starts_with('#')) && inner.trim() == section
-                }
-                None => false,
-            };
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        if let Some(v) = parse_toml_string_kv(line, "name") {
-            name = Some(v);
-        } else if let Some(v) = parse_toml_string_kv(line, "version") {
-            version = Some(v);
-        }
-    }
-
-    let name = name?;
-    let version = version?;
-    if name.is_empty() || version.is_empty() {
-        return None;
-    }
-    Some((name, version))
+        let name = item.get("name")?.as_str()?;
+        let version = item.get("version")?.as_str()?;
+        (!name.is_empty() && !version.is_empty()).then(|| (name.to_string(), version.to_string()))
+    })
 }
 
 /// Walk up from `start` looking for a `.git/config` (the working tree
@@ -190,7 +154,9 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
 /// only the outermost `.git/config` wins.
 async fn detect_git_remote(start: &Path) -> Option<String> {
     let git_config_path = find_git_config(start).await?;
-    let content = tokio::fs::read_to_string(&git_config_path).await.ok()?;
+    let content = crate::utils::fs::read_regular_to_string(&git_config_path)
+        .await
+        .ok()?;
     let url = scan_remote_origin_url(&content)?;
     Some(remote_url_to_purl(&url))
 }
@@ -365,12 +331,12 @@ fn split_remote_host_path(url: &str) -> Option<(&str, &str)> {
         .or_else(|| url.strip_prefix("https://"))
         .or_else(|| url.strip_prefix("http://"));
     if let Some(rest) = stripped {
-        // Drop optional `user@` prefix.
-        let rest = match rest.split_once('@') {
-            Some((_, after)) => after,
-            None => rest,
-        };
-        let (host_with_port, path) = rest.split_once('/')?;
+        // Userinfo belongs to the authority only. An `@` in the repository
+        // path must never change which host identifies the product.
+        let (authority, path) = rest.split_once('/')?;
+        let host_with_port = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
         // Strip a `:port` if present.
         let host = host_with_port
             .split_once(':')
@@ -381,39 +347,49 @@ fn split_remote_host_path(url: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Parse `<key> = "<value>"` or `<key> = '<value>'`. Returns `None` if
-/// the key doesn't match, the value isn't a quoted string literal, or
-/// the value is empty. TOML permits BOTH double-quoted basic strings
-/// and single-quoted literal strings, so we accept either delimiter and
-/// terminate at the matching closing quote. Inline-table forms like
-/// `version = { workspace = true }` and bare values like `version = 42`
-/// fail this check and are skipped by the caller.
-fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
-    let eq = line.find('=')?;
-    let (lhs, rhs) = line.split_at(eq);
-    if lhs.trim() != key {
-        return None;
-    }
-    // Drop the leading '=' and surrounding whitespace. The value must
-    // open with a string delimiter; match it to its twin. `'` is a
-    // literal string (no escapes), `"` a basic string — for our purposes
-    // (names/versions, which never contain escaped quotes) the first
-    // matching delimiter terminates the value in both cases.
-    let rhs = rhs[1..].trim();
-    let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-    let stripped = &rhs[quote.len_utf8()..];
-    let end = stripped.find(quote)?;
-    let value = &stripped[..end];
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toml_metadata_uses_real_tables_and_decodes_strings() {
+        assert_eq!(
+            parse_cargo_toml("['package']\n'name' = \"my\\u002dcrate\"\nversion = '1.0'\n")
+                .as_deref(),
+            Some("pkg:cargo/my-crate@1.0")
+        );
+        assert_eq!(
+            parse_pyproject("project.name = 'example'\nproject.version = '1.0'\n").as_deref(),
+            Some("pkg:pypi/example@1.0")
+        );
+        assert!(parse_cargo_toml(
+            "description = '''\n[package]\nname = 'fake'\nversion = '1.0'\n'''\n"
+        )
+        .is_none());
+        for fields in [
+            "name = 42\nversion = '1'",
+            "name = ''\nversion = '1'",
+            "name = 'example'\nversion.workspace = true",
+            "name = 'unterminated\nversion = '1'",
+            "name = 'example'\nversion = '1' trailing",
+        ] {
+            assert!(parse_cargo_toml(&format!("[package]\n{fields}\n")).is_none());
+        }
+    }
+
+    #[test]
+    fn remote_userinfo_is_confined_to_authority() {
+        let misleading = "https://example.com/repo@github.com/owner/repository.git";
+        assert_eq!(remote_url_to_purl(misleading), misleading);
+        assert_eq!(
+            remote_url_to_purl("https://user@github.com/owner/repo.git"),
+            "pkg:github/owner/repo"
+        );
+        assert_eq!(
+            split_remote_host_path("https://github.com/owner/repo@tag.git"),
+            Some(("github.com", "owner/repo@tag.git"))
+        );
+    }
 
     #[tokio::test]
     async fn detect_package_json() {
@@ -515,7 +491,7 @@ mod tests {
     #[test]
     fn scan_toml_skips_other_sections() {
         let toml = "[other]\nname = \"wrong\"\nversion = \"0.0.0\"\n\n[package]\nname = \"right\"\nversion = \"1.0.0\"\n";
-        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        let (n, v) = parse_toml_metadata(toml, &["package"]).unwrap();
         assert_eq!(n, "right");
         assert_eq!(v, "1.0.0");
     }
@@ -523,7 +499,7 @@ mod tests {
     #[test]
     fn scan_toml_ignores_comments_and_blank_lines() {
         let toml = "[package]\n# a comment\n\nname = \"x\"\nversion = \"1.0\"\n";
-        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        let (n, v) = parse_toml_metadata(toml, &["package"]).unwrap();
         assert_eq!(n, "x");
         assert_eq!(v, "1.0");
     }
@@ -531,7 +507,7 @@ mod tests {
     #[test]
     fn scan_toml_missing_version_returns_none() {
         let toml = "[package]\nname = \"only-name\"\n";
-        assert!(scan_toml_section(toml, "package").is_none());
+        assert!(parse_toml_metadata(toml, &["package"]).is_none());
     }
 
     // ─────────────────── git-remote detection ───────────────────
@@ -919,38 +895,6 @@ mod tests {
         assert!(r.purl.is_none());
     }
 
-    /// `parse_toml_string_kv`: line without `=` → None.
-    #[test]
-    fn parse_toml_kv_returns_none_when_no_equals() {
-        assert!(parse_toml_string_kv("name without equals", "name").is_none());
-    }
-
-    /// `parse_toml_string_kv`: key mismatch → None even if value is fine.
-    #[test]
-    fn parse_toml_kv_returns_none_when_key_mismatch() {
-        assert!(parse_toml_string_kv(r#"other = "value""#, "name").is_none());
-    }
-
-    /// `parse_toml_string_kv`: missing closing quote → None.
-    #[test]
-    fn parse_toml_kv_returns_none_when_unterminated_string() {
-        assert!(parse_toml_string_kv(r#"name = "no-close"#, "name").is_none());
-    }
-
-    /// `parse_toml_string_kv`: empty quoted value → None (we reject
-    /// `name = ""`).
-    #[test]
-    fn parse_toml_kv_returns_none_when_value_empty() {
-        assert!(parse_toml_string_kv(r#"name = """#, "name").is_none());
-    }
-
-    /// `parse_toml_string_kv`: non-string value (e.g. `key = 42`) →
-    /// None (we only accept quoted strings).
-    #[test]
-    fn parse_toml_kv_returns_none_when_value_not_quoted() {
-        assert!(parse_toml_string_kv(r#"name = 42"#, "name").is_none());
-    }
-
     /// `split_remote_host_path`: SSH URL with no `:` separator →
     /// None. Defensive — `git@` prefix without scp-style path.
     #[test]
@@ -1202,46 +1146,12 @@ mod tests {
     // product detection silently failed. Mirrors the cargo-crawler
     // single-quote fix.
 
-    /// `parse_toml_string_kv`: single-quoted literal value is accepted.
-    #[test]
-    fn parse_toml_kv_accepts_single_quoted_value() {
-        assert_eq!(
-            parse_toml_string_kv("name = 'serde'", "name").as_deref(),
-            Some("serde")
-        );
-    }
-
-    /// `parse_toml_string_kv`: empty single-quoted value → None, same as
-    /// the empty double-quoted case.
-    #[test]
-    fn parse_toml_kv_single_quoted_empty_is_none() {
-        assert!(parse_toml_string_kv("name = ''", "name").is_none());
-    }
-
-    /// `parse_toml_string_kv`: a single-quoted literal string keeps any
-    /// embedded double quotes verbatim (literal strings don't process
-    /// escapes), and a leading `'` must NOT terminate on a `"`.
-    #[test]
-    fn parse_toml_kv_single_quoted_preserves_inner_double_quote() {
-        assert_eq!(
-            parse_toml_string_kv(r#"name = 'he said "hi"'"#, "name").as_deref(),
-            Some(r#"he said "hi""#)
-        );
-    }
-
-    /// `parse_toml_string_kv`: an unterminated single-quoted value → None
-    /// (matches the double-quoted unterminated behaviour).
-    #[test]
-    fn parse_toml_kv_single_quoted_unterminated_is_none() {
-        assert!(parse_toml_string_kv("name = 'no-close", "name").is_none());
-    }
-
     /// `scan_toml_section`: a section using single-quoted name/version is
     /// parsed end-to-end.
     #[test]
     fn scan_toml_section_handles_single_quoted_values() {
         let toml = "[package]\nname = 'my-rust'\nversion = '2.0.0'\n";
-        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        let (n, v) = parse_toml_metadata(toml, &["package"]).unwrap();
         assert_eq!(n, "my-rust");
         assert_eq!(v, "2.0.0");
     }
@@ -1251,7 +1161,7 @@ mod tests {
     #[test]
     fn scan_toml_section_handles_mixed_quoting() {
         let toml = "[package]\nname = 'mixed'\nversion = \"3.1.4\"\n";
-        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        let (n, v) = parse_toml_metadata(toml, &["package"]).unwrap();
         assert_eq!(n, "mixed");
         assert_eq!(v, "3.1.4");
     }
@@ -1284,13 +1194,6 @@ mod tests {
         .unwrap();
         let r = detect_product(dir.path()).await;
         assert_eq!(r.purl.as_deref(), Some("pkg:pypi/my-pylib@0.4.0"));
-    }
-
-    /// Regression guard: a bare (unquoted) numeric value is still
-    /// rejected — the quote-detection must not accept non-string scalars.
-    #[test]
-    fn parse_toml_kv_bare_number_still_rejected() {
-        assert!(parse_toml_string_kv("version = 42", "version").is_none());
     }
 
     // ── Regression: UTF-8 BOM tolerance ───────────────────────────
@@ -1351,7 +1254,7 @@ mod tests {
     #[test]
     fn scan_toml_section_header_with_trailing_comment() {
         let toml = "[package] # package metadata\nname = \"x\"\nversion = \"1.0\"\n";
-        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        let (n, v) = parse_toml_metadata(toml, &["package"]).unwrap();
         assert_eq!(n, "x");
         assert_eq!(v, "1.0");
     }
@@ -1362,7 +1265,7 @@ mod tests {
     #[test]
     fn scan_toml_commented_foreign_header_still_closes_section() {
         let toml = "[package]\nname = \"x\"\n[dependencies] # noted\nversion = \"9.9\"\n";
-        assert!(scan_toml_section(toml, "package").is_none());
+        assert!(parse_toml_metadata(toml, &["package"]).is_none());
     }
 
     /// The prefix match must not over-match: `[packages]` and
@@ -1370,7 +1273,7 @@ mod tests {
     #[test]
     fn scan_toml_header_prefix_lookalikes_do_not_match() {
         let toml = "[packages] # close but no\nname = \"a\"\nversion = \"1\"\n[package.metadata] # also no\nname = \"b\"\nversion = \"2\"\n";
-        assert!(scan_toml_section(toml, "package").is_none());
+        assert!(parse_toml_metadata(toml, &["package"]).is_none());
     }
 
     #[tokio::test]
@@ -1436,7 +1339,7 @@ mod tests {
     #[test]
     fn scan_toml_section_header_with_inner_whitespace() {
         let toml = "[ package ]\nname = \"x\"\nversion = \"1.0\"\n";
-        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        let (n, v) = parse_toml_metadata(toml, &["package"]).unwrap();
         assert_eq!(n, "x");
         assert_eq!(v, "1.0");
     }
@@ -1446,7 +1349,7 @@ mod tests {
     #[test]
     fn scan_toml_section_spaced_header_with_trailing_comment() {
         let toml = "[ package ] # metadata\nname = \"x\"\nversion = \"1.0\"\n";
-        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        let (n, v) = parse_toml_metadata(toml, &["package"]).unwrap();
         assert_eq!(n, "x");
         assert_eq!(v, "1.0");
     }
@@ -1455,7 +1358,7 @@ mod tests {
     #[test]
     fn scan_toml_spaced_foreign_header_still_closes_section() {
         let toml = "[package]\nname = \"x\"\n[ dependencies ]\nversion = \"9.9\"\n";
-        assert!(scan_toml_section(toml, "package").is_none());
+        assert!(parse_toml_metadata(toml, &["package"]).is_none());
     }
 
     /// Junk (non-comment) after the closing bracket is still rejected
@@ -1464,7 +1367,7 @@ mod tests {
     #[test]
     fn scan_toml_header_with_trailing_junk_still_rejected() {
         let toml = "[package] junk\nname = \"x\"\nversion = \"1.0\"\n";
-        assert!(scan_toml_section(toml, "package").is_none());
+        assert!(parse_toml_metadata(toml, &["package"]).is_none());
     }
 
     #[tokio::test]
@@ -1798,7 +1701,7 @@ mod tests {
     #[test]
     fn scan_toml_unclosed_header_does_not_open_section() {
         let toml = "[package\nname = \"x\"\nversion = \"1.0\"\n";
-        assert!(scan_toml_section(toml, "package").is_none());
+        assert!(parse_toml_metadata(toml, &["package"]).is_none());
     }
 
     /// An unclosed FOREIGN header must still close an open
@@ -1809,7 +1712,7 @@ mod tests {
     #[test]
     fn scan_toml_unclosed_foreign_header_still_closes_section() {
         let toml = "[package]\nname = \"x\"\n[dependencies\nversion = \"9.9\"\n";
-        assert!(scan_toml_section(toml, "package").is_none());
+        assert!(parse_toml_metadata(toml, &["package"]).is_none());
     }
 
     // ── Coverage: malformed git-config header fall-through ────────

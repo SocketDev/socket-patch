@@ -296,6 +296,20 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Opt
         return None;
     }
     let path = common.resolved_manifest_path();
+    let socket_dir = path.parent().unwrap_or(Path::new("."));
+    if let Err(e) = tokio::fs::create_dir_all(socket_dir).await {
+        return Some(format!(
+            "not persisting --exclude: cannot create {}: {e}",
+            socket_dir.display()
+        ));
+    }
+    let _lock = match socket_patch_core::patch::apply_lock::acquire(
+        socket_dir,
+        std::time::Duration::from_secs(common.lock_timeout.unwrap_or(0)),
+    ) {
+        Ok(lock) => lock,
+        Err(e) => return Some(format!("not persisting --exclude: {e}")),
+    };
     // Fail closed on a manifest that exists but cannot be read or parsed: it
     // may still hold recoverable patch records, and flattening the error to
     // "no manifest yet" would rewrite the file down to a bare setup block —
@@ -312,6 +326,9 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Opt
         }
     };
     let mut merged: Vec<String> = excludes.to_vec();
+    if let Some(setup) = existing.as_ref().and_then(|m| m.setup.as_ref()) {
+        merged.extend(setup.exclude.iter().cloned());
+    }
     merged.sort();
     merged.dedup();
     if existing
@@ -333,11 +350,12 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Opt
         exclude: merged,
         manual,
     });
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let _ = write_manifest(&path, &manifest).await;
-    None
+    write_manifest(&path, &manifest).await.err().map(|e| {
+        format!(
+            "not persisting --exclude: cannot write {}: {e}",
+            path.display()
+        )
+    })
 }
 
 /// Which ecosystems are **actually set up** at `cwd` — i.e. their auto-repatch
@@ -503,7 +521,12 @@ async fn edit_python_manifests(
 /// After a real (non-dry-run) edit that changed a manifest, refresh the
 /// lockfile. Returns any warnings to surface. (There is no separate marker /
 /// audit file: the committed dependency line is the source of truth.)
-async fn finalize_python(plan: &PythonPlan, edits: &[PthEditResult], cwd: &Path) -> Vec<String> {
+async fn finalize_python(
+    plan: &PythonPlan,
+    edits: &[PthEditResult],
+    common: &GlobalArgs,
+) -> Vec<String> {
+    let cwd = &common.cwd;
     let mut warnings = Vec::new();
     let any_changed = edits.iter().any(|e| e.status == PthStatus::Updated);
     if !any_changed {
@@ -528,6 +551,10 @@ async fn finalize_python(plan: &PythonPlan, edits: &[PthEditResult], cwd: &Path)
             None => false,
         };
         if lock_present {
+            if common.offline {
+                warnings.push(format!("skipped `{program} lock` in offline mode; update the lockfile when network access is available"));
+                return warnings;
+            }
             let mut failure: Option<String> = None;
             for args in spellings {
                 match tokio::process::Command::new(program)
@@ -1249,7 +1276,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     let mut warnings = Vec::new();
     if let Some(plan) = &py_plan {
         py_results = edit_python_manifests(plan, true, false).await;
-        warnings = finalize_python(plan, &py_results, &common.cwd).await;
+        warnings = finalize_python(plan, &py_results, common).await;
     }
     // Real gem + composer removal (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
@@ -1542,16 +1569,9 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         println!("Configuring socket-patch install hooks...");
     }
 
-    // Resolve the effective exclude set (persisted + `--exclude`) and, on a real
-    // run, persist it so `--check` and a fresh clone honor it without the flag.
-    // Dry-run never writes the manifest. Excluded members are then skipped by
-    // discovery.
+    // Resolve persisted + CLI excludes for discovery. Persist only after
+    // confirmation (or when the hooks are already configured).
     let excludes = effective_excludes(common, &args.exclude).await;
-    let persist_warning = if !common.dry_run {
-        persist_setup_excludes(common, &excludes).await
-    } else {
-        None
-    };
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
     // Gem + Composer previews (dry-run); `.present` also tells us each project exists.
@@ -1632,6 +1652,14 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         + extra_preview.errors;
 
     if n_changes == 0 {
+        let warnings: Vec<String> = if common.dry_run {
+            Vec::new()
+        } else {
+            persist_setup_excludes(common, &excludes)
+                .await
+                .into_iter()
+                .collect()
+        };
         if common.json {
             print_setup_envelope(
                 if preview_errors > 0 {
@@ -1644,13 +1672,18 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 &extra_preview,
                 npm_pm,
                 py_plan.as_ref(),
-                &[],
+                &warnings,
             );
         } else if !common.silent {
             if preview_errors > 0 {
                 println!("No hooks were changed; {preview_errors} item(s) could not be processed (see errors above).");
             } else {
                 println!("All install hooks are already configured with socket-patch!");
+            }
+        }
+        if !quiet {
+            for warning in &warnings {
+                println!("  warning: {warning}");
             }
         }
         eprint_errors_when_silent(
@@ -1699,11 +1732,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     let mut warnings = Vec::new();
     if let Some(plan) = &py_plan {
         py_results = edit_python_manifests(plan, false, false).await;
-        warnings = finalize_python(plan, &py_results, &common.cwd).await;
+        warnings = finalize_python(plan, &py_results, common).await;
     }
     // A skipped (fail-closed) --exclude persistence rides the same warnings
     // channel: human summary line + `--json` envelope `warnings` array.
-    warnings.extend(persist_warning);
+    warnings.extend(persist_setup_excludes(common, &excludes).await);
     // Real gem + composer edits (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
     let extra_results = merge_outcomes(

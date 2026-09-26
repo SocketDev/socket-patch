@@ -959,6 +959,46 @@ pub(crate) async fn run_redirect_selected(
         }
     }
 
+    // Share apply/vendor/rollback's lock before reading or quarantining state.
+    // Hold it through takeover, ledger persistence and project-file writes so
+    // concurrent runs cannot plan from the same old ledger and lose originals.
+    // A dry-run must not create even the socket directory or a lock file.
+    let _lock = if common.dry_run {
+        None
+    } else {
+        use socket_patch_core::patch::apply_lock::{acquire, LockError};
+
+        let socket_dir = common.cwd.join(".socket");
+        let timeout = std::time::Duration::from_secs(common.lock_timeout.unwrap_or(0));
+        let acquired = match tokio::fs::create_dir_all(&socket_dir).await {
+            Ok(()) => acquire(&socket_dir, timeout),
+            Err(source) => Err(LockError::Io {
+                path: socket_dir,
+                source,
+            }),
+        };
+        match acquired {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let (code, message) = match error {
+                    LockError::Held => (
+                        "lock_held",
+                        crate::commands::lock_cli::held_message(timeout),
+                    ),
+                    LockError::Io { path, source } => (
+                        "lock_io",
+                        format!("failed to open lock file at {}: {source}", path.display()),
+                    ),
+                };
+                eprintln!("Error: {message}");
+                if common.json {
+                    emit_json_error_with_code(scan_result.take(), Some(code), &message);
+                }
+                return 1;
+            }
+        }
+    };
+
     // Load the existing redirect ledger before any file changes, including
     // Cargo takeover reverts. It stores the originals a future revert needs, so
     // a malformed (torn/hand-mangled) ledger must abort the run while the

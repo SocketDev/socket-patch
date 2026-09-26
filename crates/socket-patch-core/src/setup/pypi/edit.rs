@@ -16,7 +16,9 @@ use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, HOOK_DEP};
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::python_lock::preserve_line_endings;
 use crate::utils::toml_edit_ext::ensure_table;
 use crate::vendor::common::detect_eol;
 
@@ -66,14 +68,7 @@ impl PthEditResult {
 /// `open(2)` that waits for a writer — detection never opens the manifest it
 /// hands the edit path (a lockfile routes here without a read, and the Pip
 /// fallback targets `requirements.txt` sight-unseen).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
+use crate::utils::fs::read_regular_to_string;
 
 /// Shared tail of add/remove: `None` means already in the desired state,
 /// `Some(new_content)` is written atomically (unless `dry_run`).
@@ -241,7 +236,7 @@ fn pyproject_add(content: &str) -> Result<Option<String>, String> {
                 .to_string(),
         );
     };
-    Ok(if changed { Some(doc.to_string()) } else { None })
+    Ok(changed.then(|| preserve_line_endings(content, doc.to_string())))
 }
 
 fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
@@ -253,7 +248,7 @@ fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
     changed |= pep621_remove(&mut doc);
     changed |= poetry_remove(&mut doc);
 
-    Ok(if changed { Some(doc.to_string()) } else { None })
+    Ok(changed.then(|| preserve_line_endings(content, doc.to_string())))
 }
 
 fn pep621_add(doc: &mut DocumentMut) -> Result<bool, String> {
@@ -375,17 +370,6 @@ fn poetry_remove(doc: &mut DocumentMut) -> bool {
     changed
 }
 
-/// PEP 503 canonical form of a package name: `-`/`_`/`.` are interchangeable
-/// and comparison is case-insensitive. Poetry accepts any spelling as a
-/// dependency key, so the structural helpers must match keys canonically —
-/// the textual probe ([`super::detect::deps_contain_hook`]) already does.
-fn canonical_pypi_name(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| if c == '_' || c == '.' { '-' } else { c })
-        .collect()
-}
-
 /// Find the key in a Poetry dependencies table whose canonical form is
 /// `canonical`, returning the user's spelling so edits land on it in place
 /// (inserting under the canonical name next to a variant-spelled key would
@@ -393,7 +377,7 @@ fn canonical_pypi_name(name: &str) -> String {
 fn poetry_dep_key(deps: &Table, canonical: &str) -> Option<String> {
     deps.iter()
         .map(|(k, _)| k)
-        .find(|k| canonical_pypi_name(k) == canonical)
+        .find(|k| canonicalize_pypi_name(k) == canonical)
         .map(str::to_string)
 }
 
@@ -481,6 +465,28 @@ pub fn pyproject_contains_hook(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poetry_separator_runs_are_one_dependency_and_crlf_survives_edits() {
+        let original = "[tool.poetry.dependencies]\r\nSocket__Patch = \"*\"\r\n";
+        let added = pyproject_add(original).unwrap().unwrap();
+        let doc = added.parse::<DocumentMut>().unwrap();
+        let deps = doc["tool"]["poetry"]["dependencies"].as_table().unwrap();
+        assert_eq!(
+            deps.len(),
+            1,
+            "canonical spelling must update the original key"
+        );
+        assert!(item_has_hook_extra(&deps["Socket__Patch"]));
+        assert!(pyproject_contains_hook(&added));
+        assert!(pyproject_add(&added).unwrap().is_none());
+        assert!(!added.replace("\r\n", "").contains('\n'));
+
+        let removed = pyproject_remove(&added).unwrap().unwrap();
+        assert!(!pyproject_contains_hook(&removed));
+        assert!(removed.contains("Socket__Patch"));
+        assert!(!removed.replace("\r\n", "").contains('\n'));
+    }
 
     // ── requirements.txt ─────────────────────────────────────────────
 

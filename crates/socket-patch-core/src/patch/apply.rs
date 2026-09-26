@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
-use crate::patch::cow::break_hardlink_if_needed;
 use crate::patch::diff::apply_diff;
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_filtered;
@@ -195,10 +194,11 @@ pub async fn verify_file_patch(
 
     let is_new_file = file_info.before_hash.is_empty();
 
-    // Check if file exists
-    if tokio::fs::metadata(&filepath).await.is_err() {
-        // New files (empty beforeHash) are expected to not exist yet.
-        if is_new_file {
+    // Hash through the guarded file opener directly: a separate metadata
+    // probe repeats I/O and can mistake permission errors for a missing file.
+    let current_hash = match compute_file_git_sha256(&filepath).await {
+        Ok(h) => h,
+        Err(e) if is_new_file && e.kind() == std::io::ErrorKind::NotFound => {
             return VerifyResult {
                 file: file_name.to_string(),
                 status: VerifyStatus::Ready,
@@ -208,24 +208,15 @@ pub async fn verify_file_patch(
                 target_hash: Some(file_info.after_hash.clone()),
             };
         }
-        return VerifyResult {
-            file: file_name.to_string(),
-            status: VerifyStatus::NotFound,
-            message: Some("File not found".to_string()),
-            current_hash: None,
-            expected_hash: None,
-            target_hash: None,
-        };
-    }
-
-    // Compute current hash
-    let current_hash = match compute_file_git_sha256(&filepath).await {
-        Ok(h) => h,
         Err(e) => {
             return VerifyResult {
                 file: file_name.to_string(),
                 status: VerifyStatus::NotFound,
-                message: Some(format!("Failed to hash file: {}", e)),
+                message: Some(if e.kind() == std::io::ErrorKind::NotFound {
+                    "File not found".to_string()
+                } else {
+                    format!("Failed to hash file: {}", e)
+                }),
                 current_hash: None,
                 expected_hash: None,
                 target_hash: None,
@@ -351,36 +342,11 @@ pub async fn select_installed_variants(
     matched
 }
 
-/// Apply a patch to a single file.
-///
-/// **Permission policy** (per the user-visible contract — patched
-/// files must look identical to pre-patch perms-wise):
-///
-/// 1. **Existing file**. Snapshot mode + owner + group before writing.
-///    If the file is read-only, temporarily grant owner-write so the
-///    overwrite succeeds (e.g. Go's module cache marks sources read-only).
-///    After the write, restore the **exact** original mode and chown
-///    back to the pre-patch uid/gid. Owners stay put even when
-///    `tokio::fs::write` truncates and rewrites.
-///
-/// 2. **New file** (created by the patch). Inherit owner + group from
-///    the parent directory and force mode `0o444` (read-only for all).
-///    Mirrors how an unpacked tarball treats new package files —
-///    consumers expect package sources to be read-only by default.
-///
-/// On Windows there is no `uid`/`gid`, so the owner/group step is a
-/// no-op; the read-only attribute is preserved on existing files and
-/// set on new files to honor the read-only-by-default policy.
-///
-/// Writes the patched content and verifies the resulting hash.
-///
-/// This variant writes to exactly the one package root it is given.
-/// External write paths (rollback's restore) go through
-/// [`apply_file_patch`], which additionally fans the write out to every
-/// pnpm peer-variant store copy of the package; `apply_package_patch`
-/// handles those copies itself at package level (with full per-copy
-/// verification) and therefore uses this single-copy variant directly.
-pub(crate) async fn apply_file_patch_at(
+/// Write hash-verified content to one package copy via atomic replacement.
+/// Existing files retain their mode and ownership; new files inherit the
+/// parent directory's ownership and receive read-only mode. Package-level
+/// apply and rollback handle pnpm peer copies with independent verification.
+pub(crate) async fn apply_file_patch(
     pkg_path: &Path,
     file_name: &str,
     patched_content: &[u8],
@@ -418,59 +384,28 @@ pub(crate) async fn apply_file_patch_at(
     // parent dir.
     let existing_meta = tokio::fs::metadata(&filepath).await.ok();
 
-    // Create parent directories if needed (e.g., new files added by a patch).
-    //
-    // `create_dir_all` needs write permission on the FIRST existing
-    // ancestor of `parent` to materialize the missing chain. Go's module
-    // cache (and some Nix/Bazel layouts) mark package directories
-    // read-only (0o555), so a patch that adds a file under a not-yet-
-    // existing subdir would fail here with EACCES — and the
-    // `DirWriteGuard` below can't help, because it relaxes the immediate
-    // parent, which does not exist yet. Temporarily grant owner-write on
-    // the nearest existing ancestor for the duration of the mkdir, then
-    // restore it exactly. (When `parent` already exists this ancestor IS
-    // `parent`; the guard relax+restore is then a harmless wash before the
-    // dedicated `DirWriteGuard` below re-relaxes it for the write.)
-    if let Some(parent) = filepath.parent() {
-        let mkdir_guard = DirWriteGuard::acquire(nearest_existing_ancestor(parent).await).await;
-        let mkdir_result = tokio::fs::create_dir_all(parent).await;
-        mkdir_guard.restore().await;
-        mkdir_result?;
-    }
-
-    // The atomic stage+rename below — and the copy-on-write break, which
-    // also stages a sibling file — need write permission on the *parent
-    // directory*, not just on the file. Go's module cache marks both its
-    // files (0o444) and its directories (0o555) read-only, so without
-    // this the stage-file creation fails with EACCES (where the old
-    // in-place write, like `rollback.rs`, only had to relax the file's
-    // own mode). Temporarily grant owner-write on the directory; the
-    // guard restores its exact mode below.
-    let dir_guard = DirWriteGuard::acquire(filepath.parent()).await;
-
-    // Copy-on-write defense against pnpm / bazel / nix shared inodes.
-    // If `filepath` is a symlink into a content store, or a hardlink
-    // shared with other projects, give this project a private inode
-    // before we mutate. No-op on regular private files (single
-    // syscall). See `patch::cow`.
-    //
-    // Atomic write (`utils::fs::atomic_write_bytes`): stage in the
-    // parent directory, fsync, rename onto the target. POSIX
-    // `rename(2)` is atomic — observers see either the old bytes or
-    // the new bytes, never a truncated half-write.
-    //
-    // The stage file is created with the user's umask defaults
-    // (typically 0o644) — that's how we sidestep the "existing file
-    // is 0o444" problem the old in-place write had: we rename a fresh
-    // user-writable inode over the target instead of trying to open
-    // a read-only file for write. `restore_file_permissions` then
-    // re-applies the pre-patch mode + uid/gid to the new inode.
-    //
-    // Both steps run inside a closure so the directory mode is ALWAYS
-    // restored — even if a step errors — before the failure propagates.
+    // The nearest existing ancestor needs owner-write to create missing
+    // directories. If the parent already exists, the same guard covers the
+    // atomic replacement too, avoiding a second chmod/restore cycle.
+    let parent = filepath.parent();
+    let ancestor = match parent {
+        Some(parent) => nearest_existing_ancestor(parent).await,
+        None => None,
+    };
+    let dir_guard = DirWriteGuard::acquire(ancestor).await;
     let write_result = async {
-        break_hardlink_if_needed(&filepath).await?;
-        crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await
+        if let Some(parent) = parent {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        // A restrictive umask may make a newly created parent read-only.
+        // Existing parents are already covered by the ancestor guard.
+        let new_parent_guard =
+            DirWriteGuard::acquire(parent.filter(|p| Some(*p) != ancestor)).await;
+        // Renaming a fresh inode breaks hardlinks and replaces final symlinks
+        // without touching shared content. No copy of the old bytes is needed.
+        let result = crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await;
+        new_parent_guard.restore().await;
+        result
     }
     .await;
     dir_guard.restore().await;
@@ -482,31 +417,6 @@ pub(crate) async fn apply_file_patch_at(
     // manage the readonly attribute.
     restore_file_permissions(&filepath, existing_meta.as_ref()).await?;
 
-    Ok(())
-}
-
-/// [`apply_file_patch_at`] plus pnpm peer-variant fan-out: after the write
-/// to `pkg_path` succeeds, the same hash-verified bytes are written to
-/// every OTHER physical store copy of the package
-/// (`.pnpm/<name>@<ver>(peerA…)/…` vs `(peerB…)/…` are distinct real
-/// dirs, each runtime-loaded). This is the write path rollback's restore
-/// uses, so rolling back a patch restores every copy the apply reached —
-/// restoring only the resolver's single primary would leave a
-/// still-patched twin behind. Each copy goes through the full hardened
-/// pipeline (atomic stage+rename, per-copy hardlink break, permission
-/// restore); a failed copy propagates as an error — fail closed, never
-/// "done" with a copy left divergent. Non-pnpm layouts discover no copies
-/// and behave exactly as before.
-pub(crate) async fn apply_file_patch(
-    pkg_path: &Path,
-    file_name: &str,
-    patched_content: &[u8],
-    expected_hash: &str,
-) -> Result<(), std::io::Error> {
-    apply_file_patch_at(pkg_path, file_name, patched_content, expected_hash).await?;
-    for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
-        apply_file_patch_at(&copy, file_name, patched_content, expected_hash).await?;
-    }
     Ok(())
 }
 
@@ -708,12 +618,22 @@ pub async fn apply_package_patch(
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
+    // Discovery reads package.json. Capture peers before a patch can change
+    // that identity and hide copies that still need the same verification.
+    let copies = if package_key.starts_with("pkg:npm/") {
+        crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies_for_patch(
+            pkg_path,
+            package_key,
+            files,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     let mut result =
         apply_package_patch_at(package_key, pkg_path, files, sources, uuid, dry_run, policy).await;
-    // Only npm purls can name pnpm store copies; everything else skips the
-    // (already cheap) discovery outright.
-    if result.success && package_key.starts_with("pkg:npm/") {
-        for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
+    if result.success {
+        for copy in copies {
             let copy_result =
                 apply_package_patch_at(package_key, &copy, files, sources, uuid, dry_run, policy)
                     .await;
@@ -860,20 +780,19 @@ async fn apply_package_patch_at(
 
     // Apply patches to files that need it. For each file, try package
     // archive first, then diff, then blob.
-    for (file_name, file_info) in files {
-        let verify_result = result.files_verified.iter().find(|v| v.file == *file_name);
-        if let Some(vr) = verify_result {
-            if vr.status == VerifyStatus::AlreadyPatched || vr.status == VerifyStatus::NotFound {
-                continue;
-            }
+    for verify_result in &result.files_verified {
+        if verify_result.status != VerifyStatus::Ready {
+            continue;
         }
+        let file_name = &verify_result.file;
+        let file_info = &files[file_name];
 
-        let normalized = normalize_file_path(file_name).to_string();
+        let normalized = normalize_file_path(file_name);
 
         // ── Strategy 1: package archive ──────────────────────────────
         if try_apply_from_archive(
             package_entries.as_ref(),
-            &normalized,
+            normalized,
             pkg_path,
             file_name,
             file_info,
@@ -895,10 +814,10 @@ async fn apply_package_patch_at(
         // skip the wasted decompress+apply work when --force is
         // overriding a hash mismatch (force flips status to Ready but
         // the underlying hash is still wrong).
-        let current_hash_for_diff = verify_result.and_then(|v| v.current_hash.as_deref());
+        let current_hash_for_diff = verify_result.current_hash.as_deref();
         if try_apply_from_diff(
             diff_entries.as_ref(),
-            &normalized,
+            normalized,
             pkg_path,
             file_name,
             file_info,
@@ -916,15 +835,13 @@ async fn apply_package_patch_at(
         // ── Strategy 3: per-file blob ────────────────────────────────
         // The in-memory overlay wins (vendor flows stage there — no
         // `.socket/blobs` writes); the on-disk dir is the fallback.
-        let mem_hit = sources
-            .mem_blobs
-            .and_then(|m| m.get(&file_info.after_hash))
-            .cloned();
+        let mem_hit = sources.mem_blobs.and_then(|m| m.get(&file_info.after_hash));
+        let disk_content;
         let patched_content = match mem_hit {
-            Some(content) => content,
+            Some(content) => content.as_slice(),
             None => {
                 let blob_path = sources.blobs_path.join(&file_info.after_hash);
-                match tokio::fs::read(&blob_path).await {
+                disk_content = match tokio::fs::read(&blob_path).await {
                     Ok(content) => content,
                     Err(e) => {
                         result.error = Some(format!(
@@ -933,7 +850,8 @@ async fn apply_package_patch_at(
                         ));
                         return result;
                     }
-                }
+                };
+                disk_content.as_slice()
             }
         };
 
@@ -941,7 +859,7 @@ async fn apply_package_patch_at(
         // out to pnpm peer-variant copies itself, with per-copy
         // verification.
         if let Err(e) =
-            apply_file_patch_at(pkg_path, file_name, &patched_content, &file_info.after_hash).await
+            apply_file_patch(pkg_path, file_name, patched_content, &file_info.after_hash).await
         {
             result.error = Some(e.to_string());
             return result;
@@ -998,7 +916,7 @@ async fn apply_package_patch_at(
 }
 
 /// Try to write the patched bytes from `package_entries[normalized_path]`
-/// to disk, verifying the post-write hash. Returns `true` on success.
+/// to disk, verifying their hash before writing. Returns `true` on success.
 async fn try_apply_from_archive(
     package_entries: Option<&HashMap<String, Vec<u8>>>,
     normalized_path: &str,
@@ -1014,12 +932,9 @@ async fn try_apply_from_archive(
         Some(b) => b,
         None => return false,
     };
-    if compute_git_sha256_from_bytes(bytes) != file_info.after_hash {
-        return false;
-    }
     // Single-copy write: `apply_package_patch` fans out to pnpm
     // peer-variant copies itself, with per-copy verification.
-    apply_file_patch_at(pkg_path, file_name, bytes, &file_info.after_hash)
+    apply_file_patch(pkg_path, file_name, bytes, &file_info.after_hash)
         .await
         .is_ok()
 }
@@ -1074,12 +989,9 @@ async fn try_apply_from_diff(
         Ok(p) => p,
         Err(_) => return false,
     };
-    if compute_git_sha256_from_bytes(&patched) != file_info.after_hash {
-        return false;
-    }
     // Single-copy write: `apply_package_patch` fans out to pnpm
     // peer-variant copies itself, with per-copy verification.
-    apply_file_patch_at(pkg_path, file_name, &patched, &file_info.after_hash)
+    apply_file_patch(pkg_path, file_name, &patched, &file_info.after_hash)
         .await
         .is_ok()
 }
@@ -1094,15 +1006,11 @@ async fn load_archive_if_present(
     files: &HashMap<String, PatchFileInfo>,
 ) -> Option<HashMap<String, Vec<u8>>> {
     let archive_path = dir.join(format!("{uuid}.tar.gz"));
-    if tokio::fs::metadata(&archive_path).await.is_err() {
-        return None;
-    }
     // `read_archive_filtered` is synchronous (tar + flate2 are sync). Run
     // it on the blocking pool so we don't stall the executor for large
     // archives.
-    let archive_path_owned = archive_path.clone();
     let files_owned = files.clone();
-    tokio::task::spawn_blocking(move || read_archive_filtered(&archive_path_owned, &files_owned))
+    tokio::task::spawn_blocking(move || read_archive_filtered(&archive_path, &files_owned))
         .await
         .ok()
         .and_then(|r| r.ok())
@@ -1111,6 +1019,82 @@ async fn load_archive_if_present(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn apply_and_rollback_pnpm_peers_after_package_json_identity_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("node_modules/.pnpm");
+        let primary = store.join("example@1.0.0(peer@1.0.0)/node_modules/example");
+        let peer = store.join("example@1.0.0(peer@2.0.0)/node_modules/example");
+        let hashed_peer = store.join("example_hashed@1.0.0/node_modules/example");
+        let original = br#"{"name":"example","version":"1.0.0"}"#;
+        let patched = br#"{"name":"renamed","version":"1.0.1"}"#;
+        for path in [&primary, &peer, &hashed_peer] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("package.json"), original).unwrap();
+        }
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        let files = HashMap::from([(
+            "package/./package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(original),
+                after_hash: after_hash.clone(),
+            },
+        )]);
+        let blobs = HashMap::from([(after_hash, patched.to_vec())]);
+        let sources = PatchSources {
+            mem_blobs: Some(&blobs),
+            ..PatchSources::blobs_only(root.path())
+        };
+
+        let result = apply_package_patch(
+            "pkg:npm/example@1.0.0",
+            &primary,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Strict,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        for path in [&primary, &peer, &hashed_peer] {
+            assert_eq!(std::fs::read(path.join("package.json")).unwrap(), patched);
+        }
+
+        // A retry must still find an original peer when the primary already
+        // reports the patched name/version, then rollback must find all of
+        // the copies while every package.json reports that new identity.
+        std::fs::write(peer.join("package.json"), original).unwrap();
+        let retry = apply_package_patch(
+            "pkg:npm/example@1.0.0",
+            &primary,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Strict,
+        )
+        .await;
+        assert!(retry.success, "{:?}", retry.error);
+        assert_eq!(std::fs::read(peer.join("package.json")).unwrap(), patched);
+
+        let before_hash = compute_git_sha256_from_bytes(original);
+        std::fs::write(root.path().join(before_hash), original).unwrap();
+        let rollback = crate::patch::rollback::rollback_package_patch(
+            "pkg:npm/example@1.0.0",
+            &primary,
+            &files,
+            root.path(),
+            false,
+        )
+        .await;
+        assert!(rollback.success, "{:?}", rollback.error);
+        for path in [&primary, &peer, &hashed_peer] {
+            assert_eq!(std::fs::read(path.join("package.json")).unwrap(), original);
+        }
+    }
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 
     #[test]
@@ -1210,6 +1194,21 @@ mod tests {
 
         let result = verify_file_patch(dir.path(), "nonexistent.js", &file_info).await;
         assert_eq!(result.status, VerifyStatus::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verify_new_file_does_not_treat_stat_errors_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
+        let info = PatchFileInfo {
+            before_hash: String::new(),
+            after_hash: compute_git_sha256_from_bytes(b"new file"),
+        };
+
+        let result = verify_file_patch(dir.path(), "loop/new.js", &info).await;
+        assert_eq!(result.status, VerifyStatus::NotFound);
+        assert!(result.message.unwrap().starts_with("Failed to hash file:"));
     }
 
     #[tokio::test]
@@ -2763,7 +2762,9 @@ mod tests {
         assert!(result.success, "expected success: {:?}", result.error);
         assert_eq!(result.files_patched, vec!["new.js".to_string()]);
         assert_eq!(result.applied_via.get("new.js"), Some(&AppliedVia::Blob));
-        let written = tokio::fs::read(pkg_dir.path().join("new.js")).await.unwrap();
+        let written = tokio::fs::read(pkg_dir.path().join("new.js"))
+            .await
+            .unwrap();
         assert_eq!(written, fresh, "divergent existing content is overwritten");
     }
 
@@ -2811,7 +2812,9 @@ mod tests {
 
         assert!(result.success, "strict still overwrites at a new-file path");
         assert_eq!(result.files_patched, vec!["new.js".to_string()]);
-        let written = tokio::fs::read(pkg_dir.path().join("new.js")).await.unwrap();
+        let written = tokio::fs::read(pkg_dir.path().join("new.js"))
+            .await
+            .unwrap();
         assert_eq!(written, fresh);
     }
 
@@ -2886,7 +2889,7 @@ mod tests {
 
     // ── Package-level unsafe-path rejection ──────────────────────────
     //
-    // The file-level twin (`apply_file_patch_at`) has
+    // The file-level twin (`apply_file_patch`) has
     // `test_apply_file_patch_rejects_escaping_path`; these exercise the
     // package-level gate in the verify loop of `apply_package_patch_at`,
     // which must abort the whole apply BEFORE any disk write and must not
@@ -2961,7 +2964,9 @@ mod tests {
         let evil = b"pwned";
         let evil_hash = compute_git_sha256_from_bytes(evil);
 
-        tokio::fs::write(pkg.join("index.js"), original).await.unwrap();
+        tokio::fs::write(pkg.join("index.js"), original)
+            .await
+            .unwrap();
         tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
             .await
             .unwrap();
@@ -3005,7 +3010,10 @@ mod tests {
         assert!(result.files_patched.is_empty());
         // The safe file was never written — the whole apply aborted
         // before the write phase.
-        assert_eq!(tokio::fs::read(pkg.join("index.js")).await.unwrap(), original);
+        assert_eq!(
+            tokio::fs::read(pkg.join("index.js")).await.unwrap(),
+            original
+        );
         assert!(!root.path().join("escape.js").exists());
     }
 
@@ -3028,9 +3036,15 @@ mod tests {
             after_hash: compute_git_sha256_from_bytes(b"x"),
         };
 
-        let applied =
-            try_apply_from_diff(Some(&entries), "new.js", dir.path(), "new.js", &info, Some("anything"))
-                .await;
+        let applied = try_apply_from_diff(
+            Some(&entries),
+            "new.js",
+            dir.path(),
+            "new.js",
+            &info,
+            Some("anything"),
+        )
+        .await;
         assert!(!applied, "new-file entries must never apply via diff");
         assert!(!dir.path().join("new.js").exists(), "nothing written");
     }

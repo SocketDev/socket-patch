@@ -168,8 +168,7 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
     // would delete the include-referenced wheel). An unreadable include
     // tree degrades to the root file, matching the per-file tolerance
     // below.
-    if let Ok(includes) =
-        socket_patch_core::vendor::requirements_include_names(project_root).await
+    if let Ok(includes) = socket_patch_core::vendor::requirements_include_names(project_root).await
     {
         files.extend(includes);
     }
@@ -282,9 +281,7 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     }
     let needle = format!(".socket/vendor/npm/{uuid}/");
     let read = |name: &'static str| async move {
-        read_regular_to_string(&project_root.join(name))
-            .await
-            .ok()
+        read_regular_to_string(&project_root.join(name)).await.ok()
     };
     if read("bun.lock").await.is_some_and(|t| t.contains(&needle)) {
         return Some("bun".to_string());
@@ -442,20 +439,40 @@ async fn remove_vendor_dir(cwd: &Path, eco: &str, uuid: &str) {
 /// (member-healthy for a soft candidate, corrupt-but-diagnosable for a
 /// pass-1 one) must be restorable instead of leaving the wired lockfiles
 /// pointing at a bare ENOENT (see the NOTE above the staging step).
-/// Returns `(live, kept)` for [`restore_aside_vendor_dir`]; on a rename
-/// failure falls back to plain removal (the rebuild trigger must fire)
-/// and returns `None`.
-async fn set_aside_vendor_dir(cwd: &Path, eco: &str, uuid: &str) -> Option<(PathBuf, PathBuf)> {
-    let rel = vendor::path::vendor_uuid_dir_rel(eco, uuid)?;
+/// Returns `(live, kept)` for [`restore_aside_vendor_dir`], or `None` if
+/// the live directory was already missing. Refuse if a prior backup exists
+/// or the move fails: the original bytes must remain recoverable.
+async fn set_aside_vendor_dir(
+    cwd: &Path,
+    eco: &str,
+    uuid: &str,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let rel = vendor::path::vendor_uuid_dir_rel(eco, uuid)
+        .ok_or_else(|| "invalid vendor artifact coordinates".to_string())?;
     let live = cwd.join(&rel);
     let kept = cwd.join(format!("{rel}.pre-rebuild"));
-    // A crashed earlier run's leftover must not wedge the rename.
-    let _ = remove_tree(&kept).await;
-    if tokio::fs::rename(&live, &kept).await.is_ok() {
-        Some((live, kept))
-    } else {
-        let _ = remove_tree(&live).await;
-        None
+    match tokio::fs::symlink_metadata(&kept).await {
+        Ok(_) => {
+            return Err(format!(
+                "a previous rebuild backup exists at {}; preserve or restore it before retrying",
+                kept.display()
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot inspect rebuild backup {}: {e}",
+                kept.display()
+            ))
+        }
+    }
+    match tokio::fs::rename(&live, &kept).await {
+        Ok(()) => Ok(Some((live, kept))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot preserve {} before rebuilding: {e}",
+            live.display()
+        )),
     }
 }
 
@@ -1226,7 +1243,13 @@ pub(crate) async fn repair_vendored_artifacts(
         // than leaving the wired lockfiles pointing at a bare ENOENT and
         // destroying the evidence the NOTE above the staging step keeps.
         let aside = if c.soft || c.reason == "vendor_artifact_corrupt" {
-            set_aside_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await
+            match set_aside_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await {
+                Ok(aside) => aside,
+                Err(detail) => {
+                    fail(env, quiet, &c.purl, "vendor_artifact_unrepairable", detail);
+                    continue;
+                }
+            }
         } else {
             None
         };
@@ -1319,12 +1342,8 @@ pub(crate) async fn repair_vendored_artifacts(
                     );
                     continue;
                 }
-                // The rebuild replaced the artifact: the set-aside copy is
-                // condemned bytes now (post-verify failures below keep
-                // their existing nothing-kept contract).
-                if let Some((_, kept)) = &aside {
-                    let _ = remove_tree(kept).await;
-                }
+                // Keep the previous artifact until the replacement verifies
+                // and its ledger entry is safely persisted.
                 for w in &warnings {
                     // The Rebuilt event below carries the rebuild signal.
                     if w.code != "vendor_artifact_rebuilt" {
@@ -1346,6 +1365,9 @@ pub(crate) async fn repair_vendored_artifacts(
                     };
                     if let Err(detail) = verdict {
                         remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
+                        if let Some((live, kept)) = &aside {
+                            restore_aside_vendor_dir(live, kept).await;
+                        }
                         // Put the trust anchor back exactly as it was: the
                         // backend's re-wire may have refreshed the recorded
                         // integrity to the rejected rebuild's.
@@ -1381,21 +1403,7 @@ pub(crate) async fn repair_vendored_artifacts(
                 if !from_backend && c.reconstructed {
                     fill_artifact_fingerprint(&common.cwd, &mut check_entry).await;
                 }
-                if (from_backend || c.reconstructed)
-                    && persist_vendor_entry(
-                        common,
-                        env,
-                        &mut state,
-                        &c.purl,
-                        check_entry.clone(),
-                        c.detached,
-                        &c.record,
-                    )
-                    .await
-                {
-                    continue;
-                }
-                // ── Fail-closed post-verify ──────────────────────────────
+                let mut needs_persist = from_backend || c.reconstructed;
                 let mut health =
                     check_vendored_artifact(&common.cwd, &check_entry, &c.record).await;
                 // A dir-shaped rebuild whose PATCHED members all verify but
@@ -1435,7 +1443,14 @@ pub(crate) async fn repair_vendored_artifacts(
                                 ),
                                 common,
                             );
-                            if persist_vendor_entry(
+                            needs_persist = true;
+                        }
+                    }
+                }
+                match health {
+                    ArtifactHealth::Healthy => {
+                        if needs_persist
+                            && persist_vendor_entry(
                                 common,
                                 env,
                                 &mut state,
@@ -1445,14 +1460,12 @@ pub(crate) async fn repair_vendored_artifacts(
                                 &c.record,
                             )
                             .await
-                            {
-                                continue;
-                            }
+                        {
+                            continue;
                         }
-                    }
-                }
-                match health {
-                    ArtifactHealth::Healthy => {
+                        if let Some((_, kept)) = &aside {
+                            let _ = remove_tree(kept).await;
+                        }
                         if !quiet {
                             println!(
                                 "Rebuilt {} ({})",
@@ -1477,6 +1490,9 @@ pub(crate) async fn repair_vendored_artifacts(
                         // remove it rather than leave unverifiable bytes.
                         remove_vendor_dir(&common.cwd, &check_entry.ecosystem, &check_entry.uuid)
                             .await;
+                        if let Some((live, kept)) = &aside {
+                            restore_aside_vendor_dir(live, kept).await;
+                        }
                         fail(
                             env,
                             quiet,
@@ -1605,6 +1621,34 @@ fn npm_coords(base_purl: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn rebuild_preserves_previous_backup_and_live_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join(".socket/vendor/npm/patch-uuid");
+        let kept = root
+            .path()
+            .join(".socket/vendor/npm/patch-uuid.pre-rebuild");
+        tokio::fs::create_dir_all(&live).await.unwrap();
+        tokio::fs::create_dir_all(&kept).await.unwrap();
+        tokio::fs::write(live.join("artifact"), b"live")
+            .await
+            .unwrap();
+        tokio::fs::write(kept.join("artifact"), b"previous")
+            .await
+            .unwrap();
+        assert!(set_aside_vendor_dir(root.path(), "npm", "patch-uuid")
+            .await
+            .is_err());
+        assert_eq!(
+            tokio::fs::read(live.join("artifact")).await.unwrap(),
+            b"live"
+        );
+        assert_eq!(
+            tokio::fs::read(kept.join("artifact")).await.unwrap(),
+            b"previous"
+        );
+    }
+
     /// Build a local native binary resolution through the public binary
     /// rewrite entry point, which shares the codec with vendor's backend.
     fn native_binary_vendor_fixture(uuid: &str) -> Vec<u8> {
@@ -1709,7 +1753,11 @@ mod tests {
         let fifos = ["tool.py", "bun.lock"];
         for name in fifos {
             let c = std::ffi::CString::new(root.join(name).to_str().unwrap()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo {name}");
+            assert_eq!(
+                unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+                0,
+                "mkfifo {name}"
+            );
         }
         // Release valve: if a read DID wedge in open(2), connecting a
         // writer lets the blocking thread finish so the runtime can shut
@@ -1759,7 +1807,9 @@ mod tests {
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join("requirements/base.txt"),
             format!(

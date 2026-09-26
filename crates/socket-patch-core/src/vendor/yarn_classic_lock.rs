@@ -21,6 +21,7 @@
 //! blocks (comments, blank lines, other blocks, CRLF line endings) is
 //! preserved verbatim, so yarn's re-serialization produces no churn.
 
+use crate::utils::fs::read_regular_to_string;
 use std::path::Path;
 
 use serde_json::Value;
@@ -94,18 +95,22 @@ pub async fn vendor_yarn_classic(
     }
 
     // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────────
-    let mut candidate_keys: Vec<String> = Vec::new();
+    let mut candidates = Vec::new();
     let blocks = scan_blocks(&text);
+    let mut key_counts = std::collections::HashMap::new();
+    for block in &blocks {
+        *key_counts.entry(block.key.as_str()).or_insert(0usize) += 1;
+    }
     for block in &blocks {
         match classify_classic_block(block, name, version) {
-            BlockClass::Candidate => candidate_keys.push(block.key.clone()),
+            BlockClass::Candidate => candidates.push(block),
             BlockClass::LinkSkip(detail) => {
                 warnings.push(VendorWarning::new("vendor_link_entry_skipped", detail));
             }
             BlockClass::NoMatch => {}
         }
     }
-    if candidate_keys.is_empty() {
+    if candidates.is_empty() {
         return refused(
             "vendor_lock_entry_not_found",
             format!(
@@ -119,8 +124,9 @@ pub async fn vendor_yarn_classic(
     // it would splice the first same-key block, even a version-mismatched
     // one classification never selected, and leave yarn's winner resolving
     // to the registry — success reported, package unpatched. Refuse-early.
-    for key in &candidate_keys {
-        if blocks.iter().filter(|b| &b.key == key).count() > 1 {
+    for block in &candidates {
+        let key = &block.key;
+        if key_counts[key.as_str()] > 1 {
             return refused(
                 "vendor_lock_entry_ambiguous",
                 format!(
@@ -131,7 +137,6 @@ pub async fn vendor_yarn_classic(
             );
         }
     }
-    drop(blocks);
 
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline) ───────
     // A wiring failure past this point must unwind the uuid dir staging is
@@ -174,56 +179,40 @@ pub async fn vendor_yarn_classic(
 
     // ── 8. Lock rewrite: splice each candidate block, byte-preserving ─────
     let eol = detect_eol(&text);
-    let mut new_text = text;
+    let mut new_text = String::with_capacity(text.len());
+    let mut copied_until = 0;
     let mut wiring: Vec<WiringRecord> = Vec::new();
-    for key in &candidate_keys {
-        let edit = {
-            let blocks = scan_blocks(&new_text);
-            let Some(block) = blocks.iter().find(|b| &b.key == key) else {
-                return done_failure_unstage(
-                    purl,
-                    format!("lock block `{key}` vanished mid-rewrite"),
-                    project_root,
-                    &uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await;
-            };
-            let new_lines = rewrite_classic_block(
-                &block.lines,
-                &resolved_value,
-                &packed.integrity,
-                staged_pkg_json.as_ref(),
-            );
-            if new_lines == block.lines {
-                // Idempotency: already carrying our exact spec — no edit, no
-                // wiring record.
+    for block in candidates {
+        let new_lines = rewrite_classic_block(
+            &block.lines,
+            &resolved_value,
+            &packed.integrity,
+            staged_pkg_json.as_ref(),
+        );
+        if new_lines == block.lines {
+            continue;
+        }
+        let was_vendored = block_points_into_vendor(&block.lines);
+        wiring.push(WiringRecord {
+            file: YARN_LOCK.to_string(),
+            kind: KIND_LOCK_BLOCK.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(block.key.clone()),
+            original: if was_vendored {
                 None
             } else {
-                // Never record one of our own (stale) edits as the
-                // "original" — revert must restore the pre-vendor registry
-                // fragment, not a dangling `.socket/vendor/` pointer.
-                let was_vendored = block_points_into_vendor(&block.lines);
-                let rec = WiringRecord {
-                    file: YARN_LOCK.to_string(),
-                    kind: KIND_LOCK_BLOCK.to_string(),
-                    action: WiringAction::Rewritten,
-                    key: Some(key.clone()),
-                    original: if was_vendored {
-                        None
-                    } else {
-                        Some(lines_to_json(&block.lines))
-                    },
-                    new: Some(lines_to_json(&new_lines)),
-                };
-                Some((replace_block(&new_text, block, &new_lines, eol), rec))
-            }
-        };
-        if let Some((replaced, rec)) = edit {
-            new_text = replaced;
-            wiring.push(rec);
+                Some(lines_to_json(&block.lines))
+            },
+            new: Some(lines_to_json(&new_lines)),
+        });
+        new_text.push_str(&text[copied_until..block.start]);
+        new_text.push_str(&new_lines.join(eol));
+        if block.terminated {
+            new_text.push_str(eol);
         }
+        copied_until = block.end;
     }
+    new_text.push_str(&text[copied_until..]);
     if staged_pkg_json.is_some() && !wiring.is_empty() {
         warnings.push(VendorWarning::new(
             "vendor_dep_manifest_rewritten",
@@ -713,28 +702,6 @@ pub(super) async fn read_yarn_lock(project_root: &Path) -> Result<String, Box<Ve
             format!("cannot read {YARN_LOCK}: {e}"),
         ))),
     }
-}
-
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (npm_lock.rs, pnpm_lock.rs, lock_inventory.rs): `open_regular_file`
-/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
-/// as yarn.lock / package.json / .yarnrc.yml fails fast instead of wedging
-/// vendor / revert forever in an `open(2)` waiting for a writer.
-pub(super) async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// [`read_regular`], decoded as UTF-8 (`InvalidData` on failure, matching
-/// `read_to_string`'s error kind).
-pub(super) async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    let bytes = read_regular(path).await?;
-    String::from_utf8(bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// One key-line block of a yarn lockfile (classic or berry).
@@ -1477,8 +1444,14 @@ left-pad@^1.3.0:
         for lock in [wrong_version_dup, both_candidates_dup] {
             let fx = fixture_with_lock(lock).await;
             let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_ambiguous");
-            assert!(detail.contains("left-pad@^1.3.0"), "names the key: {detail}");
-            assert!(detail.contains("yarn install"), "actionable detail: {detail}");
+            assert!(
+                detail.contains("left-pad@^1.3.0"),
+                "names the key: {detail}"
+            );
+            assert!(
+                detail.contains("yarn install"),
+                "actionable detail: {detail}"
+            );
             assert_eq!(
                 tokio::fs::read(fx.lock_path()).await.unwrap(),
                 fx.lock_bytes,
@@ -2079,7 +2052,9 @@ left-pad@^1.3.0:
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(
-            !warnings.iter().any(|w| w.code == "vendor_link_entry_skipped"),
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_link_entry_skipped"),
             "a file: TARBALL range is rewritable, not a link-skip: {warnings:?}"
         );
         let entry = entry.expect("success carries a ledger entry");
@@ -2263,7 +2238,11 @@ left-pad@^1.3.0:
         // (c) Recorded key gone AND the original block not live anywhere:
         // deleted-since-vendoring drift.
         let absent = vec!["absent@^9:".to_string(), "  version \"9.0.0\"".to_string()];
-        let rec = wrec(Some("absent@^9"), KIND_LOCK_BLOCK, Some(lines_to_json(&absent)));
+        let rec = wrec(
+            Some("absent@^9"),
+            KIND_LOCK_BLOCK,
+            Some(lines_to_json(&absent)),
+        );
         let (changed, text, warnings) = run(Y2_AFTER, &rec);
         assert!(!changed);
         assert_eq!(text, Y2_AFTER);
@@ -2437,16 +2416,18 @@ left-pad@^1.3.0:
         // A DIRECTORY squatting on the marker path: the tarball pack into
         // the (pre-existing) uuid dir succeeds, the marker's atomic rename
         // onto a directory fails.
-        let marker_path = fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"));
+        let marker_path = fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ));
         tokio::fs::create_dir_all(&marker_path).await.unwrap();
 
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the vendor itself succeeded");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert!(fx.tgz_path().exists(), "tarball packed");
@@ -2555,7 +2536,9 @@ left-pad@^1.3.0:
             outcome.warnings
         );
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "artifact removed on the re-run"
         );
         assert_eq!(

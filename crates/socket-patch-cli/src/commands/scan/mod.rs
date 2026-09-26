@@ -473,6 +473,7 @@ fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
 /// never persists blobs (the vendor step consumes the staged sources).
 fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
+        lock_timeout: args.common.lock_timeout,
         cwd: args.common.cwd.clone(),
         manifest_path: args.common.resolved_manifest_path(),
         org: args.common.org.clone(),
@@ -1722,12 +1723,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         } else if args.common.global || args.common.global_prefix.is_some() {
             println!("No global packages found.");
         } else {
-            #[allow(unused_mut)]
-            let mut install_cmds = String::from("npm/yarn/pnpm/pip");
-            install_cmds.push_str("/cargo");
-            install_cmds.push_str("/go");
-            install_cmds.push_str("/mvn");
-            install_cmds.push_str("/composer");
+            let install_cmds = "npm/yarn/pnpm/pip/cargo/go/mvn/composer";
             println!("No packages found. Run {install_cmds} install first.");
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
@@ -4218,7 +4214,12 @@ mod tests {
         let mut env = vendor_env();
         note_vendor_supersedes_redirect(&mut env, root, &takeover_common()).await;
 
-        assert_eq!(env.warnings.len(), 1, "exactly one warning: {:?}", env.warnings);
+        assert_eq!(
+            env.warnings.len(),
+            1,
+            "exactly one warning: {:?}",
+            env.warnings
+        );
         assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
         assert!(
             env.warnings[0].detail.contains("reconciled automatically"),
@@ -4277,7 +4278,10 @@ mod tests {
             env.warnings[0].detail
         );
         let after = tokio::fs::read(&ledger_path).await.unwrap();
-        assert_eq!(before, after, "a dry run must leave the ledger byte-identical");
+        assert_eq!(
+            before, after,
+            "a dry run must leave the ledger byte-identical"
+        );
     }
 
     #[tokio::test]
@@ -4332,8 +4336,7 @@ mod tests {
         // Root ignores mode bits; skip there (CI containers sometimes run as root).
         if std::fs::File::create(vendor_dir.join("probe")).is_ok() {
             let _ = std::fs::remove_file(vendor_dir.join("probe"));
-            let _ =
-                std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o755));
             eprintln!("skipping: running as root, 0555 does not block writes");
             return;
         }
@@ -4348,19 +4351,25 @@ mod tests {
         assert_eq!(env.warnings.len(), 1, "{:?}", env.warnings);
         assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
         assert!(
-            env.warnings[0].detail.contains("Automatic reconciliation failed"),
+            env.warnings[0]
+                .detail
+                .contains("Automatic reconciliation failed"),
             "the persist failure must be surfaced inside the warning: {}",
             env.warnings[0].detail
         );
         assert!(
-            env.warnings[0]
-                .detail
-                .starts_with(&mode_takeover_detail(&[NPM_TAKEOVER_PURL.to_string()], false)),
+            env.warnings[0].detail.starts_with(&mode_takeover_detail(
+                &[NPM_TAKEOVER_PURL.to_string()],
+                false
+            )),
             "the failure text must ride on the full manual remediation: {}",
             env.warnings[0].detail
         );
         // Fail closed: the atomic writer left the ledger fully pre-drop.
         let after = tokio::fs::read(&ledger_path).await.unwrap();
-        assert_eq!(before, after, "a failed persist must leave the ledger untouched");
+        assert_eq!(
+            before, after,
+            "a failed persist must leave the ledger untouched"
+        );
     }
 }
