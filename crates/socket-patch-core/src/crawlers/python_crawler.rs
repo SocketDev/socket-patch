@@ -1016,8 +1016,10 @@ fn site_query_key() -> SiteQueryKey {
     (env, std::env::current_dir().ok())
 }
 
-/// The last `(key, answer)` of an expensive query, re-run whenever the key
-/// differs.
+/// The last successful `(key, answer)` of an expensive query, re-run
+/// whenever the key differs. A failed query (`None`) is never stored, so the
+/// next ask runs it again exactly as an unmemoized caller would: a transient
+/// spawn failure during the crawl cannot blank the vendor phase's answer.
 struct KeyedMemo<K, V> {
     slot: std::sync::Mutex<Option<(K, V)>>,
 }
@@ -1029,7 +1031,7 @@ impl<K: PartialEq, V: Clone> KeyedMemo<K, V> {
         }
     }
 
-    fn get_or_run(&self, key: K, run: impl FnOnce() -> V) -> V {
+    fn get_or_run(&self, key: K, run: impl FnOnce() -> Option<V>) -> Option<V> {
         let lock = || {
             self.slot
                 .lock()
@@ -1037,12 +1039,12 @@ impl<K: PartialEq, V: Clone> KeyedMemo<K, V> {
         };
         if let Some((cached, value)) = lock().as_ref() {
             if *cached == key {
-                return value.clone();
+                return Some(value.clone());
             }
         }
-        let value = run();
+        let value = run()?;
         *lock() = Some((key, value.clone()));
-        value
+        Some(value)
     }
 }
 
@@ -1050,8 +1052,23 @@ impl<K: PartialEq, V: Clone> KeyedMemo<K, V> {
 /// plus the `site` query — two process spawns), per [`SiteQueryKey`]: a
 /// scan asks it once for its crawl and again when it vendors, in the same
 /// environment, so the second ask re-spawned both processes for the same
-/// output.
-static SITE_QUERY_MEMO: KeyedMemo<SiteQueryKey, Option<String>> = KeyedMemo::new();
+/// output. Only a successful answer is kept (see [`KeyedMemo`]).
+static SITE_QUERY_MEMO: KeyedMemo<SiteQueryKey, String> = KeyedMemo::new();
+
+/// The unmemoized interpreter query: probe for a python and ask it for its
+/// site-packages. [`SITE_QUERY_MEMO`] wraps this; tests call it directly as
+/// the oracle the memoized answer must equal.
+fn run_site_query() -> Option<String> {
+    let python_cmd = find_python_command()?;
+    let runner = SystemCommandRunner;
+    runner.run(
+        python_cmd,
+        &[
+            "-c",
+            "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
+        ],
+    )
+}
 
 /// Get global/system Python `site-packages` directories.
 ///
@@ -1074,17 +1091,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 
     // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
     let site_output = run_blocking(|| {
-        SITE_QUERY_MEMO.get_or_run(site_query_key(), || {
-            let python_cmd = find_python_command()?;
-            let runner = SystemCommandRunner;
-            runner.run(
-                python_cmd,
-                &[
-                    "-c",
-                    "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
-                ],
-            )
-        })
+        SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query)
     })
     .await;
     if let Some(stdout) = site_output {
@@ -2845,12 +2852,13 @@ mod tests {
 
     /// DC-6: the interpreter query memo answers from its slot only for the
     /// exact key it was filled under, re-runs on any other key (a changed
-    /// environment or working directory), and keeps a failed query's
-    /// `None` the same way.
+    /// environment or working directory), and never keeps a failed query's
+    /// `None`: the next ask with the same key runs the query again, as an
+    /// unmemoized caller would.
     #[test]
     fn keyed_memo_reruns_only_on_a_different_key() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let memo: KeyedMemo<(u32, &str), Option<String>> = KeyedMemo::new();
+        let memo: KeyedMemo<(u32, &str), String> = KeyedMemo::new();
         let runs = AtomicUsize::new(0);
         let run = |out: Option<&str>| {
             runs.fetch_add(1, Ordering::SeqCst);
@@ -2865,20 +2873,73 @@ mod tests {
             Some("x".into())
         );
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+        // A failure is returned but not stored: the same key re-runs.
         assert_eq!(memo.get_or_run((2, "a"), || run(None)), None);
-        assert_eq!(memo.get_or_run((2, "a"), || run(Some("y"))), None);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            memo.get_or_run((2, "a"), || run(Some("y"))),
+            Some("y".into())
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            memo.get_or_run((2, "a"), || run(Some("stale"))),
+            Some("y".into())
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        // A failure under a new key leaves nothing cached for the old one
+        // to be served from, and the old key re-runs.
+        assert_eq!(memo.get_or_run((3, "a"), || run(None)), None);
         assert_eq!(
             memo.get_or_run((1, "a"), || run(Some("z"))),
             Some("z".into())
         );
-        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        assert_eq!(runs.load(Ordering::SeqCst), 5);
     }
 
-    /// DC-6: in an unchanged process environment the memoized global
-    /// site-packages discovery answers exactly what a fresh one does.
-    #[tokio::test]
-    async fn global_site_packages_are_stable_across_calls() {
-        let first = get_global_python_site_packages().await;
-        assert_eq!(get_global_python_site_packages().await, first);
+    /// DC-6: the memoized site query is wired to the whole environment.
+    /// Under two different `PYTHONUSERBASE` values (the interpreter's
+    /// `getusersitepackages` follows it) the memoized answer equals the
+    /// unmemoized oracle each time, and a repeat ask in the same
+    /// environment still equals it. A constant memo key fails the second
+    /// comparison. `#[serial]`: it mutates the process environment, and so
+    /// does every other env test in this binary.
+    #[test]
+    #[serial_test::serial]
+    fn site_query_memo_follows_the_environment() {
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: &Path) -> Self {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+        let memoized = || SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query);
+
+        let base_a = tempfile::tempdir().unwrap();
+        let base_b = tempfile::tempdir().unwrap();
+        for base in [&base_a, &base_b] {
+            let _env = EnvGuard::set("PYTHONUSERBASE", base.path());
+            let oracle = run_site_query();
+            assert_eq!(memoized(), oracle);
+            assert_eq!(memoized(), oracle);
+            if let Some(out) = &oracle {
+                // Non-vacuous whenever an interpreter is present: the
+                // answer really carries this environment's user base.
+                let needle = base.path().file_name().unwrap().to_string_lossy();
+                assert!(out.contains(needle.as_ref()), "{out}");
+            }
+        }
     }
 }
