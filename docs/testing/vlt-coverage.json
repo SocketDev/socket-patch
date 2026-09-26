@@ -1,0 +1,426 @@
+{
+  "comment": "The vlt coverage map (DESIGN §8.4): every §2.3 code and advisory detail variant, every mode × command cell and every era × OS cell, mapped to the tests (fn names; `golden:<dir>` for a redirect golden case under crates/socket-patch-core/tests/fixtures/redirect/) or CI rows (`ci:<suite>:<os>:<vlt>` in ci.yml's e2e job, `compat:<os>:<vlt>` in vlt-compatibility.yml's install-proof job) that assert them. scripts/tests/test_vlt_coverage.py checks every name.",
+  "codes": {
+    "redirect_vlt_lock_unsupported": [
+      "scan_redirect_refuses_vlt_lock_v2",
+      "vlt_takeover_refusal_before_revert",
+      "golden:npm/vlt/lock-version-unsupported",
+      "golden:npm/vlt/bom-refusal",
+      "golden:npm/vlt/non-canonical-layout-refusal"
+    ],
+    "redirect_vlt_missing_sha512": [
+      "missing_sha512_and_empty_sha512_refuse",
+      "golden:npm/vlt/missing-sha512"
+    ],
+    "redirect_vlt_entry_not_found": [
+      "scan_redirect_vlt_drives_entry_not_found_sibling_rewrite_does_not_confirm"
+    ],
+    "redirect_vlt_entry_vendored": [
+      "vlt_dry_run_over_vendored_project_previews_the_wet_takeover"
+    ],
+    "redirect_vlt_unsupported_lock_key": [
+      "an_unsupported_instance_refuses_every_instance_of_the_dep_only",
+      "residual_gate_refuses_when_the_parsed_node_is_not_the_spliced_line",
+      "scan_redirect_vlt_sibling_package_lock_vlt_installed_does_not_confirm_refused",
+      "vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed"
+    ],
+    "redirect_vlt_custom_registry_skipped": [
+      "scan_redirect_vlt_foreign_instance_vex_not_attested",
+      "vlt_pinned_matrix_hosted_named_alias_untouched",
+      "vlt_pinned_matrix_hosted_scoped_registry_untouched",
+      "vlt_pinned_matrix_hosted_jsr_untouched",
+      "golden:npm/vlt/custom-registry-skipped"
+    ],
+    "redirect_vlt_old_lockfile_ignored": [
+      "scan_redirect_rewrites_vlt_lock_a0",
+      "scan_redirect_vlt_old_lockfile_vex_not_attested",
+      "old_lockfile_ignored_counts_only_empty_and_registry_url_segments",
+      "vlt_pinned_matrix_hosted_old_lockfile_ignored"
+    ],
+    "redirect_vlt_scalar_registry_ignored": [
+      "vlt_pinned_matrix_hosted_mirror_registries_npm",
+      "golden:npm/vlt/scalar-registry-warning",
+      "golden:npm/vlt/scalar-registry-v0-with-registries-npm"
+    ],
+    "redirect_vlt_lockfile_version_missing": [
+      "scan_redirect_rewrites_vlt_lock_a0",
+      "scan_redirect_vlt_a0_vex_not_attested",
+      "golden:npm/vlt/lock-absent-version-warning"
+    ],
+    "redirect_vlt_sibling_lockfiles": [
+      "scan_redirect_vlt_sibling_package_lock_ambiguous",
+      "a_bun_lockb_on_disk_is_a_sibling_outside_files",
+      "vlt_pinned_matrix_migration_pm_switch_npm_to_vlt"
+    ],
+    "redirect_vlt_no_lockfile": [
+      "golden:npm/vlt/no-lockfile-vlt-json",
+      "golden:npm/vlt/hidden-lock-sentinel",
+      "golden:npm/vlt/hidden-lock-sentinel-only"
+    ],
+    "redirect_vlt_artifact_unverifiable": [
+      "scan_redirect_vlt_artifact_content_encoding_refused",
+      "scan_redirect_vlt_artifact_sha512_mismatch",
+      "scan_redirect_vlt_artifact_http_404",
+      "scan_redirect_vlt_artifact_http_500",
+      "scan_redirect_vlt_artifact_fetch_error",
+      "scan_redirect_vlt_artifact_already_pinned_failure_left_pinned",
+      "every_failure_reason",
+      "vlt_pinned_matrix_hosted_content_encoding_refused",
+      "vlt_pinned_matrix_production_hosted_install_proof"
+    ],
+    "redirect_vlt_reinstall_required": [
+      "scan_redirect_vlt_heal_advisory_texts_exact",
+      "vlt_hosted_remove_restores_and_emits_the_advisory",
+      "vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals",
+      "vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy"
+    ],
+    "vendor_vlt_transitive_unsupported": [
+      "vendor_vlt_refuses_transitive",
+      "target_analysis_refusals",
+      "every_lock_decidable_refusal_is_reported_per_npm_purl",
+      "vlt_pinned_matrix_vendored_transitive_refused"
+    ],
+    "vendor_vlt_lock_out_of_sync": [
+      "vendor_vlt_out_of_sync",
+      "every_lock_decidable_refusal_is_reported_per_npm_purl",
+      "get_vendored_vlt_refusal_visible_under_silent"
+    ],
+    "vendor_vlt_legacy_lockfile": [
+      "vendor_vlt_legacy_lockfile_warning",
+      "the_legacy_era_warns_and_wires_with_its_own_grammar",
+      "vlt_pinned_matrix_vendored_legacy_lockfile_warning"
+    ],
+    "vendor_flavor_changed": [
+      "vendor_vlt_refuses_flavor_changed",
+      "flavor_change_to_or_from_vlt_refuses_before_any_write",
+      "the_ledger_decides_before_the_lock",
+      "vlt_pinned_matrix_migration_flavor_changed"
+    ],
+    "vendor_artifact_gitignored": [
+      "vendor_vlt_refuses_gitignored_payload",
+      "a_gitignored_payload_refuses_and_unwinds",
+      "a_root_socket_ignore_refuses_before_any_write"
+    ],
+    "vlt_root_scripts_not_run": [
+      "setup_vlt_before_rc13_emits_the_definite_advisory",
+      "setup_vlt_without_a_usable_vlt_reads_the_lock",
+      "setup_vlt_advisory_prints_on_stderr_in_human_mode",
+      "vlt_pinned_matrix_setup_root_scripts_advisory"
+    ]
+  },
+  "advisoryVariants": {
+    "redirect_vlt_reinstall_required: stale copies removed": [
+      "scan_redirect_vlt_heal_advisory_texts_exact",
+      "scan_redirect_vlt_warm_tree_invalidates_stale_store",
+      "vlt_pinned_matrix_hosted_warm_tree_invalidates"
+    ],
+    "redirect_vlt_reinstall_required: cleanup skipped (--no-vlt-install-cleanup, SOCKET_NO_VLT_INSTALL_CLEANUP)": [
+      "scan_redirect_vlt_no_install_cleanup_flag_keeps_tree",
+      "scan_redirect_vlt_env_socket_no_vlt_install_cleanup",
+      "vlt_pinned_matrix_hosted_no_cleanup_stays_stale"
+    ],
+    "redirect_vlt_reinstall_required: dry run, nothing removed": [
+      "scan_redirect_vlt_heal_dry_run_deletes_nothing_emits_iii"
+    ],
+    "redirect_vlt_reinstall_required: copies could not be checked": [
+      "scan_redirect_vlt_heal_undeterminable_node_modules_symlink_not_deleted",
+      "scan_redirect_vlt_undeterminable_vex_not_attested"
+    ],
+    "redirect_vlt_reinstall_required: none stale": [
+      "scan_redirect_vlt_rerun_does_not_invalidate_healthy_tree"
+    ],
+    "redirect_vlt_reinstall_required: optional copies kept": [
+      "scan_redirect_vlt_heal_keeps_stale_optional_instance",
+      "scan_redirect_vlt_heal_removes_the_prod_instance_keeps_the_optional_one",
+      "vlt_pinned_matrix_hosted_optional_dependency_heal"
+    ],
+    "redirect_vlt_reinstall_required: rollback / remove (patched copies removed or kept)": [
+      "vlt_hosted_round_trip",
+      "vlt_rollback_keeps_a_patched_optional_copy",
+      "vlt_rollback_removes_the_prod_copy_keeps_the_optional_one",
+      "vlt_hosted_remove_restores_and_emits_the_advisory"
+    ],
+    "redirect_vlt_reinstall_required: hosted to vendored takeover": [
+      "vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy",
+      "vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store",
+      "vlt_pinned_matrix_hosted_then_vendored_optional_takeover"
+    ],
+    "redirect_vlt_artifact_unverifiable: content-encoding": [
+      "scan_redirect_vlt_artifact_content_encoding_refused"
+    ],
+    "redirect_vlt_artifact_unverifiable: sha512 mismatch": [
+      "scan_redirect_vlt_artifact_sha512_mismatch"
+    ],
+    "redirect_vlt_artifact_unverifiable: http status": [
+      "scan_redirect_vlt_artifact_http_404",
+      "scan_redirect_vlt_artifact_http_500"
+    ],
+    "redirect_vlt_artifact_unverifiable: fetch error": [
+      "scan_redirect_vlt_artifact_fetch_error",
+      "scan_redirect_vlt_artifact_redirect_chain_11_fails"
+    ],
+    "redirect_vlt_artifact_unverifiable: offline": [
+      "every_failure_reason"
+    ],
+    "redirect_vlt_artifact_unverifiable: left pinned by an earlier run": [
+      "scan_redirect_vlt_artifact_already_pinned_failure_left_pinned"
+    ],
+    "vlt_root_scripts_not_run: definite (vlt --version below rc.13)": [
+      "setup_vlt_before_rc13_emits_the_definite_advisory",
+      "vlt_pinned_matrix_setup_root_scripts_advisory"
+    ],
+    "vlt_root_scripts_not_run: may (lock sniff)": [
+      "setup_vlt_without_a_usable_vlt_reads_the_lock",
+      "setup_vlt_rc13_and_later_reads_the_lock_it_would_not_write",
+      "setup_vlt_version_probe_times_out_to_the_lock_sniff"
+    ],
+    "vlt_root_scripts_not_run: none (unparseable --version)": [
+      "setup_vlt_unparseable_version_emits_no_advisory"
+    ]
+  },
+  "modeCommand": {
+    "hosted/scan": [
+      "scan_redirect_rewrites_vlt_lock_v1",
+      "scan_redirect_rewrites_vlt_lock_v0",
+      "vlt_pinned_matrix_hosted_scan_fresh_ci"
+    ],
+    "hosted/get": [
+      "scan_redirect_vlt_artifact_get_uuid_driver",
+      "vlt_pinned_matrix_hosted_get_uuid_fresh_ci"
+    ],
+    "hosted/rollback": [
+      "vlt_hosted_round_trip",
+      "vlt_rollback_after_comma_move",
+      "vlt_rollback_after_e0_flag_change",
+      "vlt_pinned_matrix_hosted_rollback_byte_exact"
+    ],
+    "hosted/remove": [
+      "vlt_hosted_remove_restores_and_emits_the_advisory"
+    ],
+    "hosted/vex": [
+      "hosted_every_vlt_era_manifestless_evidence_cells",
+      "vlt_pinned_matrix_hosted_manifestless_vex"
+    ],
+    "hosted/takeover (vendored to hosted)": [
+      "vlt_vendored_then_scan_hosted_takeover_round_trips_to_registry",
+      "vlt_vendored_then_get_hosted_takeover_round_trips_to_registry",
+      "vlt_pinned_matrix_migration_vendored_then_hosted"
+    ],
+    "vendored/vendor": [
+      "vendor_vlt_direct_v1",
+      "vendor_vlt_direct_v0",
+      "vendor_vlt_workspace_member",
+      "vendor_vlt_alias_edge"
+    ],
+    "vendored/scan": [
+      "vlt_pinned_matrix_vendored_scan_fresh_ci"
+    ],
+    "vendored/get": [
+      "get_uuid_vendored_vlt_vendors_refuses_and_agent_bypasses",
+      "vlt_pinned_matrix_vendored_get_build_fresh_ci",
+      "vlt_pinned_matrix_vendored_get_service_fresh_ci"
+    ],
+    "vendored/revert": [
+      "vendor_vlt_revert_byte_exact",
+      "vendor_vlt_revert_identity_already_reverted",
+      "vendor_vlt_revert_cross_grammar_drift_detail",
+      "vlt_pinned_matrix_vendored_revert_byte_exact"
+    ],
+    "vendored/repair": [
+      "vlt_repair_rebuilds_a_deleted_dir",
+      "vlt_repair_reconstructs_the_ledger_from_the_lock",
+      "vlt_pinned_matrix_vendored_repair_rebuilds"
+    ],
+    "vendored/remove": [
+      "remove_reverts_a_vlt_vendored_entry"
+    ],
+    "vendored/list": [
+      "list_json_labels_a_vlt_vendored_entry"
+    ],
+    "vendored/vex": [
+      "vendored_every_vlt_era_manifestless_evidence_cells",
+      "vlt_pinned_matrix_vendored_manifestless_vex"
+    ],
+    "vendored/takeover (hosted to vendored)": [
+      "vlt_hosted_then_scan_vendored_takeover_round_trips_to_registry",
+      "vlt_vendored_preflight_refuses_before_the_hosted_revert",
+      "vlt_pinned_matrix_migration_hosted_then_vendored"
+    ],
+    "vendored/scan --prune": [
+      "scan_prune_keeps_a_wired_vlt_uuid_and_sweeps_an_unwired_one"
+    ],
+    "agent/scan": [
+      "vlt_pinned_matrix_agent_scan_apply_rollback_list",
+      "vlt_pinned_matrix_agent_lockfile_supplement"
+    ],
+    "agent/get": [
+      "vlt_pinned_matrix_agent_get_and_remove"
+    ],
+    "agent/apply": [
+      "apply_and_rollback_reach_every_vlt_variant_copy",
+      "vlt_layout_prints_informational_note_in_human_mode",
+      "vlt_pinned_matrix_agent_install_then_apply_patches_file"
+    ],
+    "agent/rollback": [
+      "apply_and_rollback_reach_every_vlt_variant_copy",
+      "vlt_pinned_matrix_safety_agent_rollback"
+    ],
+    "agent/remove": [
+      "vlt_pinned_matrix_agent_get_and_remove"
+    ],
+    "agent/list": [
+      "vlt_pinned_matrix_agent_scan_apply_rollback_list"
+    ],
+    "agent/vex": [
+      "vlt_pinned_matrix_agent_reruns_and_vex"
+    ],
+    "agent/crawl": [
+      "find_by_purls_resolves_vlt_store_transitives",
+      "crawl_all_inventories_vlt_store_exactly_once",
+      "test_decode_vlt_dep_id_table"
+    ],
+    "setup": [
+      "setup_detects_vlt_from_lockfile",
+      "setup_detects_vlt_from_vlt_json",
+      "setup_vlt_workspace_only_updates_root",
+      "vlt_pinned_matrix_setup_hook_fires_per_reify",
+      "vlt_pinned_matrix_setup_hook_failure"
+    ]
+  },
+  "eraOs": {
+    "A0/linux": [
+      "ci:e2e_redirect_vlt_build:ubuntu-latest:0.0.0-16",
+      "compat:ubuntu-latest:0.0.0-1",
+      "compat:ubuntu-latest:0.0.0-11",
+      "compat:ubuntu-latest:0.0.0-16",
+      "compat:ubuntu-latest:0.0.0-18"
+    ],
+    "A0/macos": [
+      "compat:macos-latest:0.0.0-16"
+    ],
+    "A0/windows": [
+      "compat:windows-latest:0.0.0-11"
+    ],
+    "A/linux": [
+      "ci:e2e_redirect_vlt_build:ubuntu-latest:0.0.0-32",
+      "ci:e2e_vendor_vlt_build:ubuntu-latest:0.0.0-32",
+      "ci:mode_migration_vlt:ubuntu-latest:0.0.0-32",
+      "ci:e2e_vlt:ubuntu-latest:0.0.0-32",
+      "compat:ubuntu-latest:0.0.0-19",
+      "compat:ubuntu-latest:0.0.0-24",
+      "compat:ubuntu-latest:0.0.0-25",
+      "compat:ubuntu-latest:0.0.0-30",
+      "compat:ubuntu-latest:0.0.0-32",
+      "compat:ubuntu-latest:1.0.0-rc.1",
+      "compat:ubuntu-latest:1.0.0-rc.5",
+      "compat:ubuntu-latest:1.0.0-rc.6",
+      "compat:ubuntu-latest:1.0.0-rc.8"
+    ],
+    "A/macos": [
+      "compat:macos-latest:0.0.0-30",
+      "compat:macos-latest:1.0.0-rc.8"
+    ],
+    "A/windows": [
+      "compat:windows-latest:0.0.0-19",
+      "compat:windows-latest:0.0.0-30"
+    ],
+    "B/linux": [
+      "ci:e2e_redirect_vlt_build:ubuntu-latest:1.0.0-rc.14",
+      "ci:e2e_vendor_vlt_build:ubuntu-latest:1.0.0-rc.14",
+      "ci:mode_migration_vlt:ubuntu-latest:1.0.0-rc.14",
+      "ci:e2e_vlt:ubuntu-latest:1.0.0-rc.12",
+      "compat:ubuntu-latest:1.0.0-rc.9",
+      "compat:ubuntu-latest:1.0.0-rc.12",
+      "compat:ubuntu-latest:1.0.0-rc.13",
+      "compat:ubuntu-latest:1.0.0-rc.14"
+    ],
+    "B/macos": [
+      "compat:macos-latest:1.0.0-rc.13",
+      "compat:macos-latest:1.0.0-rc.14"
+    ],
+    "B/windows": [
+      "ci:e2e_vendor_vlt_build:windows-latest:1.0.0-rc.14",
+      "ci:mode_migration_vlt:windows-latest:1.0.0-rc.14",
+      "ci:e2e_vlt:windows-latest:1.0.0-rc.14",
+      "compat:windows-latest:1.0.0-rc.9",
+      "compat:windows-latest:1.0.0-rc.13",
+      "compat:windows-latest:1.0.0-rc.14"
+    ],
+    "C/linux": [
+      "ci:e2e_redirect_vlt_build:ubuntu-latest:1.0.0-rc.32",
+      "ci:e2e_vendor_vlt_build:ubuntu-latest:1.0.0-rc.32",
+      "ci:e2e_vlt:ubuntu-latest:1.0.0-rc.32",
+      "compat:ubuntu-latest:1.0.0-rc.15",
+      "compat:ubuntu-latest:1.0.0-rc.18",
+      "compat:ubuntu-latest:1.0.0-rc.22",
+      "compat:ubuntu-latest:1.0.0-rc.29",
+      "compat:ubuntu-latest:1.0.0-rc.30",
+      "compat:ubuntu-latest:1.0.0-rc.32"
+    ],
+    "C/macos": [
+      "compat:macos-latest:1.0.0-rc.15",
+      "compat:macos-latest:1.0.0-rc.22"
+    ],
+    "C/windows": [
+      "compat:windows-latest:1.0.0-rc.15",
+      "compat:windows-latest:1.0.0-rc.18",
+      "compat:windows-latest:1.0.0-rc.22"
+    ],
+    "D/linux": [
+      "ci:e2e_redirect_vlt_build:ubuntu-latest:1.0.4",
+      "ci:e2e_vendor_vlt_build:ubuntu-latest:1.0.4",
+      "ci:e2e_vlt:ubuntu-latest:1.0.7",
+      "compat:ubuntu-latest:1.0.0-rc.33",
+      "compat:ubuntu-latest:1.0.4",
+      "compat:ubuntu-latest:1.0.5",
+      "compat:ubuntu-latest:1.0.7"
+    ],
+    "D/macos": [
+      "compat:macos-latest:1.0.0-rc.33"
+    ],
+    "D/windows": [
+      "compat:windows-latest:1.0.0-rc.33",
+      "compat:windows-latest:1.0.5"
+    ],
+    "E/linux": [
+      "ci:e2e_redirect_vlt_build:ubuntu-latest:1.1.1",
+      "compat:ubuntu-latest:1.0.8",
+      "compat:ubuntu-latest:1.0.10",
+      "compat:ubuntu-latest:1.1.1"
+    ],
+    "E/macos": [
+      "compat:macos-latest:1.0.8",
+      "compat:macos-latest:1.1.1"
+    ],
+    "E/windows": [
+      "compat:windows-latest:1.0.8",
+      "compat:windows-latest:1.0.10",
+      "compat:windows-latest:1.1.1"
+    ],
+    "F/linux": [
+      "ci:e2e_redirect_vlt_build:ubuntu-latest:1.2.0",
+      "ci:e2e_vendor_vlt_build:ubuntu-latest:1.2.0",
+      "ci:mode_migration_vlt:ubuntu-latest:1.2.0",
+      "ci:e2e_safety_vlt:ubuntu-latest:1.2.0",
+      "ci:e2e_safety_vlt:ubuntu-latest:1.2.0",
+      "ci:e2e_vlt:ubuntu-latest:1.2.0",
+      "compat:ubuntu-latest:1.2.0"
+    ],
+    "F/macos": [
+      "ci:e2e_redirect_vlt_build:macos-latest:1.2.0",
+      "ci:e2e_vendor_vlt_build:macos-latest:1.2.0",
+      "ci:mode_migration_vlt:macos-latest:1.2.0",
+      "ci:e2e_safety_vlt:macos-latest:1.2.0",
+      "ci:e2e_vlt:macos-latest:1.2.0",
+      "compat:macos-latest:1.2.0"
+    ],
+    "F/windows": [
+      "ci:e2e_redirect_vlt_build:windows-latest:1.2.0",
+      "ci:e2e_vendor_vlt_build:windows-latest:1.2.0",
+      "ci:mode_migration_vlt:windows-latest:1.2.0",
+      "ci:e2e_safety_vlt:windows-latest:1.2.0",
+      "ci:e2e_vlt:windows-latest:1.2.0",
+      "compat:windows-latest:1.2.0"
+    ]
+  }
+}

@@ -394,6 +394,23 @@ into the new version's section — see docs/releasing.md.
   found would not write that lock (a v0 lock beside vlt 1.0.0-rc.15 or
   later). `setup --remove` also clears the hooks earlier releases wrote
   into vlt workspace members.
+- **vlt support is proven against real vlt releases.** Every supported vlt
+  release (0.0.0-1 … 1.2.0, see `docs/testing/vlt-compatibility.md` for the
+  excluded ones) ran the five real-vlt capstones locally; CI now runs 35 of
+  those cells on every pull request (ci.yml's `e2e` vlt rows, each checked
+  by `scripts/check-vlt-legs.py` against the leg manifest), the vlt legs of
+  the required `hosted-e2e` production job (hosted and vendored), and the
+  advisory `vlt-compatibility.yml`: every capstone on every era of Linux,
+  macOS and Windows, the Node engine floors, the store linkers,
+  `scripts/backtest-vlt.py` against the production service, a cross-OS
+  `vlt-lock.json` comparison, and nightly `vlt@latest`, release-watchdog and
+  downgrade jobs. `vlt-serve-watchdog.yml` probes the public patch artifact
+  every 6 hours the way vlt fetches it. vlt releases are installed from a
+  sha512-checked `npm pack` (`scripts/install-vlt.sh`, pins in
+  `scripts/vlt-historical-integrity.json`). Hosted vlt projects stay
+  refused (`redirect_vlt_artifact_unverifiable`) until patch.socket.dev
+  stops re-encoding artifacts; vendored and agent mode work against
+  production today.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

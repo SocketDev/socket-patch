@@ -1,0 +1,581 @@
+name: vlt patch compatibility
+
+# Real vlt releases on Linux, macOS and Windows (DESIGN §8.4). ADVISORY: a
+# path-filtered workflow cannot be a required check (a skipped run reads as
+# pending), so the required gate is ci.yml's `e2e` vlt rows. This workflow
+# widens them:
+#   build          the five real-vlt capstones and the CLI, once per OS
+#   install-proof  every capstone on every era of every OS, the Node engine
+#                  floors (plus the collation golden) and the store linkers,
+#                  each run through scripts/check-vlt-legs.py
+#   native         scripts/backtest-vlt.py against the production service
+#   lock-diff      the same cell's vlt-lock.json must be byte-identical on
+#                  Linux, macOS and Windows (these rows also feed depscan)
+#   canary         nightly: vlt@latest through every capstone, plus the
+#                  release and lockfileVersion watchdogs
+#   downgrade      nightly: the latest published socket-patch meets vlt
+#                  ledgers written by this build
+# See docs/testing/vlt-compatibility.md.
+
+on:
+  pull_request:
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - '.github/workflows/vlt-compatibility.yml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/socket-patch-core/src/vendor/**'
+      - 'crates/socket-patch-core/src/patch/**'
+      - 'crates/socket-patch-core/src/crawlers/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-core/src/package_json/**'
+      - 'crates/socket-patch-core/src/utils/fs.rs'
+      - 'crates/socket-patch-core/src/constants.rs'
+      - 'crates/socket-patch-core/tests/**'
+      - 'crates/socket-patch-cli/src/commands/apply.rs'
+      - 'crates/socket-patch-cli/src/commands/rollback.rs'
+      - 'crates/socket-patch-cli/src/commands/remove.rs'
+      - 'crates/socket-patch-cli/src/commands/setup.rs'
+      - 'crates/socket-patch-cli/src/commands/vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/get.rs'
+      - 'crates/socket-patch-cli/src/commands/vlt_preflight.rs'
+      - 'crates/socket-patch-cli/src/commands/scan/**'
+      - 'crates/socket-patch-cli/src/commands/vex*'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/vlt_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/*vlt*'
+      - 'crates/socket-patch-cli/tests/*vlt*/**'
+      - 'crates/socket-patch-cli/tests/vlt-leg-manifest.json'
+      - 'docs/testing/vlt-compatibility.md'
+      - 'scripts/backtest-vlt.py'
+      - 'scripts/check-vlt-legs.py'
+      - 'scripts/install-vlt.sh'
+      - 'scripts/vlt-historical-integrity.json'
+      - 'scripts/gen-vlt-collation-golden.mjs'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - '.github/workflows/vlt-compatibility.yml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/socket-patch-core/src/vendor/**'
+      - 'crates/socket-patch-core/src/patch/**'
+      - 'crates/socket-patch-core/src/crawlers/**'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-core/src/package_json/**'
+      - 'crates/socket-patch-core/src/utils/fs.rs'
+      - 'crates/socket-patch-core/src/constants.rs'
+      - 'crates/socket-patch-core/tests/**'
+      - 'crates/socket-patch-cli/src/commands/apply.rs'
+      - 'crates/socket-patch-cli/src/commands/rollback.rs'
+      - 'crates/socket-patch-cli/src/commands/remove.rs'
+      - 'crates/socket-patch-cli/src/commands/setup.rs'
+      - 'crates/socket-patch-cli/src/commands/vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/get.rs'
+      - 'crates/socket-patch-cli/src/commands/vlt_preflight.rs'
+      - 'crates/socket-patch-cli/src/commands/scan/**'
+      - 'crates/socket-patch-cli/src/commands/vex*'
+      - 'crates/socket-patch-cli/tests/common/**'
+      - 'crates/socket-patch-cli/tests/vlt_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/*vlt*'
+      - 'crates/socket-patch-cli/tests/*vlt*/**'
+      - 'crates/socket-patch-cli/tests/vlt-leg-manifest.json'
+      - 'docs/testing/vlt-compatibility.md'
+      - 'scripts/backtest-vlt.py'
+      - 'scripts/check-vlt-legs.py'
+      - 'scripts/install-vlt.sh'
+      - 'scripts/vlt-historical-integrity.json'
+      - 'scripts/gen-vlt-collation-golden.mjs'
+  schedule:
+    # Nightly: vlt releases and the production service drift with no PR open.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'Space-separated vlt versions for the native backtest (empty = the per-OS defaults)'
+        required: false
+        default: ''
+      shapes:
+        description: 'Space-separated backtest shapes (empty = every shape)'
+        required: false
+        default: ''
+      modes:
+        description: 'Space-separated modes from hosted / vendored / agent (empty = all three)'
+        required: false
+        default: ''
+      nightly:
+        description: 'Also run the nightly canary and downgrade jobs'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# Supersede stale PR runs; main runs are the only rust-cache writers, so they
+# are never cancelled mid-save.
+concurrency:
+  group: vlt-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_INCREMENTAL: '0'
+  LANG: C
+  LC_ALL: C
+
+jobs:
+  matrix-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Every era, suite and OS is covered
+        run: python3 -B -m unittest scripts/tests/test_ci_vlt_rows.py -v
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: vlt-e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Compile the CLI and the vlt capstones once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p socket-patch-cli
+          cargo test --locked -p socket-patch-cli --test e2e_redirect_vlt_build --test e2e_vendor_vlt_build \
+            --test mode_migration_vlt --test e2e_safety_vlt --test e2e_vlt --no-run --message-format=json > target-build.json
+          python3 - <<'PY'
+          import json, pathlib, shutil, sys
+          exe = '.exe' if sys.platform == 'win32' else ''
+          dest = pathlib.Path('target/vlt-e2e')
+          dest.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(f'target/debug/socket-patch{exe}', dest / f'socket-patch{exe}')
+          suites = {'e2e_redirect_vlt_build', 'e2e_vendor_vlt_build', 'mode_migration_vlt', 'e2e_safety_vlt',
+                    'e2e_vlt'}
+          for line in pathlib.Path('target-build.json').read_text().splitlines():
+              item = json.loads(line)
+              name = item.get('target', {}).get('name')
+              if name in suites and item.get('executable') and item.get('profile', {}).get('test'):
+                  shutil.copy2(item['executable'], dest / f'{name}{exe}')
+          missing = [s for s in suites if not (dest / f'{s}{exe}').is_file()]
+          assert not missing, missing
+          PY
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: vlt-e2e-${{ matrix.os }}
+          path: target/vlt-e2e/
+          if-no-files-found: error
+          retention-days: 7
+
+  install-proof:
+    needs: build
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          # Every supported era on every OS (macos adds 0.0.0-16 for A0).
+          - {os: ubuntu-latest, vlt: '0.0.0-1'}
+          - {os: ubuntu-latest, vlt: '0.0.0-11'}
+          - {os: ubuntu-latest, vlt: '0.0.0-16'}
+          - {os: ubuntu-latest, vlt: '0.0.0-18'}
+          - {os: ubuntu-latest, vlt: '0.0.0-19'}
+          - {os: ubuntu-latest, vlt: '0.0.0-24'}
+          - {os: ubuntu-latest, vlt: '0.0.0-25'}
+          - {os: ubuntu-latest, vlt: '0.0.0-30'}
+          - {os: ubuntu-latest, vlt: '0.0.0-32'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.1'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.5'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.6'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.8'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.9'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.12'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.13'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.14'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.15'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.18'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.22'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.29'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.30'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.32'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.33'}
+          - {os: ubuntu-latest, vlt: '1.0.4'}
+          - {os: ubuntu-latest, vlt: '1.0.5'}
+          - {os: ubuntu-latest, vlt: '1.0.7'}
+          - {os: ubuntu-latest, vlt: '1.0.8'}
+          - {os: ubuntu-latest, vlt: '1.0.10'}
+          - {os: ubuntu-latest, vlt: '1.1.1'}
+          - {os: ubuntu-latest, vlt: '1.2.0'}
+          - {os: macos-latest, vlt: '0.0.0-16'}
+          - {os: macos-latest, vlt: '0.0.0-30'}
+          - {os: macos-latest, vlt: '1.0.0-rc.8'}
+          - {os: macos-latest, vlt: '1.0.0-rc.13'}
+          - {os: macos-latest, vlt: '1.0.0-rc.14'}
+          - {os: macos-latest, vlt: '1.0.0-rc.15'}
+          - {os: macos-latest, vlt: '1.0.0-rc.22'}
+          - {os: macos-latest, vlt: '1.0.0-rc.33'}
+          - {os: macos-latest, vlt: '1.0.8'}
+          - {os: macos-latest, vlt: '1.1.1'}
+          - {os: macos-latest, vlt: '1.2.0'}
+          - {os: windows-latest, vlt: '0.0.0-11'}
+          - {os: windows-latest, vlt: '0.0.0-19'}
+          - {os: windows-latest, vlt: '0.0.0-30'}
+          - {os: windows-latest, vlt: '1.0.0-rc.9'}
+          - {os: windows-latest, vlt: '1.0.0-rc.13'}
+          - {os: windows-latest, vlt: '1.0.0-rc.14'}
+          - {os: windows-latest, vlt: '1.0.0-rc.15'}
+          - {os: windows-latest, vlt: '1.0.0-rc.18'}
+          - {os: windows-latest, vlt: '1.0.0-rc.22'}
+          - {os: windows-latest, vlt: '1.0.0-rc.33'}
+          - {os: windows-latest, vlt: '1.0.5'}
+          - {os: windows-latest, vlt: '1.0.8'}
+          - {os: windows-latest, vlt: '1.0.10'}
+          - {os: windows-latest, vlt: '1.1.1'}
+          - {os: windows-latest, vlt: '1.2.0'}
+          # Node engine floors (DESIGN §1.1), with the collation golden (ICU drift).
+          - {os: ubuntu-latest, vlt: '1.2.0', node: '22.22.0'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.18', node: '22.9.0'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.9', node: '22.0.0'}
+          # Store linkers of the global store (1.2.0), safety suite only.
+          - {os: ubuntu-latest, vlt: '1.2.0', linker: auto, suites: e2e_safety_vlt}
+          - {os: ubuntu-latest, vlt: '1.2.0', linker: hardlink, suites: e2e_safety_vlt}
+          - {os: ubuntu-latest, vlt: '1.2.0', linker: copy, suites: e2e_safety_vlt}
+          - {os: ubuntu-latest, vlt: '1.2.0', linker: unpack, suites: e2e_safety_vlt}
+          - {os: macos-latest, vlt: '1.2.0', linker: auto, suites: e2e_safety_vlt}
+          - {os: macos-latest, vlt: '1.2.0', linker: hardlink, suites: e2e_safety_vlt}
+          - {os: windows-latest, vlt: '1.2.0', linker: auto, suites: e2e_safety_vlt}
+          - {os: windows-latest, vlt: '1.2.0', linker: hardlink, suites: e2e_safety_vlt}
+          - {os: ubuntu-latest, vlt: '1.2.0', linker: hardlink, cache_root: /dev/shm/vlt-e2e-cache, suites: e2e_safety_vlt}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      # The capstones resolve fixtures through the build job's checkout path,
+      # which is the same on every runner of one OS.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vlt-e2e-${{ matrix.os }}*
+          merge-multiple: true
+          path: target/vlt-e2e
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node || '24.21.0' }}
+      - name: Install vlt ${{ matrix.vlt }}
+        shell: bash
+        env:
+          VLT_TEST_VERSION: ${{ matrix.vlt }}
+        run: |
+          set -euo pipefail
+          js=$(scripts/install-vlt.sh "$VLT_TEST_VERSION" "$RUNNER_TEMP/vlt-tool")
+          echo "SOCKET_PATCH_VLT_E2E_JS=$js" >> "$GITHUB_ENV"
+          # A lockfileVersion-0 writer (0.0.0-19 … rc.14) also gets the
+          # upgrade legs, against 1.2.0.
+          if VLT_TEST_VERSION=$VLT_TEST_VERSION node -e '
+            const m = /^0\.0\.0-(\d+)$|^1\.0\.0-rc\.(\d+)$/.exec(process.env.VLT_TEST_VERSION);
+            process.exit(m && (m[1] ? Number(m[1]) >= 19 : Number(m[2]) <= 14) ? 0 : 1);'; then
+            up=$(scripts/install-vlt.sh 1.2.0 "$RUNNER_TEMP/vlt-upgrade")
+            echo "SOCKET_PATCH_VLT_E2E_UPGRADE_JS=$up" >> "$GITHUB_ENV"
+            echo "SOCKET_PATCH_VLT_E2E_UPGRADE_VERSION=1.2.0" >> "$GITHUB_ENV"
+          fi
+      - name: Collation golden under this Node
+        if: matrix.node != ''
+        run: node scripts/gen-vlt-collation-golden.mjs | diff - crates/socket-patch-core/tests/fixtures/vlt/collation-golden.json
+      - name: Every capstone, through the leg checker
+        shell: bash
+        env:
+          SOCKET_PATCH_VLT_E2E_VERSION: ${{ matrix.vlt }}
+          SOCKET_PATCH_VLT_E2E_REQUIRED: '1'
+          SOCKET_PATCH_VLT_E2E_STORE_LINKER: ${{ matrix.linker }}
+          SOCKET_PATCH_VLT_E2E_CACHE_ROOT: ${{ matrix.cache_root }}
+          VLT_SUITES: ${{ matrix.suites || 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt' }}
+        run: |
+          set -uo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          chmod +x target/vlt-e2e/* || true
+          mkdir -p target/debug logs
+          cp "target/vlt-e2e/socket-patch$exe" "target/debug/socket-patch$exe"
+          export SOCKET_PATCH_VLT_E2E_SOCKET_BIN="$PWD/target/vlt-e2e/socket-patch$exe"
+          if [ -z "$SOCKET_PATCH_VLT_E2E_STORE_LINKER" ]; then unset SOCKET_PATCH_VLT_E2E_STORE_LINKER; fi
+          if [ -z "$SOCKET_PATCH_VLT_E2E_CACHE_ROOT" ]; then
+            unset SOCKET_PATCH_VLT_E2E_CACHE_ROOT
+          else
+            mkdir -p "$SOCKET_PATCH_VLT_E2E_CACHE_ROOT"
+          fi
+          py=$(command -v python3 || command -v python)
+          status=0
+          for suite in $VLT_SUITES; do
+            echo "::group::$suite"
+            "target/vlt-e2e/$suite$exe" vlt_pinned_matrix --ignored 2>&1 | tee "logs/$suite.log" || status=1
+            "$py" scripts/check-vlt-legs.py --binary "$suite" \
+              --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json "logs/$suite.log" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - uses: ./.github/actions/upload-artifact
+        if: always()
+        with:
+          name: vlt-proof-${{ matrix.os }}-${{ matrix.vlt }}-${{ matrix.node || 'node24' }}-${{ matrix.linker || 'default' }}${{ matrix.cache_root && '-cache-root' || '' }}
+          path: logs/
+          retention-days: 14
+
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.plan.outputs.native }}
+    steps:
+      - id: plan
+        env:
+          VERSIONS_OVERRIDE: ${{ github.event.inputs.versions }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          defaults = {
+              'ubuntu-latest': ['0.0.0-16', '0.0.0-32', '1.0.0-rc.14', '1.0.0-rc.32', '1.0.4', '1.0.10', '1.2.0'],
+              'macos-latest': ['1.0.0-rc.14', '1.2.0'],
+              'windows-latest': ['1.0.0-rc.14', '1.2.0'],
+          }
+          override = os.environ.get('VERSIONS_OVERRIDE', '').split()
+          rows = [{'os': o, 'vlt': v} for o, vs in defaults.items() for v in (override or vs)]
+          print('native=' + json.dumps({'include': rows}))
+          PY
+
+  native:
+    needs: [build, plan]
+    strategy:
+      fail-fast: false
+      # Each job runs its cells against the public patch service.
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.plan.outputs.native) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vlt-e2e-${{ matrix.os }}*
+          merge-multiple: true
+          path: native-cli
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Backtest against production
+        # Every hosted cell probes the artifact first; it records
+        # blocked-by-server-encoding only when that probe saw a non-identity
+        # Content-Encoding and the CLI refused cleanly. Any other failure is an
+        # error.
+        shell: bash
+        env:
+          VLT_TEST_VERSION: ${{ matrix.vlt }}
+          CLI_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+          CLI_BUILD_SHA: ${{ github.sha }}
+          SHAPES_OVERRIDE: ${{ github.event.inputs.shapes }}
+          MODES_OVERRIDE: ${{ github.event.inputs.modes }}
+        run: |
+          set -uo pipefail
+          chmod +x native-cli/* || true
+          cli=native-cli/socket-patch
+          if [ "$RUNNER_OS" = Windows ]; then cli=native-cli/socket-patch.exe; fi
+          modes=(hosted vendored agent)
+          if [ -n "$MODES_OVERRIDE" ]; then read -r -a modes <<<"$MODES_OVERRIDE"; fi
+          shapes=()
+          if [ -n "$SHAPES_OVERRIDE" ]; then read -r -a shapes <<<"$SHAPES_OVERRIDE"; shapes=(--shapes "${shapes[@]}"); fi
+          # `${a[@]+…}`: macOS bash 3.2 treats an empty array as unset under -u.
+          python3 scripts/backtest-vlt.py --cli "$cli" --versions "$VLT_TEST_VERSION" \
+            --modes "${modes[@]}" ${shapes[@]+"${shapes[@]}"} --jobs 3 \
+            --tools "$RUNNER_TEMP/vlt-tools" --out native-vlt
+      - uses: ./.github/actions/upload-artifact
+        if: always()
+        with:
+          name: vlt-results-${{ matrix.os }}-${{ matrix.vlt }}
+          include-hidden-files: true
+          path: |
+            native-vlt/summary.json
+            native-vlt/summary.md
+            native-vlt/captures/**/result.json
+            native-vlt/captures/**/cli-output.json
+            native-vlt/captures/**/before-cli-output.json
+            native-vlt/captures/**/tree/**
+            native-vlt/captures/**/logs/**
+          retention-days: 14
+
+  lock-diff:
+    needs: native
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vlt-results-*
+          path: results
+      - name: Windows and macOS locks equal Linux
+        env:
+          VERSIONS_OVERRIDE: ${{ github.event.inputs.versions }}
+        run: |
+          required=()
+          if [ -z "$VERSIONS_OVERRIDE" ]; then
+            for v in 1.2.0 1.0.0-rc.14; do
+              for m in hosted vendored agent; do required+=("$v:$m:direct"); done
+            done
+          fi
+          python3 scripts/backtest-vlt.py --diff-locks results --out lock-diff \
+            ${required[@]:+--require-cross-os "${required[@]}"}
+      - uses: ./.github/actions/upload-artifact
+        if: always()
+        with:
+          name: vlt-lock-diff
+          path: lock-diff/
+          retention-days: 14
+
+  canary:
+    needs: build
+    if: github.event_name == 'schedule' || github.event.inputs.nightly == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vlt-e2e-${{ matrix.os }}*
+          merge-multiple: true
+          path: target/vlt-e2e
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: vlt@latest through every capstone
+        # Only the exact-version pin is relaxed: the capstones still assert
+        # `--version` against the release this step resolved.
+        shell: bash
+        run: |
+          set -uo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          chmod +x target/vlt-e2e/* || true
+          mkdir -p target/debug logs
+          cp "target/vlt-e2e/socket-patch$exe" "target/debug/socket-patch$exe"
+          js=$(scripts/install-vlt.sh latest "$RUNNER_TEMP/vlt-tool") || exit 1
+          version=$(node --no-warnings "$js" --version)
+          echo "VLT_LATEST=$version" >> "$GITHUB_ENV"
+          export SOCKET_PATCH_VLT_E2E_JS="$js" SOCKET_PATCH_VLT_E2E_VERSION="$version"
+          export SOCKET_PATCH_VLT_E2E_REQUIRED=1
+          export SOCKET_PATCH_VLT_E2E_SOCKET_BIN="$PWD/target/vlt-e2e/socket-patch$exe"
+          py=$(command -v python3 || command -v python)
+          status=0
+          for suite in e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt; do
+            echo "::group::$suite"
+            "target/vlt-e2e/$suite$exe" vlt_pinned_matrix --ignored 2>&1 | tee "logs/$suite.log" || status=1
+            "$py" scripts/check-vlt-legs.py --binary "$suite" \
+              --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json "logs/$suite.log" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - name: Release and lockfileVersion watchdogs
+        # Fails when npm lists a vlt release that is neither supported nor
+        # excluded in docs/testing/vlt-compatibility.md, and, once a release
+        # writes a lockfileVersion other than 0 or 1, unless hosted mode
+        # refuses that lock (redirect_vlt_lock_unsupported).
+        if: always() && runner.os == 'Linux'
+        run: |
+          chmod +x target/vlt-e2e/* || true
+          python3 scripts/backtest-vlt.py --cli target/vlt-e2e/socket-patch --canary-checks --allow-unlisted \
+            --versions "$VLT_LATEST" --tools "$RUNNER_TEMP/vlt-tools" --out canary
+      - uses: ./.github/actions/upload-artifact
+        if: always()
+        with:
+          name: vlt-canary-${{ matrix.os }}
+          path: |
+            logs/
+            canary/canary/report.json
+          retention-days: 14
+
+  downgrade:
+    needs: build
+    if: github.event_name == 'schedule' || github.event.inputs.nightly == 'true'
+    # Advisory until the socket-patch release that adds vlt support (with the
+    # forward-compatible ledger handling) is the latest published one.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: vlt-e2e-ubuntu-latest*
+          merge-multiple: true
+          path: target/vlt-e2e
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - name: The published release meets vlt ledgers
+        run: |
+          set -uo pipefail
+          chmod +x target/vlt-e2e/*
+          npm install --prefix "$RUNNER_TEMP/published" --no-audit --no-fund @socketsecurity/socket-patch@latest
+          published="$RUNNER_TEMP/published/node_modules/.bin/socket-patch"
+          "$published" --version
+          status=0
+          python3 scripts/backtest-vlt.py --cli target/vlt-e2e/socket-patch --downgrade-cli "$published" \
+            --versions 1.2.0 --tools "$RUNNER_TEMP/vlt-tools" --out downgrade || status=$?
+          {
+            cat <<'MD'
+          ## vlt downgrade
+
+          The latest published socket-patch ran `rollback` on a hosted vlt ledger and
+          `vendor --revert` on a `flavor: "vlt"` entry written by this build. Each must
+          leave the project untouched (fail closed) or fully reverted, never half-reverted.
+          This job is advisory until the release that adds vlt support is published.
+
+          ```json
+          MD
+            cat downgrade/downgrade/summary.json 2>/dev/null || echo '[]'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - uses: ./.github/actions/upload-artifact
+        if: always()
+        with:
+          name: vlt-downgrade
+          path: downgrade/downgrade/
+          retention-days: 14

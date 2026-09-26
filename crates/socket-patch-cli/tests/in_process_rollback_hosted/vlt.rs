@@ -297,7 +297,7 @@ async fn vlt_rollback_removes_the_prod_copy_keeps_the_optional_one() {
         );
         assert_eq!(
             advisory_details(&doc),
-            [expected.clone()],
+            std::slice::from_ref(expected),
             "{verb} {extra:?}: {doc:#}"
         );
         assert_eq!(

@@ -42,6 +42,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
+// `e2e_vex_lockfile` also loads `mod.rs` at its root; this copy keeps the
+// standalone capstones self-contained.
+#[allow(clippy::duplicate_mod)]
 #[path = "mod.rs"]
 mod common;
 pub use common::*;

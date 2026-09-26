@@ -1,0 +1,44 @@
+name: vlt serve watchdog
+
+# vlt hashes the wire body of a registry tarball and asks for
+# `accept-encoding: gzip;q=1.0, identity;q=0.5`, so a patch artifact that
+# patch.socket.dev (or its CDN) serves content-encoded fails `EINTEGRITY` on
+# every vlt release, and hosted mode refuses to pin it
+# (`redirect_vlt_artifact_unverifiable`). This job fetches the public free
+# minimist artifact exactly that way and fails when the response is
+# content-encoded or its sha512 differs from the API's integrity, which pages
+# through the repository's workflow-failure notification.
+#
+# Like installer-drift.yml it checks a deployed service, not the diff. It is
+# `continue-on-error` until the serve fix (`Cache-Control: no-transform`) is
+# verified in production; removing that line arms it (DESIGN §8.4, the depscan
+# rollout's last step).
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Fetch the minimist artifact the way vlt does
+        run: python3 scripts/backtest-vlt.py --serve-probe --out serve-probe
+
+      - name: Upload the probe
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: vlt-serve-probe
+          path: serve-probe/serve-probe.json
+          retention-days: 14

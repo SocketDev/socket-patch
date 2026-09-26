@@ -39,7 +39,8 @@
 //!   - a tampered committed member is omitted (`vendor_hash_mismatch`);
 //!   - the wiring reverted with the ledger and artifact left behind is
 //!     `vendor_unwired`, also under `--no-verify`;
-//!   and the shared matrix runs over a vendored checkout.
+//!
+//!   The shared matrix also runs over a vendored checkout.
 
 use std::path::{Path, PathBuf};
 

@@ -288,6 +288,21 @@ rewrite them, and does not convert them to text. If both filenames exist,
 `bun.lock` takes precedence. See [Bun compatibility](docs/testing/bun-compatibility.md)
 for the tested versions, workspace behavior, and installer integrity limits.
 
+### vlt compatibility
+
+[vlt](https://www.vlt.sh) projects (`vlt-lock.json`) work in every mode, on every vlt
+release from 0.0.0-1 to 1.2.0 (both DepID grammars and every `lockfileVersion`).
+Agent mode patches each copy in `node_modules/.vlt` without writing through vlt 1.2's
+shared store. Hosted mode repoints the patched nodes' integrity and URL, first checks
+that each artifact is served the way vlt can verify, and removes stale installed copies
+so the next `vlt install` fetches the patched packages. Vendored mode commits a patched
+package directory for each direct dependency of the root or a workspace member
+(transitive dependencies need hosted mode). vlt is detected ahead of every other
+npm-family package manager. vlt ledgers require the socket-patch release that adds vlt support.
+See [vlt notes](docs/ecosystems.md#npm-vlt-notes) for the caveats (`vlt update`, optional
+dependencies, registry configuration) and [vlt compatibility](docs/testing/vlt-compatibility.md)
+for the tested releases.
+
 ### Pipenv compatibility
 
 Hosted mode rewrites every `Pipfile.lock` category that pins the patched
@@ -786,9 +801,12 @@ result.
 
 What gets wired, per ecosystem:
 
-- **npm / yarn / pnpm / bun** — writes `postinstall` and `dependencies` scripts into
+- **npm / yarn / pnpm / bun / vlt** — writes `postinstall` and `dependencies` scripts into
   `package.json` so any install — including `npm install <pkg>` — re-applies patches
-  (pnpm: root package only).
+  (pnpm and vlt: root package only). vlt uses the same `npx` hook, runs it on every
+  install that changes the tree (never on a no-op install), and aborts the install when
+  it fails; vlt before 1.0.0-rc.13 never runs a root `postinstall`, which `setup` warns
+  about (`vlt_root_scripts_not_run`).
 - **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install
   hook, so `setup` instead adds a **`socket-patch[hook]`** dependency to your manifest
   (`pyproject.toml` / `requirements.txt`; for classic Poetry, the equivalent
@@ -1246,6 +1264,7 @@ Behavior worth knowing:
 | pnpm | `pnpm-lock.yaml` (all generations), `shrinkwrap.yaml` (pnpm 1/2), Rush locks | Aliased / nested `resolution` shapes are diagnosed, not attested; `overrides` alone prove nothing |
 | yarn | `yarn.lock` (classic + berry) | Berry vendored entries also need the root `package.json` `resolutions` mapping; member locks are not read |
 | bun | `bun.lock`, else `bun.lockb` | A hosted entry that Bun < 1.3.10 re-saved without its sha512 attests only after install |
+| vlt | `vlt-lock.json` (`lockfileVersion` absent, 0 or 1) | A BOM-prefixed or other-version lock wires nothing; a same-version instance on another registry keeps a hosted pin from attesting before install; a vendored directory whose `package.json` patch lost its devDependencies needs the patched blob in `.socket/blobs` without the vendor ledger |
 | cargo | `Cargo.lock`, `Cargo.toml`, `.cargo/config[.toml]` | Root manifest + project config only (no `$CARGO_HOME` / parent configs); vendored `[patch.crates-io]` entries are read from `Cargo.toml` first (v5), the project config for pre-v5 projects, and must agree with the detached lock entry's tagged version `<version>+socket.<uuid>` (a tag for another uuid — in the lock or in the copy's own `Cargo.toml` — is dead wiring; an untagged detached entry counts only beside an untagged, pre-tag copy); a manifest entry cargo ignores (a same-key project-config item, or a URL-spelled crates.io `[patch]` table) is not attested; a lockless hosted pin needs the redirect ledger's record |
 | golang | `go.mod`, `go.work`, `go.sum`, `go.work.sum` | A replace that `require` no longer selects is inert; `vendor/modules.txt` is not read |
 | pypi | `uv.lock`, `*.py.lock`, `pylock*.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt` (+ `-r` includes), `pyproject.toml` / `hatch.toml` | A `uv.lock` beside a `pyproject.toml` must agree with its `[tool.uv.sources]`; PDM 3.1 / 4.0–4.2 locks are refused; a Pipenv project needs `--product` (or a git remote) |

@@ -4,7 +4,137 @@
 [vlt](https://www.vlt.sh) projects (`vlt-lock.json`, the `node_modules/.vlt`
 store and, from vlt 1.2.0, the global content store). This page records the
 real-vlt evidence: which releases are supported, which capstone legs run on
-which release, and the vlt behaviors the legs pin.
+which release, and the vlt behaviors the legs pin. What each mode does with a
+vlt project, and the caveats users meet, are in
+[vlt notes](../ecosystems.md#npm-vlt-notes).
+
+## Formats
+
+| Era | Releases | `lockfileVersion` | DepID grammar | Default-registry node slot [3] |
+|---|---|---|---|---|
+| A0 | 0.0.0-1, 0.0.0-11 … 0.0.0-18 | absent | `·` / `§` + `encodeURIComponent` (`··name@ver`) | absent |
+| A | 0.0.0-19 … 1.0.0-rc.8 | `0` | as A0; `ṗ:N` peer extras from rc.6 | absent (3-tuples) |
+| B | 1.0.0-rc.9 … 1.0.0-rc.14 | `0` | as A, default segment `npm` (`·npm·name@ver`) | absent |
+| C | 1.0.0-rc.15 … 1.0.0-rc.32 | `1` | `~` / `+` + `_x` escapes (`~npm~name@ver`), `peer.N` | absent |
+| D | 1.0.0-rc.33 … 1.0.7 | `1` | as C | the registry URL |
+| E | 1.0.8 … 1.1.1 | `1` | as C, `peer.<16 hex>` | the registry URL |
+| F | 1.2.0 | `1` | as E; the global store (`store-linker`) | the registry URL |
+
+Hosted mode writes the patched sha512 into slot [2] and the hosted URL into
+slot [3] of every default-registry node (appending slot [3] to a 3-tuple);
+vendored mode turns the node into a `file` node for the D19 directory
+`.socket/vendor/npm/<uuid>/<name>-<version>/node_modules/<name>`. vlt reads
+CRLF locks and writes LF; a BOM-prefixed lock is unreadable by vlt and by
+socket-patch alike.
+
+## What is verified where
+
+| Layer | Where | What it proves |
+|---|---|---|
+| Unit and golden | `socket-patch-core` lib tests; `tests/redirect_golden.rs` (`npm/vlt/*`, shared with depscan's TS rewriter), `tests/redirect_golden_reverse_replay.rs`, `tests/vlt_locks.rs` (captured locks of every era) | DepID codec, collation (`tests/fixtures/vlt/collation-golden.json`), the node-line grammar, the hosted slot rewrite and its slot revert, vendored lock surgery and its inverse, lock inventory, VEX discovery |
+| Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, `setup_invariants`, … (the 3-OS `test` job) | every code of the vlt support, the artifact preflight against a wiremock server, the heal, takeovers, repair, the CLI surface |
+| Real-vlt capstones | the five binaries below plus the vlt legs of `e2e_hosted_production` / `e2e_vendored_production` | real installs: `vlt ci` and frozen installs of patched locks, byte-stable locks, integrity enforcement, the heal on a warm tree, re-saves, upgrades, the hardlinked global store, the setup hook |
+| Native backtest | `scripts/backtest-vlt.py` | the production service end to end, per release, mode and project shape, against an oracle of the documented boundaries |
+
+`docs/testing/vlt-coverage.json` maps every vlt code and advisory variant,
+every mode × command cell and every era × OS cell to the tests or CI rows that
+assert it; `scripts/tests/test_vlt_coverage.py` checks that each code is
+asserted and each named test or row exists.
+
+## CI wiring
+
+- **Required:** ci.yml's `e2e` job has 35 vlt rows (`vlt:` pins the release,
+  `vlt_store_linker:` / `vlt_upgrade:` the knobs; `test_filter:
+  --include-ignored vlt_pinned_matrix`). "Setup vlt" packs the release,
+  checks its sha512 against the registry and `scripts/vlt-historical-integrity.json`
+  (`scripts/install-vlt.sh`), installs it under a prefix and exports
+  `SOCKET_PATCH_VLT_E2E_JS` / `_VERSION` / `_REQUIRED=1` with `LANG=C`. Every
+  row's output goes through `scripts/check-vlt-legs.py`.
+  `scripts/tests/test_ci_vlt_rows.py` (run by `lint-ecosystems`) pins the rows.
+- **Required:** `hosted-e2e` installs vlt 1.2.0 the same way, runs
+  `vlt_pinned_matrix_production_hosted_install_proof` inside the production
+  suite (probe-driven: the clean refusal while patch.socket.dev re-encodes the
+  artifact, the full install proof once it does not) and
+  `vlt_pinned_matrix_production_vendored_install_proof`, both through the leg
+  checker. `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED` stays unset until the
+  serve fix is verified.
+- **Advisory:** `.github/workflows/vlt-compatibility.yml` (path-filtered pull
+  requests and pushes to main, nightly, and `workflow_dispatch` with
+  `versions` / `shapes` / `modes`). A path-filtered workflow cannot be a
+  required check. Jobs: `build` (the capstones and the CLI, once per OS);
+  `install-proof` (every capstone on 31 Linux, 11 macOS and 15 Windows
+  releases, the Node engine floors 22.22.0 / 22.9.0 / 22.0.0 with the collation
+  golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
+  cache root); `native` (the backtest against production, artifacts
+  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape);
+  `lock-diff` (the same cell's `vlt-lock.json` must be byte-identical on Linux,
+  macOS and Windows); `matrix-coverage` (every era × suite × OS).
+- **Nightly:** `canary` runs every capstone on `vlt@latest` on 3 OS (only the
+  exact-version pin is relaxed), fails when npm lists a vlt release that the
+  Releases table below neither supports nor excludes, and, once a release
+  writes a `lockfileVersion` other than 0 or 1, requires hosted mode to refuse
+  it (`redirect_vlt_lock_unsupported`). `downgrade` (advisory) has the latest
+  published socket-patch run `rollback` and `vendor --revert` on vlt ledgers
+  written by the build: each must leave the project untouched or fully
+  reverted, never half-reverted.
+- **Watchdog:** `.github/workflows/vlt-serve-watchdog.yml` probes the public
+  minimist artifact every 6 hours as vlt fetches it and fails on a
+  content-encoded response or a sha512 other than the API's. It is
+  `continue-on-error` until the serve fix is verified in production.
+
+## Running locally
+
+```sh
+export SOCKET_PATCH_VLT_E2E_JS=$(scripts/install-vlt.sh 1.2.0 /tmp/vlt-1.2.0)
+export SOCKET_PATCH_VLT_E2E_VERSION=1.2.0 SOCKET_PATCH_VLT_E2E_REQUIRED=1 LANG=C LC_ALL=C
+for s in e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt; do
+  cargo test -p socket-patch-cli --test $s -- --include-ignored vlt_pinned_matrix 2>&1 | tee vlt-leg.log
+  python3 scripts/check-vlt-legs.py --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json vlt-leg.log
+done
+
+# The production backtest (no Socket API token needed):
+python3 scripts/backtest-vlt.py --cli target/debug/socket-patch \
+  --versions 1.2.0 1.0.0-rc.14 --modes hosted vendored agent --jobs 2 --out /tmp/vlt-bt
+```
+
+The backtest writes `captures/<vlt>-<mode>-<shape>/{result.json,cli-output.json,tree/,logs/}`
+and `summary.{json,md}`, and exits non-zero when any cell's verdict differs
+from the oracle. While patch.socket.dev re-encodes the artifact, hosted cells
+record `blocked-by-server-encoding`, and only when the cell's own probe saw a
+non-identity `Content-Encoding` and the CLI refused cleanly;
+`--identity-mirror` previews the hosted proof through a loopback mirror that
+fetches the artifact un-encoded (never an import source). `--serve-probe` is
+the watchdog's probe, `--canary-checks` the canary's watchdogs, and
+`--downgrade-cli <published socket-patch>` the downgrade scenario.
+
+## The capstone registry harness
+
+The capstones serve npmjs bytes from a local wiremock registry `R` and write
+`vlt.json` per era, because before rc.33 bare specs ignore `registries.npm`:
+
+| Era window | vlt.json | Hermetic | Notes |
+|---|---|---|---|
+| ≤ 0.0.0-13 | flat `{"registry": R}` | yes | `vlt-workspaces.json` for workspaces ≤ 0.0.0-12 |
+| 0.0.0-14 … rc.6 | `{"config":{"registry": R}}` (+ `"modifiers":{}` for 0.0.0-16 … 24, except the ignored-lock leg) | yes | URL-segment DepIDs carry R's port |
+| rc.7 … rc.29 | `{"config":{"registry": "https://registry.npmjs.org/"}}` | no: lock-driven installs reach public npm | the dead-registry assertions log `skip:non-hermetic-registry`; the patch service stays local |
+| rc.30 … rc.32 | `{"config":{"registry": R}}` | yes | URL-segment DepIDs |
+| ≥ rc.33 | `{"config":{"registries":{"npm": R}}}` (+ `config.registry = R` for rc.33 … 1.0.4) | yes | |
+
+`scripts/backtest-vlt.py`'s `write_vlt_json` follows the same table against
+public npm (a `registry` equal to vlt's npmjs default is left out: vlt strips
+it from the lock anyway).
+
+## depscan parity
+
+depscan's TypeScript rewriter (`registry-rewrite/vlt.ts`) and its SBOM
+recognition implement the same spec.
+`crates/socket-patch-core/tests/fixtures/redirect/npm/vlt/*` is the single source of truth: depscan runs every case through its golden
+test from the `submodules/socket-patch` pin, with **no** `TS_LAGGING` or
+`TS_WARNING_DRIFT` entry for vlt, and `redirect_golden_reverse_replay.rs`
+proves that socket-patch rolls back what either implementation wrote. The
+`vlt-results-*` artifacts and the cross-OS locks are imported into depscan's
+fixtures (`audit-captures.py`, `generate-fixtures.py --captures`) once the serve
+fix is live.
 
 ## Real-vlt capstones
 
@@ -146,4 +276,7 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 The legs run on Linux, macOS and Windows. The Linux-default `auto` store
 linker (hardlinks, `safety/linux_auto`) cannot run on macOS or Windows; it is
 covered on Linux by the CI `e2e` row `e2e_safety_vlt` on ubuntu with vlt
-1.2.0, and SP-9 ran it in `node:24-slim` under Docker (see the SP-9 report).
+1.2.0 and by `vlt-compatibility.yml`'s store-linker rows, and was also run
+locally in `node:24-slim` under Docker. Windows-only legs
+(`setup/hook_abort_leaves_no_staging`, the junction and dir-symlink store
+cases) run on the Windows rows.

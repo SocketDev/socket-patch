@@ -64,6 +64,7 @@ hosted suite).
 | yarn classic | minimist@1.2.2 | `yarn install --frozen-lockfile --offline` | ✅ full |
 | yarn berry (node-modules) | minimist@1.2.2 | `yarn install --immutable --check-cache` | ✅ full |
 | bun (text lockfile) | minimist@1.2.2 | `bun install --frozen-lockfile` | ✅ full |
+| vlt 1.2.0 (`vlt-lock.json`) | minimist@1.2.2 | fresh checkout, `vlt ci` (lock byte-stable) | ✅ full (`vlt_pinned_matrix_production_vendored_install_proof`) |
 | pip (requirements.txt) | urllib3@1.26.18 | `pip install --no-index -r requirements.txt` | ✅ full |
 | uv (uv.lock) | urllib3@1.26.18 | `uv sync --frozen --offline` | ✅ full |
 | bundler | activestorage@6.0.3 | frozen `bundle install`, fresh empty `BUNDLE_PATH` | ✅ full |
@@ -174,11 +175,22 @@ OSes, 1.1.45 and 1.2.23 on Linux) plus the production native matrix in
 `bun-compatibility.yml` (16 releases × 3 OS in hosted and vendored mode —
 vendored is manifest-free) — see [Bun compatibility](bun-compatibility.md).
 
+The vlt leg vendors the service's directory artifact into the D19 layout
+(`.socket/vendor/npm/<uuid>/minimist-1.2.2/node_modules/minimist`) and proves
+it with a fresh `vlt ci`. The CLI's own download decodes the transfer, so the
+serve-encoding gate that blocks hosted vlt (see the
+[hosted doc](hosted-production-e2e.md#vlt-the-serve-encoding-gate)) does not
+apply. CI runs it in the `hosted-e2e` job
+(`--test e2e_vendored_production -- --include-ignored vlt_pinned_matrix`,
+through `scripts/check-vlt-legs.py`); the per-release evidence is in
+[vlt compatibility](vlt-compatibility.md).
+
 ### Environment knobs
 
 | Variable | Effect |
 |----------|--------|
 | `SOCKET_PATCH_VENDORED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. |
+| `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | The vlt release the vlt leg runs (`node <vlt.js>`, exact `--version`). |
 | `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` | Fail when cargo/maven/nuget/composer gain their first free published patch. |
 
 The suite forces `SOCKET_NO_CONFIG=true` and scrubs every ambient `SOCKET_*`
@@ -188,7 +200,7 @@ token is used.
 
 ### Toolchains
 
-`npm`, `pnpm`, `corepack` (yarn classic + berry), `bun`, `uv`, `python3` (pip),
+`npm`, `pnpm`, `corepack` (yarn classic + berry), `bun`, `vlt` (Node ≥ 22.22), `uv`, `python3` (pip),
 `ruby` + `bundle`, `go`.
 
 ### Network egress
