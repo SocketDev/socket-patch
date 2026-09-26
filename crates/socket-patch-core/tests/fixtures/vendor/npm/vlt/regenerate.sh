@@ -11,8 +11,8 @@
 # after a second `ci`, which must leave it unchanged. Every expected lock
 # must also survive `vlt install --frozen-lockfile` byte for byte (warm,
 # then from a clean node_modules), and `vlt install escape-html@1.0.3`
-# must keep every entry of it unchanged, except the values of the vendored
-# node's own edges (rc.14 rewrites their peer specs on every reify).
+# must keep every entry of it unchanged, except on rc.14 the values of the
+# vendored node's own edges (rc.14 rewrites their peer specs on every reify).
 #
 # usage: VLT_BIN_DIR=<dir holding <version>/node_modules/vlt/vlt.js> ./regenerate.sh
 set -euo pipefail
@@ -154,19 +154,23 @@ for version in $VERSIONS; do
     (cd "$run" && rm -rf node_modules packages/a/node_modules && vlt "$version" "$WORK/xdg-$version" install --frozen-lockfile >"$WORK/$version-$case-frozen-cold.log" 2>&1)
     cmp -s "$WORK/expected.json" "$run/vlt-lock.json" || { echo "$version $case: a cold install --frozen-lockfile changed the lock" >&2; exit 1; }
     (cd "$run" && vlt "$version" "$WORK/xdg-$version" install escape-html@1.0.3 >"$WORK/$version-$case-new.log" 2>&1)
+    own=
+    if [ "$version" = 1.0.0-rc.14 ]; then
+      own=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).fileId)' "$verdict")
+    fi
     node -e '
       const fs = require("fs");
       const entries = f => new Map(fs.readFileSync(f, "utf8").split("\n")
         .filter(l => l.startsWith("    \"")).map(l => l.replace(/,?\r?$/, ""))
         .map(l => [JSON.parse(l.slice(4, l.indexOf("\": ") + 1)), l]));
       const after = entries(process.argv[2]);
-      const own = process.argv[3] + " ";
+      const own = process.argv[3] && process.argv[3] + " ";
       const lost = [...entries(process.argv[1])].filter(([k, l]) =>
-        after.get(k) !== l && !(k.startsWith(own) && after.has(k)));
+        after.get(k) !== l && !(own && k.startsWith(own) && after.has(k)));
       if (lost.length || !fs.readFileSync(process.argv[2], "utf8").includes("escape-html")) {
         console.error(JSON.stringify(lost)); process.exit(1);
       }
-    ' "$WORK/expected.json" "$run/vlt-lock.json" "$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).fileId)' "$verdict")" || { echo "$version $case: vlt install <new> dropped the wiring" >&2; exit 1; }
+    ' "$WORK/expected.json" "$run/vlt-lock.json" "$own" || { echo "$version $case: vlt install <new> dropped the wiring" >&2; exit 1; }
     echo "$version $case: frozen-lockfile byte-stable, install <new> keeps the wiring"
   done
 done

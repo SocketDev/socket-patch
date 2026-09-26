@@ -264,7 +264,7 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | an optional-only project: lock-driven installs install nothing | `0.0.0-30 … 1.0.4` | — | — | — | — |
 | an optional-only project installs from the lock again | `>= 1.0.5` | — | — | — | — |
 | after a hosted→vendored takeover a plain `vlt install` already links the vendored dir | `<= 0.0.0-29` | — | — | — | — |
-| a plain `vlt install` keeps an installed optional dependency whose spec moved to a vendored `file:` directory (the upstream copy stays linked until `vlt ci`); vendored mode says so with `vendor_vlt_reinstall_required`, which `optional_warm_reinstall` pins | `>= 0.0.0-30` | — | — | — | — |
+| a plain `vlt install` keeps an installed optional dependency whose spec moved to a vendored `file:` directory (the upstream copy stays linked until `vlt ci`); vendored mode says so with `vendor_vlt_reinstall_required`, which `optional_warm_reinstall` pins; the same holds in reverse after `vendor --revert` (the link to the removed vendored directory stays until `vlt ci`), and the revert repeats the advisory | `>= 0.0.0-30` | — | — | — | — |
 | lockless `file:` directory dependencies fail to resolve | `0.0.0-31 … 1.0.0-rc.5` | — | — | — | — |
 | a re-save (`vlt install <new>`) drops slot [3] of default-registry nodes (the hosted URL; the patched integrity stays, so `vlt ci` fails `EINTEGRITY` until a rescan re-pins, and rollback reports drift) | `1.0.0-rc.6 … 1.0.0-rc.17` | — | — | — | — |
 | a warm cache re-fetches a changed tarball and fails its integrity (no stale-bytes hazard) | `1.0.0-rc.27 … 1.0.2` | — | — | — | — |

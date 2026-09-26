@@ -719,8 +719,19 @@ async fn vendored_wiring_matches_what_vlt_ci_writes_and_reverts_byte_exact() {
 
         let reverted = revert_npm_any(&entry, &staged.root, false).await;
         assert!(reverted.success, "{label}: {:?}", reverted.error);
-        assert!(
-            reverted.warnings.is_empty(),
+        let optional = entry.wiring.iter().any(|r| {
+            r.kind == "vlt_pkg_dep"
+                && r.key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("optionalDependencies/"))
+        });
+        assert_eq!(
+            reverted.warnings.iter().map(|w| w.code).collect::<Vec<_>>(),
+            if optional {
+                vec!["vendor_vlt_reinstall_required"]
+            } else {
+                Vec::new()
+            },
             "{label}: {:?}",
             reverted.warnings
         );

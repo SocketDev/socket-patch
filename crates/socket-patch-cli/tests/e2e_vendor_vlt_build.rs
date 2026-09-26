@@ -629,7 +629,8 @@ fn reinstall_advisories(doc: &Value) -> Vec<String> {
 /// `vendor_vlt_reinstall_required`: from 0.0.0-30 a plain `vlt install`
 /// keeps the installed upstream copy linked (and an in-sync rerun repeats
 /// the advisory), and `vlt ci` links the vendored copy, after which the
-/// advisory is gone.
+/// advisory is gone. Reverting it asks for `vlt ci` again: a plain `vlt
+/// install` then leaves the link to the removed vendored dir dangling.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_vendored_optional_warm_reinstall() {
@@ -647,6 +648,7 @@ async fn vlt_pinned_matrix_vendored_optional_warm_reinstall() {
     let fx = Fixture::build(leg, shape).await;
     let t = fx.t().clone();
     assert_eq!(state(&fx.proj, &t), State::Pristine, "the warm tree");
+    let lock_before = lock_bytes(&fx.proj);
     let doc = vendor_scan(&fx);
     let got = reinstall_advisories(&doc);
     assert_eq!(got.len(), 1, "{doc:#}");
@@ -691,6 +693,47 @@ async fn vlt_pinned_matrix_vendored_optional_warm_reinstall() {
     );
     let doc = vendor_scan(&fx);
     assert!(reinstall_advisories(&doc).is_empty(), "{doc:#}");
+
+    let out = vendor_revert(&fx.proj);
+    assert_eq!(out.code, 0, "{out}");
+    let got = reinstall_advisories(&out.json());
+    assert_eq!(got.len(), 1, "{out}");
+    assert!(
+        got[0].contains("ms@2.1.3 is an optional dependency")
+            && got[0].contains("run `vlt ci` (or delete node_modules and run `vlt install`)"),
+        "{}",
+        got[0]
+    );
+    assert_eq!(
+        lock_bytes(&fx.proj),
+        lock_before,
+        "the revert restores the lock"
+    );
+    fx.vlt_ok(&fx.proj, &["install"]);
+    let link = importer_dir(&fx.proj, "", &t.name);
+    if kept {
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok() && std::fs::metadata(&link).is_err(),
+            "a plain `vlt install` on {} keeps the link to the removed vendored dir",
+            fx.leg.tc.raw
+        );
+    } else {
+        assert_eq!(state(&fx.proj, &t), State::Pristine, "{}", fx.leg.tc.raw);
+    }
+    fx.vlt_ok(&fx.proj, &fx.leg.locked_install_args());
+    assert_eq!(
+        state(&fx.proj, &t),
+        State::Pristine,
+        "`vlt ci` links the upstream copy"
+    );
+    let link = std::fs::canonicalize(&link).unwrap();
+    assert!(
+        link.to_string_lossy()
+            .replace('\\', "/")
+            .contains("node_modules/.vlt/"),
+        "{}",
+        link.display()
+    );
     fx.leg.ran();
 }
 

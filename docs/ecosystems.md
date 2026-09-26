@@ -253,7 +253,9 @@ plain `vlt install` keeps an optional dependency's installed upstream copy after
 vendoring; `vendor_vlt_reinstall_required` says to run `vlt ci` (or delete `node_modules`
 and run `vlt install`) to link the vendored directory, and to upgrade to vlt 1.0.5 first
 when every dependency is optional. The same advisory names any dependency whose
-`node_modules` link still resolves to vlt's store.
+`node_modules` link still resolves to vlt's store, and `vendor --revert` repeats it for an
+optional dependency (a plain `vlt install` keeps the link to the removed vendored
+directory) or a link still into the vendored directory.
 
 **Agent mode.** `apply` and `rollback` patch every store copy of a `name@version`
 (legacy and tilde DepIDs, peer and modifier variants, transitive-only packages) and

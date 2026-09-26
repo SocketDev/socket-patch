@@ -872,8 +872,6 @@ fn vendor_vlt_revendor_new_uuid() {
     assert_eq!(read(root, "package.json"), pkg);
 }
 
-/// vlt's post-install layout: `node_modules/<name>` links the committed
-/// dir of `uuid`, and the store copy is gone.
 fn link_dir(target: &Path, link: &Path) {
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
     #[cfg(unix)]
@@ -888,6 +886,8 @@ fn unlink_dir(link: &Path) {
         .unwrap();
 }
 
+/// vlt's post-install layout: `node_modules/<name>` links the committed
+/// dir of `uuid`, and the store copy is gone.
 fn link_vendored_dir(root: &Path, uuid: &str) {
     std::fs::remove_dir_all(root.join("node_modules")).unwrap();
     std::fs::create_dir_all(root.join("node_modules")).unwrap();
@@ -1081,6 +1081,74 @@ fn vendor_vlt_revert_byte_exact() {
         "·npm·left-pad@1.3.0",
     );
     vendor_and_revert(tmp.path());
+}
+
+/// A revert while node_modules still links the vendored dir asks for a
+/// reinstall: `vlt ci` for an optional dependency (`vlt install` keeps its
+/// link), `vlt install` for any other; an unlinked revert asks nothing.
+#[test]
+fn vendor_vlt_revert_asks_for_a_reinstall_of_a_linked_vendored_copy() {
+    let reinstall = |env: &Value| -> Vec<String> {
+        events(env)
+            .iter()
+            .filter(|e| e["errorCode"] == "vendor_vlt_reinstall_required")
+            .map(|e| e.to_string())
+            .collect()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let lock = Lock::v1(
+        &[&reg_node("~npm~left-pad@1.3.0")],
+        &["\"file~_d left-pad\": \"optional 1.3.0 ~npm~left-pad@1.3.0\""],
+    );
+    let pkg = ROOT_PKG.replace("\"dependencies\"", "\"optionalDependencies\"");
+    project(root, &lock, &pkg, "~npm~left-pad@1.3.0");
+    let (code, env, stderr) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    link_vendored_dir(root, UUID);
+    let (code, env, stderr) = revert(root);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    let got = reinstall(&env);
+    assert_eq!(got.len(), 1, "{env:#}");
+    assert!(
+        got[0].contains(
+            "left-pad@1.3.0 is an optional dependency: `vlt install` (vlt 0.0.0-30 and later) \
+             keeps node_modules linked to the vendored `file:` directory"
+        ) && got[0].contains("run `vlt ci` (or delete node_modules and run `vlt install`)"),
+        "{}",
+        got[0]
+    );
+    assert_eq!(read(root, VLT_LOCK), lock.render());
+    assert_eq!(read(root, "package.json"), pkg);
+    assert!(!uuid_dir(root, UUID).exists());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    direct_project(root);
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    link_vendored_dir(root, UUID);
+    let (code, env, stderr) = revert(root);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    let got = reinstall(&env);
+    assert_eq!(got.len(), 1, "{env:#}");
+    assert!(
+        got[0].contains(
+            "node_modules/left-pad still links left-pad@1.3.0 to its vendored copy; run `vlt \
+             install` (or `vlt ci`) to link the restored copy"
+        ),
+        "{}",
+        got[0]
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    direct_project(root);
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let (code, env, _) = revert(root);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(reinstall(&env).is_empty(), "{env:#}");
 }
 
 #[test]

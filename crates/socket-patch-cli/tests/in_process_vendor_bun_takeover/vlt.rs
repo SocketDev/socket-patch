@@ -560,9 +560,52 @@ async fn vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy() {
             hosted::OPTIONAL_KEPT
         )
     );
+    assert!(
+        detail_of(&env, "vendor_vlt_reinstall_required")
+            .starts_with("left-pad@1.3.0 is an optional dependency"),
+        "{env:#}"
+    );
     assert_eq!(
         std::fs::read(hosted::store_dir(root, TILDE_ID).join("index.js")).unwrap(),
         PATCHED
     );
     assert!(root.join("node_modules/.vlt-lock.json").exists());
+}
+
+/// A vendored optional dependency taken over by `scan --mode hosted`: the
+/// revert's `vlt ci` advisory reaches the takeover's warnings.
+#[tokio::test(flavor = "multi_thread")]
+async fn vlt_vendored_then_hosted_takeover_of_an_optional_dep_asks_for_vlt_ci() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let lock = registry_lock().replace("\"prod 1.3.0", "\"optional 1.3.0");
+    let pkg = PACKAGE_JSON.replace("\"dependencies\"", "\"optionalDependencies\"");
+    std::fs::write(root.join("vlt-lock.json"), &lock).unwrap();
+    std::fs::write(root.join("package.json"), &pkg).unwrap();
+    hosted::install_importer(root, PRISTINE);
+    seed_manifest(root);
+    let (code, env, stderr) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert!(hosted::read(root, "vlt-lock.json").contains(&rel()));
+    std::fs::remove_file(root.join(".socket/manifest.json")).unwrap();
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+
+    let (code, env, stderr) = scan(root, &server, "hosted", &[]);
+
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert!(
+        all_codes(&env).contains(&"redirect_takeover_reverted_vendored".to_string()),
+        "{env:#}"
+    );
+    let detail = detail_of(&env, "vendor_vlt_reinstall_required");
+    assert!(
+        detail.starts_with(
+            "left-pad@1.3.0 is an optional dependency: `vlt install` (vlt 0.0.0-30 and later) \
+             keeps node_modules linked to the vendored `file:` directory"
+        ) && detail.contains("run `vlt ci`"),
+        "{detail}"
+    );
+    assert_eq!(hosted::read(root, "package.json"), pkg);
+    assert!(!root.join(format!(".socket/vendor/npm/{UUID}")).exists());
 }

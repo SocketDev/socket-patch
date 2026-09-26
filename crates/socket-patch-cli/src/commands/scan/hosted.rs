@@ -1674,6 +1674,15 @@ pub(crate) async fn run_redirect_selected(
                          takeover: the project is now fully hosted for this package)"
                     ),
                 }));
+                takeover_pre_warnings.extend(
+                    outcome
+                        .warnings
+                        .iter()
+                        .filter(|w| {
+                            w.code == socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED
+                        })
+                        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail })),
+                );
                 takeover_migrated.push(purl.clone());
                 takeover_files.extend(entry.wiring.iter().map(|w| w.file.clone()));
             } else {

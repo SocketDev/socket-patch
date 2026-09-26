@@ -347,7 +347,10 @@ into the new version's section — see docs/releasing.md.
   vlt 0.0.0-30 a plain `vlt install` keeps its installed upstream copy,
   so it says to run `vlt ci` (or delete `node_modules` and run `vlt
   install`); it also names any dependency whose `node_modules` link still
-  resolves to vlt's store.
+  resolves to vlt's store. Reverting a vendored optional dependency (also
+  in a vendored-to-hosted takeover) gives the same advisory, since from
+  vlt 0.0.0-30 a plain `vlt install` then keeps the link to the removed
+  vendored directory.
 - **Vendored vlt through every command.** `vendor`, `scan --mode vendored`
   and `get --mode vendored` run the complete vlt vendored preflight (lock
   version and layout, transitive, peer or foreign-registry targets,

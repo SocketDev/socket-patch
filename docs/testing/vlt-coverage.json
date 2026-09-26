@@ -93,8 +93,13 @@
     ],
     "vendor_vlt_reinstall_required": [
       "an_optional_or_stale_linked_edge_asks_for_vlt_ci",
+      "the_reinstall_advisory_follows_dry_runs_members_and_failed_patches",
+      "a_revert_asks_for_a_reinstall_while_a_link_or_an_optional_spec_moves_back",
       "vendor_vlt_optional_edge_asks_for_vlt_ci",
       "vendor_vlt_stale_prod_link_asks_for_a_reinstall",
+      "vendor_vlt_revert_asks_for_a_reinstall_of_a_linked_vendored_copy",
+      "vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy",
+      "vlt_vendored_then_hosted_takeover_of_an_optional_dep_asks_for_vlt_ci",
       "vlt_pinned_matrix_vendored_optional_warm_reinstall"
     ],
     "vendor_flavor_changed": [
@@ -154,12 +159,25 @@
     ],
     "vendor_vlt_reinstall_required: optional dependency rewired or still linked upstream": [
       "an_optional_or_stale_linked_edge_asks_for_vlt_ci",
+      "the_reinstall_advisory_follows_dry_runs_members_and_failed_patches",
       "vendor_vlt_optional_edge_asks_for_vlt_ci",
+      "vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy",
       "vlt_pinned_matrix_vendored_optional_warm_reinstall"
     ],
     "vendor_vlt_reinstall_required: a non-optional dependency still linked upstream": [
       "an_optional_or_stale_linked_edge_asks_for_vlt_ci",
+      "the_reinstall_advisory_follows_dry_runs_members_and_failed_patches",
       "vendor_vlt_stale_prod_link_asks_for_a_reinstall"
+    ],
+    "vendor_vlt_reinstall_required: revert of an optional dependency (vendor --revert, vendored to hosted takeover)": [
+      "a_revert_asks_for_a_reinstall_while_a_link_or_an_optional_spec_moves_back",
+      "vendor_vlt_revert_asks_for_a_reinstall_of_a_linked_vendored_copy",
+      "vlt_vendored_then_hosted_takeover_of_an_optional_dep_asks_for_vlt_ci",
+      "vlt_pinned_matrix_vendored_optional_warm_reinstall"
+    ],
+    "vendor_vlt_reinstall_required: revert with a link still into the vendored dir": [
+      "a_revert_asks_for_a_reinstall_while_a_link_or_an_optional_spec_moves_back",
+      "vendor_vlt_revert_asks_for_a_reinstall_of_a_linked_vendored_copy"
     ],
     "redirect_vlt_artifact_unverifiable: content-encoding": [
       "scan_redirect_vlt_artifact_content_encoding_refused"
@@ -220,6 +238,7 @@
     "hosted/takeover (vendored to hosted)": [
       "vlt_vendored_then_scan_hosted_takeover_round_trips_to_registry",
       "vlt_vendored_then_get_hosted_takeover_round_trips_to_registry",
+      "vlt_vendored_then_hosted_takeover_of_an_optional_dep_asks_for_vlt_ci",
       "vlt_pinned_matrix_migration_vendored_then_hosted"
     ],
     "vendored/vendor": [
@@ -240,6 +259,7 @@
       "vendor_vlt_revert_byte_exact",
       "vendor_vlt_revert_identity_already_reverted",
       "vendor_vlt_revert_cross_grammar_drift_detail",
+      "vendor_vlt_revert_asks_for_a_reinstall_of_a_linked_vendored_copy",
       "vlt_pinned_matrix_vendored_revert_byte_exact"
     ],
     "vendored/repair": [

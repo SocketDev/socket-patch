@@ -30,7 +30,9 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{already_patched_result, done, refused};
-use super::npm_common::{done_failure_unstage, guard_coordinates, guard_revert_uuid_dir};
+use super::npm_common::{
+    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, parse_npm_purl,
+};
 use super::npm_dir::{dependency_token, replace_dependency_token, stage_patch_dir, SpanError};
 use super::state::{
     load_state, write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
@@ -1022,7 +1024,7 @@ async fn prior_vlt_entry(project_root: &Path, purl: &str) -> Option<VendorEntry>
     })
 }
 
-const REINSTALL_REQUIRED: &str = "vendor_vlt_reinstall_required";
+pub const REINSTALL_REQUIRED: &str = "vendor_vlt_reinstall_required";
 
 /// The importer edges whose `node_modules/<dep>` still resolves into vlt's
 /// store, i.e. to an installed registry copy rather than the vendored dir.
@@ -1162,7 +1164,9 @@ pub(crate) async fn vendor_vlt(
         Ok(pair) => pair,
         Err(outcome) => return *outcome,
     };
-    warnings.extend(reinstall);
+    if result.success {
+        warnings.extend(reinstall);
+    }
     let Some(staged) = staged else {
         return done(result, None, warnings);
     };
@@ -1585,6 +1589,67 @@ fn lock_key_under(key: &str, uuid: &str) -> bool {
     split_dep_id(key).is_some_and(|d| d.kind == DepIdKind::File && d.first.starts_with(&prefix))
 }
 
+/// A revert's `vendor_vlt_reinstall_required`: an importer's
+/// `node_modules/<dep>` still resolving into the vendored dir outlives the
+/// revert, and a plain `vlt install` keeps it for an optional dependency
+/// whose spec moved back from the `file:` dir, so that one needs `vlt ci`.
+async fn revert_reinstall_advisory(
+    project_root: &Path,
+    entry: &VendorEntry,
+    uuid_dir: &Path,
+    restored_optional: bool,
+) -> Option<VendorWarning> {
+    let vendored = tokio::fs::canonicalize(uuid_dir).await.ok();
+    let mut stale: Vec<String> = Vec::new();
+    let mut stale_optional = false;
+    for rec in entry.wiring.iter().filter(|r| r.kind == KIND_PKG_DEP) {
+        let (Some(vendored), Some((field, name))) = (
+            vendored.as_ref(),
+            rec.key.as_deref().and_then(split_pkg_key),
+        ) else {
+            continue;
+        };
+        let dir = rec.file.strip_suffix(PACKAGE_JSON).unwrap_or_default();
+        let link = format!("{dir}node_modules/{name}");
+        if stale.contains(&link) {
+            continue;
+        }
+        if tokio::fs::canonicalize(project_root.join(&link))
+            .await
+            .is_ok_and(|real| real.starts_with(vendored))
+        {
+            stale_optional |= field == "optionalDependencies";
+            stale.push(link);
+        }
+    }
+    let label = parse_npm_purl(&entry.base_purl)
+        .map_or_else(|| entry.base_purl.clone(), |(n, v)| format!("{n}@{v}"));
+    if restored_optional || stale_optional {
+        return Some(VendorWarning::new(
+            REINSTALL_REQUIRED,
+            format!(
+                "{label} is an optional dependency: `vlt install` (vlt 0.0.0-30 and later) \
+                 keeps node_modules linked to the vendored `file:` directory of an optional \
+                 dependency whose spec moved back from it, so run `vlt ci` (or delete \
+                 node_modules and run `vlt install`) to link the restored copy. vlt releases \
+                 before 1.0.5 install no optional dependency from the lock of a project that \
+                 declares only optional dependencies: upgrade vlt to 1.0.5 or later first."
+            ),
+        ));
+    }
+    if stale.is_empty() {
+        return None;
+    }
+    Some(VendorWarning::new(
+        REINSTALL_REQUIRED,
+        format!(
+            "{} still links {label} to its vendored copy; run `vlt install` (or `vlt ci`) to \
+             link the restored copy",
+            stale.join(", ")
+        ),
+    ))
+}
+
 /// Undo one vlt-vendored package: every record through its §4.5.3 inverse,
 /// all or nothing, then remove the artifact.
 pub async fn revert_vlt_opts(
@@ -1728,12 +1793,23 @@ pub async fn revert_vlt_opts(
         }
     }
 
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    let restored_optional = !already_reverted
+        && entry.wiring.iter().any(|r| {
+            r.kind == KIND_PKG_DEP
+                && r.key
+                    .as_deref()
+                    .and_then(split_pkg_key)
+                    .is_some_and(|(field, _)| field == "optionalDependencies")
+        });
+    let reinstall =
+        revert_reinstall_advisory(project_root, entry, &uuid_dir, restored_optional).await;
     if !keep_artifact {
-        let uuid_dir = project_root.join(&uuid_dir_rel);
         if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
             return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
         }
     }
+    outcome.warnings.extend(reinstall);
     outcome
 }
 
@@ -2360,6 +2436,168 @@ mod tests {
             "node_modules/left-pad still links left-pad@1.3.0 to its installed upstream copy; run \
              `vlt install` (or `vlt ci`) to link the vendored copy"
         );
+    }
+
+    fn link(target: &std::path::Path, link: &std::path::Path) {
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    fn store_copy(fx: &Fx) -> std::path::PathBuf {
+        let store = fx
+            .root
+            .join(VLT_STORE_DIR)
+            .join(REG)
+            .join("node_modules/left-pad");
+        std::fs::create_dir_all(&store).unwrap();
+        store
+    }
+
+    const OPTIONAL_PKG: &str = "{\n  \"name\": \"root\",\n  \"dependencies\": {\n    \"a\": \"1.0.0\"\n  },\n  \"optionalDependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
+
+    fn optional_lock() -> String {
+        render(
+            1,
+            &[
+                r#""~npm~a@1.0.0": [0,"a","sha512-A=="]"#,
+                REG_NODE,
+                r#""~npm~z@1.0.0": [0,"z","sha512-Z=="]"#,
+            ],
+            &[
+                r#""file~_d left-pad": "optional 1.3.0 ~npm~left-pad@1.3.0""#,
+                r#""file~_d a": "prod 1.0.0 ~npm~a@1.0.0""#,
+                r#""~npm~left-pad@1.3.0 z": "prod ^1.0.0 ~npm~z@1.0.0""#,
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn the_reinstall_advisory_follows_dry_runs_members_and_failed_patches() {
+        let fx = fx(&optional_lock(), &[(PACKAGE_JSON, OPTIONAL_PKG)]).await;
+        let VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings,
+        } = run(&fx, UUID, true).await
+        else {
+            panic!("dry run");
+        };
+        assert!(result.success);
+        assert!(
+            warnings.iter().any(|w| w.code == REINSTALL_REQUIRED
+                && w.detail
+                    .starts_with("left-pad@1.3.0 is an optional dependency")),
+            "{warnings:?}"
+        );
+        assert_eq!(read(&fx, VLT_LOCK).await, optional_lock());
+        assert_eq!(read(&fx, PACKAGE_JSON).await, OPTIONAL_PKG);
+        assert!(!fx.root.join(".socket").exists());
+
+        let fx = self::fx(&optional_lock(), &[(PACKAGE_JSON, OPTIONAL_PKG)]).await;
+        tokio::fs::remove_file(fx.blobs.join(compute_git_sha256_from_bytes(PATCHED)))
+            .await
+            .unwrap();
+        let VendorOutcome::Done {
+            result, warnings, ..
+        } = run(&fx, UUID, false).await
+        else {
+            panic!("failed patch");
+        };
+        assert!(!result.success, "{result:?}");
+        assert!(
+            !codes(&warnings).contains(&REINSTALL_REQUIRED),
+            "{warnings:?}"
+        );
+        assert_eq!(read(&fx, VLT_LOCK).await, optional_lock());
+        assert_eq!(read(&fx, PACKAGE_JSON).await, OPTIONAL_PKG);
+
+        let lock = render(
+            1,
+            &[REG_NODE],
+            &[r#""workspace~packages+a left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#],
+        );
+        let member_pkg =
+            "{\n  \"name\": \"a\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
+        let fx = self::fx(&lock, &[("packages/a/package.json", member_pkg)]).await;
+        link(
+            &store_copy(&fx),
+            &fx.root.join("packages/a/node_modules/left-pad"),
+        );
+        let (_, warnings) = entry_of(run(&fx, UUID, false).await);
+        let advisory: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == REINSTALL_REQUIRED)
+            .collect();
+        assert_eq!(advisory.len(), 1, "{warnings:?}");
+        assert_eq!(
+            advisory[0].detail,
+            "packages/a/node_modules/left-pad still links left-pad@1.3.0 to its installed upstream \
+             copy; run `vlt install` (or `vlt ci`) to link the vendored copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revert_asks_for_a_reinstall_while_a_link_or_an_optional_spec_moves_back() {
+        let committed = |fx: &Fx| uuid_dir(fx, UUID).join("left-pad-1.3.0/node_modules/left-pad");
+
+        let fx = fx(&optional_lock(), &[(PACKAGE_JSON, OPTIONAL_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success, "{out:?}");
+        let advisory: Vec<&VendorWarning> = out
+            .warnings
+            .iter()
+            .filter(|w| w.code == REINSTALL_REQUIRED)
+            .collect();
+        assert_eq!(advisory.len(), 1, "{out:?}");
+        assert!(
+            advisory[0].detail.starts_with(
+                "left-pad@1.3.0 is an optional dependency: `vlt install` (vlt 0.0.0-30 and \
+                 later) keeps node_modules linked to the vendored `file:` directory"
+            ),
+            "{}",
+            advisory[0].detail
+        );
+        assert!(advisory[0].detail.contains("run `vlt ci`"));
+        assert_eq!(read(&fx, VLT_LOCK).await, optional_lock());
+        assert!(!uuid_dir(&fx, UUID).exists());
+
+        let fx = self::fx(&optional_lock(), &[(PACKAGE_JSON, OPTIONAL_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        tokio::fs::write(fx.root.join(VLT_LOCK), optional_lock())
+            .await
+            .unwrap();
+        tokio::fs::write(fx.root.join(PACKAGE_JSON), OPTIONAL_PKG)
+            .await
+            .unwrap();
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+
+        let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+
+        let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        link(&committed(&fx), &fx.root.join("node_modules/left-pad"));
+        let dry = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(true)).await;
+        assert!(dry.success && dry.warnings.is_empty(), "{dry:?}");
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success, "{out:?}");
+        assert_eq!(
+            out.warnings,
+            vec![VendorWarning::new(
+                REINSTALL_REQUIRED,
+                "node_modules/left-pad still links left-pad@1.3.0 to its vendored copy; run `vlt \
+                 install` (or `vlt ci`) to link the restored copy"
+            )]
+        );
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+        assert!(!uuid_dir(&fx, UUID).exists());
     }
 
     #[tokio::test]
