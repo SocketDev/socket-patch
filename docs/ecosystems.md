@@ -116,6 +116,22 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   enforcement for the patched package. Every boundary here is measured against real
   Bun releases — see [Bun compatibility](testing/bun-compatibility.md).
 
+## npm: which `node_modules` trees are crawled
+
+A local scan collects the project root's `node_modules` and every
+`node_modules` found in the directories below it (workspace members, nested
+projects), at any depth. The walk does not descend into symlinked
+directories, hidden directories (`.git`, `.cache`, ...), `node_modules`
+itself (packages are read from it, not searched for workspaces), or
+directories named `dist`, `build`, `coverage`, `tmp`, `temp`, `__pycache__`
+or `vendor`. It also prunes every directory that carries a
+[Cache Directory Tagging](https://bford.info/cachedir/) `CACHEDIR.TAG` file
+beginning with the standard signature — a cargo `target/`, and caches of
+other tools that follow the convention: neither that directory's own
+`node_modules` nor anything below it is crawled. The scan root is always
+crawled, even when it is tagged itself. A `CACHEDIR.TAG` that lacks the
+signature, is a directory or is a symlink prunes nothing.
+
 ## npm: Rush monorepos
 
 A Rush repo has no root `package.json`/lockfile pair — its pnpm source-of-truth locks
