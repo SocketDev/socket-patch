@@ -13,3 +13,6 @@ crates/socket-patch-core/tests/fixtures/pnpm-hosted/** -text
 
 # Captured vlt locks are byte-real; CRLF variants are derived in the tests.
 crates/socket-patch-core/tests/fixtures/vlt-locks/** -text
+
+# The vendored vlt fixtures pin locks real vlt wrote, byte for byte.
+crates/socket-patch-core/tests/fixtures/vendor/** -text

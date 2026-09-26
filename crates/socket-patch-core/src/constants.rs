@@ -158,6 +158,19 @@ pub mod npm_family {
             redirect_candidate: true,
             detects_pnpm: false,
         },
+        FileRow {
+            name: "vlt-lock.json",
+            vendor_probe: true,
+            redirect_candidate: true,
+            detects_pnpm: false,
+        },
+        // vlt's config: a read-only redirect input, never wired.
+        FileRow {
+            name: "vlt.json",
+            vendor_probe: false,
+            redirect_candidate: true,
+            detects_pnpm: false,
+        },
         // deno.lock is deliberately absent: deno is its own ecosystem
         // (JSR-crawled); no npm-family vendor/redirect/detection path treats
         // deno.lock as an npm lock today. Adding it here is a feature

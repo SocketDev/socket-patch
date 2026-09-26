@@ -308,6 +308,30 @@ into the new version's section — see docs/releasing.md.
   unchecked, whose lock a vlt release may ignore, or which also resolves
   from a non-default registry. vlt ledgers require the socket-patch
   release that adds vlt support.
+- **`vendor` wires vlt projects.** A `vlt-lock.json` (lockfileVersion 0
+  or 1) routes npm vendoring to the new vlt backend ahead of every other
+  lockfile. A direct dependency of the root or of a workspace member is
+  vendored as a patched package directory,
+  `.socket/vendor/npm/<uuid>/<name>-<version>/node_modules/<name>/`, so a
+  package that `require()`s its own name still resolves; its
+  `devDependencies` are dropped from the vendored `package.json`, and the
+  uuid dir's `.gitignore` re-includes the payload against the project's
+  own ignores while `.gitattributes` keeps EOL conversion off it. The
+  lock's node becomes a `file` node, its importer edges and the importers'
+  `package.json` specs move to the `file:` path, and every moved entry is
+  placed where vlt's own serializer puts it, so `vlt ci` keeps the lock
+  byte-identical (checked against vlt 1.2.0, 1.0.10 and 1.0.0-rc.14).
+  Transitive targets (`vendor_vlt_transitive_unsupported`), peer or
+  modifier variants, foreign registries, peer edges and dependencies
+  declared in several fields refuse before any write, as do locks vlt
+  cannot read and specs that no longer match the lock
+  (`vendor_vlt_lock_out_of_sync`); a payload git would ignore refuses with
+  `vendor_artifact_gitignored`, and a package already vendored through
+  another lockfile flavor with `vendor_flavor_changed`. `vendor --revert`
+  restores the registry node, edges and specs (keeping flags, trailing
+  slots and outgoing edge values vlt rewrote since) or keeps everything on
+  drift. Lock inventory reads `vlt-lock.json` too, Socket-hosted pins
+  included.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

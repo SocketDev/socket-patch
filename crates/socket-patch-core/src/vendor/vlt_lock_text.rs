@@ -881,14 +881,15 @@ fn leaf_version<'l>(bare: &str, leaf: &'l str) -> Option<&'l str> {
         .filter(|v| is_npm_semver(v))
 }
 
-/// A decoded `file` path of the vendored directory shape, with the name
-/// read from its `node_modules/` segments.
-pub(crate) fn parse_vendored_dir_path(path: &str) -> Option<VendoredPath> {
-    let segments: Vec<&str> = path.strip_prefix(VENDOR_NPM_PREFIX)?.split('/').collect();
-    let (uuid, scope, leaf, bare) = match segments.as_slice() {
-        [uuid, leaf, "node_modules", bare] => (*uuid, None, *leaf, *bare),
-        [uuid, scope, leaf, "node_modules", scope_again, bare] if scope == scope_again => {
-            (*uuid, Some(*scope), *leaf, *bare)
+/// `(name, version)` of a vendored directory leaf below the uuid level,
+/// `[@s/]<bare>-<version>/node_modules/[@s/]<bare>`, with the name read from
+/// its `node_modules/` segments.
+pub(crate) fn parse_vendored_dir_leaf(leaf: &str) -> Option<(String, String)> {
+    let segments: Vec<&str> = leaf.split('/').collect();
+    let (scope, leaf, bare) = match segments.as_slice() {
+        [leaf, "node_modules", bare] => (None, *leaf, *bare),
+        [scope, leaf, "node_modules", scope_again, bare] if scope == scope_again => {
+            (Some(*scope), *leaf, *bare)
         }
         _ => return None,
     };
@@ -897,13 +898,24 @@ pub(crate) fn parse_vendored_dir_path(path: &str) -> Option<VendoredPath> {
         Some(_) => return None,
         None => bare.to_string(),
     };
-    if !is_canonical_uuid(uuid) || !is_registry_package_name(&name) {
+    if !is_registry_package_name(&name) {
         return None;
     }
+    Some((name, leaf_version(bare, leaf)?.to_string()))
+}
+
+/// A decoded `file` path of the vendored directory shape, with the name
+/// read from its `node_modules/` segments.
+pub(crate) fn parse_vendored_dir_path(path: &str) -> Option<VendoredPath> {
+    let (uuid, leaf) = path.strip_prefix(VENDOR_NPM_PREFIX)?.split_once('/')?;
+    if !is_canonical_uuid(uuid) {
+        return None;
+    }
+    let (name, version) = parse_vendored_dir_leaf(leaf)?;
     Some(VendoredPath {
         uuid: uuid.to_string(),
-        version: leaf_version(bare, leaf)?.to_string(),
         name,
+        version,
         shape: VendoredShape::Dir,
     })
 }
@@ -941,10 +953,7 @@ pub(crate) fn parse_vendored_path(path: &str, name: &str) -> Option<VendoredPath
 /// `rel` of the vendored directory artifact:
 /// `.socket/vendor/npm/<uuid>/[@s/]<bare>-<version>/node_modules/<name>`.
 pub(crate) fn vendored_dir_rel(uuid: &str, name: &str, version: &str) -> String {
-    let leaf = match name.split_once('/') {
-        Some((scope, bare)) => format!("{scope}/{bare}-{version}"),
-        None => format!("{name}-{version}"),
-    };
+    let leaf = super::npm_common::pkg_rel_leaf(name, version);
     format!("{VENDOR_NPM_PREFIX}{uuid}/{leaf}/node_modules/{name}")
 }
 

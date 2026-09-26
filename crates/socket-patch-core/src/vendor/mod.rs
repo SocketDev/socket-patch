@@ -13,7 +13,7 @@
 //!
 //! | eco      | artifact            | wiring                                         |
 //! |----------|---------------------|------------------------------------------------|
-//! | npm      | deterministic tgz   | per lockfile flavor: package-lock `resolved`+`integrity`, yarn classic, yarn berry, pnpm, bun ([`npm_flavor`] routes) |
+//! | npm      | deterministic tgz (vlt: package dir) | per lockfile flavor: package-lock `resolved`+`integrity`, yarn classic, yarn berry, pnpm, bun, vlt ([`npm_flavor`] routes) |
 //! | cargo    | crate dir           | root `Cargo.toml` `[patch.crates-io]` + Cargo.lock surgery ([`cargo_manifest`]) |
 //! | golang   | module dir          | `go.mod` `replace` ([`ReplaceOwner::Vendor`])  |
 //! | composer | package dir         | composer.lock `dist` → `{type: path}`          |
@@ -69,6 +69,7 @@ pub mod lock_inventory;
 pub(crate) mod maven_pom;
 pub mod maven_repo;
 pub(crate) mod npm_common;
+pub(crate) mod npm_dir;
 pub mod npm_flavor;
 pub mod npm_lock;
 mod npm_pack;
@@ -92,6 +93,7 @@ pub(crate) mod service_fetch;
 pub(crate) mod test_support;
 mod toml_surgery;
 pub(crate) mod verify;
+pub mod vlt_lock;
 #[allow(dead_code)]
 pub(crate) mod vlt_lock_text;
 pub(crate) mod yarn_berry_lock;
@@ -506,9 +508,12 @@ pub async fn harvest_artifact_blobs_from(
             }
             continue;
         }
-        // Dir-shaped artifacts (cargo/golang/composer/gem copies): the
-        // record keys are package-relative, so resolve each needed file
-        // directly instead of walking the whole tree.
+        // Dir-shaped artifacts (cargo/golang/composer/gem copies, vlt
+        // package dirs): the record keys are package-relative, so resolve
+        // each needed file directly instead of walking the whole tree. A vlt
+        // dir's package.json is post-transform, never the afterHash blob,
+        // and its node_modules holds vlt's links.
+        let vlt_dir = entry.ecosystem == "npm" && entry.flavor.as_deref() == Some(vlt_lock::FLAVOR);
         if tokio::fs::metadata(&artifact)
             .await
             .is_ok_and(|m| m.is_dir())
@@ -518,7 +523,9 @@ pub async fn harvest_artifact_blobs_from(
                     continue;
                 }
                 let rel = normalize_file_path(file_name);
-                if !is_safe_relative_subpath(rel) {
+                if !is_safe_relative_subpath(rel)
+                    || (vlt_dir && (rel == "package.json" || rel.starts_with("node_modules/")))
+                {
                     continue;
                 }
                 let path = artifact.join(rel);

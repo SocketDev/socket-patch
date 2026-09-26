@@ -602,7 +602,7 @@ async fn repair_rebuilds_corrupt_bun_tarball() {
 }
 
 /// An entry stamped with a flavor this release has no backend for (written
-/// by a newer socket-patch, e.g. `vlt`) is never judged or rebuilt: repair
+/// by a newer socket-patch, e.g. `future-pm`) is never judged or rebuilt: repair
 /// warns `vendor_wiring_unknown_revert_blocked` and leaves the ledger, the
 /// lock and the (here deleted) artifact exactly as found.
 #[tokio::test]
@@ -618,7 +618,7 @@ async fn repair_skips_an_entry_with_an_unknown_flavor() {
     let state_path = tmp.path().join(".socket/vendor/state.json");
     let mut v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
-    v["entries"][PURL]["flavor"] = serde_json::json!("vlt");
+    v["entries"][PURL]["flavor"] = serde_json::json!("future-pm");
     std::fs::write(&state_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     let state_before = std::fs::read(&state_path).unwrap();
     let lock_before = std::fs::read(tmp.path().join(flavor.lock_name())).unwrap();

@@ -712,9 +712,15 @@ pub(crate) fn is_safe_npm_name(name: &str) -> bool {
 /// The artifact path under the uuid dir: `[@scope/]<name>-<version>.tgz`,
 /// with the scope kept as a real subdirectory.
 pub(super) fn tgz_rel_leaf(name: &str, version: &str) -> String {
+    format!("{}.tgz", pkg_rel_leaf(name, version))
+}
+
+/// `[@scope/]<name>-<version>`: the tarball leaf without `.tgz`, which the
+/// vlt directory artifact uses as its version-bearing level.
+pub(crate) fn pkg_rel_leaf(name: &str, version: &str) -> String {
     match name.split_once('/') {
-        Some((scope, bare)) => format!("{scope}/{bare}-{version}.tgz"),
-        None => format!("{name}-{version}.tgz"),
+        Some((scope, bare)) => format!("{scope}/{bare}-{version}"),
+        None => format!("{name}-{version}"),
     }
 }
 
@@ -733,7 +739,7 @@ pub(crate) fn tgz_leaf_version<'l>(name: &str, leaf: &'l str) -> Option<&'l str>
 /// to `Object.keys(bd)` for any other truthy value — so an OBJECT form
 /// bundles its keys too; any of these makes the package unvendorable (see
 /// the refusal site).
-fn declares_bundled_deps(pkg: &Value) -> bool {
+pub(super) fn declares_bundled_deps(pkg: &Value) -> bool {
     ["bundleDependencies", "bundledDependencies"]
         .iter()
         .any(|k| match pkg.get(*k) {
