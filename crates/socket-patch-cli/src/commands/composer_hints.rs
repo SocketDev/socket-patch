@@ -2,11 +2,15 @@
 //!
 //! Both modes rewire `composer.lock` only: the installed `vendor/` tree keeps
 //! the unpatched bytes until Composer reinstalls the package. Composer 2
-//! reinstalls a locked package whose dist changed on the next `composer
-//! install`; Composer 1 does not, so its `vendor/<vendor>/<name>` must be
-//! removed first.
+//! reinstalls a locked package on the next `composer install` only when its
+//! version, dist reference or source reference changed. Vendoring sets the
+//! dist reference to the patch uuid; a hosted redirect keeps it and drops
+//! the entry's `source`, so an entry that had no `source` changes nothing
+//! Composer compares. Composer 1 never reinstalls a changed package. In both
+//! cases `vendor/<vendor>/<name>` must be removed first.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+use socket_patch_core::patch::redirect::FileEdit;
 
 const VENDOR_PREFIX: &str = ".socket/vendor/composer/";
 
@@ -59,12 +63,47 @@ pub(crate) fn vendored_reinstall_hints(packages: &[String]) -> Vec<String> {
 }
 
 /// The reinstall example for a hosted run's next steps when it rewrote
-/// `composer.lock`.
-pub(crate) fn hosted_reinstall_hint(files: &[String]) -> Option<&'static str> {
-    files.iter().any(|f| f == "composer.lock").then_some(
-        " (e.g. `composer install`; on Composer 1 first remove the patched packages' \
-         vendor/<vendor>/<name> directories)",
-    )
+/// `composer.lock`. `edits` are the run's rewrite edits: a redirected entry
+/// whose edit removed no `source` must have its vendor dir removed on every
+/// Composer version.
+pub(crate) fn hosted_reinstall_hint(files: &[String], edits: &[FileEdit]) -> Option<String> {
+    if !files.iter().any(|f| f == "composer.lock") {
+        return None;
+    }
+    let mut unchanged: Vec<String> = edits
+        .iter()
+        .filter(|e| e.path == "composer.lock" && e.kind == "redirect_composer_dist")
+        .filter(|e| !removes_source(e))
+        .filter_map(|e| Some(format!("vendor/{}", e.key.as_deref()?.to_lowercase())))
+        .collect();
+    unchanged.sort_unstable();
+    unchanged.dedup();
+    if unchanged.is_empty() {
+        return Some(
+            " (e.g. `composer install`; on Composer 1 first remove the patched packages' \
+             vendor/<vendor>/<name> directories)"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        " (e.g. `composer install`; first remove {} — Composer does not reinstall a package \
+         whose lock entry has no `source` when only its dist url changes — and on Composer 1 \
+         every other patched package's vendor/<vendor>/<name> directory)",
+        unchanged.join(", ")
+    ))
+}
+
+/// Whether a composer dist edit dropped the entry's `source` object, which
+/// changes the source reference Composer 2 compares. The recorded fragments
+/// are runs of whole entry members, so each parses as an object's body.
+fn removes_source(edit: &FileEdit) -> bool {
+    let members = |fragment: Option<&Value>| -> Option<Map<String, Value>> {
+        serde_json::from_str(&format!("{{{}}}", fragment?.as_str()?)).ok()
+    };
+    let had = members(edit.original.as_ref())
+        .is_some_and(|m| m.get("source").is_some_and(Value::is_object));
+    let has = members(edit.new.as_ref()).is_none_or(|m| m.contains_key("source"));
+    had && !has
 }
 
 #[cfg(test)]
@@ -124,8 +163,51 @@ mod tests {
 
     #[test]
     fn hosted_hint_needs_a_rewritten_composer_lock() {
-        assert!(hosted_reinstall_hint(&["package-lock.json".to_string()]).is_none());
-        let hint = hosted_reinstall_hint(&["composer.lock".to_string()]).unwrap();
+        assert!(hosted_reinstall_hint(&["package-lock.json".to_string()], &[]).is_none());
+        let hint = hosted_reinstall_hint(&["composer.lock".to_string()], &[]).unwrap();
         assert!(hint.contains("composer install") && hint.contains("Composer 1"));
+    }
+
+    fn dist_edit(key: &str, original: &str, new: &str) -> FileEdit {
+        FileEdit {
+            path: "composer.lock".into(),
+            kind: "redirect_composer_dist".into(),
+            action: "rewritten".into(),
+            key: Some(key.into()),
+            original: Some(Value::String(original.into())),
+            new: Some(Value::String(new.into())),
+        }
+    }
+
+    const OLD_DIST: &str =
+        r#""dist": {"type": "zip", "url": "https://x/a.zip", "reference": "abc"}"#;
+    const NEW_DIST: &str = r#""dist": {"type": "zip", "url": "https://patch/a.zip", "reference": "abc", "shasum": "1111111111111111111111111111111111111111"}"#;
+
+    /// Composer 2 reinstalls a redirected entry because dropping its
+    /// `source` changes the source reference; a dist-only entry changes
+    /// nothing it compares, so its vendor dir is named for every version.
+    #[test]
+    fn hosted_hint_names_dist_only_entries_for_every_composer() {
+        let files = ["composer.lock".to_string()];
+        let with_source = dist_edit(
+            "psr/log",
+            &format!(r#""source": {{"type": "git", "url": "u", "reference": "abc"}}, {OLD_DIST}"#),
+            NEW_DIST,
+        );
+        let source_after_extra = dist_edit(
+            "psr/log",
+            &format!(r#"{OLD_DIST}, "extra": {{"source": {{}}}}, "source": {{"type": "git"}}"#),
+            &format!(r#"{NEW_DIST}, "extra": {{"source": {{}}}}"#),
+        );
+        for edits in [vec![with_source.clone()], vec![source_after_extra]] {
+            let hint = hosted_reinstall_hint(&files, &edits).unwrap();
+            assert!(hint.contains("on Composer 1 first remove"), "{hint}");
+        }
+
+        let dist_only = dist_edit("Acme/Lib", OLD_DIST, NEW_DIST);
+        let hint = hosted_reinstall_hint(&files, &[with_source, dist_only]).unwrap();
+        assert!(hint.contains("first remove vendor/acme/lib —"), "{hint}");
+        assert!(!hint.contains("vendor/psr/log"), "{hint}");
+        assert!(hint.contains("on Composer 1"), "{hint}");
     }
 }
