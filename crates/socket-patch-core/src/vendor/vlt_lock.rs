@@ -654,8 +654,10 @@ async fn analyze(
 /// The read-only vendored-mode refusals vlt can decide before any write:
 /// the lock sniff and layout, the target analysis with its declaration
 /// checks, the installed store copy's `bundleDependencies` and duplicate
-/// `devDependencies`, and a git ignore rule covering the would-be marker
-/// (DESIGN §4.6, core part).
+/// `devDependencies`, and a git rule ignoring the would-be uuid dir
+/// (DESIGN §4.6, core part). The dir form matches only directory
+/// exclusions: every other rule is overridden by the `!*` the engine
+/// writes into that dir.
 pub async fn vlt_vendor_preflight(
     project_root: &Path,
     purl: &str,
@@ -696,8 +698,9 @@ pub async fn vlt_vendor_preflight(
         }
     }
     if let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", uuid) {
-        let marker = format!("{uuid_dir}/{}", super::state::VENDOR_MARKER_FILE);
-        if let Some(rules) = super::npm_dir::gitignored(project_root, &[marker]).await {
+        if let Some(rules) =
+            super::npm_dir::gitignored(project_root, &[format!("{uuid_dir}/")]).await
+        {
             return Err((
                 super::npm_dir::GITIGNORED,
                 super::npm_dir::gitignored_detail(&analysis.rel, &rules),
@@ -2422,6 +2425,37 @@ mod tests {
             .unwrap_err();
         assert_eq!(code, UNSUPPORTED);
         assert!(detail.contains("duplicate devDependencies"), "{detail}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_preflight_refuses_only_rules_the_uuid_gitignore_cannot_undo() {
+        let Some(git) = crate::utils::process::resolve_tool("git") else {
+            return;
+        };
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let status = std::process::Command::new(&git)
+            .args(["init", "-q"])
+            .current_dir(&fx.root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ignore = fx.root.join(".gitignore");
+        tokio::fs::write(&ignore, "*.json\n!package.json\n!vlt-lock.json\n")
+            .await
+            .unwrap();
+        assert_eq!(vlt_vendor_preflight(&fx.root, PURL, UUID).await, Ok(()));
+        for rule in [".socket/", ".socket/vendor/", "npm/", UUID] {
+            tokio::fs::write(&ignore, format!("*.json\n{rule}\n"))
+                .await
+                .unwrap();
+            let (code, detail) = vlt_vendor_preflight(&fx.root, PURL, UUID)
+                .await
+                .unwrap_err();
+            assert_eq!(code, super::super::npm_dir::GITIGNORED, "{rule}");
+            assert!(detail.contains(&format!(".gitignore:2:{rule}")), "{detail}");
+            assert!(!detail.contains("*.json"), "{detail}");
+        }
     }
 
     fn service_tgz(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {

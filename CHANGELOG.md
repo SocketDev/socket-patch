@@ -351,11 +351,14 @@ into the new version's section — see docs/releasing.md.
   `.gitattributes`, and stamps reconstructed entries `flavor: "vlt"`. The
   human output names the vlt committables and `vlt install`. A Bun lock
   beside `vlt-lock.json` no longer triggers the Bun vendored preflight.
-- **`rollback` fetches a before-blob that only a store peer variant
-  needs.** The before-blob gate now probes every pnpm and vlt store variant
-  copy the rollback restores, so an online rollback no longer fails
-  `Before blob not found` for a still-patched variant beside an
-  already-original copy.
+  The git-ignore check refuses only a rule that ignores the vendored
+  uuid directory itself (such as `.socket/`), not one like `*.json` that
+  the directory's own `.gitignore` overrides. A takeover whose vendoring
+  then fails still removes the hosted store copies against the restored
+  registry pin. When vlt's link to the committed directory is the only
+  installed copy, `vendor` says so (`vendor_ledger_entry_missing`, run
+  `socket-patch repair`, when the vendor ledger lost the entry) instead of
+  reporting the package as not installed.
 - **`vex` reads `vlt-lock.json`.** Manifest-less VEX (and the ledger
   liveness gates behind `vex`, `scan`'s takeovers and the
   `hosted_wiring_retained` advisory) discovers hosted vlt nodes (a Socket
@@ -735,6 +738,19 @@ into the new version's section — see docs/releasing.md.
   (parity with rollback/repair/`scan --prune`).
 
 ### Fixed
+
+- **`rollback` fetches a before-blob that only a store peer variant
+  needs.** The before-blob gate now probes every pnpm and vlt store variant
+  copy the rollback restores, so an online rollback no longer fails
+  `Before blob not found` for a still-patched variant beside an
+  already-original copy.
+
+- **Re-vendoring under a newer patch never builds from the old patch's
+  artifact.** With no installed copy, `vendor` staged the committed
+  artifact of the previous patch as the build source, so a file only the
+  old patch changed reached the new artifact unnoticed. The committed
+  artifact is now staged only for the patch that built it; a newer patch
+  fetches the pristine package per the lockfile (`--offline` skips it).
 
 - **Ledgers written by a newer socket-patch are never half-reverted.**
   A hosted redirect edit kind this release does not understand used to

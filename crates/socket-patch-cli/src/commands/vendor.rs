@@ -1261,7 +1261,7 @@ pub(crate) async fn vendor_records(
     for (purl, paths) in npm_paths_by_identity(&crawler_options, &missing_npm).await {
         all_packages.insert(purl, paths[0].clone());
     }
-    drop_vendored_installs(&common.cwd, &mut all_packages);
+    let vendored_installs = drop_vendored_installs(&common.cwd, &mut all_packages);
 
     // ── Auto-fetch: lockfile-resolved packages with no installed copy ────
     // A manifest patch whose package is not on disk but IS resolvable from
@@ -1293,11 +1293,14 @@ pub(crate) async fn vendor_records(
             // Artifact-staging path: an already-vendored purl with no
             // installed copy (fresh clone) stages from its own committed
             // artifact, sha256-verified against the ledger — offline-safe,
-            // no registry traffic.
+            // no registry traffic. Only at the record's own uuid: an older
+            // patch's artifact holds that patch's bytes, never a pristine
+            // source for a superseding one.
             for purl in &missing {
                 let ledger_entry = lookup_entry(&state.entries, purl);
                 if let Some(entry) = ledger_entry.filter(|e| {
                     e.ecosystem == "npm"
+                        && records.get(purl).is_some_and(|r| r.uuid == e.uuid)
                         && (e.artifact.path.ends_with(".tgz")
                             || !vendor::artifact_is_file_shaped(&e.artifact.path))
                 }) {
@@ -1840,6 +1843,8 @@ pub(crate) async fn vendor_records(
             )
             .await;
             status.finish();
+            let vendored =
+                matches!(&outcome, Some(VendorOutcome::Done { result, .. }) if result.success);
 
             match outcome {
                 None => {
@@ -1968,20 +1973,28 @@ pub(crate) async fn vendor_records(
                         )
                         .await;
                     }
-                    if result.success {
-                        if let Some(targets) = vlt_takeover_targets.remove(candidate) {
-                            if let Some(detail) =
-                                crate::commands::scan::vlt_takeover_heal(common, &targets).await
-                            {
-                                record_warning(
-                                    env,
-                                    candidate,
-                                    &VendorWarning::new("redirect_vlt_reinstall_required", detail),
-                                    common,
-                                );
-                            }
-                        }
-                    }
+                }
+            }
+            // The reverted hosted pin is gone either way: a vendored purl
+            // is healed against its new wiring, a failed one against the
+            // restored registry pin (DESIGN §4.10 step 4).
+            if let Some(targets) = vlt_takeover_targets.remove(candidate) {
+                let detail = if vendored {
+                    crate::commands::scan::vlt_takeover_heal(common, &targets).await
+                } else {
+                    crate::commands::scan::vlt_rollback_heal(common, &targets)
+                        .await
+                        .into_iter()
+                        .map(|(_, detail)| detail)
+                        .next()
+                };
+                if let Some(detail) = detail {
+                    record_warning(
+                        env,
+                        candidate,
+                        &VendorWarning::new("redirect_vlt_reinstall_required", detail),
+                        common,
+                    );
                 }
             }
         }
@@ -2021,6 +2034,55 @@ pub(crate) async fn vendor_records(
             HashSet::new()
         };
         for purl in &unmatched {
+            if let Some(dir) = vendored_installs.get(purl) {
+                // The only installed copy is this tool's own artifact, which
+                // is never a pristine source: say so, not "not installed".
+                match lookup_entry(&state.entries, purl) {
+                    None => {
+                        let detail = format!(
+                            "installed from the vendored artifact {dir}, but the vendor ledger \
+                             has no entry for it; run `socket-patch repair` to restore the entry"
+                        );
+                        report_vendor_failure(common, purl, &detail);
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, purl.clone())
+                                .with_error("vendor_ledger_entry_missing", detail),
+                        );
+                        continue;
+                    }
+                    Some(entry) if records.get(purl).is_some_and(|r| r.uuid != entry.uuid) => {
+                        let blocked = if common.offline {
+                            "--offline prevents fetching the pristine artifact from the registry"
+                        } else {
+                            "no pristine artifact could be fetched"
+                        };
+                        let detail = format!(
+                            "the only installed copy is the vendored artifact {dir} of patch \
+                             {}, which is not a pristine source for this patch; {blocked}",
+                            entry.uuid
+                        );
+                        report_vendor_failure(common, purl, &detail);
+                        env.record(
+                            PatchEvent::new(PatchAction::Skipped, purl.clone())
+                                .with_reason("package_not_installed", detail),
+                        );
+                        continue;
+                    }
+                    Some(_) => {
+                        let detail = format!(
+                            "the only installed copy is the vendored artifact {dir}, which is \
+                             not a pristine source, and its ledger entry records no file \
+                             inventory to stage the committed artifact against"
+                        );
+                        report_vendor_failure(common, purl, &detail);
+                        env.record(
+                            PatchEvent::new(PatchAction::Skipped, purl.clone())
+                                .with_reason("package_not_installed", detail),
+                        );
+                        continue;
+                    }
+                }
+            }
             // Honesty order: every purl here is first and foremost a crawler
             // miss — nothing on disk matched — so the on-disk cause leads.
             // The --offline note is strictly secondary and only stated when
@@ -2113,18 +2175,34 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
 /// longer resolve at all): vlt links a vendored `file:` dependency straight
 /// to its committed dir, which is this tool's own artifact and never a
 /// pristine source. The committed-artifact rung stages it
-/// inventory-verified instead.
+/// inventory-verified instead. Returns the dropped purls whose copy
+/// resolved into a vendored uuid dir, with that dir
+/// (`.socket/vendor/<eco>/<uuid>/`).
 pub(crate) fn drop_vendored_installs(
     cwd: &Path,
     packages: &mut HashMap<String, std::path::PathBuf>,
-) {
+) -> HashMap<String, String> {
+    let mut dropped = HashMap::new();
     let Ok(vendor_root) = std::fs::canonicalize(cwd.join(SOCKET_DIR).join("vendor")) else {
-        return;
+        return dropped;
     };
     packages.retain(|purl, path| {
-        !purl.starts_with("pkg:npm/")
-            || std::fs::canonicalize(path).is_ok_and(|real| !real.starts_with(&vendor_root))
+        if !purl.starts_with("pkg:npm/") {
+            return true;
+        }
+        let Ok(real) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        let Ok(rest) = real.strip_prefix(&vendor_root) else {
+            return true;
+        };
+        let mut parts = rest.components().map(|c| c.as_os_str().to_string_lossy());
+        if let (Some(eco), Some(uuid)) = (parts.next(), parts.next()) {
+            dropped.insert(purl.clone(), format!(".socket/vendor/{eco}/{uuid}/"));
+        }
+        false
     });
+    dropped
 }
 
 /// Ledger entries whose patch is gone from the manifest — the stale test

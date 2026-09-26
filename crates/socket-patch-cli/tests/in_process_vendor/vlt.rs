@@ -721,6 +721,186 @@ fn vendor_vlt_revendor_new_uuid() {
     assert_eq!(read(root, "package.json"), pkg);
 }
 
+/// vlt's post-install layout: `node_modules/<name>` links the committed
+/// dir of `uuid`, and the store copy is gone.
+fn link_vendored_dir(root: &Path, uuid: &str) {
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    std::fs::create_dir_all(root.join("node_modules")).unwrap();
+    let target = Path::new("..").join(rel_dir(uuid, NAME, VERSION));
+    let link = root.join("node_modules").join(NAME);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(root.join(rel_dir(uuid, NAME, VERSION)), &link).unwrap();
+}
+
+#[test]
+fn vendor_vlt_linked_install_without_a_ledger_entry_points_at_repair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    direct_project(root);
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    link_vendored_dir(root, UUID);
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        codes(&env).contains(&"already_vendored".to_string()),
+        "{env:#}"
+    );
+    let lock = read(root, VLT_LOCK);
+    std::fs::remove_file(root.join(".socket/vendor/state.json")).unwrap();
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 1, "{env:#}");
+    let (got, detail) = failure(&env, PURL);
+    assert_eq!(got, "vendor_ledger_entry_missing", "{env:#}");
+    assert_eq!(
+        detail,
+        format!(
+            "installed from the vendored artifact .socket/vendor/npm/{UUID}/, but the vendor \
+             ledger has no entry for it; run `socket-patch repair` to restore the entry"
+        )
+    );
+    assert!(
+        !codes(&env).contains(&"package_not_installed".to_string()),
+        "{env:#}"
+    );
+    assert_eq!(read(root, VLT_LOCK), lock);
+
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, env, _) = socket(root, &["repair", "--json", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let entry = ledger_entry(root, PURL);
+    assert_eq!(entry["flavor"], "vlt", "{env:#}");
+    assert_eq!(entry["uuid"], UUID, "{env:#}");
+    // The reconstructed entry has no inventory: the rerun says so instead
+    // of claiming nothing is installed.
+    assert!(entry["artifact"]["fileInventory"].is_null(), "{entry:#}");
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 1, "{env:#}");
+    let skip = events(&env)
+        .into_iter()
+        .find(|e| e["errorCode"] == "package_not_installed")
+        .unwrap_or_else(|| panic!("{env:#}"));
+    assert_eq!(
+        skip["reason"],
+        format!(
+            "the only installed copy is the vendored artifact .socket/vendor/npm/{UUID}/, which \
+             is not a pristine source, and its ledger entry records no file inventory to stage \
+             the committed artifact against"
+        )
+    );
+    assert_eq!(read(root, VLT_LOCK), lock);
+}
+
+const EXTRA: (&str, &[u8], &[u8]) = ("package/extra.js", b"orig\n", b"v1-only\n");
+
+/// A project vendored at [`UUID`] by a patch that also changes
+/// `extra.js`, then linked the way `vlt install` links it, with a
+/// superseding [`UUID2`] patch that leaves `extra.js` alone.
+fn superseded_linked_project(root: &Path, lock: &Lock) {
+    project(root, lock, ROOT_PKG, "~npm~left-pad@1.3.0");
+    std::fs::write(
+        store_dir(root, "~npm~left-pad@1.3.0", NAME).join("extra.js"),
+        EXTRA.1,
+    )
+    .unwrap();
+    stage_patch(root, &[PURL], UUID, &[EXTRA]);
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        read(root, &format!("{}/extra.js", rel_dir(UUID, NAME, VERSION))).as_bytes(),
+        EXTRA.2
+    );
+    link_vendored_dir(root, UUID);
+    stage_patch(root, &[PURL], UUID2, &[]);
+}
+
+#[test]
+fn vendor_vlt_revendor_new_uuid_never_builds_from_the_old_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    superseded_linked_project(root, &direct_lock());
+    let lock = read(root, VLT_LOCK);
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 1, "{env:#}");
+    let skip = events(&env)
+        .into_iter()
+        .find(|e| e["errorCode"] == "package_not_installed")
+        .unwrap_or_else(|| panic!("{env:#}"));
+    assert_eq!(
+        skip["reason"],
+        format!(
+            "the only installed copy is the vendored artifact .socket/vendor/npm/{UUID}/ of \
+             patch {UUID}, which is not a pristine source for this patch; --offline prevents \
+             fetching the pristine artifact from the registry"
+        ),
+        "{env:#}"
+    );
+    assert!(!uuid_dir(root, UUID2).exists(), "{env:#}");
+    assert_eq!(read(root, VLT_LOCK), lock);
+    assert_eq!(ledger_entry(root, PURL)["uuid"], UUID);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vendor_vlt_revendor_new_uuid_fetches_the_pristine_package() {
+    let server = MockServer::start().await;
+    let pristine = tarball(
+        &[
+            (
+                "package/package.json",
+                b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}\n",
+            ),
+            ("package/index.js", PRISTINE),
+            ("package/extra.js", EXTRA.1),
+        ],
+        &[],
+    );
+    Mock::given(method("GET"))
+        .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(pristine.clone()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/left-pad/-/left-pad-1.3.0.tgz", server.uri());
+    let lock = Lock::v1(
+        &[&format!(
+            "\"~npm~left-pad@1.3.0\": [0,\"{NAME}\",\"{}\",\"{url}\"]",
+            sri(&pristine)
+        )],
+        &["\"file~_d left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0\""],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    superseded_linked_project(root, &lock);
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, env, stderr) = socket(
+        root,
+        &[
+            "vendor",
+            "--json",
+            "--vendor-source",
+            "build",
+            "--cwd",
+            &cwd,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert!(
+        codes(&env).contains(&"vendor_fetched_missing".to_string()),
+        "{env:#}"
+    );
+    let rel2 = rel_dir(UUID2, NAME, VERSION);
+    assert_eq!(read(root, &format!("{rel2}/index.js")).as_bytes(), PATCHED);
+    assert_eq!(
+        read(root, &format!("{rel2}/extra.js")).as_bytes(),
+        EXTRA.1,
+        "the old patch's extra.js never reaches the new artifact"
+    );
+    assert!(!uuid_dir(root, UUID).exists());
+    assert_eq!(ledger_entry(root, PURL)["uuid"], UUID2);
+}
+
 // ── revert inverses ──────────────────────────────────────────────────────
 
 #[test]

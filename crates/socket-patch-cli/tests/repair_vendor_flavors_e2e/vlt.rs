@@ -16,7 +16,11 @@
 //!     unreferenced one;
 //! (f) a deleted `<uuid>/.gitignore` is rewritten, no rebuild;
 //! (g) a package.json-touching patch of a package with devDependencies is
-//!     healthy (the vlt manifest exemption; no Corrupt → rebuild loop).
+//!     healthy (the vlt manifest exemption; no Corrupt → rebuild loop);
+//! (h) a reference only `vlt-lock.json` carries is kept by the orphan
+//!     sweep and judged by a ledger-less repair;
+//! (i) a failed must-verify post-verify puts `vlt-lock.json` and every
+//!     importer package.json back byte-for-byte.
 
 use std::path::{Path, PathBuf};
 
@@ -330,5 +334,109 @@ async fn vlt_repair_keeps_a_devdependency_stripped_manifest_healthy() {
     assert_eq!(
         std::fs::read_to_string(dir.join("package.json")).unwrap(),
         committed
+    );
+}
+
+/// `package.json` edited back to the registry spec since vendoring: only
+/// `vlt-lock.json` names the vendored dir. The orphan sweep keeps it, and
+/// a ledger-less repair finds the reference and refuses the out-of-sync
+/// declaration instead of dropping the dir.
+#[tokio::test]
+async fn vlt_lock_only_reference_is_kept_and_judged() {
+    for lock in LOCKS {
+        let mock = wiremock::MockServer::start().await;
+        mount_patch_api(&mock).await;
+        super::mount_blob(&mock).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), lock, None);
+        let registry_pkg = std::fs::read(tmp.path().join("package.json")).unwrap();
+        let dir = vendor_project(tmp.path(), &mock.uri(), lock);
+        // package.json edited back since vendoring: only the lock names
+        // the vendored dir now.
+        std::fs::write(tmp.path().join("package.json"), &registry_pkg).unwrap();
+        std::fs::write(
+            tmp.path().join(".socket/vendor/state.json"),
+            "{\"version\":1,\"entries\":{}}",
+        )
+        .unwrap();
+        let (code, stdout, stderr) = common::run_with_env(
+            tmp.path(),
+            &["vendor", "--revert", "--json"],
+            &[("SOCKET_TELEMETRY_DISABLED", "1")],
+        );
+        assert_eq!(code, 0, "{lock:?}: {stdout}\n{stderr}");
+        assert!(
+            dir.join("index.js").is_file(),
+            "{lock:?}: the lock still installs it: {stdout}"
+        );
+        std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
+        let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+        assert_eq!(code, 1, "{lock:?}: {stdout}\n{stderr}");
+        let v = parse_env(&stdout);
+        assert!(
+            events_of(&v).iter().any(|e| e["action"] == "failed"
+                && e["purl"] == PURL
+                && e["errorCode"] == "vendor_vlt_lock_out_of_sync"),
+            "{lock:?}: the lock-only reference is found and judged: {v}"
+        );
+        assert!(dir.join("index.js").is_file(), "{lock:?}: {v}");
+    }
+}
+
+/// A must-verify rebuild (a pnpm-wired entry reconstructed from its lock
+/// integrity) in a project that also carries `vlt-lock.json`: the vlt
+/// backend drives the re-wire, the rebuilt artifact fails the post-verify,
+/// and every wiring file, vlt's included, is put back byte-for-byte.
+#[tokio::test]
+async fn vlt_wiring_files_are_restored_after_a_failed_post_verify() {
+    let mock = wiremock::MockServer::start().await;
+    mount_patch_api(&mock).await;
+    super::mount_blob(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    super::write_fixture(root, super::Flavor::Pnpm);
+    super::vendor_project(root, &mock.uri(), super::Flavor::Pnpm);
+    let lock = VltLock::V1.lock().replace(
+        "\n  }\n}\n",
+        &format!(",\n    \"workspace~packages+a {DEP}\": \"prod {DEP_VERSION} ~npm~left-pad@1.3.0\"\n  }}\n}}\n"),
+    );
+    std::fs::write(root.join("vlt-lock.json"), &lock).unwrap();
+    std::fs::create_dir_all(root.join("packages/a")).unwrap();
+    std::fs::write(
+        root.join("packages/a/package.json"),
+        format!("{{\n  \"name\": \"a\",\n  \"dependencies\": {{\n    \"{DEP}\": \"{DEP_VERSION}\"\n  }}\n}}\n"),
+    )
+    .unwrap();
+    let files = [
+        "vlt-lock.json",
+        "package.json",
+        "packages/a/package.json",
+        "pnpm-lock.yaml",
+    ];
+    let before: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(root.join(f)).unwrap())
+        .collect();
+    std::fs::remove_dir_all(root.join(".socket/vendor")).unwrap();
+
+    let (code, stdout, stderr) = run_cli(root, &mock.uri(), &["repair", "--download-mode", "file"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "failed" && e["purl"] == PURL),
+        "{v}"
+    );
+    for (file, bytes) in files.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read(root.join(file)).unwrap(),
+            bytes,
+            "{file} is restored: {v}"
+        );
+    }
+    assert!(
+        !root.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        "{v}"
     );
 }

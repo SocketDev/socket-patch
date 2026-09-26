@@ -1155,6 +1155,16 @@ async fn get_vendored_vlt_refusal_visible_under_silent() {
         assert_eq!(code, 1, "{label}: stdout={stdout}\nstderr={stderr}");
         assert!(stdout.trim().is_empty(), "{label}: {stdout}");
         assert!(stderr.contains(VLT_SYNC_CODE), "{label}: {stderr}");
+        let download_line = format!("[error] {PURL1} ({VLT_SYNC_CODE}):");
+        if label == "purl" {
+            assert!(stderr.contains(&download_line), "{label}: {stderr}");
+        } else {
+            assert!(
+                stderr.contains(&format!("Error ({VLT_SYNC_CODE}):")),
+                "the uuid path refuses before the download: {stderr}"
+            );
+            assert!(!stderr.contains(&download_line), "{label}: {stderr}");
+        }
         assert_eq!(
             std::fs::read(tmp.path().join("vlt-lock.json")).unwrap(),
             lock_before,

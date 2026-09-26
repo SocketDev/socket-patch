@@ -442,3 +442,71 @@ async fn vlt_hosted_artifact_preflight_refuses_before_the_vendored_revert() {
     );
     assert!(root.join(rel()).join("index.js").is_file());
 }
+
+/// A vendor that fails after the takeover revert was persisted (here a
+/// patch-service artifact failing its integrity check) still heals the
+/// hosted store copy against the restored registry pin: the redirect
+/// record is gone, so no later run could find it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    hosted_project(root, &server).await;
+    seed_manifest(root);
+
+    let service = MockServer::start().await;
+    hosted::mock_reference_at(
+        &service,
+        &hosted::artifact_url(&service),
+        "sha512-bm90IHRoZSBieXRlcw==",
+    )
+    .await;
+    hosted::mock_artifact(&service).await;
+    let cwd = root.to_str().unwrap().to_string();
+    let uri = service.uri();
+    let argv = [
+        "vendor",
+        "--cwd",
+        &cwd,
+        "--api-url",
+        &uri,
+        "--vendor-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let (code, env, stderr) = hosted::run_json(root, &argv, &[]);
+    assert_eq!(code, 1, "{env:#}\n{stderr}");
+    let codes = all_codes(&env);
+    assert!(
+        codes.contains(&"vendor_takeover_reverted_redirect".to_string()),
+        "{env:#}"
+    );
+    assert!(
+        detail_of(&env, "apply_failed").contains("integrity"),
+        "{env:#}"
+    );
+    assert_eq!(
+        detail_of(&env, "redirect_vlt_reinstall_required"),
+        "restored registry pins for 1 packages; removed the patched installed copies, so \
+         node_modules is incomplete until you run `vlt install` (or `vlt ci`)"
+    );
+    assert_eq!(hosted::read(root, "vlt-lock.json"), registry_lock());
+    assert_eq!(hosted::read(root, "package.json"), PACKAGE_JSON);
+    assert!(vendor_entry(root).is_none());
+    assert!(
+        redirect_ledger(root).is_none_or(|l| l["records"]
+            .as_object()
+            .is_none_or(|r| !r.contains_key(PURL))),
+        "the redirect record is dropped"
+    );
+    assert!(
+        !hosted::store_dir(root, TILDE_ID).exists(),
+        "the hosted store copy is invalidated"
+    );
+    assert!(!root.join("node_modules/.vlt-lock.json").exists());
+}

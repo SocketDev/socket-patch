@@ -2102,6 +2102,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_recovers_vlt_lock_and_workspace_package_json_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let in_lock = "11111111-1111-4111-8111-111111111111";
+        let in_member = "22222222-2222-4222-8222-222222222222";
+        let lock_path =
+            format!(".socket/vendor/npm/{in_lock}/left-pad-1.3.0/node_modules/left-pad");
+        let member_path = format!(".socket/vendor/npm/{in_member}/debug-4.3.4/node_modules/debug");
+        let node_id = format!(
+            "file~{}",
+            lock_path
+                .replace('/', "+")
+                .replace("node_modules", "node__modules")
+        );
+        tokio::fs::write(
+            root.join("vlt-lock.json"),
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+                 \"{node_id}\": [0,\"left-pad\",null,\"{lock_path}\"],\n    \
+                 \"~npm~debug@4.3.4\": [0,\"debug\",\"sha512-D==\"]\n  }},\n  \"edges\": {{\n    \
+                 \"file~_d left-pad\": \"prod file:./{lock_path} {node_id}\",\n    \
+                 \"workspace~packages+a debug\": \"prod 4.3.4 ~npm~debug@4.3.4\"\n  }}\n}}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("package.json"),
+            "{\"dependencies\":{\"left-pad\":\"1.3.0\"}}",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join("packages/a"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("packages/a/package.json"),
+            format!("{{\"dependencies\":{{\"debug\":\"file:../../{member_path}\"}}}}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scan_vendor_references(root).await,
+            vec![
+                ("npm".to_string(), in_lock.to_string(), lock_path),
+                ("npm".to_string(), in_member.to_string(), member_path),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn scan_recovers_script_and_pep751_vendor_references() {
         let tmp = tempfile::tempdir().unwrap();
         let uuid = "11111111-1111-4111-8111-111111111111";
