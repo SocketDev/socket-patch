@@ -691,9 +691,12 @@ jobs:
           # coverage.
           #
           # composer: 1 (packagist stopped serving composer 1 on 2025-09-01,
-          # so the fixture resolves from an inline repository), 2.2 LTS (the
-          # other release with the git-source download fallback the hosted
-          # redirect must drop) and current 2.
+          # so the fixture resolves from an inline repository), 2.2 LTS and
+          # current 2. Every release from 1.x through 2.9 falls back to the
+          # git `source` when the dist download fails (the fallback the
+          # hosted redirect must drop); 2.10 does not. The exact-release
+          # matrix, 2.9.8 and macOS/Windows included, is
+          # composer-compatibility.yml.
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2'}
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2.2'}
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '1'}

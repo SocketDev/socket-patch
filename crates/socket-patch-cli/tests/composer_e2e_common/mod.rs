@@ -14,7 +14,8 @@
 //!
 //! ## Composer majors
 //!
-//! The capstones run against whatever `composer` is on `PATH`, and branch
+//! The capstones run against whatever [`composer_command`] resolves to
+//! (the `composer` on `PATH`, or `SOCKET_PATCH_COMPOSER_PHAR`), and branch
 //! on its MAJOR where the two majors genuinely differ:
 //!
 //! * **Resolution source.** packagist.org shut Composer 1 metadata off on
@@ -38,6 +39,13 @@
 //!   (prefix) the leg pinned, e.g. setup-php's `composer:<v>`; the capstone
 //!   asserts `composer --version` reports exactly it or a release under it
 //!   (`2.2` matches `2.2.30`, never `2.20.0`).
+//! * `SOCKET_PATCH_COMPOSER_PHAR=<path>` — run that exact `composer.phar`
+//!   as `php <phar>` instead of the `composer` on PATH
+//!   (`composer-compatibility.yml` downloads and sha256-verifies one per
+//!   leg). On Windows this is the only working mode: `Command::new` does
+//!   not resolve `composer.bat`.
+//! * `SOCKET_PATCH_PHP_BIN=<path>` — the `php` that runs the phar
+//!   (default: `php` on PATH). Ignored without `SOCKET_PATCH_COMPOSER_PHAR`.
 
 #![allow(dead_code)]
 
@@ -47,6 +55,28 @@ use std::process::{Command, Output};
 /// psr/log 3.0.2's upstream commit — the GitHub zipball both majors
 /// install (packagist's own dist for 3.0.2 on composer 2).
 pub const PSR_LOG_REF: &str = "f16e1d5863e37f8d8c2a01719f5b34baa2b714d3";
+
+/// A non-empty environment variable, as a path.
+fn env_path(var: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The composer toolchain command: `php <phar>` when
+/// `SOCKET_PATCH_COMPOSER_PHAR` is set (php from `SOCKET_PATCH_PHP_BIN`,
+/// else PATH), otherwise the `composer` on PATH. Callers add the args.
+pub fn composer_command() -> Command {
+    match env_path("SOCKET_PATCH_COMPOSER_PHAR") {
+        Some(phar) => {
+            let php = env_path("SOCKET_PATCH_PHP_BIN").unwrap_or_else(|| "php".into());
+            let mut cmd = Command::new(php);
+            cmd.arg(phar);
+            cmd
+        }
+        None => Command::new("composer"),
+    }
+}
 
 /// `SOCKET_PATCH_COMPOSER_E2E_REQUIRED` is set to a non-empty value other
 /// than `0` (the CI legs' "must run" switch).
@@ -66,17 +96,22 @@ pub fn skip<T>(suite: &str, why: &str) -> Option<T> {
     None
 }
 
-/// The major of the `composer` on PATH (`Composer version 2.10.3 …` →
+/// The major of [`composer_command`] (`Composer version 2.10.3 …` →
 /// `2`), or `None` when composer is not runnable. Asserts the full version
 /// is `SOCKET_PATCH_COMPOSER_E2E_VERSION` (or a release under that prefix)
 /// when that is set.
 pub fn composer_major(suite: &str) -> Option<u32> {
-    let mut probe = Command::new("composer");
+    let mut probe = composer_command();
     probe.arg("--version").arg("--no-ansi");
     super::cache_env::isolate(&mut probe);
     let out = match probe.output() {
         Ok(out) if out.status.success() => out,
-        _ => return skip(suite, "`composer` not installed"),
+        _ => {
+            return skip(
+                suite,
+                &format!("composer not runnable ({:?})", composer_command()),
+            )
+        }
     };
     let text = String::from_utf8_lossy(&out.stdout);
     let version = text
@@ -97,7 +132,8 @@ pub fn composer_major(suite: &str) -> Option<u32> {
         if !want.is_empty() {
             assert!(
                 version == want || version.starts_with(&format!("{want}.")),
-                "{suite}: the leg pins composer {want} but PATH has:\n{text}"
+                "{suite}: the leg pins composer {want} but {:?} reports:\n{text}",
+                composer_command()
             );
         }
     }
@@ -119,7 +155,7 @@ pub fn composer(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output 
     if !config.exists() {
         std::fs::write(&config, r#"{"config": {"secure-http": false}}"#).unwrap();
     }
-    let mut cmd = Command::new("composer");
+    let mut cmd = composer_command();
     cmd.args(args)
         .arg("--no-interaction")
         .arg("--no-ansi")
