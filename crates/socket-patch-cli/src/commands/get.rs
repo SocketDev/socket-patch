@@ -18,7 +18,7 @@ use socket_patch_core::manifest::schema::{
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
-use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
+use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
 };
@@ -1371,9 +1371,10 @@ async fn filter_to_installed_releases(
         .filter(|(_, variants)| variants.iter().any(|s| paths.contains_key(&s.purl)))
         .flat_map(|(_, variants)| variants.iter().map(|s| s.uuid.clone()))
         .collect();
+    let window_len = installed_variants.len();
     let mut variant_views = std::pin::pin!(ordered_concurrent(
         installed_variants,
-        api_concurrency(api_client.uses_public_proxy()),
+        api_concurrency_for(api_client.uses_public_proxy(), window_len),
         |uuid| async move {
             let view = hold_back_debug(api_client.fetch_patch(&uuid)).await;
             (uuid, view)
@@ -1896,9 +1897,10 @@ async fn fetch_selected_patches(
         })
         .map(|sr| sr.uuid.as_str())
         .collect();
+    let window_len = to_fetch.len();
     let mut views = std::pin::pin!(ordered_concurrent(
         to_fetch,
-        api_concurrency(api_client.uses_public_proxy()),
+        api_concurrency_for(api_client.uses_public_proxy(), window_len),
         |uuid| async move { (uuid, hold_back_debug(api_client.fetch_patch(uuid)).await) },
     ));
 

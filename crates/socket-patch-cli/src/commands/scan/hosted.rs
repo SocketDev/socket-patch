@@ -11,7 +11,9 @@ use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
-use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
+use socket_patch_core::utils::concurrent::{
+    api_concurrency, api_concurrency_for, ordered_concurrent,
+};
 use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
@@ -2739,7 +2741,7 @@ pub(crate) async fn run_redirect_selected(
         // serial loop would have made the request.
         let mut views = std::pin::pin!(ordered_concurrent(
             confirmed.iter(),
-            api_concurrency(api_client.uses_public_proxy()),
+            api_concurrency_for(api_client.uses_public_proxy(), confirmed.len()),
             |(_, uuid)| {
                 hold_back_debug(async move {
                     api_client.fetch_patch(uuid).await.map(|resp| {
