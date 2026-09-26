@@ -39,6 +39,9 @@ fn serial_oracle(
     result
 }
 
+/// One golden case's input files and overrides.
+type Case = (BTreeMap<String, String>, Vec<DepOverride>);
+
 fn fixture_roots() -> Vec<PathBuf> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     vec![base.join("redirect")]
@@ -116,8 +119,7 @@ fn parallel_groups_match_the_serial_chain_on_golden_fixtures() {
     }
     assert!(dirs.len() > 50, "golden fixtures not found: {}", dirs.len());
     // Per ecosystem, the (files, overrides) of each case.
-    let mut by_eco: BTreeMap<String, Vec<(BTreeMap<String, String>, Vec<DepOverride>)>> =
-        BTreeMap::new();
+    let mut by_eco: BTreeMap<String, Vec<Case>> = BTreeMap::new();
     for case in &dirs {
         let Ok(overrides) = serde_json::from_str::<Vec<DepOverride>>(
             &std::fs::read_to_string(case.join("overrides.json")).unwrap(),
