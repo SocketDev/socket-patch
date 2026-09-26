@@ -1,5 +1,16 @@
-# composer (PHP) ecosystem test image: base + PHP + Composer.
+# composer (PHP) ecosystem test image: base + PHP + an exact Composer.
+#
+# COMPOSER_VERSION pins the release: the phar is downloaded from
+# getcomposer.org, verified against the published .sha256sum (and against
+# COMPOSER_SHA256 too when that is passed), and the build fails unless
+# `composer --version` reports exactly that release.
+# The default is what ci.yml's e2e-docker job builds;
+# composer-compatibility.yml's docker job passes other releases.
+# PHP is the distro's (Debian 12: 8.2).
 FROM socket-patch-test-base:latest
+
+ARG COMPOSER_VERSION=2.10.3
+ARG COMPOSER_SHA256=
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -8,6 +19,20 @@ RUN apt-get update \
       php-xml \
       php-mbstring \
       unzip \
- && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer \
- && php --version && composer --version
+ && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu \
+ && cd /tmp \
+ && curl -fsSL --retry 3 -o composer.phar \
+      "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar" \
+ && curl -fsSL --retry 3 -o composer.phar.sha256sum \
+      "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar.sha256sum" \
+ && echo "$(cut -d' ' -f1 composer.phar.sha256sum)  composer.phar" | sha256sum -c - \
+ && if [ -n "${COMPOSER_SHA256}" ]; then \
+      echo "${COMPOSER_SHA256}  composer.phar" | sha256sum -c -; \
+    fi \
+ && install -m 0755 composer.phar /usr/local/bin/composer \
+ && rm -f composer.phar composer.phar.sha256sum \
+ && php --version \
+ && composer --version --no-ansi \
+ && composer --version --no-ansi | grep -F "Composer version ${COMPOSER_VERSION} "
