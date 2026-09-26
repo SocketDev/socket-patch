@@ -307,8 +307,9 @@ async fn find_store_peer_variant_copies_unreadable_primary_returns_empty() {
 /// the ROOT `node_modules`, reachable only on the link's canonical chain.
 /// Real copies whose DepID decodes to the primary's `name@version` are
 /// returned (a `~peer.<n>` twin); a git dependency of the same
-/// `name@version` is a different artifact (its own bytes), never a
-/// variant, and a store entry reached through a link is not a store entry.
+/// `name@version` is never a variant (the resolver reports it as a primary
+/// of its own), and a store entry reached through a link is not a store
+/// entry.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]

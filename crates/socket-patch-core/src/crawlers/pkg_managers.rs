@@ -87,7 +87,9 @@ pub enum NpmPkgManager {
 ///
 /// vlt wins over every other lockfile or store marker: its install state
 /// only exists after a vlt install, while a sibling `bun.lock`,
-/// `pnpm-lock.yaml` or `yarn.lock` may be stale. Bun comes before pnpm in the precedence because bun's isolated
+/// `pnpm-lock.yaml` or `yarn.lock` may be stale.
+///
+/// Bun comes before pnpm in the precedence because bun's isolated
 /// linker (v1.3.2+ default) populates `node_modules/.bun/` which
 /// superficially resembles pnpm's `.pnpm/` content store. The
 /// lockfile filename disambiguates cleanly.
@@ -117,6 +119,8 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         return NpmPkgManager::YarnBerryPnP;
     }
 
+    // 2. vlt — its store or hidden lock exists only after a vlt install,
+    //    so a stale sibling lockfile never outranks it.
     if project_root
         .join(crate::constants::npm_family::VLT_STORE_DIR)
         .is_dir()

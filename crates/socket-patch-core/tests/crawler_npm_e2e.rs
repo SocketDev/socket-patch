@@ -2543,19 +2543,42 @@ async fn find_by_purls_resolves_vlt_store_transitives() {
         let purls: Vec<String> = copies.keys().cloned().collect();
         assert!(purls.len() > 200, "{tree}: the capture is the full tree");
 
+        let importer_links: Vec<std::path::PathBuf> = listing["importers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| nm.join(key))
+            .collect();
         let result = NpmCrawler.find_by_purls(&nm, &purls).await.unwrap();
         for purl in &purls {
             let found = result
                 .get(purl)
                 .unwrap_or_else(|| panic!("{tree}: {purl} must resolve"));
-            let allowed: Vec<_> = copies[purl].iter().map(|p| canonical(p)).collect();
+            let mut allowed: Vec<_> = copies[purl].iter().map(|p| canonical(p)).collect();
+            let mut resolved = Vec::new();
             for pkg in found {
+                let is_link = std::fs::symlink_metadata(&pkg.path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink();
+                assert!(
+                    !is_link || importer_links.contains(&pkg.path),
+                    "{tree}: {purl} resolved to the dependency link {}",
+                    pkg.path.display()
+                );
                 assert!(
                     allowed.contains(&canonical(&pkg.path)),
                     "{tree}: {purl} resolved to {} which is no copy of it",
                     pkg.path.display()
                 );
+                resolved.push(canonical(&pkg.path));
             }
+            resolved.sort();
+            allowed.sort();
+            assert_eq!(
+                resolved, allowed,
+                "{tree}: {purl} resolves to each real copy exactly once; got {found:?}"
+            );
             if let Some(key) = vlt_importer_key(&listing, tmp.path(), purl) {
                 assert_eq!(
                     found[0].path,
@@ -2571,6 +2594,12 @@ async fn find_by_purls_resolves_vlt_store_transitives() {
                 .strip_prefix(nm.join(".vlt"))
                 .is_ok_and(|rel| rel.to_string_lossy().contains("debug"))),
             "{tree}: the modifier-extra ms entry must resolve; got {ms:?}"
+        );
+        let tap = &result["pkg:npm/tap@15.2.3"];
+        assert_eq!(
+            tap.len(),
+            1,
+            "{tree}: the git entry's link to tap is an edge, not a copy; got {tap:?}"
         );
         let alias = &result["pkg:npm/left-pad@1.1.3"];
         assert_eq!(
@@ -2732,8 +2761,161 @@ async fn find_by_purls_probes_undecodable_vlt_store_entry() {
     }
 }
 
+/// Links inside a store entry's `node_modules` are dependency edges, never
+/// copies: a git entry and a registry entry both link `tap` and `@s/p`
+/// from their real entries, on either side of the real entries in readdir
+/// order. An importer link into an undecodable entry already names that
+/// entry's copy, so the probe of the entry adds nothing.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_skips_vlt_dependency_links_and_importer_resolved_copies() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".vlt");
+    tokio::fs::create_dir_all(&store).await.unwrap();
+    tokio::fs::write(nm.join(".vlt-lock.json"), b"{}")
+        .await
+        .unwrap();
+    let tap = store.join("~npm~tap@1.0.0/node_modules/tap");
+    stage_pkg_dir(&tap, "tap", "1.0.0").await;
+    let scoped = store.join("~npm~@s+p@1.0.0/node_modules/@s/p");
+    stage_pkg_dir(&scoped, "@s/p", "1.0.0").await;
+    for (id, name) in [("git~github_cx+y~v1.0.0", "y"), ("~npm~zz@1.0.0", "zz")] {
+        let entry_nm = store.join(id).join("node_modules");
+        stage_pkg_dir(&entry_nm.join(name), name, "1.0.0").await;
+        symlink(
+            "../../~npm~tap@1.0.0/node_modules/tap",
+            entry_nm.join("tap"),
+        )
+        .unwrap();
+        tokio::fs::create_dir_all(entry_nm.join("@s"))
+            .await
+            .unwrap();
+        symlink(
+            "../../../~npm~@s+p@1.0.0/node_modules/@s/p",
+            entry_nm.join("@s/p"),
+        )
+        .unwrap();
+    }
+    symlink(".vlt/git~github_cx+y~v1.0.0/node_modules/y", nm.join("y")).unwrap();
+    let remote_id = "remote~https_c++r.example+left-pad-1.2.0.tgz";
+    stage_pkg_dir(
+        &store.join(remote_id).join("node_modules/left-pad"),
+        "left-pad",
+        "1.2.0",
+    )
+    .await;
+    symlink(
+        format!(".vlt/{remote_id}/node_modules/left-pad"),
+        nm.join("left-pad"),
+    )
+    .unwrap();
+
+    let purls: Vec<String> = [
+        "pkg:npm/tap@1.0.0",
+        "pkg:npm/@s/p@1.0.0",
+        "pkg:npm/zz@1.0.0",
+        "pkg:npm/y@1.0.0",
+        "pkg:npm/left-pad@1.2.0",
+    ]
+    .iter()
+    .map(|p| p.to_string())
+    .collect();
+    let result = NpmCrawler.find_by_purls(&nm, &purls).await.unwrap();
+    let paths = |purl: &str| -> Vec<std::path::PathBuf> {
+        result
+            .get(purl)
+            .map(|found| found.iter().map(|p| p.path.clone()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(paths("pkg:npm/tap@1.0.0"), vec![tap]);
+    assert_eq!(paths("pkg:npm/@s/p@1.0.0"), vec![scoped]);
+    assert_eq!(
+        paths("pkg:npm/zz@1.0.0"),
+        vec![store.join("~npm~zz@1.0.0/node_modules/zz")]
+    );
+    assert_eq!(paths("pkg:npm/y@1.0.0"), vec![nm.join("y")]);
+    assert_eq!(paths("pkg:npm/left-pad@1.2.0"), vec![nm.join("left-pad")]);
+}
+
+/// A git (or remote, `file:`) entry holding a real copy whose package.json
+/// says the same `name@version` as a registry copy is an installed copy in
+/// its own right: the resolver returns it beside the importer link, while
+/// the peer fan-out from the importer link never adds it (it is no peer
+/// variant, and the resolver already reports it).
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_returns_same_version_git_copy_as_its_own_primary() {
+    use socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".vlt");
+    stage_pkg_dir(
+        &store.join("~npm~tap@1.0.0/node_modules/tap"),
+        "tap",
+        "1.0.0",
+    )
+    .await;
+    let git_copy = store.join("git~github_cz+tap~v1.0.0/node_modules/tap");
+    stage_pkg_dir(&git_copy, "tap", "1.0.0").await;
+    std::os::unix::fs::symlink(".vlt/~npm~tap@1.0.0/node_modules/tap", nm.join("tap")).unwrap();
+
+    let purl = "pkg:npm/tap@1.0.0".to_string();
+    let result = NpmCrawler
+        .find_by_purls(&nm, std::slice::from_ref(&purl))
+        .await
+        .unwrap();
+    assert_eq!(
+        result[&purl]
+            .iter()
+            .map(|p| p.path.clone())
+            .collect::<Vec<_>>(),
+        vec![nm.join("tap"), git_copy]
+    );
+    assert!(find_store_peer_variant_copies(&nm.join("tap"))
+        .await
+        .is_empty());
+}
+
+/// Only a REAL `node_modules/.vlt` directory is a store: one that links to
+/// another tree is never followed, by the resolver or by the scan.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_and_crawl_all_never_follow_a_linked_vlt_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    tokio::fs::create_dir_all(&nm).await.unwrap();
+    tokio::fs::write(nm.join(".vlt-lock.json"), b"{}")
+        .await
+        .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    stage_pkg_dir(
+        &outside.path().join("~npm~x@1.0.0/node_modules/x"),
+        "x",
+        "1.0.0",
+    )
+    .await;
+    std::os::unix::fs::symlink(outside.path(), nm.join(".vlt")).unwrap();
+
+    let purl = "pkg:npm/x@1.0.0".to_string();
+    let result = NpmCrawler
+        .find_by_purls(&nm, std::slice::from_ref(&purl))
+        .await
+        .unwrap();
+    assert!(result.is_empty(), "got {result:?}");
+    let scanned = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+    assert!(!scanned.iter().any(|p| p.purl == purl), "got {scanned:?}");
+}
+
 /// What the traversal must never read inside `.vlt`: the hoist dir
-/// `node_modules` (links plus real `@scope` dirs), the `vlt.json` file,
+/// `node_modules` (links plus real `@scope` dirs, skipped whole even when
+/// it holds a `node_modules` of its own), the `vlt.json` file,
 /// `.VLT.DELETE.<key>.<DepID>` rollback staging, an entry dir without its
 /// own `node_modules`, an entry reached through a link, and an entry's
 /// `.bin`. Decoy packages sit in each; none may resolve or be scanned.
@@ -2757,6 +2939,12 @@ async fn find_by_purls_and_crawl_all_skip_vlt_hoist_dir_and_vlt_json_and_delete_
     stage_pkg_dir(
         &store.join("node_modules/@babel/scoped-decoy"),
         "@babel/scoped-decoy",
+        "9.9.9",
+    )
+    .await;
+    stage_pkg_dir(
+        &store.join("node_modules/node_modules/nested-hoist-decoy"),
+        "nested-hoist-decoy",
         "9.9.9",
     )
     .await;
@@ -2785,6 +2973,7 @@ async fn find_by_purls_and_crawl_all_skip_vlt_hoist_dir_and_vlt_json_and_delete_
     let decoys = [
         "pkg:npm/hoist-decoy@9.9.9",
         "pkg:npm/@babel/scoped-decoy@9.9.9",
+        "pkg:npm/nested-hoist-decoy@9.9.9",
         "pkg:npm/ghost@1.0.0",
         "pkg:npm/bare@1.0.0",
         "pkg:npm/linked@1.0.0",

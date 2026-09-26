@@ -451,9 +451,9 @@ enum ScanPolicy<'a> {
     /// One pnpm or vlt store entry's `node_modules`: only REAL
     /// directories are inventoried — a symlinked (or, on Windows,
     /// junctioned) entry here is the package's dependency pointing at a
-    /// sibling store entry,
-    /// which is inventoried via that entry; following it would record the
-    /// same package under a path owned by a different store entry.
+    /// sibling store entry, which is inventoried via that entry; following
+    /// it would record the same package under a path owned by a different
+    /// store entry.
     /// `identity_seen` optionally carries the entry's own package name
     /// (what the store dir name decodes to) when its name@version is
     /// already inventoried — the importer pass wins the `seen` dedup for
@@ -621,10 +621,16 @@ impl NpmCrawler {
         if pending.is_empty() {
             return pending;
         }
-        let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
-        while let Some(nm_path) = queue.pop_front() {
+        let mut queue: VecDeque<(PathBuf, bool)> =
+            VecDeque::from([(node_modules_path.to_path_buf(), false)]);
+        while let Some((nm_path, store_entry)) = queue.pop_front() {
             for target in &pending {
                 let pkg_path = nm_path.join(&target.dir_key);
+                // Inside a store entry a link is a dependency edge into a
+                // sibling entry, whose own probe records that copy.
+                if store_entry && !is_real_package_dir(&nm_path, &target.dir_key).await {
+                    continue;
+                }
                 let pkg_json_path = pkg_path.join("package.json");
 
                 match read_package_json(&pkg_json_path).await {
@@ -639,8 +645,11 @@ impl NpmCrawler {
                         let copies = result.entry(target.purl.clone()).or_default();
                         // Record each physical copy once — a path reached
                         // twice (defensive against overlapping walks) is not
-                        // double-counted.
-                        if !copies.iter().any(|c| c.path == pkg_path) {
+                        // double-counted, and a store copy an importer link
+                        // already resolves to keeps the importer path.
+                        let recorded = copies.iter().any(|c| c.path == pkg_path)
+                            || (store_entry && resolves_to_any(&pkg_path, copies).await);
+                        if !recorded {
                             copies.push(CrawledPackage {
                                 name: target.name.clone(),
                                 version: found_version,
@@ -674,7 +683,8 @@ impl NpmCrawler {
     }
 
     /// Append the `node_modules` dirs living one level below `nm_path`
-    /// (inside each of its package dirs, scoped or not) to `queue`.
+    /// (inside each of its package dirs, scoped or not) to `queue`, each
+    /// tagged `true` when it is a store entry's (see `ScanPolicy::StoreEntry`).
     /// Mirrors `scan_node_modules`' traversal policy: hidden entries are
     /// skipped and symlinked packages are never traversed — a symlink here
     /// points into pnpm's content-addressed store or an `npm link` target
@@ -686,7 +696,7 @@ impl NpmCrawler {
     async fn collect_nested_node_modules(
         nm_path: &Path,
         pending_names: Option<&HashSet<&str>>,
-        queue: &mut VecDeque<PathBuf>,
+        queue: &mut VecDeque<(PathBuf, bool)>,
     ) {
         for entry in crate::utils::fs::list_dir_entries(nm_path).await {
             let name = entry.file_name();
@@ -780,13 +790,13 @@ impl NpmCrawler {
                     }
                     let nested = entry_path.join(&scoped_name).join("node_modules");
                     if is_dir(&nested).await {
-                        queue.push_back(nested);
+                        queue.push_back((nested, false));
                     }
                 }
             } else {
                 let nested = entry_path.join("node_modules");
                 if is_dir(&nested).await {
-                    queue.push_back(nested);
+                    queue.push_back((nested, false));
                 }
             }
         }
@@ -812,7 +822,7 @@ impl NpmCrawler {
     fn enqueue_pending_store_entries(
         entries: Vec<StoreEntry>,
         pending_names: Option<&HashSet<&str>>,
-        queue: &mut VecDeque<PathBuf>,
+        queue: &mut VecDeque<(PathBuf, bool)>,
     ) {
         for entry in entries {
             if let (Some(filter), Some((entry_pkg, _version))) = (pending_names, &entry.advertised)
@@ -821,7 +831,7 @@ impl NpmCrawler {
                     continue;
                 }
             }
-            queue.push_back(entry.node_modules);
+            queue.push_back((entry.node_modules, true));
         }
     }
 
@@ -1245,13 +1255,12 @@ impl NpmCrawler {
 
     /// Inventory the packages under each virtual-store entry's
     /// `node_modules` (entries come from `list_pnpm_store_entries`,
-    /// `collect_nested_store_entries` or `list_vlt_store_entries`). An entry
-    /// whose name decodes to a
-    /// name@version the importer pass already inventoried (every
-    /// root-linked direct dep) skips the redundant package.json re-read
-    /// via `identity_seen` — the entry is still walked, because
-    /// bundled/injected dependencies are real dirs that physically live
-    /// only inside the store entry.
+    /// `collect_nested_store_entries` or `list_vlt_store_entries`). An
+    /// entry whose name decodes to a name@version the importer pass already
+    /// inventoried (every root-linked direct dep) skips the redundant
+    /// package.json re-read via `identity_seen` — the entry is still
+    /// walked, because bundled/injected dependencies are real dirs that
+    /// physically live only inside the store entry.
     async fn scan_store_entries(
         entries: Vec<StoreEntry>,
         seen: &mut HashSet<String>,
@@ -1466,9 +1475,11 @@ enum StoreLayout {
 ///    decodes to a DIFFERENT name@version is skipped and an undecodable
 ///    name stays probeable. vlt entries come from `list_vlt_store_entries`
 ///    and must decode to exactly the primary's name@version: an
-///    undecodable vlt id is a git/file/remote artifact with its own bytes,
-///    not a peer variant of the registry copy. The package.json probe is
-///    the authority either way.
+///    undecodable vlt id (git, remote, `file:`) is never a peer variant.
+///    A matching copy inside one is still installed, and
+///    `NpmCrawler::find_by_purls` returns it as a primary of its own (it
+///    probes every undecodable entry), so it is patched like any other.
+///    The package.json probe is the authority either way.
 /// 3. Only REAL directories count (a link inside a store entry is another
 ///    entry's copy, already yielded via that entry), the copy `pkg_path`
 ///    itself canonicalizes to is excluded, and results are deduped by
@@ -1581,6 +1592,35 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
+
+/// Whether every component of `dir_key` (`name` or `@scope/name`) below
+/// `nm_path` is a real directory: links and junctions do not count.
+async fn is_real_package_dir(nm_path: &Path, dir_key: &str) -> bool {
+    let mut path = nm_path.to_path_buf();
+    for component in dir_key.split('/') {
+        path.push(component);
+        let real = tokio::fs::symlink_metadata(&path)
+            .await
+            .is_ok_and(|m| m.is_dir());
+        if !real {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `pkg_path` is the physical dir one of `copies` resolves to.
+async fn resolves_to_any(pkg_path: &Path, copies: &[CrawledPackage]) -> bool {
+    let Ok(canon) = tokio::fs::canonicalize(pkg_path).await else {
+        return false;
+    };
+    for copy in copies {
+        if tokio::fs::canonicalize(&copy.path).await.ok().as_ref() == Some(&canon) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Whether a PURL-derived path component is safe to join onto the
 /// `node_modules` root. An npm package's scope (`@types`) and bare name
@@ -2549,7 +2589,11 @@ mod tests {
         );
         assert_eq!(
             queue,
-            VecDeque::from([PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")])
+            VecDeque::from([
+                (PathBuf::from("a"), true),
+                (PathBuf::from("b"), true),
+                (PathBuf::from("c"), true),
+            ])
         );
         let mut queue = VecDeque::new();
         let as_pnpm = entries()
@@ -2562,7 +2606,7 @@ mod tests {
             &mut queue,
         );
         assert!(
-            !queue.contains(&PathBuf::from("a")),
+            !queue.contains(&(PathBuf::from("a"), true)),
             "the pnpm decoder misreads the legacy name"
         );
     }
@@ -2585,6 +2629,7 @@ mod tests {
             "··ms@2.1.3/node_modules/ms",
             "~npm~a@1.0.0/node_modules/a",
             "node_modules/@scope",
+            "node_modules/node_modules/hoist-decoy",
             ".VLT.DELETE.9.~npm~b@1.0.0/node_modules/b",
             "~npm~no-nm@1.0.0/no-nm",
             "elsewhere/node_modules",

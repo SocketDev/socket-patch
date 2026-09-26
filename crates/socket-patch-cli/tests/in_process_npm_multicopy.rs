@@ -268,7 +268,9 @@ fn rollback_restores_every_on_disk_copy_of_a_duplicated_package() {
 /// (`.vlt/~npm~dupvuln@1.0.0~peer.2/` and `~peer.3/`), both real and
 /// runtime-loaded. The importer links ONE of them, so the resolver hands
 /// apply one primary and the store fan-out must reach the other; rollback
-/// restores both. Returns `(root, primary index.js, twin index.js)`.
+/// restores both. A git dependency links the primary from its own entry,
+/// a dependency edge that must never count as a third copy. Returns
+/// `(root, primary index.js, twin index.js)`.
 fn build_vlt_peer_variant_tree(tmp: &Path, link_importer: bool) -> (PathBuf, PathBuf, PathBuf) {
     let name = "dupvuln";
     let purl = "pkg:npm/dupvuln@1.0.0";
@@ -290,6 +292,14 @@ fn build_vlt_peer_variant_tree(tmp: &Path, link_importer: bool) -> (PathBuf, Pat
     let primary = write_copy(&entry("~npm~dupvuln@1.0.0~peer.2"), name, "1.0.0", original);
     let twin = write_copy(&entry("~npm~dupvuln@1.0.0~peer.3"), name, "1.0.0", original);
     std::fs::write(tmp.join("node_modules").join(".vlt-lock.json"), "{}").unwrap();
+    let git_nm = store.join("git~github_cx+y~v1.0.0").join("node_modules");
+    write_copy(&git_nm.join("y"), "y", "1.0.0", b"require('dupvuln');\n");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "../../~npm~dupvuln@1.0.0~peer.2/node_modules/dupvuln",
+        git_nm.join(name),
+    )
+    .unwrap();
     if link_importer {
         #[cfg(unix)]
         std::os::unix::fs::symlink(
@@ -354,16 +364,22 @@ fn apply_and_rollback_reach_both_vlt_peer_variant_copies_from_an_importer_link()
     let (code, v) = run_apply(&root);
     assert_eq!(code, 0, "apply must succeed; envelope={v}");
     assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["skipped"], 0, "envelope={v}");
     assert_vlt_copies([&primary, &twin], true, "after apply");
 
     let (code, v) = run_rollback(&root);
     assert_eq!(code, 0, "rollback must succeed; envelope={v}");
+    assert_eq!(v["rolledBack"], 1, "envelope={v}");
+    assert_eq!(v["alreadyOriginal"], 0, "envelope={v}");
     assert_vlt_copies([&primary, &twin], false, "after rollback");
 }
 
 /// Without an importer link (a transitive-only dependency) both store
 /// copies are found by the resolver itself; each is patched exactly once
-/// and both are restored.
+/// and both are restored. The first copy's fan-out already reaches the
+/// second, so the second reports skipped (apply) and already original
+/// (rollback), and the git entry's link adds nothing.
 #[test]
 fn apply_and_rollback_reach_both_transitive_only_vlt_store_copies() {
     let tmp = tempfile::tempdir().unwrap();
@@ -371,9 +387,13 @@ fn apply_and_rollback_reach_both_transitive_only_vlt_store_copies() {
 
     let (code, v) = run_apply(&root);
     assert_eq!(code, 0, "apply must succeed; envelope={v}");
+    assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
+    assert_eq!(v["summary"]["skipped"], 1, "envelope={v}");
     assert_vlt_copies([&primary, &twin], true, "after apply");
 
     let (code, v) = run_rollback(&root);
     assert_eq!(code, 0, "rollback must succeed; envelope={v}");
+    assert_eq!(v["rolledBack"], 1, "envelope={v}");
+    assert_eq!(v["alreadyOriginal"], 1, "envelope={v}");
     assert_vlt_copies([&primary, &twin], false, "after rollback");
 }

@@ -1183,7 +1183,8 @@ mod tests {
     /// Windows link shapes vlt produces: junctions (absolute targets, vlt
     /// >= 1.0.0-rc.22 and pnpm) and directory symlinks (older vlt). Both
     /// read as links through `entry_file_type` and `symlink_metadata`, are
-    /// followed by `is_dir`, report their target through `read_link`, and    /// `remove_link` deletes them while the target survives.
+    /// followed by `is_dir`, report their target through `read_link`, and
+    /// `remove_link` deletes them while the target survives.
     #[cfg(windows)]
     async fn assert_windows_dir_link(tmp: &Path, link: &Path, target: &Path) {
         let entry = list_dir_entries(tmp)
