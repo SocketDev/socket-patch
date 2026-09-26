@@ -217,6 +217,29 @@ pub fn cargo_run(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Outpu
     cmd.output().expect("failed to run cargo")
 }
 
+/// Run the vlt at `vlt_js` (`node --no-warnings <vlt.js> <args>`) in
+/// `cwd`: ambient vlt/npm/socket config scrubbed, caches sandboxed,
+/// telemetry off and the `C` locale (vlt's edge order follows it), then
+/// `extra_env`. Spawning `node` directly keeps Windows off the `vlt.cmd`
+/// shim `Command::new` cannot see.
+pub fn vlt_run(cwd: &Path, vlt_js: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new("node");
+    cmd.arg("--no-warnings")
+        .arg(vlt_js)
+        .args(args)
+        .current_dir(cwd);
+    cache_env::scrub_ambient_vlt_env(&mut cmd);
+    cache_env::isolate(&mut cmd);
+    cmd.env("VLT_TELEMETRY", "0")
+        .env("NO_COLOR", "1")
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("failed to run node vlt.js")
+}
+
 fn run_toolchain(cwd: &Path, exe: &str, args: &[&str], extra_env: &[(&str, &str)]) {
     let mut cmd = Command::new(exe);
     cmd.args(args).current_dir(cwd);

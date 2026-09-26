@@ -82,3 +82,7 @@ serial_test = { workspace = true }
 # assert the lock_held exit-code contract. Same crate the binary
 # uses internally (`socket-patch-core::patch::apply_lock`).
 fs2 = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+# `e2e_safety_vlt` reads hardlink counts and file indexes.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

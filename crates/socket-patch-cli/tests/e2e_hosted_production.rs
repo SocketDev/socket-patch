@@ -86,8 +86,6 @@ use std::process::{Command, Output};
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
 #[path = "npm_e2e_common/manifestless.rs"]
 mod npm_e2e_common;
 #[path = "vex_e2e_common/mod.rs"]
@@ -100,6 +98,10 @@ mod yarn_classic_vex;
 mod uv_vex;
 #[path = "vex_pipenv_pip_steps/mod.rs"]
 mod vex_pipenv_pip_steps;
+#[path = "vlt_e2e_common/mod.rs"]
+mod vlt_e2e_common;
+
+use vlt_e2e_common::cache_env;
 
 // ---------------------------------------------------------------------------
 // Production endpoints + required-patch catalog
@@ -2558,4 +2560,105 @@ async fn canary_unpublished_ecosystems() {
         panic!("{msg}");
     }
     println!("NOTE canary_unpublished_ecosystems: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// vlt (suite `production`, DESIGN §8.3)
+// ---------------------------------------------------------------------------
+
+/// `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1`: the serve fix is
+/// deployed, so a content-encoded artifact is a failure, not a pinned
+/// refusal.
+fn vlt_hosted_production_required() -> bool {
+    std::env::var("SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED").is_ok_and(|v| v == "1")
+}
+
+/// The vlt install proof against production. The artifact is fetched the
+/// way vlt fetches it (`fetch_artifact_probe`): while patch.socket.dev
+/// re-encodes it, the scan must refuse cleanly
+/// (`redirect_vlt_artifact_unverifiable`, nothing written); once it serves
+/// identity bytes, the lock pins it and a fresh checkout's `vlt ci`
+/// installs the patched minimist. So the test neither breaks nor goes
+/// vacuous when the serve fix deploys.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live production API + real npm registry + real vlt. Run with --ignored."]
+async fn vlt_pinned_matrix_production_hosted_install_proof() {
+    use vlt_e2e_common::*;
+    if strict() && std::env::var_os("SOCKET_PATCH_VLT_E2E_JS").is_none() {
+        panic!("STRICT: vlt_pinned_matrix_production_hosted_install_proof needs SOCKET_PATCH_VLT_E2E_JS");
+    }
+    let Some(leg) = Leg::start("production", "hosted_install_proof") else {
+        return;
+    };
+    let npmjs = "https://registry.npmjs.org/";
+    let proj = leg.dir("proj");
+    write(
+        &proj.join("package.json"),
+        package_json("vlt-prod", &[(NPM_NAME, NPM_VERSION)]),
+    );
+    write_vlt_json(&proj, leg.version(), npmjs, &VltJson::default());
+    leg.vlt_ok(&proj, &["install"]);
+    assert_pristine(
+        &minimist_entry(&proj),
+        PATCH_MARKER,
+        "vlt hosted production",
+    );
+    let lock_before = lock_bytes(&proj);
+    std::fs::remove_dir_all(proj.join("node_modules")).unwrap();
+    let cwd = proj.to_str().unwrap().to_string();
+    let out = socket(
+        &proj,
+        &["scan", "--mode", "hosted", "--json", "--yes", "--cwd", &cwd],
+        &[],
+    );
+    let doc = out.json();
+    let lock = read_lock(&proj);
+    let id = node_id(&lock, NPM_NAME, NPM_VERSION);
+    let pinned_url = lock["nodes"][&id][3].as_str().map(str::to_string);
+    let url = match pinned_url.filter(|u| u.contains(PATCH_HOST)) {
+        Some(u) => u,
+        None => {
+            let detail = warning_detail(&doc, "redirect_vlt_artifact_unverifiable");
+            let rest = detail
+                .strip_prefix("vlt would fail to verify ")
+                .unwrap_or_else(|| panic!("{detail}"));
+            rest.split(": ").next().unwrap().to_string()
+        }
+    };
+    assert!(url.contains(NPM_UUID), "{url}");
+    let client = reqwest::Client::builder().build().unwrap();
+    let probe =
+        socket_patch_core::patch::redirect::vlt_preflight::fetch_artifact_probe(&client, &url)
+            .await;
+    let encoded = probe
+        .content_encoding
+        .as_deref()
+        .is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"));
+    if encoded {
+        assert!(
+            !vlt_hosted_production_required(),
+            "patch.socket.dev still serves {url} content-encoded ({:?}) but \
+             SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1",
+            probe.content_encoding
+        );
+        let detail = warning_detail(&doc, "redirect_vlt_artifact_unverifiable");
+        assert!(
+            detail.contains("content-encoding") && detail.contains("nothing was written"),
+            "{detail}"
+        );
+        assert_eq!(lock_bytes(&proj), lock_before, "the refusal writes nothing");
+        assert!(!proj.join(".socket/vendor/redirect-state.json").exists());
+        eprintln!("vlt hosted production: artifact content-encoded; clean refusal pinned");
+    } else {
+        assert_eq!(out.code, 0, "{out}");
+        assert_eq!(
+            lock["nodes"][&id][2].as_str(),
+            probe.sha512.as_deref(),
+            "{lock:#}"
+        );
+        let co = fresh_checkout(&proj, &leg.root.join("fresh"));
+        leg.vlt_ok_with(&co, &leg.locked_install_args(), &VltRun::profile("fresh"));
+        assert_patched(&minimist_entry(&co), PATCH_MARKER, "vlt hosted production");
+    }
+    leg.ran();
 }

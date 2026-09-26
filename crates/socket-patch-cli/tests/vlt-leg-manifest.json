@@ -1,0 +1,1007 @@
+{
+  "comment": "Generated from docs/testing/vlt-compatibility.md by `scripts/check-vlt-legs.py --derive`; never edit by hand.",
+  "binaries": {
+    "e2e_redirect_vlt_build": {
+      "hosted": [
+        "scan_fresh_ci",
+        "frozen_dead_registry",
+        "ordinary_install_stable",
+        "get_uuid_fresh_ci",
+        "tamper_cold_eintegrity",
+        "rollback_byte_exact",
+        "rerun_noop",
+        "warm_tree_invalidates",
+        "no_cleanup_stays_stale",
+        "heal_rule_b_hidden_lock_without_node",
+        "heal_rule_c_no_hidden_lock",
+        "heal_rule_c_no_record",
+        "scoped",
+        "peer_workspace_instances",
+        "install_newdep_preserves",
+        "update_drops",
+        "resave_install_rollback",
+        "resave_crlf_rollback",
+        "resave_update_rollback",
+        "crlf_lock",
+        "mirror_registries_npm",
+        "scalar_registry",
+        "named_alias_untouched",
+        "scoped_registry_untouched",
+        "jsr_untouched",
+        "default_registry_alias",
+        "registry_from_env",
+        "registry_from_user_config",
+        "content_encoding_refused",
+        "old_lockfile_ignored",
+        "warm_cache_hazard",
+        "idempotence",
+        "manifestless_vex",
+        "ts_written_lock",
+        "optional_dependency_heal",
+        "then_vendored_optional_takeover",
+        "platform_optional_skipped"
+      ]
+    },
+    "e2e_vendor_vlt_build": {
+      "vendored": [
+        "scan_fresh_ci",
+        "get_build_fresh_ci",
+        "get_service_fresh_ci",
+        "durability",
+        "workspace_member_selfref",
+        "alias_selfref",
+        "dep_with_deps",
+        "hostile_gitignore",
+        "autocrlf_checkout",
+        "bin_bearing",
+        "package_json_devdeps_patch",
+        "repair_rebuilds",
+        "idempotency",
+        "revert_byte_exact",
+        "resave_install_revert",
+        "resave_uninstall_revert",
+        "resave_crlf_revert",
+        "tamper_planted_file",
+        "tamper_file_content",
+        "tamper_payload_package_json",
+        "tamper_symlink_outside",
+        "tamper_deleted_gitignore",
+        "tamper_lock_file_node_path",
+        "transitive_refused",
+        "legacy_lockfile_warning",
+        "absent_version_refused",
+        "lockless_reinstall",
+        "manifestless_vex"
+      ]
+    },
+    "mode_migration_vlt": {
+      "migration": [
+        "vendored_then_hosted",
+        "hosted_then_vendored",
+        "dry_run_parity",
+        "scoped_unwind_one_of_two",
+        "rollback_from_mixed",
+        "agent_apply_yields_to_vendored",
+        "agent_apply_after_hosted",
+        "hosted_scan_keeps_agent_patched_tree",
+        "agent_rollback_after_takeovers",
+        "pm_switch_npm_to_vlt",
+        "pm_switch_vlt_to_npm",
+        "flavor_changed",
+        "upgrade_hosted",
+        "upgrade_vendored"
+      ]
+    },
+    "e2e_safety_vlt": {
+      "safety": [
+        "linux_auto",
+        "explicit_hardlink",
+        "private_copies",
+        "cross_device_cache",
+        "agent_rollback",
+        "peer_fanout",
+        "hosted_heal",
+        "vendored_build",
+        "vendor_revert_and_repair",
+        "layout_note"
+      ]
+    },
+    "e2e_vlt": {
+      "agent": [
+        "scan_apply_rollback_list",
+        "get_and_remove",
+        "install_then_apply_patches_file",
+        "transitive_only_dep_apply_patches_store",
+        "lockfile_supplement",
+        "launcher",
+        "persistence_survives",
+        "persistence_reverted_by_reinstall",
+        "reruns_and_vex"
+      ],
+      "setup": [
+        "hook_fires_per_reify",
+        "root_scripts_advisory",
+        "workspace_root_only",
+        "twice_no_duplicate",
+        "hook_failure",
+        "hook_abort_leaves_no_staging"
+      ]
+    },
+    "e2e_hosted_production": {
+      "production": [
+        "hosted_install_proof"
+      ]
+    },
+    "e2e_vendored_production": {
+      "production": [
+        "vendored_install_proof"
+      ]
+    }
+  },
+  "legs": {
+    "hosted": [
+      "scan_fresh_ci",
+      "frozen_dead_registry",
+      "ordinary_install_stable",
+      "get_uuid_fresh_ci",
+      "tamper_cold_eintegrity",
+      "rollback_byte_exact",
+      "rerun_noop",
+      "warm_tree_invalidates",
+      "no_cleanup_stays_stale",
+      "heal_rule_b_hidden_lock_without_node",
+      "heal_rule_c_no_hidden_lock",
+      "heal_rule_c_no_record",
+      "scoped",
+      "peer_workspace_instances",
+      "install_newdep_preserves",
+      "update_drops",
+      "resave_install_rollback",
+      "resave_crlf_rollback",
+      "resave_update_rollback",
+      "crlf_lock",
+      "mirror_registries_npm",
+      "scalar_registry",
+      "named_alias_untouched",
+      "scoped_registry_untouched",
+      "jsr_untouched",
+      "default_registry_alias",
+      "registry_from_env",
+      "registry_from_user_config",
+      "content_encoding_refused",
+      "old_lockfile_ignored",
+      "warm_cache_hazard",
+      "idempotence",
+      "manifestless_vex",
+      "ts_written_lock",
+      "optional_dependency_heal",
+      "then_vendored_optional_takeover",
+      "platform_optional_skipped"
+    ],
+    "vendored": [
+      "scan_fresh_ci",
+      "get_build_fresh_ci",
+      "get_service_fresh_ci",
+      "durability",
+      "workspace_member_selfref",
+      "alias_selfref",
+      "dep_with_deps",
+      "hostile_gitignore",
+      "autocrlf_checkout",
+      "bin_bearing",
+      "package_json_devdeps_patch",
+      "repair_rebuilds",
+      "idempotency",
+      "revert_byte_exact",
+      "resave_install_revert",
+      "resave_uninstall_revert",
+      "resave_crlf_revert",
+      "tamper_planted_file",
+      "tamper_file_content",
+      "tamper_payload_package_json",
+      "tamper_symlink_outside",
+      "tamper_deleted_gitignore",
+      "tamper_lock_file_node_path",
+      "transitive_refused",
+      "legacy_lockfile_warning",
+      "absent_version_refused",
+      "lockless_reinstall",
+      "manifestless_vex"
+    ],
+    "migration": [
+      "vendored_then_hosted",
+      "hosted_then_vendored",
+      "dry_run_parity",
+      "scoped_unwind_one_of_two",
+      "rollback_from_mixed",
+      "agent_apply_yields_to_vendored",
+      "agent_apply_after_hosted",
+      "hosted_scan_keeps_agent_patched_tree",
+      "agent_rollback_after_takeovers",
+      "pm_switch_npm_to_vlt",
+      "pm_switch_vlt_to_npm",
+      "flavor_changed",
+      "upgrade_hosted",
+      "upgrade_vendored"
+    ],
+    "safety": [
+      "linux_auto",
+      "explicit_hardlink",
+      "private_copies",
+      "cross_device_cache",
+      "agent_rollback",
+      "peer_fanout",
+      "hosted_heal",
+      "vendored_build",
+      "vendor_revert_and_repair",
+      "layout_note"
+    ],
+    "agent": [
+      "scan_apply_rollback_list",
+      "get_and_remove",
+      "install_then_apply_patches_file",
+      "transitive_only_dep_apply_patches_store",
+      "lockfile_supplement",
+      "launcher",
+      "persistence_survives",
+      "persistence_reverted_by_reinstall",
+      "reruns_and_vex"
+    ],
+    "setup": [
+      "hook_fires_per_reify",
+      "root_scripts_advisory",
+      "workspace_root_only",
+      "twice_no_duplicate",
+      "hook_failure",
+      "hook_abort_leaves_no_staging"
+    ],
+    "production": [
+      "hosted_install_proof",
+      "vendored_install_proof"
+    ]
+  },
+  "rules": [
+    {
+      "boundary": "A0 locks (no `lockfileVersion`) are refused by vendored mode",
+      "suite": "vendored",
+      "legs": "*",
+      "except": [
+        "absent_version_refused"
+      ],
+      "versions": {
+        "op": "<=",
+        "a": "0.0.0-18"
+      },
+      "conditions": [],
+      "reason": "a0-vendored-unsupported"
+    },
+    {
+      "boundary": "A0 locks are refused by vendored mode",
+      "suite": "migration",
+      "legs": "*",
+      "except": [],
+      "versions": {
+        "op": "<=",
+        "a": "0.0.0-18"
+      },
+      "conditions": [],
+      "reason": "a0-vendored-unsupported"
+    },
+    {
+      "boundary": "A0 locks are refused by vendored mode",
+      "suite": "production",
+      "legs": [
+        "vendored_install_proof"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<=",
+        "a": "0.0.0-18"
+      },
+      "conditions": [],
+      "reason": "a0-vendored-unsupported"
+    },
+    {
+      "boundary": "the global store and `store-linker`",
+      "suite": "safety",
+      "legs": "*",
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.2.0"
+      },
+      "conditions": [],
+      "reason": "no-global-store"
+    },
+    {
+      "boundary": "`vlt ci`, `--frozen-lockfile`, `--expect-lockfile` exist",
+      "suite": "hosted",
+      "legs": [
+        "frozen_dead_registry",
+        "optional_dependency_heal",
+        "then_vendored_optional_takeover"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "0.0.0-19"
+      },
+      "conditions": [],
+      "reason": "no-vlt-ci"
+    },
+    {
+      "boundary": "a scalar `registry` makes lock-driven installs re-resolve from public npm",
+      "suite": "hosted",
+      "legs": [
+        "frozen_dead_registry"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "1.0.0-rc.7",
+        "b": "1.0.0-rc.29"
+      },
+      "conditions": [],
+      "reason": "non-hermetic-registry"
+    },
+    {
+      "boundary": "registry tarball integrity is not enforced on a cold fetch",
+      "suite": "hosted",
+      "legs": [
+        "tamper_cold_eintegrity"
+      ],
+      "except": [],
+      "versions": {
+        "op": "==",
+        "a": "0.0.0-1"
+      },
+      "conditions": [],
+      "reason": "integrity-unenforced"
+    },
+    {
+      "boundary": "bare specs honor `registries.npm`",
+      "suite": "hosted",
+      "legs": [
+        "mirror_registries_npm"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.0.0-rc.33"
+      },
+      "conditions": [],
+      "reason": "registries-npm-ignored"
+    },
+    {
+      "boundary": "named registry specs (`acme:x@1`), scoped registries and URL-segment DepIDs exist (flat-config releases record every registry node under the default segment)",
+      "suite": "hosted",
+      "legs": [
+        "named_alias_untouched"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "0.0.0-14"
+      },
+      "conditions": [],
+      "reason": "no-named-registry-specs"
+    },
+    {
+      "boundary": "as above",
+      "suite": "hosted",
+      "legs": [
+        "scoped_registry_untouched",
+        "jsr_untouched"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "0.0.0-14"
+      },
+      "conditions": [],
+      "reason": "registry-not-in-dep-id"
+    },
+    {
+      "boundary": "`jsr:` specs resolve through `jsr-registries` (0.0.0-14 \u2026 rc.6 send the `@jsr` scope to npm.jsr.io; rc.7 \u2026 rc.32 cannot run the leg hermetically, below)",
+      "suite": "hosted",
+      "legs": [
+        "jsr_untouched"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.0.0-rc.7"
+      },
+      "conditions": [],
+      "reason": "jsr-registry-not-configurable"
+    },
+    {
+      "boundary": "a scalar `registry` makes lock-driven installs re-resolve from public npm",
+      "suite": "hosted",
+      "legs": [
+        "jsr_untouched"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "1.0.0-rc.7",
+        "b": "1.0.0-rc.29"
+      },
+      "conditions": [],
+      "reason": "non-hermetic-registry"
+    },
+    {
+      "boundary": "`npm:` alias specs resolve against public npm even with `registries.npm`",
+      "suite": "hosted",
+      "legs": [
+        "jsr_untouched"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "1.0.0-rc.30",
+        "b": "1.0.0-rc.32"
+      },
+      "conditions": [],
+      "reason": "non-hermetic-registry"
+    },
+    {
+      "boundary": "`default-registry-alias` exists",
+      "suite": "hosted",
+      "legs": [
+        "default_registry_alias"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.0.0-rc.33"
+      },
+      "conditions": [],
+      "reason": "no-default-registry-alias"
+    },
+    {
+      "boundary": "the lock is ignored unless vlt.json declares `\"modifiers\": {}`",
+      "suite": "hosted",
+      "legs": [
+        "old_lockfile_ignored"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "0.0.0-16"
+      },
+      "conditions": [],
+      "reason": "lock-not-ignored"
+    },
+    {
+      "boundary": "as above",
+      "suite": "hosted",
+      "legs": [
+        "old_lockfile_ignored"
+      ],
+      "except": [],
+      "versions": {
+        "op": ">",
+        "a": "0.0.0-24"
+      },
+      "conditions": [],
+      "reason": "lock-not-ignored"
+    },
+    {
+      "boundary": "`vlt update` exists",
+      "suite": "hosted",
+      "legs": [
+        "update_drops",
+        "resave_update_rollback"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "0.0.0-20"
+      },
+      "conditions": [],
+      "reason": "no-vlt-update"
+    },
+    {
+      "boundary": "the golden `basic` lock (`registries.npm`, no scalar `registry`) is what the release writes",
+      "suite": "hosted",
+      "legs": [
+        "ts_written_lock"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.0.5"
+      },
+      "conditions": [],
+      "reason": "golden-grammar"
+    },
+    {
+      "boundary": "a platform-skipped optional dependency makes the install fail (`Dependency node could not be found`)",
+      "suite": "hosted",
+      "legs": [
+        "platform_optional_skipped"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "0.0.0-31",
+        "b": "1.0.0-rc.1"
+      },
+      "conditions": [],
+      "reason": "vlt-platform-optional-bug"
+    },
+    {
+      "boundary": "a scalar `registry` makes lock-driven installs re-resolve from public npm",
+      "suite": "vendored",
+      "legs": [
+        "workspace_member_selfref",
+        "alias_selfref"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "1.0.0-rc.7",
+        "b": "1.0.0-rc.29"
+      },
+      "conditions": [],
+      "reason": "non-hermetic-registry"
+    },
+    {
+      "boundary": "`npm:` alias specs resolve against public npm even with `registries.npm`",
+      "suite": "vendored",
+      "legs": [
+        "alias_selfref"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "1.0.0-rc.30",
+        "b": "1.0.0-rc.32"
+      },
+      "conditions": [],
+      "reason": "npm-alias-non-hermetic"
+    },
+    {
+      "boundary": "era A (`\u00b7\u00b7` ids): `vendor_vlt_legacy_lockfile`",
+      "suite": "vendored",
+      "legs": [
+        "legacy_lockfile_warning"
+      ],
+      "except": [],
+      "versions": {
+        "op": ">",
+        "a": "1.0.0-rc.8"
+      },
+      "conditions": [],
+      "reason": "not-legacy-lockfile"
+    },
+    {
+      "boundary": "`lockfileVersion` is written",
+      "suite": "vendored",
+      "legs": [
+        "absent_version_refused"
+      ],
+      "except": [],
+      "versions": {
+        "op": ">=",
+        "a": "0.0.0-19"
+      },
+      "conditions": [],
+      "reason": "lockfile-version-present"
+    },
+    {
+      "boundary": "the upgrade legs need a second vlt",
+      "suite": "migration",
+      "legs": [
+        "upgrade_hosted",
+        "upgrade_vendored"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "upgrade",
+          "op": "=",
+          "value": "unset"
+        }
+      ],
+      "reason": "no-upgrade-vlt"
+    },
+    {
+      "boundary": "only a v0 lock (0.0.0-19 \u2026 rc.14) meets a grammar change",
+      "suite": "migration",
+      "legs": [
+        "upgrade_hosted",
+        "upgrade_vendored"
+      ],
+      "except": [],
+      "versions": {
+        "op": ">",
+        "a": "1.0.0-rc.14"
+      },
+      "conditions": [],
+      "reason": "no-grammar-upgrade"
+    },
+    {
+      "boundary": "the upgrade vlt must check `lockfileVersion`",
+      "suite": "migration",
+      "legs": [
+        "upgrade_hosted",
+        "upgrade_vendored"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "upgrade",
+          "op": "<",
+          "value": "1.0.0-rc.15"
+        }
+      ],
+      "reason": "no-grammar-upgrade"
+    },
+    {
+      "boundary": "`store-linker=auto` hardlinks on Linux only",
+      "suite": "safety",
+      "legs": [
+        "linux_auto"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "os",
+          "op": "!=",
+          "value": "linux"
+        }
+      ],
+      "reason": "not-linux-auto"
+    },
+    {
+      "boundary": "as above",
+      "suite": "safety",
+      "legs": [
+        "linux_auto"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "linker",
+          "op": "notin",
+          "value": [
+            "unset",
+            "auto"
+          ]
+        }
+      ],
+      "reason": "not-linux-auto"
+    },
+    {
+      "boundary": "as above",
+      "suite": "safety",
+      "legs": [
+        "linux_auto"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "cache_root",
+          "op": "=",
+          "value": "set"
+        }
+      ],
+      "reason": "not-linux-auto"
+    },
+    {
+      "boundary": "the explicit hardlink leg",
+      "suite": "safety",
+      "legs": [
+        "explicit_hardlink"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "linker",
+          "op": "!=",
+          "value": "hardlink"
+        }
+      ],
+      "reason": "store-linker-not-hardlink"
+    },
+    {
+      "boundary": "as above",
+      "suite": "safety",
+      "legs": [
+        "explicit_hardlink"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "cache_root",
+          "op": "=",
+          "value": "set"
+        }
+      ],
+      "reason": "store-linker-not-hardlink"
+    },
+    {
+      "boundary": "the store is hardlinked",
+      "suite": "safety",
+      "legs": [
+        "private_copies"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "linker",
+          "op": "=",
+          "value": "hardlink"
+        },
+        {
+          "key": "cache_root",
+          "op": "=",
+          "value": "unset"
+        }
+      ],
+      "reason": "store-linker-hardlinks"
+    },
+    {
+      "boundary": "as above",
+      "suite": "safety",
+      "legs": [
+        "private_copies"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "linker",
+          "op": "in",
+          "value": [
+            "unset",
+            "auto"
+          ]
+        },
+        {
+          "key": "os",
+          "op": "=",
+          "value": "linux"
+        },
+        {
+          "key": "cache_root",
+          "op": "=",
+          "value": "unset"
+        }
+      ],
+      "reason": "store-linker-hardlinks"
+    },
+    {
+      "boundary": "a cache on another filesystem falls back to copies",
+      "suite": "safety",
+      "legs": [
+        "private_copies"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "cache_root",
+          "op": "=",
+          "value": "set"
+        }
+      ],
+      "reason": "store-linker-hardlinks"
+    },
+    {
+      "boundary": "as above",
+      "suite": "safety",
+      "legs": [
+        "cross_device_cache"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "cache_root",
+          "op": "=",
+          "value": "unset"
+        }
+      ],
+      "reason": "no-cache-root"
+    },
+    {
+      "boundary": "a scalar `registry` makes lock-driven installs re-resolve from public npm",
+      "suite": "agent",
+      "legs": [
+        "scan_apply_rollback_list",
+        "launcher"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "1.0.0-rc.7",
+        "b": "1.0.0-rc.29"
+      },
+      "conditions": [],
+      "reason": "non-hermetic-registry"
+    },
+    {
+      "boundary": "`npm:` alias specs resolve against public npm even with `registries.npm`",
+      "suite": "agent",
+      "legs": [
+        "scan_apply_rollback_list"
+      ],
+      "except": [],
+      "versions": {
+        "op": "range",
+        "a": "1.0.0-rc.30",
+        "b": "1.0.0-rc.32"
+      },
+      "conditions": [],
+      "reason": "non-hermetic-registry"
+    },
+    {
+      "boundary": "root `pre*`/`post*` scripts run without an `install` script",
+      "suite": "setup",
+      "legs": [
+        "hook_fires_per_reify",
+        "workspace_root_only",
+        "hook_failure"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.0.0-rc.13"
+      },
+      "conditions": [],
+      "reason": "root-postinstall-not-run"
+    },
+    {
+      "boundary": "a failing hook's abort on Windows (rollback EBUSY fix from 1.0.5)",
+      "suite": "setup",
+      "legs": [
+        "hook_abort_leaves_no_staging"
+      ],
+      "except": [],
+      "versions": {
+        "op": "all"
+      },
+      "conditions": [
+        {
+          "key": "os",
+          "op": "!=",
+          "value": "windows"
+        }
+      ],
+      "reason": "windows-only"
+    },
+    {
+      "boundary": "as above",
+      "suite": "setup",
+      "legs": [
+        "hook_abort_leaves_no_staging"
+      ],
+      "except": [],
+      "versions": {
+        "op": "<",
+        "a": "1.0.5"
+      },
+      "conditions": [],
+      "reason": "pre-ebusy-fix"
+    }
+  ],
+  "supported": [
+    "0.0.0-1",
+    "0.0.0-11",
+    "0.0.0-12",
+    "0.0.0-13",
+    "0.0.0-14",
+    "0.0.0-15",
+    "0.0.0-16",
+    "0.0.0-17",
+    "0.0.0-18",
+    "0.0.0-19",
+    "0.0.0-20",
+    "0.0.0-21",
+    "0.0.0-23",
+    "0.0.0-24",
+    "0.0.0-25",
+    "0.0.0-26",
+    "0.0.0-27",
+    "0.0.0-28",
+    "0.0.0-29",
+    "0.0.0-30",
+    "0.0.0-31",
+    "0.0.0-32",
+    "1.0.0-rc.1",
+    "1.0.0-rc.2",
+    "1.0.0-rc.3",
+    "1.0.0-rc.4",
+    "1.0.0-rc.5",
+    "1.0.0-rc.6",
+    "1.0.0-rc.7",
+    "1.0.0-rc.8",
+    "1.0.0-rc.9",
+    "1.0.0-rc.10",
+    "1.0.0-rc.11",
+    "1.0.0-rc.12",
+    "1.0.0-rc.13",
+    "1.0.0-rc.14",
+    "1.0.0-rc.15",
+    "1.0.0-rc.16",
+    "1.0.0-rc.17",
+    "1.0.0-rc.18",
+    "1.0.0-rc.22",
+    "1.0.0-rc.23",
+    "1.0.0-rc.24",
+    "1.0.0-rc.25",
+    "1.0.0-rc.26",
+    "1.0.0-rc.27",
+    "1.0.0-rc.28",
+    "1.0.0-rc.29",
+    "1.0.0-rc.30",
+    "1.0.0-rc.31",
+    "1.0.0-rc.32",
+    "1.0.0-rc.33",
+    "1.0.0-rc.34",
+    "1.0.1",
+    "1.0.2",
+    "1.0.3",
+    "1.0.4",
+    "1.0.5",
+    "1.0.6",
+    "1.0.7",
+    "1.0.8",
+    "1.0.9",
+    "1.0.10",
+    "1.1.0",
+    "1.1.1",
+    "1.2.0"
+  ],
+  "excluded": [
+    "0.0.0-0",
+    "0.0.0-2",
+    "0.0.0-3",
+    "0.0.0-4",
+    "0.0.0-5",
+    "0.0.0-6",
+    "0.0.0-7",
+    "0.0.0-8",
+    "0.0.0-9",
+    "0.0.0-10",
+    "0.0.0-22",
+    "1.0.0-rc.19",
+    "1.0.0-rc.20",
+    "1.0.0-rc.21",
+    "0.0.1",
+    "1.0.0"
+  ]
+}

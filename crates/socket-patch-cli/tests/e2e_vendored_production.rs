@@ -110,8 +110,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
 #[path = "npm_e2e_common/manifestless.rs"]
 mod npm_e2e_common;
 #[path = "vex_e2e_common/mod.rs"]
@@ -124,6 +122,10 @@ mod yarn_classic_vex;
 mod uv_vex;
 #[path = "vex_pipenv_pip_steps/mod.rs"]
 mod vex_pipenv_pip_steps;
+#[path = "vlt_e2e_common/mod.rs"]
+mod vlt_e2e_common;
+
+use vlt_e2e_common::cache_env;
 
 // ---------------------------------------------------------------------------
 // Production endpoints + required-patch catalog
@@ -2285,9 +2287,7 @@ fn gem_bundler_vendored_install_proof() {
     // The committable artifact + the mandatory pair edit.
     let copy_rel = format!(".socket/vendor/gem/{wired_uuid}/{GEM_NAME}-{GEM_VERSION}");
     assert_patched(
-        &proj
-            .join(&copy_rel)
-            .join(patched_file_rel),
+        &proj.join(&copy_rel).join(patched_file_rel),
         PATCH_MARKER,
         LEG,
     );
@@ -2670,4 +2670,71 @@ async fn canary_unpublished_vendored_ecosystems() {
         panic!("{msg}");
     }
     println!("NOTE canary_unpublished_vendored_ecosystems: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// vlt (suite `production`, DESIGN §8.3)
+// ---------------------------------------------------------------------------
+
+/// The vlt vendored install proof against production: the service's
+/// artifact is extracted into the D19 layout
+/// (`.socket/vendor/npm/<uuid>/minimist-1.2.2/node_modules/minimist`), and a
+/// fresh checkout's `vlt ci` installs the patched minimist with the lock
+/// byte-stable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live production API + real npm registry + real vlt. Run with --ignored."]
+async fn vlt_pinned_matrix_production_vendored_install_proof() {
+    use vlt_e2e_common::*;
+    if strict() && std::env::var_os("SOCKET_PATCH_VLT_E2E_JS").is_none() {
+        panic!("STRICT: vlt_pinned_matrix_production_vendored_install_proof needs SOCKET_PATCH_VLT_E2E_JS");
+    }
+    let Some(leg) = Leg::start("production", "vendored_install_proof") else {
+        return;
+    };
+    if leg.era() == VltEra::A0 {
+        return leg.skip("a0-vendored-unsupported");
+    }
+    let npmjs = "https://registry.npmjs.org/";
+    let proj = leg.dir("proj");
+    write(
+        &proj.join("package.json"),
+        package_json("vlt-prod", &[(NPM_NAME, NPM_VERSION)]),
+    );
+    write_vlt_json(&proj, leg.version(), npmjs, &VltJson::default());
+    leg.vlt_ok(&proj, &["install"]);
+    assert_pristine(
+        &minimist_entry(&proj),
+        PATCH_MARKER,
+        "vlt vendored production",
+    );
+    let cwd = proj.to_str().unwrap().to_string();
+    let out = socket(
+        &proj,
+        &[
+            "scan", "--mode", "vendored", "--json", "--yes", "--cwd", &cwd,
+        ],
+        &[],
+    );
+    assert_eq!(out.code, 0, "{out}");
+    let doc = out.json();
+    assert_vendor_applied(&doc, NPM_PURL, "vlt vendored production");
+    let rel =
+        format!(".socket/vendor/npm/{NPM_UUID}/{NPM_NAME}-{NPM_VERSION}/node_modules/{NPM_NAME}");
+    assert!(
+        proj.join(&rel).join("index.js").is_file(),
+        "the D19 payload at {rel}"
+    );
+    let lock = String::from_utf8(lock_bytes(&proj)).unwrap();
+    assert!(
+        lock.contains(&rel),
+        "vlt-lock.json is wired to the payload:\n{lock}"
+    );
+    let co = fresh_checkout(&proj, &leg.root.join("fresh"));
+    assert_ci_byte_stable(&leg, &co, &VltRun::profile("fresh"), false);
+    assert_patched(
+        &minimist_entry(&co),
+        PATCH_MARKER,
+        "vlt vendored production",
+    );
+    leg.ran();
 }
