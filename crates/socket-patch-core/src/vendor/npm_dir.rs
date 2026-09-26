@@ -406,13 +406,23 @@ async fn git_output(
         .kill_on_drop(true)
         .spawn()
         .ok()?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(input.as_bytes()).await.ok()?;
-    }
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+    let pipe = child.stdin.take();
+    // `check-ignore -v` answers each path as it reads it, so stdout must
+    // drain while stdin is written or both pipes fill and neither side moves.
+    let write_input = async move {
+        if let (Some(input), Some(mut pipe)) = (stdin, pipe) {
+            pipe.write_all(input.as_bytes()).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    let exchange = async {
+        let (written, output) = tokio::join!(write_input, child.wait_with_output());
+        written.ok()?;
+        output.ok()
+    };
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
         .await
-        .ok()?
-        .ok()?;
+        .ok()??;
     Some((
         output.status.code()?,
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1095,5 +1105,36 @@ mod tests {
         assert!(gitignored(&tmp.path().join("missing"), &paths)
             .await
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_gitignore_probe_finishes_for_thousands_of_paths() {
+        let Some(git) = crate::utils::process::resolve_tool("git") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let status = std::process::Command::new(&git)
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let uuid = root.join(".socket/vendor/npm/u");
+        std::fs::create_dir_all(&uuid).unwrap();
+        restore_uuid_metadata(&uuid).await.unwrap();
+        let mut paths: Vec<String> = (0..6000)
+            .map(|i| format!(".socket/vendor/npm/u/d-2.30.0/node_modules/d/esm/f{i}/index.js"))
+            .collect();
+        let probe =
+            tokio::time::timeout(std::time::Duration::from_secs(60), gitignored(root, &paths));
+        assert_eq!(probe.await.expect("probe deadlocked"), None);
+        std::fs::write(root.join(".gitignore"), ".socket/\n").unwrap();
+        paths.push(".socket/vendor/npm/u/.gitignore".to_string());
+        let probe =
+            tokio::time::timeout(std::time::Duration::from_secs(60), gitignored(root, &paths));
+        let rules = probe.await.expect("probe deadlocked").unwrap();
+        assert!(rules.contains(".gitignore:1:.socket/"), "{rules}");
     }
 }
