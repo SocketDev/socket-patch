@@ -306,6 +306,20 @@ fn corpus() -> Vec<CorpusEntry> {
                     out.push((name, staged.path().to_path_buf(), Some(staged)));
                 }
             }
+            // Vendored composer projects: each immediate child is one
+            // project root; the committed copies under its `.socket/vendor/`
+            // (which hold files, a `composer.json` included) are payload.
+            "composer-vendored" => {
+                let mut cases: Vec<PathBuf> = std::fs::read_dir(&top)
+                    .expect("read composer-vendored")
+                    .map(|e| e.expect("composer-vendored entry").path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                cases.sort();
+                for case in cases {
+                    out.push((rel(&root, &case), case, None));
+                }
+            }
             // Real-package-manager captures: every directory holding a
             // file other than a README is one project.
             _ => {

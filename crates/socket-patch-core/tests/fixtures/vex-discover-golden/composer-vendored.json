@@ -1,0 +1,174 @@
+{
+  "composer-vendored/basic": {
+    "refs": [
+      {
+        "purl": "pkg:composer/psr/log@3.0.2",
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "source_file": "composer.lock",
+        "artifact_rel": ".socket/vendor/composer/5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f/psr/log@3.0.2",
+        "locked_integrity": null,
+        "integrity_required": false,
+        "url": null,
+        "lockfile_basis_ok": false
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "vendored",
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "purl": "pkg:composer/psr/log@3.0.2",
+        "artifact_rel": ".socket/vendor/composer/5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f/psr/log@3.0.2"
+      }
+    ]
+  },
+  "composer-vendored/dev": {
+    "refs": [
+      {
+        "purl": "pkg:composer/acme/tooling@dev-main",
+        "uuid": "8c9d0e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f",
+        "mode": "vendored",
+        "source_file": "composer.lock",
+        "artifact_rel": ".socket/vendor/composer/8c9d0e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f/acme/tooling@dev-main",
+        "locked_integrity": null,
+        "integrity_required": false,
+        "url": null,
+        "lockfile_basis_ok": false
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "8c9d0e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f",
+        "mode": "vendored",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "vendored",
+        "uuid": "8c9d0e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f",
+        "purl": "pkg:composer/acme/tooling@dev-main",
+        "artifact_rel": ".socket/vendor/composer/8c9d0e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f/acme/tooling@dev-main"
+      }
+    ]
+  },
+  "composer-vendored/outside-anchor": {
+    "refs": [],
+    "diagnostics": [
+      {
+        "code": "patched_ref_invalid",
+        "file": "composer.lock",
+        "detail": "composer.lock: packages entry \"psr/log\" is wired to \"../.socket/vendor/composer/5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f/psr/log@3.0.2\", which is not a .socket/vendor/composer/<uuid>/<vendor>/<name>@<version> path inside this project"
+      }
+    ],
+    "recognized": [
+      {
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "composer-vendored/reference-mismatch": {
+    "refs": [],
+    "diagnostics": [
+      {
+        "code": "patched_ref_invalid",
+        "file": "composer.lock",
+        "detail": "composer.lock: pkg:composer/psr/log@3.0.2's vendored dist.reference Some(\"f16e1d5863e37f8d8c2a01719f5b34baa2b714d3\") does not carry the patch uuid 5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f its path names"
+      }
+    ],
+    "recognized": [
+      {
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "composer-vendored/source-leftover": {
+    "refs": [
+      {
+        "purl": "pkg:composer/psr/log@3.0.2",
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "source_file": "composer.lock",
+        "artifact_rel": ".socket/vendor/composer/5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f/psr/log@3.0.2",
+        "locked_integrity": null,
+        "integrity_required": false,
+        "url": null,
+        "lockfile_basis_ok": false
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "vendored",
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "purl": "pkg:composer/psr/log@3.0.2",
+        "artifact_rel": ".socket/vendor/composer/5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f/psr/log@3.0.2"
+      }
+    ]
+  },
+  "composer-vendored/v-tagged": {
+    "refs": [
+      {
+        "purl": "pkg:composer/symfony/deprecation-contracts@3.5.1",
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "source_file": "composer.lock",
+        "artifact_rel": ".socket/vendor/composer/5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f/symfony/deprecation-contracts@3.5.1",
+        "locked_integrity": null,
+        "integrity_required": false,
+        "url": null,
+        "lockfile_basis_ok": false
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "mode": "vendored",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "vendored",
+        "uuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+        "purl": "pkg:composer/symfony/deprecation-contracts@3.5.1",
+        "artifact_rel": ".socket/vendor/composer/5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f/symfony/deprecation-contracts@3.5.1"
+      }
+    ]
+  }
+}
