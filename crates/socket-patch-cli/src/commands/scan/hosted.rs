@@ -19,6 +19,7 @@ mod python;
 mod vlt;
 
 pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
+pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
 
 /// Candidate lockfiles / registry configs the redirect rewriters may touch —
 /// read from the project when present and handed to `rewrite_registry_redirect`.

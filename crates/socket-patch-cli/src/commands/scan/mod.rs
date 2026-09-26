@@ -49,7 +49,7 @@ pub(crate) use self::discovery::unsupported_layout_warnings;
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
-pub(crate) use self::hosted::vlt_rollback_heal;
+pub(crate) use self::hosted::{vlt_rollback_heal, vlt_takeover_heal};
 pub(crate) use self::vendor_flow::{
     boxed_scan_vendor_step, preview_vendor_json, print_dry_run_refusals,
 };

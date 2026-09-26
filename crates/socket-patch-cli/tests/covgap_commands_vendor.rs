@@ -1800,3 +1800,38 @@ async fn pdm_relock_rescan_under_outage_rewires_the_committed_wheel() {
         "rollback restores the relocked bytes"
     );
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// The vlt twin of the pnpm committables line: a vlt-wired run names
+/// package.json (and workspace package.json files), vlt-lock.json and
+/// `.socket/vendor/`, points CI at `vlt ci`, and names `vlt install` as
+/// the reinstall; `vendor --revert` names `vlt install` too.
+#[test]
+fn human_vlt_vendor_names_vlt_committables_and_vlt_install() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::write_project(root);
+    vlt_vendored::seed_manifest(root);
+    let cwd = root.to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(root, &["vendor", "--offline", "--cwd", cwd], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(
+            "Commit package.json (and workspace package.json files), vlt-lock.json and \
+             .socket/vendor/ (the .gitignore there re-includes the payload and keeps vlt's \
+             node_modules links out of git); CI: `vlt ci`."
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Run `vlt install` to update the installed tree"),
+        "{stdout}"
+    );
+    let (code, stdout, stderr) = run_cli(root, &["vendor", "--revert", "--cwd", cwd], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("Run `vlt install` to resync"), "{stdout}");
+}

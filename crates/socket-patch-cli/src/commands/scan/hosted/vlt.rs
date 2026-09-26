@@ -437,6 +437,55 @@ pub(crate) async fn rollback_heal(
     vec![(REINSTALL_REQUIRED.to_string(), detail)]
 }
 
+/// The hosted→vendored heal (DESIGN §4.10 step 4): once a purl is
+/// vendored over its reverted hosted pin, the lock no longer names the
+/// registry DepID, so a store copy still holding the hosted bytes is stale
+/// against the pristine expectation and is invalidated like a rollback's.
+pub(crate) async fn takeover_heal(
+    common: &crate::args::GlobalArgs,
+    targets: &[LedgerTarget],
+) -> Option<String> {
+    if targets.is_empty() || common.dry_run {
+        return None;
+    }
+    let classified: Vec<(Target<'_>, &str)> = targets
+        .iter()
+        .map(|t| {
+            (
+                Target {
+                    dep_id: &t.dep_id,
+                    name: &t.name,
+                    lock_sha512: None,
+                    record: t.record.as_ref(),
+                    artifact: None,
+                },
+                t.purl.as_str(),
+            )
+        })
+        .collect();
+    let tally = heal_targets(common, &classified, Expected::Pristine).await;
+    let vendored: BTreeSet<&str> = targets.iter().map(|t| t.purl.as_str()).collect();
+    let detail = if tally.stale_left > 0 {
+        format!(
+            "vendored {} hosted-pinned packages, but node_modules still holds {} copies of the \
+             hosted artifacts; run `vlt install` (or re-run without --no-vlt-install-cleanup)",
+            vendored.len(),
+            tally.stale_left
+        )
+    } else if tally.undeterminable > 0 {
+        undeterminable_detail(tally.undeterminable)
+    } else if tally.invalidated > 0 {
+        format!(
+            "vendored {} hosted-pinned packages; removed their hosted installed copies, so \
+             node_modules is incomplete until you run `vlt install`",
+            vendored.len()
+        )
+    } else {
+        return None;
+    };
+    Some(detail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2556,14 +2556,32 @@ pub(crate) async fn rollback_patches_inner(
             // only a representative copy skipped the download and wedged the
             // online rollback with a mid-run `MissingBlob` failure. Mirrors
             // apply's `mismatch_blob_gaps`.
-            let pkg_paths = all_packages_multi
+            let mut pkg_paths = all_packages_multi
                 .get(purl)
-                .expect("gate manifest holds only attempted targets, which the crawler discovered");
+                .expect("gate manifest holds only attempted targets, which the crawler discovered")
+                .clone();
+            // The engine also restores every pnpm/vlt store peer variant of
+            // an npm copy, so each of those is a copy that may need a blob.
+            if purl.starts_with("pkg:npm/") {
+                let found = pkg_paths.clone();
+                for path in &found {
+                    for copy in
+                        socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies(
+                            path,
+                        )
+                        .await
+                    {
+                        if !pkg_paths.contains(&copy) {
+                            pkg_paths.push(copy);
+                        }
+                    }
+                }
+            }
             for (file, info) in &patch.files {
                 if info.before_hash.is_empty() || !absent_blobs.contains(&info.before_hash) {
                     continue;
                 }
-                for pkg_path in pkg_paths {
+                for pkg_path in &pkg_paths {
                     let v = verify_file_rollback(pkg_path, file, info, &blobs_path).await;
                     if v.status == VerifyRollbackStatus::MissingBlob {
                         missing_blobs.insert(info.before_hash.clone());

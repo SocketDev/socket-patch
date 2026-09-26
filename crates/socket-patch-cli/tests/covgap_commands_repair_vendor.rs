@@ -1855,7 +1855,9 @@ async fn repair_human_output_lines() {
     let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     assert!(
-        stderr.contains(&format!("Error: Cannot repair vendored artifact for {PURL}")),
+        stderr.contains(&format!(
+            "Error: Cannot repair vendored artifact for {PURL}"
+        )),
         "the failure line is printed to stderr: {stderr}"
     );
 }
@@ -2723,4 +2725,35 @@ async fn repair_inventory_refresh_persist_failure_stays_loud() {
         AFTER,
         "the member-verified rebuild is kept on disk"
     );
+}
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// A lost ledger over a vlt dir artifact, offline and with nothing
+/// installed: no lock integrity anchors a dir, so the entry is restored
+/// fingerprint-less with `vendor_inventory_unverified` (never the live
+/// tree fingerprinted), stamped `flavor: "vlt"`, the artifact kept.
+#[test]
+fn repair_offline_restores_a_vlt_entry_without_a_fingerprint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    std::fs::remove_file(root.join(".socket/vendor/state.json")).unwrap();
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, env, stderr) =
+        vlt_hosted_common::run_json(root, &["repair", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert!(
+        env.to_string().contains("vendor_inventory_unverified"),
+        "{env:#}"
+    );
+    let entry = vlt_vendored::state(root)["entries"][vlt_hosted_common::PURL].clone();
+    assert_eq!(entry["flavor"], "vlt", "{entry:#}");
+    assert_eq!(entry["artifact"]["path"], vlt_vendored::rel(), "{entry:#}");
+    assert!(entry["artifact"]["fileInventory"].is_null(), "{entry:#}");
+    assert!(root.join(vlt_vendored::rel()).join("index.js").is_file());
 }

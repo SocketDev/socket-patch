@@ -46,6 +46,7 @@ use crate::commands::rollback::VendorRevertStep;
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
+use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_pairs};
 use crate::ecosystem_dispatch::{
     find_packages_for_rollback, npm_paths_by_identity, partition_purls,
 };
@@ -1260,6 +1261,7 @@ pub(crate) async fn vendor_records(
     for (purl, paths) in npm_paths_by_identity(&crawler_options, &missing_npm).await {
         all_packages.insert(purl, paths[0].clone());
     }
+    drop_vendored_installs(&common.cwd, &mut all_packages);
 
     // ── Auto-fetch: lockfile-resolved packages with no installed copy ────
     // A manifest patch whose package is not on disk but IS resolvable from
@@ -1294,11 +1296,13 @@ pub(crate) async fn vendor_records(
             // no registry traffic.
             for purl in &missing {
                 let ledger_entry = lookup_entry(&state.entries, purl);
-                if let Some(entry) = ledger_entry
-                    .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
-                {
-                    let tgz = common.cwd.join(&entry.artifact.path);
-                    if tokio::fs::metadata(&tgz).await.is_err() {
+                if let Some(entry) = ledger_entry.filter(|e| {
+                    e.ecosystem == "npm"
+                        && (e.artifact.path.ends_with(".tgz")
+                            || !vendor::artifact_is_file_shaped(&e.artifact.path))
+                }) {
+                    let committed = common.cwd.join(&entry.artifact.path);
+                    if tokio::fs::metadata(&committed).await.is_err() {
                         // The committed artifact is GONE (gitignored or
                         // deleted): not corruption — fall through to the
                         // registry ladder, which recovers the pre-vendor
@@ -1317,9 +1321,17 @@ pub(crate) async fn vendor_records(
                             common,
                         );
                     } else {
-                        match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256)
+                        let staged = if entry.artifact.path.ends_with(".tgz") {
+                            registry_fetch::stage_local_artifact(&committed, &entry.artifact.sha256)
+                                .await
+                        } else {
+                            registry_fetch::stage_local_dir_artifact(
+                                &committed,
+                                entry.artifact.file_inventory.as_ref(),
+                            )
                             .await
-                        {
+                        };
+                        match staged {
                             Ok(staged) => {
                                 all_packages.insert(purl.clone(), staged.dir().to_path_buf());
                                 fetched_holders.push(staged);
@@ -1429,6 +1441,12 @@ pub(crate) async fn vendor_records(
         .filter_map(|p| records.get(p).map(|r| (p.as_str(), r.uuid.as_str())))
         .collect();
     let bun_refusal = bun_vendor_preflight_pairs(&common.cwd, &bun_pairs, Ok(&state.entries)).await;
+    // The vlt twin (see `crate::commands::vlt_preflight`): every refusal
+    // the vlt backend can decide from the lock, the package.json files,
+    // the ledger and the installed copy, consulted per candidate before
+    // the takeover below reverts a live hosted redirect.
+    let vlt_refusals =
+        vlt_vendor_preflight_pairs(&common.cwd, &bun_pairs, Ok(&state.entries)).await;
 
     // Release-variant grouping (pypi `?artifact_id=`, gem `?platform=`):
     // the crawler emits base purls; match the manifest's qualified variants
@@ -1472,6 +1490,12 @@ pub(crate) async fn vendor_records(
     let berry_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
         tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
+    // The vlt store entries each hosted→vendored takeover unpinned, healed
+    // once the purl is vendored (DESIGN §4.10).
+    let mut vlt_takeover_targets: HashMap<
+        String,
+        Vec<socket_patch_core::patch::redirect::vlt_heal::LedgerTarget>,
+    > = HashMap::new();
     let mut dry_in_sync: u32 = 0;
     // Sorted, so per-package lines print in the same order every run.
     let mut all_packages: Vec<(String, std::path::PathBuf)> = all_packages.into_iter().collect();
@@ -1538,6 +1562,15 @@ pub(crate) async fn vendor_records(
             // behalf. Hosted wiring, redirect ledger and lockfile stay
             // byte-untouched for a refused purl.
             if let Some(refusal) = bun_refusal.as_ref().filter(|r| r.applies_to(candidate)) {
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, candidate.clone())
+                        .with_error(refusal.code, refusal.detail.clone()),
+                );
+                report_vendor_failure(common, candidate, &refusal.detail);
+                continue;
+            }
+            if let Some(refusal) = vlt_refusal_for(&vlt_refusals, candidate) {
                 has_errors = true;
                 env.record(
                     PatchEvent::new(PatchAction::Failed, candidate.clone())
@@ -1685,6 +1718,10 @@ pub(crate) async fn vendor_records(
                     }
                 } else if claimed {
                     let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
+                    let targets = socket_patch_core::patch::redirect::vlt_heal::ledger_targets(
+                        ledger,
+                        std::slice::from_ref(candidate),
+                    );
                     match socket_patch_core::patch::redirect::revert_redirect_purl(
                         &common.cwd,
                         ledger,
@@ -1743,6 +1780,9 @@ pub(crate) async fn vendor_records(
                                 "the hosted lockfile edits back to their pre-redirect \
                                  registry values"
                             };
+                            if !targets.is_empty() {
+                                vlt_takeover_targets.insert(candidate.clone(), targets);
+                            }
                             record_warning(
                                 env,
                                 candidate,
@@ -1928,6 +1968,20 @@ pub(crate) async fn vendor_records(
                         )
                         .await;
                     }
+                    if result.success {
+                        if let Some(targets) = vlt_takeover_targets.remove(candidate) {
+                            if let Some(detail) =
+                                crate::commands::scan::vlt_takeover_heal(common, &targets).await
+                            {
+                                record_warning(
+                                    env,
+                                    candidate,
+                                    &VendorWarning::new("redirect_vlt_reinstall_required", detail),
+                                    common,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2001,6 +2055,8 @@ pub(crate) async fn vendor_records(
                      pnpm-workspace.yaml to make the patches portable (pnpm >=11 reads \
                      the vendored override only from pnpm-workspace.yaml)."
                 );
+            } else if wired_flavors.contains("vlt") {
+                println!("{VLT_COMMIT_HINT}");
             } else {
                 println!(
                     "Commit .socket/vendor/ and the updated lockfiles to make the patches \
@@ -2028,6 +2084,11 @@ pub(crate) async fn vendor_records(
     has_errors
 }
 
+/// The committable-files hint of a vlt-wired run (DESIGN §4.9).
+const VLT_COMMIT_HINT: &str = "Commit package.json (and workspace package.json files), \
+     vlt-lock.json and .socket/vendor/ (the .gitignore there re-includes the payload and keeps \
+     vlt's node_modules links out of git); CI: `vlt ci`.";
+
 /// The install command that re-materializes the project tree from the wired
 /// lockfile, per npm-family flavor. Vendoring edits ONLY the lockfile/config
 /// wiring — the already-installed node_modules keeps its pre-vendor bytes
@@ -2043,8 +2104,27 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
         // specifiers, so `--frozen-lockfile` only passes at the vendoring path.
         "pnpm" | "pnpm-legacy" => Some("pnpm install"),
         "bun" => Some("bun install"),
+        "vlt" => Some("vlt install"),
         _ => None,
     }
+}
+
+/// Drop installed npm copies that resolve into `.socket/vendor/` (or no
+/// longer resolve at all): vlt links a vendored `file:` dependency straight
+/// to its committed dir, which is this tool's own artifact and never a
+/// pristine source. The committed-artifact rung stages it
+/// inventory-verified instead.
+pub(crate) fn drop_vendored_installs(
+    cwd: &Path,
+    packages: &mut HashMap<String, std::path::PathBuf>,
+) {
+    let Ok(vendor_root) = std::fs::canonicalize(cwd.join(SOCKET_DIR).join("vendor")) else {
+        return;
+    };
+    packages.retain(|purl, path| {
+        !purl.starts_with("pkg:npm/")
+            || std::fs::canonicalize(path).is_ok_and(|real| !real.starts_with(&vendor_root))
+    });
 }
 
 /// Ledger entries whose patch is gone from the manifest — the stale test
@@ -3797,6 +3877,7 @@ mod scope_and_hint_tests {
         assert_eq!(flavor_install_command("pnpm"), Some("pnpm install"));
         assert_eq!(flavor_install_command("pnpm-legacy"), Some("pnpm install"));
         assert_eq!(flavor_install_command("bun"), Some("bun install"));
+        assert_eq!(flavor_install_command("vlt"), Some("vlt install"));
         assert_eq!(flavor_install_command("cargo"), None);
         assert_eq!(flavor_install_command(""), None);
     }

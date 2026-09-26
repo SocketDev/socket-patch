@@ -1,6 +1,7 @@
 //! End-to-end tests for `repair`'s vendored-artifact phase across the npm
 //! FLAVORS — pnpm (lockfileVersion 9.0), yarn berry (4.x, node-modules
-//! linker), and bun (text bun.lock). The npm-classic (`package-lock.json`)
+//! linker), bun (text bun.lock), and vlt's directory artifacts
+//! (`repair_vendor_flavors_e2e/vlt.rs`). The npm-classic (`package-lock.json`)
 //! flavor is covered by `repair_vendor_e2e.rs`; this file is the flavor
 //! generalization of the same invariants:
 //!
@@ -30,6 +31,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod bun_vex;
 #[path = "common/mod.rs"]
 mod common;
+#[path = "repair_vendor_flavors_e2e/vlt.rs"]
+mod vlt;
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
@@ -325,8 +328,29 @@ fn write_fixture(root: &Path, flavor: Flavor) {
 /// vendor/repair in-memory staging has the patch content (same shape as
 /// repair_vendor_e2e.rs / scan_vendor_e2e.rs).
 async fn mount_patch_api(mock: &MockServer) {
+    mount_patch_api_with(mock, &[]).await;
+}
+
+/// [`mount_patch_api`] whose patch also carries `extra` files
+/// (`(path, before, after)`).
+async fn mount_patch_api_with(mock: &MockServer, extra: &[(&str, &[u8], &[u8])]) {
     let before_hash = git_sha256(BEFORE);
     let after_hash = git_sha256(AFTER);
+    let mut files = serde_json::json!({
+        "package/index.js": {
+            "beforeHash": before_hash,
+            "afterHash":  after_hash,
+            "blobContent": AFTER_B64,
+        }
+    });
+    for (file, before, after) in extra {
+        use base64::Engine as _;
+        files[*file] = serde_json::json!({
+            "beforeHash": git_sha256(before),
+            "afterHash": git_sha256(after),
+            "blobContent": base64::engine::general_purpose::STANDARD.encode(after),
+        });
+    }
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -363,13 +387,7 @@ async fn mount_patch_api(mock: &MockServer) {
             "uuid": UUID,
             "purl": PURL,
             "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
+            "files": files,
             "vulnerabilities": {
                 "GHSA-aaaa-bbbb-cccc": {
                     "cves": ["CVE-2026-0001"], "summary": "test vuln",

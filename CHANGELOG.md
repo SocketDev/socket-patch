@@ -332,6 +332,30 @@ into the new version's section — see docs/releasing.md.
   slots and outgoing edge values vlt rewrote since) or keeps everything on
   drift. Lock inventory reads `vlt-lock.json` too, Socket-hosted pins
   included.
+- **Vendored vlt through every command.** `vendor`, `scan --mode vendored`
+  and `get --mode vendored` run the complete vlt vendored preflight (lock
+  version and layout, transitive, peer or foreign-registry targets,
+  dependencies declared in several fields, out-of-sync specs, a package
+  already vendored through another lockfile flavor, the installed copy's
+  `bundleDependencies` or duplicate `devDependencies`, a git rule that
+  ignores `.socket/`) before any patch is downloaded, anything is written,
+  or a hosted redirect is reverted for the takeover; the dry-run previews
+  report the same codes as `would_refuse`. A committed vlt directory
+  artifact is staged inventory-verified when nothing is installed (a fresh
+  clone), and vlt's own link to it is never taken as a pristine source.
+  After a hosted → vendored takeover the store copies vlt installed from
+  the hosted pin are removed (`redirect_vlt_reinstall_required`). `repair`
+  finds vlt references in `vlt-lock.json` and workspace `package.json`
+  files, rebuilds vlt directories against the inventory that leaves out
+  vlt's `node_modules/` links, restores a missing `<uuid>/.gitignore` or
+  `.gitattributes`, and stamps reconstructed entries `flavor: "vlt"`. The
+  human output names the vlt committables and `vlt install`. A Bun lock
+  beside `vlt-lock.json` no longer triggers the Bun vendored preflight.
+- **`rollback` fetches a before-blob that only a store peer variant
+  needs.** The before-blob gate now probes every pnpm and vlt store variant
+  copy the rollback restores, so an online rollback no longer fails
+  `Before blob not found` for a still-patched variant beside an
+  already-original copy.
 - **`vex` reads `vlt-lock.json`.** Manifest-less VEX (and the ledger
   liveness gates behind `vex`, `scan`'s takeovers and the
   `hosted_wiring_retained` advisory) discovers hosted vlt nodes (a Socket

@@ -21,6 +21,10 @@ use wiremock::MockServer;
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
 
 // ---------------------------------------------------------------------------
 // `--debug` provenance echoes (list.rs telemetry_credentials, config layer)
@@ -253,11 +257,8 @@ fn list_non_json_minimal_record_omits_empty_sections() {
     let tmp = tempfile::tempdir().unwrap();
     write_sparse_manifest(tmp.path());
 
-    let (code, stdout, stderr) = common::run_with_env(
-        tmp.path(),
-        &["list"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
-    );
+    let (code, stdout, stderr) =
+        common::run_with_env(tmp.path(), &["list"], &[("SOCKET_TELEMETRY_DISABLED", "1")]);
     assert_eq!(code, 0, "stderr:\n{stderr}");
     assert!(
         stdout.contains("Found 2 patches:"),
@@ -306,4 +307,23 @@ fn list_non_json_minimal_record_omits_empty_sections() {
         !bare_block.contains("Description:"),
         "an empty description must be omitted; got: {bare_block}"
     );
+}
+
+/// A vlt vendored entry (the `flavor: "vlt"` directory artifact) lists as a
+/// vendored record once no manifest holds it.
+#[test]
+fn list_json_labels_a_vlt_vendored_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, false);
+    assert_eq!(
+        vlt_vendored::state(root)["entries"][vlt_hosted_common::PURL]["flavor"],
+        "vlt"
+    );
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, env, stderr) = vlt_hosted_common::run_json(root, &["list", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    let text = env.to_string();
+    assert!(text.contains(vlt_hosted_common::PURL), "{env:#}");
+    assert!(text.contains("vendored"), "{env:#}");
 }

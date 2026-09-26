@@ -1977,6 +1977,120 @@ async fn scan_vendored_bun_silent_human_names_code_on_stderr() {
     assert!(!tmp.path().join(".socket/vendor").exists());
 }
 
+// ---------------------------------------------------------------------------
+// vlt vendored mode through `scan` (DESIGN §4.6): the preflight in the
+// download phase and the dry-run preview, and a direct dependency vendored
+// ---------------------------------------------------------------------------
+
+const VLT_TRANSITIVE_CODE: &str = "vendor_vlt_transitive_unsupported";
+
+/// `left-pad` in vlt's store, reached from the root through `has` (a
+/// transitive target) or directly.
+fn write_vlt_fixture(root: &Path, transitive: bool) {
+    write_fixture(root);
+    std::fs::remove_file(root.join("package-lock.json")).unwrap();
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    let store = root.join("node_modules/.vlt/~npm~left-pad@1.3.0/node_modules/left-pad");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("package.json"),
+        br#"{"name":"left-pad","version":"1.3.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(store.join("index.js"), BEFORE).unwrap();
+    let (dep, nodes, edges) = if transitive {
+        (
+            "has",
+            "    \"~npm~has@1.0.0\": [0,\"has\",\"sha512-H==\"],\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-orig==\"]",
+            "    \"file~_d has\": \"prod 1.0.0 ~npm~has@1.0.0\",\n    \"~npm~has@1.0.0 left-pad\": \"prod ^1.3.0 ~npm~left-pad@1.3.0\"",
+        )
+    } else {
+        (
+            "left-pad",
+            "    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-orig==\"]",
+            "    \"file~_d left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0\"",
+        )
+    };
+    let spec = if transitive { "1.0.0" } else { "1.3.0" };
+    std::fs::write(
+        root.join("package.json"),
+        format!("{{\n  \"name\": \"scan-vendor-test\",\n  \"dependencies\": {{\n    \"{dep}\": \"{spec}\"\n  }}\n}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("vlt-lock.json"),
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n{nodes}\n  }},\n  \"edges\": {{\n{edges}\n  }}\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn scan_vendored_vlt_transitive_refuses_in_download_phase() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_vlt_fixture(tmp.path(), true);
+    let lock_before = std::fs::read(tmp.path().join("vlt-lock.json")).unwrap();
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--mode", "vendored"]);
+    assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let dl = &v["download"];
+    assert_eq!(dl["failed"], 1, "envelope={v}");
+    assert_eq!(
+        dl["patches"][0]["errorCode"], VLT_TRANSITIVE_CODE,
+        "envelope={v}"
+    );
+    assert_eq!(
+        view_fetches(&mock).await,
+        0,
+        "a refused patch is never fetched"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("vlt-lock.json")).unwrap(),
+        lock_before
+    );
+    assert!(!tmp.path().join(".socket").exists());
+
+    let (code, stdout, stderr) = run_scan_vendor(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let text = v.to_string();
+    assert!(
+        text.contains("would_refuse") && text.contains(VLT_TRANSITIVE_CODE),
+        "envelope={v}"
+    );
+    assert!(!tmp.path().join(".socket").exists());
+}
+
+#[tokio::test]
+async fn scan_vendored_vlt_direct_dependency_vendors() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_vlt_fixture(tmp.path(), false);
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--mode", "vendored"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+    assert_eq!(
+        std::fs::read(tmp.path().join(&rel).join("index.js")).unwrap(),
+        AFTER
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap();
+    assert!(lock.contains(&format!("prod file:./{rel} ")), "{lock}");
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["entries"][PURL]["flavor"], "vlt", "{state}");
+    assert_socket_dir_lean(tmp.path());
+}
+
 /// Manifest-less VEX over the committed state `scan --vendor` leaves
 /// (manifest-free since 5.0 — the ledger's `detached` entries embed the
 /// records, and the hidden `--detached` flag is a no-op, so there is one

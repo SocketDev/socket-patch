@@ -512,9 +512,7 @@ pub async fn compute_dir_inventory(dir: &Path) -> Result<BTreeMap<String, String
 
 /// [`compute_dir_inventory`] of a vlt package dir, leaving out its top-level
 /// `node_modules/` (vlt's links, never part of the artifact).
-pub(crate) async fn compute_package_dir_inventory(
-    dir: &Path,
-) -> Result<BTreeMap<String, String>, String> {
+pub async fn compute_package_dir_inventory(dir: &Path) -> Result<BTreeMap<String, String>, String> {
     inventory_walk(dir, true).await
 }
 

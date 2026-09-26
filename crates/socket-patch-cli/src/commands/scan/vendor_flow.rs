@@ -37,6 +37,7 @@ use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, track_outcomes_for_vendor, vendor_records,
 };
+use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_selected};
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 use crate::ui::{plural, print_json};
 
@@ -69,16 +70,17 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 /// Action values are part of the CLI contract: `would_vendor` (no ledger
 /// entry), `already_vendored` (entry at this uuid), `would_revendor` +
 /// `oldUuid` (entry at an older uuid), and — additive — `would_refuse` +
-/// `errorCode` + `error` for npm purls the wet run's Bun preflight
-/// ([`crate::commands::bun_preflight::BunVendorRefusal`]) would refuse
-/// before any download. The preview stays a ledger classification otherwise
-/// (engine refusals outside the preflight are not predicted), and it never
-/// flips the run's status or exit code: `would_refuse` is best-effort
-/// advice so a preview never advertises vendoring the wet run is known to
-/// refuse. The preflight reads `bun.lock`/`bun.lockb` (plus, on a refused
-/// workspace lock, the lock once more per npm purl for the exemption) —
-/// the only disk access here — and runs only when the selection holds an
-/// npm purl.
+/// `errorCode` + `error` for npm purls the wet run's Bun or vlt preflight
+/// ([`crate::commands::bun_preflight::BunVendorRefusal`],
+/// [`crate::commands::vlt_preflight`]) would refuse before any download.
+/// The preview stays a ledger classification otherwise (engine refusals
+/// outside the preflights are not predicted), and it never flips the run's
+/// status or exit code: `would_refuse` is best-effort advice so a preview
+/// never advertises vendoring the wet run is known to refuse. The
+/// preflights read `bun.lock`/`bun.lockb` (plus, on a refused workspace
+/// lock, the lock once more per npm purl for the exemption) or
+/// `vlt-lock.json` with its importer package.json files — the only disk
+/// access here — and run only when the selection holds an npm purl.
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
@@ -91,6 +93,8 @@ pub(crate) async fn preview_vendor_json(
     let state = load_state(cwd).await;
     let refusal =
         bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    let vlt_refusals =
+        vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let state = state.unwrap_or_default();
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
@@ -99,6 +103,13 @@ pub(crate) async fn preview_vendor_json(
             // UUID even after rollback has removed its live wiring.
             _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
                 let r = refusal.as_ref().expect("checked by the guard");
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
+                    "errorCode": r.code, "error": r.detail,
+                })
+            }
+            _ if vlt_refusal_for(&vlt_refusals, &p.purl).is_some() => {
+                let r = vlt_refusal_for(&vlt_refusals, &p.purl).expect("checked by the guard");
                 serde_json::json!({
                     "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
                     "errorCode": r.code, "error": r.detail,

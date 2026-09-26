@@ -25,8 +25,9 @@
 //!    discovery + the patch API (the view route is hit).
 //! 3. `offline` — `--offline` with no ledgers: `record_unavailable`, exit 1,
 //!    ZERO requests to the API.
-//! 4. `reverted` — the lock put back to the registry version (ledgers and
-//!    committed artifacts kept, the patched install left in node_modules):
+//! 4. `reverted` — the lock (and, vendored, the importer package.json
+//!    files) put back to the registry version (ledgers and committed
+//!    artifacts kept, the patched install left in node_modules):
 //!    NOT attested (`redirect_unwired` / `vendor_unwired`), also under
 //!    `--no-verify`.
 //!
@@ -95,6 +96,9 @@ pub struct VltVexCase<'a> {
     /// `vlt-lock.json` BEFORE the patch (the registry wiring) — the
     /// `reverted` step writes it back.
     pub registry_lock: Vec<u8>,
+    /// Project-relative package.json files BEFORE a vendored wiring (their
+    /// `file:` specs are wiring too); the `reverted` step writes them back.
+    pub registry_manifests: Vec<(String, Vec<u8>)>,
     /// `--patch-server-url` for a hosted URL on a mock origin (a hosted ref
     /// counts only on a Socket host or the configured one).
     pub patch_server_url: Option<String>,
@@ -322,6 +326,9 @@ fn matrix<F: FnOnce(&Path)>(project: &Path, scratch: &Path, case: &VltVexCase<'_
         "{what}: the flow left no ledger — the reverted step would be vacuous"
     );
     std::fs::write(&lock_path, &case.registry_lock).unwrap();
+    for (rel, bytes) in &case.registry_manifests {
+        std::fs::write(checkout.join(rel), bytes).unwrap();
+    }
     for no_verify in [false, true] {
         let run = VexRun {
             no_verify,

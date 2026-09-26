@@ -468,12 +468,15 @@ fn ignoring_rules(out: &str) -> Vec<String> {
 }
 
 fn gitignored_refusal(rel_dir: &str, rules: &str) -> VendorOutcome {
-    refused(
-        "vendor_artifact_gitignored",
-        format!(
-            "git would not commit the vendored artifact at {rel_dir} ({rules}); remove the \
-             rule that ignores .socket/ (or .socket/vendor/) and vendor again"
-        ),
+    refused(GITIGNORED, gitignored_detail(rel_dir, rules))
+}
+
+pub(crate) const GITIGNORED: &str = "vendor_artifact_gitignored";
+
+pub(crate) fn gitignored_detail(rel: &str, rules: &str) -> String {
+    format!(
+        "git would not commit the vendored artifact at {rel} ({rules}); remove the rule that \
+         ignores .socket/ (or .socket/vendor/) and vendor again"
     )
 }
 

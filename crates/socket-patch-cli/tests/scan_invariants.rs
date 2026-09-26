@@ -2096,3 +2096,52 @@ async fn ecosystems_filter_keeps_records_but_not_wiring_live() {
          even though the lock provably pins the patch server; envelope={v}"
     );
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// vlt twin of `scan_agent_over_vendored_purl_surfaces_run_level_warning`:
+/// an agent scan over a purl a vlt directory artifact vendors skips it
+/// (`vendored`), names the retained ownership, and patches nothing in
+/// place.
+#[tokio::test]
+async fn scan_agent_over_vlt_vendored_purl_surfaces_run_level_warning() {
+    use vlt_hosted_common as hosted;
+    let mock = MockServer::start().await;
+    hosted::mock_all(&mock).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, false);
+    let cwd = root.to_str().unwrap().to_string();
+    let uri = mock.uri();
+    let (code, v, stderr) = hosted::run_json(
+        root,
+        &[
+            "scan",
+            "--mode",
+            "agent",
+            "--yes",
+            "--cwd",
+            &cwd,
+            "--api-url",
+            &uri,
+            "--org",
+            hosted::ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    let patches = v["apply"]["patches"].as_array().expect("apply.patches");
+    assert_eq!(patches[0]["errorCode"], "vendored", "{v:#}");
+    let w = find_warning(&v, "vendored_ownership_retained").unwrap_or_else(|| panic!("{v:#}"));
+    assert!(w["detail"].as_str().unwrap().contains(hosted::PURL), "{w}");
+    assert_eq!(
+        std::fs::read(root.join("node_modules/left-pad/index.js")).unwrap(),
+        hosted::PRISTINE,
+        "agent mode yields a vendored purl"
+    );
+}

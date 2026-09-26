@@ -653,8 +653,9 @@ async fn analyze(
 
 /// The read-only vendored-mode refusals vlt can decide before any write:
 /// the lock sniff and layout, the target analysis with its declaration
-/// checks, and the installed store copy's `bundleDependencies` and
-/// duplicate `devDependencies` (DESIGN §4.6, core part).
+/// checks, the installed store copy's `bundleDependencies` and duplicate
+/// `devDependencies`, and a git ignore rule covering the would-be marker
+/// (DESIGN §4.6, core part).
 pub async fn vlt_vendor_preflight(
     project_root: &Path,
     purl: &str,
@@ -691,6 +692,15 @@ pub async fn vlt_vendor_preflight(
             return Err((
                 UNSUPPORTED,
                 format!("{name}@{version}'s package.json declares duplicate devDependencies"),
+            ));
+        }
+    }
+    if let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", uuid) {
+        let marker = format!("{uuid_dir}/{}", super::state::VENDOR_MARKER_FILE);
+        if let Some(rules) = super::npm_dir::gitignored(project_root, &[marker]).await {
+            return Err((
+                super::npm_dir::GITIGNORED,
+                super::npm_dir::gitignored_detail(&analysis.rel, &rules),
             ));
         }
     }
@@ -1131,6 +1141,38 @@ pub async fn restore_vlt_uuid_metadata(
     super::npm_dir::restore_uuid_metadata(&project_root.join(uuid_dir)).await
 }
 
+/// Whether `text` passes the §4.1 router sniff (a BOM-less JSON object
+/// with `lockfileVersion` 0 or 1).
+pub fn vlt_lock_sniff_ok(text: &str) -> bool {
+    sniff_vendor_lock(text).is_ok()
+}
+
+/// The importer package.json files of the project's canonical
+/// `vlt-lock.json`, project-relative: the root one plus every workspace
+/// importer its edges name. Just the root one when the lock is missing or
+/// not canonical.
+pub async fn vlt_importer_package_jsons(project_root: &Path) -> Vec<String> {
+    let doc = read_regular_to_string(&project_root.join(VLT_LOCK))
+        .await
+        .ok()
+        .and_then(|text| parse_doc(&text).ok());
+    let mut dirs: BTreeSet<String> = BTreeSet::from([String::new()]);
+    for e in doc.iter().flat_map(|d| &d.edges.entries) {
+        if let Some(dir) = importer_dir(e.edge_from()) {
+            dirs.insert(dir);
+        }
+    }
+    dirs.into_iter().map(|d| pkg_json_rel(&d)).collect()
+}
+
+fn pkg_json_rel(dir: &str) -> String {
+    if dir.is_empty() {
+        PACKAGE_JSON.to_string()
+    } else {
+        format!("{dir}/{PACKAGE_JSON}")
+    }
+}
+
 // ── in use ───────────────────────────────────────────────────────────────
 
 fn lock_has_file_node_under(text: &str, uuid: &str) -> Option<bool> {
@@ -1228,15 +1270,7 @@ fn allowed_pkg_files(doc: Option<&LockDoc>, entry: &VendorEntry) -> BTreeSet<Str
             add(from);
         }
     }
-    dirs.into_iter()
-        .map(|d| {
-            if d.is_empty() {
-                PACKAGE_JSON.to_string()
-            } else {
-                format!("{d}/{PACKAGE_JSON}")
-            }
-        })
-        .collect()
+    dirs.into_iter().map(|d| pkg_json_rel(&d)).collect()
 }
 
 /// The lock being reverted: each block's entries, restored in place, and

@@ -428,7 +428,24 @@ async fn flavor_change_refusal(
     detected: NpmLockFlavor,
 ) -> Option<String> {
     let state = super::state::load_state(project_root).await.ok()?;
-    state.entries.iter().find_map(|(key, entry)| {
+    flavor_change_detail(&state.entries, purl, detected)
+}
+
+/// [`flavor_change_refusal`] for a project [`vlt_routes`] routes to vlt,
+/// over a ledger the caller already loaded (the vendored preflight).
+pub fn vlt_flavor_change_refusal(
+    entries: &std::collections::HashMap<String, VendorEntry>,
+    purl: &str,
+) -> Option<String> {
+    flavor_change_detail(entries, purl, NpmLockFlavor::Vlt)
+}
+
+fn flavor_change_detail(
+    entries: &std::collections::HashMap<String, VendorEntry>,
+    purl: &str,
+    detected: NpmLockFlavor,
+) -> Option<String> {
+    entries.iter().find_map(|(key, entry)| {
         if entry.ecosystem != "npm" || !entry.covers_purl(key, purl) {
             return None;
         }
@@ -446,6 +463,26 @@ async fn flavor_change_refusal(
             detected.as_str()
         ))
     })
+}
+
+/// Does the router send this project's npm purls to the vlt backend?
+/// `Some(Ok(()))` when it detects [`NpmLockFlavor::Vlt`], `Some(Err(_))`
+/// with the refusal the §4.1 `vlt-lock.json` sniff raised, `None` when a
+/// PnP loader, another lockfile or no lockfile decides.
+pub async fn vlt_routes(project_root: &Path) -> Option<Result<(), (&'static str, String)>> {
+    match detect_npm_lock_flavor(project_root).await {
+        Ok((NpmLockFlavor::Vlt, _)) => Some(Ok(())),
+        Ok(_) => None,
+        Err(refusal) => {
+            let pnp = PNP_MARKERS
+                .iter()
+                .any(|m| std::fs::symlink_metadata(project_root.join(m)).is_ok());
+            let vlt = tokio::fs::metadata(project_root.join(VLT_LOCK))
+                .await
+                .is_ok();
+            (vlt && !pnp).then_some(Err(refusal))
+        }
+    }
 }
 
 /// Is this npm-vendored entry still consumed by its lockfile's dependency

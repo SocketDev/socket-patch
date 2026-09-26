@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
 
 /// Spawn `socket-patch remove` with the scrubbed env plus telemetry
 /// disabled; `env` entries land last so per-test injections survive.
@@ -1441,7 +1445,9 @@ fn remove_multi_variant_blast_radius_prints_expansion() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[base, "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains(&format!("{base} matches 2 release variants — all will be removed:")),
+        stderr.contains(&format!(
+            "{base} matches 2 release variants — all will be removed:"
+        )),
         "the blast-radius line must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -1777,9 +1783,8 @@ mod pty {
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let reader_handle = crate::pty_io::PtyOutput::spawn(
-            pair.master.try_clone_reader().expect("clone reader"),
-        );
+        let reader_handle =
+            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -1794,7 +1799,10 @@ mod pty {
         let status = child.wait().expect("child.wait");
         drop(pair.master);
         let output = reader_handle.finish();
-        (status.exit_code() as i32, String::from_utf8_lossy(&output).to_string())
+        (
+            status.exit_code() as i32,
+            String::from_utf8_lossy(&output).to_string(),
+        )
     }
 
     /// Declining the hosted-only confirm prompt must cancel cleanly (exit
@@ -2064,4 +2072,32 @@ fn remove_ledger_only_entry_without_detached_flag_reverts() {
         !socket.join("apply.lock").exists(),
         "the lock file never outlives the run"
     );
+}
+
+/// `remove <purl>` of a vlt-vendored patch reverts the `file` node, its
+/// edges and package.json byte for byte and deletes the directory
+/// artifact.
+#[test]
+fn remove_reverts_a_vlt_vendored_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, env, stderr) = vlt_hosted_common::run_json(
+        root,
+        &["remove", vlt_hosted_common::PURL, "--cwd", &cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(
+        vlt_hosted_common::read(root, "vlt-lock.json"),
+        vlt_vendored::registry_lock()
+    );
+    assert_eq!(
+        vlt_hosted_common::read(root, "package.json"),
+        vlt_vendored::PACKAGE_JSON
+    );
+    assert!(!root
+        .join(format!(".socket/vendor/npm/{}", vlt_hosted_common::UUID))
+        .exists());
 }

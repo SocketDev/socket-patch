@@ -30,8 +30,16 @@
 //!   registry keeps the hosted ref off the lockfile basis: only an installed
 //!   tree whose every copy verifies attests.
 //!
-//! The vendored cells (committed dir artifact, tampered, mismatch, offline,
-//! unwired) run `vendor --offline` and live with the vendored CLI.
+//! * vendored — the REAL `vendor --offline` wires the `lockfileVersion` 1
+//!   and 0 locks to the committed directory artifact; with the manifest,
+//!   the ledgers and `node_modules` deleted:
+//!   - the committed dir attests `(vendored)` from the lock + patch API;
+//!   - a record naming another package is omitted (`record_mismatch`);
+//!   - `--offline` is omitted (`record_unavailable`);
+//!   - a tampered committed member is omitted (`vendor_hash_mismatch`);
+//!   - the wiring reverted with the ledger and artifact left behind is
+//!     `vendor_unwired`, also under `--no-verify`;
+//!   and the shared matrix runs over a vendored checkout.
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +53,8 @@ mod vlt_vex;
 use hosted::{Era, NAME, PATCHED, PRISTINE, PURL, UUID, VERSION};
 use vlt_vex::{
     assert_absent, assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex,
-    run_vlt_vex_matrix, strip_ledgers, Marker, PatchApi, VexRun, VltMode, VltVexCase, VLT_LOCK,
+    run_vlt_vex_matrix, strip_ledgers, strip_manifest, Marker, PatchApi, VexRun, VltMode,
+    VltVexCase, VLT_LOCK,
 };
 
 const VULNS: &[(&str, &[&str])] = &[(hosted::GHSA, &["CVE-2026-4242"])];
@@ -246,6 +255,7 @@ fn hosted_vlt_checkout_runs_the_shared_manifestless_matrix() {
         files: vec![("package/index.js".to_string(), git_sha256(PATCHED))],
         vulns: VULNS,
         registry_lock: p.registry_lock.clone().into_bytes(),
+        registry_manifests: Vec::new(),
         patch_server_url: Some(p.origin.clone()),
     };
     run_vlt_vex_matrix(&p.root, tmp.path(), &case, |checkout| {
@@ -293,4 +303,156 @@ fn a_same_version_alias_registry_instance_needs_every_copy_to_verify() {
     let out = run_vex(&binary(), root, &VexRun::online(&api));
     assert_eq!(out.code, Some(0), "every copy patched: {out}");
     assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+}
+
+// ── vendored ─────────────────────────────────────────────────────────────
+
+const PACKAGE_JSON: &str =
+    "{\n  \"name\": \"consumer\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
+
+/// A registry lock of `era` with the root importer edge the vendored
+/// backend rewires.
+fn vendorable_lock(era: Era) -> String {
+    let id = era.dep_id();
+    let (version, importer) = match era {
+        Era::V1 => ("1", "file~_d"),
+        _ => ("0", "file·."),
+    };
+    format!(
+        "{{\n  \"lockfileVersion\": {version},\n  \"options\": {{}},\n  \"nodes\": {{\n    {}\n  \
+         }},\n  \"edges\": {{\n    \"{importer} left-pad\": \"prod 1.3.0 {id}\"\n  }}\n}}\n",
+        hosted::registry_node(id)
+    )
+}
+
+fn vendored_rel() -> String {
+    format!(".socket/vendor/npm/{UUID}/{NAME}-{VERSION}/node_modules/{NAME}")
+}
+
+/// `vendor --offline` over a pristine importer copy; returns the pristine
+/// lock.
+fn vendored_project(root: &Path, era: Era) -> String {
+    std::fs::create_dir_all(root.join(".socket/blobs")).unwrap();
+    let lock = vendorable_lock(era);
+    std::fs::write(root.join(VLT_LOCK), &lock).unwrap();
+    std::fs::write(root.join("package.json"), PACKAGE_JSON).unwrap();
+    hosted::install_importer(root, PRISTINE);
+    let mut record = view(UUID, PURL);
+    record.as_object_mut().unwrap().remove("purl");
+    record["exportedAt"] = serde_json::json!("2026-01-01T00:00:00Z");
+    std::fs::write(
+        root.join(".socket/manifest.json"),
+        serde_json::json!({ "patches": { PURL: record } }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".socket/blobs").join(git_sha256(PATCHED)),
+        PATCHED,
+    )
+    .unwrap();
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, env, stderr) = hosted::run_json(root, &["vendor", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "vendor: {env:#}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 1, "vendor: {env:#}");
+    assert!(root.join(vendored_rel()).join("index.js").is_file());
+    lock
+}
+
+/// vlt's install of the vendored lock: the importer copy is the vendored
+/// dir (a copy, so the cell runs everywhere).
+fn install_vendored(root: &Path) {
+    let dest = root.join("node_modules").join(NAME);
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(&dest).unwrap();
+    for file in ["package.json", "index.js"] {
+        std::fs::copy(root.join(vendored_rel()).join(file), dest.join(file)).unwrap();
+    }
+}
+
+#[test]
+fn vendored_every_vlt_era_manifestless_evidence_cells() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = binary();
+    for (era, tag) in [(Era::V1, "v1"), (Era::V0, "v0")] {
+        let root = tmp.path().join(format!("vendored-{tag}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let pristine_lock = vendored_project(&root, era);
+        let wired_lock = hosted::read(&root, VLT_LOCK);
+        let wired_pkg = hosted::read(&root, "package.json");
+        let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+        strip_manifest(&root);
+        strip_ledgers(&root);
+        std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+
+        let api = api_with(UUID, PURL);
+        let out = run_vex(&bin, &root, &VexRun::online(&api));
+        assert_eq!(out.code, Some(0), "[{tag}] vendored: {out}");
+        assert_attested(out.doc(), PURL, UUID, Marker::Vendored, VULNS);
+
+        install_vendored(&root);
+        let out = run_vex(&bin, &root, &VexRun::online(&api));
+        assert_eq!(out.code, Some(0), "[{tag}] installed: {out}");
+        assert_attested(out.doc(), PURL, UUID, Marker::Vendored, VULNS);
+        std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+
+        let bad = api_with(UUID, "pkg:npm/right-pad@1.3.0");
+        let out = run_vex(&bin, &root, &VexRun::online(&bad));
+        assert_eq!(out.code, Some(1), "[{tag}] mismatch: {out}");
+        assert_not_attested(&out.envelope, PURL, "record_mismatch");
+
+        let out = run_vex(&bin, &root, &VexRun::offline());
+        assert_eq!(out.code, Some(1), "[{tag}] offline: {out}");
+        assert_not_attested(&out.envelope, PURL, "record_unavailable");
+
+        let member = root.join(vendored_rel()).join("index.js");
+        std::fs::write(&member, TAMPERED).unwrap();
+        let out = run_vex(&bin, &root, &VexRun::online(&api));
+        assert_eq!(out.code, Some(1), "[{tag}] tampered: {out}");
+        assert_not_attested(&out.envelope, PURL, "vendor_hash_mismatch");
+        assert_absent(out.doc.as_ref(), PURL);
+        std::fs::write(&member, PATCHED).unwrap();
+
+        std::fs::write(root.join(".socket/vendor/state.json"), &state).unwrap();
+        std::fs::write(root.join(VLT_LOCK), &pristine_lock).unwrap();
+        std::fs::write(root.join("package.json"), PACKAGE_JSON).unwrap();
+        for no_verify in [false, true] {
+            let out = run_vex(
+                &bin,
+                &root,
+                &VexRun {
+                    no_verify,
+                    ..VexRun::online(&api)
+                },
+            );
+            assert_eq!(out.code, Some(1), "[{tag}] unwired: {out}");
+            assert_not_attested(&out.envelope, PURL, "vendor_unwired");
+            assert_absent(out.doc.as_ref(), PURL);
+        }
+        assert_ne!(wired_lock, pristine_lock);
+        assert_ne!(wired_pkg, PACKAGE_JSON);
+        eprintln!("vendored vlt {tag}: all cells OK");
+    }
+}
+
+#[test]
+fn vendored_vlt_checkout_runs_the_shared_manifestless_matrix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let registry_lock = vendored_project(&root, Era::V1);
+    let case = VltVexCase {
+        tag: "hermetic-vendored-v1",
+        mode: VltMode::Vendored,
+        purl: PURL,
+        uuid: UUID,
+        files: vec![("package/index.js".to_string(), git_sha256(PATCHED))],
+        vulns: VULNS,
+        registry_lock: registry_lock.into_bytes(),
+        registry_manifests: vec![("package.json".to_string(), PACKAGE_JSON.as_bytes().to_vec())],
+        patch_server_url: None,
+    };
+    run_vlt_vex_matrix(&root, tmp.path(), &case, |checkout| {
+        assert!(!checkout.join("node_modules").exists());
+        install_vendored(checkout);
+    });
 }
