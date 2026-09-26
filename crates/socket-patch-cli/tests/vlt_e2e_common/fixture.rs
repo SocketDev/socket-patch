@@ -25,7 +25,7 @@ pub const ADVISORY: &str = "redirect_vlt_reinstall_required";
 pub const UNVERIFIABLE: &str = "redirect_vlt_artifact_unverifiable";
 pub const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt install` does not \
      reinstall a removed optional dependency. Run `vlt ci` (or delete node_modules and run `vlt \
-     install`). vlt releases before 1.0.5 install no optional dependency from the lock of a \
+     install`). vlt 0.0.0-30 … 1.0.4 install no optional dependency from the lock of a \
      project that declares only optional dependencies, so there both commands remove the \
      installed copy: upgrade vlt to 1.0.5 or later first.";
 pub const VLT_UPDATE_NOTE: &str =

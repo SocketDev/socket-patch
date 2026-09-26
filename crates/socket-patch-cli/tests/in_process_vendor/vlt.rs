@@ -274,7 +274,7 @@ fn vendor_vlt_optional_edge_asks_for_vlt_ci() {
     assert!(
         got[0].contains("left-pad@1.3.0 is an optional dependency")
             && got[0].contains("run `vlt ci` (or delete node_modules and run `vlt install`)")
-            && got[0].contains("before 1.0.5"),
+            && got[0].contains("vlt 0.0.0-30 … 1.0.4 install no optional dependency"),
         "{}",
         got[0]
     );

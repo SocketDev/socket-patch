@@ -1152,7 +1152,7 @@ async fn reinstall_advisory(
                 "{name}@{version} is an optional dependency: `vlt install` (vlt 0.0.0-30 and \
                  later) keeps an installed upstream copy of an optional dependency whose spec \
                  moved to a vendored `file:` directory, so run `vlt ci` (or delete node_modules \
-                 and run `vlt install`) to link the vendored copy. vlt releases before 1.0.5 \
+                 and run `vlt install`) to link the vendored copy. vlt 0.0.0-30 … 1.0.4 \
                  install no optional dependency from the lock of a project that declares only \
                  optional dependencies: upgrade vlt to 1.0.5 or later first."
             ),
@@ -1265,8 +1265,9 @@ pub(crate) async fn vendor_vlt(
         warnings.push(VendorWarning::new(
             "vendor_vlt_legacy_lockfile",
             "vlt-lock.json was written by vlt 0.0.0-19 … 1.0.0-rc.8 (`··` or scalar-registry URL \
-             ids); those releases install the vendored lock but fail if it is deleted and \
-             re-created — upgrade vlt",
+             ids); vlt 0.0.0-31 … 1.0.0-rc.5 install the vendored lock but fail to reinstall \
+             the vendored `file:` dependency if vlt-lock.json is deleted and re-created — \
+             upgrade vlt",
         ));
     }
     let prior = prior_vlt_entry(project_root, purl).await;
@@ -1766,8 +1767,8 @@ async fn revert_reinstall_advisory(
                 "{label} is an optional dependency: `vlt install` (vlt 0.0.0-30 and later) \
                  keeps node_modules linked to the vendored `file:` directory of an optional \
                  dependency whose spec moved back from it, so run `vlt ci` (or delete \
-                 node_modules and run `vlt install`) to link the restored copy. vlt releases \
-                 before 1.0.5 install no optional dependency from the lock of a project that \
+                 node_modules and run `vlt install`) to link the restored copy. vlt 0.0.0-30 \
+                 … 1.0.4 install no optional dependency from the lock of a project that \
                  declares only optional dependencies: upgrade vlt to 1.0.5 or later first."
             ),
         ));
@@ -2825,6 +2826,13 @@ mod tests {
         let fx = fx(&lock, &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let (_, warnings) = entry_of(run(&fx, UUID, false).await);
         assert_eq!(warnings[0].code, "vendor_vlt_legacy_lockfile");
+        assert!(
+            warnings[0]
+                .detail
+                .contains("vlt 0.0.0-31 … 1.0.0-rc.5 install the vendored lock but fail"),
+            "only the measured lockless-reinstall window fails: {}",
+            warnings[0].detail
+        );
         let wired = read(&fx, VLT_LOCK).await;
         assert!(
             wired.contains(&format!(

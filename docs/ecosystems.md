@@ -193,8 +193,8 @@ patched packages; `rollback` and `remove` do the same for the registry bytes. No
 outside the project, no link target and no copy socket-patch cannot judge is ever
 removed. A stale copy of an optional dependency is kept, because `vlt install` does not
 put back a removed optional dependency; the advisory says to run `vlt ci` instead, and to
-upgrade to vlt 1.0.5 first when every dependency is optional (earlier releases install no
-optional dependency from the lock of such a project; mixed projects install it on every
+upgrade to vlt 1.0.5 first when every dependency is optional (vlt 0.0.0-30 … 1.0.4 install
+no optional dependency from the lock of such a project; mixed projects install it on every
 release). The advisory names the kept copies by what they are: unpatched copies after
 `scan`/`get`, patched copies after `rollback`/`remove`, and, after a hosted → vendored
 takeover, the installed copies of the now-vendored optional dependencies (whatever bytes
@@ -249,13 +249,13 @@ the committed directory (`vendor_vlt_build_scripts_unsupported`); use hosted mod
 dependency with resolved peers carries a `~peer.<hex>` extra even with one peer context (a
 workspace member's a `~peer.N` one from rc.15): vendored mode writes its `file` node
 without the extra, exactly as vlt writes a `file:` dependency, keeps its peer edges, and
-`vendor --revert` restores the extra. Before rc.6 vlt cannot reinstall a vendored `file:`
-dependency without the lock (`vendor_vlt_legacy_lockfile` on era-A locks: `··` ids, or
-URL-segment ids equal to a scalar `registry`), and A0 locks are refused. From 0.0.0-30 a
+`vendor --revert` restores the extra. vlt 0.0.0-31 … rc.5 cannot reinstall a vendored
+`file:` dependency without the lock (`vendor_vlt_legacy_lockfile` on era-A locks: `··` ids,
+or URL-segment ids equal to a scalar `registry`), and A0 locks are refused. From 0.0.0-30 a
 plain `vlt install` keeps an optional dependency's installed upstream copy after
 vendoring; `vendor_vlt_reinstall_required` says to run `vlt ci` (or delete `node_modules`
 and run `vlt install`) to link the vendored directory, and to upgrade to vlt 1.0.5 first
-when every dependency is optional. The same advisory names any dependency whose
+when every dependency is optional (0.0.0-30 … 1.0.4 install none from the lock). The same advisory names any dependency whose
 `node_modules` link still resolves to vlt's store, and `vendor --revert` repeats it for an
 optional dependency (a plain `vlt install` keeps the link to the removed vendored
 directory) or a link still into the vendored directory.
