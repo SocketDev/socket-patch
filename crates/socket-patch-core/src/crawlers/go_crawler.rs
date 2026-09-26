@@ -1515,7 +1515,13 @@ mod tests {
         #[tokio::test]
         async fn randomized_caches_match_the_async_oracle() {
             let (mut crawled, mut found) = (0, 0);
-            for seed in 0..48u64 {
+            // At least 48 seeds, and more until the fixtures clear the
+            // non-vacuity bar below: a case-insensitive filesystem folds
+            // `Azure`/`!azure`-style siblings together and Windows ignores
+            // the permission modes (and may refuse the symlinks), so the
+            // same seeds yield fewer modules there than on Unix.
+            let mut seed = 0u64;
+            while seed < 48 || ((crawled <= 100 || found <= 100) && seed < 480) {
                 let tmp = tempfile::tempdir().unwrap();
                 let mut gen = Gen {
                     rng: Rng::new(seed),
@@ -1530,6 +1536,7 @@ mod tests {
                 let (c, f) = assert_equivalent(&gen, &format!("seed {seed}")).await;
                 crawled += c;
                 found += f;
+                seed += 1;
             }
             assert!(
                 crawled > 100 && found > 100,

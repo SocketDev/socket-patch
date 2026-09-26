@@ -4446,7 +4446,11 @@ mod tests {
                 continue;
             }
             let name = file.name().to_string();
-            let mode = if file.unix_mode().is_some_and(|m| m & 0o111 != 0) {
+            // `tree_of` reads no mode off a non-Unix disk (it reports 0),
+            // so the oracle expects none there either.
+            let mode = if !cfg!(unix) {
+                0
+            } else if file.unix_mode().is_some_and(|m| m & 0o111 != 0) {
                 0o755
             } else {
                 0o644
@@ -4856,7 +4860,7 @@ mod tests {
                     .strip_prefix(root)
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned();
+                    .replace('\\', "/");
                 let bytes = std::fs::read(e.path()).unwrap();
                 #[cfg(unix)]
                 let mode = {

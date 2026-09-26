@@ -10,3 +10,9 @@ crates/socket-patch-core/tests/fixtures/pdm-native/*.lock -text
 # refuse CRLF by design (vendor_lockfile_crlf_unsupported), and the tests
 # derive their CRLF variants from the LF bytes themselves.
 crates/socket-patch-core/tests/fixtures/pnpm-hosted/** -text
+
+# The legacy vendor ledgers are what the base binary wrote, byte for byte:
+# vendor_ledger_schema_e2e replays them through `vendor --revert` and
+# compares the result byte for byte, so a CRLF checkout would change both
+# the replayed wiring files and the expected revert.
+crates/socket-patch-cli/tests/fixtures/legacy-ledgers/** -text
