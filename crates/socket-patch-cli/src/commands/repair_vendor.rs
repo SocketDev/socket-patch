@@ -427,9 +427,18 @@ fn soft_restore_without_fingerprint(
     env: &mut Envelope,
     common: &GlobalArgs,
     purl: &str,
-    artifact_path: &str,
+    entry: &VendorEntry,
     why: &str,
 ) {
+    let artifact_path = entry.artifact.path.as_str();
+    // A vlt lock rewired to the vendored dir keeps no registry resolution,
+    // so `vendor` alone has no pristine copy to re-vendor from.
+    let remedy = if entry.flavor.as_deref() == Some(vendor::vlt_lock::FLAVOR) {
+        "restore the registry version spec in the package.json files that name the vendored \
+         dir, run `vlt install`, then run `socket-patch vendor` to re-vendor and record one"
+    } else {
+        "run `socket-patch vendor` to re-vendor and record one"
+    };
     record_warning(
         env,
         purl,
@@ -438,8 +447,7 @@ fn soft_restore_without_fingerprint(
             format!(
                 "the ledger entry was reconstructed but its artifact has no independent \
                  integrity anchor and {why}; the entry was restored without a whole-file \
-                 fingerprint (only the patched members were verified) — run `socket-patch \
-                 vendor` to re-vendor and record one"
+                 fingerprint (only the patched members were verified) — {remedy}"
             ),
         ),
         common,
@@ -1262,7 +1270,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         env,
                         common,
                         &c.purl,
-                        &c.entry.artifact.path,
+                        &c.entry,
                         "its patch content has no local source to rebuild from",
                     );
                     rebuilt += 1;
@@ -1345,7 +1353,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     env,
                     common,
                     &c.purl,
-                    &c.entry.artifact.path,
+                    &c.entry,
                     "the package is not installed and --offline prevents fetching a \
                      pristine copy to rebuild from",
                 );
@@ -1418,7 +1426,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         env,
                         common,
                         &c.purl,
-                        &c.entry.artifact.path,
+                        &c.entry,
                         "no verifiable pristine source exists to rebuild from (the package \
                          is not installed, the lockfile is rewired to the vendored artifact, \
                          and the reconstructed entry records no recoverable registry \
@@ -1456,7 +1464,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         env,
                         common,
                         &c.purl,
-                        &c.entry.artifact.path,
+                        &c.entry,
                         &format!("the pristine fetch failed ({detail})"),
                     );
                     rebuilt += 1;

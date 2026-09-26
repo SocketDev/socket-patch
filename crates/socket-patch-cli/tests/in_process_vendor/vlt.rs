@@ -935,6 +935,18 @@ fn vendor_vlt_linked_install_without_a_ledger_entry_points_at_repair() {
     let cwd = root.to_str().unwrap().to_string();
     let (code, env, _) = socket(root, &["repair", "--json", "--offline", "--cwd", &cwd], &[]);
     assert_eq!(code, 0, "{env:#}");
+    let unverified = events(&env)
+        .into_iter()
+        .find(|e| e["errorCode"] == "vendor_inventory_unverified")
+        .unwrap_or_else(|| panic!("{env:#}"));
+    assert!(
+        unverified["reason"].as_str().unwrap().ends_with(
+            "restore the registry version spec in the package.json files that name the \
+             vendored dir, run `vlt install`, then run `socket-patch vendor` to re-vendor and \
+             record one"
+        ),
+        "{unverified:#}"
+    );
     let entry = ledger_entry(root, PURL);
     assert_eq!(entry["flavor"], "vlt", "{env:#}");
     assert_eq!(entry["uuid"], UUID, "{env:#}");
