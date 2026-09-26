@@ -48,6 +48,9 @@ const VLT_ROOT_SCRIPTS_REMEDY: &str = "vlt before 1.0.0-rc.13 does not run the r
 /// The first vlt release that runs a root `postinstall` without an
 /// `install` script.
 const VLT_ROOT_SCRIPTS_FLOOR: &str = "1.0.0-rc.13";
+/// The first vlt release that writes `lockfileVersion` 1 and refuses a v0
+/// lock.
+const VLT_LOCK_V1_FLOOR: &str = "1.0.0-rc.15";
 const VLT_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What `vlt --version` said, when a `vlt` resolved on PATH and exited 0
@@ -77,39 +80,42 @@ async fn probe_vlt_version(cwd: &Path) -> VltVersionProbe {
 }
 
 /// The `vlt_root_scripts_not_run` detail, if any. A reported version
-/// decides alone (an unparseable one never warns); without one, a lock
-/// only an old vlt writes makes the warning a "may".
+/// below the floor is definite and an unparseable one never warns. Else a
+/// lock only an old vlt writes makes the warning a "may", unless the
+/// reported vlt writes that lock itself (rc.13 and rc.14 write v0).
 fn vlt_root_scripts_advisory(
     probe: &VltVersionProbe,
     lock: Option<LegacyVltLock>,
 ) -> Option<String> {
-    match probe {
-        VltVersionProbe::Reported(raw) => {
-            let floor = semver::Version::parse(VLT_ROOT_SCRIPTS_FLOOR).ok()?;
-            let version = semver::Version::parse(raw).ok()?;
-            (version < floor)
-                .then(|| format!("{VLT_ROOT_SCRIPTS_REMEDY} (`vlt --version` reports {raw})"))
+    if let VltVersionProbe::Reported(raw) = probe {
+        let floor = semver::Version::parse(VLT_ROOT_SCRIPTS_FLOOR).ok()?;
+        let lock_v1_floor = semver::Version::parse(VLT_LOCK_V1_FLOOR).ok()?;
+        let version = semver::Version::parse(raw).ok()?;
+        if version < floor {
+            return Some(format!(
+                "{VLT_ROOT_SCRIPTS_REMEDY} (`vlt --version` reports {raw})"
+            ));
         }
-        VltVersionProbe::Unavailable => lock.map(|lock| {
-            let version = match lock {
-                LegacyVltLock::NoVersion => "has no lockfileVersion",
-                LegacyVltLock::VersionZero => "has lockfileVersion 0",
-            };
-            format!(
-                "{VLT_ROOT_SCRIPTS_REMEDY} (vlt-lock.json {version}, so this project may be \
-                 installed by such a vlt)"
-            )
-        }),
+        if lock == Some(LegacyVltLock::VersionZero) && version < lock_v1_floor {
+            return None;
+        }
     }
+    lock.map(|lock| {
+        let version = match lock {
+            LegacyVltLock::NoVersion => "has no lockfileVersion",
+            LegacyVltLock::VersionZero => "has lockfileVersion 0",
+        };
+        format!(
+            "{VLT_ROOT_SCRIPTS_REMEDY} (vlt-lock.json {version}, so this project may be \
+             installed by such a vlt)"
+        )
+    })
 }
 
 /// The run's `(code, detail)` advisories for a vlt project `setup` wires.
 async fn vlt_setup_advisories(cwd: &Path) -> Vec<(&'static str, String)> {
     let probe = probe_vlt_version(cwd).await;
-    let lock = match probe {
-        VltVersionProbe::Reported(_) => None,
-        VltVersionProbe::Unavailable => legacy_vlt_lock(cwd).await,
-    };
+    let lock = legacy_vlt_lock(cwd).await;
     vlt_root_scripts_advisory(&probe, lock)
         .map(|detail| (VLT_ROOT_SCRIPTS_NOT_RUN, detail))
         .into_iter()
@@ -204,6 +210,21 @@ pub async fn run(args: SetupArgs) -> i32 {
 /// applying the pnpm "root-only" filtering. Returns an empty vec when none are
 /// found (callers also consider Python before reporting `no_files`).
 async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocation> {
+    discover_members(args, excludes, false).await
+}
+
+/// [`discover`] for `--remove`, which also visits the vlt workspace members
+/// that still carry a hook: releases before vlt workspace support wired
+/// every member.
+async fn discover_for_remove(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocation> {
+    discover_members(args, excludes, true).await
+}
+
+async fn discover_members(
+    args: &SetupArgs,
+    excludes: &[String],
+    keep_hooked_vlt_members: bool,
+) -> Vec<PackageJsonLocation> {
     let Some(found) = find_members(args).await else {
         return Vec::new();
     };
@@ -211,7 +232,29 @@ async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocat
         &args.common,
         &unmatched_excludes(&found, &args.common.cwd, excludes),
     );
-    select_members(found, &args.common.cwd, excludes)
+    let keep = if keep_hooked_vlt_members {
+        hooked_vlt_members(&found).await
+    } else {
+        Vec::new()
+    };
+    select_members(found, &args.common.cwd, excludes, &keep)
+}
+
+/// The vlt workspace members whose package.json carries either hook.
+async fn hooked_vlt_members(found: &PackageJsonFindResult) -> Vec<PathBuf> {
+    if !matches!(found.workspace_type, WorkspaceType::Vlt) {
+        return Vec::new();
+    }
+    let mut hooked = Vec::new();
+    for loc in found.files.iter().filter(|loc| !loc.is_root) {
+        if let Ok(content) = tokio::fs::read_to_string(&loc.path).await {
+            let status = is_setup_configured_str(&content);
+            if status.postinstall_configured || status.dependencies_configured {
+                hooked.push(loc.path.clone());
+            }
+        }
+    }
+    hooked
 }
 
 /// Walk for package.json files; `None` when npm is out of `--ecosystems` scope.
@@ -256,11 +299,13 @@ fn warn_unmatched_excludes(common: &GlobalArgs, unmatched: &[String]) {
     }
 }
 
-/// Apply the pnpm/vlt root-only rule and drop excluded members.
+/// Apply the pnpm/vlt root-only rule (sparing the members in `keep`) and
+/// drop excluded members.
 fn select_members(
     found: PackageJsonFindResult,
     cwd: &Path,
     excludes: &[String],
+    keep: &[PathBuf],
 ) -> Vec<PackageJsonLocation> {
     // For pnpm monorepos, only update root package.json. pnpm runs root
     // postinstall on `pnpm install`, so workspace-level postinstall scripts are
@@ -268,9 +313,11 @@ fn select_members(
     // has one root store and runs the root hook once per install, even one
     // started from a member directory.
     let files: Vec<PackageJsonLocation> = match found.workspace_type {
-        WorkspaceType::Pnpm | WorkspaceType::Vlt => {
-            found.files.into_iter().filter(|loc| loc.is_root).collect()
-        }
+        WorkspaceType::Pnpm | WorkspaceType::Vlt => found
+            .files
+            .into_iter()
+            .filter(|loc| loc.is_root || keep.contains(&loc.path))
+            .collect(),
         _ => found.files,
     };
 
@@ -1498,7 +1545,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     // was deliberately excluded from setup. Remove does not change the set.
     let existing = read_setup_manifest(common).await;
     let excludes = effective_excludes(manifest_view(&existing), &args.exclude);
-    let npm_files = discover(args, &excludes).await;
+    let npm_files = discover_for_remove(args, &excludes).await;
     let py_plan = plan_python(common).await;
     // Gem + Composer projects are discovered ONCE; the preview and the real
     // removal below share them.
@@ -2058,7 +2105,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         .cloned()
         .collect();
     let npm_files = found
-        .map(|f| select_members(f, &common.cwd, &excludes))
+        .map(|f| select_members(f, &common.cwd, &excludes, &[]))
         .unwrap_or_default();
     let py_plan = plan_python(common).await;
     // Gem + Composer projects are discovered ONCE and bundler probed ONCE:
@@ -2892,13 +2939,44 @@ mod tests {
             );
         }
         for new in ["1.0.0-rc.13", "1.0.0-rc.14", "1.0.0", "1.2.0"] {
-            for lock in [None, Some(LegacyVltLock::VersionZero)] {
-                assert_eq!(
-                    vlt_root_scripts_advisory(&reported(new), lock),
-                    None,
-                    "{new}"
-                );
-            }
+            assert_eq!(
+                vlt_root_scripts_advisory(&reported(new), None),
+                None,
+                "{new}"
+            );
+        }
+    }
+
+    #[test]
+    fn vlt_root_scripts_advisory_is_a_may_for_a_lock_the_reported_vlt_never_writes() {
+        let reported = |v: &str| VltVersionProbe::Reported(v.to_string());
+        let may = |version: &str| {
+            format!(
+                "vlt before 1.0.0-rc.13 does not run the root postinstall hook; upgrade vlt \
+                 or run `socket-patch apply` after `vlt ci` (vlt-lock.json {version}, so this \
+                 project may be installed by such a vlt)"
+            )
+        };
+        for writes_v0 in ["1.0.0-rc.13", "1.0.0-rc.14"] {
+            assert_eq!(
+                vlt_root_scripts_advisory(&reported(writes_v0), Some(LegacyVltLock::VersionZero)),
+                None,
+                "{writes_v0}"
+            );
+        }
+        for refuses_v0 in ["1.0.0-rc.15", "1.0.1", "1.2.0"] {
+            assert_eq!(
+                vlt_root_scripts_advisory(&reported(refuses_v0), Some(LegacyVltLock::VersionZero)),
+                Some(may("has lockfileVersion 0")),
+                "{refuses_v0}"
+            );
+        }
+        for new in ["1.0.0-rc.13", "1.0.0-rc.14", "1.2.0"] {
+            assert_eq!(
+                vlt_root_scripts_advisory(&reported(new), Some(LegacyVltLock::NoVersion)),
+                Some(may("has no lockfileVersion")),
+                "{new}"
+            );
         }
     }
 

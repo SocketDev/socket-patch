@@ -1271,13 +1271,32 @@ fn setup_vlt_before_rc13_emits_the_definite_advisory() {
 }
 
 #[test]
-fn setup_vlt_rc13_and_later_emits_no_advisory_even_with_a_v0_lock() {
-    for version in ["1.0.0-rc.13", "1.2.0"] {
-        let tmp = vlt_project(Some(VLT_LOCK_V0));
+fn setup_vlt_rc13_and_later_reads_the_lock_it_would_not_write() {
+    let may_v0 = format!(
+        "{VLT_ADVISORY_PREFIX} (vlt-lock.json has lockfileVersion 0, so this project may be \
+         installed by such a vlt)"
+    );
+    let may_a0 = format!(
+        "{VLT_ADVISORY_PREFIX} (vlt-lock.json has no lockfileVersion, so this project may be \
+         installed by such a vlt)"
+    );
+    let a0 = "{\"nodes\":{},\"edges\":{}}\n";
+    for (version, lock, want) in [
+        ("1.0.0-rc.13", VLT_LOCK_V0, None),
+        ("1.0.0-rc.14", VLT_LOCK_V0, None),
+        ("1.0.0-rc.15", VLT_LOCK_V0, Some(&may_v0)),
+        ("1.2.0", VLT_LOCK_V0, Some(&may_v0)),
+        ("1.0.0-rc.14", a0, Some(&may_a0)),
+        ("1.2.0", a0, Some(&may_a0)),
+        ("1.0.0-rc.13", VLT_LOCK_V1, None),
+        ("1.2.0", VLT_LOCK_V1, None),
+    ] {
+        let tmp = vlt_project(Some(lock));
         let path = vlt_reporting(version);
         let (code, v) = run_setup_with_path(tmp.path(), path.path(), &["--yes"]);
-        assert_eq!(code, 0, "{version}: {v}");
-        assert!(warnings(&v).is_empty(), "{version}: {v}");
+        assert_eq!(code, 0, "{version} {lock}: {v}");
+        let want: Vec<String> = want.into_iter().cloned().collect();
+        assert_eq!(warnings(&v), want, "{version} {lock}: {v}");
     }
 }
 
@@ -1356,4 +1375,56 @@ fn setup_npm_project_never_probes_vlt() {
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["packageManager"], "npm", "{v}");
     assert!(warnings(&v).is_empty(), "{v}");
+}
+
+#[test]
+fn setup_remove_clears_hooks_older_releases_wrote_into_vlt_members() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let wired = format!(
+        "{{ \"name\": \"m\", \"version\": \"1.0.0\", \"scripts\": {{ \"postinstall\": \
+         \"{NPX_HOOK}\", \"dependencies\": \"{NPX_HOOK}\" }} }}\n"
+    );
+    write(&tmp.path().join("package.json"), &wired);
+    write(
+        &tmp.path().join("vlt.json"),
+        "{ \"workspaces\": \"packages/*\" }\n",
+    );
+    write(&tmp.path().join("packages/a/package.json"), &wired);
+    write(&tmp.path().join("packages/excluded/package.json"), &wired);
+    let clean = "{ \"name\": \"c\", \"version\": \"1.0.0\" }\n";
+    write(&tmp.path().join("packages/clean/package.json"), clean);
+    let path = vlt_path(None);
+
+    let out = setup_command(
+        tmp.path(),
+        &[
+            "setup",
+            "--remove",
+            "--yes",
+            "--json",
+            "--exclude",
+            "packages/excluded",
+        ],
+    )
+    .env("PATH", path.path())
+    .output()
+    .expect("run socket-patch");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("remove JSON");
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["removed"], 2, "root and the hooked member: {v}");
+    assert_eq!(v["notConfigured"], 0, "a clean member is not visited: {v}");
+    for rel in ["package.json", "packages/a/package.json"] {
+        let content = std::fs::read_to_string(tmp.path().join(rel)).unwrap();
+        assert!(!content.contains("socket-patch"), "{rel}: {content}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("packages/excluded/package.json")).unwrap(),
+        wired,
+        "an excluded member is never touched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("packages/clean/package.json")).unwrap(),
+        clean
+    );
 }

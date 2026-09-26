@@ -385,8 +385,11 @@ into the new version's section — see docs/releasing.md.
   `patch_setup` telemetry `manager` report `vlt`. vlt before 1.0.0-rc.13
   never runs a root `postinstall`: `setup` still wires the project and
   warns `vlt_root_scripts_not_run` — definitely when the `vlt` on `PATH`
-  reports such a version, and as a "may" when no usable `vlt` is found and
-  `vlt-lock.json` has `lockfileVersion` 0 or none.
+  reports such a version, and as a "may" when `vlt-lock.json` has
+  `lockfileVersion` 0 or none and no usable `vlt` is found, or the one
+  found would not write that lock (a v0 lock beside vlt 1.0.0-rc.15 or
+  later). `setup --remove` also clears the hooks earlier releases wrote
+  into vlt workspace members.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare
