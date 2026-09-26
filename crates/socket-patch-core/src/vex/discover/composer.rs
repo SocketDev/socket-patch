@@ -94,15 +94,13 @@ struct InstallPreference {
 }
 
 impl InstallPreference {
-    /// Read quietly: composer.json is not a lock, and a missing or
-    /// unparseable one leaves composer's default.
-    async fn load(ctx: &DiscoverCtx<'_>, lock: &Value) -> Self {
-        let preferred_install =
-            crate::utils::fs::read_regular_to_string(&ctx.root.join(COMPOSER_JSON))
-                .await
-                .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .and_then(|manifest| manifest.get("config")?.get("preferred-install").cloned());
+    /// A missing or unparseable composer.json leaves composer's default.
+    async fn load(ctx: &DiscoverCtx<'_>, lock: &Value, out: &mut Discovery) -> Self {
+        let preferred_install = ctx
+            .read_text(COMPOSER_JSON, out)
+            .await
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|manifest| manifest.get("config")?.get("preferred-install").cloned());
         Self {
             preferred_install,
             plugin_api_version: lock
@@ -202,7 +200,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         );
         return;
     }
-    let preference = InstallPreference::load(ctx, &doc).await;
+    let preference = InstallPreference::load(ctx, &doc, out).await;
     // The inventory's own walk: `packages` then `packages-dev` (a missing
     // or non-array section — composer writes `"packages-dev": []`, older /
     // hand-trimmed locks may omit it — is simply empty).
