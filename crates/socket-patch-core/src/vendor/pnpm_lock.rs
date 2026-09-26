@@ -44,7 +44,9 @@
 //! unwinds package.json to its original bytes so the P3 desync pair is
 //! never left behind.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
@@ -61,6 +63,7 @@ use super::npm_common::{
     done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
     stage_patch_pack, tgz_rel_leaf,
 };
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
 use super::state::{
@@ -213,11 +216,11 @@ pub async fn vendor_pnpm<'a>(
         };
     let mut lock_changed = false;
     for edit in [
-        edit_overrides,
-        edit_importers,
-        edit_packages,
-        edit_snapshot_rekey,
-        edit_snapshot_refs,
+        edit_overrides::<LockLines>,
+        edit_importers::<LockLines>,
+        edit_packages::<LockLines>,
+        edit_snapshot_rekey::<LockLines>,
+        edit_snapshot_refs::<LockLines>,
     ] {
         match edit(&mut lines, &ctx, &mut wiring) {
             Ok(changed) => lock_changed |= changed,
@@ -303,6 +306,17 @@ pub async fn vendor_pnpm<'a>(
         )
         .await;
     }
+    if lock_changed {
+        // Re-seed the memo with the lock just written, so the next package
+        // reads it back without re-splitting it. Only when the split of
+        // those bytes is provably these lines (no line carries a `\n`);
+        // otherwise the next read simply misses.
+        if let LockLines::Owned(written) = lines {
+            if !written.iter().any(|l| l.contains('\n')) {
+                LOCK_MEMO.store(lock_out.into_bytes(), LockDoc::new(written));
+            }
+        }
+    }
 
     // ── 7. Marker + ledger entry ─────────────────────────────────────────
     let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
@@ -353,7 +367,7 @@ pub async fn vendor_pnpm<'a>(
 pub(super) struct PnpmProject {
     pkg_bytes: Vec<u8>,
     pkg: Value,
-    lines: Vec<String>,
+    lines: LockLines,
     ws_text: Option<String>,
 }
 
@@ -414,7 +428,11 @@ pub(super) async fn read_project(project_root: &Path) -> Result<PnpmProject, Box
             ),
         )));
     }
-    let lines = split_lines(&lock_text);
+    // The split (and its section index) is the run's, while the bytes just
+    // read are the ones it came from; see [`LOCK_MEMO`].
+    let lines = LockLines::Shared(LOCK_MEMO.parse_infallible(lock_text.as_bytes(), || {
+        LockDoc::new(split_lines(&lock_text))
+    }));
     // `pnpm-workspace.yaml` is optional (single-package projects have none);
     // its `overrides:` is where pnpm >= 11 reads them. ONLY a missing file
     // counts as "no file": an existing one we cannot read (non-UTF-8
@@ -484,7 +502,7 @@ pub(super) fn preflight_package(
     {
         return Err(Box::new(refused("vendor_override_conflict", detail)));
     }
-    if !lock_has_target_package(&project.lines, name, version) {
+    if !lock_has_target_package_in(&project.lines, name, version) {
         return Err(Box::new(refused(
             "vendor_lock_entry_not_found",
             format!(
@@ -493,7 +511,9 @@ pub(super) fn preflight_package(
             ),
         )));
     }
-    if let Err(detail) = check_rewritable_refs(&project.lines, name, version) {
+    if let Err(detail) =
+        check_rewritable_refs_with(&project.lines, name, version, project.lines.index())
+    {
         return Err(Box::new(refused("vendor_lock_entry_unsupported", detail)));
     }
     Ok(effective_key)
@@ -545,26 +565,37 @@ pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Opti
     if text.contains('\r') {
         return None;
     }
-    let lines = split_lines(&text);
+    // Every `packages:`/`snapshots:` block key resolving into
+    // `.socket/vendor/npm/<uuid>/`, collected once per lock bytes (see
+    // [`LockIndex`]); [`pnpm_entry_in_use_scan`] is the per-call scan it
+    // answers for.
+    let doc = LOCK_MEMO.parse_infallible(text.as_bytes(), || LockDoc::new(split_lines(&text)));
+    Some(doc.index().vendored_npm_uuids.contains(&entry.uuid))
+}
+
+/// The pre-index [`pnpm_entry_in_use`] body over already-split lines — the
+/// equivalence oracle for the indexed answer.
+#[cfg(test)]
+fn pnpm_entry_in_use_scan(uuid: &str, lines: &[String]) -> bool {
     for section in ["packages", "snapshots"] {
-        let Some((start, end)) = section_bounds(&lines, section) else {
+        let Some((start, end)) = section_bounds(lines, section) else {
             continue;
         };
         let mut i = start + 1;
-        while let Some(block) = next_block(&lines, i, end) {
+        while let Some(block) = next_block(lines, i, end) {
             let resolved_to_ours = block
                 .key
                 .find("@file:")
                 .map(|at| &block.key[at + 1..])
                 .and_then(parse_vendor_path)
-                .is_some_and(|p| p.eco == "npm" && p.uuid == entry.uuid);
+                .is_some_and(|p| p.eco == "npm" && p.uuid == uuid);
             if resolved_to_ours {
-                return Some(true);
+                return true;
             }
             i = block.end;
         }
     }
-    Some(false)
+    false
 }
 
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
@@ -1316,6 +1347,32 @@ fn lock_has_target_package(lines: &[String], name: &str, version: &str) -> bool 
     false
 }
 
+/// [`lock_has_target_package`] over the backend's lock lines: answered from
+/// the section index while the lines are the memoized split (the
+/// candidate blocks are exactly those whose key is the registry key or
+/// starts with `name@file:`, in lock order), else by the scan.
+fn lock_has_target_package_in(lines: &LockLines, name: &str, version: &str) -> bool {
+    let Some(index) = lines.index() else {
+        return lock_has_target_package(lines, name, version);
+    };
+    if index.packages.bounds.is_none() {
+        return false;
+    }
+    let reg_key = format!("{name}@{version}");
+    let ours_prefix = format!("{name}@file:");
+    index
+        .packages
+        .candidates(&reg_key, name)
+        .into_iter()
+        .any(|block| {
+            block.key == reg_key
+                || block
+                    .key
+                    .strip_prefix(&ours_prefix)
+                    .is_some_and(|rest| vendor_value_is_for(rest, name, version))
+        })
+}
+
 /// Pre-flight fail-closed guard against reference forms the surgery does
 /// not rewrite. The five edits move the plain registry forms only — the
 /// `name@version` packages/snapshots keys, bare-`version` importer fields
@@ -1336,7 +1393,26 @@ fn lock_has_target_package(lines: &[String], name: &str, version: &str) -> bool 
 /// specifier, so rewriting the importer entry to `file:` desyncs the lock
 /// from the manifest and `pnpm install --frozen-lockfile` rejects it with
 /// ERR_PNPM_OUTDATED_LOCKFILE (verified against real pnpm).
+///
+/// The run itself calls [`check_rewritable_refs_with`] (indexed); this
+/// scan-only spelling is the unit tests' entry point and oracle.
+#[cfg(test)]
 fn check_rewritable_refs(lines: &[String], name: &str, version: &str) -> Result<(), String> {
+    check_rewritable_refs_with(lines, name, version, None)
+}
+
+/// [`check_rewritable_refs`], answering the `snapshots:` and `importers:`
+/// scans from `index` when given — the section index of exactly these
+/// lines. The refusal reported is the scan's: each index map yields the
+/// FIRST position its condition holds at, the earliest of those is
+/// re-checked with the scan's own predicates in the scan's order, and
+/// `catalogs:` (rare, small) is always scanned.
+fn check_rewritable_refs_with(
+    lines: &[String],
+    name: &str,
+    version: &str,
+    index: Option<&LockIndex>,
+) -> Result<(), String> {
     let reg_key = format!("{name}@{version}");
     let key_peer_prefix = format!("{reg_key}(");
     let val_peer_prefix = format!("{version}(");
@@ -1387,6 +1463,51 @@ fn check_rewritable_refs(lines: &[String], name: &str, version: &str) -> Result<
             }
             i = catalog.end;
         }
+    }
+    if let Some(index) = index {
+        for candidate in index.snapshot_ref_candidates(&reg_key, name, version) {
+            match candidate {
+                SnapshotCandidate::Key(block) => {
+                    let key = &index.snapshots.blocks[block].key;
+                    if key.starts_with(&key_peer_prefix) {
+                        return refuse("a peer-suffixed snapshot key", key);
+                    }
+                }
+                SnapshotCandidate::Body(line) => {
+                    let Some((dep, _repr, rest)) = parse_key_line(&lines[line], 6) else {
+                        continue;
+                    };
+                    if rest == reg_key || rest.starts_with(&key_peer_prefix) {
+                        return refuse("an aliased snapshot reference", rest);
+                    }
+                    if dep == name && rest.starts_with(&val_peer_prefix) {
+                        return refuse("a peer-suffixed snapshot reference", rest);
+                    }
+                }
+            }
+        }
+        for entry in index.importer_ref_candidates(&reg_key, name, version) {
+            let dep = entry.dep.as_str();
+            if let Some(v) = entry.ver.as_deref() {
+                if v == reg_key || v.starts_with(&key_peer_prefix) {
+                    return refuse("an aliased importer version", v);
+                }
+                if dep == name && v.starts_with(&val_peer_prefix) {
+                    return refuse("a peer-suffixed importer version", v);
+                }
+                if dep == name && v == version {
+                    if let Some(s) = entry.spec.as_deref() {
+                        if unquote_value(s).starts_with("catalog:") {
+                            return refuse_catalog(
+                                &format!("importer `{}` specifier", entry.importer),
+                                s,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
     }
     if let Some((start, end)) = section_bounds(lines, "snapshots") {
         let mut i = start + 1;
@@ -1708,19 +1829,19 @@ fn ws_record(
 /// Edit 1: the `overrides:` section — insert it before `importers:` when
 /// absent (pnpm emits it between `settings:` and `importers:`), or splice
 /// our entry into the existing one.
-fn edit_overrides(
-    lines: &mut Vec<String>,
+fn edit_overrides<L: EditLines>(
+    lines: &mut L,
     ctx: &EditCtx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
     let our_key = ctx.override_key.to_string();
     let entry_line = format!("  {}: {}", yaml_key(&our_key), ctx.spec);
-    if let Some((start, end)) = section_bounds(lines, "overrides") {
+    if let Some((start, end)) = lines.bounds("overrides") {
         // Immutable scan first: our line's position (if present) + the last
         // entry line (the append anchor).
         let mut ours = None;
         let mut last_entry = start;
-        for (i, line) in lines.iter().enumerate().take(end).skip(start + 1) {
+        for (i, line) in lines.read().iter().enumerate().take(end).skip(start + 1) {
             if let Some((key, repr, rest)) = parse_key_line(line, 2) {
                 last_entry = i;
                 if key == our_key {
@@ -1738,7 +1859,7 @@ fn edit_overrides(
             // value being TAKEN OVER (recorded as original; the live key
             // repr/quoting is preserved so revert is byte-faithful).
             let original = (!is_vendor_value(&rest)).then(|| rest.clone());
-            lines[i] = format!("  {}: {}", yaml_key_like(&our_key, &repr), ctx.spec);
+            lines.write()[i] = format!("  {}: {}", yaml_key_like(&our_key, &repr), ctx.spec);
             wiring.push(overrides_record(
                 &our_key,
                 ctx.spec,
@@ -1747,7 +1868,7 @@ fn edit_overrides(
             ));
             return Ok(true);
         }
-        lines.insert(last_entry + 1, entry_line);
+        lines.write().insert(last_entry + 1, entry_line);
         wiring.push(overrides_record(
             &our_key,
             ctx.spec,
@@ -1758,9 +1879,10 @@ fn edit_overrides(
     }
     // No overrides section: insert one right before `importers:` (with the
     // blank separator pnpm emits — byte-identical to the P1/P4 fixtures).
-    let (importers, _) =
-        section_bounds(lines, "importers").ok_or("no importers: section to anchor on")?;
-    lines.splice(
+    let (importers, _) = lines
+        .bounds("importers")
+        .ok_or("no importers: section to anchor on")?;
+    lines.write().splice(
         importers..importers,
         ["overrides:".to_string(), entry_line, String::new()],
     );
@@ -1819,26 +1941,23 @@ fn dep_field_lines(
 /// Edit 2: every importer's dep entry for the exact `name@version` —
 /// `specifier:` (re-relativized per importer) AND `version:` move to the
 /// `file:` spec.
-// &mut Vec keeps all five edit functions' signatures unifiable into the one
-// fn array `vendor_pnpm` iterates (the section-splicing edits need the Vec).
-#[allow(clippy::ptr_arg)]
-fn edit_importers(
-    lines: &mut Vec<String>,
+fn edit_importers<L: EditLines>(
+    lines: &mut L,
     ctx: &EditCtx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
-    let Some((start, end)) = section_bounds(lines, "importers") else {
+    let Some((start, end)) = lines.bounds("importers") else {
         return Ok(false);
     };
     let mut changed = false;
     let mut i = start + 1;
-    while let Some(importer) = next_block(lines, i, end) {
+    while let Some(importer) = next_block(lines.read(), i, end) {
         let importer_key = importer.key.clone();
         // Dep entries sit at 6-space indent under the 4-space dep-type
         // headers; their fields at 8.
         let mut k = importer.header + 1;
         while k < importer.end {
-            let Some((dep, _repr, rest)) = parse_key_line(&lines[k], 6) else {
+            let Some((dep, _repr, rest)) = parse_key_line(&lines.read()[k], 6) else {
                 k += 1;
                 continue;
             };
@@ -1846,7 +1965,7 @@ fn edit_importers(
                 k += 1;
                 continue;
             }
-            let (spec_idx, ver_idx, f) = dep_field_lines(lines, k + 1, importer.end);
+            let (spec_idx, ver_idx, f) = dep_field_lines(lines.read(), k + 1, importer.end);
             if let (Some((si, old_spec)), Some((vi, old_ver))) = (spec_idx, ver_idx) {
                 let target =
                     old_ver == ctx.version || (old_ver != ctx.spec && ctx.is_ours(&old_ver));
@@ -1872,6 +1991,7 @@ fn edit_importers(
                             "version": ctx.spec,
                         })),
                     };
+                    let lines = lines.write();
                     lines[si] = format!("        specifier: {importer_spec}");
                     lines[vi] = format!("        version: {}", ctx.spec);
                     wiring.push(record);
@@ -1890,24 +2010,23 @@ fn edit_importers(
 /// for this package, a rekey would splice a DUPLICATE mapping key (pnpm
 /// refuses to parse those) and surgery cannot decide which block carries
 /// the truth.
+///
+/// `matches` is the section's [`matching_blocks`]: every other block is
+/// neither, so it cannot change the answer.
 fn check_no_split_entry(
-    lines: &[String],
-    start: usize,
-    end: usize,
+    matches: &[YamlBlock],
     ctx: &EditCtx<'_>,
     section: &str,
 ) -> Result<(), String> {
     let reg_key = ctx.reg_key();
     let mut has_registry = false;
     let mut has_ours = false;
-    let mut j = start + 1;
-    while let Some(block) = next_block(lines, j, end) {
+    for block in matches {
         if block.key == reg_key {
             has_registry = true;
         } else if ctx.is_ours_key(&block.key) {
             has_ours = true;
         }
-        j = block.end;
     }
     if has_registry && has_ours {
         return Err(format!(
@@ -1922,25 +2041,22 @@ fn check_no_split_entry(
 /// Edit 3: rekey the `packages:` entry and rewrite its body —
 /// `resolution: {integrity: <ours>, tarball: <spec>}`, a `version:` line
 /// inserted after it, `deprecated:` dropped, everything else verbatim.
-fn edit_packages(
-    lines: &mut Vec<String>,
+fn edit_packages<L: EditLines>(
+    lines: &mut L,
     ctx: &EditCtx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
-    let (start, end) = section_bounds(lines, "packages").ok_or("no packages: section")?;
+    let (start, end) = lines.bounds("packages").ok_or("no packages: section")?;
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
-    check_no_split_entry(lines, start, end, ctx, "packages")?;
+    let matches = matching_blocks(lines, "packages", start, end, ctx);
+    check_no_split_entry(&matches, ctx, "packages")?;
 
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        let is_registry = block.key == reg_key;
+    // The first registry-or-ours block is the one rewritten (every path
+    // below returns).
+    if let Some(block) = matches.into_iter().next() {
         let is_ours_key = ctx.is_ours_key(&block.key);
-        if !is_registry && !is_ours_key {
-            i = block.end;
-            continue;
-        }
-        let original_lines: Vec<String> = lines[block.header..block.end].to_vec();
+        let original_lines: Vec<String> = lines.read()[block.header..block.end].to_vec();
         let expected_resolution = format!(
             "    resolution: {{integrity: {}, tarball: {}}}",
             ctx.integrity, ctx.spec
@@ -1977,7 +2093,9 @@ fn edit_packages(
                 block.key
             ));
         }
-        lines.splice(block.header..block.end, new_lines.clone());
+        lines
+            .write()
+            .splice(block.header..block.end, new_lines.clone());
         wiring.push(WiringRecord {
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_PACKAGE.to_string(),
@@ -2004,37 +2122,35 @@ fn edit_packages(
 
 /// Edit 4a: rekey the `snapshots:` entry (`name@version` →
 /// `name@file:<rel-tgz>`), body verbatim.
-fn edit_snapshot_rekey(
-    lines: &mut Vec<String>,
+fn edit_snapshot_rekey<L: EditLines>(
+    lines: &mut L,
     ctx: &EditCtx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
-    let Some((start, end)) = section_bounds(lines, "snapshots") else {
+    let Some((start, end)) = lines.bounds("snapshots") else {
         return Ok(false); // a lock without snapshots has nothing to rekey
     };
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
-    check_no_split_entry(lines, start, end, ctx, "snapshots")?;
+    let matches = matching_blocks(lines, "snapshots", start, end, ctx);
+    check_no_split_entry(&matches, ctx, "snapshots")?;
 
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        let is_registry = block.key == reg_key;
+    // The first registry-or-ours block decides (every path below returns).
+    if let Some(block) = matches.into_iter().next() {
         let is_ours_key = ctx.is_ours_key(&block.key);
-        if !is_registry && !is_ours_key {
-            i = block.end;
-            continue;
-        }
         if block.key == new_key {
             return Ok(false); // in sync
         }
-        let original_lines: Vec<String> = lines[block.header..block.end].to_vec();
+        let original_lines: Vec<String> = lines.read()[block.header..block.end].to_vec();
         let mut new_lines = original_lines.clone();
         new_lines[0] = format!(
             "  {}:{}",
             yaml_key_like(&new_key, &block.repr),
             block.rest_suffix()
         );
-        lines.splice(block.header..block.end, new_lines.clone());
+        lines
+            .write()
+            .splice(block.header..block.end, new_lines.clone());
         wiring.push(WiringRecord {
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_SNAPSHOT.to_string(),
@@ -2057,53 +2173,537 @@ fn edit_snapshot_rekey(
 /// Edit 4b: every OTHER snapshot's dep reference to the exact version —
 /// `name: <version>` → bare `name: file:<rel-tgz>` (spike P1: dependents
 /// reference the override with no `name@` prefix).
-// &mut Vec keeps all five edit functions' signatures unifiable into the one
-// fn array `vendor_pnpm` iterates (the section-splicing edits need the Vec).
-#[allow(clippy::ptr_arg)]
-fn edit_snapshot_refs(
-    lines: &mut Vec<String>,
+fn edit_snapshot_refs<L: EditLines>(
+    lines: &mut L,
     ctx: &EditCtx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
-    let Some((start, end)) = section_bounds(lines, "snapshots") else {
+    let Some((start, end)) = lines.bounds("snapshots") else {
         return Ok(false);
     };
-    let mut changed = false;
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        for line in lines[block.header + 1..block.end].iter_mut() {
-            let Some((dep, _repr, rest)) = parse_key_line(line, 6) else {
-                continue;
-            };
-            if dep != ctx.name {
-                continue;
+    // Every snapshot body line whose 6-space dep key is `ctx.name`, in lock
+    // order, with its block's key: from the index while the lines are the
+    // memoized split, else by the scan. The rewrites below replace lines in
+    // place (never insert or remove), so the positions stay valid.
+    let candidates: Vec<(usize, String)> = match lines.index() {
+        Some(index) => index
+            .snapshot_dep_lines
+            .get(ctx.name)
+            .into_iter()
+            .flatten()
+            .map(|&(line, block)| (line, index.snapshots.blocks[block].key.clone()))
+            .collect(),
+        None => {
+            let lines = lines.read();
+            let mut found = Vec::new();
+            let mut i = start + 1;
+            while let Some(block) = next_block(lines, i, end) {
+                for (k, line) in lines
+                    .iter()
+                    .enumerate()
+                    .take(block.end)
+                    .skip(block.header + 1)
+                {
+                    if parse_key_line(line, 6).is_some_and(|(dep, _, _)| dep == ctx.name) {
+                        found.push((k, block.key.clone()));
+                    }
+                }
+                i = block.end;
             }
-            let target = rest == ctx.version || (rest != ctx.spec && ctx.is_ours(rest));
-            if !target {
-                continue;
-            }
-            let was_ours = ctx.is_ours(rest);
-            // Built before the splice below: `dep`/`rest` borrow `*line`.
-            let record = WiringRecord {
-                file: PNPM_LOCK.to_string(),
-                kind: KIND_LOCK_SNAPSHOT_REF.to_string(),
-                action: WiringAction::Rewritten,
-                key: Some(format!("{}|{dep}", block.key)),
-                original: if was_ours {
-                    None
-                } else {
-                    Some(Value::String(rest.to_string()))
-                },
-                new: Some(Value::String(ctx.spec.to_string())),
-            };
-            let rewritten = format!("      {}: {}", yaml_key(dep), ctx.spec);
-            *line = rewritten;
-            wiring.push(record);
-            changed = true;
+            found
         }
-        i = block.end;
+    };
+    let mut changed = false;
+    for (k, block_key) in candidates {
+        let Some((dep, _repr, rest)) = parse_key_line(&lines.read()[k], 6) else {
+            continue;
+        };
+        if dep != ctx.name {
+            continue;
+        }
+        let target = rest == ctx.version || (rest != ctx.spec && ctx.is_ours(rest));
+        if !target {
+            continue;
+        }
+        let was_ours = ctx.is_ours(rest);
+        // Built before the rewrite below: `dep`/`rest` borrow the line.
+        let record = WiringRecord {
+            file: PNPM_LOCK.to_string(),
+            kind: KIND_LOCK_SNAPSHOT_REF.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(format!("{block_key}|{dep}")),
+            original: if was_ours {
+                None
+            } else {
+                Some(Value::String(rest.to_string()))
+            },
+            new: Some(Value::String(ctx.spec.to_string())),
+        };
+        let rewritten = format!("      {}: {}", yaml_key(dep), ctx.spec);
+        lines.write()[k] = rewritten;
+        wiring.push(record);
+        changed = true;
     }
     Ok(changed)
+}
+
+/// The blocks of section `name` (`[start, end)`, its current bounds) whose
+/// key is the registry key `name@version` or our `name@file:` key for this
+/// version, in lock order — the only blocks the packages/snapshots edits
+/// act on. From the index while the lines are the memoized split (its
+/// candidates are a superset, filtered by the same predicate), else by the
+/// scan.
+fn matching_blocks<L: EditLines>(
+    lines: &L,
+    name: &str,
+    start: usize,
+    end: usize,
+    ctx: &EditCtx<'_>,
+) -> Vec<YamlBlock> {
+    let reg_key = ctx.reg_key();
+    let keep = |key: &str| key == reg_key || ctx.is_ours_key(key);
+    if let Some(section) = lines.index().and_then(|index| index.section(name)) {
+        return section
+            .candidates(&reg_key, ctx.name)
+            .into_iter()
+            .filter(|block| keep(&block.key))
+            .map(IndexedBlock::to_block)
+            .collect();
+    }
+    let lines = lines.read();
+    let mut found = Vec::new();
+    let mut i = start + 1;
+    while let Some(block) = next_block(lines, i, end) {
+        i = block.end;
+        if keep(&block.key) {
+            found.push(block);
+        }
+    }
+    found
+}
+
+// ─────────────────────── memoized split + section index ────────────────────
+
+/// The run's `pnpm-lock.yaml` split. A vendored run reads the lock once per
+/// patched npm package — and a monorepo lock runs to megabytes, so the
+/// split into lines and the whole-section scans the pre-flight and the
+/// edits make were paid per package. See [`ParseMemo`]: the read still
+/// happens every time, and a lock whose bytes changed between two packages
+/// is split afresh. The backend re-seeds the slot with the lock it wrote.
+static LOCK_MEMO: ParseMemo<LockDoc> = ParseMemo::new();
+
+/// One lock's lines plus, built on first use, their [`LockIndex`] — a pure
+/// function of the lines, so of the bytes the memo keys on.
+struct LockDoc {
+    lines: Vec<String>,
+    index: OnceLock<LockIndex>,
+}
+
+impl LockDoc {
+    fn new(lines: Vec<String>) -> Self {
+        Self {
+            lines,
+            index: OnceLock::new(),
+        }
+    }
+
+    fn index(&self) -> &LockIndex {
+        self.index.get_or_init(|| LockIndex::build(&self.lines))
+    }
+}
+
+/// The lock lines a pnpm vendor run works on: the memoized split, shared,
+/// until the first edit takes a private copy (and with it leaves the index
+/// behind, which describes the unedited lines only).
+enum LockLines {
+    Shared(Arc<LockDoc>),
+    Owned(Vec<String>),
+}
+
+impl std::ops::Deref for LockLines {
+    type Target = [String];
+
+    fn deref(&self) -> &[String] {
+        self.read()
+    }
+}
+
+/// Read / write access to lock lines for the edits, which run both on the
+/// backend's [`LockLines`] and on a plain `Vec` (unit tests). `index` is
+/// `Some` only while the lines are exactly the ones it was built from.
+trait EditLines {
+    fn read(&self) -> &Vec<String>;
+    fn write(&mut self) -> &mut Vec<String>;
+    fn index(&self) -> Option<&LockIndex> {
+        None
+    }
+    /// [`section_bounds`] of `name`, from the index when there is one.
+    fn bounds(&self, name: &str) -> Option<(usize, usize)> {
+        match self.index() {
+            Some(index) => index.bounds(name),
+            None => section_bounds(self.read(), name),
+        }
+    }
+}
+
+impl EditLines for Vec<String> {
+    fn read(&self) -> &Vec<String> {
+        self
+    }
+
+    fn write(&mut self) -> &mut Vec<String> {
+        self
+    }
+}
+
+impl EditLines for LockLines {
+    fn read(&self) -> &Vec<String> {
+        match self {
+            LockLines::Shared(doc) => &doc.lines,
+            LockLines::Owned(lines) => lines,
+        }
+    }
+
+    fn write(&mut self) -> &mut Vec<String> {
+        if let LockLines::Shared(doc) = self {
+            *self = LockLines::Owned(doc.lines.clone());
+        }
+        match self {
+            LockLines::Owned(lines) => lines,
+            LockLines::Shared(_) => unreachable!("converted to Owned above"),
+        }
+    }
+
+    fn index(&self) -> Option<&LockIndex> {
+        match self {
+            LockLines::Shared(doc) => Some(doc.index()),
+            LockLines::Owned(_) => None,
+        }
+    }
+}
+
+/// A block as [`next_block`] yields it, kept by the index.
+struct IndexedBlock {
+    header: usize,
+    end: usize,
+    key: String,
+    repr: String,
+    rest: String,
+}
+
+impl IndexedBlock {
+    fn to_block(&self) -> YamlBlock {
+        YamlBlock {
+            header: self.header,
+            end: self.end,
+            key: self.key.clone(),
+            repr: self.repr.clone(),
+            rest: self.rest.clone(),
+        }
+    }
+}
+
+/// The blocks of one top-level section, in lock order, as the scans walk
+/// them ([`section_bounds`] + [`next_block`]), with two lookups: blocks by
+/// exact key, and blocks by the key text before each `@file:` in it (so
+/// `name` finds every key starting `name@file:`).
+#[derive(Default)]
+struct SectionIndex {
+    bounds: Option<(usize, usize)>,
+    blocks: Vec<IndexedBlock>,
+    by_key: HashMap<String, Vec<usize>>,
+    by_file_prefix: HashMap<String, Vec<usize>>,
+}
+
+impl SectionIndex {
+    fn build(lines: &[String], name: &str) -> Self {
+        let mut index = SectionIndex {
+            bounds: section_bounds(lines, name),
+            ..Default::default()
+        };
+        let Some((start, end)) = index.bounds else {
+            return index;
+        };
+        let mut i = start + 1;
+        while let Some(block) = next_block(lines, i, end) {
+            i = block.end;
+            let at = index.blocks.len();
+            index.by_key.entry(block.key.clone()).or_default().push(at);
+            for (p, _) in block.key.match_indices("@file:") {
+                index
+                    .by_file_prefix
+                    .entry(block.key[..p].to_string())
+                    .or_default()
+                    .push(at);
+            }
+            index.blocks.push(IndexedBlock {
+                header: block.header,
+                end: block.end,
+                key: block.key,
+                repr: block.repr,
+                rest: block.rest,
+            });
+        }
+        index
+    }
+
+    /// Every block whose key is `reg_key` or starts with `name@file:`, in
+    /// lock order.
+    fn candidates(&self, reg_key: &str, name: &str) -> Vec<&IndexedBlock> {
+        let mut at: Vec<usize> = self
+            .by_key
+            .get(reg_key)
+            .into_iter()
+            .chain(self.by_file_prefix.get(name))
+            .flatten()
+            .copied()
+            .collect();
+        at.sort_unstable();
+        at.dedup();
+        at.into_iter().map(|i| &self.blocks[i]).collect()
+    }
+}
+
+/// One importer dep entry as [`check_rewritable_refs`]'s importer scan
+/// visits it (a 6-space dep key with an empty inline value, and its
+/// 8-space `specifier:`/`version:` fields).
+struct ImporterDep {
+    importer: String,
+    dep: String,
+    spec: Option<String>,
+    ver: Option<String>,
+}
+
+/// A position the snapshot scan of [`check_rewritable_refs`] may refuse
+/// at: a block header (by block) or a body line.
+enum SnapshotCandidate {
+    Key(usize),
+    Body(usize),
+}
+
+/// Everything the per-package lock probes ask of an unedited lock, built in
+/// one pass per lock bytes. Each `first_*` map holds the FIRST position (in
+/// the scan's order) at which its condition holds, keyed so a probe looks
+/// its package up instead of scanning; `*_paren` maps key on the text
+/// before each `(` (so `x` finds everything starting `x(`).
+#[derive(Default)]
+struct LockIndex {
+    /// First line index of every column-0 line, and all column-0 lines in
+    /// order: [`section_bounds`] for any section.
+    headers: HashMap<String, usize>,
+    col0: Vec<usize>,
+    len: usize,
+    packages: SectionIndex,
+    snapshots: SectionIndex,
+    /// Snapshot body lines by their 6-space dep key: `(line, block)`.
+    snapshot_dep_lines: HashMap<String, Vec<(usize, usize)>>,
+    first_snapshot_key_paren: HashMap<String, usize>,
+    first_snapshot_rest: HashMap<String, usize>,
+    first_snapshot_rest_paren: HashMap<String, usize>,
+    first_snapshot_dep_rest_paren: HashMap<(String, String), usize>,
+    importer_deps: Vec<ImporterDep>,
+    first_importer_ver: HashMap<String, usize>,
+    first_importer_ver_paren: HashMap<String, usize>,
+    first_importer_dep_ver_paren: HashMap<(String, String), usize>,
+    first_importer_catalog: HashMap<(String, String), usize>,
+    /// The uuid of every packages/snapshots key resolving into
+    /// `.socket/vendor/npm/<uuid>/` ([`pnpm_entry_in_use`]).
+    vendored_npm_uuids: HashSet<String>,
+}
+
+/// Every prefix of `s` that ends right before a `(`.
+fn paren_prefixes(s: &str) -> impl Iterator<Item = &str> {
+    s.match_indices('(').map(move |(p, _)| &s[..p])
+}
+
+impl LockIndex {
+    fn build(lines: &[String]) -> Self {
+        let mut index = LockIndex {
+            len: lines.len(),
+            ..Default::default()
+        };
+        for (i, line) in lines.iter().enumerate() {
+            if !line.is_empty() && !line.starts_with(' ') {
+                index.col0.push(i);
+                index.headers.entry(line.clone()).or_insert(i);
+            }
+        }
+        index.packages = SectionIndex::build(lines, "packages");
+        index.snapshots = SectionIndex::build(lines, "snapshots");
+
+        for (at, block) in index.snapshots.blocks.iter().enumerate() {
+            for prefix in paren_prefixes(&block.key) {
+                index
+                    .first_snapshot_key_paren
+                    .entry(prefix.to_string())
+                    .or_insert(at);
+            }
+            for (k, line) in lines
+                .iter()
+                .enumerate()
+                .take(block.end)
+                .skip(block.header + 1)
+            {
+                let Some((dep, _repr, rest)) = parse_key_line(line, 6) else {
+                    continue;
+                };
+                index
+                    .snapshot_dep_lines
+                    .entry(dep.to_string())
+                    .or_default()
+                    .push((k, at));
+                index
+                    .first_snapshot_rest
+                    .entry(rest.to_string())
+                    .or_insert(k);
+                for prefix in paren_prefixes(rest) {
+                    index
+                        .first_snapshot_rest_paren
+                        .entry(prefix.to_string())
+                        .or_insert(k);
+                    index
+                        .first_snapshot_dep_rest_paren
+                        .entry((dep.to_string(), prefix.to_string()))
+                        .or_insert(k);
+                }
+            }
+        }
+
+        if let Some((start, end)) = section_bounds(lines, "importers") {
+            let mut i = start + 1;
+            while let Some(importer) = next_block(lines, i, end) {
+                let mut k = importer.header + 1;
+                while k < importer.end {
+                    let Some((dep, _repr, rest)) = parse_key_line(&lines[k], 6) else {
+                        k += 1;
+                        continue;
+                    };
+                    if !rest.is_empty() {
+                        k += 1;
+                        continue;
+                    }
+                    let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end);
+                    if let Some((_, v)) = &ver {
+                        let at = index.importer_deps.len();
+                        index.first_importer_ver.entry(v.clone()).or_insert(at);
+                        for prefix in paren_prefixes(v) {
+                            index
+                                .first_importer_ver_paren
+                                .entry(prefix.to_string())
+                                .or_insert(at);
+                            index
+                                .first_importer_dep_ver_paren
+                                .entry((dep.to_string(), prefix.to_string()))
+                                .or_insert(at);
+                        }
+                        if spec
+                            .as_ref()
+                            .is_some_and(|(_, s)| unquote_value(s).starts_with("catalog:"))
+                        {
+                            index
+                                .first_importer_catalog
+                                .entry((dep.to_string(), v.clone()))
+                                .or_insert(at);
+                        }
+                        index.importer_deps.push(ImporterDep {
+                            importer: importer.key.clone(),
+                            dep: dep.to_string(),
+                            spec: spec.map(|(_, s)| s),
+                            ver: ver.map(|(_, v)| v),
+                        });
+                    }
+                    k = f;
+                }
+                i = importer.end;
+            }
+        }
+
+        for section in [&index.packages, &index.snapshots] {
+            for block in &section.blocks {
+                if let Some(parts) = block
+                    .key
+                    .find("@file:")
+                    .map(|at| &block.key[at + 1..])
+                    .and_then(parse_vendor_path)
+                    .filter(|p| p.eco == "npm")
+                {
+                    index.vendored_npm_uuids.insert(parts.uuid);
+                }
+            }
+        }
+        index
+    }
+
+    /// [`section_bounds`] of `name` over the indexed lines.
+    fn bounds(&self, name: &str) -> Option<(usize, usize)> {
+        let start = *self.headers.get(&format!("{name}:"))?;
+        let next = self.col0.partition_point(|&i| i <= start);
+        Some((start, self.col0.get(next).copied().unwrap_or(self.len)))
+    }
+
+    fn section(&self, name: &str) -> Option<&SectionIndex> {
+        match name {
+            "packages" => Some(&self.packages),
+            "snapshots" => Some(&self.snapshots),
+            _ => None,
+        }
+    }
+
+    /// The snapshot positions at which [`check_rewritable_refs`] could
+    /// first refuse `name@version`, in scan order: the first key starting
+    /// `reg_key(`, the first dep value equal to `reg_key` or starting
+    /// `reg_key(`, and the first `name:` dep whose value starts
+    /// `version(`.
+    fn snapshot_ref_candidates(
+        &self,
+        reg_key: &str,
+        name: &str,
+        version: &str,
+    ) -> Vec<SnapshotCandidate> {
+        let mut found: Vec<(usize, SnapshotCandidate)> = Vec::new();
+        if let Some(&block) = self.first_snapshot_key_paren.get(reg_key) {
+            found.push((
+                self.snapshots.blocks[block].header,
+                SnapshotCandidate::Key(block),
+            ));
+        }
+        let body = [
+            self.first_snapshot_rest.get(reg_key),
+            self.first_snapshot_rest_paren.get(reg_key),
+            self.first_snapshot_dep_rest_paren
+                .get(&(name.to_string(), version.to_string())),
+        ];
+        for &line in body.into_iter().flatten() {
+            found.push((line, SnapshotCandidate::Body(line)));
+        }
+        found.sort_by_key(|(line, _)| *line);
+        found.into_iter().map(|(_, c)| c).collect()
+    }
+
+    /// The importer dep entries at which [`check_rewritable_refs`] could
+    /// first refuse `name@version`, in scan order (see
+    /// [`Self::snapshot_ref_candidates`]).
+    fn importer_ref_candidates(
+        &self,
+        reg_key: &str,
+        name: &str,
+        version: &str,
+    ) -> Vec<&ImporterDep> {
+        let pair = (name.to_string(), version.to_string());
+        let mut at: Vec<usize> = [
+            self.first_importer_ver.get(reg_key),
+            self.first_importer_ver_paren.get(reg_key),
+            self.first_importer_dep_ver_paren.get(&pair),
+            self.first_importer_catalog.get(&pair),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
+        at.sort_unstable();
+        at.dedup();
+        at.into_iter().map(|i| &self.importer_deps[i]).collect()
+    }
 }
 
 // ───────────────────────────── revert helpers ─────────────────────────────
@@ -7723,5 +8323,333 @@ snapshots:
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(planned, Ok(()), "the plan cannot see a staged-copy gate");
         assert_eq!(looped, Err("vendor_bundled_deps_unsupported"));
+    }
+
+    // ─────────────── V-2: memoized split + section index oracles ───────────────
+
+    /// A tiny deterministic generator (no `rand` dependency).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as usize
+        }
+        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+            xs[self.next() % xs.len()]
+        }
+        fn chance(&mut self, pct: usize) -> bool {
+            self.next() % 100 < pct
+        }
+    }
+
+    const NAMES: [&str; 4] = ["left-pad", "@s/x", "a", "b"];
+    const VERSIONS: [&str; 3] = ["1.3.0", "1.2.0", "2.0.0"];
+    const OTHER_UUID: &str = "0a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d";
+
+    fn vendor_spec(rng: &mut Lcg, name: &str, version: &str) -> String {
+        let uuid = if rng.chance(50) { UUID } else { OTHER_UUID };
+        let leaf_version = if rng.chance(70) {
+            version
+        } else {
+            rng.pick(&VERSIONS)
+        };
+        format!(
+            "file:.socket/vendor/npm/{uuid}/{}",
+            tgz_rel_leaf(name, leaf_version)
+        )
+    }
+
+    fn random_key(rng: &mut Lcg) -> String {
+        let name = rng.pick(&NAMES);
+        let version = rng.pick(&VERSIONS);
+        let key = match rng.next() % 5 {
+            0 | 1 => format!("{name}@{version}"),
+            2 => format!("{name}@{version}(peer@1.0.0)(other@2.0.0)"),
+            3 => format!("{name}@{}", vendor_spec(rng, name, version)),
+            _ => format!("{name}@{version}(a@1.3.0)"),
+        };
+        if name.starts_with('@') || rng.chance(15) {
+            format!("'{key}'")
+        } else {
+            key
+        }
+    }
+
+    fn random_value(rng: &mut Lcg) -> String {
+        let name = rng.pick(&NAMES);
+        let version = rng.pick(&VERSIONS);
+        match rng.next() % 7 {
+            0 | 1 => version.to_string(),
+            2 => format!("{version}(peer@1.0.0)"),
+            3 => format!("{name}@{version}"),
+            4 => format!("{name}@{version}(x@1.0.0)"),
+            5 => vendor_spec(rng, name, version),
+            _ => format!("npm:{name}@{version}"),
+        }
+    }
+
+    fn random_lock(seed: u64) -> String {
+        let mut rng = Lcg(seed);
+        let mut out = vec!["lockfileVersion: '9.0'".to_string(), String::new()];
+        let mut sections = vec!["importers", "packages", "snapshots"];
+        if rng.chance(40) {
+            sections.insert(0, "overrides");
+        }
+        if rng.chance(30) {
+            sections.insert(0, "catalogs");
+        }
+        if rng.chance(20) {
+            sections.push(rng.pick(&["packages", "snapshots", "importers"]));
+        }
+        for section in sections {
+            out.push(format!("{section}:"));
+            out.push(String::new());
+            for _ in 0..rng.next() % 7 {
+                match section {
+                    "overrides" => {
+                        let name = rng.pick(&NAMES);
+                        let version = rng.pick(&VERSIONS);
+                        let value = random_value(&mut rng);
+                        out.push(format!(
+                            "  {}: {value}",
+                            yaml_key(&format!("{name}@{version}"))
+                        ));
+                    }
+                    "catalogs" => {
+                        out.push(format!("  {}:", rng.pick(&["default", "named"])));
+                        for _ in 0..rng.next() % 3 {
+                            out.push(format!("    {}:", yaml_key(rng.pick(&NAMES))));
+                            out.push(format!("      specifier: ^{}", rng.pick(&VERSIONS)));
+                            out.push(format!("      version: {}", random_value(&mut rng)));
+                        }
+                    }
+                    "importers" => {
+                        out.push(format!("  {}:", rng.pick(&[".", "packages/app", "libs/x"])));
+                        out.push("    dependencies:".to_string());
+                        for _ in 0..rng.next() % 4 {
+                            let name = rng.pick(&NAMES);
+                            if rng.chance(15) {
+                                out.push(format!("      {}: 1.0.0", yaml_key(name)));
+                                continue;
+                            }
+                            out.push(format!("      {}:", yaml_key(name)));
+                            if rng.chance(85) {
+                                let spec =
+                                    rng.pick(&["1.3.0", "'catalog:'", "catalog:named", "^1.0.0"]);
+                                out.push(format!("        specifier: {spec}"));
+                            }
+                            if rng.chance(85) {
+                                out.push(format!("        version: {}", random_value(&mut rng)));
+                            }
+                        }
+                        out.push(String::new());
+                    }
+                    _ => {
+                        let key = random_key(&mut rng);
+                        if rng.chance(20) {
+                            out.push(format!("  {key}: {{}}"));
+                        } else {
+                            out.push(format!("  {key}:"));
+                            if section == "packages" {
+                                out.push(format!(
+                                    "    resolution: {{integrity: {}}}",
+                                    rng.pick(&["sha512-x", "sha512-y"])
+                                ));
+                                if rng.chance(30) {
+                                    out.push("    deprecated: gone".to_string());
+                                }
+                                if rng.chance(30) {
+                                    out.push(format!("    version: {}", rng.pick(&VERSIONS)));
+                                }
+                            }
+                            if rng.chance(70) {
+                                out.push("    dependencies:".to_string());
+                                for _ in 0..rng.next() % 4 {
+                                    let dep = rng.pick(&NAMES);
+                                    out.push(format!(
+                                        "      {}: {}",
+                                        yaml_key(dep),
+                                        random_value(&mut rng)
+                                    ));
+                                }
+                            }
+                        }
+                        if rng.chance(80) {
+                            out.push(String::new());
+                        }
+                    }
+                }
+            }
+            if rng.chance(10) {
+                out.push("  # stray".to_string());
+            }
+        }
+        out.join("\n")
+    }
+
+    /// One lock edit over `L` lines, as `vendor_pnpm`'s edit array holds it.
+    type Edit<L> = fn(&mut L, &EditCtx<'_>, &mut Vec<WiringRecord>) -> Result<bool, String>;
+
+    fn shared(lines: &[String]) -> LockLines {
+        LockLines::Shared(Arc::new(LockDoc::new(lines.to_vec())))
+    }
+
+    /// V-2: every indexed answer equals the scan it replaces — section
+    /// bounds, the pre-flight's target and refusal probes (the refusal
+    /// TEXT, so the first refusing position too), the in-use probe, and
+    /// the full edit sequence run over the shared split versus a plain
+    /// `Vec` (results, final lines, wiring records) — over generated locks
+    /// dense in the shapes those probes discriminate (peer-suffixed and
+    /// aliased keys and values, sibling-version and stale-uuid vendored
+    /// keys, catalogs, quoted keys, duplicated sections, split entries).
+    #[test]
+    fn indexed_lock_probes_match_the_scans() {
+        let mut refusals = 0usize;
+        let mut rewrites = 0usize;
+        let mut indexed_rewrites = 0usize;
+        for seed in 0..600u64 {
+            let text = random_lock(seed);
+            let lines = split_lines(&text);
+            let index = LockIndex::build(&lines);
+            for name in [
+                "packages",
+                "snapshots",
+                "importers",
+                "overrides",
+                "catalogs",
+                "settings",
+                "nope",
+            ] {
+                assert_eq!(
+                    index.bounds(name),
+                    section_bounds(&lines, name),
+                    "seed {seed} {name}"
+                );
+            }
+            for uuid in [UUID, OTHER_UUID] {
+                assert_eq!(
+                    index.vendored_npm_uuids.contains(uuid),
+                    pnpm_entry_in_use_scan(uuid, &lines),
+                    "seed {seed} in-use {uuid}"
+                );
+            }
+            for name in NAMES {
+                for version in VERSIONS {
+                    let scan = check_rewritable_refs_with(&lines, name, version, None);
+                    refusals += usize::from(scan.is_err());
+                    assert_eq!(
+                        check_rewritable_refs_with(&lines, name, version, Some(&index)),
+                        scan,
+                        "seed {seed} refs {name}@{version}\n{text}"
+                    );
+                    assert_eq!(
+                        lock_has_target_package_in(&shared(&lines), name, version),
+                        lock_has_target_package(&lines, name, version),
+                        "seed {seed} target {name}@{version}\n{text}"
+                    );
+
+                    let rel_tgz =
+                        format!(".socket/vendor/npm/{UUID}/{}", tgz_rel_leaf(name, version));
+                    let spec = format!("file:{rel_tgz}");
+                    let override_key = format!("{name}@{version}");
+                    let ctx = EditCtx {
+                        name,
+                        version,
+                        rel_tgz: &rel_tgz,
+                        spec: &spec,
+                        integrity: SPIKE_INTEGRITY,
+                        override_key: &override_key,
+                    };
+                    let mut plain = lines.clone();
+                    let mut cow = shared(&lines);
+                    let (mut w_plain, mut w_cow) = (Vec::new(), Vec::new());
+                    let steps: [(Edit<Vec<String>>, Edit<LockLines>); 5] = [
+                        (edit_overrides::<Vec<String>>, edit_overrides::<LockLines>),
+                        (edit_importers::<Vec<String>>, edit_importers::<LockLines>),
+                        (edit_packages::<Vec<String>>, edit_packages::<LockLines>),
+                        (
+                            edit_snapshot_rekey::<Vec<String>>,
+                            edit_snapshot_rekey::<LockLines>,
+                        ),
+                        (
+                            edit_snapshot_refs::<Vec<String>>,
+                            edit_snapshot_refs::<LockLines>,
+                        ),
+                    ];
+                    for (step, (a, b)) in steps.iter().enumerate() {
+                        let ra = a(&mut plain, &ctx, &mut w_plain);
+                        let rb = b(&mut cow, &ctx, &mut w_cow);
+                        assert_eq!(ra, rb, "seed {seed} step {step} {name}@{version}\n{text}");
+                        assert_eq!(
+                            &plain,
+                            cow.read(),
+                            "seed {seed} step {step} {name}@{version}"
+                        );
+                        rewrites += usize::from(ra == Ok(true));
+                        if ra.is_err() {
+                            break;
+                        }
+                    }
+                    assert_eq!(w_plain, w_cow, "seed {seed} wiring {name}@{version}");
+                    // Each edit alone over the unedited split too: in the
+                    // sequence the first write leaves the index behind, so
+                    // this is what exercises every edit's indexed path.
+                    for (step, (a, b)) in steps.iter().enumerate() {
+                        let (mut plain, mut cow) = (lines.clone(), shared(&lines));
+                        let (mut w_plain, mut w_cow) = (Vec::new(), Vec::new());
+                        let ra = a(&mut plain, &ctx, &mut w_plain);
+                        assert_eq!(
+                            ra,
+                            b(&mut cow, &ctx, &mut w_cow),
+                            "seed {seed} alone {step}"
+                        );
+                        assert_eq!(&plain, cow.read(), "seed {seed} alone {step}");
+                        assert_eq!(w_plain, w_cow, "seed {seed} alone {step}");
+                        indexed_rewrites += usize::from(ra == Ok(true));
+                    }
+                }
+            }
+        }
+        // The generator must actually reach the refusing and rewriting
+        // paths, or the equivalence above proves little.
+        assert!(refusals > 1000, "refusals {refusals}");
+        assert!(rewrites > 1000, "rewrites {rewrites}");
+        assert!(
+            indexed_rewrites > 1000,
+            "indexed rewrites {indexed_rewrites}"
+        );
+    }
+
+    /// V-2: the memoized split is keyed on the bytes read, so a lock edited
+    /// between two packages is re-split — the second read sees the edit.
+    #[tokio::test]
+    async fn lock_memo_misses_when_the_lock_changes_between_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(PACKAGE_JSON), "{\"name\":\"fx\"}\n").unwrap();
+        std::fs::write(root.join(PNPM_LOCK), P1_BEFORE_LOCK).unwrap();
+        let first = read_project(root).await.map_err(|_| ()).unwrap();
+        // (The memo is process-wide and tests run concurrently, so which
+        // document the slot holds is not asserted — only what a read sees.)
+        assert!(matches!(first.lines, LockLines::Shared(_)));
+        assert_eq!(first.lines.read(), &split_lines(P1_BEFORE_LOCK));
+        let edited = P1_BEFORE_LOCK.replace("left-pad", "right-pad");
+        std::fs::write(root.join(PNPM_LOCK), &edited).unwrap();
+        let second = read_project(root).await.map_err(|_| ()).unwrap();
+        assert_eq!(second.lines.read(), &split_lines(&edited));
+        assert_ne!(first.lines.read(), second.lines.read());
+        assert!(!lock_has_target_package_in(
+            &second.lines,
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(lock_has_target_package_in(
+            &second.lines,
+            "right-pad",
+            "1.3.0"
+        ));
     }
 }
