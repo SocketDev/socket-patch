@@ -1233,6 +1233,16 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **The `node_modules` walk runs on 4 threads by default.** The crawl's
+  walk pool used one thread per logical CPU (up to 16), but the walk is
+  bound by the kernel's directory cache: on a 14-core Mac and on Linux
+  ext4, 4 threads walked a large monorepo as fast as or faster than one per CPU,
+  with a quarter of the system time (see `walk_pool.rs` for the
+  measurements). The default is now 4, or the performance-core count when
+  that is lower (`hw.perflevel0.logicalcpu` on Apple silicon).
+  `SOCKET_WALK_THREADS=<n>` overrides it, clamped to 1-16 and to the CPU
+  count. What the crawl finds, and its order, are unchanged.
+
 - **Maven discovery takes coordinates from the `~/.m2` path.** A POM at its
   canonical `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom`
   location is no longer opened: its groupId / artifactId / version come from

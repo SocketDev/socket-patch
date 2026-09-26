@@ -65,6 +65,35 @@ const RESERVED_FDS: u64 = 64;
 /// below it the pool is one thread.
 const MAX_WALK_THREADS: usize = 16;
 
+/// The pool's default size, below [`MAX_WALK_THREADS`]: the walk is bound
+/// by the kernel's directory and page-cache paths, which contend with one
+/// another well before the CPUs run out, so past a handful of threads each
+/// extra one adds system time (lock contention in the VFS) and, past four
+/// or six, wall time too. Measured with the npm crawl (`crawl_all`,
+/// 21k walked dirs, 2,802 packages) of the polyglot monorepo fixture, warm
+/// cache, medians of 7:
+///
+/// | threads | macOS 10P+4E, APFS: wall / sys | Linux 10 vCPU, ext4: wall / sys |
+/// |---------|--------------------------------|---------------------------------|
+/// | 2       | 0.83 s / 0.71 s                | 0.046 s / 0.066 s               |
+/// | 4       | 0.71 s / 1.11 s                | 0.033 s / 0.090 s               |
+/// | 6       | 0.73 s / 1.76 s                | 0.034 s / 0.146 s               |
+/// | 8       | 0.78 s / 2.67 s                | 0.040 s / 0.217 s               |
+/// | 10      | 0.83 s / 3.54 s                | 0.051 s / 0.299 s               |
+/// | 14      | 0.83 s / 4.01 s                | —                               |
+///
+/// Four is the fastest (or tied) on both, at a quarter of the machine-wide
+/// pool's system time. On a machine with fewer (performance) cores than
+/// this, the core count binds instead.
+const DEFAULT_WALK_THREADS: usize = 4;
+
+/// Env override for the pool size: a positive integer replaces the default
+/// ([`DEFAULT_WALK_THREADS`], capped by the machine's performance cores),
+/// clamped to `1..=`[`MAX_WALK_THREADS`]. The descriptor budget still
+/// applies on top (a tight `RLIMIT_NOFILE` still means one thread). An
+/// unset, empty, zero or non-numeric value keeps the default.
+pub const WALK_THREADS_ENV: &str = "SOCKET_WALK_THREADS";
+
 /// The process's soft `RLIMIT_NOFILE`, read once. `None` when unlimited
 /// or unknown (and on Windows, whose handle table has no comparable
 /// per-process cap).
@@ -129,6 +158,58 @@ fn descriptor_budget(cpus: usize, soft_limit: Option<u64>) -> usize {
     }
 }
 
+/// The pool's ceiling for this machine and environment: `requested` (the
+/// [`WALK_THREADS_ENV`] value) when it parses to a positive count, clamped
+/// to [`MAX_WALK_THREADS`]; otherwise [`DEFAULT_WALK_THREADS`], lowered to
+/// `perf_cores` (the performance-core count, see [`performance_cores`]).
+fn walk_ceiling(requested: Option<&str>, perf_cores: usize) -> usize {
+    match requested
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        Some(n) => n.min(MAX_WALK_THREADS),
+        None => DEFAULT_WALK_THREADS.min(perf_cores.max(1)),
+    }
+}
+
+/// Walk-pool threads: [`walk_threads`] (the descriptor budget under the hard
+/// ceiling) under the machine's [`walk_ceiling`].
+fn pool_threads(
+    cpus: usize,
+    soft_limit: Option<u64>,
+    requested: Option<&str>,
+    perf_cores: usize,
+) -> usize {
+    walk_threads(cpus, soft_limit).min(walk_ceiling(requested, perf_cores))
+}
+
+/// Performance cores: on macOS `hw.perflevel0.logicalcpu` (Apple silicon
+/// schedules a blocking walk thread on an efficiency core at a fraction of
+/// the speed, so those do not count), elsewhere — and when the sysctl is
+/// missing (Intel Macs) — the logical CPUs [`default_cpus`] reports.
+fn performance_cores() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: the name is NUL-terminated and `value`/`size` describe a
+        // writable c_int, which is what this sysctl returns.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.perflevel0.logicalcpu".as_ptr(),
+                (&mut value as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && value > 0 {
+            return usize::try_from(value).map_or(default_cpus(), |n| n.min(default_cpus()));
+        }
+    }
+    default_cpus()
+}
+
 /// Logical CPUs. `RAYON_NUM_THREADS` can lower the count (like rayon's
 /// global pool) but never raise it past the machine's parallelism.
 fn default_cpus() -> usize {
@@ -149,7 +230,12 @@ fn walk_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
         build_with_fallback(
-            walk_threads(default_cpus(), soft_nofile_limit()),
+            pool_threads(
+                default_cpus(),
+                soft_nofile_limit(),
+                std::env::var(WALK_THREADS_ENV).ok().as_deref(),
+                performance_cores(),
+            ),
             |threads| {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
@@ -301,6 +387,38 @@ mod tests {
             walk_threads(MAX_WALK_THREADS - 1, None),
             MAX_WALK_THREADS - 1
         );
+    }
+
+    /// The default pool is [`DEFAULT_WALK_THREADS`], lowered to the
+    /// performance cores; [`WALK_THREADS_ENV`] replaces it up to the hard
+    /// ceiling; the descriptor budget and the CPU count still bind.
+    #[test]
+    fn pool_size_defaults_small_and_the_env_overrides_it() {
+        assert_eq!(pool_threads(14, Some(256), None, 10), DEFAULT_WALK_THREADS);
+        assert_eq!(pool_threads(96, None, None, 96), DEFAULT_WALK_THREADS);
+        // Fewer performance cores than the default: they bind.
+        assert_eq!(pool_threads(8, None, None, 2), 2.min(DEFAULT_WALK_THREADS));
+        assert_eq!(pool_threads(8, None, None, 0), 1);
+        // Fewer CPUs than the default: they bind (descriptor budget).
+        assert_eq!(pool_threads(1, None, None, 1), 1);
+        // The override, whitespace-tolerant, clamped to the hard ceiling.
+        assert_eq!(pool_threads(14, Some(1024), Some("8"), 10), 8);
+        assert_eq!(pool_threads(14, Some(1024), Some(" 2 "), 10), 2);
+        assert_eq!(pool_threads(14, Some(1024), Some("1"), 10), 1);
+        assert_eq!(pool_threads(64, None, Some("9999"), 10), MAX_WALK_THREADS);
+        // The override ignores the performance-core count but not the CPUs
+        // or the descriptor budget.
+        assert_eq!(pool_threads(14, None, Some("12"), 4), 12);
+        assert_eq!(pool_threads(6, None, Some("12"), 4), 6);
+        assert_eq!(pool_threads(14, Some(64), Some("12"), 10), 1);
+        // Unusable values keep the default.
+        for bad in ["", "  ", "0", "-3", "four", "2.5"] {
+            assert_eq!(
+                pool_threads(14, Some(1024), Some(bad), 10),
+                DEFAULT_WALK_THREADS,
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
