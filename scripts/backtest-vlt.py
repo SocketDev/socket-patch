@@ -1454,16 +1454,22 @@ class Cell:
         checks['rollbackOriginalBytes'] = pristine
 
 
+# The CLI's own report of a transport failure: a request error, or a 5xx from
+# the patch API (e.g. "API request failed with status 504: error code: 504").
+CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API request failed with status 5\d\d\b')
+
+
 def transient(row):
-    """A failure the service's transport caused (a request error, or a probe
-    that got no 2xx/4xx answer), never a functional one."""
+    """A failure the service's transport caused (a request error, a 5xx from
+    the patch API, or a probe that got no 2xx/4xx answer), never a
+    functional one."""
     if row.get('matchesExpectation'):
         return False
     probe = row.get('serveProbe') or {}
     if probe and (probe.get('curlExit') or (probe.get('status') or 0) >= 500
                   or probe.get('status') is None):
         return True
-    return 'error sending request for url (' in json.dumps(row)
+    return bool(CLI_TRANSPORT_FAILURE.search(json.dumps(row)))
 
 
 def run_with_retries(cell_factory, job, attempts=3):

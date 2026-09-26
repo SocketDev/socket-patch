@@ -55,6 +55,13 @@ class BunTransportRetryTests(unittest.TestCase):
             self.assertEqual((evidence / 'cli.log').read_text(), 'failed request evidence')
             self.assertFalse((evidence / 'cache').exists())
 
+    def test_a_patch_api_5xx_is_a_transport_failure(self):
+        self.assertTrue(bun.has_transport_failure({'repeat': {'error': (
+            'failed to resolve patch references: API request failed with status 503: upstream '
+            'connect error or disconnect/reset before headers')}}))
+        self.assertTrue(bun.has_transport_failure(['API request failed with status 504: error code: 504']))
+        self.assertFalse(bun.has_transport_failure({'error': 'API request failed with status 404: not found'}))
+
     def test_functional_failure_is_never_retried(self):
         with tempfile.TemporaryDirectory() as temp:
             row = dict(passed=False, checks={'frozenPatchedBytes': False}, error='installed bytes differ')
@@ -606,6 +613,9 @@ class VltRetryTests(unittest.TestCase):
         self.assertTrue(vlt.transient({'serveProbe': {'curlExit': 7}}))
         self.assertTrue(vlt.transient({'serveProbe': {'curlExit': 0, 'status': 503}}))
         self.assertTrue(vlt.transient({'error': 'error sending request for url (https://x)'}))
+        self.assertTrue(vlt.transient({'cliStderrTail': 'Error: Failed to resolve patch references: API '
+                                                        'request failed with status 504: error code: 504'}))
+        self.assertFalse(vlt.transient({'cliStderrTail': 'API request failed with status 404: not found'}))
         self.assertFalse(vlt.transient({'serveProbe': {'curlExit': 0, 'status': 200},
                                         'failingChecks': ['freshCi']}))
 
