@@ -1233,6 +1233,18 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **The npm crawl skips tagged cache directories.** The walk that finds
+  workspace `node_modules` trees no longer descends into a directory that
+  carries a [Cache Directory Tagging](https://bford.info/cachedir/)
+  `CACHEDIR.TAG` beginning with the standard signature (every cargo
+  `target/` does), using the directory listing it already reads. One
+  semantic change: a `node_modules` inside such a directory, or anywhere
+  below it, is no longer crawled, so its packages are no longer scanned,
+  patched or attested. The scan root itself is always crawled, and a
+  `CACHEDIR.TAG` without the signature (or that is a directory or a
+  symlink) prunes nothing. On a Rust-plus-JS monorepo this skipped 57% of
+  the walked directories. See docs/ecosystems.md.
+
 - **`scan` sends up to 32 patch-API requests at once on the authenticated
   API, up from 8.** Each step sizes its window from the requests it has to
   make: a quarter of them, between 8 and 32 — the batch queries, the

@@ -250,6 +250,32 @@ impl Listing {
     }
 }
 
+/// The file a [Cache Directory Tagging](https://bford.info/cachedir/)
+/// cache directory carries, and the signature it must begin with.
+const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether `dir` (whose `listing` the walk already holds) is a tagged cache
+/// directory: its listing names a regular `CACHEDIR.TAG` that begins with
+/// the standard signature. Only a dir whose listing carries the name costs
+/// a read; the name alone is not enough (the specification asks readers to
+/// check the signature, so an unrelated file of that name prunes nothing).
+fn is_tagged_cache_dir(dir: &Path, listing: &Listing) -> bool {
+    let tagged = listing
+        .entries
+        .iter()
+        .any(|e| e.name_str == CACHEDIR_TAG && e.file_type.is_some_and(|t| t.is_file()));
+    if !tagged {
+        return false;
+    }
+    // FIFO-safe open (a FIFO planted under the name must not wedge the
+    // walk), and only the signature's bytes are read.
+    let mut head = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    crate::utils::fs::open_regular_file_sync(&dir.join(CACHEDIR_TAG))
+        .and_then(|(mut f, _)| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok_and(|()| head == CACHEDIR_TAG_SIGNATURE)
+}
+
 /// List `path` (empty when it cannot be read — the walks' long-standing
 /// tolerate-and-skip contract).
 fn list_dir_sync(path: &Path) -> Listing {
@@ -1155,6 +1181,12 @@ impl NpmCrawler {
         while !level.is_empty() {
             let visits: Vec<(Option<PathBuf>, Vec<PathBuf>)> = par_map(level, |full_path| {
                 let listing = list_dir_sync(&full_path);
+                // A tagged cache directory (a cargo `target/`, a tool's
+                // cache) is pruned whole: neither its `node_modules` nor
+                // anything below it is a workspace.
+                if is_tagged_cache_dir(&full_path, &listing) {
+                    return (None, Vec::new());
+                }
                 // Check if this subdirectory has its own node_modules
                 let node_modules = has_node_modules_dir(&full_path, &listing)
                     .then(|| full_path.join("node_modules"));
@@ -2807,5 +2839,82 @@ mod tests {
             .unwrap();
         let found = pool.install(|| NpmCrawler::find_local_node_modules_dirs(&root));
         assert_eq!(found, expected);
+    }
+
+    /// A directory carrying a signed `CACHEDIR.TAG` (a cargo `target/`, a
+    /// tool cache) is pruned from the workspace roots walk whole: its own
+    /// `node_modules` and every workspace below it. An untagged sibling,
+    /// the scan root itself, and a tag that is not a valid one (no
+    /// signature, a directory, a symlink) prune nothing.
+    #[tokio::test]
+    async fn test_workspace_walk_prunes_tagged_cache_dirs() {
+        const TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# a cache\n";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let nm = |rel: &str| {
+            let path = root.join(rel).join("node_modules");
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        // The scan root is tagged too: it is still scanned.
+        std::fs::write(root.join("CACHEDIR.TAG"), TAG).unwrap();
+        let root_nm = nm("");
+        let app = nm("apps/web");
+        // Pruned: the tagged dir's own node_modules and everything below.
+        nm("target");
+        nm("target/debug/deps/pkg");
+        std::fs::write(root.join("target/CACHEDIR.TAG"), TAG).unwrap();
+        nm("apps/web/cache");
+        nm("apps/web/cache/deep/ws");
+        std::fs::write(root.join("apps/web/cache/CACHEDIR.TAG"), TAG).unwrap();
+        // Not tags: kept.
+        let unsigned = nm("libs/unsigned");
+        std::fs::write(root.join("libs/unsigned/CACHEDIR.TAG"), b"not a tag\n").unwrap();
+        let short = nm("libs/short");
+        std::fs::write(root.join("libs/short/CACHEDIR.TAG"), &TAG[..10]).unwrap();
+        let as_dir = nm("libs/as-dir");
+        std::fs::create_dir_all(root.join("libs/as-dir/CACHEDIR.TAG")).unwrap();
+        #[cfg(unix)]
+        let linked = {
+            let linked = nm("libs/linked");
+            std::fs::write(root.join("real.tag"), TAG).unwrap();
+            std::os::unix::fs::symlink(
+                root.join("real.tag"),
+                root.join("libs/linked/CACHEDIR.TAG"),
+            )
+            .unwrap();
+            linked
+        };
+
+        let options = CrawlerOptions {
+            cwd: root.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        let mut found = NpmCrawler::new()
+            .get_node_modules_paths(&options)
+            .await
+            .unwrap();
+        found.sort();
+        let mut want = vec![root_nm, app, unsigned, short, as_dir];
+        #[cfg(unix)]
+        want.push(linked);
+        want.sort();
+        assert_eq!(found, want);
+
+        // Removing the tag un-prunes the directory.
+        std::fs::remove_file(root.join("target/CACHEDIR.TAG")).unwrap();
+        let found = NpmCrawler::new()
+            .get_node_modules_paths(&options)
+            .await
+            .unwrap();
+        assert!(
+            found.contains(&root.join("target/node_modules")),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&root.join("target/debug/deps/pkg/node_modules")),
+            "{found:?}"
+        );
     }
 }
