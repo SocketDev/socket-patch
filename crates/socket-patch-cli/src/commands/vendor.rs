@@ -32,8 +32,8 @@ use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
-    save_state, DeferredMiss, DeferredPackage, PackageSource, RevertOpts, RevertOutcome,
-    VendorEntry, VendorOutcome, VendorServiceConfig, VendorState, VendorWarning,
+    save_state, save_state_shared, DeferredMiss, DeferredPackage, PackageSource, RevertOpts,
+    RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -1025,8 +1025,12 @@ pub(crate) async fn persist_vendor_entry(
     detached: bool,
     record: &PatchRecord,
 ) -> bool {
+    let mut shared = std::sync::Arc::new(std::mem::take(state));
     let (has_errors, stale) =
-        record_vendor_entry(common, env, state, candidate, entry, detached, record).await;
+        record_vendor_entry(common, env, &mut shared, candidate, entry, detached, record).await;
+    // A group commit keeps its own reference to the ledger it captured, so
+    // this copies — once per save, as the by-value save always did.
+    *state = std::sync::Arc::try_unwrap(shared).unwrap_or_else(|held| (*held).clone());
     if let Some(stale) = stale {
         sweep_stale_artifact(common, env, state, stale).await;
     }
@@ -1049,7 +1053,7 @@ pub(crate) struct StaleArtifact {
 async fn record_vendor_entry(
     common: &GlobalArgs,
     env: &mut Envelope,
-    state: &mut VendorState,
+    state: &mut std::sync::Arc<VendorState>,
     candidate: &str,
     mut entry: VendorEntry,
     detached: bool,
@@ -1081,11 +1085,17 @@ async fn record_vendor_entry(
         vendor::carry_forward_wiring(prev, &mut entry);
     }
     let new_uuid = entry.uuid.clone();
-    state.entries.insert(candidate.clone(), entry);
     // Persist per-package so a crash mid-run leaves a ledger that matches
     // what's already wired (under a group commit this lands in the run's
-    // captured state, committed with the wiring it describes).
-    if let Err(e) = save_state(&common.cwd, state).await {
+    // captured state, committed with the wiring it describes — the group
+    // holds this very ledger, so the insert is made in place rather than
+    // on a per-package copy of the whole ledger).
+    let key = candidate.clone();
+    if let Err(e) = save_state_shared(&common.cwd, state, move |s| {
+        s.entries.insert(key, entry);
+    })
+    .await
+    {
         env.record(
             PatchEvent::new(PatchAction::Failed, candidate.clone())
                 .with_error("vendor_state_write_failed", e.to_string()),
@@ -1561,7 +1571,7 @@ pub(crate) async fn vendor_records_reusing(
     // first (and pushing its warnings into the envelope) only to fail the
     // run afterwards.
     let mut state = match ledger {
-        Ok(s) => s,
+        Ok(s) => std::sync::Arc::new(s),
         Err(e) => {
             env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
             report_state_unreadable(common, &e);
