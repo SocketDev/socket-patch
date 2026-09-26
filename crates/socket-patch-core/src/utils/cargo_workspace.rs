@@ -13,8 +13,11 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Table};
+
+use crate::vendor::parse_memo::ParseMemo;
 
 /// Upper bound on discovered manifests — a runaway glob (or a hostile tree)
 /// must not turn one scan into an unbounded walk.
@@ -24,6 +27,125 @@ const MAX_MANIFESTS: usize = 4096;
 /// in-root path dependencies of the project at `root`, sorted. Empty when
 /// `root/Cargo.toml` is absent or unparseable.
 pub fn member_manifests(root: &Path) -> Vec<String> {
+    let Some(facts) = read_manifest(&root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<(String, Arc<ManifestFacts>)> = Vec::new();
+
+    if let Some((members, exclude)) = &facts.workspace {
+        let excluded: BTreeSet<String> =
+            exclude.iter().flat_map(|p| expand_glob(root, p)).collect();
+        for pattern in members {
+            for dir in expand_glob(root, pattern) {
+                if !excluded.contains(&dir) {
+                    enqueue(root, dir, &mut dirs, &mut queue);
+                }
+            }
+        }
+    }
+    for dep_dir in &facts.path_deps {
+        if let Some(dir) = normalize_rel("", dep_dir) {
+            enqueue(root, dir, &mut dirs, &mut queue);
+        }
+    }
+    while let Some((dir, facts)) = queue.pop() {
+        for dep_dir in &facts.path_deps {
+            if let Some(dep) = normalize_rel(&dir, dep_dir) {
+                enqueue(root, dep, &mut dirs, &mut queue);
+            }
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| format!("{dir}/Cargo.toml"))
+        .collect()
+}
+
+/// What [`member_manifests`] reads out of one manifest: its `[workspace]`
+/// `members` and `exclude` patterns (when it has a `[workspace]` table)
+/// and its [`path_dependencies`].
+struct ManifestFacts {
+    workspace: Option<(Vec<String>, Vec<String>)>,
+    path_deps: Vec<String>,
+}
+
+impl ManifestFacts {
+    fn of(doc: &DocumentMut) -> Self {
+        let workspace = doc
+            .get("workspace")
+            .and_then(Item::as_table_like)
+            .map(|ws| {
+                let patterns = |key: &str| -> Vec<String> {
+                    ws.get(key)
+                        .and_then(Item::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                (patterns("members"), patterns("exclude"))
+            });
+        ManifestFacts {
+            workspace,
+            path_deps: path_dependencies(doc),
+        }
+    }
+}
+
+/// The manifests' facts, per manifest bytes. The vendored cargo backend
+/// asks for the members once per patched crate, and once a project is
+/// vendored every `[patch.crates-io]` path copy is a path dependency — so
+/// each ask re-parsed every vendored crate's manifest, O(P²) parses over a
+/// run. See [`ParseMemo`]: every manifest is still read on every ask, and
+/// bytes that moved are parsed afresh. Enough slots for a large workspace
+/// plus its vendored copies; beyond them the oldest slots are evicted.
+static FACTS_MEMO: ParseMemo<ManifestFacts, 512> = ParseMemo::new();
+
+fn read_manifest(path: &Path) -> Option<Arc<ManifestFacts>> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    FACTS_MEMO
+        .parse(text.as_bytes(), || {
+            text.parse::<DocumentMut>()
+                .map(|doc| ManifestFacts::of(&doc))
+        })
+        .ok()
+}
+
+/// The pre-memo [`member_manifests`] (a full parse of every manifest per
+/// call), kept as the equivalence oracle.
+#[cfg(test)]
+fn member_manifests_unmemoized(root: &Path) -> Vec<String> {
+    fn read_manifest(path: &Path) -> Option<DocumentMut> {
+        if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+            return None;
+        }
+        std::fs::read_to_string(path).ok()?.parse().ok()
+    }
+    fn enqueue(
+        root: &Path,
+        dir: String,
+        dirs: &mut BTreeSet<String>,
+        queue: &mut Vec<(String, DocumentMut)>,
+    ) {
+        if dir.is_empty()
+            || dirs.len() >= MAX_MANIFESTS
+            || dirs.contains(&dir)
+            || dir.split('/').any(|seg| seg == "target")
+            || !is_real_dir_path(root, &dir)
+        {
+            return;
+        }
+        let Some(doc) = read_manifest(&root.join(&dir).join("Cargo.toml")) else {
+            return;
+        };
+        dirs.insert(dir.clone());
+        queue.push((dir, doc));
+    }
     let Some(doc) = read_manifest(&root.join("Cargo.toml")) else {
         return Vec::new();
     };
@@ -70,13 +192,6 @@ pub fn member_manifests(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn read_manifest(path: &Path) -> Option<DocumentMut> {
-    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()?.parse().ok()
-}
-
 /// A directory that is not itself a symbolic link.
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
@@ -96,7 +211,7 @@ fn enqueue(
     root: &Path,
     dir: String,
     dirs: &mut BTreeSet<String>,
-    queue: &mut Vec<(String, DocumentMut)>,
+    queue: &mut Vec<(String, Arc<ManifestFacts>)>,
 ) {
     // `target` is cargo's build directory at every level: the glob walk
     // already skips it, and a literal `members = ["target/gen"]` or a path
@@ -111,11 +226,11 @@ fn enqueue(
     {
         return;
     }
-    let Some(doc) = read_manifest(&root.join(&dir).join("Cargo.toml")) else {
+    let Some(facts) = read_manifest(&root.join(&dir).join("Cargo.toml")) else {
         return;
     };
     dirs.insert(dir.clone());
-    queue.push((dir, doc));
+    queue.push((dir, facts));
 }
 
 /// Every `path = "…"` of a dependency declaration: the dependency tables
@@ -428,5 +543,70 @@ mod tests {
         assert!(wildcard_match(b"a?c", b"abc"));
         assert!(!wildcard_match(b"a?c", b"ac"));
         assert!(!wildcard_match(b"a*d", b"abc"));
+    }
+
+    /// V-7: the memoized member walk returns exactly what the per-call
+    /// parse returned — over workspaces with globs, excludes, nested path
+    /// dependencies, `[patch]` path copies, unparseable and missing
+    /// manifests — and a manifest rewritten between two calls is re-read
+    /// (the memo keys on its bytes).
+    #[test]
+    fn memoized_member_walk_matches_the_per_call_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let check = || {
+            assert_eq!(member_manifests(root), member_manifests_unmemoized(root));
+            // Twice: the second walk is the one the memo answers.
+            assert_eq!(member_manifests(root), member_manifests_unmemoized(root));
+        };
+        check();
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\", \"tools/**\"]\nexclude = [\"crates/x\"]\n\
+             [patch.crates-io]\nserde = { path = \".socket/vendor/cargo/u1/serde-1.0.0\" }\n\
+             [workspace.dependencies]\nshared = { path = \"libs/shared\" }\n",
+        );
+        write(
+            root,
+            "crates/a/Cargo.toml",
+            &format!("{}[dependencies.b]\npath = \"../b\"\n", pkg("a")),
+        );
+        write(root, "crates/b/Cargo.toml", &pkg("b"));
+        write(root, "crates/x/Cargo.toml", &pkg("x"));
+        write(root, "crates/bad/Cargo.toml", "not = [toml");
+        write(root, "tools/deep/t/Cargo.toml", &pkg("t"));
+        write(root, "libs/shared/Cargo.toml", &pkg("shared"));
+        write(
+            root,
+            ".socket/vendor/cargo/u1/serde-1.0.0/Cargo.toml",
+            &format!(
+                "{}[dependencies]\nderive = {{ path = \"../derive\" }}\n",
+                pkg("serde")
+            ),
+        );
+        write(
+            root,
+            ".socket/vendor/cargo/u1/derive/Cargo.toml",
+            &pkg("derive"),
+        );
+        check();
+        assert!(member_manifests(root)
+            .contains(&".socket/vendor/cargo/u1/derive/Cargo.toml".to_string()));
+        // Rewritten between two walks: the new path dependency is followed.
+        write(
+            root,
+            "crates/b/Cargo.toml",
+            &format!("{}[dependencies]\nz = {{ path = \"../../z\" }}\n", pkg("b")),
+        );
+        write(root, "z/Cargo.toml", &pkg("z"));
+        check();
+        assert!(member_manifests(root).contains(&"z/Cargo.toml".to_string()));
+        // The root turned unparseable, then back.
+        let good = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        write(root, "Cargo.toml", "[workspace\n");
+        check();
+        write(root, "Cargo.toml", &good);
+        check();
     }
 }
