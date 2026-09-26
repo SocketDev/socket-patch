@@ -253,8 +253,10 @@ static MANIFEST_MEMO: ParseMemo<toml_edit::DocumentMut> = ParseMemo::new();
 /// bytes: the residue check runs once per patched crate over the same
 /// manifests — and once a project is vendored, every `[patch.crates-io]`
 /// path copy is a member, so there are as many as there are vendored
-/// crates. Slots to match the member walk's own memo; beyond them the
-/// oldest are evicted.
+/// crates. Slots to match the member walk's own memo, with the same
+/// limit: beyond them the oldest-inserted slot is evicted, so a manifest
+/// set larger than the slots misses on every read of the fixed-order walk
+/// and costs the extraction plus the slot scan and bytes copy.
 static PIN_MEMO: ParseMemo<crate::patch::redirect::CargoRegistryPins, 512> = ParseMemo::new();
 
 async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str) -> Option<String> {

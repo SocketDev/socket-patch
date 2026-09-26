@@ -100,7 +100,11 @@ impl ManifestFacts {
 /// each ask re-parsed every vendored crate's manifest, O(P²) parses over a
 /// run. See [`ParseMemo`]: every manifest is still read on every ask, and
 /// bytes that moved are parsed afresh. Enough slots for a large workspace
-/// plus its vendored copies; beyond them the oldest slots are evicted.
+/// plus its vendored copies. Beyond them the oldest-inserted slot is
+/// evicted, and since every walk visits the manifests in the same order,
+/// a set larger than the slots misses on every read: each then pays the
+/// parse PLUS the slot scan and the bytes copy, slightly more than an
+/// unmemoized walk (answers stay correct either way).
 static FACTS_MEMO: ParseMemo<ManifestFacts, 512> = ParseMemo::new();
 
 fn read_manifest(path: &Path) -> Option<Arc<ManifestFacts>> {
