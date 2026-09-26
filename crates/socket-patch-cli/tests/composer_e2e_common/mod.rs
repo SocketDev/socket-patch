@@ -147,7 +147,9 @@ pub fn composer_major(suite: &str) -> Option<u32> {
 /// Run `composer <args>` in `cwd` with a PRIVATE home + cache (the host's
 /// composer state must neither leak in nor be polluted). The home's
 /// `config.json` disables `secure-http`: the hosted capstone's patch server
-/// is a plain-http loopback wiremock.
+/// is a plain-http loopback wiremock. Git runs with `core.autocrlf=false`:
+/// Git for Windows' system default converts a source install's checkout to
+/// CRLF, so its bytes would never equal the upstream archive's.
 pub fn composer(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output {
     std::fs::create_dir_all(home).unwrap();
     std::fs::create_dir_all(cache).unwrap();
@@ -163,6 +165,9 @@ pub fn composer(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output 
     super::cache_env::isolate(&mut cmd);
     cmd.env("COMPOSER_HOME", home)
         .env("COMPOSER_CACHE_DIR", cache)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_0", "false")
         .output()
         .expect("failed to run composer")
 }

@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
 
-use docker_vendor_common::{bash_prelude, stage_patch_fn};
+use docker_vendor_common::{bash_prelude, skip_or_require_image, stage_patch_fn};
 
 /// The docker images always have coreutils `sha256sum`; macOS dev hosts may
 /// only have perl `shasum`, so shim it for these local runs.
@@ -163,4 +163,14 @@ fn stage_patch_records_git_blob_sha256_and_stages_blob() {
 
     let blob = dir.path().join(".socket/blobs").join(git_sha256(after));
     assert_eq!(std::fs::read(&blob).unwrap(), after, "staged blob bytes");
+}
+
+/// A required docker suite fails on a missing image instead of skipping;
+/// an optional one skips.
+#[test]
+fn a_required_docker_suite_fails_on_a_missing_image() {
+    let image = "socket-patch-test-does-not-exist:never";
+    assert!(skip_or_require_image(image, false));
+    let required = std::panic::catch_unwind(|| skip_or_require_image(image, true));
+    assert!(required.is_err(), "a required suite must not skip");
 }
