@@ -52,18 +52,24 @@ use socket_patch_core::vex::HostedCopies;
 
 use crate::args::GlobalArgs;
 use crate::commands::vex_sources::HostedWiring;
-use crate::ecosystem_dispatch::{npm_paths_by_identity, partition_purls};
+use crate::ecosystem_dispatch::{
+    npm_paths_by_identity, npm_paths_by_identity_in, partition_purls, NpmCrawlSnapshot,
+};
 
 /// Resolve [`HostedCopies`] for every hosted-basis purl of `hosted` (see the
 /// module docs), under the same crawler options and `--ecosystems` scope as
 /// the installed-tree lookup. `installed` is that lookup's every-copy
 /// result ([`crate::ecosystem_dispatch::find_manifest_package_copies`] over
 /// the record view, which holds every hosted purl): the shared-location
-/// ecosystems read it instead of crawling the tree a second time.
+/// ecosystems read it instead of crawling the tree a second time. `prior`
+/// (embedded hosted `scan --vex` only) is scan's npm crawl of the same
+/// tree: the alias walk takes its `node_modules` roots and the identity
+/// fallback its packages instead of walking the tree again.
 pub(crate) async fn hosted_consumed_copies(
     common: &GlobalArgs,
     hosted: &BTreeMap<String, HostedWiring>,
     installed: &HashMap<String, Vec<PathBuf>>,
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, HostedCopies> {
     let mut out = HashMap::new();
     if hosted.is_empty() {
@@ -90,10 +96,17 @@ pub(crate) async fn hosted_consumed_copies(
             .filter_map(|purl| Some((purl.clone(), installed.get(purl)?.clone())))
             .collect();
         let mut aliases = match shared.get(&Ecosystem::Npm) {
-            Some(npm) => npm_alias_copies(&options, npm).await,
+            Some(npm) => npm_alias_copies_reusing(&options, npm, prior).await,
             None => HashMap::new(),
         };
-        npm_identity_fallback(shared.get(&Ecosystem::Npm), &options, &mut all, &aliases).await;
+        npm_identity_fallback_reusing(
+            shared.get(&Ecosystem::Npm),
+            &options,
+            &mut all,
+            &aliases,
+            prior,
+        )
+        .await;
         for purl in shared.values().flatten() {
             let mut paths = all.remove(purl).unwrap_or_default();
             paths.extend(aliases.remove(purl).unwrap_or_default());
@@ -158,9 +171,22 @@ const ALIAS_WALK_MAX_DIRS: usize = 200_000;
 /// traversed. A plain `--global` run is not walked: its roots come from
 /// spawning every package manager again, and the identity fallback covers
 /// an alias that is the only global copy.
+#[cfg(test)]
 async fn npm_alias_copies(
     options: &CrawlerOptions,
     purls: &[String],
+) -> HashMap<String, Vec<PathBuf>> {
+    npm_alias_copies_reusing(options, purls, None).await
+}
+
+/// [`npm_alias_copies`], taking the importer `node_modules` roots from
+/// `prior` when it was crawled with `options` (the same roots
+/// `NpmCrawler::get_node_modules_paths` returns) instead of walking the tree
+/// for them; the per-root BFS below is unchanged.
+async fn npm_alias_copies_reusing(
+    options: &CrawlerOptions,
+    purls: &[String],
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
     let wanted: HashMap<(String, String), &String> = purls
         .iter()
@@ -176,10 +202,13 @@ async fn npm_alias_copies(
     if options.global && options.global_prefix.is_none() {
         return out;
     }
-    let roots = NpmCrawler::new()
-        .get_node_modules_paths(options)
-        .await
-        .unwrap_or_default();
+    let roots = match prior.and_then(|p| p.roots_for(options)) {
+        Some(roots) => roots.to_vec(),
+        None => NpmCrawler::new()
+            .get_node_modules_paths(options)
+            .await
+            .unwrap_or_default(),
+    };
     let mut queue = std::collections::VecDeque::from(roots);
     let mut visited = 0usize;
     while let Some(nm) = queue.pop_front() {
@@ -251,11 +280,25 @@ async fn real_subdirs(dir: &Path) -> Vec<(PathBuf, String)> {
 /// hash-verified ("installed evidence wins"). Resolve every npm purl the
 /// targeted lookup missed by the installed `package.json` identity instead
 /// — the same fallback `vendor` uses before declaring a package missing.
+#[cfg(test)]
 async fn npm_identity_fallback(
     npm: Option<&Vec<String>>,
     options: &CrawlerOptions,
     all: &mut HashMap<String, Vec<PathBuf>>,
     aliases: &HashMap<String, Vec<PathBuf>>,
+) {
+    npm_identity_fallback_reusing(npm, options, all, aliases, None).await
+}
+
+/// [`npm_identity_fallback`], answering from `prior`'s crawled packages
+/// when it was crawled with `options` (the whole `NpmCrawler::crawl_all`
+/// output for them) instead of crawling again.
+async fn npm_identity_fallback_reusing(
+    npm: Option<&Vec<String>>,
+    options: &CrawlerOptions,
+    all: &mut HashMap<String, Vec<PathBuf>>,
+    aliases: &HashMap<String, Vec<PathBuf>>,
+    prior: Option<&NpmCrawlSnapshot>,
 ) {
     let missing: Vec<&String> = npm
         .into_iter()
@@ -264,7 +307,10 @@ async fn npm_identity_fallback(
             all.get(*purl).is_none_or(Vec::is_empty) && aliases.get(*purl).is_none_or(Vec::is_empty)
         })
         .collect();
-    all.extend(npm_paths_by_identity(options, &missing).await);
+    match prior.and_then(|p| p.packages_for(options)) {
+        Some(installed) => all.extend(npm_paths_by_identity_in(installed, &missing)),
+        None => all.extend(npm_paths_by_identity(options, &missing).await),
+    }
 }
 
 // ── golang ───────────────────────────────────────────────────────────────

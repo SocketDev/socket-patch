@@ -35,7 +35,7 @@ use crate::commands::vex_sources::{
     self, Plan, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED, VENDOR_UNWIRED,
     WIRING_CONFLICT,
 };
-use crate::ecosystem_dispatch::{collapse_to_first, find_manifest_package_copies};
+use crate::ecosystem_dispatch::{collapse_to_first, find_manifest_package_copies_reusing};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
 use crate::ui::plural;
 
@@ -182,6 +182,7 @@ impl VexEmbedArgs {
             // Embedded callers skip VEX entirely under `--dry-run`.
             dry_run: false,
             product_flag: "--vex-product",
+            npm_prior: None,
         }
     }
 }
@@ -215,6 +216,14 @@ pub(crate) struct VexBuildParams {
     /// The flag that carried `product`, named in the non-IRI advisory
     /// (`--product` standalone, `--vex-product` embedded).
     pub product_flag: &'static str,
+    /// Embedded hosted `scan --vex` only: scan's npm crawl of the same
+    /// tree earlier in this process. The installed-copy lookups take the
+    /// npm `node_modules` roots (and, for the identity fallback, the
+    /// crawled packages) from it instead of walking the tree again; each
+    /// root is still searched as before, so copy choice and order are
+    /// unchanged. Ignored when taken with other crawler options. The
+    /// standalone `vex` passes `None` and walks the tree.
+    pub npm_prior: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 }
 
 /// Successful result of [`generate_vex`].
@@ -333,6 +342,7 @@ pub async fn run(args: VexArgs) -> i32 {
         known_stale: Vec::new(),
         dry_run: args.common.dry_run,
         product_flag: "--product",
+        npm_prior: None,
     };
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -572,7 +582,9 @@ async fn generate_vex(
         let purls: Vec<String> = manifest.patches.keys().cloned().collect();
         // ONE installed-tree lookup: the first copy of every purl for the
         // record check, every copy of the hosted ones below.
-        let copies = find_manifest_package_copies(&purls, common, quiet).await;
+        let copies =
+            find_manifest_package_copies_reusing(&purls, common, quiet, params.npm_prior.as_ref())
+                .await;
         let package_paths = collapse_to_first(copies.clone());
         let go_patches = synthesize_go_patches(common, manifest, &plan.vendor_entries).await;
         // Hosted-basis purls are judged by the copies their build CONSUMES
@@ -580,9 +592,13 @@ async fn generate_vex(
         // maven's suffixed version; every copy where hosted and registry
         // bytes share a location) — never by a pristine sibling the
         // crawler's first match may be. See `vex_consumed`.
-        let hosted =
-            crate::commands::vex_consumed::hosted_consumed_copies(common, &plan.hosted, &copies)
-                .await;
+        let hosted = crate::commands::vex_consumed::hosted_consumed_copies(
+            common,
+            &plan.hosted,
+            &copies,
+            params.npm_prior.as_ref(),
+        )
+        .await;
         let vendor = VendorContext {
             project_root: common.cwd.clone(),
             entries: plan.vendor_entries.clone(),
@@ -1818,6 +1834,219 @@ mod tests {
                 assert_eq!(args.doc_id.as_deref(), Some("urn:uuid:fixed"));
                 assert!(args.compact);
             }
+        }
+    }
+}
+
+/// H3: embedded hosted `scan --vex` takes the npm roots and crawled
+/// packages from scan's crawl instead of walking the tree again; the VEX
+/// document is byte-identical (modulo its per-run timestamps) to the one
+/// the tree walk produces.
+#[cfg(test)]
+mod npm_prior_tests {
+    use super::*;
+    use socket_patch_core::crawlers::CrawlerOptions;
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
+    use socket_patch_core::patch::redirect::RedirectState;
+    use std::collections::HashMap;
+
+    const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn put(root: &Path, rel: &str, bytes: &[u8]) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn npm_pkg(root: &Path, dir: &str, name: &str, index: &[u8]) {
+        put(
+            root,
+            &format!("{dir}/package.json"),
+            format!(r#"{{ "name": "{name}", "version": "1.3.0" }}"#).as_bytes(),
+        );
+        put(root, &format!("{dir}/index.js"), index);
+    }
+
+    /// A hosted left-pad@1.3.0 redirect (ledger record + pinned
+    /// package-lock wiring) installed as a root copy, a nested copy, a
+    /// workspace member's alias (`packages/a/node_modules/lp`) and a member
+    /// copy found only by its identity (`apps/web/node_modules/@me/lp`).
+    fn fixture(root: &Path, patched: &[u8], alias: &[u8]) {
+        put(
+            root,
+            "package.json",
+            br#"{ "name": "app", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" } }"#,
+        );
+        npm_pkg(root, "node_modules/left-pad", "left-pad", patched);
+        npm_pkg(
+            root,
+            "node_modules/dep/node_modules/left-pad",
+            "left-pad",
+            patched,
+        );
+        npm_pkg(root, "packages/a/node_modules/lp", "left-pad", alias);
+        npm_pkg(root, "apps/web/node_modules/@me/lp", "left-pad", patched);
+        let url = format!(
+            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/{TOKEN}/{UUID}/left-pad-1.3.0.tgz"
+        );
+        put(
+            root,
+            "package-lock.json",
+            serde_json::json!({
+                "name": "app", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": url,
+                        "integrity": "sha512-UEFUQ0hFRHBhdGNoZWRQQVRDSEVEcGF0Y2hlZA==",
+                    },
+                },
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let record = PatchRecord {
+            uuid: UUID.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: HashMap::from([(
+                "package/index.js".to_string(),
+                PatchFileInfo {
+                    before_hash: "a".repeat(64),
+                    after_hash: compute_git_sha256_from_bytes(patched),
+                },
+            )]),
+            vulnerabilities: HashMap::from([(
+                "GHSA-rdir-1111".to_string(),
+                VulnerabilityInfo {
+                    cves: vec!["CVE-2024-1".to_string()],
+                    summary: "s".to_string(),
+                    severity: "high".to_string(),
+                    description: "d".to_string(),
+                },
+            )]),
+            description: "p".to_string(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        };
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), record);
+        put(
+            root,
+            ".socket/vendor/redirect-state.json",
+            serde_json::to_string_pretty(&state).unwrap().as_bytes(),
+        );
+    }
+
+    /// The document with its per-run timestamps blanked.
+    fn untimed(path: &Path) -> serde_json::Value {
+        fn strip(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if map.contains_key("timestamp") {
+                        map.insert("timestamp".into(), serde_json::Value::Null);
+                    }
+                    map.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        strip(&mut doc);
+        doc
+    }
+
+    async fn run(
+        common: &GlobalArgs,
+        out: &Path,
+        prior: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    ) -> (
+        serde_json::Value,
+        usize,
+        Vec<FailedPatch>,
+        serde_json::Value,
+    ) {
+        let params = VexBuildParams {
+            output: Some(out.to_path_buf()),
+            product: Some("pkg:npm/app@1.0.0".into()),
+            no_verify: false,
+            doc_id: Some("urn:uuid:00000000-0000-4000-8000-000000000000".into()),
+            compact: false,
+            assume_applied: Vec::new(),
+            known_stale: Vec::new(),
+            dry_run: false,
+            product_flag: "--vex-product",
+            npm_prior: prior,
+        };
+        let manifest_path = common.resolved_manifest_path();
+        match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
+            Ok(s) => (
+                untimed(out),
+                s.statements,
+                s.failed,
+                serde_json::to_value(&s.warnings).unwrap(),
+            ),
+            Err(e) => (
+                serde_json::json!({ "error": e.code }),
+                0,
+                Vec::new(),
+                serde_json::to_value(e.embedded_warnings()).unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_vex_from_the_crawl_snapshot_matches_the_tree_walk() {
+        let patched = &b"module.exports = 'patched'\n"[..];
+        let pristine = &b"module.exports = 'pristine'\n"[..];
+        for (label, alias, want_statements) in [
+            ("every copy patched", patched, 1),
+            ("stale alias", pristine, 0),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("proj");
+            fixture(&root, patched, alias);
+            let common = GlobalArgs {
+                cwd: root.clone(),
+                json: true,
+                no_telemetry: true,
+                ..GlobalArgs::default()
+            };
+            let options = CrawlerOptions {
+                cwd: root.clone(),
+                global: false,
+                global_prefix: None,
+            };
+            let (_, _, _, snapshot) =
+                crate::ecosystem_dispatch::crawl_ecosystems_with_npm(&options, None).await;
+            let snapshot = snapshot.expect("npm crawled");
+
+            let walked = run(&common, &tmp.path().join("walked.json"), None).await;
+            let reused = run(
+                &common,
+                &tmp.path().join("reused.json"),
+                Some(snapshot.clone()),
+            )
+            .await;
+            assert_eq!(walked, reused, "{label}");
+            assert_eq!(walked.1, want_statements, "{label}: {:?}", walked);
+
+            // A snapshot taken with other crawler options is ignored.
+            let other = CrawlerOptions {
+                cwd: tmp.path().to_path_buf(),
+                global: false,
+                global_prefix: None,
+            };
+            let (_, _, _, foreign) =
+                crate::ecosystem_dispatch::crawl_ecosystems_with_npm(&other, None).await;
+            let ignored = run(&common, &tmp.path().join("ignored.json"), foreign).await;
+            assert_eq!(walked, ignored, "{label} (foreign snapshot)");
         }
     }
 }

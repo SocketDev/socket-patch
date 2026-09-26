@@ -506,6 +506,13 @@ impl NpmCrawlSnapshot {
     pub(crate) fn packages_for(&self, options: &CrawlerOptions) -> Option<&[CrawledPackage]> {
         self.taken_with(options).then_some(self.packages.as_slice())
     }
+
+    /// The `node_modules` roots the crawl walked — exactly what
+    /// `NpmCrawler::get_node_modules_paths` returns for the same options and
+    /// tree — when crawled with exactly `options`.
+    pub(crate) fn roots_for(&self, options: &CrawlerOptions) -> Option<&[PathBuf]> {
+        self.taken_with(options).then_some(self.roots.as_slice())
+    }
 }
 
 /// [`NpmCrawler`] for [`dispatch_find`], answering its root discovery from
@@ -608,13 +615,37 @@ pub async fn find_manifest_package_copies(
     common: &GlobalArgs,
     quiet: bool,
 ) -> HashMap<String, Vec<PathBuf>> {
+    find_manifest_package_copies_reusing(purls, common, quiet, None).await
+}
+
+/// [`find_manifest_package_copies`], taking the npm `node_modules` roots
+/// from `prior` (a crawl of the same options earlier in this process, over
+/// a tree whose directories nothing has touched since) instead of walking
+/// the tree for them again — the every-copy twin of
+/// [`find_packages_for_rollback_reusing`]. Only the root discovery is
+/// reused: each root is still searched by `find_by_purls`, so copy choice
+/// and order are unchanged. A snapshot taken with other options is ignored.
+pub async fn find_manifest_package_copies_reusing(
+    purls: &[String],
+    common: &GlobalArgs,
+    quiet: bool,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashMap<String, Vec<PathBuf>> {
     let partitioned = partition_purls(purls, common.ecosystems.as_deref());
     let crawler_options = CrawlerOptions {
         cwd: common.cwd.clone(),
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    find_all_packages_for_rollback(&partitioned, &crawler_options, quiet).await
+    let npm_roots = prior.and_then(|p| p.roots_for(&crawler_options));
+    dispatch_find(
+        &partitioned,
+        &crawler_options,
+        quiet,
+        merge_qualified,
+        npm_roots,
+    )
+    .await
 }
 
 /// Box the future `make` returns, constructing it inside this (non-async)

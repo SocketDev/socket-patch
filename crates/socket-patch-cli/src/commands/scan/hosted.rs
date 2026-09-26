@@ -1059,6 +1059,10 @@ pub(super) async fn run_redirect(
     // Scan's pending telemetry, flushed by `discover_selected` before
     // anything below writes to stdout.
     telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
+    // Scan's npm crawl (`Some` only when an embedded `--vex` will run),
+    // handed to the VEX step so it does not walk the tree for the npm
+    // roots again.
+    npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
     let selected = match discover_selected(
@@ -1104,6 +1108,7 @@ pub(super) async fn run_redirect(
         api_client,
         &pairs,
         scan_result,
+        npm_prior,
     )
     .await
 }
@@ -1201,6 +1206,7 @@ pub(crate) async fn run_redirect_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[(String, String)],
     mut scan_result: Option<serde_json::Value>,
+    npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
@@ -3030,6 +3036,11 @@ pub(crate) async fn run_redirect_selected(
     let mut vex_code = 0;
     if vex.vex.is_some() && !common.dry_run {
         let mut params = vex.to_build_params();
+        // Hosted mode wrote only lockfiles and config files since scan's
+        // crawl, never a directory the npm root walk descends into, so its
+        // roots and packages still describe the tree (the snapshot checks
+        // it was taken with these crawler options).
+        params.npm_prior = npm_prior.cloned();
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
@@ -3573,6 +3584,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
     api_client: &'a socket_patch_core::api::client::ApiClient,
     selected: &'a [(String, String)],
     scan_result: Option<serde_json::Value>,
+    npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_redirect_selected(
         common,
@@ -3581,6 +3593,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         api_client,
         selected,
         scan_result,
+        npm_prior,
     ))
 }
 
