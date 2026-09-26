@@ -32,7 +32,7 @@ use super::get::{download_and_apply_patches_with, select_patches, DownloadParams
 
 mod discovery;
 mod gc;
-mod hosted;
+pub(crate) mod hosted;
 pub(crate) mod render;
 pub(crate) mod vendor_flow;
 

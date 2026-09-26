@@ -8,6 +8,7 @@
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
+pub mod hosted_memory;
 pub mod json_envelope;
 pub mod path_scope;
 pub mod ui;
@@ -108,6 +109,12 @@ pub enum Commands {
         override_usage = "socket-patch --update [VERSION] [OPTIONS]"
     )]
     SelfUpdate(commands::update::UpdateArgs),
+
+    // Internal parity/debug harness for the in-memory hosted engine: reads a
+    // JSON file bundle on stdin, prints the engine result. Hidden and
+    // documented as internal in CLI_CONTRACT.md (no stability guarantee).
+    #[command(hide = true, name = "hosted-bundle")]
+    HostedBundle(commands::hosted_bundle::HostedBundleArgs),
 }
 
 impl Commands {
@@ -127,6 +134,7 @@ impl Commands {
             Commands::Remove(a) => &a.common,
             Commands::Repair(a) => &a.common,
             Commands::SelfUpdate(a) => &a.common,
+            Commands::HostedBundle(a) => &a.common,
         }
     }
 }

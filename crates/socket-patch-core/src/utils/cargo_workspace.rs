@@ -12,9 +12,11 @@
 //! Cargo.lock dependents check refuses a crate one of them depends on.
 
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use toml_edit::{DocumentMut, Item, Table};
+
+use crate::vendor::lock_inventory::view::{MemoryProject, ProjectView};
 
 /// Upper bound on discovered manifests — a runaway glob (or a hostile tree)
 /// must not turn one scan into an unbounded walk.
@@ -24,7 +26,87 @@ const MAX_MANIFESTS: usize = 4096;
 /// in-root path dependencies of the project at `root`, sorted. Empty when
 /// `root/Cargo.toml` is absent or unparseable.
 pub fn member_manifests(root: &Path) -> Vec<String> {
-    let Some(doc) = read_manifest(&root.join("Cargo.toml")) else {
+    member_manifests_with(&DiskTree(root))
+}
+
+/// [`member_manifests`] over a [`ProjectView`]: the in-memory variant
+/// reads the manifests the host supplied and expands member globs against
+/// the supplied paths (a directory exists when some supplied path lives
+/// under it; symbolic links are never directories).
+pub fn member_manifests_in(view: &ProjectView<'_>) -> Vec<String> {
+    match view {
+        ProjectView::Disk(root) => member_manifests(root),
+        ProjectView::Memory(project) => member_manifests_with(&MemoryTree(project)),
+    }
+}
+
+/// The three filesystem questions the member walk asks, keyed by
+/// `/`-separated root-relative paths (`""` is the root).
+trait Tree {
+    /// A regular (non-symlink) manifest file, parsed.
+    fn read_manifest(&self, rel: &str) -> Option<DocumentMut>;
+    /// A real directory (not a symbolic link).
+    fn is_real_dir(&self, rel: &str) -> bool;
+    /// The real sub-directory names of `rel`, or `None` when unreadable.
+    fn child_dirs(&self, rel: &str) -> Option<Vec<String>>;
+}
+
+struct DiskTree<'a>(&'a Path);
+
+impl Tree for DiskTree<'_> {
+    fn read_manifest(&self, rel: &str) -> Option<DocumentMut> {
+        read_manifest(&self.0.join(rel))
+    }
+
+    fn is_real_dir(&self, rel: &str) -> bool {
+        is_real_dir(&self.0.join(rel))
+    }
+
+    fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
+        let entries = std::fs::read_dir(self.0.join(rel)).ok()?;
+        Some(
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect(),
+        )
+    }
+}
+
+struct MemoryTree<'a>(&'a MemoryProject);
+
+impl Tree for MemoryTree<'_> {
+    fn read_manifest(&self, rel: &str) -> Option<DocumentMut> {
+        self.0.text(rel)?.parse().ok()
+    }
+
+    fn is_real_dir(&self, rel: &str) -> bool {
+        self.0.is_dir(rel)
+    }
+
+    fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
+        self.0.is_dir(rel).then(|| {
+            self.0
+                .children(rel)
+                .into_iter()
+                .filter(|(_, is_dir)| *is_dir)
+                .map(|(name, _)| name)
+                .collect()
+        })
+    }
+}
+
+fn join_rel(base: &str, seg: &str) -> String {
+    if base.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{base}/{seg}")
+    }
+}
+
+fn member_manifests_with(tree: &dyn Tree) -> Vec<String> {
+    let Some(doc) = tree.read_manifest("Cargo.toml") else {
         return Vec::new();
     };
     let mut dirs: BTreeSet<String> = BTreeSet::new();
@@ -43,25 +125,25 @@ pub fn member_manifests(root: &Path) -> Vec<String> {
         };
         let excluded: BTreeSet<String> = patterns("exclude")
             .iter()
-            .flat_map(|p| expand_glob(root, p))
+            .flat_map(|p| expand_glob(tree, p))
             .collect();
         for pattern in patterns("members") {
-            for dir in expand_glob(root, &pattern) {
+            for dir in expand_glob(tree, &pattern) {
                 if !excluded.contains(&dir) {
-                    enqueue(root, dir, &mut dirs, &mut queue);
+                    enqueue(tree, dir, &mut dirs, &mut queue);
                 }
             }
         }
     }
     for dep_dir in path_dependencies(&doc) {
         if let Some(dir) = normalize_rel("", &dep_dir) {
-            enqueue(root, dir, &mut dirs, &mut queue);
+            enqueue(tree, dir, &mut dirs, &mut queue);
         }
     }
     while let Some((dir, doc)) = queue.pop() {
         for dep_dir in path_dependencies(&doc) {
             if let Some(dep) = normalize_rel(&dir, &dep_dir) {
-                enqueue(root, dep, &mut dirs, &mut queue);
+                enqueue(tree, dep, &mut dirs, &mut queue);
             }
         }
     }
@@ -83,17 +165,17 @@ fn is_real_dir(path: &Path) -> bool {
 }
 
 /// Every component of repo-relative `dir` is a real directory under
-/// `root` — none is a symbolic link (which may lead outside the root).
-fn is_real_dir_path(root: &Path, dir: &str) -> bool {
-    let mut at = root.to_path_buf();
+/// the root — none is a symbolic link (which may lead outside the root).
+fn is_real_dir_path(tree: &dyn Tree, dir: &str) -> bool {
+    let mut at = String::new();
     dir.split('/').all(|seg| {
-        at.push(seg);
-        is_real_dir(&at)
+        at = join_rel(&at, seg);
+        tree.is_real_dir(&at)
     })
 }
 
 fn enqueue(
-    root: &Path,
+    tree: &dyn Tree,
     dir: String,
     dirs: &mut BTreeSet<String>,
     queue: &mut Vec<(String, DocumentMut)>,
@@ -107,11 +189,11 @@ fn enqueue(
         || dirs.len() >= MAX_MANIFESTS
         || dirs.contains(&dir)
         || dir.split('/').any(|seg| seg == "target")
-        || !is_real_dir_path(root, &dir)
+        || !is_real_dir_path(tree, &dir)
     {
         return;
     }
-    let Some(doc) = read_manifest(&root.join(&dir).join("Cargo.toml")) else {
+    let Some(doc) = tree.read_manifest(&format!("{dir}/Cargo.toml")) else {
         return;
     };
     dirs.insert(dir.clone());
@@ -191,53 +273,51 @@ pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
 
 /// Expand a cargo `members` / `exclude` glob (`*`, `?`, `**`) to the
 /// repo-relative directories it names.
-fn expand_glob(root: &Path, pattern: &str) -> Vec<String> {
+fn expand_glob(tree: &dyn Tree, pattern: &str) -> Vec<String> {
     let Some(normalized) = normalize_rel("", pattern.trim_end_matches('/')) else {
         return Vec::new();
     };
     let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
     let mut out = Vec::new();
-    expand_from(root, PathBuf::new(), &segments, &mut out);
+    expand_from(tree, String::new(), &segments, &mut out);
     out.sort();
     out.dedup();
     out
 }
 
-fn expand_from(root: &Path, at: PathBuf, rest: &[&str], out: &mut Vec<String>) {
+fn expand_from(tree: &dyn Tree, at: String, rest: &[&str], out: &mut Vec<String>) {
     if out.len() >= MAX_MANIFESTS {
         return;
     }
     let Some((seg, tail)) = rest.split_first() else {
-        out.push(at.to_string_lossy().replace('\\', "/"));
+        out.push(at);
         return;
     };
     if !seg.contains(['*', '?']) {
-        let next = at.join(seg);
-        if is_real_dir(&root.join(&next)) {
-            expand_from(root, next, tail, out);
+        let next = join_rel(&at, seg);
+        if tree.is_real_dir(&next) {
+            expand_from(tree, next, tail, out);
         }
         return;
     }
-    let Ok(entries) = std::fs::read_dir(root.join(&at)) else {
+    let Some(entries) = tree.child_dirs(&at) else {
         return;
     };
     let mut children: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .into_iter()
         .filter(|name| !name.starts_with('.') && name != "target")
         .collect();
     children.sort();
     if *seg == "**" {
-        expand_from(root, at.clone(), tail, out);
+        expand_from(tree, at.clone(), tail, out);
         for child in children {
-            expand_from(root, at.join(child), rest, out);
+            expand_from(tree, join_rel(&at, &child), rest, out);
         }
         return;
     }
     for child in children {
         if wildcard_match(seg.as_bytes(), child.as_bytes()) {
-            expand_from(root, at.join(child), tail, out);
+            expand_from(tree, join_rel(&at, &child), tail, out);
         }
     }
 }

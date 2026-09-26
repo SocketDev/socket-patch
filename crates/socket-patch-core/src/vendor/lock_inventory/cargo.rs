@@ -1,10 +1,12 @@
 //! `Cargo.lock`: the registry view.
 
+#[cfg(test)]
 use std::path::Path;
 
 use crate::utils::digest::is_hex;
 use crate::utils::purl::simple_purl;
 
+use super::view::ProjectView;
 use super::{dedup_prefer_integrity, LockIntegrity, LockfileEntry, SourceKind};
 
 // ── registry view ──
@@ -22,18 +24,32 @@ use super::{dedup_prefer_integrity, LockIntegrity, LockfileEntry, SourceKind};
 /// verifier (its checksum pins a tagged version no registry serves under
 /// the purl's version). A lock that is not TOML yields nothing — cargo
 /// itself refuses to build from it.
+#[cfg(test)]
 pub(super) async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    inventory_cargo_lock_raw(project_root)
+    inventory_cargo_lock_in(&ProjectView::Disk(project_root)).await
+}
+
+/// [`inventory_cargo_lock`] over a [`ProjectView`].
+pub(super) async fn inventory_cargo_lock_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    inventory_cargo_lock_raw_in(view)
         .await
         .map(dedup_prefer_integrity)
 }
 
 /// [`inventory_cargo_lock`] before its collapse: every instance
 /// ([`super::inventory_project_every_lock`]).
-pub(super) async fn inventory_cargo_lock_raw(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let (_, doc, _) = crate::vendor::cargo_lock::read_lock(project_root)
-        .await
-        .ok()?;
+pub(super) async fn inventory_cargo_lock_raw_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
+    let doc: toml_edit::DocumentMut = match view {
+        ProjectView::Disk(project_root) => {
+            crate::vendor::cargo_lock::read_lock(project_root)
+                .await
+                .ok()?
+                .1
+        }
+        ProjectView::Memory(_) => view.read_text("Cargo.lock").await.ok()?.parse().ok()?,
+    };
     let mut out = Vec::new();
     for pkg in crate::vendor::cargo_lock::locked_packages(&doc) {
         let Some(source) = pkg.source else {
