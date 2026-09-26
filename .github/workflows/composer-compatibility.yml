@@ -1,0 +1,200 @@
+name: Composer patch compatibility
+
+# Exact Composer releases on ubuntu, windows and macOS through the real
+# vendored (`e2e_vendor_composer_build`) and hosted
+# (`e2e_redirect_composer_build`) capstones, each ending in the
+# manifest-less VEX step, plus the hermetic `composer::` VEX cells.
+#
+# Release boundaries: 1.10.28 = Composer 1 (inline-repository fixture,
+# packagist dropped Composer 1 metadata); 2.0.14 / 2.1.14 = the 2.x lines
+# whose path mirror still drops `.gitignore`d files; 2.2.30 = LTS;
+# 2.5.8 / 2.8.12 = mid 2.x; 2.9.8 = the last release whose dist failure
+# falls back to `source`, so the hosted redirect's source drop is load
+# bearing there; 2.10.3 = current, no fallback.
+#
+# PHP: Composer 1 never on 8.5 (broken there). No 7.4 cell: the psr/log
+# 3.0.2 capstones need PHP >= 8.0; the depscan harness covers 7.4.
+#
+# Each leg runs one checksum-pinned composer.phar through `php` (the
+# capstones' SOCKET_PATCH_COMPOSER_PHAR mode), which is also what makes
+# Windows work: `Command::new("composer")` cannot resolve `composer.bat`.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/composer-compatibility.yml'
+      - 'tests/docker/Dockerfile.composer'
+      - 'crates/socket-patch-core/src/vendor/composer_lock.rs'
+      - 'crates/socket-patch-core/src/vendor/composer_lock/**'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/composer.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
+      - 'crates/socket-patch-core/src/crawlers/composer_crawler.rs'
+      - 'crates/socket-patch-core/src/utils/composer*.rs'
+      - 'crates/socket-patch-core/src/utils/purl.rs'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vendor*'
+      - 'crates/socket-patch-cli/src/commands/composer_hints.rs'
+      - 'crates/socket-patch-cli/src/commands/scan/**'
+      - 'crates/socket-patch-cli/src/commands/vex*.rs'
+      - 'crates/socket-patch-cli/tests/e2e_*composer*.rs'
+      - 'crates/socket-patch-cli/tests/docker_e2e_vendor_composer.rs'
+      - 'crates/socket-patch-cli/tests/composer_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/docker_vendor_common/**'
+      - 'crates/socket-patch-cli/tests/e2e_vex_lockfile/composer.rs'
+      - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: composer-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOCKET_NO_CONFIG: '1'
+  SOCKET_NO_UPDATE_CHECK: '1'
+
+jobs:
+  native:
+    name: composer ${{ matrix.composer }} / php ${{ matrix.php }} / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: ubuntu-latest, composer: '2.0.14', php: '8.0', sha256: 29454b41558968ca634bf5e2d4d07ff2275d91b637a76d7a05e6747d36dd3473}
+          - {os: ubuntu-latest, composer: '2.1.14', php: '8.1', sha256: d44a904520f9aaa766e8b4b05d2d9a766ad9a6f03fa1a48518224aad703061a4}
+          - {os: ubuntu-latest, composer: '2.2.30', php: '8.1', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
+          - {os: ubuntu-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
+          - {os: ubuntu-latest, composer: '2.5.8', php: '8.2', sha256: f07934fad44f9048c0dc875a506cca31cc2794d6aebfc1867f3b1fbf48dce2c5}
+          - {os: ubuntu-latest, composer: '2.8.12', php: '8.4', sha256: f446ea719708bb85fcbf4ef18def5d0515f1f9b4d703f6d820c9c1656e10a2f2}
+          - {os: ubuntu-latest, composer: '2.9.8', php: '8.4', sha256: 59b2c50e10cafa0d8efc19ede9a326d782f096c674a26baf98cf042ce23de890}
+          - {os: ubuntu-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
+          - {os: windows-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: windows-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
+          - {os: windows-latest, composer: '2.9.8', php: '8.4', sha256: 59b2c50e10cafa0d8efc19ede9a326d782f096c674a26baf98cf042ce23de890}
+          - {os: windows-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
+          - {os: macos-latest, composer: '1.10.28', php: '8.1', sha256: 0915af36eb01e3f0e16cd309adff7051832b9ef014e38371756804b20425cd5a}
+          - {os: macos-latest, composer: '2.2.30', php: '8.3', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
+          - {os: macos-latest, composer: '2.10.3', php: '8.5', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: composer-compat
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: none
+          extensions: zip, mbstring, curl, openssl
+          ini-values: memory_limit=-1
+          coverage: none
+      - name: Download and verify composer ${{ matrix.composer }}
+        shell: bash
+        env:
+          COMPOSER_RELEASE: ${{ matrix.composer }}
+          COMPOSER_PHAR_SHA256: ${{ matrix.sha256 }}
+        # The pinned digest is the contract; the published .sha256sum is a
+        # second, independent check. php computes the digest so the step
+        # needs no sha256sum/shasum on any runner image.
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP"
+          if command -v cygpath >/dev/null 2>&1; then
+            dir="$(cygpath -m "$RUNNER_TEMP")"
+          fi
+          phar="$dir/composer-$COMPOSER_RELEASE.phar"
+          base="https://getcomposer.org/download/$COMPOSER_RELEASE/composer.phar"
+          curl -fsSL --retry 3 -o "$phar" "$base"
+          published="$(curl -fsSL --retry 3 "$base.sha256sum" | cut -d' ' -f1)"
+          # shellcheck disable=SC2016 # $argv is PHP, not shell
+          actual="$(php -r 'echo hash_file("sha256", $argv[1]);' "$phar")"
+          if [ "$actual" != "$COMPOSER_PHAR_SHA256" ] || [ "$actual" != "$published" ]; then
+            echo "::error::composer $COMPOSER_RELEASE phar sha256 $actual (pinned $COMPOSER_PHAR_SHA256, published $published)"
+            exit 1
+          fi
+          reported="$(php "$phar" --version --no-ansi)"
+          echo "$reported"
+          case "$reported" in
+            *"Composer version $COMPOSER_RELEASE "*) ;;
+            *) echo "::error::expected composer $COMPOSER_RELEASE"; exit 1 ;;
+          esac
+          echo "SOCKET_PATCH_COMPOSER_PHAR=$phar" >> "$GITHUB_ENV"
+      - name: Real-composer vendored + hosted flows with manifest-less VEX
+        shell: bash
+        env:
+          SOCKET_PATCH_COMPOSER_E2E_REQUIRED: '1'
+          SOCKET_PATCH_COMPOSER_E2E_VERSION: ${{ matrix.composer }}
+        # The build capstones are `#[ignore]`-gated (the unpinned `test` job
+        # skips them). The hermetic `composer::` VEX cells are a module of
+        # the shared `e2e_vex_lockfile` binary; their filter goes in a second
+        # command so it does not also filter the build suites.
+        run: |
+          cargo test -p socket-patch-cli --no-fail-fast \
+            --test e2e_vendor_composer_build --test e2e_redirect_composer_build \
+            -- --ignored --nocapture
+          cargo test -p socket-patch-cli --test e2e_vex_lockfile -- composer:: --nocapture
+
+  docker:
+    # The vendored Docker capstone against an exact composer image. Its
+    # fixture resolves psr/log from packagist, which no longer serves
+    # Composer 1, so 1.10.28 is covered by the native legs only.
+    name: docker composer ${{ matrix.composer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {composer: '2.2.30', sha256: 8c2b4478b64f8f7cdf1574838fdb0033b29049ca821dad452db7a3dcfcdbffc2}
+          - {composer: '2.10.3', sha256: 7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # `driver: docker` so the composer image's
+        # `FROM socket-patch-test-base:latest` resolves against the host
+        # daemon (as in ci.yml's e2e-docker job).
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker
+
+      - name: Install Rust
+        run: rustup show
+
+      # No `actions/cache`: this job builds Docker images (zizmor
+      # cache-poisoning audit), as in ci.yml's e2e-docker job.
+
+      - name: Build base image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.base
+          tags: socket-patch-test-base:latest
+          load: true
+
+      - name: Build composer ${{ matrix.composer }} image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.composer
+          build-args: |
+            COMPOSER_VERSION=${{ matrix.composer }}
+            COMPOSER_SHA256=${{ matrix.sha256 }}
+          tags: socket-patch-test-composer:latest
+          load: true
+
+      - name: Run the vendored composer Docker capstone
+        run: cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_vendor_composer

@@ -1,0 +1,7 @@
+{
+    "name": "socket/composer-vendored-fixture",
+    "require": {},
+    "require-dev": {
+        "acme/tooling": "dev-main"
+    }
+}

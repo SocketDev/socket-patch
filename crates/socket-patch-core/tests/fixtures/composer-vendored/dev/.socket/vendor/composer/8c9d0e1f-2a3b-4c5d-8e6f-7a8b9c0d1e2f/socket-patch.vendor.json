@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "purl": "pkg:composer/acme/tooling@dev-main",
+  "patchUuid": "8c9d0e1f-2a3b-4c5d-8e6f-7a8b9c0d1e2f",
+  "ecosystem": "composer",
+  "vulnerabilities": [],
+  "vendoredAt": "2026-09-26T00:00:00Z"
+}

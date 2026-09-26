@@ -1,0 +1,6 @@
+{
+    "name": "socket/composer-vendored-fixture",
+    "require": {
+        "symfony/deprecation-contracts": "v3.5.1"
+    }
+}

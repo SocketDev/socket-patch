@@ -1,12 +1,13 @@
 //! Composer vendor backend: lock-only `dist` surgery pointing at a committed
 //! patched copy.
 //!
-//! Spike-verified mechanism (composer 2.10 — `spikes/PHASE0-FINDINGS.txt`):
+//! Mechanism (verified against real Composer 1.10 through 2.10 — see
+//! `docs/testing/composer-compatibility.md`):
 //! edit ONLY `composer.lock`. `composer.json` is never touched, and the lock's
 //! `content-hash` covers composer.json alone, so the surgery triggers no
 //! "lock file out of date" warning. The package's lock entry is rewritten to:
 //!
-//! * `dist` → `{"type": "path", "url": "<rel copy dir>", "reference": null}`
+//! * `dist` → `{"type": "path", "url": "<rel copy dir>", "reference": "<patch-uuid>"}`
 //!   (replaced IN ITS ORIGINAL SLOT so the entry's key order is stable);
 //! * `source` REMOVED entirely — left in place, `--prefer-source` could
 //!   git-clone the unpatched upstream; with it removed the spike confirmed
@@ -14,14 +15,18 @@
 //! * `"transport-options": {"symlink": false}` inserted right after `dist` —
 //!   LOAD-BEARING: composer's default path-repo strategy symlinks, and a
 //!   symlink into `.socket/vendor/` would defeat the real-copy guarantee.
-//!   `symlink: false` forces the 'Mirroring' (copy) strategy.
+//!   `symlink: false` forces the 'Mirroring' (copy) strategy, whose file
+//!   finder skips whatever the copy's `.gitignore` / `.hgignore` /
+//!   `.gitattributes` `export-ignore` rules match — so those rules are
+//!   neutralized in the copy first (`mirror_filters`).
 //!
 //! Lock names are matched CASE-INSENSITIVELY (locks are normally lowercase,
 //! but hand-written mixed-case locks exist and install fine) while the dist
 //! URL we write always uses the lowercase canonical `<vendor>/<name>` — the
-//! casing of the directory this backend creates. Versions are matched through
-//! the leading-`v` normalization (locks carry the pretty `v6.4.1`, PURLs the
-//! bare `6.4.1`) but the lock's own `version` string is never rewritten.
+//! casing of the directory this backend creates. Versions are matched by
+//! composer release identity (locks carry the pretty `v6.4.1` / `3.0.2`, a
+//! patch purl the bare `6.4.1` or padded `3.0.2.0`) but the lock's own
+//! `version` string is never rewritten.
 //!
 //! Serialization mirrors composer's own writer: 4-space indent
 //! (`JSON_PRETTY_PRINT`) + trailing newline; serde_json does not escape `/`
@@ -33,11 +38,11 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use crate::constants::SOCKET_DIR;
-use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
@@ -55,6 +60,8 @@ use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+
+mod mirror_filters;
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
@@ -166,8 +173,12 @@ pub async fn vendor_composer(
     // verbatim pre-vendor original, and re-recording here would clobber it.
     if entry_is_wired(&lock[section][idx], &copy_rel) {
         if copy_matches_after_hashes(&copy_dir, &record.files).await {
+            let mut warnings = Vec::new();
+            if !dry_run {
+                mirror_filters::heal_or_warn(&copy_dir, record, &pkg, &mut warnings).await;
+            }
             let result = already_patched_result(purl, &copy_dir, &record.files);
-            return done(result, None, Vec::new());
+            return done(result, None, warnings);
         }
         // Wired but the committed copy is missing/stale: rebuild the
         // ARTIFACT only. The lock is already correct and the first run's
@@ -214,6 +225,7 @@ pub async fn vendor_composer(
                     }
                 }
             };
+            mirror_filters::heal_or_warn(&copy_dir, record, &pkg, &mut warnings).await;
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
                 format!(
@@ -280,6 +292,13 @@ pub async fn vendor_composer(
                 }
             }
         };
+    if let Err(detail) =
+        mirror_filters::neutralize_or_conflict(&copy_dir, record, &pkg, &mut warnings).await
+    {
+        let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_dirs(&copy_dir).await;
+        return refused("vendor_composer_mirror_filter_conflict", detail);
+    }
 
     // ── lock rewrite ─────────────────────────────────────────────────────
     let original_entry = lock[section][idx].clone();
@@ -738,15 +757,15 @@ async fn composer_service_copy(
 }
 
 /// Locate the package's entry: `packages[]` first, then `packages-dev[]`.
-/// Names are compared case-insensitively, versions through the `v`-prefix
-/// normalization (see module doc).
+/// Names are compared case-insensitively, versions by composer release
+/// identity (see module doc).
 fn find_lock_entry(lock: &Value, pkg_lc: &str, version: &str) -> Option<(&'static str, usize)> {
     composer_lock_packages(lock)
         .into_iter()
         .find(|p| {
             p.name.is_some_and(|n| n.eq_ignore_ascii_case(pkg_lc))
                 && p.version
-                    .is_some_and(|v| normalize_version(v) == normalize_version(version))
+                    .is_some_and(|v| composer_versions_equivalent(v, version))
         })
         .map(|p| (p.section, p.index))
 }
@@ -2746,6 +2765,47 @@ mod tests {
         );
     }
 
+    /// The patch purl's version may be composer's padded spelling of the
+    /// release the lock records prettily (`3.0.2.0` for `3.0.2` / `v3.0.2`,
+    /// `1.0.0.0` for `1.0`, `8.1.0.0-RC1` for `v8.1.0-rc.1`); other releases
+    /// never match.
+    #[test]
+    fn test_find_lock_entry_matches_equivalent_composer_versions() {
+        let lock = json!({
+            "packages": [
+                { "name": "psr/log", "version": "3.0.20" },
+                { "name": "psr/log", "version": "3.0.2" },
+                { "name": "psr/cache", "version": "v3.0.2" },
+                { "name": "psr/container", "version": "1.0" }
+            ],
+            "packages-dev": [
+                { "name": "symfony/http-kernel", "version": "v8.1.0-rc.1" }
+            ]
+        });
+        for (pkg, version, want) in [
+            ("psr/log", "3.0.2.0", Some(("packages", 1))),
+            ("psr/log", "v3.0.2", Some(("packages", 1))),
+            ("psr/log", "3.0.2", Some(("packages", 1))),
+            ("psr/log", "3.0.20.0", Some(("packages", 0))),
+            ("psr/cache", "3.0.2.0", Some(("packages", 2))),
+            ("psr/container", "1.0.0.0", Some(("packages", 3))),
+            (
+                "symfony/http-kernel",
+                "8.1.0.0-RC1",
+                Some(("packages-dev", 0)),
+            ),
+            ("psr/log", "3.0.2.1", None),
+            ("psr/container", "1.0.1", None),
+            ("symfony/http-kernel", "8.1.0", None),
+        ] {
+            assert_eq!(
+                find_lock_entry(&lock, pkg, version),
+                want,
+                "{pkg}@{version}"
+            );
+        }
+    }
+
     /// A source-only entry (no `dist`) gets `dist` + `transport-options`
     /// appended at the end; a pre-existing `transport-options` (wherever it
     /// sits) is superseded by ours, never duplicated.
@@ -3626,6 +3686,153 @@ mod tests {
         assert_eq!(
             tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
             lock_before
+        );
+    }
+
+    /// The vendored copy ships filter files Composer's path mirror honours:
+    /// they are neutralized before the lock is wired, and warned about.
+    #[tokio::test]
+    async fn fresh_vendor_neutralizes_mirror_filters() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        tokio::fs::write(installed.join(".gitignore"), "/src\n")
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join(".gitattributes"), "/src export-ignore\n")
+            .await
+            .unwrap();
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_composer_mirror_filters_neutralized"),
+            "{warnings:?}"
+        );
+        let copy = root.join(copy_rel());
+        assert_eq!(tokio::fs::read(copy.join(".gitignore")).await.unwrap(), b"");
+        assert_eq!(
+            tokio::fs::read(copy.join(".gitattributes")).await.unwrap(),
+            b""
+        );
+        assert_eq!(
+            tokio::fs::read(installed.join(".gitignore")).await.unwrap(),
+            b"/src\n",
+            "the installed tree is never touched"
+        );
+    }
+
+    /// A patch that itself rewrites a filter file needing a change cannot be
+    /// made mirror-safe: the fresh vendor refuses and leaves nothing behind.
+    #[tokio::test]
+    async fn fresh_vendor_refuses_a_patched_filter_file() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, mut record) = fixture(&lock).await;
+        let root = dir.path();
+        let attrs = b"/tests export-ignore\n";
+        tokio::fs::write(installed.join(".gitattributes"), attrs)
+            .await
+            .unwrap();
+        let hash = compute_git_sha256_from_bytes(attrs);
+        tokio::fs::write(blobs.join(&hash), attrs).await.unwrap();
+        record.files.insert(
+            ".gitattributes".to_string(),
+            PatchFileInfo {
+                before_hash: hash.clone(),
+                after_hash: hash,
+            },
+        );
+        let lock_before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert_eq!(code, "vendor_composer_mirror_filter_conflict", "{detail}");
+        assert!(detail.contains(".gitattributes"), "{detail}");
+        assert!(!root.join(".socket/vendor/composer").exists());
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_before
+        );
+    }
+
+    /// A copy vendored by an older CLI (filter files intact) is healed by the
+    /// idempotent re-run without touching the lock or the patched file.
+    #[tokio::test]
+    async fn idempotent_rerun_heals_a_legacy_copy() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        let copy = root.join(copy_rel());
+        tokio::fs::write(copy.join(".hgignore"), "src\n")
+            .await
+            .unwrap();
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let (_, dry_entry, dry_warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, true).await);
+        assert!(
+            dry_entry.is_none() && dry_warnings.is_empty(),
+            "{dry_warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(copy.join(".hgignore")).await.unwrap(),
+            b"src\n"
+        );
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        assert!(entry.is_none(), "the hot path never re-records");
+        assert_eq!(
+            warnings.iter().map(|w| w.code).collect::<Vec<_>>(),
+            vec!["vendor_composer_mirror_filters_neutralized"]
+        );
+        assert_eq!(tokio::fs::read(copy.join(".hgignore")).await.unwrap(), b"");
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes
+        );
+        let (_, _, again) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(
+            again.is_empty(),
+            "healed copy: nothing left to warn {again:?}"
+        );
+    }
+
+    /// The artifact-only rebuild of a wired package neutralizes the rebuilt
+    /// copy's filters too.
+    #[tokio::test]
+    async fn artifact_rebuild_neutralizes_mirror_filters() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join(".gitignore"), "/src\n")
+            .await
+            .unwrap();
+        let (result, _, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let codes: Vec<&str> = warnings.iter().map(|w| w.code).collect();
+        assert_eq!(
+            codes,
+            vec![
+                "vendor_composer_mirror_filters_neutralized",
+                "vendor_artifact_rebuilt"
+            ]
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join(".gitignore"))
+                .await
+                .unwrap(),
+            b""
         );
     }
 }

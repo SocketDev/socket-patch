@@ -2022,6 +2022,12 @@ pub(crate) async fn vendor_records(
                      until reinstalled."
                 );
             }
+            if let Ok(lock) = std::fs::read_to_string(common.cwd.join("composer.lock")) {
+                let packages = super::composer_hints::vendored_composer_packages(&lock);
+                super::composer_hints::vendored_reinstall_hints(&packages)
+                    .iter()
+                    .for_each(|hint| println!("{hint}"));
+            }
         }
     }
 

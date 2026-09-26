@@ -3285,7 +3285,11 @@ fn format_next_steps(
     let npm = files
         .iter()
         .any(|f| f == "package-lock.json" || f == "npm-shrinkwrap.json");
-    let hint = if npm { " (e.g. `npm ci`)" } else { "" };
+    let hint = if npm {
+        " (e.g. `npm ci`)"
+    } else {
+        crate::commands::composer_hints::hosted_reinstall_hint(files).unwrap_or("")
+    };
     vec![
         format!("Commit {} to keep the redirect.", join_names(&commit, 6)),
         format!(

@@ -1,0 +1,958 @@
+{
+  "composer": "2.10.3",
+  "composerSemver": "3.4.4",
+  "vectors": [
+    {
+      "input": "3.0.2",
+      "composerNormalized": "3.0.2.0",
+      "identity": "3.0.2.0"
+    },
+    {
+      "input": "v3.0.2",
+      "composerNormalized": "3.0.2.0",
+      "identity": "3.0.2.0"
+    },
+    {
+      "input": "V3.0.2",
+      "composerNormalized": "3.0.2.0",
+      "identity": "3.0.2.0"
+    },
+    {
+      "input": "3.0.2.0",
+      "composerNormalized": "3.0.2.0",
+      "identity": "3.0.2.0"
+    },
+    {
+      "input": "v3.0.2.0",
+      "composerNormalized": "3.0.2.0",
+      "identity": "3.0.2.0"
+    },
+    {
+      "input": "3.0.20",
+      "composerNormalized": "3.0.20.0",
+      "identity": "3.0.20.0"
+    },
+    {
+      "input": "1",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "v1.0.0",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0.0",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0.1",
+      "composerNormalized": "1.0.0.1",
+      "identity": "1.0.0.1"
+    },
+    {
+      "input": "1.2.3.4",
+      "composerNormalized": "1.2.3.4",
+      "identity": "1.2.3.4"
+    },
+    {
+      "input": "1.2.3.4.5",
+      "composerNormalized": null,
+      "identity": "1.2.3.4.5"
+    },
+    {
+      "input": "v1.2.3.4.5",
+      "composerNormalized": null,
+      "identity": "1.2.3.4.5"
+    },
+    {
+      "input": "01.02.03",
+      "composerNormalized": "01.02.03.0",
+      "identity": "01.02.03.0"
+    },
+    {
+      "input": "0.0.0",
+      "composerNormalized": "0.0.0.0",
+      "identity": "0.0.0.0"
+    },
+    {
+      "input": "10.20.30.40",
+      "composerNormalized": "10.20.30.40",
+      "identity": "10.20.30.40"
+    },
+    {
+      "input": "12345.0",
+      "composerNormalized": "12345.0.0.0",
+      "identity": "12345.0.0.0"
+    },
+    {
+      "input": "123456",
+      "composerNormalized": "123456",
+      "identity": "123456"
+    },
+    {
+      "input": "123456.1",
+      "composerNormalized": "123456.1",
+      "identity": "123456.1"
+    },
+    {
+      "input": "99999.1",
+      "composerNormalized": "99999.1.0.0",
+      "identity": "99999.1.0.0"
+    },
+    {
+      "input": "1.0.0-beta1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0.0-beta1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "v1.0-BETA1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0-beta2",
+      "composerNormalized": "1.0.0.0-beta2",
+      "identity": "1.0.0.0-beta2"
+    },
+    {
+      "input": "1.0.0-b1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0b1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0beta1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0-beta.1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0-beta-1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0-beta",
+      "composerNormalized": "1.0.0.0-beta",
+      "identity": "1.0.0.0-beta"
+    },
+    {
+      "input": "1.0.0-RC1",
+      "composerNormalized": "1.0.0.0-RC1",
+      "identity": "1.0.0.0-RC1"
+    },
+    {
+      "input": "1.0.0-rc1",
+      "composerNormalized": "1.0.0.0-RC1",
+      "identity": "1.0.0.0-RC1"
+    },
+    {
+      "input": "1.0.0.0-RC1",
+      "composerNormalized": "1.0.0.0-RC1",
+      "identity": "1.0.0.0-RC1"
+    },
+    {
+      "input": "8.1.0-RC1",
+      "composerNormalized": "8.1.0.0-RC1",
+      "identity": "8.1.0.0-RC1"
+    },
+    {
+      "input": "v8.1.0-rc.1",
+      "composerNormalized": "8.1.0.0-RC1",
+      "identity": "8.1.0.0-RC1"
+    },
+    {
+      "input": "1.0.0-RC.1",
+      "composerNormalized": "1.0.0.0-RC1",
+      "identity": "1.0.0.0-RC1"
+    },
+    {
+      "input": "1.0.0rc1",
+      "composerNormalized": "1.0.0.0-RC1",
+      "identity": "1.0.0.0-RC1"
+    },
+    {
+      "input": "1.0.0-rc-1",
+      "composerNormalized": "1.0.0.0-RC1",
+      "identity": "1.0.0.0-RC1"
+    },
+    {
+      "input": "1.0.0-RC1.2",
+      "composerNormalized": "1.0.0.0-RC1.2",
+      "identity": "1.0.0.0-RC1.2"
+    },
+    {
+      "input": "1.0.0-alpha1",
+      "composerNormalized": "1.0.0.0-alpha1",
+      "identity": "1.0.0.0-alpha1"
+    },
+    {
+      "input": "1.0.0-a1",
+      "composerNormalized": "1.0.0.0-alpha1",
+      "identity": "1.0.0.0-alpha1"
+    },
+    {
+      "input": "1.0.0a",
+      "composerNormalized": "1.0.0.0-alpha",
+      "identity": "1.0.0.0-alpha"
+    },
+    {
+      "input": "1.0.0-alpha.2.3",
+      "composerNormalized": "1.0.0.0-alpha2.3",
+      "identity": "1.0.0.0-alpha2.3"
+    },
+    {
+      "input": "1.0.0-patch1",
+      "composerNormalized": "1.0.0.0-patch1",
+      "identity": "1.0.0.0-patch1"
+    },
+    {
+      "input": "1.0.0-p1",
+      "composerNormalized": "1.0.0.0-patch1",
+      "identity": "1.0.0.0-patch1"
+    },
+    {
+      "input": "1.0.0-pl1",
+      "composerNormalized": "1.0.0.0-patch1",
+      "identity": "1.0.0.0-patch1"
+    },
+    {
+      "input": "1.0.0pl2",
+      "composerNormalized": "1.0.0.0-patch2",
+      "identity": "1.0.0.0-patch2"
+    },
+    {
+      "input": "1.0.0-stable",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0-STABLE",
+      "composerNormalized": "1.0.0.0-stable",
+      "identity": "1.0.0.0-stable"
+    },
+    {
+      "input": "1.0.0stable",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0_beta1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0.beta1",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0-beta1-dev",
+      "composerNormalized": "1.0.0.0-beta1-dev",
+      "identity": "1.0.0.0-beta1-dev"
+    },
+    {
+      "input": "1.0.0-dev",
+      "composerNormalized": "1.0.0.0-dev",
+      "identity": "1.0.0.0-dev"
+    },
+    {
+      "input": "1.0-dev",
+      "composerNormalized": "1.0.0.0-dev",
+      "identity": "1.0.0.0-dev"
+    },
+    {
+      "input": "2-dev",
+      "composerNormalized": "2.0.0.0-dev",
+      "identity": "2.0.0.0-dev"
+    },
+    {
+      "input": "1.0.0.0-dev",
+      "composerNormalized": "1.0.0.0-dev",
+      "identity": "1.0.0.0-dev"
+    },
+    {
+      "input": "v2.0.0-RC2",
+      "composerNormalized": "2.0.0.0-RC2",
+      "identity": "2.0.0.0-RC2"
+    },
+    {
+      "input": "1.0.0+build",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0+20130313144700",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "v1.0.0-beta.1+exp.sha.5114f85",
+      "composerNormalized": "1.0.0.0-beta1",
+      "identity": "1.0.0.0-beta1"
+    },
+    {
+      "input": "1.0.0+build+x",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0@beta",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0@stable",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0@dev",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "dev-main@dev",
+      "composerNormalized": "dev-main",
+      "identity": "dev-main"
+    },
+    {
+      "input": "1.0.0 as 2.0.0",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "dev-main as 1.0.x-dev",
+      "composerNormalized": "dev-main",
+      "identity": "dev-main"
+    },
+    {
+      "input": "dev-main",
+      "composerNormalized": "dev-main",
+      "identity": "dev-main"
+    },
+    {
+      "input": "dev-master",
+      "composerNormalized": "dev-master",
+      "identity": "dev-master"
+    },
+    {
+      "input": "DEV-Main",
+      "composerNormalized": "dev-Main",
+      "identity": "dev-Main"
+    },
+    {
+      "input": "dev-feature/Foo_Bar",
+      "composerNormalized": "dev-feature/Foo_Bar",
+      "identity": "dev-feature/Foo_Bar"
+    },
+    {
+      "input": "master",
+      "composerNormalized": "dev-master",
+      "identity": "dev-master"
+    },
+    {
+      "input": "trunk",
+      "composerNormalized": "dev-trunk",
+      "identity": "dev-trunk"
+    },
+    {
+      "input": "default",
+      "composerNormalized": "dev-default",
+      "identity": "dev-default"
+    },
+    {
+      "input": "Master",
+      "composerNormalized": null,
+      "identity": "Master"
+    },
+    {
+      "input": "main",
+      "composerNormalized": null,
+      "identity": "main"
+    },
+    {
+      "input": "2.0.x-dev",
+      "composerNormalized": "2.0.9999999.9999999-dev",
+      "identity": "2.0.9999999.9999999-dev"
+    },
+    {
+      "input": "v2.0.x-dev",
+      "composerNormalized": "2.0.9999999.9999999-dev",
+      "identity": "2.0.9999999.9999999-dev"
+    },
+    {
+      "input": "2.0.X-dev",
+      "composerNormalized": "2.0.9999999.9999999-dev",
+      "identity": "2.0.9999999.9999999-dev"
+    },
+    {
+      "input": "2.0.*-dev",
+      "composerNormalized": "2.0.9999999.9999999-dev",
+      "identity": "2.0.9999999.9999999-dev"
+    },
+    {
+      "input": "2.x-dev",
+      "composerNormalized": "2.9999999.9999999.9999999-dev",
+      "identity": "2.9999999.9999999.9999999-dev"
+    },
+    {
+      "input": "2.0.9999999.9999999-dev",
+      "composerNormalized": "2.0.9999999.9999999-dev",
+      "identity": "2.0.9999999.9999999-dev"
+    },
+    {
+      "input": "1.0.x.x-dev",
+      "composerNormalized": "1.0.9999999.9999999-dev",
+      "identity": "1.0.9999999.9999999-dev"
+    },
+    {
+      "input": "2.1.3.x-dev",
+      "composerNormalized": "2.1.3.9999999-dev",
+      "identity": "2.1.3.9999999-dev"
+    },
+    {
+      "input": "foo-dev",
+      "composerNormalized": null,
+      "identity": "foo-dev"
+    },
+    {
+      "input": "feature.x-dev",
+      "composerNormalized": null,
+      "identity": "feature.x-dev"
+    },
+    {
+      "input": "20100102",
+      "composerNormalized": "20100102",
+      "identity": "20100102"
+    },
+    {
+      "input": "2010-01-02",
+      "composerNormalized": "2010.01.02",
+      "identity": "2010.01.02"
+    },
+    {
+      "input": "2010.01.02.5",
+      "composerNormalized": "2010.01.02.5",
+      "identity": "2010.01.02.5"
+    },
+    {
+      "input": "20100102-beta1",
+      "composerNormalized": "20100102-beta1",
+      "identity": "20100102-beta1"
+    },
+    {
+      "input": "201001021530",
+      "composerNormalized": "201001021530",
+      "identity": "201001021530"
+    },
+    {
+      "input": " 1.0.0 ",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "\t3.0.2\n",
+      "composerNormalized": "3.0.2.0",
+      "identity": "3.0.2.0"
+    },
+    {
+      "input": "",
+      "composerNormalized": null,
+      "identity": ""
+    },
+    {
+      "input": "v",
+      "composerNormalized": null,
+      "identity": "v"
+    },
+    {
+      "input": "vfoo",
+      "composerNormalized": null,
+      "identity": "vfoo"
+    },
+    {
+      "input": "v-1.0",
+      "composerNormalized": null,
+      "identity": "v-1.0"
+    },
+    {
+      "input": "latest",
+      "composerNormalized": null,
+      "identity": "latest"
+    },
+    {
+      "input": "*",
+      "composerNormalized": null,
+      "identity": "*"
+    },
+    {
+      "input": "1.0.*",
+      "composerNormalized": null,
+      "identity": "1.0.*"
+    },
+    {
+      "input": "^1.0",
+      "composerNormalized": null,
+      "identity": "^1.0"
+    },
+    {
+      "input": "~1.0",
+      "composerNormalized": null,
+      "identity": "~1.0"
+    },
+    {
+      "input": ">=1.0",
+      "composerNormalized": null,
+      "identity": ">=1.0"
+    },
+    {
+      "input": "1.0.0-foo",
+      "composerNormalized": null,
+      "identity": "1.0.0-foo"
+    },
+    {
+      "input": "1.0.0-beta1a",
+      "composerNormalized": null,
+      "identity": "1.0.0-beta1a"
+    },
+    {
+      "input": "not-a-version",
+      "composerNormalized": null,
+      "identity": "not-a-version"
+    },
+    {
+      "input": "1.0.0.0.0",
+      "composerNormalized": null,
+      "identity": "1.0.0.0.0"
+    },
+    {
+      "input": "1.0.0-beta1-foo",
+      "composerNormalized": null,
+      "identity": "1.0.0-beta1-foo"
+    },
+    {
+      "input": "1.0 .0",
+      "composerNormalized": null,
+      "identity": "1.0 .0"
+    },
+    {
+      "input": "1.0.0-a2",
+      "composerNormalized": "1.0.0.0-alpha2",
+      "identity": "1.0.0.0-alpha2"
+    },
+    {
+      "input": "1.0.0pl3",
+      "composerNormalized": "1.0.0.0-patch3",
+      "identity": "1.0.0.0-patch3"
+    },
+    {
+      "input": "1.0.0+build.5",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "dev-Feature/X",
+      "composerNormalized": "dev-Feature/X",
+      "identity": "dev-Feature/X"
+    },
+    {
+      "input": "\u00001.0.0\u0000",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "\f1.0.0",
+      "composerNormalized": null,
+      "identity": "\f1.0.0"
+    },
+    {
+      "input": "1.0.0\u000b",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.0.0",
+      "composerNormalized": "1.0.0.0",
+      "identity": "1.0.0.0"
+    },
+    {
+      "input": "1.2.3",
+      "composerNormalized": "1.2.3.0",
+      "identity": "1.2.3.0"
+    },
+    {
+      "input": "dev-Main",
+      "composerNormalized": "dev-Main",
+      "identity": "dev-Main"
+    },
+    {
+      "input": "2.1.x-dev",
+      "composerNormalized": "2.1.9999999.9999999-dev",
+      "identity": "2.1.9999999.9999999-dev"
+    },
+    {
+      "input": "2.0.0.0-dev",
+      "composerNormalized": "2.0.0.0-dev",
+      "identity": "2.0.0.0-dev"
+    },
+    {
+      "input": "2010:01:02",
+      "composerNormalized": "2010.01.02",
+      "identity": "2010.01.02"
+    },
+    {
+      "input": "2010.01.02",
+      "composerNormalized": "2010.01.02.0",
+      "identity": "2010.01.02.0"
+    },
+    {
+      "input": "v1.0.0-foo",
+      "composerNormalized": null,
+      "identity": "1.0.0-foo"
+    },
+    {
+      "input": "1.0.0.0-foo",
+      "composerNormalized": null,
+      "identity": "1.0.0.0-foo"
+    },
+    {
+      "input": "foo",
+      "composerNormalized": null,
+      "identity": "foo"
+    },
+    {
+      "input": "0",
+      "composerNormalized": "0.0.0.0",
+      "identity": "0.0.0.0"
+    }
+  ],
+  "equivalence": [
+    {
+      "left": "3.0.2",
+      "right": "v3.0.2",
+      "equivalent": true
+    },
+    {
+      "left": "3.0.2",
+      "right": "V3.0.2",
+      "equivalent": true
+    },
+    {
+      "left": "3.0.2",
+      "right": "3.0.2.0",
+      "equivalent": true
+    },
+    {
+      "left": "v3.0.2",
+      "right": "v3.0.2.0",
+      "equivalent": true
+    },
+    {
+      "left": "3.0.2",
+      "right": "3.0.20",
+      "equivalent": false
+    },
+    {
+      "left": "1",
+      "right": "1.0",
+      "equivalent": true
+    },
+    {
+      "left": "1",
+      "right": "v1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "1.0",
+      "right": "1.0.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0",
+      "right": "1.0.0.1",
+      "equivalent": false
+    },
+    {
+      "left": "1.2.3.4.5",
+      "right": "1.2.3.4.5",
+      "equivalent": true
+    },
+    {
+      "left": "1.2.3.4.5",
+      "right": "v1.2.3.4.5",
+      "equivalent": true
+    },
+    {
+      "left": "1.2.3.4.5",
+      "right": "1.2.3.4",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0.0.0",
+      "right": "1.0.0.0",
+      "equivalent": false
+    },
+    {
+      "left": "01.02.03",
+      "right": "1.2.3",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0-beta1",
+      "right": "1.0.0.0-beta1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-beta1",
+      "right": "v1.0-BETA1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-beta1",
+      "right": "1.0.0-b1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-beta1",
+      "right": "1.0.0beta1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-beta1",
+      "right": "1.0.0-beta.1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-beta1",
+      "right": "1.0.0-beta2",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0-beta1",
+      "right": "1.0.0",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0-RC1",
+      "right": "1.0.0-rc1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-RC1",
+      "right": "1.0.0.0-RC1",
+      "equivalent": true
+    },
+    {
+      "left": "8.1.0-RC1",
+      "right": "v8.1.0-rc.1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-RC1",
+      "right": "1.0.0",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0-RC1",
+      "right": "1.0.0-RC1.2",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0-alpha1",
+      "right": "1.0.0-a1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-patch1",
+      "right": "1.0.0-p1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-p1",
+      "right": "1.0.0-pl1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-stable",
+      "right": "1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-STABLE",
+      "right": "1.0.0",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0+build",
+      "right": "1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "v1.0.0-beta.1+exp.sha.5114f85",
+      "right": "1.0.0-beta1",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0@dev",
+      "right": "1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0 as 2.0.0",
+      "right": "1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-dev",
+      "right": "1.0.0",
+      "equivalent": false
+    },
+    {
+      "left": "1.0-dev",
+      "right": "1.0.0.0-dev",
+      "equivalent": true
+    },
+    {
+      "left": "dev-main",
+      "right": "dev-main",
+      "equivalent": true
+    },
+    {
+      "left": "dev-main",
+      "right": "dev-master",
+      "equivalent": false
+    },
+    {
+      "left": "DEV-Main",
+      "right": "dev-Main",
+      "equivalent": true
+    },
+    {
+      "left": "dev-Main",
+      "right": "dev-main",
+      "equivalent": false
+    },
+    {
+      "left": "master",
+      "right": "dev-master",
+      "equivalent": true
+    },
+    {
+      "left": "Master",
+      "right": "dev-master",
+      "equivalent": false
+    },
+    {
+      "left": "main",
+      "right": "dev-main",
+      "equivalent": false
+    },
+    {
+      "left": "2.0.x-dev",
+      "right": "v2.0.x-dev",
+      "equivalent": true
+    },
+    {
+      "left": "2.0.x-dev",
+      "right": "2.0.9999999.9999999-dev",
+      "equivalent": true
+    },
+    {
+      "left": "2.0.x-dev",
+      "right": "2.0.*-dev",
+      "equivalent": true
+    },
+    {
+      "left": "2.0.x-dev",
+      "right": "2.1.x-dev",
+      "equivalent": false
+    },
+    {
+      "left": "2.0.x-dev",
+      "right": "2.0.0.0-dev",
+      "equivalent": false
+    },
+    {
+      "left": "2010-01-02",
+      "right": "2010:01:02",
+      "equivalent": true
+    },
+    {
+      "left": "2010-01-02",
+      "right": "2010.01.02",
+      "equivalent": false
+    },
+    {
+      "left": "20100102",
+      "right": "2010.01.02",
+      "equivalent": false
+    },
+    {
+      "left": " 1.0.0 ",
+      "right": "1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-foo",
+      "right": "1.0.0-foo",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-foo",
+      "right": "v1.0.0-foo",
+      "equivalent": true
+    },
+    {
+      "left": "1.0.0-foo",
+      "right": "1.0.0.0-foo",
+      "equivalent": false
+    },
+    {
+      "left": "1.0.0-foo",
+      "right": "1.0.0",
+      "equivalent": false
+    },
+    {
+      "left": "vfoo",
+      "right": "foo",
+      "equivalent": false
+    },
+    {
+      "left": "latest",
+      "right": "latest",
+      "equivalent": true
+    },
+    {
+      "left": "",
+      "right": "",
+      "equivalent": true
+    },
+    {
+      "left": "",
+      "right": "0",
+      "equivalent": false
+    }
+  ]
+}
