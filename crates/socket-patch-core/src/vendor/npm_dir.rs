@@ -62,7 +62,7 @@ pub(super) struct NpmStagedDir {
     /// The committed dir passed the reuse check; nothing was written.
     pub reused: bool,
     /// A rebuild discarded the old dir's `node_modules/` (it held more
-    /// than vlt's links), so the package needs `vlt install` to re-link.
+    /// than vlt's links), so the package needs `vlt ci` to re-link.
     pub links_dropped: bool,
 }
 

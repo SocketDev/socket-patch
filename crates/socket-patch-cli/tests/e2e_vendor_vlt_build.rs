@@ -782,6 +782,25 @@ async fn vlt_pinned_matrix_vendored_dep_with_deps() {
         !tracked.contains(&format!("{}/node_modules/", rel(&t))),
         "{tracked}"
     );
+    // A stray edit condemns the payload; the rebuild keeps vlt's links.
+    let readme = fx.proj.join(rel(&t)).join("README.md");
+    let mut text = std::fs::read_to_string(&readme).unwrap();
+    text.push_str("\nstray\n");
+    write(&readme, &text);
+    let out = repair(&fx);
+    assert_eq!(out.code, 0, "{out}");
+    assert!(inner.join("ms").exists(), "repair keeps vlt's links: {out}");
+    let loaded = std::process::Command::new("node")
+        .args(["-e", "require('debug')"])
+        .current_dir(&fx.proj)
+        .output()
+        .unwrap();
+    assert_ok(&loaded, "require('debug') after repair");
+    assert_eq!(std::fs::read_to_string(&readme).unwrap(), {
+        let mut t = text.clone();
+        t.truncate(t.len() - "\nstray\n".len());
+        t
+    });
     let co = fx.leg.root.join("clone");
     git_ok(
         &fx.leg.root,

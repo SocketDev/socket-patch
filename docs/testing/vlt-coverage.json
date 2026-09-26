@@ -169,6 +169,14 @@
       "the_reinstall_advisory_follows_dry_runs_members_and_failed_patches",
       "vendor_vlt_stale_prod_link_asks_for_a_reinstall"
     ],
+    "vendor_vlt_reinstall_required: a link still into the vendored dir of the patch a re-vendor replaces": [
+      "a_new_uuid_warns_about_links_into_the_replaced_dir"
+    ],
+    "vendor_vlt_reinstall_required: a rebuild could not keep vlt's links inside the payload (vendor, repair)": [
+      "a_rebuild_keeps_vlt_links_and_says_to_reinstall_when_it_cannot",
+      "repair_moves_vlt_links_back_from_the_set_aside_dir",
+      "vlt_pinned_matrix_vendored_dep_with_deps"
+    ],
     "vendor_vlt_reinstall_required: revert of an optional dependency (vendor --revert, vendored to hosted takeover)": [
       "a_revert_asks_for_a_reinstall_while_a_link_or_an_optional_spec_moves_back",
       "vendor_vlt_revert_asks_for_a_reinstall_of_a_linked_vendored_copy",

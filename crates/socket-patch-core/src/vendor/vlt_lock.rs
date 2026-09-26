@@ -1171,6 +1171,57 @@ async fn reinstall_advisory(
     ))
 }
 
+/// `vendor_vlt_reinstall_required` for a rebuilt dir that lost vlt's
+/// links to its dependencies. A plain `vlt install` does not put them back
+/// (measured on rc.14 through 1.2.0); `vlt ci` does.
+fn links_dropped_warning(name: &str, version: &str) -> VendorWarning {
+    VendorWarning::new(
+        REINSTALL_REQUIRED,
+        format!(
+            "the rebuilt vendored dir for {name}@{version} has none of vlt's links to its \
+             dependencies (its old node_modules/ held more than those links and was \
+             discarded), so requiring them fails; run `vlt ci` (or delete node_modules and run \
+             `vlt install`) to re-link them, as a plain `vlt install` does not"
+        ),
+    )
+}
+
+/// Repair's set-aside moves a whole uuid dir away before the rebuild, vlt's
+/// links to the package's dependencies (`<dir>/node_modules/`) included.
+/// After a successful rebuild at `project_root`, move them back from
+/// `kept_uuid_dir` when they are only links; otherwise the rebuilt dir has
+/// none, and the returned advisory says how to re-link them.
+pub async fn keep_vlt_links(
+    entry: &VendorEntry,
+    kept_uuid_dir: &Path,
+    project_root: &Path,
+) -> Option<VendorWarning> {
+    if entry.flavor.as_deref() != Some(FLAVOR) {
+        return None;
+    }
+    let uuid_rel = super::path::vendor_uuid_dir_rel("npm", &entry.uuid)?;
+    let within = entry
+        .artifact
+        .path
+        .strip_prefix(uuid_rel.as_str())?
+        .strip_prefix('/')?;
+    if !is_safe_multi_segment(within) {
+        return None;
+    }
+    let kept_rel = kept_uuid_dir.join(within);
+    let old_links = kept_rel.join("node_modules");
+    tokio::fs::symlink_metadata(&old_links).await.ok()?;
+    let live_links = project_root.join(&entry.artifact.path).join("node_modules");
+    let (name, version) = super::npm_common::parse_npm_purl(&entry.base_purl).unwrap_or_default();
+    if tokio::fs::symlink_metadata(&live_links).await.is_ok()
+        || !super::npm_dir::node_modules_holds_only_links(&kept_rel).await
+        || tokio::fs::rename(&old_links, &live_links).await.is_err()
+    {
+        return Some(links_dropped_warning(&name, &version));
+    }
+    None
+}
+
 /// Vendor one installed npm package into a vlt project (see the module
 /// doc). Same contract as the other npm backends: refuse-early / wire-last,
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
@@ -1243,6 +1294,9 @@ pub(crate) async fn vendor_vlt(
     let Some(staged) = staged else {
         return done(result, None, warnings);
     };
+    if staged.links_dropped {
+        warnings.push(links_dropped_warning(name, version));
+    }
     if staged.staged_pkg_json.is_some() {
         warnings.push(VendorWarning::new(
             "vendor_dep_manifest_stale",
@@ -1288,17 +1342,11 @@ pub(crate) async fn vendor_vlt(
                 warnings,
             );
         }
-        let relink = if staged.links_dropped {
-            "; its node_modules/ held more than vlt's dependency links and was discarded, so \
-             run `vlt install` to re-link its dependencies"
-        } else {
-            ""
-        };
         warnings.push(VendorWarning::new(
             "vendor_artifact_rebuilt",
             format!(
                 "the committed vendored dir for {name}@{version} was missing or stale; rebuilt \
-                 at {} (vlt-lock.json and package.json untouched){relink}",
+                 at {} (vlt-lock.json and package.json untouched)",
                 staged.rel_dir
             ),
         ));
@@ -3635,12 +3683,61 @@ mod tests {
             .unwrap();
         let (_, entry, warnings) = done_parts(run(&fx, UUID, false).await);
         assert!(entry.is_some());
-        assert_eq!(codes(&warnings), ["vendor_artifact_rebuilt"]);
-        assert!(
-            warnings[0].detail.contains("run `vlt install`"),
-            "{warnings:?}"
+        assert_eq!(
+            codes(&warnings),
+            [REINSTALL_REQUIRED, "vendor_artifact_rebuilt"]
         );
+        assert!(warnings[0].detail.contains("run `vlt ci`"), "{warnings:?}");
+        assert!(!warnings[1].detail.contains("vlt install"), "{warnings:?}");
         assert!(!links.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repair_moves_vlt_links_back_from_the_set_aside_dir() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (first, _) = entry_of(run(&fx, UUID, false).await);
+        persist(&fx, &first).await;
+        let live = uuid_dir(&fx, UUID);
+        let kept = live.with_file_name(format!("{UUID}.pre-rebuild"));
+        let within = first
+            .artifact
+            .path
+            .strip_prefix(&format!(".socket/vendor/npm/{UUID}/"))
+            .unwrap()
+            .to_string();
+        let target = "../../../../../../../../node_modules/.vlt/z";
+        let plant = |planted: bool| {
+            let links = kept.join(&within).join("node_modules");
+            std::fs::create_dir_all(links.join(".bin")).unwrap();
+            std::os::unix::fs::symlink(target, links.join("z")).unwrap();
+            if planted {
+                std::fs::write(links.join("planted.js"), b"x").unwrap();
+            }
+        };
+
+        plant(false);
+        assert_eq!(keep_vlt_links(&first, &kept, &fx.root).await, None);
+        let live_links = fx.root.join(&first.artifact.path).join("node_modules");
+        assert_eq!(
+            std::fs::read_link(live_links.join("z")).unwrap(),
+            std::path::Path::new(target)
+        );
+        assert!(!kept.join(&within).join("node_modules").exists());
+
+        std::fs::remove_dir_all(&live_links).unwrap();
+        plant(true);
+        let warning = keep_vlt_links(&first, &kept, &fx.root).await.unwrap();
+        assert_eq!(warning.code, REINSTALL_REQUIRED);
+        assert!(warning.detail.contains("run `vlt ci`"), "{warning:?}");
+        assert!(!live_links.exists());
+
+        std::fs::remove_dir_all(&kept).unwrap();
+        assert_eq!(keep_vlt_links(&first, &kept, &fx.root).await, None);
+        let mut npm = first.clone();
+        npm.flavor = None;
+        plant(false);
+        assert_eq!(keep_vlt_links(&npm, &kept, &fx.root).await, None);
     }
 
     #[tokio::test]

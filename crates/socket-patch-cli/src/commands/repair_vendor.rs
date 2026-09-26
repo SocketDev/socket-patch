@@ -1601,6 +1601,11 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 // condemned bytes now (post-verify failures below keep
                 // their existing nothing-kept contract).
                 if let Some((_, kept)) = &aside {
+                    if let Some(w) =
+                        vendor::vlt_lock::keep_vlt_links(&c.entry, kept, &common.cwd).await
+                    {
+                        record_warning(env, &c.purl, &w, common);
+                    }
                     let _ = remove_tree(kept).await;
                 }
                 for w in &warnings {
