@@ -322,7 +322,10 @@ fn artifact_check(dir: &Path, artifact: &[u8]) -> ByteCheck {
         Err(true) => return ByteCheck::Mismatch,
         Err(false) => return ByteCheck::Unknown,
     };
-    let expected: BTreeMap<String, Vec<u8>> = expected.into_iter().collect();
+    let expected: BTreeMap<String, Vec<u8>> = expected
+        .into_iter()
+        .filter(|(path, _)| path != "node_modules" && !path.starts_with("node_modules/"))
+        .collect();
     if expected == installed {
         ByteCheck::Match
     } else {
@@ -393,20 +396,29 @@ async fn remove_entry(path: &Path) -> std::io::Result<()> {
 
 /// Remove the hidden lock and each stale store entry. Callers pass only
 /// ids [`classify_target`] judged stale, which requires a real store dir.
+/// A hidden lock that cannot be removed keeps every store entry: vlt would
+/// trust it and leave the importer links dangling.
 pub async fn invalidate(root: &Path, state: &InstallState, stale: &[String]) -> Invalidation {
     let mut out = Invalidation::default();
     if stale.is_empty() || state.store != StoreState::Real {
         return out;
     }
+    let unique: BTreeSet<&String> = stale.iter().collect();
     if state.hidden_present {
         if let Err(e) = remove_entry(&root.join(VLT_HIDDEN_LOCK_REL)).await {
             if e.kind() != std::io::ErrorKind::NotFound {
+                let why = e.to_string();
                 out.failed
-                    .push((VLT_HIDDEN_LOCK_REL.to_string(), e.to_string()));
+                    .push((VLT_HIDDEN_LOCK_REL.to_string(), why.clone()));
+                out.failed.extend(
+                    unique
+                        .into_iter()
+                        .map(|id| (id.clone(), format!("kept: {VLT_HIDDEN_LOCK_REL}: {why}"))),
+                );
+                return out;
             }
         }
     }
-    let unique: BTreeSet<&String> = stale.iter().collect();
     for id in unique {
         if !is_safe_dep_id(id) {
             continue;
@@ -678,6 +690,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_node_modules_in_the_artifact_are_not_compared() {
+        let tmp = tempfile::tempdir().unwrap();
+        store(tmp.path(), ID, PATCHED);
+        let dir = package_dir(tmp.path(), ID, "left-pad");
+        std::fs::create_dir_all(dir.join("node_modules/x")).unwrap();
+        std::fs::write(dir.join("node_modules/x/index.js"), b"bundled").unwrap();
+        let bundling = tarball(&[
+            ("package/index.js", PATCHED),
+            ("package/package.json", b"{\"name\":\"left-pad\"}"),
+            ("package/node_modules/x/index.js", b"bundled"),
+        ]);
+        assert_eq!(
+            classify(
+                tmp.path(),
+                &target(None, Some(&bundling)),
+                Expected::Patched
+            )
+            .await,
+            TargetState::Healthy
+        );
+    }
+
+    #[tokio::test]
     async fn an_uninstalled_target_is_healthy() {
         let tmp = tempfile::tempdir().unwrap();
         let rec = record();
@@ -772,6 +807,27 @@ mod tests {
         assert!(!tmp.path().join(VLT_HIDDEN_LOCK_REL).exists());
         assert!(!tmp.path().join(VLT_STORE_DIR).join(ID).exists());
         assert!(other_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unremovable_hidden_lock_keeps_every_store_entry() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        store(tmp.path(), ID, PRISTINE);
+        hidden(tmp.path(), Some("sha512-UPSTREAM"));
+        let state = read_install_state(tmp.path()).await;
+        let node_modules = tmp.path().join("node_modules");
+        std::fs::set_permissions(&node_modules, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = invalidate(tmp.path(), &state, &[ID.to_string()]).await;
+        std::fs::set_permissions(&node_modules, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(out.removed.is_empty(), "{out:?}");
+        let failed: Vec<&str> = out.failed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(failed, [VLT_HIDDEN_LOCK_REL, ID]);
+        assert!(tmp.path().join(VLT_HIDDEN_LOCK_REL).exists());
+        assert!(package_dir(tmp.path(), ID, "left-pad")
+            .join("index.js")
+            .exists());
     }
 
     #[cfg(unix)]

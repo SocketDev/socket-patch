@@ -154,6 +154,14 @@ pub(super) fn default_instances<'a>(lock: &'a HostedLock, dep: &DepOverride) -> 
     partition_instances(nodes, &full_name(dep), &dep.version, lock.parsed.options()).0
 }
 
+/// Does `dep` have a node of socket-patch's vendored vlt shape (§3.4) in a
+/// lock that passed the lock-level parse?
+pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> bool {
+    lock.parsed
+        .nodes()
+        .is_some_and(|nodes| has_vendored_node(nodes, &full_name(dep), &dep.version))
+}
+
 fn is_old_lockfile_ignored(lock: &HostedLock, files: &BTreeMap<String, String>) -> bool {
     if lock.parsed.version == Some(1) {
         return false;

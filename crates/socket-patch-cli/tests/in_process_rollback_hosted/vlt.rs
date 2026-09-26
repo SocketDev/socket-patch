@@ -189,3 +189,88 @@ async fn vlt_rollback_of_a_pristine_tree_keeps_it() {
     assert!(store_dir(root, TILDE_ID).join("index.js").exists());
     assert!(root.join("node_modules/.vlt-lock.json").exists());
 }
+
+const OTHER: &str = "right-pad";
+const OTHER_UUID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+fn as_other(text: &str) -> String {
+    text.replace(NAME, OTHER).replace(UUID, OTHER_UUID)
+}
+
+/// Add a second hosted vlt package to the ledger and the lock by renaming
+/// left-pad's recorded edit, record and pinned node.
+fn add_second_hosted_package(root: &Path, server: &MockServer) -> String {
+    let path = ledger_path(root);
+    let mut ledger: Value = serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json"))
+        .expect("the hosted run wrote a ledger");
+    let edits: Vec<Value> = ledger["edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "redirect_vlt_lock_node")
+        .map(|e| serde_json::from_str(&as_other(&e.to_string())).unwrap())
+        .collect();
+    assert_eq!(edits.len(), 1);
+    ledger["edits"].as_array_mut().unwrap().extend(edits);
+    let record: Value =
+        serde_json::from_str(&as_other(&ledger["records"][PURL].to_string())).unwrap();
+    ledger["records"][as_other(PURL)] = record;
+    std::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    let other_pinned = as_other(&pinned_node(TILDE_ID, server));
+    std::fs::write(
+        root.join("vlt-lock.json"),
+        vlt_lock(
+            Era::V1,
+            &[pinned_node(TILDE_ID, server), other_pinned.clone()],
+        ),
+    )
+    .unwrap();
+    other_pinned
+}
+
+fn other_store_dir(root: &Path) -> std::path::PathBuf {
+    root.join("node_modules/.vlt")
+        .join(as_other(TILDE_ID))
+        .join("node_modules")
+        .join(OTHER)
+}
+
+/// A scoped rollback of one of two hosted vlt packages takes the per-purl
+/// path (not a whole-ledger replay): only that package's pin is restored
+/// and only its patched store entry (plus the hidden lock) is removed.
+#[tokio::test]
+async fn vlt_scoped_rollback_of_one_of_two_heals_only_that_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let server = hosted_vlt_project(root).await;
+    let other_pinned = add_second_hosted_package(root, &server);
+    install_store(root, TILDE_ID, PATCHED);
+    let other = other_store_dir(root);
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("package.json"),
+        as_other(&String::from_utf8_lossy(PACKAGE_JSON)),
+    )
+    .unwrap();
+    std::fs::write(other.join("index.js"), PATCHED).unwrap();
+    write_hidden_lock(
+        root,
+        &[pinned_node(TILDE_ID, &server), other_pinned.clone()],
+    );
+
+    let (_, doc) = run_verb(root, "rollback", &[PURL]);
+
+    assert_eq!(
+        read(root, "vlt-lock.json"),
+        vlt_lock(Era::V1, &[registry_node(TILDE_ID), other_pinned])
+    );
+    assert_eq!(advisory_details(&doc), [RESTORED], "{doc:#}");
+    assert!(!store_dir(root, TILDE_ID).exists());
+    assert!(!root.join("node_modules/.vlt-lock.json").exists());
+    assert!(
+        other.join("index.js").exists(),
+        "the other package's copy stays"
+    );
+    let ledger = read(root, ".socket/vendor/redirect-state.json");
+    assert!(ledger.contains(OTHER_UUID), "{ledger}");
+}

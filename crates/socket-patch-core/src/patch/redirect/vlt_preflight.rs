@@ -184,15 +184,21 @@ pub struct PreflightDep {
     /// Every default-registry instance already carries this URL and sha512
     /// (an earlier run pinned it).
     pub already_pinned: bool,
+    /// In scope only through its vendored node: a vendored-to-hosted
+    /// takeover restores the registry node this run would pin.
+    pub vendored: bool,
 }
 
 /// The npm overrides the preflight probes: `vlt-lock.json` passes the
 /// lock-level parse, the override has a sha512, and it has at least one
-/// default-registry instance in the lock. Nothing is probed without a
-/// `vlt-lock.json`.
+/// default-registry instance in the lock, or (for the uuids in
+/// `vendored_vlt`, whose purl a vlt vendored entry claims) a vendored node
+/// the hosted takeover will turn back into one. Nothing is probed without
+/// a `vlt-lock.json`.
 pub fn preflight_scope(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    vendored_vlt: &BTreeSet<String>,
 ) -> Vec<PreflightDep> {
     let Some(text) = files.get(VLT_LOCK) else {
         return Vec::new();
@@ -206,16 +212,20 @@ pub fn preflight_scope(
         .filter_map(|dep| {
             let sha512 = dep.integrity.sha512.as_deref().filter(|s| !s.is_empty())?;
             let ids = vlt::default_instances(&lock, dep);
-            if ids.is_empty() {
+            let vendored = ids.is_empty()
+                && vendored_vlt.contains(&dep.patch_uuid)
+                && vlt::has_vendored_instance(&lock, dep);
+            if ids.is_empty() && !vendored {
                 return None;
             }
-            let already_pinned =
-                vlt::every_instance_pinned(text, &ids, sha512, &dep.artifact_url).is_some();
+            let already_pinned = !vendored
+                && vlt::every_instance_pinned(text, &ids, sha512, &dep.artifact_url).is_some();
             Some(PreflightDep {
                 patch_uuid: dep.patch_uuid.clone(),
                 artifact_url: dep.artifact_url.clone(),
                 sha512: sha512.to_string(),
                 already_pinned,
+                vendored,
             })
         })
         .collect()
@@ -489,15 +499,38 @@ mod tests {
             dep("d", Some("sha512-D")),
             dep("a", None),
         ];
-        let scope = preflight_scope(&files, &deps);
+        let none = BTreeSet::new();
+        let scope = preflight_scope(&files, &deps, &none);
         let got: Vec<(&str, bool)> = scope
             .iter()
             .map(|d| (d.patch_uuid.as_str(), d.already_pinned))
             .collect();
         assert_eq!(got, [("uuid-a", false), ("uuid-b", true)]);
-        assert!(preflight_scope(&BTreeMap::new(), &deps).is_empty());
+        assert!(preflight_scope(&BTreeMap::new(), &deps, &none).is_empty());
         let mut bom = files.clone();
         bom.insert(VLT_LOCK.into(), format!("\u{feff}{}", files[VLT_LOCK]));
-        assert!(preflight_scope(&bom, &deps).is_empty());
+        assert!(preflight_scope(&bom, &deps, &none).is_empty());
+    }
+
+    #[test]
+    fn a_vlt_vendored_takeover_is_scoped_through_its_vendored_node() {
+        let files = lock(&[
+            r#""file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+e-1.0.0+node__modules+e": [0,"e",null,".socket/vendor/npm/11111111-2222-4333-8444-555555555555/e-1.0.0/node_modules/e"]"#,
+            r#""file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+f-1.0.0+node__modules+f": [0,"f",null,".socket/vendor/npm/11111111-2222-4333-8444-555555555555/f-1.0.0/node_modules/f"]"#,
+        ]);
+        let deps = [dep("e", Some("sha512-E")), dep("f", Some("sha512-F"))];
+        assert!(preflight_scope(&files, &deps, &BTreeSet::new()).is_empty());
+        let vendored = BTreeSet::from(["uuid-e".to_string()]);
+        let scope = preflight_scope(&files, &deps, &vendored);
+        assert_eq!(
+            scope,
+            [PreflightDep {
+                patch_uuid: "uuid-e".into(),
+                artifact_url: "https://patch.socket.dev/patch/npm/t/u/e-1.0.0.tgz".into(),
+                sha512: "sha512-E".into(),
+                already_pinned: false,
+                vendored: true,
+            }]
+        );
     }
 }

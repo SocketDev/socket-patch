@@ -2415,16 +2415,20 @@ pub(crate) async fn run_redirect_selected(
     // here is always safe; `pdm.lock` only ever carries pypi URLs.
     let pdm_inactive =
         files.contains_key("pdm.lock") && !socket_patch_core::patch::redirect::pdm_drives(&files);
-    let final_texts: Vec<&String> = files
+    // Likewise a `vlt-lock.json` the vlt rewrite was withheld from (its
+    // artifact failed the preflight beside another npm-family lock) may
+    // still hold an earlier run's pin: only the sibling lock this run
+    // rewrote can confirm that dep.
+    let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .map(|(name, content)| rewrite.files.get(name).unwrap_or(content))
+        .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
                 .filter(|(name, _)| !files.contains_key(*name))
-                .map(|(_, content)| content),
+                .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();
     let confirmed: Vec<(String, String)> = candidates
@@ -2504,7 +2508,11 @@ pub(crate) async fn run_redirect_selected(
             let suffixed_version =
                 registry.and_then(|o| o.identifiers.maven_suffixed_version.as_deref());
             let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
-            final_texts.iter().any(|text| {
+            let vlt_withheld = vlt_preflight.withheld_from_vlt.contains(uuid);
+            final_texts.iter().any(|(name, text)| {
+                if vlt_withheld && *name == socket_patch_core::constants::npm_family::VLT_LOCK {
+                    return false;
+                }
                 // The rewriters' own predicate — raw, or the `\/`-escaped
                 // slashes an old composer.lock spells them with — so a
                 // writer's spelling can never be one this probe misses. It
