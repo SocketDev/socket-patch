@@ -32,7 +32,9 @@
 //! commit-point write runs the barrier first, so a lockfile or ledger that
 //! names an artifact is never made durable ahead of the artifact itself: the
 //! per-file `F_FULLFSYNC` pair each artifact used to pay collapses into one
-//! plain `fsync` per file plus one cache flush per commit point.
+//! plain `fsync` per file plus one cache flush per commit point. (Unix
+//! only: off Unix the writer fsyncs each file itself and the barrier has
+//! nothing to sync — see [`DEFERS_FILE_SYNC`].)
 //!
 //! # Why a crash cannot corrupt a project
 //!
@@ -218,8 +220,20 @@ fn restore_pending(files: Vec<PathBuf>, dirs: BTreeSet<PathBuf>) {
     pending.dirs.extend(dirs);
 }
 
+/// Whether an artifact's file sync is deferred to the barrier. Unix only:
+/// the barrier reopens each file by path, and `fsync(2)` works on a
+/// read-only descriptor. Windows' `FlushFileBuffers` needs a handle with
+/// write access — a read-only reopen fails with `ERROR_ACCESS_DENIED`, and
+/// a write reopen fails on a read-only artifact — so there the stage + rename
+/// writer fsyncs every stage through its own handle before the rename, as
+/// the durable writer always did, and the barrier has no file left to sync
+/// (directories are not synced off Unix either). Everything is still
+/// recorded, so the barrier runs at the same points on every platform.
+pub(crate) const DEFERS_FILE_SYNC: bool = cfg!(unix);
+
 /// Plain-fsync every file and directory, then flush each device's cache
-/// once where the platform needs a separate call for that.
+/// once where the platform needs a separate call for that. Off Unix both
+/// were already synced when they were written ([`DEFERS_FILE_SYNC`]).
 pub(crate) fn sync_all_blocking(
     files: &[PathBuf],
     dirs: &BTreeSet<PathBuf>,
@@ -227,6 +241,7 @@ pub(crate) fn sync_all_blocking(
     // One open handle per device for the final cache flush.
     let mut flush: BTreeMap<u64, std::fs::File> = BTreeMap::new();
     let mut seen: BTreeSet<&Path> = BTreeSet::new();
+    let files: &[PathBuf] = if DEFERS_FILE_SYNC { files } else { &[] };
     for file in files {
         if !seen.insert(file.as_path()) {
             continue;

@@ -609,7 +609,12 @@ pub(crate) fn atomic_write_sync(
 }
 
 /// Stage `content` next to `path` and rename it over `path`; `durable`
-/// fsyncs the stage before the rename.
+/// fsyncs the stage before the rename. Off Unix every stage is fsynced here,
+/// through its own writable handle: Windows' `FlushFileBuffers` needs write
+/// access, so the barrier cannot sync the file later by reopening its path
+/// (a read-only open is refused with `ERROR_ACCESS_DENIED`, and a write open
+/// is refused for a read-only artifact) — see
+/// `super::durability::sync_all_blocking`.
 async fn stage_and_rename(
     path: &Path,
     parent: &Path,
@@ -617,6 +622,7 @@ async fn stage_and_rename(
     perms: Option<std::fs::Permissions>,
     durable: bool,
 ) -> std::io::Result<()> {
+    let durable = durable || !super::durability::DEFERS_FILE_SYNC;
     let stem = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
