@@ -669,6 +669,33 @@ pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Re
     Ok(())
 }
 
+/// [`save_state`] for a caller that holds the ledger as an `Arc` and
+/// changes it once per save (the vendor loop, one entry per package):
+/// `edit` is applied to `state` and the result persisted exactly as
+/// [`save_state`] would persist it. Inside a group commit the ledger the
+/// group holds IS `state` — the edit happens in place and nothing is
+/// copied — where [`save_state`] captured a deep copy of the whole ledger
+/// per package, O(P²) over a run. The bytes the commit renders are the
+/// same, since the captured value is the same ledger.
+///
+/// `edit` always runs, before any write is attempted, so a failed save
+/// leaves `state` edited exactly as the caller's own edit-then-save did.
+pub async fn save_state_shared(
+    project_root: &Path,
+    state: &mut Arc<VendorState>,
+    edit: impl FnOnce(&mut VendorState),
+) -> std::io::Result<()> {
+    let path = state_path(project_root);
+    STATE_MEMO.invalidate();
+    match crate::utils::group_commit::edit_value(&path, state, edit, render_state) {
+        Ok(()) if !state.entries.is_empty() => return Ok(()),
+        // Captured but emptied: `save_state` turns it into the removal.
+        Ok(()) => {}
+        Err(edit) => edit(Arc::make_mut(state)),
+    }
+    save_state(project_root, state).await
+}
+
 /// The ledger's on-disk JSON: a whole-file wiring record's `new` is
 /// stored as a version-2 edit of its `original` (see
 /// `super::ledger_snapshots`); a ledger without one keeps its version-1
@@ -1756,6 +1783,72 @@ mod tests {
         for e in std::fs::read_dir(dir).unwrap() {
             let name = e.unwrap().file_name().to_string_lossy().into_owned();
             assert!(!name.starts_with(".socket-stage-"), "litter: {name}");
+        }
+    }
+
+    /// SC5: [`save_state_shared`] persists exactly what the edit-then-
+    /// [`save_state`] it replaces persists — the same ledger seen by every
+    /// read, the same committed bytes, the same removal once emptied —
+    /// with and without a group commit; inside one, the edit is made on
+    /// the ledger the group holds instead of a per-save copy.
+    #[tokio::test]
+    async fn shared_save_matches_edit_then_save_state() {
+        use crate::utils::group_commit::GroupCommit;
+        for grouped in [false, true] {
+            let (shared_dir, owned_dir) =
+                (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (a, b) = (shared_dir.path(), owned_dir.path());
+            let mut seed = VendorState::new();
+            seed.entries
+                .insert("pkg:npm/seed@1.0.0".into(), sample_entry());
+            save_state(a, &seed).await.unwrap();
+            save_state(b, &seed).await.unwrap();
+
+            let groups = grouped.then(|| (GroupCommit::begin(a), GroupCommit::begin(b)));
+            let mut shared = Arc::new(load_state(a).await.unwrap());
+            let mut owned = load_state(b).await.unwrap();
+            for i in 0..6 {
+                let key = format!("pkg:npm/p{i}@1.0.0");
+                let mut entry = sample_entry();
+                entry.uuid = format!("{i:08}-0000-4000-8000-000000000000");
+                owned.entries.insert(key.clone(), entry.clone());
+                save_state(b, &owned).await.unwrap();
+                let before = Arc::as_ptr(&shared);
+                save_state_shared(a, &mut shared, |s| {
+                    s.entries.insert(key, entry);
+                })
+                .await
+                .unwrap();
+                if grouped && i > 0 {
+                    assert_eq!(Arc::as_ptr(&shared), before, "edited in place, not copied");
+                }
+                assert_eq!(*shared, owned);
+                assert_eq!(load_state(a).await.unwrap(), load_state(b).await.unwrap());
+                assert_eq!(*load_state_shared(a).await.unwrap(), owned);
+            }
+            if let Some((ga, gb)) = groups {
+                ga.commit().await.unwrap();
+                gb.commit().await.unwrap();
+            }
+            assert_eq!(
+                std::fs::read(a.join(VENDOR_STATE_REL)).unwrap(),
+                std::fs::read(b.join(VENDOR_STATE_REL)).unwrap(),
+                "grouped {grouped}: committed ledger bytes"
+            );
+
+            // Emptied: both remove the ledger.
+            let groups = grouped.then(|| (GroupCommit::begin(a), GroupCommit::begin(b)));
+            owned.entries.clear();
+            save_state(b, &owned).await.unwrap();
+            save_state_shared(a, &mut shared, |s| s.entries.clear())
+                .await
+                .unwrap();
+            if let Some((ga, gb)) = groups {
+                ga.commit().await.unwrap();
+                gb.commit().await.unwrap();
+            }
+            assert!(!a.join(VENDOR_STATE_REL).exists(), "grouped {grouped}");
+            assert!(!b.join(VENDOR_STATE_REL).exists(), "grouped {grouped}");
         }
     }
 }

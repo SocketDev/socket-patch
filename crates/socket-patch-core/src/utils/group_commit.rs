@@ -242,6 +242,59 @@ pub(crate) fn capture_value<T: Any + Send + Sync>(
     true
 }
 
+/// [`capture_value`] for a caller that keeps holding the value it captured
+/// and re-saves it after each edit (the vendor loop's ledger): `edit` runs
+/// on `value` IN PLACE and the result is captured, with no copy of the
+/// whole value per save. The overlay's own reference to the value this
+/// caller captured last time is dropped first, under the overlay's lock,
+/// so `Arc::make_mut` finds `value` unshared (a reader still holding an
+/// older `Arc` from [`read_value`] merely costs the one copy it always
+/// cost). Readers never observe a state between the two: the release, the
+/// edit and the capture happen under one lock hold.
+///
+/// `Err(edit)` — nothing run, nothing captured — when `path` is not
+/// captured, so the caller can apply the edit and write the disk itself.
+pub(crate) fn edit_value<T, F>(
+    path: &Path,
+    value: &mut Arc<T>,
+    edit: F,
+    render: Render,
+) -> Result<(), F>
+where
+    T: Any + Send + Sync + Clone,
+    F: FnOnce(&mut T),
+{
+    let Some((overlay, key)) = resolve(path) else {
+        return Err(edit);
+    };
+    let mut files = overlay
+        .files
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ours = matches!(
+        files.get(&key).and_then(|c| c.bytes.as_ref()),
+        Some(Content::Value { value: held, .. })
+            if std::ptr::eq(Arc::as_ptr(held) as *const u8, Arc::as_ptr(value) as *const u8)
+    );
+    if ours {
+        files.remove(&key);
+    }
+    edit(Arc::make_mut(value));
+    let held: Arc<dyn Any + Send + Sync> = Arc::clone(value) as Arc<dyn Any + Send + Sync>;
+    files.insert(
+        key,
+        Captured {
+            bytes: Some(Content::Value {
+                value: held,
+                render,
+                rendered: OnceLock::new(),
+            }),
+            preserve_mode: false,
+        },
+    );
+    Ok(())
+}
+
 /// The value [`capture_value`] captured for `path`, when it was captured
 /// as a `T`.
 pub(crate) fn read_value<T: Any + Send + Sync>(path: &Path) -> Option<Arc<T>> {
