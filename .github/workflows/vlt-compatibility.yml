@@ -442,11 +442,16 @@ jobs:
       - name: Windows and macOS locks equal Linux
         env:
           VERSIONS_OVERRIDE: ${{ github.event.inputs.versions }}
+          SHAPES_OVERRIDE: ${{ github.event.inputs.shapes }}
+          MODES_OVERRIDE: ${{ github.event.inputs.modes }}
         run: |
           required=()
-          if [ -z "$VERSIONS_OVERRIDE" ]; then
+          modes=(hosted vendored agent)
+          if [ -n "$MODES_OVERRIDE" ]; then read -r -a modes <<<"$MODES_OVERRIDE"; fi
+          # The required set only covers cells the native jobs were asked to run.
+          if [ -z "$VERSIONS_OVERRIDE" ] && { [ -z "$SHAPES_OVERRIDE" ] || [[ " $SHAPES_OVERRIDE " == *" direct "* ]]; }; then
             for v in 1.2.0 1.0.0-rc.14; do
-              for m in hosted vendored agent; do required+=("$v:$m:direct"); done
+              for m in "${modes[@]}"; do required+=("$v:$m:direct"); done
             done
           fi
           python3 scripts/backtest-vlt.py --diff-locks results --out lock-diff \

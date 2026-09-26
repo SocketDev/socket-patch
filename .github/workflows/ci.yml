@@ -1861,9 +1861,10 @@ jobs:
           set -o pipefail
           for attempt in 1 2 3; do
             echo "::group::hosted-e2e attempt $attempt"
+            # The step shell runs with -e: keep a failed attempt from ending it.
+            status=0
             cargo test -p socket-patch-cli --test e2e_hosted_production -- \
-              --ignored --nocapture --test-threads=4 2>&1 | tee hosted-e2e.log
-            status=$?
+              --ignored --nocapture --test-threads=4 2>&1 | tee hosted-e2e.log || status=$?
             echo "::endgroup::"
             if [ "$status" -eq 0 ]; then
               # The vlt leg (probe-driven: the clean refusal while the artifact
@@ -1888,9 +1889,9 @@ jobs:
           set -uo pipefail
           for attempt in 1 2 3; do
             echo "::group::vendored vlt production attempt $attempt"
+            status=0
             cargo test -p socket-patch-cli --test e2e_vendored_production -- \
-              --include-ignored vlt_pinned_matrix --nocapture 2>&1 | tee vlt-vendored-production.log
-            status=$?
+              --include-ignored vlt_pinned_matrix --nocapture 2>&1 | tee vlt-vendored-production.log || status=$?
             echo "::endgroup::"
             if [ "$status" -eq 0 ]; then
               python3 scripts/check-vlt-legs.py \

@@ -140,9 +140,11 @@ unchanged specifiers).
 
 ## npm: vlt notes
 
-[vlt](https://www.vlt.sh) is supported in agent, vendored and hosted mode on every
-release from 0.0.0-1 to 1.2.0, excluding the broken and never-published releases listed
-in [vlt compatibility](testing/vlt-compatibility.md#releases). vlt's lock is
+[vlt](https://www.vlt.sh) is supported in agent and hosted mode on every release from
+0.0.0-1 to 1.2.0, and in vendored mode from 0.0.0-19 (the first release whose lock has a
+`lockfileVersion`; older locks are refused with `vendor_lockfile_version_unsupported`),
+excluding the broken and never-published releases listed in
+[vlt compatibility](testing/vlt-compatibility.md#releases). vlt's lock is
 `vlt-lock.json`; its installed tree is `node_modules/.vlt/<DepID>/node_modules/<name>`
 plus the hidden lock `node_modules/.vlt-lock.json`, which vlt trusts as the installed
 graph. From 1.2.0 vlt also keeps a machine-wide content store (`store-linker`, hardlinked
@@ -240,7 +242,9 @@ use hosted mode for those. From vlt 1.0.8 a root dependency with resolved peers 
 `~peer.<hex>` extra even with one peer context (a workspace member's from rc.15), and
 vendored mode refuses such a variant instance today. Before rc.6 vlt cannot reinstall a
 vendored `file:` dependency without the lock (`vendor_vlt_legacy_lockfile` on era-A
-locks), and A0 locks are refused.
+locks), and A0 locks are refused. From 0.0.0-30 a plain `vlt install` keeps an optional
+dependency's installed upstream copy after vendoring; run `vlt ci` to link the vendored
+directory.
 
 **Agent mode.** `apply` and `rollback` patch every store copy of a `name@version`
 (legacy and tilde DepIDs, peer and modifier variants, transitive-only packages) and

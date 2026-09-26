@@ -101,7 +101,9 @@ The backtest writes `captures/<vlt>-<mode>-<shape>/{result.json,cli-output.json,
 and `summary.{json,md}`, and exits non-zero when any cell's verdict differs
 from the oracle. While patch.socket.dev re-encodes the artifact, hosted cells
 record `blocked-by-server-encoding`, and only when the cell's own probe saw a
-non-identity `Content-Encoding` and the CLI refused cleanly;
+non-identity `Content-Encoding` and the CLI refused cleanly. A blocked cell
+must carry only `redirect_vlt_artifact_unverifiable`: the withheld dependency
+never reaches a rewriter, so its lock-level and vendored codes are not due.
 `--identity-mirror` previews the hosted proof through a loopback mirror that
 fetches the artifact un-encoded (never an import source). `--serve-probe` is
 the watchdog's probe, `--canary-checks` the canary's watchdogs, and
@@ -262,6 +264,7 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | an optional-only project: lock-driven installs install nothing | `0.0.0-30 … 1.0.4` | — | — | — | — |
 | an optional-only project installs from the lock again | `>= 1.0.5` | — | — | — | — |
 | after a hosted→vendored takeover a plain `vlt install` already links the vendored dir | `<= 0.0.0-29` | — | — | — | — |
+| a plain `vlt install` keeps an installed optional dependency whose spec moved to a vendored `file:` directory (the upstream copy stays linked until `vlt ci`) | `>= 0.0.0-30` | — | — | — | — |
 | lockless `file:` directory dependencies fail to resolve | `0.0.0-31 … 1.0.0-rc.5` | — | — | — | — |
 | a re-save (`vlt install <new>`) drops slot [3] of default-registry nodes (the hosted URL; the patched integrity stays, so `vlt ci` fails `EINTEGRITY` until a rescan re-pins, and rollback reports drift) | `1.0.0-rc.6 … 1.0.0-rc.17` | — | — | — | — |
 | a warm cache re-fetches a changed tarball and fails its integrity (no stale-bytes hazard) | `1.0.0-rc.27 … 1.0.2` | — | — | — | — |

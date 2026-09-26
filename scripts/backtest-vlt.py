@@ -22,7 +22,10 @@ warmOrdinary / warmCi (the project's own tree after the heal),
 rollbackByteIdentical and rollbackOriginalBytes.
 Checks (vendored): cliSuccess, publishedPatch, referenceWritten,
 lockFormatPreserved, freshCi, freshOrdinary, vexManifestless,
-repeatStableLock, repair (a deleted payload is rebuilt and installs patched),
+repeatStableLock, warmOrdinary / warmCi (the project's own tree, which still
+links the registry copy; from 0.0.0-30 `vlt install` keeps an optional one),
+repair (a deleted payload is rebuilt and installs
+patched),
 rollbackByteIdentical (`vendor --revert`) and rollbackOriginalBytes.
 Checks (agent): cliSuccess, manifestWritten, lockUnchanged, patchedBytes,
 survivesNoopInstall, repeatStableLock, rollbackByteIdentical and
@@ -97,10 +100,12 @@ NPM_REGISTRY = 'https://registry.npmjs.org/'
 ACME_REGISTRY = 'https://registry.yarnpkg.com/'
 VLT_ACCEPT_ENCODING = 'gzip;q=1.0, identity;q=0.5'
 BLOCKED = 'blocked-by-server-encoding'
+BLOCKED_CODES = ['redirect_vlt_artifact_unverifiable']
 VERDICTS = ['patched', 'safe-refusal', 'unsafe', 'error', 'unsupported', BLOCKED]
 COMMAND_TIMEOUT = 600
 VEX_PRODUCT = 'pkg:npm/vlt-patch-backtest@1.0.0'
 OPTIONAL_HELD = 'unpatched copies of optional dependencies'
+A0_SKIPPED_OPTIONAL = 'Could not read package.json file'
 OPTIONAL_ONLY_LOCK = ('installs no optional dependency from the lock of a project that declares '
                       'only optional dependencies')
 
@@ -161,10 +166,11 @@ def unlisted_releases(published, supported, excluded):
 
 
 # ---------------------------------------------------------------------------
-# Shapes (a subset of depscan's capture-vlt.py SHAPES, with the same names and
-# the same oracle; the production patch is minimist@1.2.2 only, so shapes that
-# need a scoped, transitive-only or peer-bearing patch are left to the
-# hermetic suites and the local capture).
+# Shapes (a subset of depscan's capture-vlt.py SHAPES, with the same names).
+# The oracle follows the committed boundary table; capture-vlt.py does not yet
+# match it for optional-only cells on 0.0.0-24 … 0.0.0-31. The production
+# patch is minimist@1.2.2 only, so shapes that need a scoped, transitive-only
+# or peer-bearing patch are left to the hermetic suites and the local capture.
 
 def manifest(name='vlt-patch-backtest', **sections):
     data = dict(name=name, version='1.0.0', private=True)
@@ -310,6 +316,26 @@ def known_vlt_limitation(version, mode, shape_name):
     return None
 
 
+def optional_warm_kept(version, mode, shape_name):
+    """From 0.0.0-30 a plain `vlt install` keeps an installed optional
+    dependency whose spec moved to the vendored `file:` directory; `vlt ci`
+    relinks it (boundary table)."""
+    return mode == 'vendored' and bool(SHAPES[shape_name].get('optional')) and at_least(
+        version, '0.0.0-30')
+
+
+def integrity_enforced(version, optional, code, err, installed, patched_bytes_used):
+    """The tampered checkout failed on the digest. vlt skips an optional
+    dependency that fails to fetch, and 0.0.0-16 then fails reading its
+    package.json: when the untampered checkout installed the patched bytes,
+    only the wrong digest kept the target out (depscan's capture-vlt.py
+    rule)."""
+    if code != 0 and 'integrity' in err.lower():
+        return True
+    skipped = code == 0 or (era_of(version) == 'A0' and A0_SKIPPED_OPTIONAL in err)
+    return bool(optional) and not installed and skipped and patched_bytes_used is True
+
+
 def churn_exempt(version, mode, shape_name):
     """rc.14 rewrites an alias-named `file:` dependency's peer-edge bareSpec on
     its first `ci` (DESIGN §8.3 byte-stability oracle)."""
@@ -336,12 +362,22 @@ def observed_verdict(row):
     return 'unsafe'
 
 
+def required_codes(row):
+    """The codes the row must carry. A blocked cell's dep is withheld from
+    every rewriter (and a conversion never reaches its second run), so only
+    the refusal's own code is due, not the cell's lock-level or vendored
+    codes."""
+    if row.get('verdict') == BLOCKED:
+        return BLOCKED_CODES
+    return row.get('expectedCodes', [])
+
+
 def matches_expectation(row):
     """Observed == expected. Two allowances: a must-patch hosted cell whose
     probe saw a content-encoded artifact and whose CLI refused cleanly
     (BLOCKED), and a must-patch cell whose only unproven checks are the
     documented vlt limitation (`expectedLimitation`)."""
-    if not set(row.get('expectedCodes', [])) <= set(row.get('codes', [])):
+    if not set(required_codes(row)) <= set(row.get('codes', [])):
         return False
     verdict, expected = row.get('verdict'), row.get('expectedVerdict')
     if verdict == expected:
@@ -952,6 +988,7 @@ class Cell:
         self.project = self.case / 'project'
         self.record = ctx['record']
         self.envelopes = []
+        self.fresh_patched = {}
 
     # CLI -------------------------------------------------------------------
     def cli(self, args, cwd=None):
@@ -1147,6 +1184,8 @@ class Cell:
         if clean:
             row['blocked'] = True
             row['blockedByProbe'] = probe.get('contentEncoding')
+            row['expectedCodesUnblocked'] = row['expectedCodes']
+            row['expectedCodes'] = BLOCKED_CODES
             row.pop('manifestSha256', None)
             row['manifestSha256'] = capture_tree(self.project, self.case / 'tree')
             row['checks'].pop('serveEncodingIdentity', None)
@@ -1190,6 +1229,7 @@ class Cell:
                 row.setdefault('churn', []).append(f'{label}: skip:vlt-own-churn')
             patched, row[label + 'Files'] = self.holds(checkout, text, 'after')
             checks[label] = code == 0 and stable and patched
+            self.fresh_patched[label] = code == 0 and patched
             shutil.rmtree(checkout, ignore_errors=True)
         self.limitation(row, checks, ['freshCi', 'freshOrdinary'])
 
@@ -1286,9 +1326,9 @@ class Cell:
         checkout, code, err = self.fresh(vlt, 'tamper', files)
         row['tamperTail'] = tail(err, 1500)
         installed = any(p.is_dir() for p in self.copies(checkout, text))
-        checks['tamperedDigest'] = tampered != lock_after and (
-            (code != 0 and 'integrity' in err.lower())
-            or (self.spec.get('optional') and code == 0 and not installed))
+        checks['tamperedDigest'] = tampered != lock_after and integrity_enforced(
+            self.version, self.spec.get('optional'), code, err, installed,
+            self.fresh_patched.get('freshCi'))
         shutil.rmtree(checkout, ignore_errors=True)
         self.limitation(row, checks, ['tamperedDigest'])
         self.vex(row, checks, vlt, 'redirected', record or self.record)
@@ -1305,11 +1345,27 @@ class Cell:
             code, _, _ = vlt.run(['install'], self.project, self.home('install'), self.log)
             patched, row['warmOrdinaryFiles'] = self.holds(self.project, text, 'after')
             checks['warmOrdinary'] = code == 0 and patched
+        self.warm_ci(row, checks, vlt, text)
+        self.rolled_back(row, checks, vlt, original, text)
+
+    def warm_ci(self, row, checks, vlt, text):
         code, _, _ = vlt.reinstall(self.project, self.home('install'), self.log)
         patched, row['warmCiFiles'] = self.holds(self.project, text, 'after')
         checks['warmCi'] = code == 0 and patched
         self.limitation(row, checks, ['warmOrdinary', 'warmCi'])
-        self.rolled_back(row, checks, vlt, original, text)
+
+    def warm(self, row, checks, vlt, text):
+        """The project's own tree, which still links the registry copy: an
+        ordinary install lands the vendored bytes (or, where vlt keeps an
+        optional dependency, leaves the upstream copy intact), then a locked
+        one lands them."""
+        code, _, _ = vlt.run(['install'], self.project, self.home('install'), self.log)
+        patched, row['warmOrdinaryFiles'] = self.holds(self.project, text, 'after')
+        if not patched and optional_warm_kept(self.version, self.mode, self.shape_name):
+            patched, _ = self.holds(self.project, text, 'before')
+            row['warmOrdinaryKeptUpstream'] = patched
+        checks['warmOrdinary'] = code == 0 and patched
+        self.warm_ci(row, checks, vlt, text)
 
     def check_vendored(self, row, checks, before_lock, vlt, original):
         if self.unchanged(row):
@@ -1344,6 +1400,8 @@ class Cell:
         self.installs(row, checks, vlt, lock_after, text)
         self.vex(row, checks, vlt, 'vendored', record or self.record)
         self.repeat(row, checks, lock_after)
+        self.warm(row, checks, vlt, text)
+        lock_before_repair = (self.project / 'vlt-lock.json').read_bytes()
         payload_dir = self.project / payload
         shutil.rmtree(payload_dir)
         code, out, _ = self.cli(['repair', '--yes', '--cwd', self.project])
@@ -1355,7 +1413,7 @@ class Cell:
         checkout, install_code, _ = self.fresh(vlt, 'repair-checkout', snapshot(self.project))
         patched, row['repairFiles'] = self.holds(checkout, text, 'after')
         checks['repair'] = code == 0 and rebuilt and install_code == 0 and patched and (
-            self.project / 'vlt-lock.json').read_bytes() == lock_after
+            self.project / 'vlt-lock.json').read_bytes() == lock_before_repair
         shutil.rmtree(checkout, ignore_errors=True)
         self.limitation(row, checks, ['repair'])
         self.rolled_back(row, checks, vlt, original, text)

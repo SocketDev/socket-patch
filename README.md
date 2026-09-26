@@ -290,8 +290,10 @@ for the tested versions, workspace behavior, and installer integrity limits.
 
 ### vlt compatibility
 
-[vlt](https://www.vlt.sh) projects (`vlt-lock.json`) work in every mode, on every vlt
-release from 0.0.0-1 to 1.2.0 (both DepID grammars and every `lockfileVersion`).
+[vlt](https://www.vlt.sh) projects (`vlt-lock.json`) work in agent and hosted mode on
+every vlt release from 0.0.0-1 to 1.2.0 (both DepID grammars and every
+`lockfileVersion`), and in vendored mode on locks with `lockfileVersion` 0 or 1
+(0.0.0-19 and later); older locks are refused with `vendor_lockfile_version_unsupported`.
 Agent mode patches each copy in `node_modules/.vlt` without writing through vlt 1.2's
 shared store. Hosted mode repoints the patched nodes' integrity and URL, first checks
 that each artifact is served the way vlt can verify, and removes stale installed copies
