@@ -250,9 +250,12 @@ static MANIFEST_MEMO: ParseMemo<toml_edit::DocumentMut> = ParseMemo::new();
 
 /// The Socket registry pins of each manifest [`hosted_redirect_residue`]
 /// reads (the root one and every member's), extracted once per manifest
-/// bytes: the residue check runs once per patched crate over the same few
-/// manifests. One slot per manifest a workspace commonly has.
-static PIN_MEMO: ParseMemo<crate::patch::redirect::CargoRegistryPins, 8> = ParseMemo::new();
+/// bytes: the residue check runs once per patched crate over the same
+/// manifests — and once a project is vendored, every `[patch.crates-io]`
+/// path copy is a member, so there are as many as there are vendored
+/// crates. Slots to match the member walk's own memo; beyond them the
+/// oldest are evicted.
+static PIN_MEMO: ParseMemo<crate::patch::redirect::CargoRegistryPins, 512> = ParseMemo::new();
 
 async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str) -> Option<String> {
     let socket_indexes = cargo_config::socket_registry_indexes(project_root).await;
