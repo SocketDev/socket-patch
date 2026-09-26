@@ -251,10 +251,12 @@ jobs:
           - {os: windows-latest, vlt: '1.0.10'}
           - {os: windows-latest, vlt: '1.1.1'}
           - {os: windows-latest, vlt: '1.2.0'}
-          # Node engine floors (DESIGN §1.1), with the collation golden (ICU drift).
+          # Node floors (DESIGN §1.1 as measured, scripts/install-vlt.sh): the
+          # newest release on each, with the collation golden (ICU drift).
           - {os: ubuntu-latest, vlt: '1.2.0', node: '22.22.0'}
-          - {os: ubuntu-latest, vlt: '1.0.0-rc.18', node: '22.9.0'}
-          - {os: ubuntu-latest, vlt: '1.0.0-rc.9', node: '22.0.0'}
+          - {os: ubuntu-latest, vlt: '1.0.0-rc.18', node: '22.13.0'}
+          - {os: ubuntu-latest, vlt: '0.0.0-30', node: '22.7.0'}
+          - {os: ubuntu-latest, vlt: '0.0.0-1', node: '22.0.0'}
           # Store linkers of the global store (1.2.0), safety suite only.
           - {os: ubuntu-latest, vlt: '1.2.0', linker: auto, suites: e2e_safety_vlt}
           - {os: ubuntu-latest, vlt: '1.2.0', linker: hardlink, suites: e2e_safety_vlt}
@@ -285,13 +287,15 @@ jobs:
         shell: bash
         env:
           VLT_TEST_VERSION: ${{ matrix.vlt }}
+          NODE_PIN: ${{ matrix.node }}
         run: |
           set -euo pipefail
           js=$(scripts/install-vlt.sh "$VLT_TEST_VERSION" "$RUNNER_TEMP/vlt-tool")
           echo "SOCKET_PATCH_VLT_E2E_JS=$js" >> "$GITHUB_ENV"
           # A lockfileVersion-0 writer (0.0.0-19 … rc.14) also gets the
-          # upgrade legs, against 1.2.0.
-          if VLT_TEST_VERSION=$VLT_TEST_VERSION node -e '
+          # upgrade legs, against 1.2.0 — except on a Node-floor row, whose
+          # Node is below 1.2.0's floor (the legs then skip no-upgrade-vlt).
+          if [ -z "$NODE_PIN" ] && VLT_TEST_VERSION=$VLT_TEST_VERSION node -e '
             const m = /^0\.0\.0-(\d+)$|^1\.0\.0-rc\.(\d+)$/.exec(process.env.VLT_TEST_VERSION);
             process.exit(m && (m[1] ? Number(m[1]) >= 19 : Number(m[2]) <= 14) ? 0 : 1);'; then
             up=$(scripts/install-vlt.sh 1.2.0 "$RUNNER_TEMP/vlt-upgrade")

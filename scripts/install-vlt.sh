@@ -6,10 +6,16 @@
 # `npm pack` (5 attempts), then the tarball's sha512 must equal the registry's
 # `dist.integrity` and, when scripts/vlt-historical-integrity.json lists the
 # release, that committed pin too (fail closed). The tarball is installed
-# with `npm install --prefix <prefix> --ignore-scripts`, and `node vlt.js
-# --version` must print the release. Finally the running Node must meet the
-# release's engine floor (DESIGN §1.1): >=22 through 1.0.0-rc.9, >=22.9.0 for
-# rc.10 … rc.18, >=22.22.0 from rc.22.
+# with `npm install --prefix <prefix> --ignore-scripts`. The running Node
+# must meet the Node floor the release's CLI actually runs on (checked before
+# vlt runs), and `node vlt.js --version` must print the release. The floor is
+# above the
+# `engines` field (>=22 through rc.9, >=22.9.0 for rc.10 … rc.18) where that
+# field is wrong: 0.0.0-11 … 0.0.0-30 ship ESM without `"type": "module"`
+# (Node >= 22.7.0, which detects module syntax unflagged), 0.0.0-31 … rc.18
+# load `node:sqlite` on `vlt install` (Node >= 22.13.0, which unflags it),
+# and every release from rc.22 declares >=22.22.0. 0.0.0-1 is
+# `"type": "module"` and runs from 22.0.0.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -63,21 +69,16 @@ if (actual !== expected || (pinned !== undefined && pinned !== expected)) {
 npm install --prefix "$prefix" --no-audit --no-fund --ignore-scripts --no-package-lock "$tarball" >&2
 rm -f "$tarball"
 js="$prefix/node_modules/vlt/vlt.js"
-actual=$(node --no-warnings "$js" --version)
-if [ "$actual" != "$version" ]; then
-  echo "expected vlt $version at $js, got $actual" >&2
-  exit 1
-fi
 
 # shellcheck disable=SC2016 # JavaScript, not shell
 VLT_VERSION=$version node -e '
 const v = process.env.VLT_VERSION;
 const m = /^(\d+)\.(\d+)\.(\d+)(?:-(rc\.)?(\d+))?$/.exec(v);
 if (!m) { console.error(`not a vlt release: ${v}`); process.exit(1); }
-const rc = m[4] ? Number(m[5]) : null;
+const pre = m[5] === undefined ? null : Number(m[5]);
 let floor = "22.22.0";
-if (m[1] === "0" || (rc !== null && rc <= 9)) floor = "22.0.0";
-else if (rc !== null && rc <= 18) floor = "22.9.0";
+if (m[1] === "0") floor = pre === null || pre <= 10 ? "22.0.0" : pre <= 30 ? "22.7.0" : "22.13.0";
+else if (m[4] && pre <= 18) floor = "22.13.0";
 const have = process.versions.node.split(".").map(Number);
 const need = floor.split(".").map(Number);
 for (let i = 0; i < 3; i++) {
@@ -88,4 +89,11 @@ for (let i = 0; i < 3; i++) {
   }
 }
 '
+# After the floor check, so a too-old Node fails with the floor message
+# rather than vlt's own SyntaxError / ERR_UNKNOWN_BUILTIN_MODULE.
+actual=$(node --no-warnings "$js" --version)
+if [ "$actual" != "$version" ]; then
+  echo "expected vlt $version at $js, got $actual" >&2
+  exit 1
+fi
 printf '%s\n' "$js"

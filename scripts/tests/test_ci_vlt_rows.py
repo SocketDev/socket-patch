@@ -271,8 +271,8 @@ class CompatibilityWorkflow(unittest.TestCase):
 
     def test_node_floors_and_store_linkers(self):
         floors = sorted((r["vlt"], r["node"]) for r in self.rows if "node" in r)
-        self.assertEqual(floors, [("1.0.0-rc.18", "22.9.0"), ("1.0.0-rc.9", "22.0.0"),
-                                  ("1.2.0", "22.22.0")])
+        self.assertEqual(floors, [("0.0.0-1", "22.0.0"), ("0.0.0-30", "22.7.0"),
+                                  ("1.0.0-rc.18", "22.13.0"), ("1.2.0", "22.22.0")])
         linkers = sorted((r["os"], r["linker"], r.get("cache_root", "")) for r in self.rows
                          if "linker" in r)
         self.assertEqual(linkers, sorted([

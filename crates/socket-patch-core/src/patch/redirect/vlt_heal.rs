@@ -901,19 +901,17 @@ mod tests {
         let sibling_dir = package_dir(root, sibling, "ms");
         std::fs::create_dir_all(&sibling_dir).unwrap();
         std::fs::write(sibling_dir.join("index.js"), b"ms").unwrap();
-        let entry = root.join(VLT_STORE_DIR).join(ID).join("node_modules");
+        // `mklink` reads a `/` as a switch: build both paths from components.
+        let vlt_dir = root.join("node_modules").join(".vlt");
+        let entry = vlt_dir.join(ID).join("node_modules");
         std::fs::create_dir_all(entry.join("left-pad")).unwrap();
         let status = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(entry.join("ms"))
-            .arg(
-                root.join(VLT_STORE_DIR)
-                    .join(sibling)
-                    .join("node_modules/ms"),
-            )
+            .arg(vlt_dir.join(sibling).join("node_modules").join("ms"))
             .status()
             .unwrap();
-        assert!(status.success());
+        assert!(status.success(), "mklink /J failed");
         if std::os::windows::fs::symlink_dir(
             root.join(VLT_STORE_DIR).join(sibling),
             entry.join("dir-link"),

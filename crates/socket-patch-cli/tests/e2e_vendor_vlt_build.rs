@@ -163,6 +163,16 @@ fn assert_vendored(fx: &Fixture, t: &PatchTarget, importer: &str) {
     }
 }
 
+/// `p` relative to the leg root, `/`-separated, for a git run in the root:
+/// git rejects the `\\?\` verbatim paths the canonical root has on Windows
+/// ("could not create work tree dir … Invalid argument").
+fn leg_relative(fx: &Fixture, p: &Path) -> String {
+    p.strip_prefix(&fx.leg.root)
+        .expect("a path under the leg root")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 /// A fresh checkout's locked install and frozen install land the patched
 /// payload with the lock byte-stable.
 fn assert_fresh_vendored(fx: &Fixture, t: &PatchTarget, name: &str) -> PathBuf {
@@ -778,8 +788,8 @@ async fn vlt_pinned_matrix_vendored_dep_with_deps() {
         &[
             "clone",
             "-q",
-            fx.proj.to_str().unwrap(),
-            co.to_str().unwrap(),
+            &leg_relative(&fx, &fx.proj),
+            &leg_relative(&fx, &co),
         ],
     );
     fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "clone");
@@ -817,8 +827,8 @@ async fn vlt_pinned_matrix_vendored_hostile_gitignore() {
         &[
             "clone",
             "-q",
-            fx.proj.to_str().unwrap(),
-            co.to_str().unwrap(),
+            &leg_relative(&fx, &fx.proj),
+            &leg_relative(&fx, &co),
         ],
     );
     fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "clone");
@@ -848,8 +858,8 @@ async fn vlt_pinned_matrix_vendored_autocrlf_checkout() {
             "core.autocrlf=true",
             "clone",
             "-q",
-            fx.proj.to_str().unwrap(),
-            co.to_str().unwrap(),
+            &leg_relative(&fx, &fx.proj),
+            &leg_relative(&fx, &co),
         ],
     );
     let payload = package_files(&co.join(rel(fx.t())));
@@ -1290,7 +1300,25 @@ async fn vlt_pinned_matrix_vendored_legacy_lockfile_warning() {
     let mut leg = leg;
     for scalar in [false, true] {
         let mut shape = Shape::with_bystander().warm();
-        shape.vlt_json.no_registry = !scalar;
+        if scalar {
+            // The harness's own vlt.json names npmjs on rc.7 … rc.29
+            // (`scalar_registry_ignored`), which rc.8 writes as `··` ids:
+            // name the local registry, as `hosted/scalar_registry` does.
+            shape = shape.vlt_json_fn(|v, r| {
+                let config = json!({ "registry": r });
+                let mut doc = if flat_vlt_json(v) {
+                    config
+                } else {
+                    json!({ "config": config })
+                };
+                if lock_ignored_without_modifiers(v) {
+                    doc["modifiers"] = json!({});
+                }
+                doc
+            });
+        } else {
+            shape.vlt_json.no_registry = true;
+        }
         let fx = Fixture::build(leg, shape).await;
         let lock = read_lock(&fx.proj);
         let id = node_id(&lock, LP.0, LP.1);
@@ -1310,15 +1338,29 @@ async fn vlt_pinned_matrix_vendored_legacy_lockfile_warning() {
             doc.to_string().contains("vendor_vlt_legacy_lockfile"),
             "{doc:#}"
         );
-        assert_fresh_vendored(
-            &fx,
-            fx.t(),
-            if scalar {
-                "fresh-legacy-scalar"
-            } else {
-                "fresh-legacy"
-            },
-        );
+        if scalar && scalar_registry_ignored(fx.leg.version()) {
+            // rc.7 … rc.29 re-resolve a scalar-registry lock: `vlt ci`
+            // rewrites the bystander's URL-segment id to `··` (measured on
+            // rc.8), so only the vendored payload is asserted.
+            let co = fx.checkout("fresh-legacy-scalar");
+            fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "fresh-legacy-scalar");
+            assert_eq!(state(&co, fx.t()), State::Patched);
+            let ci = read_lock(&co);
+            assert!(
+                node_id(&ci, MS.0, MS.1).starts_with("··"),
+                "vlt re-resolved the scalar-registry lock: {ci:#}"
+            );
+        } else {
+            assert_fresh_vendored(
+                &fx,
+                fx.t(),
+                if scalar {
+                    "fresh-legacy-scalar"
+                } else {
+                    "fresh-legacy"
+                },
+            );
+        }
         leg = fx.leg;
     }
     leg.ran();

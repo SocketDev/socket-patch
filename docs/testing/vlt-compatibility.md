@@ -63,8 +63,8 @@ asserted and each named test or row exists.
   `versions` / `shapes` / `modes`). A path-filtered workflow cannot be a
   required check. Jobs: `build` (the capstones and the CLI, once per OS);
   `install-proof` (every capstone on 31 Linux, 11 macOS and 15 Windows
-  releases, the Node engine floors 22.22.0 / 22.9.0 / 22.0.0 with the collation
-  golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
+  releases, the Node floors 22.22.0 / 22.13.0 / 22.7.0 / 22.0.0 with the
+  collation golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
   cache root); `native` (the backtest against production, artifacts
   `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape);
   `lock-diff` (the same cell's `vlt-lock.json` must be byte-identical on Linux,
@@ -152,6 +152,13 @@ cargo test -p socket-patch-cli --test e2e_redirect_vlt_build -- --include-ignore
 python3 scripts/check-vlt-legs.py --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json vlt-leg.log
 ```
 
+vlt finishes some work in detached children after a command returns: the
+global-store explode on 1.2.0 (Linux `auto`, `hardlink`, `copy`), the cache
+unzip, cache revalidation and the deletion of `.VLT.DELETE.*` staging dirs.
+Every harness vlt run preloads a hook (`node --import`, not inherited by those
+children) that spawns them attached and waits for them, so a leg asserts the
+tree vlt leaves once its work is done, never a race with it.
+
 Every leg is a test named `vlt_pinned_matrix_<suite>_<leg>` that prints one
 `VLT-LEG <vlt-version> <os> <suite> <leg> ran|skip:<reason>` line.
 `scripts/check-vlt-legs.py` fails a run on `0 passed`, on a binary that
@@ -220,8 +227,11 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | A0 locks are refused by vendored mode | `<= 0.0.0-18` | — | migration | `*` | `a0-vendored-unsupported` |
 | A0 locks are refused by vendored mode | `<= 0.0.0-18` | — | production | `vendored_install_proof` | `a0-vendored-unsupported` |
 | the global store and `store-linker` | `< 1.2.0` | — | safety | `*` | `no-global-store` |
+| `vlt install` needs Node >= 22.7.0, above `engines` (`>=22`): the CLI is ESM without `"type": "module"`, and Node detects module syntax unflagged only from 22.7.0 (22.6.0: `SyntaxError: Cannot use import statement outside a module`); `install-proof` runs 0.0.0-30 on 22.7.0 | `0.0.0-11 … 0.0.0-30` | — | — | — | — |
+| `vlt install` loads `node:sqlite`, unflagged from Node 22.13.0, above `engines` (`>=22` through rc.9, `>=22.9.0` for rc.10 … rc.18; 22.12.0: `ERR_UNKNOWN_BUILTIN_MODULE`); `install-proof` runs rc.18 on 22.13.0 | `0.0.0-31 … 1.0.0-rc.18` | — | — | — | — |
 | `vlt ci`, `--frozen-lockfile`, `--expect-lockfile` exist | `< 0.0.0-19` | — | hosted | `frozen_dead_registry`, `optional_dependency_heal`, `then_vendored_optional_takeover` | `no-vlt-ci` |
 | a scalar `registry` makes lock-driven installs re-resolve from public npm | `1.0.0-rc.7 … 1.0.0-rc.29` | — | hosted | `frozen_dead_registry` | `non-hermetic-registry` |
+| the same re-resolution makes `vlt ci` rewrite a vendored era-A lock's scalar-registry ids to `··` (the vendored `file:` payload still installs patched), so `legacy_lockfile_warning`'s scalar arm pins that instead of a byte-stable lock | `1.0.0-rc.7 … 1.0.0-rc.8` | — | — | — | — |
 | registry tarball integrity is not enforced on a cold fetch | `== 0.0.0-1` | — | hosted | `tamper_cold_eintegrity` | `integrity-unenforced` |
 | bare specs honor `registries.npm` | `< 1.0.0-rc.33` | — | hosted | `mirror_registries_npm` | `registries-npm-ignored` |
 | named registry specs (`acme:x@1`), scoped registries and URL-segment DepIDs exist (flat-config releases record every registry node under the default segment) | `< 0.0.0-14` | — | hosted | `named_alias_untouched` | `no-named-registry-specs` |
