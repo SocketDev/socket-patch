@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "purl": "pkg:composer/psr/log@3.0.2",
+  "patchUuid": "5f3c8a2e-7b41-4d6a-9e0c-1a2b3c4d5e6f",
+  "ecosystem": "composer",
+  "vulnerabilities": [],
+  "vendoredAt": "2026-09-26T00:00:00Z"
+}

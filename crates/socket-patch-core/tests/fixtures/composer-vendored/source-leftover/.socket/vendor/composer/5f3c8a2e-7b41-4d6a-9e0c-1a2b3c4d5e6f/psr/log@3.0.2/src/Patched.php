@@ -1,0 +1,2 @@
+<?php
+// SOCKET-PATCH-MARKER
