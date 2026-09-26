@@ -2,6 +2,13 @@
 members = [
     "crates/socket-patch-core",
     "crates/socket-patch-cli",
+    "crates/socket-patch-node",
+]
+# Bare `cargo build` (release.yml's per-target builds) skips the Node addon,
+# which no release artifact ships; `--workspace` and `-p` still build it.
+default-members = [
+    "crates/socket-patch-core",
+    "crates/socket-patch-cli",
 ]
 resolver = "2"
 
@@ -21,6 +28,7 @@ sha1 = "=0.10.6"
 hex = "=0.4.3"
 reqwest = { version = "=0.12.28", features = ["rustls-tls", "json"], default-features = false }
 tokio = { version = "=1.50.0", features = ["full"] }
+tokio-util = "=0.7.18"
 thiserror = "=2.0.18"
 walkdir = "=2.5.0"
 uuid = { version = "=1.21.0", features = ["v4"] }
@@ -45,6 +53,9 @@ wiremock = "=0.6.5"
 portable-pty = "=0.9.0"
 base64 = "=0.22.1"
 serial_test = "=3.4.0"
+napi = { version = "=3.13.0", features = ["napi8", "tokio_rt"] }
+napi-derive = "=3.6.9"
+napi-build = "=2.5.0"
 
 [profile.release]
 strip = true
@@ -61,6 +72,12 @@ opt-level = "s"
 inherits = "release"
 lto = false
 strip = "none" # unstripped test binaries => usable backtraces on failure
+
+# The Node addon (crates/socket-patch-node) for hosts that load it
+# in-process: release semantics without the slow full-LTO link.
+[profile.addon]
+inherits = "release"
+lto = "thin"
 
 # Test-execution speed: `cargo test` builds dependencies with the dev
 # profile; at opt-level 0 the hash/compression/bsdiff hot loops are 10-100x
