@@ -1240,7 +1240,13 @@ into the new version's section — see docs/releasing.md.
   `target/` does), using the directory listing it already reads. One
   semantic change: a `node_modules` inside such a directory, or anywhere
   below it, is no longer crawled, so its packages are no longer scanned,
-  patched or attested. The scan root itself is always crawled, and a
+  patched or attested. Every command that looks for installed npm copies
+  walks the same trees, so the change reaches past `scan`: `scan --prune` /
+  `--sync` treat a package installed only under a tagged directory as not
+  installed and garbage-collect its manifest entry and blobs (unless a
+  lockfile still resolves it), and `apply`, `rollback`, `remove`, `repair`,
+  `vendor` and `vex` no longer find copies there — so `remove` leaves such a
+  copy's patched files in place. The scan root itself is always crawled, and a
   `CACHEDIR.TAG` without the signature (or that is a directory or a
   symlink) prunes nothing. On a Rust-plus-JS monorepo this skipped 57% of
   the walked directories. See docs/ecosystems.md.
@@ -1254,18 +1260,21 @@ into the new version's section — see docs/releasing.md.
   follow the new cap up to their own ceilings: `vex` / `scan --vex` record
   fetches now run up to 10 at once (was 8), wheel metadata stays at 4 and the
   vendored archive prefetch at 4. The public proxy stays at 4.
-  `SOCKET_API_CONCURRENCY=<n>` still replaces all of it (1-32; on the proxy
-  it can only lower the cap). Output is unchanged — every window folds its
+  `SOCKET_API_CONCURRENCY=<n>` still overrides the adaptive cap (1-32; on
+  the proxy it can only lower it); the fixed windows keep their own ceilings
+  on top of it. Output is unchanged — every window folds its
   answers in request order — but a large monorepo's hosted scan at 100 ms of
   latency drops from ~20 s to ~9 s.
 
-- **The `node_modules` walk runs on 4 threads by default.** The crawl's
-  walk pool used one thread per logical CPU (up to 16), but the walk is
+- **The crawl's directory walks run on 4 threads by default.** The walk
+  pool behind the `node_modules` walk and the Maven repository walk (and its
+  POM parse) used one thread per logical CPU (up to 16), but the walk is
   bound by the kernel's directory cache: on a 14-core Mac and on Linux
-  ext4, 4 threads walked a large monorepo as fast as or faster than one per CPU,
-  with a quarter of the system time (see `walk_pool.rs` for the
-  measurements). The default is now 4, or the performance-core count when
-  that is lower (`hw.perflevel0.logicalcpu` on Apple silicon).
+  ext4, 4 threads walked a large monorepo's `node_modules` as fast as or
+  faster than one per CPU, with a quarter of the system time (see
+  `walk_pool.rs` for the measurements; the Maven walk shares the pool and was
+  not measured separately). The default is now 4, or the performance-core
+  count when that is lower (`hw.perflevel0.logicalcpu` on Apple silicon).
   `SOCKET_WALK_THREADS=<n>` overrides it, clamped to 1-16 and to the CPU
   count. What the crawl finds, and its order, are unchanged.
 

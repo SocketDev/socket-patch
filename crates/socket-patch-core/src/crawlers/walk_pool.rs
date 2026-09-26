@@ -85,6 +85,9 @@ const MAX_WALK_THREADS: usize = 16;
 /// Four is the fastest (or tied) on both, at a quarter of the machine-wide
 /// pool's system time. On a machine with fewer (performance) cores than
 /// this, the core count binds instead.
+///
+/// The Maven crawler's repository walk and POM parse share this pool, so
+/// the default sizes them too; only the npm crawl was measured.
 const DEFAULT_WALK_THREADS: usize = 4;
 
 /// Env override for the pool size: a positive integer replaces the default
