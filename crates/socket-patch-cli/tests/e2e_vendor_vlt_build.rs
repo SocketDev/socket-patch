@@ -122,18 +122,25 @@ fn repair(fx: &Fixture) -> SocketOut {
     socket_api(&fx.proj, &fx.svc, &["repair"], &[])
 }
 
+/// The lock's `file` node wiring `t`'s vendored dir, if any.
+fn vendored_file_node(lock: &Value, t: &PatchTarget) -> Option<String> {
+    let r = rel(t);
+    lock["nodes"]
+        .as_object()?
+        .iter()
+        .find(|(id, tuple)| id.starts_with("file") && tuple[3] == r)
+        .map(|(id, _)| id.clone())
+}
+
 /// The committed wiring for `t`: the importer spec, the lock's `file` node
 /// and the payload (with `devDependencies` stripped from package.json).
 fn assert_vendored(fx: &Fixture, t: &PatchTarget, importer: &str) {
     let r = rel(t);
     let lock = read_lock(&fx.proj);
-    let file_node = lock["nodes"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .find(|(id, _)| id.starts_with("file") && lock["nodes"][*id][3] == r)
-        .map(|(id, _)| id.clone());
-    assert!(file_node.is_some(), "a file node for {r}: {lock:#}");
+    assert!(
+        vendored_file_node(&lock, t).is_some(),
+        "a file node for {r}: {lock:#}"
+    );
     let pkg: Value = serde_json::from_slice(
         &std::fs::read(fx.proj.join(importer).join("package.json")).unwrap(),
     )
@@ -1358,17 +1365,31 @@ async fn vlt_pinned_matrix_vendored_legacy_lockfile_warning() {
             "{doc:#}"
         );
         if scalar && scalar_registry_ignored(fx.leg.version()) {
-            // rc.7 … rc.29 re-resolve a scalar-registry lock: `vlt ci`
-            // rewrites the bystander's URL-segment id to `··` (measured on
-            // rc.8), so only the vendored payload is asserted.
-            let co = fx.checkout("fresh-legacy-scalar");
-            fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), "fresh-legacy-scalar");
-            assert_eq!(state(&co, fx.t()), State::Patched);
+            // rc.7 … rc.29 re-resolve a scalar-registry lock, so `vlt ci`
+            // is not byte-stable here: it re-keys the bystander from
+            // (public) npm, which is vlt's business and only logged. The
+            // vendored node and payload must survive it, and the frozen
+            // install must land them again on the lock `vlt ci` wrote.
+            let name = "fresh-legacy-scalar";
+            let co = fx.checkout(name);
+            fx.vlt_ok_profile(&co, &fx.leg.locked_install_args(), name);
+            assert_eq!(state(&co, fx.t()), State::Patched, "after ci");
             let ci = read_lock(&co);
             assert!(
-                node_id(&ci, MS.0, MS.1).starts_with("··"),
-                "vlt re-resolved the scalar-registry lock: {ci:#}"
+                vendored_file_node(&ci, fx.t()).is_some(),
+                "ci keeps the vendored node: {ci:#}"
             );
+            eprintln!(
+                "observed: vlt {} ci re-keys the bystander as {:?}",
+                fx.leg.tc.raw,
+                node_ids(&ci, MS.0, MS.1)
+            );
+            let frozen = fx.leg.frozen_args();
+            std::fs::remove_dir_all(co.join("node_modules")).unwrap();
+            let before = lock_bytes(&co);
+            fx.vlt_ok_profile(&co, &frozen, &format!("{name}-frozen"));
+            assert_eq!(state(&co, fx.t()), State::Patched, "after {frozen:?}");
+            assert_eq!(lock_bytes(&co), before, "frozen keeps the post-ci lock");
         } else {
             assert_fresh_vendored(
                 &fx,
