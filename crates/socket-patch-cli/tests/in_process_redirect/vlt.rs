@@ -598,6 +598,65 @@ async fn scan_redirect_vlt_drives_entry_not_found_sibling_rewrite_does_not_confi
     assert_eq!(artifact_requests(&server).await, 0);
 }
 
+/// When vlt does not drive (a sibling lock and no vlt install state), a
+/// dep vlt-lock.json merely lacks is confirmed by the sibling lock's rules.
+#[tokio::test]
+async fn scan_redirect_vlt_not_driving_entry_not_found_sibling_confirms() {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_package_json(tmp.path());
+    std::fs::write(
+        tmp.path().join("vlt-lock.json"),
+        lock_with(Era::V1, &["\"~npm~ms@2.1.3\": [0,\"ms\"]".to_string()]),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("package-lock.json"), package_lock()).unwrap();
+
+    let (_, doc) = scan_hosted(tmp.path(), &server, &["--no-npm-allow-remote-config"], &[]);
+
+    let codes = warning_codes(&doc);
+    assert!(
+        codes.contains(&"redirect_vlt_entry_not_found".to_string())
+            && codes.contains(&"redirect_vlt_sibling_lockfiles".to_string()),
+        "{doc:#}"
+    );
+    assert!(read(tmp.path(), "package-lock.json").contains(&artifact_url(&server)));
+    assert_eq!(redirected(&doc), 1, "{doc:#}");
+    assert!(ledger(tmp.path())["records"][PURL].is_object());
+}
+
+/// A dep the vlt rewriter refuses is confirmed by no lock, even when vlt
+/// does not drive and the sibling lock already carries its hosted URL.
+#[tokio::test]
+async fn scan_redirect_vlt_not_driving_refused_dep_is_not_confirmed_by_the_sibling() {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_package_json(tmp.path());
+    let off_grammar =
+        format!("\"{TILDE_ID}\": [0, \"{NAME}\", \"{UPSTREAM_SHA512}\", \"{REGISTRY_URL}\"]");
+    let lock = lock_with(
+        Era::V1,
+        &["\"~npm~ms@2.1.3\": [0,\"ms\"]".to_string(), off_grammar],
+    );
+    std::fs::write(tmp.path().join("vlt-lock.json"), &lock).unwrap();
+    std::fs::write(tmp.path().join("package-lock.json"), package_lock()).unwrap();
+
+    let (_, doc) = scan_hosted(tmp.path(), &server, &["--no-npm-allow-remote-config"], &[]);
+
+    let codes = warning_codes(&doc);
+    assert!(
+        codes.contains(&"redirect_vlt_unsupported_lock_key".to_string())
+            && codes.contains(&"redirect_vlt_sibling_lockfiles".to_string()),
+        "{doc:#}"
+    );
+    assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
+    assert!(read(tmp.path(), "package-lock.json").contains(&artifact_url(&server)));
+    assert_eq!(redirected(&doc), 0, "{doc:#}");
+    assert!(!ledger_path(tmp.path()).exists() || ledger(tmp.path())["records"][PURL].is_null());
+}
+
 const VENDORED_UUID: &str = "11111111-2222-4333-8444-555555555555";
 
 /// A vlt project whose left-pad is vendored (§3.4 D19 dir node) and
