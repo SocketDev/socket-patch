@@ -273,7 +273,10 @@ fn write_manifest(root: &Path, patches: &[Patch]) {
 fn zip_bytes(members: &[(&str, &[u8])]) -> Vec<u8> {
     use std::io::Write as _;
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default();
+    // A fixed "made by" host: the zip crate stamps DOS on a Windows build,
+    // and the checked-in legacy-ledger fixtures carry these archives'
+    // hashes as a Unix build made them.
+    let opts = zip::write::SimpleFileOptions::default().system(zip::System::Unix);
     for (name, bytes) in members {
         zw.start_file(*name, opts).unwrap();
         zw.write_all(bytes).unwrap();

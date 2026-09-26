@@ -234,9 +234,12 @@ impl JsonLayout {
 }
 
 /// Serialize `(name, bytes, unix mode)` entries — in the given order — into
-/// a deterministic zip: a fixed DOS timestamp (1980-01-01 00:00:00) and a
-/// fixed deflate level, so rebuilding the same content always yields
-/// identical bytes (churn-free commits, stable checksums).
+/// a deterministic zip: a fixed DOS timestamp (1980-01-01 00:00:00), a
+/// fixed deflate level and a fixed "made by" host (Unix — the zip crate
+/// otherwise stamps DOS on a Windows build, which also tells readers to
+/// ignore the unix modes it carries), so rebuilding the same content always
+/// yields identical bytes on every platform (churn-free commits, stable
+/// checksums).
 pub(crate) fn write_zip_entries(entries: &[(String, Vec<u8>, u32)]) -> Result<Vec<u8>, String> {
     use std::io::Write as _;
 
@@ -246,6 +249,7 @@ pub(crate) fn write_zip_entries(entries: &[(String, Vec<u8>, u32)]) -> Result<Ve
             .compression_method(zip::CompressionMethod::Deflated)
             .compression_level(Some(6))
             .last_modified_time(zip::DateTime::default())
+            .system(zip::System::Unix)
             .unix_permissions(*mode);
         writer
             .start_file(name, options)
@@ -2407,6 +2411,33 @@ mod tests {
                 "{label} must fall back to the on-disk repack"
             );
         }
+    }
+
+    /// The rebuilt archive is byte-identical on every platform: every
+    /// central-directory entry names Unix as its "made by" host (the zip
+    /// crate's own default is DOS on Windows) and keeps the unix mode it was
+    /// given, so a wheel/jar/nupkg rebuilt on Windows hashes like the one
+    /// the ledger recorded on macOS or Linux.
+    #[test]
+    fn write_zip_entries_stamps_a_unix_host_on_every_platform() {
+        let bytes = write_zip_entries(&[
+            ("pkg/run.sh".to_string(), b"#!/bin/sh\n".to_vec(), 0o755),
+            ("pkg/data.txt".to_string(), b"data\n".to_vec(), 0o644),
+        ])
+        .unwrap();
+        let mut hosts = Vec::new();
+        let mut at = 0;
+        while let Some(i) = bytes[at..].windows(4).position(|w| w == b"PK\x01\x02") {
+            let header = at + i;
+            hosts.push(bytes[header + 5]);
+            at = header + 4;
+        }
+        assert_eq!(hosts, vec![3, 3], "made-by host byte is Unix (3)");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let modes: Vec<u32> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().unix_mode().unwrap() & 0o777)
+            .collect();
+        assert_eq!(modes, vec![0o755, 0o644]);
     }
 
     /// `record.files` is a `HashMap` with a per-process random hasher, and
