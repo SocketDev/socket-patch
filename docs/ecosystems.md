@@ -132,6 +132,14 @@ other tools that follow the convention: neither that directory's own
 crawled, even when it is tagged itself. A `CACHEDIR.TAG` that lacks the
 signature, is a directory or is a symlink prunes nothing.
 
+Every command that looks for installed npm copies walks these same trees, not
+only `scan`. A package installed only under a pruned directory is therefore
+"not installed" to `scan --prune` / `--sync`, which garbage-collect its
+manifest entry and blobs unless a lockfile still resolves it, and `apply`,
+`rollback`, `remove`, `repair`, `vendor` and `vex` do not find that copy:
+`remove` drops the manifest entry but leaves the copy's patched files in
+place.
+
 ## npm: Rush monorepos
 
 A Rush repo has no root `package.json`/lockfile pair — its pnpm source-of-truth locks

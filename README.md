@@ -544,8 +544,8 @@ a scan starts reporting fewer patches than it should because some requests are b
 rejected. `SOCKET_API_CONCURRENCY=1` sends one request at a time, the slowest and most
 conservative setting. An unset, empty or non-numeric value leaves the defaults in place.
 
-The crawl has a pacing knob too. The `node_modules` walk runs on a small pool of threads:
-4 by default (fewer on a machine with fewer performance cores), because the walk is bound
+The crawl has a pacing knob too. Its directory walks (`node_modules`, and the Maven
+repository with its POM parse) run on a small pool of threads: 4 by default (fewer on a machine with fewer performance cores), because the walk is bound
 by the kernel's directory cache and more threads only add system time.
 `SOCKET_WALK_THREADS=<n>` overrides that, clamped to `1`-`16` and to the machine's CPU
 count; an unset, empty or non-numeric value leaves the default in place. A soft open-file
