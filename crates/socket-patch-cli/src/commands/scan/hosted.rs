@@ -3635,7 +3635,7 @@ mod tests {
     fn socket_api_concurrency_paces_the_wheel_metadata_window() {
         let orig = std::env::var(API_CONCURRENCY_ENV).ok();
         std::env::remove_var(API_CONCURRENCY_ENV);
-        // The window's own ceiling still binds: the authenticated cap is 8,
+        // The window's own ceiling still binds: the authenticated cap is 32,
         // but a whole wheel per in-flight request is what sizes this one.
         assert_eq!(
             wheel_metadata_concurrency(false),

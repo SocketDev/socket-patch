@@ -1061,8 +1061,9 @@ mod tests {
         use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
         let orig = std::env::var(API_CONCURRENCY_ENV).ok();
         std::env::remove_var(API_CONCURRENCY_ENV);
-        // A view is heavy, so the API's own cap is what binds by default.
-        assert_eq!(fetch_concurrency(false), 8);
+        // A view is heavy, so this window's own ceiling binds by default
+        // on the authenticated API (whose cap is above it).
+        assert_eq!(fetch_concurrency(false), FETCH_CONCURRENCY);
         assert_eq!(fetch_concurrency(true), 4);
 
         std::env::set_var(API_CONCURRENCY_ENV, "1");
