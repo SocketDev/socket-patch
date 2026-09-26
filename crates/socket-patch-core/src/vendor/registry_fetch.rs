@@ -326,7 +326,10 @@ async fn resolve_pypi_url_by_hash(
         entry.version
     );
     let resp = client.get(&api).send().await.map_err(|e| {
-        FetchError::Failed(format!("PyPI JSON API request for {} failed: {e}", entry.purl))
+        FetchError::Failed(format!(
+            "PyPI JSON API request for {} failed: {e}",
+            entry.purl
+        ))
     })?;
     if !resp.status().is_success() {
         return Err(FetchError::Failed(format!(
@@ -336,7 +339,10 @@ async fn resolve_pypi_url_by_hash(
         )));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| {
-        FetchError::Failed(format!("PyPI JSON API response for {} is not JSON: {e}", entry.purl))
+        FetchError::Failed(format!(
+            "PyPI JSON API response for {} is not JSON: {e}",
+            entry.purl
+        ))
     })?;
     let digest_matches = |file: &serde_json::Value| {
         file.get("digests")
@@ -899,6 +905,53 @@ pub async fn stage_local_artifact(
     })
 }
 
+/// Stage a package from a committed vlt directory artifact (the
+/// fresh-clone re-vendor path): an inventory-verified copy of `dir` without
+/// its `node_modules/`. Refused when the ledger records no inventory, and
+/// on any missing, extra or modified file.
+pub async fn stage_local_dir_artifact(
+    dir: &Path,
+    inventory: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<FetchedPackage, FetchError> {
+    let Some(inventory) = inventory else {
+        return Err(FetchError::Unverifiable(
+            "the vendor ledger records no file inventory for the artifact".to_string(),
+        ));
+    };
+    let actual = super::verify::compute_package_dir_inventory(dir)
+        .await
+        .map_err(|e| FetchError::Failed(format!("{}: {e}", dir.display())))?;
+    if &actual != inventory {
+        return Err(FetchError::Failed(format!(
+            "{}: the committed dir does not match the vendor ledger's file inventory",
+            dir.display()
+        )));
+    }
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create staging tempdir: {e}")))?;
+    let staged = tmp.path().join("package");
+    crate::patch::copy_tree::fresh_copy(dir, &staged, None)
+        .await
+        .map_err(|e| FetchError::Failed(format!("cannot stage {}: {e}", dir.display())))?;
+    crate::patch::copy_tree::remove_tree(&staged.join("node_modules"))
+        .await
+        .map_err(|e| FetchError::Failed(format!("cannot stage {}: {e}", dir.display())))?;
+    let copied = super::verify::compute_package_dir_inventory(&staged)
+        .await
+        .map_err(|e| FetchError::Failed(format!("{}: {e}", dir.display())))?;
+    if &copied != inventory {
+        return Err(FetchError::Failed(format!(
+            "{}: the staged copy does not match the vendor ledger's file inventory",
+            dir.display()
+        )));
+    }
+    Ok(FetchedPackage {
+        dir: staged,
+        url: format!("file:{}", dir.display()),
+        _tmp: tmp,
+    })
+}
+
 /// Capped download. http(s) only; the cap is enforced on the declared
 /// Content-Length AND the actual stream (a lying server cannot blow past
 /// it).
@@ -1134,13 +1187,20 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
 /// `.crate` (tar.gz, single top-level `{name}-{version}/` prefix) into the
 /// vendor copy dir — the same content the local `fresh_copy` produces.
 pub(crate) fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
-    extract_tar_gz(bytes, dest, /*strip_first=*/ true)
+    extract_tar_gz(bytes, dest, /*strip_first=*/ true, false)
+}
+
+/// [`extract_tgz`] that refuses the archive instead of skipping a symlink,
+/// hardlink, device or FIFO entry (a directory artifact is committed as
+/// extracted, so nothing the archive carries may be silently dropped).
+pub(crate) fn extract_tgz_strict(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    extract_tar_gz(bytes, dest, /*strip_first=*/ true, true)
 }
 
 /// Like [`extract_tgz`] but keeps entry paths verbatim (gem `data.tar.gz`
 /// archives carry package content at the root, no prefix dir).
 fn extract_tgz_no_strip(bytes: &[u8], dest: &Path) -> Result<(), String> {
-    extract_tar_gz(bytes, dest, /*strip_first=*/ false)
+    extract_tar_gz(bytes, dest, /*strip_first=*/ false, false)
 }
 
 /// Extract a `.gem`'s package content into `dest`. A `.gem` is a plain
@@ -1179,7 +1239,12 @@ pub(crate) fn extract_gem_data(gem_bytes: &[u8], dest: &Path) -> Result<(), Stri
     Err("the .gem carries no data.tar.gz".to_string())
 }
 
-fn extract_tar_gz(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
+fn extract_tar_gz(
+    bytes: &[u8],
+    dest: &Path,
+    strip_first: bool,
+    strict: bool,
+) -> Result<(), String> {
     use std::io::Read as _;
     let gz = flate2::read::GzDecoder::new(bytes).take(MAX_TOTAL_DECOMPRESSED_BYTES);
     let mut archive = tar::Archive::new(gz);
@@ -1195,7 +1260,21 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), St
         }
         // Regular files only: symlinks/hardlinks/devices never extract
         // (a symlink could redirect later entries out of the stage).
-        if !entry.header().entry_type().is_file() {
+        let kind = entry.header().entry_type();
+        if !kind.is_file() {
+            if strict
+                && !(kind.is_dir()
+                    || kind.is_pax_global_extensions()
+                    || kind.is_pax_local_extensions())
+            {
+                return Err(format!(
+                    "tarball entry `{}` is not a regular file or directory — refusing the artifact",
+                    entry
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ));
+            }
             continue;
         }
         let raw = entry
@@ -1539,6 +1618,45 @@ mod tests {
         match stage_local_artifact(&tgz_path, "").await {
             Err(FetchError::Unverifiable(_)) => {}
             other => panic!("expected Unverifiable for empty hash, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_local_dir_artifact_verifies_the_inventory_and_drops_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("left-pad");
+        std::fs::create_dir_all(dir.join("node_modules/.bin")).unwrap();
+        std::fs::write(dir.join("package.json"), b"{}").unwrap();
+        std::fs::write(dir.join("index.js"), b"x").unwrap();
+        std::fs::write(dir.join("node_modules/.bin/tool"), b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../../elsewhere", dir.join("node_modules/dep")).unwrap();
+        let inventory = super::super::verify::compute_package_dir_inventory(&dir)
+            .await
+            .unwrap();
+        assert_eq!(inventory.len(), 2, "{inventory:?}");
+
+        let staged = stage_local_dir_artifact(&dir, Some(&inventory))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(staged.dir().join("index.js")).unwrap(), b"x");
+        assert!(!staged.dir().join("node_modules").exists());
+        assert_eq!(staged.url, format!("file:{}", dir.display()));
+
+        std::fs::write(dir.join("planted.js"), b"y").unwrap();
+        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
+            other => panic!("a planted file must fail, got {other:?}"),
+        }
+        std::fs::remove_file(dir.join("planted.js")).unwrap();
+        std::fs::write(dir.join("index.js"), b"modified").unwrap();
+        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
+            other => panic!("a modified file must fail, got {other:?}"),
+        }
+        match stage_local_dir_artifact(&dir, None).await {
+            Err(FetchError::Unverifiable(_)) => {}
+            other => panic!("no inventory is unverifiable, got {other:?}"),
         }
     }
 
@@ -1934,7 +2052,6 @@ mod tests {
             .dir()
             .join("requests-2.28.0.dist-info/RECORD")
             .is_file());
-
     }
 
     /// poetry.lock records wheel hashes but no URLs: the fetcher resolves the
@@ -1944,7 +2061,10 @@ mod tests {
     async fn pypi_hash_only_entry_is_resolved_through_the_json_api() {
         let wheel = make_zip(&[
             ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
+            (
+                "requests-2.28.0.dist-info/RECORD",
+                b"requests/__init__.py,sha256=abc,24\n",
+            ),
         ]);
         let sha = hex::encode(Sha256::digest(&wheel));
         let mock = MockServer::start().await;
@@ -2014,7 +2134,10 @@ mod tests {
     async fn pypi_digest_set_entry_picks_the_pure_wheel_by_hash() {
         let wheel = make_zip(&[
             ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
+            (
+                "requests-2.28.0.dist-info/RECORD",
+                b"requests/__init__.py,sha256=abc,24\n",
+            ),
         ]);
         let wheel_sha = hex::encode(Sha256::digest(&wheel));
         let sdist_sha = "0".repeat(64);
@@ -2079,11 +2202,21 @@ mod tests {
         restore();
         let fetched = fetched.unwrap();
         assert!(fetched.dir().join("requests/__init__.py").is_file());
-        assert!(fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"), "{}", fetched.url);
-        for (label, result) in [("no pure wheel", no_pure_result), ("unknown", unknown_result)] {
+        assert!(
+            fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"),
+            "{}",
+            fetched.url
+        );
+        for (label, result) in [
+            ("no pure wheel", no_pure_result),
+            ("unknown", unknown_result),
+        ] {
             match result {
                 Err(FetchError::Unverifiable(msg)) => {
-                    assert!(msg.contains("none-any.whl") && msg.contains("digests"), "{label}: {msg}")
+                    assert!(
+                        msg.contains("none-any.whl") && msg.contains("digests"),
+                        "{label}: {msg}"
+                    )
                 }
                 other => panic!("{label}: expected Unverifiable, got {other:?}"),
             }
@@ -2791,7 +2924,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         extract_zip(&bytes, tmp.path(), /*strip_first=*/ false).unwrap();
         assert!(tmp.path().join("m@v1/go.mod").is_file());
-        assert!(!tmp.path().join("m@v1/d").exists(), "dir entry must not materialize");
+        assert!(
+            !tmp.path().join("m@v1/d").exists(),
+            "dir entry must not materialize"
+        );
 
         // The dirhash covers FILES only — the dir entry must not add a line.
         assert_eq!(
@@ -3011,8 +3147,11 @@ mod tests {
         let zip_bytes = make_module_zip("m@v1/", &[("go.mod", b"module m\n")]);
         let h1 = go_h1_of_zip(&zip_bytes).unwrap();
         verify_go_h1(&zip_bytes, &h1).expect("a matching dirhash must verify");
-        let err = verify_go_h1(&zip_bytes, "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .unwrap_err();
+        let err = verify_go_h1(
+            &zip_bytes,
+            "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .unwrap_err();
         assert!(err.contains("mismatch"), "{err}");
     }
 
@@ -3044,9 +3183,8 @@ mod tests {
 
         // GoH1 has a dedicated fetch-path verifier; None is reachable from a
         // repair against an npm-era lock recording no integrity. Both refuse.
-        let err =
-            artifact_matches_integrity(b"x", "pkg", &LockIntegrity::GoH1("h1:x".into()))
-                .unwrap_err();
+        let err = artifact_matches_integrity(b"x", "pkg", &LockIntegrity::GoH1("h1:x".into()))
+            .unwrap_err();
         assert!(err.contains("dedicated ecosystem fetcher"), "{err}");
         let err = artifact_matches_integrity(b"x", "pkg", &LockIntegrity::None).unwrap_err();
         assert!(err.contains("no integrity recorded"), "{err}");

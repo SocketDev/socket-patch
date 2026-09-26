@@ -2493,3 +2493,132 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
         "the heal run prints the full guidance again; stderr=\n{stderr}"
     );
 }
+
+// ───────────────────────────── vlt ─────────────────────────────
+
+/// A vendored vlt entry is never reverted for a hosted takeover the vlt
+/// rewriter would then refuse: the lock-level refusal (here a BOM) is known
+/// first, the purl is skipped with that code, and the vendored ledger and
+/// the lock stay byte-identical.
+#[tokio::test]
+async fn vlt_takeover_refusal_before_revert() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    std::fs::remove_file(tmp.path().join("package-lock.json")).unwrap();
+    let lock = format!(
+        "\u{feff}{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+         \"~npm~{NAME}@{VERSION}\": [0,\"{NAME}\",\"{UPSTREAM_SHA512}\",\"https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+    );
+    std::fs::write(tmp.path().join("vlt-lock.json"), &lock).unwrap();
+    write_vendor_state(tmp.path(), PURL, UUID, "vlt");
+    let state_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
+
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
+
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert!(
+        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
+            .iter()
+            .any(|e| e["purl"] == PURL && e["reason"] == "redirect_vlt_lock_unsupported")),
+        "{doc:#}"
+    );
+    assert!(warning_detail(&doc, "redirect_vlt_lock_unsupported").contains("BOM"));
+    assert!(!warning_codes(&doc).contains(&"redirect_vendored_revert_failed".to_string()));
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+        state_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap(),
+        lock
+    );
+}
+
+/// With `bun.lockb` beside a vlt-driven `vlt-lock.json`, the vlt rules
+/// decide npm confirmation before the binary-bun rule: the binary rewrite
+/// lands, but the vlt rewriter refused the dep, so it is not confirmed.
+#[tokio::test]
+async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let body = b"minimist tarball".to_vec();
+    let sri = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&body))
+    );
+    let server = MockServer::start().await;
+    let url = format!("{}/patch/npm/minimist-1.2.2.tgz", server.uri());
+    mock_discovery(&server, purl, UUID).await;
+    mock_reference_results(
+        &server,
+        json!({ UUID: {
+            "status": "granted", "url": url, "purl": purl,
+            "artifacts": [{"kind": "tarball", "url": url, "integrity": {"sha512": sri}}],
+            "registryOverride": null,
+        }}),
+    )
+    .await;
+    mock_view(&server, UUID, purl).await;
+    Mock::given(method("GET"))
+        .and(path("/patch/npm/minimist-1.2.2.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let run = |off_grammar: bool| {
+        let tmp = tempfile::tempdir().unwrap();
+        let original =
+            include_bytes!("../../socket-patch-core/tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+        std::fs::write(tmp.path().join("bun.lockb"), original).unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            include_bytes!("../../socket-patch-core/tests/fixtures/bun-lockb/1.1.45/package.json"),
+        )
+        .unwrap();
+        let space = if off_grammar { " " } else { "" };
+        std::fs::write(
+            tmp.path().join("vlt-lock.json"),
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+                 \"~npm~is-number@7.0.0\": [0,\"is-number\"],\n    \
+                 \"~npm~minimist@1.2.2\": [0,{space}\"minimist\",\"{UPSTREAM_SHA512}\",\"https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let pkg = tmp.path().join("node_modules/minimist");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "minimist", "version": "1.2.2" }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/.vlt")).unwrap();
+        let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[("PATH", "")]);
+        assert_eq!(code, 0, "{doc:#}");
+        (doc, tmp)
+    };
+
+    let (refused, tmp) = run(true);
+    assert!(
+        warning_codes(&refused).contains(&"redirect_vlt_unsupported_lock_key".to_string()),
+        "{refused:#}"
+    );
+    assert!(
+        refused["redirect"]["rewrittenFiles"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("bun.lockb")),
+        "the binary lock is still rewritten: {refused:#}"
+    );
+    assert_eq!(refused["redirect"]["redirected"], 0, "{refused:#}");
+    drop(tmp);
+
+    let (confirmed, _tmp) = run(false);
+    assert_eq!(confirmed["redirect"]["redirected"], 1, "{confirmed:#}");
+}

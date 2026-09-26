@@ -12,7 +12,8 @@
 //! Fail-closed order (each failure is a stable snake_case routing tag):
 //! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
 //! `vendor_artifact_missing` → `vendor_artifact_unreadable` /
-//! `file_not_found` / `vendor_hash_mismatch` / `vendor_inventory_mismatch`
+//! `file_not_found` / `vendor_hash_mismatch` / `vendor_inventory_mismatch` /
+//! `vendor_manifest_unverifiable`
 //! (dir-shaped artifacts with a recorded [`file_inventory`] additionally
 //! verify their FULL file tree — missing, extra and modified unpatched
 //! files all fail; entries without one keep member-only verification).
@@ -24,7 +25,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-use crate::manifest::schema::PatchRecord;
+use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{normalize_file_path, verify_file_patch, VerifyStatus};
 use crate::patch::package::read_archive_to_map;
 
@@ -92,6 +93,9 @@ pub async fn verify_vendored_patch_record(
     // `.nupkg` (a plain OPC zip) / `.jar` (a plain zip) via the bounded zip
     // reader — their member paths are package-relative, exactly the manifest
     // key space. Everything else is a dir-shaped copy hashed in place.
+    if is_vlt_dir_entry(entry) {
+        return verify_vlt_dir(project_root, &artifact, entry, record).await;
+    }
     let path_str = artifact.to_string_lossy();
     let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
     let is_zip =
@@ -161,6 +165,201 @@ async fn verify_dir_members(
         }
     }
     Ok(())
+}
+
+/// A vlt package-dir entry (DESIGN §4.2): npm, flavor `vlt`, not a tarball.
+pub(crate) fn is_vlt_dir_entry(entry: &VendorEntry) -> bool {
+    entry.ecosystem == "npm"
+        && entry.flavor.as_deref() == Some(super::vlt_lock::FLAVOR)
+        && !artifact_is_file_shaped(&entry.artifact.path)
+}
+
+/// The largest afterHash blob the vlt manifest exemption reads.
+const MAX_MANIFEST_BLOB_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A vlt package dir: the §4.2 structure rule, only links and `.bin/`
+/// scripts under its `node_modules/`, every record member at its afterHash
+/// with the vlt manifest exemption for `package.json` (§4.4), and the
+/// inventory of everything but `node_modules/`.
+async fn verify_vlt_dir(
+    project_root: &Path,
+    dir: &Path,
+    entry: &VendorEntry,
+    record: &PatchRecord,
+) -> Result<(), String> {
+    let Some((name, _)) = parse_vendor_path(&entry.artifact.path)
+        .and_then(|p| super::vlt_lock_text::parse_vendored_dir_leaf(&p.leaf))
+    else {
+        return Err("vendor_path_unsafe".to_string());
+    };
+    if !super::npm_dir::structure_rule_holds(dir, &name).await
+        || !super::npm_dir::node_modules_holds_only_links(dir).await
+    {
+        return Err("vendor_inventory_mismatch".to_string());
+    }
+    let inventory = entry.artifact.file_inventory.as_ref();
+    for (file_name, info) in &record.files {
+        if normalize_file_path(file_name) == "package.json" {
+            if let Some(pin) = inventory.and_then(|inv| inv.get("package.json")) {
+                if vlt_manifest_matches(project_root, dir, pin, &info.after_hash).await {
+                    continue;
+                }
+                return Err("vendor_hash_mismatch".to_string());
+            }
+            unpinned_vlt_manifest(project_root, dir, file_name, info).await?;
+            continue;
+        }
+        match verify_file_patch(dir, file_name, info).await.status {
+            VerifyStatus::AlreadyPatched => {}
+            VerifyStatus::Ready | VerifyStatus::HashMismatch => {
+                return Err("vendor_hash_mismatch".to_string())
+            }
+            VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+        }
+    }
+    if let Some(inventory) = inventory {
+        let actual = compute_package_dir_inventory(dir)
+            .await
+            .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+        let same = actual.len() == inventory.len()
+            && inventory
+                .iter()
+                .all(|(rel, sha)| actual.get(rel).is_some_and(|a| a.eq_ignore_ascii_case(sha)));
+        if !same {
+            return Err("vendor_inventory_mismatch".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `installed`, an installed copy of the vlt package-dir `entry`,
+/// carries `record`. vlt links a `file:` dependency straight to the
+/// committed directory, so a copy that resolves to it is the artifact
+/// itself; any other copy verifies each member, `package.json` under the
+/// vlt manifest exemption.
+pub(crate) async fn vlt_installed_copy_matches(
+    project_root: &Path,
+    installed: &Path,
+    entry: &VendorEntry,
+    record: &PatchRecord,
+) -> bool {
+    let artifact = project_root.join(normalize_file_path(&entry.artifact.path));
+    if let (Ok(a), Ok(b)) = (
+        tokio::fs::canonicalize(installed).await,
+        tokio::fs::canonicalize(&artifact).await,
+    ) {
+        if a == b {
+            return true;
+        }
+    }
+    let pin = entry
+        .artifact
+        .file_inventory
+        .as_ref()
+        .and_then(|inv| inv.get("package.json"));
+    for (file_name, info) in &record.files {
+        if normalize_file_path(file_name) == "package.json" {
+            let matches = match pin {
+                Some(pin) => {
+                    vlt_manifest_matches(project_root, installed, pin, &info.after_hash).await
+                }
+                None => unpinned_vlt_manifest(project_root, installed, file_name, info)
+                    .await
+                    .is_ok(),
+            };
+            if !matches {
+                return false;
+            }
+            continue;
+        }
+        if verify_file_patch(installed, file_name, info).await.status
+            != VerifyStatus::AlreadyPatched
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The vlt manifest exemption (DESIGN §4.4): the committed `package.json`
+/// is post-transform, so it verifies iff it hashes to the inventory pin and,
+/// when the afterHash blob is in the local blob store, the blob with its
+/// devDependencies stripped hashes to that pin too.
+async fn vlt_manifest_matches(
+    project_root: &Path,
+    dir: &Path,
+    pin: &str,
+    after_hash: &str,
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let Ok(on_disk) = crate::utils::fs::read_regular_to_bytes(&dir.join("package.json")).await
+    else {
+        return false;
+    };
+    if !hex::encode(Sha256::digest(&on_disk)).eq_ignore_ascii_case(pin) {
+        return false;
+    }
+    let Some(blob) = local_after_blob(project_root, after_hash).await else {
+        return true;
+    };
+    stripped_manifest(blob)
+        .is_some_and(|stripped| hex::encode(Sha256::digest(&stripped)).eq_ignore_ascii_case(pin))
+}
+
+/// The vlt manifest exemption for an entry with no inventory pin (one
+/// built from `vlt-lock.json` alone): `package.json` verifies at its
+/// afterHash, or as the local afterHash blob with its devDependencies
+/// stripped. Without that blob a transformed manifest cannot be judged
+/// (`vendor_manifest_unverifiable`).
+async fn unpinned_vlt_manifest(
+    project_root: &Path,
+    dir: &Path,
+    file_name: &str,
+    info: &PatchFileInfo,
+) -> Result<(), String> {
+    match verify_file_patch(dir, file_name, info).await.status {
+        VerifyStatus::AlreadyPatched => return Ok(()),
+        VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+        VerifyStatus::Ready | VerifyStatus::HashMismatch => {}
+    }
+    let Some(blob) = local_after_blob(project_root, &info.after_hash).await else {
+        return Err("vendor_manifest_unverifiable".to_string());
+    };
+    let Ok(on_disk) = crate::utils::fs::read_regular_to_bytes(&dir.join("package.json")).await
+    else {
+        return Err("vendor_artifact_unreadable".to_string());
+    };
+    if stripped_manifest(blob).is_some_and(|stripped| stripped == on_disk) {
+        Ok(())
+    } else {
+        Err("vendor_hash_mismatch".to_string())
+    }
+}
+
+/// The afterHash blob from the local blob store, when present, bounded and
+/// intact.
+async fn local_after_blob(project_root: &Path, after_hash: &str) -> Option<Vec<u8>> {
+    let blob_path = project_root.join(".socket/blobs").join(after_hash);
+    let blob = match tokio::fs::metadata(&blob_path).await {
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_MANIFEST_BLOB_BYTES => {
+            crate::utils::fs::read_regular_to_bytes(&blob_path)
+                .await
+                .ok()
+        }
+        _ => None,
+    };
+    blob.filter(|b| compute_git_sha256_from_bytes(b).eq_ignore_ascii_case(after_hash))
+}
+
+/// `blob` with its top-level devDependencies stripped (§4.4); `None` when
+/// the transform refuses it.
+fn stripped_manifest(blob: Vec<u8>) -> Option<Vec<u8>> {
+    let text = String::from_utf8(blob).ok()?;
+    match super::npm_dir::strip_dev_dependencies(&text) {
+        Ok(Some(stripped)) => Some(stripped.into_bytes()),
+        Ok(None) => Some(text.into_bytes()),
+        Err(_) => None,
+    }
 }
 
 /// Does the cargo copy's `Cargo.toml`, Socket tag dropped, hash to
@@ -308,6 +507,19 @@ pub fn artifact_is_file_shaped(path: &str) -> bool {
 /// could escape the artifact dir or wedge the audit), a non-UTF-8 name, an
 /// unreadable file, or a tree past the entry cap.
 pub async fn compute_dir_inventory(dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    inventory_walk(dir, false).await
+}
+
+/// [`compute_dir_inventory`] of a vlt package dir, leaving out its top-level
+/// `node_modules/` (vlt's links, never part of the artifact).
+pub async fn compute_package_dir_inventory(dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    inventory_walk(dir, true).await
+}
+
+async fn inventory_walk(
+    dir: &Path,
+    skip_node_modules: bool,
+) -> Result<BTreeMap<String, String>, String> {
     let root = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         use sha2::{Digest, Sha256};
@@ -324,6 +536,9 @@ pub async fn compute_dir_inventory(dir: &Path) -> Result<BTreeMap<String, String
                     .to_str()
                     .ok_or_else(|| format!("non-UTF-8 file name under `{rel}`"))?
                     .to_string();
+                if skip_node_modules && rel.is_empty() && name == "node_modules" {
+                    continue;
+                }
                 let child_rel = if rel.is_empty() {
                     name
                 } else {
@@ -438,6 +653,9 @@ pub enum ArtifactHealth {
     /// The entry can't be judged (poisoned path, empty record): fail
     /// closed, never rebuild from it.
     Unverifiable { reason: String },
+    /// An npm entry wired by a flavor this build has no backend for (a
+    /// newer socket-patch): its layout is not ours to judge or rebuild.
+    UnknownFlavor { flavor: String },
 }
 
 /// Health-check one vendored artifact against its patch record: the
@@ -453,6 +671,12 @@ pub async fn check_vendored_artifact(
     entry: &VendorEntry,
     record: &PatchRecord,
 ) -> ArtifactHealth {
+    if entry.ecosystem == "npm" && !super::npm_flavor::npm_flavor_is_known(entry.flavor.as_deref())
+    {
+        return ArtifactHealth::UnknownFlavor {
+            flavor: entry.flavor.clone().unwrap_or_default(),
+        };
+    }
     match verify_vendored_patch_record(project_root, entry, record).await {
         Err(tag) => {
             // A broken member copy must not hide a simultaneously corrupt
@@ -1430,6 +1654,148 @@ mod tests {
                 reason: "vendor_path_unsafe".to_string()
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vlt_dirs_verify_with_links_and_refuse_planted_or_extra_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(dir.join("node_modules/.bin"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("index.js"), PATCHED)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("../../../dep", dir.join("node_modules/dep")).unwrap();
+        tokio::fs::write(dir.join("node_modules/.bin/dep"), b"#!/bin/sh\n")
+            .await
+            .unwrap();
+        let rec = record(UUID, "package/index.js");
+        let mut ent = entry("npm", UUID, &rel);
+        ent.flavor = Some("vlt".into());
+        ent.artifact.file_inventory = Some(compute_package_dir_inventory(&dir).await.unwrap());
+        assert_eq!(
+            ent.artifact
+                .file_inventory
+                .as_ref()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["index.js"]
+        );
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Healthy
+        );
+
+        tokio::fs::write(dir.join("node_modules/planted.js"), b"x")
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec).await,
+            Err("vendor_inventory_mismatch".to_string())
+        );
+        tokio::fs::remove_file(dir.join("node_modules/planted.js"))
+            .await
+            .unwrap();
+
+        let beside = root.join(format!(
+            ".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/other"
+        ));
+        tokio::fs::create_dir_all(&beside).await.unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec).await,
+            Err("vendor_inventory_mismatch".to_string())
+        );
+        tokio::fs::remove_dir(&beside).await.unwrap();
+
+        tokio::fs::write(dir.join("extra.js"), b"x").await.unwrap();
+        assert!(matches!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn vlt_manifest_blob_pins_the_inventory() {
+        use sha2::Digest;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/a-1.0.0/node_modules/a");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let blob: &[u8] = b"{\"name\":\"a\",\"devDependencies\":{\"t\":\"1\"},\"main\":\"m.js\"}";
+        let committed = "{\"name\":\"a\",\"main\":\"x.js\"}";
+        tokio::fs::write(dir.join("package.json"), committed)
+            .await
+            .unwrap();
+        let mut rec = record(UUID, "package/index.js");
+        rec.files.clear();
+        rec.files.insert(
+            "package/package.json".into(),
+            PatchFileInfo {
+                before_hash: "b".into(),
+                after_hash: compute_git_sha256_from_bytes(blob),
+            },
+        );
+        let mut ent = entry("npm", UUID, &rel);
+        ent.flavor = Some("vlt".into());
+        ent.artifact.file_inventory = Some(BTreeMap::from([(
+            "package.json".to_string(),
+            hex::encode(sha2::Sha256::digest(committed.as_bytes())),
+        )]));
+        assert_eq!(verify_vendored_patch_record(root, &ent, &rec).await, Ok(()));
+        let blobs = root.join(".socket/blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        tokio::fs::write(blobs.join(compute_git_sha256_from_bytes(blob)), blob)
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec).await,
+            Err("vendor_hash_mismatch".to_string()),
+            "the blob stripped is not what the inventory pins"
+        );
+        tokio::fs::write(
+            dir.join("package.json"),
+            "{\"name\":\"a\",\"main\":\"m.js\"}",
+        )
+        .await
+        .unwrap();
+        ent.artifact.file_inventory = Some(BTreeMap::from([(
+            "package.json".to_string(),
+            hex::encode(sha2::Sha256::digest(b"{\"name\":\"a\",\"main\":\"m.js\"}")),
+        )]));
+        assert_eq!(verify_vendored_patch_record(root, &ent, &rec).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn unknown_npm_flavor_is_never_judged_by_this_builds_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        tokio::fs::create_dir_all(root.join(&rel).join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(&rel).join("index.js"), b"tampered")
+            .await
+            .unwrap();
+        let rec = record(UUID, "package/index.js");
+        let mut ent = entry("npm", UUID, &rel);
+        ent.flavor = Some("future-pm".into());
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::UnknownFlavor {
+                flavor: "future-pm".into()
+            }
+        );
+        ent.flavor = Some("bun".into());
+        assert!(matches!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt { .. }
+        ));
     }
 
     /// SECURITY: the zip entry-count cap fails a tampered wheel closed —

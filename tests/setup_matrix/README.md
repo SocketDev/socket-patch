@@ -33,7 +33,7 @@ install. No Socket API is contacted.
 source of truth, consumed by both the runner script and the Rust
 wrappers).
 
-- **Package managers:** npm, yarn, pnpm, bun · pip, uv, poetry, pdm,
+- **Package managers:** npm, yarn, pnpm, bun, vlt · pip, uv, poetry, pdm,
   hatch · cargo · bundler · go · mvn · composer · dotnet · deno.
 - **Scenarios (single-project):**
   - `baseline_with_setup` — setup + install ⇒ patch applied *(ideal)*.
@@ -54,14 +54,15 @@ wrappers).
 The driver's `SM_LAYOUT` selects the project shape (each layout has its
 own `*_targets` / `*_scenarios` sections in `matrix.json`):
 
-- **`single`** *(default)* — one project, one dependency. The 16-PM grid above.
+- **`single`** *(default)* — one project, one dependency. The 17-PM grid above.
 - **`workspace`** — a **nested workspace/monorepo**: a root + several
   members (incl. a deeply-nested one and a member that does *not* use the
   patched package). Models real-world monorepo deployments and exercises
   `setup`'s workspace handling — npm/yarn write the hook to **every**
-  member, pnpm only to the **root** — plus the cross-workspace apply on a
-  single root install. Covered PMs: **npm, pnpm, yarn** (apply; the
-  dependency hoists / lands in the pnpm store and is patched once) and
+  member, pnpm and vlt only to the **root** — plus the cross-workspace apply
+  on a single root install. Covered PMs: **npm, pnpm, yarn, vlt** (apply;
+  the dependency hoists / lands in the pnpm or vlt store and is patched
+  once) and
   **pip** (nested `requirements.txt` files) + **uv** (uv workspace, one
   shared `.venv`) as Python gaps. Scenarios: `workspace_with_setup`,
   `workspace_no_setup`, `workspace_patch_missing`.
@@ -81,6 +82,30 @@ own `*_targets` / `*_scenarios` sections in `matrix.json`):
 > a single cwd makes every member target the root manifest and fail
 > mid-install with "no packages found on disk". The driver therefore does
 > **not** pin `SOCKET_CWD`.
+
+## vlt cases
+
+The `pm: vlt` rows (single and workspace) are **non-gating extras**: every
+vlt `setup` assertion that gates a release lives in the real-vlt capstone
+`crates/socket-patch-cli/tests/e2e_vlt.rs` (suite `setup`). They run vlt
+1.2.0 from the npm image (`npm install -g vlt@1.2.0`, Node >= 22.22) and
+follow the npm-family round trip:
+
+- the scaffold declares the dependency up front and writes a `vlt.json`,
+  which is both the marker `setup` detects vlt by and the registry config
+  (`config.registry` + `config.registries.npm`) vlt >= 1.0.0-rc.33 needs to
+  install at all; the workspace scaffold declares its members in vlt.json
+  `workspaces`, the only place vlt reads them;
+- `setup` writes npm's `npx` hook (vlt ships through npm, so `npx` is
+  always there; `vlx` is never used), root package only for a workspace;
+- the native install is `vlt install`, whose root `postinstall` fires on
+  every install that changes the graph (vlt >= 1.0.0-rc.13), with
+  `VLT_TELEMETRY=0`.
+
+A failing hook aborts and rolls back the whole `vlt install`, exactly as it
+fails `npm install`, so `wrong_target_patchset` (a manifest whose only
+patch targets an absent package makes `apply` exit 1) reports a failed
+install for vlt as it does for npm.
 
 ## Result classification
 

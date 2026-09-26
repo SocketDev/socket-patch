@@ -1,0 +1,12 @@
+{
+  "lockfileVersion": 1,
+  "options": {},
+  "nodes": {
+    "~npm~fsevents@2.3.3": [1,"fsevents","sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",null,null,null,null,{  "engines": {    "node": "^8.16.0 || ^10.6.0 || >=11.0.0"  },  "os": [    "darwin"  ]}],
+    "~npm~semver@7.6.0": [0,"semver","sha512-EnwXhrlwXMk9gKu5/flx5sv/an57AkRplG3hTK68W7FRDN+k+OWBj65M7719OkA82XLBxrcX0KSHj+X5COhOVg==",null,null,null,null,null,{  "semver": "bin/semver.js"}]
+  },
+  "edges": {
+    "file~_d fsevents": "optional 2.3.3 ~npm~fsevents@2.3.3",
+    "file~_d semver": "prod 7.6.0 ~npm~semver@7.6.0"
+  }
+}

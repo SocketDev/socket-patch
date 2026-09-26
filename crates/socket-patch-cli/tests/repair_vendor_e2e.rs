@@ -2091,3 +2091,41 @@ async fn repaired_vendored_state_attests_manifest_less() {
         });
     }
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// `repair --dry-run` over a deleted vlt directory artifact previews the
+/// rebuild (`wouldRebuild`, the dir path) and writes nothing; the wet run
+/// rebuilds it offline from the installed copy.
+#[test]
+fn repair_previews_then_rebuilds_a_deleted_vlt_dir() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let uuid_dir = root.join(format!(".socket/vendor/npm/{}", hosted::UUID));
+    std::fs::remove_dir_all(&uuid_dir).unwrap();
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, v, stderr) = hosted::run_json(
+        root,
+        &["repair", "--dry-run", "--offline", "--cwd", &cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    let text = v.to_string();
+    assert!(
+        text.contains("wouldRebuild") && text.contains(&vlt_vendored::rel()),
+        "{v:#}"
+    );
+    assert!(!uuid_dir.exists());
+    let (code, v, stderr) = hosted::run_json(root, &["repair", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        std::fs::read(root.join(vlt_vendored::rel()).join("index.js")).unwrap(),
+        hosted::PATCHED
+    );
+    assert!(uuid_dir.join(".gitignore").is_file());
+}

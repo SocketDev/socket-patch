@@ -17,8 +17,9 @@
 //!      transient-stage failure warning;
 //!   5. human-mode output block: "No patches to apply.", the no-matching-
 //!      packages warning, the npm per-package failure line, the dry-run
-//!      "already patched" count, `--verbose` per-file labels, the pnpm/bun
-//!      layout notes, and the corrupt-manifest-under-PnP fall-through;
+//!      "already patched" count, `--verbose` per-file labels, the
+//!      pnpm/bun/vlt layout notes, and the corrupt-manifest-under-PnP
+//!      fall-through;
 //!   6. gem fallback-home skip surfacing on human stderr;
 //!   7. apply-loop wiring: a vendored release-variant base with its
 //!      installed tree PRESENT is skipped (not re-patched), and a qualified
@@ -772,6 +773,58 @@ fn bun_layout_prints_informational_note_in_human_mode() {
         "the note must explain the CoW guarantee; stderr={stderr}"
     );
     assert!(stdout.contains("No patches to apply."), "stdout={stdout}");
+}
+
+/// A vlt install (the `node_modules/.vlt` store) prints its informational
+/// note in human mode and never refuses. vlt install state outranks a
+/// sibling `bun.lock`, so the bun note does not print.
+#[test]
+fn vlt_layout_prints_informational_note_in_human_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), json!({}));
+    std::fs::create_dir_all(tmp.path().join("node_modules").join(".vlt")).unwrap();
+    std::fs::write(tmp.path().join("bun.lock"), "{}\n").unwrap();
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    assert_eq!(
+        code, 0,
+        "the vlt note is informational only; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Note: vlt layout detected. Copy-on-write keeps vlt's shared package store \
+             (<vlt cache>/store/v1) untouched."
+        ),
+        "the vlt layout note must print on human stderr; stderr={stderr}"
+    );
+    assert!(!stderr.contains("bun layout detected"), "stderr={stderr}");
+    assert!(stdout.contains("No patches to apply."), "stdout={stdout}");
+}
+
+/// The vlt note is human-only: `--json` and `--silent` runs (the install
+/// hook runs `apply --silent`) stay quiet. The hidden lock alone is vlt
+/// install state too.
+#[test]
+fn vlt_layout_note_is_muted_under_json_and_silent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest(tmp.path(), json!({}));
+    std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+    std::fs::write(tmp.path().join("node_modules/.vlt-lock.json"), "{}").unwrap();
+
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("Note: vlt layout detected."),
+        "stderr={stderr}"
+    );
+    for flag in ["--json", "--silent"] {
+        let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline", flag], &[]);
+        assert_eq!(code, 0, "{flag}: stderr={stderr}");
+        assert!(
+            !stderr.contains("layout detected"),
+            "{flag}: stderr={stderr}"
+        );
+    }
 }
 
 /// A corrupt manifest under a yarn-PnP layout must fall through to the

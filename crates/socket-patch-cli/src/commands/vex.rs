@@ -464,7 +464,7 @@ fn org_looks_like_path(org: Option<&str>) -> Option<String> {
 /// Unrecognized names yield `None` and are ignored.
 fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
     match name.to_ascii_lowercase().as_str() {
-        "npm" | "yarn" | "pnpm" | "bun" => Some(Ecosystem::Npm),
+        "npm" | "yarn" | "pnpm" | "bun" | "vlt" => Some(Ecosystem::Npm),
         "pypi" | "python" => Some(Ecosystem::Pypi),
         "gem" | "ruby" => Some(Ecosystem::Gem),
         "cargo" | "rust" => Some(Ecosystem::Cargo),
@@ -1416,6 +1416,11 @@ fn omission_phrase(reason: &str) -> &'static str {
         "vendor_inventory_mismatch" => {
             "the vendored artifact's contents do not match its ledger inventory"
         }
+        "vendor_manifest_unverifiable" => {
+            "the vendored package.json has its devDependencies stripped, and neither a vendor \
+             ledger inventory nor the patched package.json in .socket/blobs is there to check it \
+             against"
+        }
         "stale_install" => "the installed copy is not patched",
         RECORD_UNAVAILABLE => {
             "a lockfile wires the patch, but no local record exists and the patch API could not \
@@ -1522,6 +1527,7 @@ mod tests {
     #[test]
     fn ecosystem_from_manual_name_maps_every_ecosystem() {
         assert_eq!(ecosystem_from_manual_name("npm"), Some(Ecosystem::Npm));
+        assert_eq!(ecosystem_from_manual_name("vlt"), Some(Ecosystem::Npm));
         assert_eq!(ecosystem_from_manual_name("PyPI"), Some(Ecosystem::Pypi)); // case-insensitive
         assert_eq!(ecosystem_from_manual_name("python"), Some(Ecosystem::Pypi));
         assert_eq!(ecosystem_from_manual_name("ruby"), Some(Ecosystem::Gem));
@@ -1699,6 +1705,7 @@ mod tests {
             "no_files",
             "vendor_hash_mismatch",
             "vendor_artifact_missing",
+            "vendor_manifest_unverifiable",
             "stale_install",
             RECORD_UNAVAILABLE,
             RECORD_MISMATCH,

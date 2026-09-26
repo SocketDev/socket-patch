@@ -279,6 +279,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_vlt() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x"}"#).await.unwrap();
+        let result = update_package_json(&pkg, false, PackageManager::Vlt).await;
+        assert_eq!(result.status, UpdateStatus::Updated);
+        let npx = "npx @socketsecurity/socket-patch apply --silent --ecosystems npm";
+        assert_eq!(result.new_script, npx);
+        assert_eq!(result.new_dependencies_script, npx);
+        let content: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&pkg).await.unwrap()).unwrap();
+        assert_eq!(content["scripts"]["postinstall"], npx);
+        assert_eq!(content["scripts"]["dependencies"], npx);
+    }
+
+    #[tokio::test]
     async fn test_update_adds_dependencies_when_postinstall_exists() {
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");

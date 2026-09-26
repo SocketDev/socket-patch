@@ -18,6 +18,9 @@
 
 use std::path::Path;
 
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+
 use serde_json::{json, Value};
 use serial_test::serial;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -219,7 +222,13 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 fn vendor_cli(cwd: &Path) -> (i32, Value) {
     let (code, stdout, stderr) = run_cli(
         cwd,
-        &["vendor", "--json", "--offline", "--cwd", cwd.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ],
     );
     let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("vendor --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
@@ -442,10 +451,9 @@ async fn dry_run_refuses_unrevertable_vendored_state_like_the_wet_run() {
         "a refused purl must not also be promised a takeover: {doc:#}"
     );
     assert!(
-        doc["redirect"]["skipped"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|e| e["purl"] == PURL
-                && e["reason"] == "vendored_revert_failed")),
+        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
+            .iter()
+            .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
         "the refusal must be accounted as skipped: {doc:#}"
     );
     assert_eq!(
@@ -639,4 +647,82 @@ async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
         "allow-remote=all\n",
         "the wet run writes what the preview promised"
     );
+}
+
+/// vlt twin: the vendored `file` node and its edges are reverted to the
+/// registry node before the rewrite, so the dry run previews
+/// `redirected: 1` (never `redirect_vlt_entry_vendored`) and writes
+/// nothing; the wet run lands the same outcome.
+#[tokio::test]
+#[serial]
+async fn vlt_dry_run_over_vendored_project_previews_the_wet_takeover() {
+    use vlt_hosted_common as hosted;
+    let server = MockServer::start().await;
+    hosted::mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let registry_lock = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    {}\n  }},\n  \
+         \"edges\": {{\n    \"file~_d left-pad\": \"prod 1.3.0 {}\"\n  }}\n}}\n",
+        hosted::registry_node(hosted::TILDE_ID),
+        hosted::TILDE_ID
+    );
+    std::fs::write(root.join("vlt-lock.json"), &registry_lock).unwrap();
+    hosted::write_package_json(root);
+    hosted::install_importer(root, hosted::PRISTINE);
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let mut record = hosted::view_body();
+    record.as_object_mut().unwrap().remove("purl");
+    record["exportedAt"] = json!("2026-01-01T00:00:00Z");
+    std::fs::write(
+        socket.join("manifest.json"),
+        json!({ "patches": { hosted::PURL: record } }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        socket
+            .join("blobs")
+            .join(hosted::git_sha256(hosted::PATCHED)),
+        hosted::PATCHED,
+    )
+    .unwrap();
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, env, stderr) = hosted::run_json(root, &["vendor", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    std::fs::remove_file(socket.join("manifest.json")).unwrap();
+    let vendored_lock = std::fs::read(root.join("vlt-lock.json")).unwrap();
+    let vendored_state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+    let vendored_pkg = std::fs::read(root.join("package.json")).unwrap();
+
+    let (_, doc) = hosted::scan_hosted(root, &server, &["--dry-run"], &[]);
+    let codes = hosted::warning_codes(&doc);
+    assert!(
+        codes.contains(&"redirect_would_revert_vendored".to_string()),
+        "{doc:#}"
+    );
+    assert!(
+        !codes.contains(&"redirect_vlt_entry_vendored".to_string()),
+        "{doc:#}"
+    );
+    assert_eq!(hosted::redirected(&doc), 1, "{doc:#}");
+    assert_eq!(
+        std::fs::read(root.join("vlt-lock.json")).unwrap(),
+        vendored_lock
+    );
+    assert_eq!(
+        std::fs::read(root.join("package.json")).unwrap(),
+        vendored_pkg
+    );
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        vendored_state
+    );
+    assert!(!hosted::ledger_path(root).exists());
+
+    let (_, wet) = hosted::scan_hosted(root, &server, &[], &[]);
+    assert_eq!(hosted::redirected(&wet), 1, "{wet:#}");
+    let lock = hosted::read(root, "vlt-lock.json");
+    assert!(lock.contains(&hosted::artifact_url(&server)), "{lock}");
+    assert!(!lock.contains(".socket/vendor"), "{lock}");
 }

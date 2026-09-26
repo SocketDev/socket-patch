@@ -37,8 +37,8 @@ fn run_remove(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, 
 }
 
 fn read_json_file(path: &Path) -> serde_json::Value {
-    let body = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let body =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&body).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
@@ -134,7 +134,13 @@ fn preserve_state_restores_but_keeps_entry() {
 
     let (code, stdout, stderr) = run_remove(
         tmp.path(),
-        &[PRESERVE_PURL, "--json", "--yes", "--offline", "--preserve-state"],
+        &[
+            PRESERVE_PURL,
+            "--json",
+            "--yes",
+            "--offline",
+            "--preserve-state",
+        ],
         &[],
     );
     assert_eq!(
@@ -420,7 +426,12 @@ fn default_remove_sweeps_archives_too() {
 
     let (code, stdout, stderr) = run_remove(
         tmp.path(),
-        &["pkg:npm/__archive_a__@1.0.0", "--json", "--yes", "--skip-rollback"],
+        &[
+            "pkg:npm/__archive_a__@1.0.0",
+            "--json",
+            "--yes",
+            "--skip-rollback",
+        ],
         &[],
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
@@ -436,11 +447,17 @@ fn default_remove_sweeps_archives_too() {
     // A's archives are gone from BOTH archive dirs; B's survive in both.
     for dir in ["diffs", "packages"] {
         assert!(
-            !socket.join(dir).join(format!("{ARCH_UUID_A}.tar.gz")).exists(),
+            !socket
+                .join(dir)
+                .join(format!("{ARCH_UUID_A}.tar.gz"))
+                .exists(),
             "the removed entry's {dir} archive must be swept"
         );
         assert!(
-            socket.join(dir).join(format!("{ARCH_UUID_B}.tar.gz")).exists(),
+            socket
+                .join(dir)
+                .join(format!("{ARCH_UUID_B}.tar.gz"))
+                .exists(),
             "the kept entry's {dir} archive must survive"
         );
     }
@@ -770,7 +787,10 @@ fn hosted_only_unsupported_remove_without_manifest_fails_closed() {
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error", "envelope={v}");
-    assert_eq!(v["error"]["code"], "hosted_revert_unsupported", "envelope={v}");
+    assert_eq!(
+        v["error"]["code"], "hosted_revert_unsupported",
+        "envelope={v}"
+    );
     let msg = v["error"]["message"].as_str().unwrap_or_default();
     assert!(
         msg.contains(GEM_PURL) && msg.contains("socket-patch rollback"),
@@ -848,5 +868,49 @@ fn drift_kept_vendored_remove_is_partial_failure() {
     assert!(
         artifact_dir.join("package.tgz").exists(),
         "the vendored artifact must survive a drift-keep"
+    );
+}
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// `remove --preserve-state` of a vlt-vendored purl restores the registry
+/// lock and package.json but keeps the directory artifact and the ledger
+/// entry (byte-identical).
+#[test]
+fn remove_preserve_state_unwires_a_vlt_entry_and_keeps_the_artifact() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, v, stderr) = hosted::run_json(
+        root,
+        &[
+            "remove",
+            hosted::PURL,
+            "--preserve-state",
+            "--offline",
+            "--cwd",
+            &cwd,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        hosted::read(root, "vlt-lock.json"),
+        vlt_vendored::registry_lock()
+    );
+    assert_eq!(
+        hosted::read(root, "package.json"),
+        vlt_vendored::PACKAGE_JSON
+    );
+    assert!(root.join(vlt_vendored::rel()).join("index.js").is_file());
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state
     );
 }

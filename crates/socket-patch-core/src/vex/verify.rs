@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
 use crate::vendor::state::{lookup_entry, VendorEntry};
-use crate::vendor::verify::verify_vendored_patch_record;
+use crate::vendor::verify::{
+    is_vlt_dir_entry, verify_vendored_patch_record, vlt_installed_copy_matches,
+};
 
 /// One entry per manifest PURL that did NOT pass verification. The
 /// `reason` is a short snake_case tag the CLI can route on (matches
@@ -162,7 +164,7 @@ pub async fn applied_patches_with_vendor(
         match result {
             Ok(()) => {
                 out.applied.push(purl.clone());
-                if vendor_entry.is_some() {
+                if let Some((ctx, entry)) = vendor_entry {
                     out.vendored.push(purl.clone());
                     // Disclosure probe: with the vendor artifact healthy,
                     // also check whether the LIVE installed tree (when the
@@ -181,7 +183,13 @@ pub async fn applied_patches_with_vendor(
                     // it" is advice no `go` command can follow.
                     let go_cache_copy = purl.starts_with("pkg:golang/");
                     if let Some(pkg_path) = package_paths.get(purl).filter(|_| !go_cache_copy) {
-                        if verify_patch_record(pkg_path, record).await.is_err() {
+                        let in_sync = if is_vlt_dir_entry(entry) {
+                            vlt_installed_copy_matches(&ctx.project_root, pkg_path, entry, record)
+                                .await
+                        } else {
+                            verify_patch_record(pkg_path, record).await.is_ok()
+                        };
+                        if !in_sync {
                             out.vendored_out_of_sync.push(purl.clone());
                         }
                     }
@@ -1581,5 +1589,87 @@ mod tests {
             renamed.files.contains_key("lib-1.0.1.jar"),
             "not a whole component"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_vlt_link_to_the_vendored_dir_is_in_sync_under_the_manifest_exemption() {
+        use sha2::Digest;
+        use std::collections::BTreeMap;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let purl = "pkg:npm/a@1.0.0";
+        let rel = format!(".socket/vendor/npm/{VUUID}/a-1.0.0/node_modules/a");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(dir.join("node_modules"))
+            .await
+            .unwrap();
+        let blob: &[u8] = b"{\"name\":\"a\",\"devDependencies\":{\"t\":\"1\"}}";
+        let stripped: &[u8] = b"{\"name\":\"a\"}";
+        let index: &[u8] = b"patched";
+        tokio::fs::write(dir.join("package.json"), stripped)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("index.js"), index).await.unwrap();
+        let mut rec = record_with_one_file(&compute_git_sha256_from_bytes(index));
+        rec.uuid = VUUID.to_string();
+        rec.files.insert(
+            "package.json".to_string(),
+            crate::manifest::schema::PatchFileInfo {
+                before_hash: "b".repeat(64),
+                after_hash: compute_git_sha256_from_bytes(blob),
+            },
+        );
+        let mut entry = vendor_entry(purl, &rel);
+        entry.ecosystem = "npm".to_string();
+        entry.flavor = Some("vlt".to_string());
+        entry.artifact.file_inventory = Some(BTreeMap::from([
+            (
+                "index.js".to_string(),
+                hex::encode(sha2::Sha256::digest(index)),
+            ),
+            (
+                "package.json".to_string(),
+                hex::encode(sha2::Sha256::digest(stripped)),
+            ),
+        ]));
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+        let ctx = VendorContext {
+            project_root: root.to_path_buf(),
+            entries: HashMap::from([(purl.to_string(), entry)]),
+            go_patches: HashMap::new(),
+            hosted: HashMap::new(),
+        };
+        let link = root.join("node_modules/a");
+        tokio::fs::create_dir_all(root.join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::symlink(&dir, &link).await.unwrap();
+        let paths = HashMap::from([(purl.to_string(), link.clone())]);
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert_eq!(out.vendored, vec![purl.to_string()], "{:?}", out.failed);
+        assert!(
+            out.vendored_out_of_sync.is_empty(),
+            "the link IS the artifact"
+        );
+
+        let copy = root.join("copy");
+        tokio::fs::create_dir_all(&copy).await.unwrap();
+        tokio::fs::write(copy.join("package.json"), stripped)
+            .await
+            .unwrap();
+        tokio::fs::write(copy.join("index.js"), index)
+            .await
+            .unwrap();
+        let paths = HashMap::from([(purl.to_string(), copy.clone())]);
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert!(out.vendored_out_of_sync.is_empty(), "exempt package.json");
+
+        tokio::fs::write(copy.join("index.js"), b"pristine")
+            .await
+            .unwrap();
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
     }
 }

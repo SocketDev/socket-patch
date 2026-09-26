@@ -32,6 +32,9 @@ use crate::commands::bun_preflight::{
     bun_vendor_preflight, bun_vendor_preflight_with_ledger, BunVendorRefusal,
 };
 use crate::commands::lock_cli::lock_failure;
+use crate::commands::vlt_preflight::{
+    vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
+};
 use crate::ecosystem_dispatch::{
     crawl_all_ecosystems, find_packages_for_rollback, partition_purls,
 };
@@ -1774,19 +1777,36 @@ impl FetchBatch {
     }
 }
 
+/// The vendored-mode preflight verdicts the download phase refuses by
+/// (Bun's project-level one, vlt's per purl); agent downloads pass none.
+#[derive(Clone, Copy, Default)]
+struct VendorRefusals<'a> {
+    bun: Option<&'a BunVendorRefusal>,
+    vlt: &'a [(String, VltVendorRefusal)],
+}
+
+impl VendorRefusals<'_> {
+    fn for_purl(&self, purl: &str) -> Option<(&'static str, &str)> {
+        self.bun
+            .filter(|r| r.applies_to(purl))
+            .map(|r| (r.code, r.detail.as_str()))
+            .or_else(|| vlt_refusal_for(self.vlt, purl).map(|r| (r.code, r.detail.as_str())))
+    }
+}
+
 /// The fetch loop both download engines share: installed-release
-/// narrowing, the caller's Bun refusal, the per-store skip decision, the
-/// view fetch (served from `prefetched` when the narrowing or the caller
-/// already holds the view), the no-applicable-files guardrail, optional
-/// blob persistence, and every per-patch failure record. Every pinned
-/// stderr line and JSON action lives here once.
+/// narrowing, the caller's Bun and vlt refusals, the per-store skip
+/// decision, the view fetch (served from `prefetched` when the narrowing or
+/// the caller already holds the view), the no-applicable-files guardrail,
+/// optional blob persistence, and every per-patch failure record. Every
+/// pinned stderr line and JSON action lives here once.
 async fn fetch_selected_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
     api_client: &ApiClient,
     store: RecordStore<'_>,
     blobs_dir: Option<&Path>,
-    bun_refusal: Option<&BunVendorRefusal>,
+    refusals: VendorRefusals<'_>,
     mut prefetched: HashMap<String, PatchResponse>,
 ) -> FetchBatch {
     let quiet = params.quiet();
@@ -1833,17 +1853,14 @@ async fn fetch_selected_patches(
         // unwired it, so UUID equality alone never exempts a purl — the
         // lock-derived exemption inside `applies_to` decides. Code-tagged so
         // a `--silent` operator can grep the stable code.
-        if let Some(refusal) = bun_refusal.filter(|r| r.applies_to(purl)) {
+        if let Some((code, detail)) = refusals.for_purl(purl) {
             batch.fail(
                 params.json,
-                Some(format!(
-                    "[error] {purl} ({}): {}",
-                    refusal.code, refusal.detail
-                )),
+                Some(format!("[error] {purl} ({code}): {detail}")),
                 purl,
                 uuid,
-                &refusal.detail,
-                Some(refusal.code),
+                detail,
+                Some(code),
             );
             continue;
         }
@@ -2066,6 +2083,14 @@ pub(crate) async fn download_patch_records_with(
         vendor_state.as_ref().map(|s| &s.entries),
     )
     .await;
+    // The vlt twin: every lock-, manifest- and ledger-decidable vlt refusal
+    // (see `crate::commands::vlt_preflight`), per purl.
+    let vlt_refusals = vlt_vendor_preflight_selected(
+        &params.cwd,
+        selected,
+        vendor_state.as_ref().map(|s| &s.entries),
+    )
+    .await;
     download_patch_records_preflighted(
         selected,
         params,
@@ -2073,6 +2098,7 @@ pub(crate) async fn download_patch_records_with(
         prefetched,
         vendor_state,
         bun_refusal.as_ref(),
+        &vlt_refusals,
     )
     .await
 }
@@ -2089,6 +2115,7 @@ async fn download_patch_records_preflighted(
     prefetched: HashMap<String, PatchResponse>,
     vendor_state: std::io::Result<VendorState>,
     bun_refusal: Option<&BunVendorRefusal>,
+    vlt_refusals: &[(String, VltVendorRefusal)],
 ) -> DetachedDownload {
     let vendor_state = vendor_state.unwrap_or_default();
 
@@ -2099,7 +2126,10 @@ async fn download_patch_records_preflighted(
         api_client,
         RecordStore::Ledger(&vendor_state.entries),
         params.persist_blobs.then_some(blobs_dir.as_path()),
-        bun_refusal,
+        VendorRefusals {
+            bun: bun_refusal,
+            vlt: vlt_refusals,
+        },
         prefetched,
     )
     .await;
@@ -2317,7 +2347,7 @@ pub async fn download_and_apply_patches_with(
         run.api_client,
         RecordStore::Manifest(&manifest),
         params.persist_blobs.then_some(blobs_dir.as_path()),
-        None,
+        VendorRefusals::default(),
         HashMap::new(),
     )
     .await;
@@ -3539,6 +3569,7 @@ async fn run_get_vendored(
     // phase below (which otherwise runs its own): the pre-record refusal
     // shape is this path's, so it owns the read.
     let mut bun_refusal: Option<BunVendorRefusal> = None;
+    let mut vlt_refusals: Vec<(String, VltVendorRefusal)> = Vec::new();
     if let Some(patch) = prefetched {
         // Bun preflight (see `BunVendorRefusal`): refuse BEFORE the engine
         // and the vendor step, so the tree stays exactly as it was (no
@@ -3561,8 +3592,19 @@ async fn run_get_vendored(
         // Human: `Error (<code>): <detail>` on stderr — an error, so it is
         // exempt from `--silent` like every other `Error (…)` line here.
         bun_refusal = bun_vendor_preflight(&args.common.cwd, selected).await;
-        if let Some(refusal) = bun_refusal.as_ref().filter(|r| r.applies_to(&patch.purl)) {
-            let BunVendorRefusal { code, detail, .. } = refusal;
+        let ledger = load_state(&args.common.cwd).await;
+        vlt_refusals = vlt_vendor_preflight_selected(
+            &args.common.cwd,
+            selected,
+            ledger.as_ref().map(|s| &s.entries),
+        )
+        .await;
+        let refusal = bun_refusal
+            .as_ref()
+            .filter(|r| r.applies_to(&patch.purl))
+            .map(|r| (&r.code, &r.detail))
+            .or_else(|| vlt_refusal_for(&vlt_refusals, &patch.purl).map(|r| (&r.code, &r.detail)));
+        if let Some((code, detail)) = refusal {
             // Same failure telemetry as the vendor-step Err arm below: this
             // run exits 1 without vendoring anything.
             socket_patch_core::telemetry::track_patch_vendor_failed(
@@ -3618,6 +3660,7 @@ async fn run_get_vendored(
             prefetched_views,
             vendor_state,
             bun_refusal.as_ref(),
+            &vlt_refusals,
         ))
         .await
     } else {

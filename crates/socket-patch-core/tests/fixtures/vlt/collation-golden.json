@@ -1,0 +1,1675 @@
+{
+  "alphabet": " _-,;:!?.·'\"()[]{}§@*/\\&#%`^+<=>|~$0123456789aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ",
+  "nodes": [
+    "··@a§b@1.0.0",
+    "··@A§b@1.0.0",
+    "··@a§b@1.0.0-rc.1",
+    "··@A§b@1.0.0-rc.1",
+    "··@a§b@1.0.0%2Bbuild.1",
+    "··@A§b@1.0.0%2Bbuild.1",
+    "··@a§b@10.0.0",
+    "··@A§b@10.0.0",
+    "··@a§b@2.1.3",
+    "··@A§b@2.1.3",
+    "··@isaacs§string-locale-compare@1.0.0",
+    "··@isaacs§string-locale-compare@1.0.0-rc.1",
+    "··@isaacs§string-locale-compare@1.0.0%2Bbuild.1",
+    "··@isaacs§string-locale-compare@10.0.0",
+    "··@isaacs§string-locale-compare@2.1.3",
+    "··@jsr§std__semver@1.0.0",
+    "··@jsr§std__semver@1.0.0-rc.1",
+    "··@jsr§std__semver@1.0.0%2Bbuild.1",
+    "··@jsr§std__semver@10.0.0",
+    "··@jsr§std__semver@2.1.3",
+    "··@scope_x§bar@1.0.0",
+    "··@scope_x§bar@1.0.0-rc.1",
+    "··@scope_x§bar@1.0.0%2Bbuild.1",
+    "··@scope_x§bar@10.0.0",
+    "··@scope_x§bar@2.1.3",
+    "··@scope§bar-baz@1.0.0",
+    "··@scope§bar-baz@1.0.0-rc.1",
+    "··@scope§bar-baz@1.0.0%2Bbuild.1",
+    "··@scope§bar-baz@10.0.0",
+    "··@scope§bar-baz@2.1.3",
+    "··@scope§bar@1.0.0",
+    "··@scope§bar@1.0.0-rc.1",
+    "··@scope§bar@1.0.0%2Bbuild.1",
+    "··@scope§bar@10.0.0",
+    "··@scope§bar@2.1.3",
+    "··@sindresorhus§is@1.0.0",
+    "··@sindresorhus§is@1.0.0-rc.1",
+    "··@sindresorhus§is@1.0.0%2Bbuild.1",
+    "··@sindresorhus§is@10.0.0",
+    "··@sindresorhus§is@2.1.3",
+    "··0x@1.0.0",
+    "··0x@1.0.0-rc.1",
+    "··0x@1.0.0%2Bbuild.1",
+    "··0x@10.0.0",
+    "··0x@2.1.3",
+    "··a__b@1.0.0",
+    "··a__b@1.0.0-rc.1",
+    "··a__b@1.0.0%2Bbuild.1",
+    "··a__b@10.0.0",
+    "··a__b@2.1.3",
+    "··a_b@1.0.0",
+    "··a_b@1.0.0-rc.1",
+    "··a_b@1.0.0%2Bbuild.1",
+    "··a_b@10.0.0",
+    "··a_b@2.1.3",
+    "··a-b@1.0.0",
+    "··a-b@1.0.0-rc.1",
+    "··a-b@1.0.0%2Bbuild.1",
+    "··a-b@10.0.0",
+    "··a-b@2.1.3",
+    "··a.b@1.0.0",
+    "··a.b@1.0.0-rc.1",
+    "··a.b@1.0.0%2Bbuild.1",
+    "··a.b@10.0.0",
+    "··a.b@2.1.3",
+    "··a@1.0.0",
+    "··A@1.0.0",
+    "··a@1.0.0-rc.1",
+    "··A@1.0.0-rc.1",
+    "··a@1.0.0%2Bbuild.1",
+    "··A@1.0.0%2Bbuild.1",
+    "··a@10.0.0",
+    "··A@10.0.0",
+    "··a@2.1.3",
+    "··A@2.1.3",
+    "··a~b@1.0.0",
+    "··a~b@1.0.0-rc.1",
+    "··a~b@1.0.0%2Bbuild.1",
+    "··a~b@10.0.0",
+    "··a~b@2.1.3",
+    "··a1@1.0.0",
+    "··a1@1.0.0-rc.1",
+    "··a1@1.0.0%2Bbuild.1",
+    "··a1@10.0.0",
+    "··a1@2.1.3",
+    "··ab@1.0.0",
+    "··aB@1.0.0",
+    "··Ab@1.0.0",
+    "··ab@1.0.0-rc.1",
+    "··aB@1.0.0-rc.1",
+    "··Ab@1.0.0-rc.1",
+    "··ab@1.0.0%2Bbuild.1",
+    "··aB@1.0.0%2Bbuild.1",
+    "··Ab@1.0.0%2Bbuild.1",
+    "··ab@10.0.0",
+    "··aB@10.0.0",
+    "··Ab@10.0.0",
+    "··ab@2.1.3",
+    "··aB@2.1.3",
+    "··Ab@2.1.3",
+    "··is-number@1.0.0",
+    "··is-number@1.0.0-rc.1",
+    "··is-number@1.0.0%2Bbuild.1",
+    "··is-number@10.0.0",
+    "··is-number@2.1.3",
+    "··JSONStream@1.0.0",
+    "··JSONStream@1.0.0-rc.1",
+    "··JSONStream@1.0.0%2Bbuild.1",
+    "··JSONStream@10.0.0",
+    "··JSONStream@2.1.3",
+    "··left-pad@1.0.0",
+    "··left-pad@1.0.0-rc.1",
+    "··left-pad@1.0.0%2Bbuild.1",
+    "··left-pad@10.0.0",
+    "··left-pad@2.1.3",
+    "··ms@1.0.0",
+    "··MS@1.0.0",
+    "··ms@1.0.0-rc.1",
+    "··MS@1.0.0-rc.1",
+    "··ms@1.0.0%2Bbuild.1",
+    "··MS@1.0.0%2Bbuild.1",
+    "··ms@10.0.0",
+    "··MS@10.0.0",
+    "··ms@2.1.3",
+    "··MS@2.1.3",
+    "··react-dom@1.0.0",
+    "··react-dom@1.0.0-rc.1",
+    "··react-dom@1.0.0%2Bbuild.1",
+    "··react-dom@10.0.0",
+    "··react-dom@2.1.3",
+    "··react@1.0.0",
+    "··react@1.0.0-rc.1",
+    "··react@1.0.0%2Bbuild.1",
+    "··react@10.0.0",
+    "··react@2.1.3",
+    "··use-sync-external-store@1.0.0",
+    "··use-sync-external-store@1.0.0-rc.1",
+    "··use-sync-external-store@1.0.0%2Bbuild.1",
+    "··use-sync-external-store@10.0.0",
+    "··use-sync-external-store@2.1.3",
+    "··z@1.0.0",
+    "··z@1.0.0-rc.1",
+    "··z@1.0.0%2Bbuild.1",
+    "··z@10.0.0",
+    "··z@2.1.3",
+    "··zz@1.0.0",
+    "··zz@1.0.0-rc.1",
+    "··zz@1.0.0%2Bbuild.1",
+    "··zz@10.0.0",
+    "··zz@2.1.3",
+    "·acme·@a§b@1.0.0",
+    "·acme·@a§b@10.0.0",
+    "·acme·@A§b@2.1.3",
+    "·acme·@isaacs§string-locale-compare@2.1.3",
+    "·acme·@jsr§std__semver@1.0.0-rc.1",
+    "·acme·@scope_x§bar@1.0.0",
+    "·acme·@scope_x§bar@10.0.0",
+    "·acme·@scope§bar-baz@1.0.0-rc.1",
+    "·acme·@scope§bar@1.0.0%2Bbuild.1",
+    "·acme·@sindresorhus§is@1.0.0%2Bbuild.1",
+    "·acme·0x@2.1.3",
+    "·acme·a__b@2.1.3",
+    "·acme·a_b@1.0.0",
+    "·acme·a_b@10.0.0",
+    "·acme·a-b@1.0.0-rc.1",
+    "·acme·a.b@1.0.0%2Bbuild.1",
+    "·acme·A@1.0.0-rc.1",
+    "·acme·a@1.0.0%2Bbuild.1",
+    "·acme·a~b@1.0.0",
+    "·acme·a~b@10.0.0",
+    "·acme·a1@1.0.0-rc.1",
+    "·acme·ab@1.0.0",
+    "·acme·Ab@1.0.0%2Bbuild.1",
+    "·acme·ab@10.0.0",
+    "·acme·aB@2.1.3",
+    "·acme·is-number@1.0.0%2Bbuild.1",
+    "·acme·JSONStream@1.0.0%2Bbuild.1",
+    "·acme·left-pad@2.1.3",
+    "·acme·MS@1.0.0%2Bbuild.1",
+    "·acme·ms@2.1.3",
+    "·acme·react-dom@1.0.0-rc.1",
+    "·acme·react@1.0.0",
+    "·acme·react@10.0.0",
+    "·acme·use-sync-external-store@1.0.0-rc.1",
+    "·acme·z@1.0.0-rc.1",
+    "·acme·zz@1.0.0",
+    "·acme·zz@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·@A§b@1.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·@a§b@1.0.0-rc.1",
+    "·http%3A§§127.0.0.1%3A4873§·@A§b@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·@isaacs§string-locale-compare@1.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·@isaacs§string-locale-compare@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·@jsr§std__semver@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·@scope_x§bar@1.0.0-rc.1",
+    "·http%3A§§127.0.0.1%3A4873§·@scope§bar-baz@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·@scope§bar@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·@sindresorhus§is@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·0x@1.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·0x@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·a__b@1.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·a__b@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·a_b@1.0.0-rc.1",
+    "·http%3A§§127.0.0.1%3A4873§·a-b@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·a.b@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·A@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·a@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·a~b@1.0.0-rc.1",
+    "·http%3A§§127.0.0.1%3A4873§·a1@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·aB@1.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·ab@1.0.0-rc.1",
+    "·http%3A§§127.0.0.1%3A4873§·aB@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·Ab@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·is-number@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·JSONStream@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·left-pad@1.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·left-pad@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·ms@1.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·ms@10.0.0",
+    "·http%3A§§127.0.0.1%3A4873§·MS@2.1.3",
+    "·http%3A§§127.0.0.1%3A4873§·react-dom@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·react@1.0.0-rc.1",
+    "·http%3A§§127.0.0.1%3A4873§·use-sync-external-store@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·z@1.0.0%2Bbuild.1",
+    "·http%3A§§127.0.0.1%3A4873§·zz@1.0.0-rc.1",
+    "·npm·@a§b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@A§b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@A§b@1.0.0%2Bbuild.1",
+    "·npm·@a§b@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@A§b@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@a§b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@A§b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@a§b@2.1.3",
+    "·npm·@isaacs§string-locale-compare@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@isaacs§string-locale-compare@1.0.0%2Bbuild.1",
+    "·npm·@isaacs§string-locale-compare@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@isaacs§string-locale-compare@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@jsr§std__semver@1.0.0",
+    "·npm·@jsr§std__semver@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@jsr§std__semver@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@jsr§std__semver@10.0.0",
+    "·npm·@jsr§std__semver@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@scope_x§bar@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@scope_x§bar@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@scope_x§bar@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@scope_x§bar@2.1.3",
+    "·npm·@scope§bar-baz@1.0.0",
+    "·npm·@scope§bar-baz@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@scope§bar-baz@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@scope§bar-baz@10.0.0",
+    "·npm·@scope§bar-baz@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@scope§bar@1.0.0-rc.1",
+    "·npm·@scope§bar@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@scope§bar@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@scope§bar@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@sindresorhus§is@1.0.0-rc.1",
+    "·npm·@sindresorhus§is@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·@sindresorhus§is@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·@sindresorhus§is@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·0x@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·0x@1.0.0%2Bbuild.1",
+    "·npm·0x@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·0x@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a__b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a__b@1.0.0%2Bbuild.1",
+    "·npm·a__b@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·a__b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a_b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a_b@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·a_b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a_b@2.1.3",
+    "·npm·a-b@1.0.0",
+    "·npm·a-b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a-b@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·a-b@10.0.0",
+    "·npm·a-b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a.b@1.0.0-rc.1",
+    "·npm·a.b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a.b@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·a.b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·A@1.0.0",
+    "·npm·a@1.0.0-rc.1",
+    "·npm·a@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·A@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·A@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·A@10.0.0",
+    "·npm·a@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·A@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a~b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a~b@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·a~b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a~b@2.1.3",
+    "·npm·a1@1.0.0",
+    "·npm·a1@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·a1@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·a1@10.0.0",
+    "·npm·a1@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·Ab@1.0.0-rc.1",
+    "·npm·ab@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·aB@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·Ab@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·aB@1.0.0%2Bbuild.1",
+    "·npm·ab@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·aB@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·Ab@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·ab@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·aB@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·Ab@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·ab@2.1.3",
+    "·npm·is-number@1.0.0-rc.1",
+    "·npm·is-number@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·is-number@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·is-number@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·JSONStream@1.0.0-rc.1",
+    "·npm·JSONStream@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·JSONStream@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·JSONStream@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·left-pad@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·left-pad@1.0.0%2Bbuild.1",
+    "·npm·left-pad@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·left-pad@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·MS@1.0.0-rc.1",
+    "·npm·ms@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·MS@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·ms@1.0.0%2Bbuild.1",
+    "·npm·ms@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·MS@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·ms@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·MS@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·react-dom@1.0.0",
+    "·npm·react-dom@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·react-dom@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·react-dom@10.0.0",
+    "·npm·react-dom@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·react@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·react@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·react@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·react@2.1.3",
+    "·npm·use-sync-external-store@1.0.0",
+    "·npm·use-sync-external-store@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·use-sync-external-store@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·use-sync-external-store@10.0.0",
+    "·npm·use-sync-external-store@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·z@1.0.0",
+    "·npm·z@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·z@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·z@10.0.0",
+    "·npm·z@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·zz@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·zz@1.0.0%2Bbuild.1·%E1%B9%97%3A3",
+    "·npm·zz@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+    "·npm·zz@2.1.3",
+    "~acme~@A+b@1.0.0_pbuild.1",
+    "~acme~@A+b@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@a+b@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@A+b@1.0.0-rc.1~peer.dbd5ca8b03a66489",
+    "~acme~@A+b@1.0.0~peer.2",
+    "~acme~@a+b@1.0.0~peer.dbd5ca8b03a66489",
+    "~acme~@A+b@10.0.0~peer.2",
+    "~acme~@a+b@10.0.0~peer.dbd5ca8b03a66489",
+    "~acme~@a+b@2.1.3",
+    "~acme~@a+b@2.1.3~peer.2",
+    "~acme~@isaacs+string-locale-compare@1.0.0_pbuild.1",
+    "~acme~@isaacs+string-locale-compare@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@isaacs+string-locale-compare@1.0.0-rc.1~peer.dbd5ca8b03a66489",
+    "~acme~@isaacs+string-locale-compare@1.0.0~peer.2",
+    "~acme~@isaacs+string-locale-compare@10.0.0~peer.2",
+    "~acme~@jsr+std____semver@1.0.0",
+    "~acme~@jsr+std____semver@1.0.0_pbuild.1~peer.2",
+    "~acme~@jsr+std____semver@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@jsr+std____semver@10.0.0",
+    "~acme~@jsr+std____semver@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@jsr+std____semver@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~@scope__x+bar@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@scope__x+bar@1.0.0~peer.dbd5ca8b03a66489",
+    "~acme~@scope__x+bar@10.0.0~peer.dbd5ca8b03a66489",
+    "~acme~@scope__x+bar@2.1.3",
+    "~acme~@scope__x+bar@2.1.3~peer.2",
+    "~acme~@scope+bar-baz@1.0.0",
+    "~acme~@scope+bar-baz@1.0.0_pbuild.1~peer.2",
+    "~acme~@scope+bar-baz@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@scope+bar-baz@10.0.0",
+    "~acme~@scope+bar-baz@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@scope+bar-baz@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~@scope+bar@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~@scope+bar@1.0.0-rc.1",
+    "~acme~@scope+bar@1.0.0-rc.1~peer.2",
+    "~acme~@scope+bar@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~@sindresorhus+is@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~@sindresorhus+is@1.0.0-rc.1",
+    "~acme~@sindresorhus+is@1.0.0-rc.1~peer.2",
+    "~acme~@sindresorhus+is@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~0x@1.0.0_pbuild.1",
+    "~acme~0x@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~0x@1.0.0-rc.1~peer.dbd5ca8b03a66489",
+    "~acme~0x@1.0.0~peer.2",
+    "~acme~0x@10.0.0~peer.2",
+    "~acme~a____b@1.0.0_pbuild.1",
+    "~acme~a____b@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a____b@1.0.0-rc.1~peer.dbd5ca8b03a66489",
+    "~acme~a____b@1.0.0~peer.2",
+    "~acme~a____b@10.0.0~peer.2",
+    "~acme~a__b@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a__b@1.0.0~peer.dbd5ca8b03a66489",
+    "~acme~a__b@10.0.0~peer.dbd5ca8b03a66489",
+    "~acme~a__b@2.1.3",
+    "~acme~a__b@2.1.3~peer.2",
+    "~acme~a_tb@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a_tb@1.0.0~peer.dbd5ca8b03a66489",
+    "~acme~a_tb@10.0.0~peer.dbd5ca8b03a66489",
+    "~acme~a_tb@2.1.3",
+    "~acme~a_tb@2.1.3~peer.2",
+    "~acme~a-b@1.0.0",
+    "~acme~a-b@1.0.0_pbuild.1~peer.2",
+    "~acme~a-b@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a-b@10.0.0",
+    "~acme~a-b@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a-b@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~a.b@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~a.b@1.0.0-rc.1",
+    "~acme~a.b@1.0.0-rc.1~peer.2",
+    "~acme~a.b@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~A@1.0.0",
+    "~acme~A@1.0.0_pbuild.1~peer.2",
+    "~acme~a@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~a@1.0.0-rc.1",
+    "~acme~a@1.0.0-rc.1~peer.2",
+    "~acme~A@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~A@10.0.0",
+    "~acme~A@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~A@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~a1@1.0.0",
+    "~acme~a1@1.0.0_pbuild.1~peer.2",
+    "~acme~a1@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a1@10.0.0",
+    "~acme~a1@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~a1@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~aB@1.0.0_pbuild.1",
+    "~acme~aB@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~Ab@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~Ab@1.0.0-rc.1",
+    "~acme~ab@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~Ab@1.0.0-rc.1~peer.2",
+    "~acme~aB@1.0.0-rc.1~peer.dbd5ca8b03a66489",
+    "~acme~aB@1.0.0~peer.2",
+    "~acme~ab@1.0.0~peer.dbd5ca8b03a66489",
+    "~acme~aB@10.0.0~peer.2",
+    "~acme~ab@10.0.0~peer.dbd5ca8b03a66489",
+    "~acme~ab@2.1.3",
+    "~acme~Ab@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~ab@2.1.3~peer.2",
+    "~acme~is-number@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~is-number@1.0.0-rc.1",
+    "~acme~is-number@1.0.0-rc.1~peer.2",
+    "~acme~is-number@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~JSONStream@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~JSONStream@1.0.0-rc.1",
+    "~acme~JSONStream@1.0.0-rc.1~peer.2",
+    "~acme~JSONStream@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~left-pad@1.0.0_pbuild.1",
+    "~acme~left-pad@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~left-pad@1.0.0-rc.1~peer.dbd5ca8b03a66489",
+    "~acme~left-pad@1.0.0~peer.2",
+    "~acme~left-pad@10.0.0~peer.2",
+    "~acme~ms@1.0.0_pbuild.1",
+    "~acme~ms@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~MS@1.0.0_pbuild.1~peer.dbd5ca8b03a66489",
+    "~acme~MS@1.0.0-rc.1",
+    "~acme~MS@1.0.0-rc.1~peer.2",
+    "~acme~ms@1.0.0-rc.1~peer.dbd5ca8b03a66489",
+    "~acme~ms@1.0.0~peer.2",
+    "~acme~ms@10.0.0~peer.2",
+    "~acme~MS@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~react-dom@1.0.0",
+    "~acme~react-dom@1.0.0_pbuild.1~peer.2",
+    "~acme~react-dom@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~react-dom@10.0.0",
+    "~acme~react-dom@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~react-dom@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~react@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~react@1.0.0~peer.dbd5ca8b03a66489",
+    "~acme~react@10.0.0~peer.dbd5ca8b03a66489",
+    "~acme~react@2.1.3",
+    "~acme~react@2.1.3~peer.2",
+    "~acme~use-sync-external-store@1.0.0",
+    "~acme~use-sync-external-store@1.0.0_pbuild.1~peer.2",
+    "~acme~use-sync-external-store@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~use-sync-external-store@10.0.0",
+    "~acme~use-sync-external-store@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~use-sync-external-store@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~z@1.0.0",
+    "~acme~z@1.0.0_pbuild.1~peer.2",
+    "~acme~z@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~z@10.0.0",
+    "~acme~z@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~z@2.1.3~peer.dbd5ca8b03a66489",
+    "~acme~zz@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+    "~acme~zz@1.0.0~peer.dbd5ca8b03a66489",
+    "~acme~zz@10.0.0~peer.dbd5ca8b03a66489",
+    "~acme~zz@2.1.3",
+    "~acme~zz@2.1.3~peer.2",
+    "~https_c++registry.example.com+npm+~@A+b@1.0.0",
+    "~https_c++registry.example.com+npm+~@a+b@1.0.0-rc.1",
+    "~https_c++registry.example.com+npm+~@A+b@10.0.0",
+    "~https_c++registry.example.com+npm+~@isaacs+string-locale-compare@1.0.0",
+    "~https_c++registry.example.com+npm+~@isaacs+string-locale-compare@10.0.0",
+    "~https_c++registry.example.com+npm+~@jsr+std____semver@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~@scope__x+bar@1.0.0-rc.1",
+    "~https_c++registry.example.com+npm+~@scope+bar-baz@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~@scope+bar@2.1.3",
+    "~https_c++registry.example.com+npm+~@sindresorhus+is@2.1.3",
+    "~https_c++registry.example.com+npm+~0x@1.0.0",
+    "~https_c++registry.example.com+npm+~0x@10.0.0",
+    "~https_c++registry.example.com+npm+~a____b@1.0.0",
+    "~https_c++registry.example.com+npm+~a____b@10.0.0",
+    "~https_c++registry.example.com+npm+~a__b@1.0.0-rc.1",
+    "~https_c++registry.example.com+npm+~a_tb@1.0.0-rc.1",
+    "~https_c++registry.example.com+npm+~a-b@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~a.b@2.1.3",
+    "~https_c++registry.example.com+npm+~A@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~a@2.1.3",
+    "~https_c++registry.example.com+npm+~a1@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~aB@1.0.0",
+    "~https_c++registry.example.com+npm+~ab@1.0.0-rc.1",
+    "~https_c++registry.example.com+npm+~aB@10.0.0",
+    "~https_c++registry.example.com+npm+~Ab@2.1.3",
+    "~https_c++registry.example.com+npm+~is-number@2.1.3",
+    "~https_c++registry.example.com+npm+~JSONStream@2.1.3",
+    "~https_c++registry.example.com+npm+~left-pad@1.0.0",
+    "~https_c++registry.example.com+npm+~left-pad@10.0.0",
+    "~https_c++registry.example.com+npm+~ms@1.0.0",
+    "~https_c++registry.example.com+npm+~ms@10.0.0",
+    "~https_c++registry.example.com+npm+~MS@2.1.3",
+    "~https_c++registry.example.com+npm+~react-dom@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~react@1.0.0-rc.1",
+    "~https_c++registry.example.com+npm+~use-sync-external-store@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~z@1.0.0_pbuild.1",
+    "~https_c++registry.example.com+npm+~zz@1.0.0-rc.1",
+    "~jsr~@a+b@1.0.0",
+    "~jsr~@a+b@10.0.0",
+    "~jsr~@A+b@2.1.3",
+    "~jsr~@isaacs+string-locale-compare@2.1.3",
+    "~jsr~@jsr+std____semver@1.0.0-rc.1",
+    "~jsr~@scope__x+bar@1.0.0",
+    "~jsr~@scope__x+bar@10.0.0",
+    "~jsr~@scope+bar-baz@1.0.0-rc.1",
+    "~jsr~@scope+bar@1.0.0_pbuild.1",
+    "~jsr~@sindresorhus+is@1.0.0_pbuild.1",
+    "~jsr~0x@2.1.3",
+    "~jsr~a____b@2.1.3",
+    "~jsr~a__b@1.0.0",
+    "~jsr~a__b@10.0.0",
+    "~jsr~a_tb@1.0.0",
+    "~jsr~a_tb@10.0.0",
+    "~jsr~a-b@1.0.0-rc.1",
+    "~jsr~a.b@1.0.0_pbuild.1",
+    "~jsr~a@1.0.0_pbuild.1",
+    "~jsr~A@1.0.0-rc.1",
+    "~jsr~a1@1.0.0-rc.1",
+    "~jsr~ab@1.0.0",
+    "~jsr~Ab@1.0.0_pbuild.1",
+    "~jsr~ab@10.0.0",
+    "~jsr~aB@2.1.3",
+    "~jsr~is-number@1.0.0_pbuild.1",
+    "~jsr~JSONStream@1.0.0_pbuild.1",
+    "~jsr~left-pad@2.1.3",
+    "~jsr~MS@1.0.0_pbuild.1",
+    "~jsr~ms@2.1.3",
+    "~jsr~react-dom@1.0.0-rc.1",
+    "~jsr~react@1.0.0",
+    "~jsr~react@10.0.0",
+    "~jsr~use-sync-external-store@1.0.0-rc.1",
+    "~jsr~z@1.0.0-rc.1",
+    "~jsr~zz@1.0.0",
+    "~jsr~zz@10.0.0",
+    "~npm~@a+b@1.0.0",
+    "~npm~@A+b@1.0.0",
+    "~npm~@a+b@1.0.0_pbuild.1",
+    "~npm~@A+b@1.0.0_pbuild.1",
+    "~npm~@a+b@1.0.0-rc.1",
+    "~npm~@A+b@1.0.0-rc.1",
+    "~npm~@a+b@10.0.0",
+    "~npm~@A+b@10.0.0",
+    "~npm~@a+b@2.1.3",
+    "~npm~@A+b@2.1.3",
+    "~npm~@isaacs+string-locale-compare@1.0.0",
+    "~npm~@isaacs+string-locale-compare@1.0.0_pbuild.1",
+    "~npm~@isaacs+string-locale-compare@1.0.0-rc.1",
+    "~npm~@isaacs+string-locale-compare@10.0.0",
+    "~npm~@isaacs+string-locale-compare@2.1.3",
+    "~npm~@jsr+std____semver@1.0.0",
+    "~npm~@jsr+std____semver@1.0.0_pbuild.1",
+    "~npm~@jsr+std____semver@1.0.0-rc.1",
+    "~npm~@jsr+std____semver@10.0.0",
+    "~npm~@jsr+std____semver@2.1.3",
+    "~npm~@scope__x+bar@1.0.0",
+    "~npm~@scope__x+bar@1.0.0_pbuild.1",
+    "~npm~@scope__x+bar@1.0.0-rc.1",
+    "~npm~@scope__x+bar@10.0.0",
+    "~npm~@scope__x+bar@2.1.3",
+    "~npm~@scope+bar-baz@1.0.0",
+    "~npm~@scope+bar-baz@1.0.0_pbuild.1",
+    "~npm~@scope+bar-baz@1.0.0-rc.1",
+    "~npm~@scope+bar-baz@10.0.0",
+    "~npm~@scope+bar-baz@2.1.3",
+    "~npm~@scope+bar@1.0.0",
+    "~npm~@scope+bar@1.0.0_pbuild.1",
+    "~npm~@scope+bar@1.0.0-rc.1",
+    "~npm~@scope+bar@10.0.0",
+    "~npm~@scope+bar@2.1.3",
+    "~npm~@sindresorhus+is@1.0.0",
+    "~npm~@sindresorhus+is@1.0.0_pbuild.1",
+    "~npm~@sindresorhus+is@1.0.0-rc.1",
+    "~npm~@sindresorhus+is@10.0.0",
+    "~npm~@sindresorhus+is@2.1.3",
+    "~npm~0x@1.0.0",
+    "~npm~0x@1.0.0_pbuild.1",
+    "~npm~0x@1.0.0-rc.1",
+    "~npm~0x@10.0.0",
+    "~npm~0x@2.1.3",
+    "~npm~a____b@1.0.0",
+    "~npm~a____b@1.0.0_pbuild.1",
+    "~npm~a____b@1.0.0-rc.1",
+    "~npm~a____b@10.0.0",
+    "~npm~a____b@2.1.3",
+    "~npm~a__b@1.0.0",
+    "~npm~a__b@1.0.0_pbuild.1",
+    "~npm~a__b@1.0.0-rc.1",
+    "~npm~a__b@10.0.0",
+    "~npm~a__b@2.1.3",
+    "~npm~a_tb@1.0.0",
+    "~npm~a_tb@1.0.0_pbuild.1",
+    "~npm~a_tb@1.0.0-rc.1",
+    "~npm~a_tb@10.0.0",
+    "~npm~a_tb@2.1.3",
+    "~npm~a-b@1.0.0",
+    "~npm~a-b@1.0.0_pbuild.1",
+    "~npm~a-b@1.0.0-rc.1",
+    "~npm~a-b@10.0.0",
+    "~npm~a-b@2.1.3",
+    "~npm~a.b@1.0.0",
+    "~npm~a.b@1.0.0_pbuild.1",
+    "~npm~a.b@1.0.0-rc.1",
+    "~npm~a.b@10.0.0",
+    "~npm~a.b@2.1.3",
+    "~npm~a@1.0.0",
+    "~npm~A@1.0.0",
+    "~npm~a@1.0.0_pbuild.1",
+    "~npm~A@1.0.0_pbuild.1",
+    "~npm~a@1.0.0-rc.1",
+    "~npm~A@1.0.0-rc.1",
+    "~npm~a@10.0.0",
+    "~npm~A@10.0.0",
+    "~npm~a@2.1.3",
+    "~npm~A@2.1.3",
+    "~npm~a1@1.0.0",
+    "~npm~a1@1.0.0_pbuild.1",
+    "~npm~a1@1.0.0-rc.1",
+    "~npm~a1@10.0.0",
+    "~npm~a1@2.1.3",
+    "~npm~ab@1.0.0",
+    "~npm~aB@1.0.0",
+    "~npm~Ab@1.0.0",
+    "~npm~ab@1.0.0_pbuild.1",
+    "~npm~aB@1.0.0_pbuild.1",
+    "~npm~Ab@1.0.0_pbuild.1",
+    "~npm~ab@1.0.0-rc.1",
+    "~npm~aB@1.0.0-rc.1",
+    "~npm~Ab@1.0.0-rc.1",
+    "~npm~ab@10.0.0",
+    "~npm~aB@10.0.0",
+    "~npm~Ab@10.0.0",
+    "~npm~ab@2.1.3",
+    "~npm~aB@2.1.3",
+    "~npm~Ab@2.1.3",
+    "~npm~is-number@1.0.0",
+    "~npm~is-number@1.0.0_pbuild.1",
+    "~npm~is-number@1.0.0-rc.1",
+    "~npm~is-number@10.0.0",
+    "~npm~is-number@2.1.3",
+    "~npm~JSONStream@1.0.0",
+    "~npm~JSONStream@1.0.0_pbuild.1",
+    "~npm~JSONStream@1.0.0-rc.1",
+    "~npm~JSONStream@10.0.0",
+    "~npm~JSONStream@2.1.3",
+    "~npm~left-pad@1.0.0",
+    "~npm~left-pad@1.0.0_pbuild.1",
+    "~npm~left-pad@1.0.0-rc.1",
+    "~npm~left-pad@10.0.0",
+    "~npm~left-pad@2.1.3",
+    "~npm~ms@1.0.0",
+    "~npm~MS@1.0.0",
+    "~npm~ms@1.0.0_pbuild.1",
+    "~npm~MS@1.0.0_pbuild.1",
+    "~npm~ms@1.0.0-rc.1",
+    "~npm~MS@1.0.0-rc.1",
+    "~npm~ms@10.0.0",
+    "~npm~MS@10.0.0",
+    "~npm~ms@2.1.3",
+    "~npm~MS@2.1.3",
+    "~npm~react-dom@1.0.0",
+    "~npm~react-dom@1.0.0_pbuild.1",
+    "~npm~react-dom@1.0.0-rc.1",
+    "~npm~react-dom@10.0.0",
+    "~npm~react-dom@2.1.3",
+    "~npm~react@1.0.0",
+    "~npm~react@1.0.0_pbuild.1",
+    "~npm~react@1.0.0-rc.1",
+    "~npm~react@10.0.0",
+    "~npm~react@2.1.3",
+    "~npm~use-sync-external-store@1.0.0",
+    "~npm~use-sync-external-store@1.0.0_pbuild.1",
+    "~npm~use-sync-external-store@1.0.0-rc.1",
+    "~npm~use-sync-external-store@10.0.0",
+    "~npm~use-sync-external-store@2.1.3",
+    "~npm~z@1.0.0",
+    "~npm~z@1.0.0_pbuild.1",
+    "~npm~z@1.0.0-rc.1",
+    "~npm~z@10.0.0",
+    "~npm~z@2.1.3",
+    "~npm~zz@1.0.0",
+    "~npm~zz@1.0.0_pbuild.1",
+    "~npm~zz@1.0.0-rc.1",
+    "~npm~zz@10.0.0",
+    "~npm~zz@2.1.3",
+    "file·.",
+    "file·..",
+    "file·..§x",
+    "file·.§packages§a",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§@isaacs§string-locale-compare-1.0.0%2Bbuild.1§node_modules§@isaacs§string-locale-compare",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§@scope§bar-10.0.0§node_modules§@scope§bar",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§0x-1.0.0§node_modules§0x",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§a_b-1.0.0-rc.1§node_modules§a_b",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§a-1.0.0§node_modules§a",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§a1-10.0.0§node_modules§a1",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§aB-2.1.3§node_modules§aB",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§MS-1.0.0%2Bbuild.1§node_modules§MS",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§react-2.1.3§node_modules§react",
+    "file·.socket§vendor§npm§0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b§use-sync-external-store-1.0.0-rc.1§node_modules§use-sync-external-store",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§@a§b-1.0.0%2Bbuild.1§node_modules§@a§b",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§@scope§bar-baz-1.0.0§node_modules§@scope§bar-baz",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§@sindresorhus§is-2.1.3§node_modules§@sindresorhus§is",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§a__b-1.0.0%2Bbuild.1§node_modules§a__b",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§A-1.0.0-rc.1§node_modules§A",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§a~b-1.0.0§node_modules§a~b",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§Ab-10.0.0§node_modules§Ab",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§is-number-1.0.0-rc.1§node_modules§is-number",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§left-pad-10.0.0§node_modules§left-pad",
+    "file·.socket§vendor§npm§80630680-4da6-45f9-bba8-b888e0ffd58c§z-2.1.3§node_modules§z",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§@A§b-2.1.3§node_modules§@A§b",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§@jsr§std__semver-10.0.0§node_modules§@jsr§std__semver",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§@scope_x§bar-1.0.0-rc.1§node_modules§@scope_x§bar",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§a-b-1.0.0§node_modules§a-b",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§a.b-2.1.3§node_modules§a.b",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§ab-1.0.0%2Bbuild.1§node_modules§ab",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§JSONStream-1.0.0§node_modules§JSONStream",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§ms-1.0.0-rc.1§node_modules§ms",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§react-dom-1.0.0%2Bbuild.1§node_modules§react-dom",
+    "file·.socket§vendor§npm§ffffffff-2222-4333-8444-555555555555§zz-10.0.0§node_modules§zz",
+    "file·a%20b§c",
+    "file·vendor§x",
+    "file·vendor§x.tgz",
+    "file~_d",
+    "file~._d",
+    "file~..+x",
+    "file~.+packages+a",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+@isaacs+string-locale-compare-1.0.0_pbuild.1+node__modules+@isaacs+string-locale-compare",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+@scope+bar-10.0.0+node__modules+@scope+bar",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+0x-1.0.0+node__modules+0x",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+a__b-1.0.0-rc.1+node__modules+a__b",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+a-1.0.0+node__modules+a",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+a1-10.0.0+node__modules+a1",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+aB-2.1.3+node__modules+aB",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+MS-1.0.0_pbuild.1+node__modules+MS",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+react-2.1.3+node__modules+react",
+    "file~.socket+vendor+npm+0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b+use-sync-external-store-1.0.0-rc.1+node__modules+use-sync-external-store",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+@a+b-1.0.0_pbuild.1+node__modules+@a+b",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+@scope+bar-baz-1.0.0+node__modules+@scope+bar-baz",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+@sindresorhus+is-2.1.3+node__modules+@sindresorhus+is",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+a____b-1.0.0_pbuild.1+node__modules+a____b",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+a_tb-1.0.0+node__modules+a_tb",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+A-1.0.0-rc.1+node__modules+A",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+Ab-10.0.0+node__modules+Ab",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+is-number-1.0.0-rc.1+node__modules+is-number",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+left-pad-10.0.0+node__modules+left-pad",
+    "file~.socket+vendor+npm+80630680-4da6-45f9-bba8-b888e0ffd58c+z-2.1.3+node__modules+z",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+@A+b-2.1.3+node__modules+@A+b",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+@jsr+std____semver-10.0.0+node__modules+@jsr+std____semver",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+@scope__x+bar-1.0.0-rc.1+node__modules+@scope__x+bar",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+a-b-1.0.0+node__modules+a-b",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+a.b-2.1.3+node__modules+a.b",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+ab-1.0.0_pbuild.1+node__modules+ab",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+JSONStream-1.0.0+node__modules+JSONStream",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+ms-1.0.0-rc.1+node__modules+ms",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+react-dom-1.0.0_pbuild.1+node__modules+react-dom",
+    "file~.socket+vendor+npm+ffffffff-2222-4333-8444-555555555555+zz-10.0.0+node__modules+zz",
+    "file~a_sb+c",
+    "file~vendor+x",
+    "file~vendor+x.tgz",
+    "git·git%2Bssh%3A§§git@host§x.git·main",
+    "git·github%3Auser§proj·semver%3A%5E1",
+    "git·github%3Auser§proj·v1.0.0",
+    "git~git_pssh_c++git@host+x.git~main",
+    "git~github_cuser+proj~semver_c^1",
+    "git~github_cuser+proj~v1.0.0",
+    "remote·http%3A§§h§x.tgz",
+    "remote·https%3A§§e.com§r-1.0.0.tgz",
+    "remote·https%3A§§e.com§R-1.0.0.tgz",
+    "remote~http_c++h+x.tgz",
+    "remote~https_c++e.com+r-1.0.0.tgz",
+    "remote~https_c++e.com+R-1.0.0.tgz",
+    "workspace·apps§web-1",
+    "workspace·packages§a",
+    "workspace·packages§b",
+    "workspace·packages§my_lib",
+    "workspace~apps+web-1",
+    "workspace~packages+a",
+    "workspace~packages+b",
+    "workspace~packages+my__lib"
+  ],
+  "edges": [
+    [
+      "file·. dep-0-1",
+      "dev ^1.0.0 || ^2 ··@isaacs§string-locale-compare@10.0.0"
+    ],
+    [
+      "file·. dep-0-2",
+      "optional 1.0.0 ··@scope§bar-baz@1.0.0-rc.1"
+    ],
+    [
+      "file·. dep-0-3",
+      "peer ^1.0.0 || ^2 ··@sindresorhus§is@2.1.3"
+    ],
+    [
+      "file·. dep-0-0",
+      "prod 1.0.0 MISSING"
+    ],
+    [
+      "file~_d dep-1-0",
+      "dev 1.0.0 ··@A§b@10.0.0"
+    ],
+    [
+      "file~_d dep-1-1",
+      "optional ^1.0.0 || ^2 ··@scope_x§bar@1.0.0"
+    ],
+    [
+      "file~_d dep-1-2",
+      "peer 1.0.0 ··@scope§bar@10.0.0"
+    ],
+    [
+      "file~_d dep-1-3",
+      "peerOptional ^1.0.0 || ^2 ··a__b@1.0.0-rc.1"
+    ],
+    [
+      "workspace·apps§web-1 dep-2-0",
+      "optional 1.0.0 ··@isaacs§string-locale-compare@2.1.3"
+    ],
+    [
+      "workspace·apps§web-1 dep-2-1",
+      "peer ^1.0.0 || ^2 ··@scope§bar-baz@1.0.0%2Bbuild.1"
+    ],
+    [
+      "workspace·apps§web-1 dep-2-2",
+      "peerOptional 1.0.0 ··0x@1.0.0"
+    ],
+    [
+      "workspace·apps§web-1 dep-2-3",
+      "prod ^1.0.0 || ^2 ··a_b@10.0.0"
+    ],
+    [
+      "workspace·packages§a dep-3-3",
+      "dev ^1.0.0 || ^2 ··a.b@1.0.0"
+    ],
+    [
+      "workspace·packages§a dep-3-0",
+      "peer 1.0.0 ··@scope_x§bar@1.0.0-rc.1"
+    ],
+    [
+      "workspace·packages§a dep-3-1",
+      "peerOptional ^1.0.0 || ^2 ··@scope§bar@2.1.3"
+    ],
+    [
+      "workspace·packages§a dep-3-2",
+      "prod 1.0.0 ··a__b@1.0.0%2Bbuild.1"
+    ],
+    [
+      "workspace·packages§b dep-4-2",
+      "dev 1.0.0 ··a_b@2.1.3"
+    ],
+    [
+      "workspace·packages§b dep-4-3",
+      "optional ^1.0.0 || ^2 ··a@1.0.0-rc.1"
+    ],
+    [
+      "workspace·packages§b dep-4-0",
+      "peerOptional 1.0.0 ··@scope§bar-baz@10.0.0"
+    ],
+    [
+      "workspace·packages§b dep-4-1",
+      "prod ^1.0.0 || ^2 ··0x@1.0.0-rc.1"
+    ],
+    [
+      "workspace·packages§my_lib dep-5-1",
+      "dev ^1.0.0 || ^2 ··a__b@10.0.0"
+    ],
+    [
+      "workspace·packages§my_lib dep-5-2",
+      "optional 1.0.0 ··a.b@1.0.0-rc.1"
+    ],
+    [
+      "workspace·packages§my_lib dep-5-3",
+      "peer ^1.0.0 || ^2 ··A@2.1.3"
+    ],
+    [
+      "workspace·packages§my_lib dep-5-0",
+      "prod 1.0.0 ··@sindresorhus§is@1.0.0"
+    ],
+    [
+      "workspace~apps+web-1 dep-6-0",
+      "dev 1.0.0 ··0x@1.0.0%2Bbuild.1"
+    ],
+    [
+      "workspace~apps+web-1 dep-6-1",
+      "optional ^1.0.0 || ^2 ··a-b@1.0.0"
+    ],
+    [
+      "workspace~apps+web-1 dep-6-2",
+      "peer 1.0.0 ··A@1.0.0-rc.1"
+    ],
+    [
+      "workspace~apps+web-1 dep-6-3",
+      "peerOptional ^1.0.0 || ^2 ··a1@1.0.0-rc.1"
+    ],
+    [
+      "workspace~packages+a dep-7-0",
+      "optional 1.0.0 ··a__b@2.1.3"
+    ],
+    [
+      "workspace~packages+a dep-7-1",
+      "peer ^1.0.0 || ^2 ··a.b@1.0.0%2Bbuild.1"
+    ],
+    [
+      "workspace~packages+a dep-7-2",
+      "peerOptional 1.0.0 ··a~b@1.0.0"
+    ],
+    [
+      "workspace~packages+a dep-7-3",
+      "prod ^1.0.0 || ^2 ··ab@1.0.0-rc.1"
+    ],
+    [
+      "workspace~packages+b dep-8-3",
+      "dev ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "workspace~packages+b dep-8-0",
+      "peer 1.0.0 ··a-b@1.0.0-rc.1"
+    ],
+    [
+      "workspace~packages+b dep-8-1",
+      "peerOptional ^1.0.0 || ^2 ··a@1.0.0%2Bbuild.1"
+    ],
+    [
+      "workspace~packages+b dep-8-2",
+      "prod 1.0.0 ··a1@1.0.0%2Bbuild.1"
+    ],
+    [
+      "workspace~packages+my__lib dep-9-2",
+      "dev 1.0.0 MISSING"
+    ],
+    [
+      "workspace~packages+my__lib dep-9-3",
+      "optional ^1.0.0 || ^2 ··is-number@1.0.0%2Bbuild.1"
+    ],
+    [
+      "workspace~packages+my__lib dep-9-0",
+      "peerOptional 1.0.0 ··a.b@10.0.0"
+    ],
+    [
+      "workspace~packages+my__lib dep-9-1",
+      "prod ^1.0.0 || ^2 ··a~b@1.0.0-rc.1"
+    ],
+    [
+      "··@a§b@1.0.0 dep-10-1",
+      "dev ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "··@a§b@1.0.0 dep-10-2",
+      "optional 1.0.0 ··Ab@10.0.0"
+    ],
+    [
+      "··@a§b@1.0.0 dep-10-3",
+      "peer ^1.0.0 || ^2 ··JSONStream@2.1.3"
+    ],
+    [
+      "··@a§b@1.0.0 dep-10-0",
+      "prod 1.0.0 ··A@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··@jsr§std__semver@1.0.0%2Bbuild.1 dep-11-0",
+      "dev 1.0.0 MISSING"
+    ],
+    [
+      "··@jsr§std__semver@1.0.0%2Bbuild.1 dep-11-1",
+      "optional ^1.0.0 || ^2 ··Ab@1.0.0-rc.1"
+    ],
+    [
+      "··@jsr§std__semver@1.0.0%2Bbuild.1 dep-11-2",
+      "peer 1.0.0 ··is-number@10.0.0"
+    ],
+    [
+      "··@jsr§std__semver@1.0.0%2Bbuild.1 dep-11-3",
+      "peerOptional ^1.0.0 || ^2 ··MS@1.0.0"
+    ],
+    [
+      "··@scope§bar@2.1.3 dep-12-0",
+      "optional 1.0.0 ··a1@2.1.3"
+    ],
+    [
+      "··@scope§bar@2.1.3 dep-12-1",
+      "peer ^1.0.0 || ^2 ··ab@2.1.3"
+    ],
+    [
+      "··@scope§bar@2.1.3 dep-12-2",
+      "peerOptional 1.0.0 ··left-pad@1.0.0"
+    ],
+    [
+      "··@scope§bar@2.1.3 dep-12-3",
+      "prod ^1.0.0 || ^2 ··ms@2.1.3"
+    ],
+    [
+      "··a_b@1.0.0-rc.1 dep-13-3",
+      "dev ^1.0.0 || ^2 ··react@1.0.0"
+    ],
+    [
+      "··a_b@1.0.0-rc.1 dep-13-0",
+      "peer 1.0.0 ··ab@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··a_b@1.0.0-rc.1 dep-13-1",
+      "peerOptional ^1.0.0 || ^2 ··is-number@2.1.3"
+    ],
+    [
+      "··a_b@1.0.0-rc.1 dep-13-2",
+      "prod 1.0.0 ··ms@1.0.0-rc.1"
+    ],
+    [
+      "··A@1.0.0-rc.1 dep-14-2",
+      "dev 1.0.0 ··MS@2.1.3"
+    ],
+    [
+      "··A@1.0.0-rc.1 dep-14-3",
+      "optional ^1.0.0 || ^2 ··use-sync-external-store@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··A@1.0.0-rc.1 dep-14-0",
+      "peerOptional 1.0.0 ··aB@2.1.3"
+    ],
+    [
+      "··A@1.0.0-rc.1 dep-14-1",
+      "prod ^1.0.0 || ^2 ··left-pad@1.0.0-rc.1"
+    ],
+    [
+      "··ab@1.0.0 dep-15-1",
+      "dev ^1.0.0 || ^2 ··MS@1.0.0-rc.1"
+    ],
+    [
+      "··ab@1.0.0 dep-15-2",
+      "optional 1.0.0 ··react@1.0.0-rc.1"
+    ],
+    [
+      "··ab@1.0.0 dep-15-3",
+      "peer ^1.0.0 || ^2 ··z@2.1.3"
+    ],
+    [
+      "··ab@1.0.0 dep-15-0",
+      "prod 1.0.0 ··JSONStream@1.0.0"
+    ],
+    [
+      "··is-number@1.0.0%2Bbuild.1 dep-16-0",
+      "dev 1.0.0 ··left-pad@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··is-number@1.0.0%2Bbuild.1 dep-16-1",
+      "optional ^1.0.0 || ^2 ··react-dom@1.0.0"
+    ],
+    [
+      "··is-number@1.0.0%2Bbuild.1 dep-16-2",
+      "peer 1.0.0 ··use-sync-external-store@10.0.0"
+    ],
+    [
+      "··is-number@1.0.0%2Bbuild.1 dep-16-3",
+      "peerOptional ^1.0.0 || ^2 ·acme·@a§b@10.0.0"
+    ],
+    [
+      "··ms@1.0.0%2Bbuild.1 dep-17-0",
+      "optional 1.0.0 ··ms@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··ms@1.0.0%2Bbuild.1 dep-17-1",
+      "peer ^1.0.0 || ^2 ··react@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··ms@1.0.0%2Bbuild.1 dep-17-2",
+      "peerOptional 1.0.0 ··zz@1.0.0"
+    ],
+    [
+      "··ms@1.0.0%2Bbuild.1 dep-17-3",
+      "prod ^1.0.0 || ^2 ·acme·@scope§bar@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··use-sync-external-store@1.0.0-rc.1 dep-18-3",
+      "dev ^1.0.0 || ^2 ·acme·a.b@1.0.0%2Bbuild.1"
+    ],
+    [
+      "··use-sync-external-store@1.0.0-rc.1 dep-18-0",
+      "peer 1.0.0 ··react-dom@1.0.0-rc.1"
+    ],
+    [
+      "··use-sync-external-store@1.0.0-rc.1 dep-18-1",
+      "peerOptional ^1.0.0 || ^2 ··use-sync-external-store@2.1.3"
+    ],
+    [
+      "··use-sync-external-store@1.0.0-rc.1 dep-18-2",
+      "prod 1.0.0 ·acme·@A§b@2.1.3"
+    ],
+    [
+      "·acme·@isaacs§string-locale-compare@2.1.3 dep-19-2",
+      "dev 1.0.0 ·acme·@sindresorhus§is@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·acme·@isaacs§string-locale-compare@2.1.3 dep-19-3",
+      "optional ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "·acme·@isaacs§string-locale-compare@2.1.3 dep-19-0",
+      "peerOptional 1.0.0 ··react@10.0.0"
+    ],
+    [
+      "·acme·@isaacs§string-locale-compare@2.1.3 dep-19-1",
+      "prod ^1.0.0 || ^2 ··zz@1.0.0-rc.1"
+    ],
+    [
+      "·acme·a1@1.0.0-rc.1 dep-20-1",
+      "dev ^1.0.0 || ^2 ·acme·@isaacs§string-locale-compare@2.1.3"
+    ],
+    [
+      "·acme·a1@1.0.0-rc.1 dep-20-2",
+      "optional 1.0.0 MISSING"
+    ],
+    [
+      "·acme·a1@1.0.0-rc.1 dep-20-3",
+      "peer ^1.0.0 || ^2 ·acme·ms@2.1.3"
+    ],
+    [
+      "·acme·a1@1.0.0-rc.1 dep-20-0",
+      "prod 1.0.0 ··z@1.0.0"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·@A§b@1.0.0 dep-21-0",
+      "dev 1.0.0 ··zz@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·@A§b@1.0.0 dep-21-1",
+      "optional ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·@A§b@1.0.0 dep-21-2",
+      "peer 1.0.0 ·acme·ab@10.0.0"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·@A§b@1.0.0 dep-21-3",
+      "peerOptional ^1.0.0 || ^2 ·acme·zz@10.0.0"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·A@1.0.0%2Bbuild.1 dep-22-0",
+      "optional 1.0.0 MISSING"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·A@1.0.0%2Bbuild.1 dep-22-1",
+      "peer ^1.0.0 || ^2 ·acme·a@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·A@1.0.0%2Bbuild.1 dep-22-2",
+      "peerOptional 1.0.0 ·acme·react-dom@1.0.0-rc.1"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·A@1.0.0%2Bbuild.1 dep-22-3",
+      "prod ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·@scope_x§bar@1.0.0-rc.1"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·use-sync-external-store@1.0.0%2Bbuild.1 dep-23-3",
+      "dev ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·a__b@10.0.0"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·use-sync-external-store@1.0.0%2Bbuild.1 dep-23-0",
+      "peer 1.0.0 ·acme·a__b@2.1.3"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·use-sync-external-store@1.0.0%2Bbuild.1 dep-23-1",
+      "peerOptional ^1.0.0 || ^2 ·acme·aB@2.1.3"
+    ],
+    [
+      "·http%3A§§127.0.0.1%3A4873§·use-sync-external-store@1.0.0%2Bbuild.1 dep-23-2",
+      "prod 1.0.0 ·http%3A§§127.0.0.1%3A4873§·@A§b@1.0.0"
+    ],
+    [
+      "·npm·@jsr§std__semver@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-24-2",
+      "dev 1.0.0 ·http%3A§§127.0.0.1%3A4873§·@scope§bar-baz@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·npm·@jsr§std__semver@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-24-3",
+      "optional ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·a1@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·npm·@jsr§std__semver@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-24-0",
+      "peerOptional 1.0.0 ·acme·a~b@1.0.0"
+    ],
+    [
+      "·npm·@jsr§std__semver@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-24-1",
+      "prod ^1.0.0 || ^2 ·acme·react@1.0.0"
+    ],
+    [
+      "·npm·@sindresorhus§is@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-25-1",
+      "dev ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·@a§b@1.0.0-rc.1"
+    ],
+    [
+      "·npm·@sindresorhus§is@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-25-2",
+      "optional 1.0.0 ·http%3A§§127.0.0.1%3A4873§·a_b@1.0.0-rc.1"
+    ],
+    [
+      "·npm·@sindresorhus§is@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-25-3",
+      "peer ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·left-pad@1.0.0"
+    ],
+    [
+      "·npm·@sindresorhus§is@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-25-0",
+      "prod 1.0.0 ·acme·is-number@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·npm·a-b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-26-0",
+      "dev 1.0.0 ·acme·react@10.0.0"
+    ],
+    [
+      "·npm·a-b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-26-1",
+      "optional ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·@scope§bar@2.1.3"
+    ],
+    [
+      "·npm·a-b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-26-2",
+      "peer 1.0.0 ·http%3A§§127.0.0.1%3A4873§·aB@1.0.0"
+    ],
+    [
+      "·npm·a-b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-26-3",
+      "peerOptional ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·use-sync-external-store@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·npm·a~b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-27-0",
+      "optional 1.0.0 ·http%3A§§127.0.0.1%3A4873§·@A§b@10.0.0"
+    ],
+    [
+      "·npm·a~b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-27-1",
+      "peer ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·a-b@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·npm·a~b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-27-2",
+      "peerOptional 1.0.0 ·http%3A§§127.0.0.1%3A4873§·left-pad@10.0.0"
+    ],
+    [
+      "·npm·a~b@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-27-3",
+      "prod ^1.0.0 || ^2 ·npm·@A§b@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "·npm·aB@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-28-3",
+      "dev ^1.0.0 || ^2 ·npm·@isaacs§string-locale-compare@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "·npm·aB@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-28-0",
+      "peer 1.0.0 ·http%3A§§127.0.0.1%3A4873§·@sindresorhus§is@2.1.3"
+    ],
+    [
+      "·npm·aB@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-28-1",
+      "peerOptional ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·ab@1.0.0-rc.1"
+    ],
+    [
+      "·npm·aB@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-28-2",
+      "prod 1.0.0 ·http%3A§§127.0.0.1%3A4873§·z@1.0.0%2Bbuild.1"
+    ],
+    [
+      "·npm·MS@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-29-2",
+      "dev 1.0.0 ·npm·@a§b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "·npm·MS@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-29-3",
+      "optional ^1.0.0 || ^2 ·npm·@scope_x§bar@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "·npm·MS@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-29-0",
+      "peerOptional 1.0.0 ·http%3A§§127.0.0.1%3A4873§·a.b@2.1.3"
+    ],
+    [
+      "·npm·MS@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms dep-29-1",
+      "prod ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·ms@1.0.0"
+    ],
+    [
+      "·npm·use-sync-external-store@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-30-1",
+      "dev ^1.0.0 || ^2 ·http%3A§§127.0.0.1%3A4873§·zz@1.0.0-rc.1"
+    ],
+    [
+      "·npm·use-sync-external-store@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-30-2",
+      "optional 1.0.0 ·npm·@jsr§std__semver@1.0.0"
+    ],
+    [
+      "·npm·use-sync-external-store@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-30-3",
+      "peer ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "·npm·use-sync-external-store@1.0.0%2Bbuild.1·%E1%B9%97%3A3 dep-30-0",
+      "prod 1.0.0 ·http%3A§§127.0.0.1%3A4873§·aB@10.0.0"
+    ],
+    [
+      "~acme~@a+b@1.0.0~peer.dbd5ca8b03a66489 dep-31-0",
+      "dev 1.0.0 ·http%3A§§127.0.0.1%3A4873§·ms@10.0.0"
+    ],
+    [
+      "~acme~@a+b@1.0.0~peer.dbd5ca8b03a66489 dep-31-1",
+      "optional ^1.0.0 || ^2 ·npm·@A§b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~@a+b@1.0.0~peer.dbd5ca8b03a66489 dep-31-2",
+      "peer 1.0.0 MISSING"
+    ],
+    [
+      "~acme~@a+b@1.0.0~peer.dbd5ca8b03a66489 dep-31-3",
+      "peerOptional ^1.0.0 || ^2 ·npm·@sindresorhus§is@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~acme~@scope__x+bar@1.0.0~peer.dbd5ca8b03a66489 dep-32-0",
+      "optional 1.0.0 ·npm·@a§b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~@scope__x+bar@1.0.0~peer.dbd5ca8b03a66489 dep-32-1",
+      "peer ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "~acme~@scope__x+bar@1.0.0~peer.dbd5ca8b03a66489 dep-32-2",
+      "peerOptional 1.0.0 ·npm·@scope§bar@1.0.0-rc.1"
+    ],
+    [
+      "~acme~@scope__x+bar@1.0.0~peer.dbd5ca8b03a66489 dep-32-3",
+      "prod ^1.0.0 || ^2 ·npm·a__b@1.0.0%2Bbuild.1"
+    ],
+    [
+      "~acme~@sindresorhus+is@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-33-3",
+      "dev ^1.0.0 || ^2 ·npm·a-b@1.0.0"
+    ],
+    [
+      "~acme~@sindresorhus+is@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-33-0",
+      "peer 1.0.0 MISSING"
+    ],
+    [
+      "~acme~@sindresorhus+is@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-33-1",
+      "peerOptional ^1.0.0 || ^2 ·npm·@scope_x§bar@2.1.3"
+    ],
+    [
+      "~acme~@sindresorhus+is@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-33-2",
+      "prod 1.0.0 ·npm·@sindresorhus§is@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~a_tb@1.0.0~peer.dbd5ca8b03a66489 dep-34-2",
+      "dev 1.0.0 ·npm·a__b@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~acme~a_tb@1.0.0~peer.dbd5ca8b03a66489 dep-34-3",
+      "optional ^1.0.0 || ^2 ·npm·a.b@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~acme~a_tb@1.0.0~peer.dbd5ca8b03a66489 dep-34-0",
+      "peerOptional 1.0.0 ·npm·@jsr§std__semver@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~acme~a_tb@1.0.0~peer.dbd5ca8b03a66489 dep-34-1",
+      "prod ^1.0.0 || ^2 ·npm·@scope§bar@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~a@1.0.0-rc.1 dep-35-1",
+      "dev ^1.0.0 || ^2 ·npm·0x@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~a@1.0.0-rc.1 dep-35-2",
+      "optional 1.0.0 ·npm·a-b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~a@1.0.0-rc.1 dep-35-3",
+      "peer ^1.0.0 || ^2 ·npm·A@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~acme~a@1.0.0-rc.1 dep-35-0",
+      "prod 1.0.0 ·npm·@scope§bar-baz@1.0.0"
+    ],
+    [
+      "~acme~ab@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-36-0",
+      "dev 1.0.0 ·npm·@scope§bar@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~acme~ab@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-36-1",
+      "optional ^1.0.0 || ^2 ·npm·a__b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~ab@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-36-2",
+      "peer 1.0.0 ·npm·a.b@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~ab@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-36-3",
+      "peerOptional ^1.0.0 || ^2 ·npm·a~b@2.1.3"
+    ],
+    [
+      "~acme~JSONStream@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-37-0",
+      "optional 1.0.0 ·npm·0x@1.0.0%2Bbuild.1"
+    ],
+    [
+      "~acme~JSONStream@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-37-1",
+      "peer ^1.0.0 || ^2 ·npm·a-b@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~acme~JSONStream@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-37-2",
+      "peerOptional 1.0.0 ·npm·A@10.0.0"
+    ],
+    [
+      "~acme~JSONStream@2.1.3~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-37-3",
+      "prod ^1.0.0 || ^2 ·npm·ab@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~react-dom@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-38-3",
+      "dev ^1.0.0 || ^2 ·npm·ab@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~react-dom@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-38-0",
+      "peer 1.0.0 ·npm·a_b@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~react-dom@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-38-1",
+      "peerOptional ^1.0.0 || ^2 ·npm·A@1.0.0"
+    ],
+    [
+      "~acme~react-dom@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-38-2",
+      "prod 1.0.0 ·npm·a1@1.0.0"
+    ],
+    [
+      "~acme~z@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-39-2",
+      "dev 1.0.0 ·npm·aB@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~z@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-39-3",
+      "optional ^1.0.0 || ^2 ·npm·is-number@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~acme~z@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-39-0",
+      "peerOptional 1.0.0 ·npm·a-b@10.0.0"
+    ],
+    [
+      "~acme~z@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number dep-39-1",
+      "prod ^1.0.0 || ^2 ·npm·a@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~@scope+bar@2.1.3 dep-40-1",
+      "dev ^1.0.0 || ^2 ·npm·a1@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~@scope+bar@2.1.3 dep-40-2",
+      "optional 1.0.0 ·npm·aB@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~@scope+bar@2.1.3 dep-40-3",
+      "peer ^1.0.0 || ^2 ·npm·left-pad@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~@scope+bar@2.1.3 dep-40-0",
+      "prod 1.0.0 ·npm·a@1.0.0-rc.1"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~is-number@2.1.3 dep-41-0",
+      "dev 1.0.0 ·npm·A@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~is-number@2.1.3 dep-41-1",
+      "optional ^1.0.0 || ^2 ·npm·Ab@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~is-number@2.1.3 dep-41-2",
+      "peer 1.0.0 ·npm·JSONStream@1.0.0-rc.1"
+    ],
+    [
+      "~https_c++registry.example.com+npm+~is-number@2.1.3 dep-41-3",
+      "peerOptional ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "~jsr~@scope__x+bar@1.0.0 dep-42-0",
+      "optional 1.0.0 ·npm·a1@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~jsr~@scope__x+bar@1.0.0 dep-42-1",
+      "peer ^1.0.0 || ^2 ·npm·Ab@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~jsr~@scope__x+bar@1.0.0 dep-42-2",
+      "peerOptional 1.0.0 MISSING"
+    ],
+    [
+      "~jsr~@scope__x+bar@1.0.0 dep-42-3",
+      "prod ^1.0.0 || ^2 ·npm·react-dom@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~jsr~Ab@1.0.0_pbuild.1 dep-43-3",
+      "dev ^1.0.0 || ^2 ·npm·use-sync-external-store@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~jsr~Ab@1.0.0_pbuild.1 dep-43-0",
+      "peer 1.0.0 ·npm·aB@1.0.0%2Bbuild.1"
+    ],
+    [
+      "~jsr~Ab@1.0.0_pbuild.1 dep-43-1",
+      "peerOptional ^1.0.0 || ^2 MISSING"
+    ],
+    [
+      "~jsr~Ab@1.0.0_pbuild.1 dep-43-2",
+      "prod 1.0.0 ·npm·ms@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~@a+b@1.0.0_pbuild.1 dep-44-2",
+      "dev 1.0.0 ·npm·react@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~@a+b@1.0.0_pbuild.1 dep-44-3",
+      "optional ^1.0.0 || ^2 ·npm·z@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~@a+b@1.0.0_pbuild.1 dep-44-0",
+      "peerOptional 1.0.0 MISSING"
+    ],
+    [
+      "~npm~@a+b@1.0.0_pbuild.1 dep-44-1",
+      "prod ^1.0.0 || ^2 ·npm·MS@1.0.0-rc.1"
+    ],
+    [
+      "~npm~@jsr+std____semver@2.1.3 dep-45-1",
+      "dev ^1.0.0 || ^2 ·npm·MS@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~@jsr+std____semver@2.1.3 dep-45-2",
+      "optional 1.0.0 ·npm·use-sync-external-store@10.0.0"
+    ],
+    [
+      "~npm~@jsr+std____semver@2.1.3 dep-45-3",
+      "peer ^1.0.0 || ^2 ~acme~@a+b@1.0.0-rc.1~_croot_s_g_s#to-regex-range_s_g_s#is-number"
+    ],
+    [
+      "~npm~@jsr+std____semver@2.1.3 dep-45-0",
+      "prod 1.0.0 ·npm·JSONStream@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~npm~@sindresorhus+is@1.0.0_pbuild.1 dep-46-0",
+      "dev 1.0.0 ·npm·ms@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~@sindresorhus+is@1.0.0_pbuild.1 dep-46-1",
+      "optional ^1.0.0 || ^2 ·npm·react@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~npm~@sindresorhus+is@1.0.0_pbuild.1 dep-46-2",
+      "peer 1.0.0 ·npm·zz@1.0.0-rc.1·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~@sindresorhus+is@1.0.0_pbuild.1 dep-46-3",
+      "peerOptional ^1.0.0 || ^2 ~acme~@a+b@2.1.3~peer.2"
+    ],
+    [
+      "~npm~a__b@10.0.0 dep-47-0",
+      "optional 1.0.0 ·npm·react-dom@1.0.0"
+    ],
+    [
+      "~npm~a__b@10.0.0 dep-47-1",
+      "peer ^1.0.0 || ^2 ·npm·use-sync-external-store@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~a__b@10.0.0 dep-47-2",
+      "peerOptional 1.0.0 ~acme~@A+b@1.0.0-rc.1~peer.dbd5ca8b03a66489"
+    ],
+    [
+      "~npm~a__b@10.0.0 dep-47-3",
+      "prod ^1.0.0 || ^2 ~acme~@jsr+std____semver@1.0.0_pbuild.1~peer.2"
+    ],
+    [
+      "~npm~a@1.0.0 dep-48-3",
+      "dev ^1.0.0 || ^2 ~acme~@scope__x+bar@10.0.0~peer.dbd5ca8b03a66489"
+    ],
+    [
+      "~npm~a@1.0.0 dep-48-0",
+      "peer 1.0.0 ·npm·react@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~a@1.0.0 dep-48-1",
+      "peerOptional ^1.0.0 || ^2 ·npm·zz@1.0.0%2Bbuild.1·%E1%B9%97%3A3"
+    ],
+    [
+      "~npm~a@1.0.0 dep-48-2",
+      "prod 1.0.0 ~acme~@isaacs+string-locale-compare@1.0.0_pbuild.1"
+    ],
+    [
+      "~npm~Ab@1.0.0 dep-49-2",
+      "dev 1.0.0 ~acme~@jsr+std____semver@1.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number"
+    ],
+    [
+      "~npm~Ab@1.0.0 dep-49-3",
+      "optional ^1.0.0 || ^2 ~acme~@scope+bar-baz@10.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number"
+    ],
+    [
+      "~npm~Ab@1.0.0 dep-49-0",
+      "peerOptional 1.0.0 ·npm·z@1.0.0"
+    ],
+    [
+      "~npm~Ab@1.0.0 dep-49-1",
+      "prod ^1.0.0 || ^2 ~acme~@A+b@1.0.0~peer.2"
+    ],
+    [
+      "~npm~is-number@2.1.3 dep-50-1",
+      "dev ^1.0.0 || ^2 ~acme~@isaacs+string-locale-compare@1.0.0_pbuild.1~_croot_s_g_s#to-regex-range_s_g_s#is-number"
+    ],
+    [
+      "~npm~is-number@2.1.3 dep-50-2",
+      "optional 1.0.0 ~acme~@scope__x+bar@2.1.3"
+    ],
+    [
+      "~npm~is-number@2.1.3 dep-50-3",
+      "peer ^1.0.0 || ^2 ~acme~@sindresorhus+is@1.0.0-rc.1"
+    ],
+    [
+      "~npm~is-number@2.1.3 dep-50-0",
+      "prod 1.0.0 ·npm·zz@10.0.0·%3Aroot%20%3E%20%23debug%20%3E%20%23ms"
+    ],
+    [
+      "~npm~ms@10.0.0 dep-51-0",
+      "dev 1.0.0 ~acme~@a+b@1.0.0~peer.dbd5ca8b03a66489"
+    ],
+    [
+      "~npm~ms@10.0.0 dep-51-1",
+      "optional ^1.0.0 || ^2 ~acme~@jsr+std____semver@10.0.0"
+    ],
+    [
+      "~npm~ms@10.0.0 dep-51-2",
+      "peer 1.0.0 ~acme~@scope+bar-baz@2.1.3~peer.dbd5ca8b03a66489"
+    ],
+    [
+      "~npm~ms@10.0.0 dep-51-3",
+      "peerOptional ^1.0.0 || ^2 ~acme~0x@10.0.0~peer.2"
+    ],
+    [
+      "~npm~use-sync-external-store@10.0.0 dep-52-0",
+      "optional 1.0.0 ~acme~@isaacs+string-locale-compare@1.0.0-rc.1~peer.dbd5ca8b03a66489"
+    ],
+    [
+      "~npm~use-sync-external-store@10.0.0 dep-52-1",
+      "peer ^1.0.0 || ^2 ~acme~@scope__x+bar@2.1.3~peer.2"
+    ],
+    [
+      "~npm~use-sync-external-store@10.0.0 dep-52-2",
+      "peerOptional 1.0.0 ~acme~@sindresorhus+is@1.0.0-rc.1~peer.2"
+    ],
+    [
+      "~npm~use-sync-external-store@10.0.0 dep-52-3",
+      "prod ^1.0.0 || ^2 MISSING"
+    ]
+  ]
+}

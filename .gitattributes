@@ -10,3 +10,9 @@ crates/socket-patch-core/tests/fixtures/pdm-native/*.lock -text
 # refuse CRLF by design (vendor_lockfile_crlf_unsupported), and the tests
 # derive their CRLF variants from the LF bytes themselves.
 crates/socket-patch-core/tests/fixtures/pnpm-hosted/** -text
+
+# Captured vlt locks are byte-real; CRLF variants are derived in the tests.
+crates/socket-patch-core/tests/fixtures/vlt-locks/** -text
+
+# The vendored vlt fixtures pin locks real vlt wrote, byte for byte.
+crates/socket-patch-core/tests/fixtures/vendor/** -text

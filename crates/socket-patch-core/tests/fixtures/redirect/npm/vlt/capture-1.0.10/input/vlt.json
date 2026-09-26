@@ -1,0 +1,1 @@
+{"config": {"registries": {"npm": "https://registry.npmjs.org/"}}, "modifiers": {":root > #debug > #ms": "2.1.3"}}

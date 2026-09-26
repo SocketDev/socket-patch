@@ -42,6 +42,9 @@ mod requirements;
 mod staged;
 mod state;
 mod takeover;
+pub mod vlt;
+pub mod vlt_heal;
+pub mod vlt_preflight;
 pub use replay::{revert_remaining_redirect_edits, GroupRefusal, ReplayOutcome};
 pub use state::{
     drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
@@ -49,7 +52,7 @@ pub use state::{
 };
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
-pub(crate) use takeover::hosted_url_version;
+pub(crate) use takeover::{hosted_url_names, hosted_url_version};
 pub use takeover::{
     redirect_revert_supported, revert_cargo_redirect_purl, revert_golang_redirect_purl,
     revert_npm_redirect_purl, revert_redirect_purl, RedirectRevert,
@@ -219,6 +222,20 @@ pub struct RewriteResult {
     pub hatch_uuids: std::collections::BTreeSet<String>,
     pub confirmed_hatch_uuids: std::collections::BTreeSet<String>,
     pub confirmed_requirements_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids every default-registry vlt instance of which carries the
+    /// patched slots, written by this run or already in place. When vlt
+    /// drives, npm confirmation keys off this set alone.
+    pub confirmed_vlt_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the vlt rewriter refused (no sha512, an instance outside
+    /// the node grammar, a failed residual gate). Never confirmed, whichever
+    /// lock drives.
+    pub refused_vlt_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids with a same-`name@version` vlt node under a named alias,
+    /// a scoped registry or jsr, which hosted mode leaves unpatched.
+    pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
+    /// [`vlt::vlt_drives`] over the rewriter's input files and the
+    /// caller's `bun_lockb_present`.
+    pub vlt_drives: bool,
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -263,7 +280,7 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
 ) -> RewriteResult {
-    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None)
+    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None, false)
 }
 
 /// Whether any pypi override targets an entry of `files["Pipfile.lock"]` —
@@ -314,11 +331,37 @@ fn withhold<'a>(
     }
 }
 
+/// `bun_lockb_present` reports a `bun.lockb` in the project that `files`
+/// leaves out because the caller rewrites its bytes itself; vlt counts it
+/// as a sibling lock.
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
+) -> RewriteResult {
+    rewrite_registry_redirect_withholding_vlt(
+        files,
+        overrides,
+        python_metadata,
+        pipenv_major,
+        bun_lockb_present,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// [`rewrite_registry_redirect_with_pipenv_version`] with the patch uuids
+/// in `vlt_withheld` kept out of the vlt rewrite only: their artifact
+/// failed vlt's preflight while another npm-family lock may be the one the
+/// project installs from.
+pub fn rewrite_registry_redirect_withholding_vlt(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    python_metadata: &BTreeMap<String, String>,
+    pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
+    vlt_withheld: &std::collections::BTreeSet<String>,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     // pdm runs FIRST, but only when `pdm.lock` is the project's PyPI install
@@ -340,6 +383,13 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     rewrite_yarn_classic(files, overrides, &mut result);
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
+    vlt::rewrite_vlt_lock(
+        files,
+        &withhold(overrides, vlt_withheld),
+        bun_lockb_present,
+        &mut result,
+    );
+    result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
     requirements::rewrite(files, overrides, &mut result);
     rewrite_hatch(files, overrides, &mut result);
     rewrite_uv_lock(files, overrides, python_metadata, &mut result);
@@ -449,12 +499,13 @@ fn rewrite_npm_lock(
         .filter(|f| files.contains_key(*f))
         .collect();
     if present.is_empty() {
-        // Another npm-family lock (pnpm — root or nested Rush —, yarn, bun)
-        // owns the redirect for these deps and its rewriter emits its own
-        // per-dep diagnostics; warning "no package-lock.json" on every
+        // Another npm-family lock (pnpm — root or nested Rush —, yarn, bun,
+        // vlt) owns the redirect for these deps and its rewriter emits its
+        // own per-dep diagnostics; warning "no package-lock.json" on every
         // successful pnpm/yarn/bun/Rush run is pure noise that trains users
         // to ignore the warnings channel. Only warn when NO npm-family
-        // lockfile exists at all.
+        // lockfile exists at all. A vlt project without its lock gets
+        // `redirect_vlt_no_lockfile` from the vlt rewriter instead.
         let sibling_lock_present = files.keys().any(|k| {
             k == "yarn.lock"
                 || k == "bun.lock"
@@ -463,6 +514,9 @@ fn rewrite_npm_lock(
                 || k.ends_with("/pnpm-lock.yaml")
                 || k == "shrinkwrap.yaml"
                 || k.ends_with("/shrinkwrap.yaml")
+                || k == crate::constants::npm_family::VLT_LOCK
+                || k == crate::constants::npm_family::VLT_CONFIG
+                || k == crate::constants::npm_family::VLT_HIDDEN_LOCK_REL
         });
         if !sibling_lock_present {
             // Without a lock, the installer-state marker still identifies

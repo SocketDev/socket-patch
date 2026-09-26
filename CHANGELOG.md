@@ -263,6 +263,171 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **`apply` and `rollback` patch vlt installs in place.** A project
+  installed by vlt (`node_modules/.vlt/` or `node_modules/.vlt-lock.json`)
+  is detected as vlt ahead of any sibling bun, pnpm, yarn or npm marker,
+  and `apply` prints `Note: vlt layout detected…` in human mode. `scan`,
+  `get`, `apply`, `rollback` and `vex` find every package in vlt's store
+  (`node_modules/.vlt/<DepID>/node_modules/<name>`) in every DepID era,
+  including transitive-only packages, aliases, git/remote/`file:` entries
+  and workspace members' link-only trees. `apply` and `rollback` reach
+  every store copy of a patched `name@version` (vlt's `~peer.<n>`,
+  hashed-peer and modifier variants, and the legacy `··` / `·npm·` pair),
+  and every write replaces the file rather than writing through it, so
+  vlt 1.2's machine-wide store (hardlinked on Linux) stays untouched. The
+  store-copy failure note is now `store copy <path> failed to patch` /
+  `failed to roll back` for pnpm and vlt alike. `--update` in a vlt
+  project suggests `vlt install @socketsecurity/socket-patch@latest`, and
+  in vlx's cache `vlx -y -- @socketsecurity/socket-patch@latest …`.
+- **`rollback`, `remove` and the vendored takeover revert hosted vlt
+  redirects.** A `redirect_vlt_lock_node` ledger edit (written by the
+  depscan PR flow, or by `scan --mode hosted` once it rewrites
+  `vlt-lock.json`) puts the registry integrity and URL back on the node,
+  keeping whatever vlt re-laid since (a moved comma, a new flag or bins
+  slot, CRLF re-saved as LF). A node vlt has since re-locked away is
+  already reverted; any other change refuses with the `vlt-lock.json`
+  remedy. Peer and modifier variants are claimed per `name@version`.
+- **`scan --mode hosted` and `get --mode hosted` redirect vlt projects.**
+  `vlt-lock.json` default-registry nodes of a patched `name@version` (every
+  peer and modifier variant, in every DepID era and CRLF lock) keep their
+  DepID and get the patched sha512 and hosted URL; `vlt.json` is read only.
+  vlt drives confirmation when its install state is present or no other
+  npm-family lock is; otherwise both locks are rewritten
+  (`redirect_vlt_sibling_lockfiles`). Before anything is written, each
+  artifact is fetched as vlt fetches it: a response vlt would reject
+  (re-gzipped, wrong sha512, HTTP error, unreachable) withholds the dep
+  (`redirect_vlt_artifact_unverifiable`) instead of pinning a lock `vlt ci`
+  cannot install. After the write, stale installed copies of the
+  Socket-owned nodes (`node_modules/.vlt-lock.json` and their
+  `node_modules/.vlt/<DepID>` entries) are removed so the next `vlt install`
+  extracts the patched packages; `rollback` and `remove` do the same for
+  the registry bytes. New `--no-vlt-install-cleanup` /
+  `SOCKET_NO_VLT_INSTALL_CLEANUP` keeps them, and the
+  `redirect_vlt_reinstall_required` advisory says what to run. A stale
+  copy of an optional dependency is never removed, because `vlt install`
+  would not put it back; the advisory says to run `vlt ci` instead
+  (after upgrading to vlt 1.0.5 or later when every dependency is
+  optional, since older releases would drop the installed copy). A
+  same-run `--vex` does not attest a vlt package whose installed copy is
+  stale or unchecked, whose lock a vlt release may ignore, or which also
+  resolves from a non-default registry. vlt ledgers require the socket-patch
+  release that adds vlt support.
+- **`vendor` wires vlt projects.** A `vlt-lock.json` (lockfileVersion 0
+  or 1) routes npm vendoring to the new vlt backend ahead of every other
+  lockfile. A direct dependency of the root or of a workspace member is
+  vendored as a patched package directory,
+  `.socket/vendor/npm/<uuid>/<name>-<version>/node_modules/<name>/`, so a
+  package that `require()`s its own name still resolves; its
+  `devDependencies` are dropped from the vendored `package.json`, and the
+  uuid dir's `.gitignore` re-includes the payload against the project's
+  own ignores while `.gitattributes` keeps EOL conversion off it. The
+  lock's node becomes a `file` node, its importer edges and the importers'
+  `package.json` specs move to the `file:` path, and every moved entry is
+  placed where vlt's own serializer puts it, so `vlt ci`, warm and cold
+  `vlt install --frozen-lockfile` keep the lock byte-identical and `vlt
+  install <new>` keeps the wiring (checked against vlt 1.2.0, 1.0.10,
+  1.0.4, 1.0.0-rc.32 and 1.0.0-rc.14). A node whose only extra is one
+  peer context (a root dependency with resolved peers from vlt 1.0.8, a
+  workspace member's from rc.15) is vendored without the extra, as vlt
+  writes `file:` dependencies. Transitive targets
+  (`vendor_vlt_transitive_unsupported`), several instances of one
+  `name@version`, modifier variants, foreign registries, peer edges and
+  dependencies declared in several fields refuse before any write, as do
+  locks vlt
+  cannot read and specs that no longer match the lock
+  (`vendor_vlt_lock_out_of_sync`); a payload git would ignore refuses with
+  `vendor_artifact_gitignored`, and a package already vendored through
+  another lockfile flavor with `vendor_flavor_changed`. `vendor --revert`
+  restores the registry node, edges and specs (keeping flags, trailing
+  slots and outgoing edge values vlt rewrote since) or keeps everything on
+  drift. Lock inventory reads `vlt-lock.json` too, Socket-hosted pins
+  included. Era-A locks (`··` ids, or URL-segment ids equal to a scalar
+  `registry`) warn `vendor_vlt_legacy_lockfile`. A vendored optional
+  dependency gets the new `vendor_vlt_reinstall_required` advisory: from
+  vlt 0.0.0-30 a plain `vlt install` keeps its installed upstream copy,
+  so it says to run `vlt ci` (or delete `node_modules` and run `vlt
+  install`); it also names any dependency whose `node_modules` link still
+  resolves to vlt's store. Reverting a vendored optional dependency (also
+  in a vendored-to-hosted takeover) gives the same advisory, since from
+  vlt 0.0.0-30 a plain `vlt install` then keeps the link to the removed
+  vendored directory.
+- **Vendored vlt through every command.** `vendor`, `scan --mode vendored`
+  and `get --mode vendored` run the complete vlt vendored preflight (lock
+  version and layout, transitive, peer or foreign-registry targets,
+  dependencies declared in several fields, out-of-sync specs, a package
+  already vendored through another lockfile flavor, the installed copy's
+  `bundleDependencies` or duplicate `devDependencies`, a git rule that
+  ignores `.socket/`) before any patch is downloaded, anything is written,
+  or a hosted redirect is reverted for the takeover; the dry-run previews
+  report the same codes as `would_refuse`. A committed vlt directory
+  artifact is staged inventory-verified when nothing is installed (a fresh
+  clone), and vlt's own link to it is never taken as a pristine source.
+  After a hosted → vendored takeover the store copies vlt installed from
+  the hosted pin are removed (`redirect_vlt_reinstall_required`), except
+  optional ones, which the advisory reports as installed copies of the
+  vendored optional dependencies. `repair`
+  finds vlt references in `vlt-lock.json` and workspace `package.json`
+  files, rebuilds vlt directories against the inventory that leaves out
+  vlt's `node_modules/` links, restores a missing `<uuid>/.gitignore` or
+  `.gitattributes`, and stamps reconstructed entries `flavor: "vlt"`. The
+  human output names the vlt committables and `vlt install`. A Bun lock
+  beside `vlt-lock.json` no longer triggers the Bun vendored preflight.
+  The git-ignore check refuses only a rule that ignores the vendored
+  uuid directory itself (such as `.socket/`), not one like `*.json` that
+  the directory's own `.gitignore` overrides. A takeover whose vendoring
+  then fails still removes the hosted store copies against the restored
+  registry pin. When vlt's link to the committed directory is the only
+  installed copy, `vendor` says so (`vendor_ledger_entry_missing`, run
+  `socket-patch repair`, when the vendor ledger lost the entry) instead of
+  reporting the package as not installed.
+- **`vex` reads `vlt-lock.json`.** Manifest-less VEX (and the ledger
+  liveness gates behind `vex`, `scan`'s takeovers and the
+  `hosted_wiring_retained` advisory) discovers hosted vlt nodes (a Socket
+  URL and sha512 on a registry node, every DepID era) and vendored vlt
+  package directories, and verifies a vendored directory with the vlt
+  `package.json` exemption, including the out-of-sync check of the
+  installed link. A lock vlt cannot read (BOM, other `lockfileVersion`)
+  wires nothing. A hosted npm package is now judged by every store variant
+  of its installed copies (pnpm and vlt peer, modifier and registry-alias
+  instances), and a same-version instance on another registry (or a
+  Socket-shaped one that does not verify) keeps a vlt hosted pin from
+  attesting before install. A vendored vlt directory verified without its
+  vendor ledger checks a devDependencies-stripped `package.json` against
+  the patched blob in `.socket/blobs`, and is omitted as
+  `vendor_manifest_unverifiable` when that blob is absent. `setup.manual`
+  accepts `vlt`.
+- **`setup` wires vlt projects.** A `vlt-lock.json`, `vlt.json`,
+  `node_modules/.vlt-lock.json` or `node_modules/.vlt/` directory in the
+  project root makes `setup` treat it as vlt, ahead of any pnpm marker. The
+  hook is npm's `npx @socketsecurity/socket-patch apply --silent --ecosystems
+  npm`, and a vlt workspace (vlt.json `workspaces`, or vlt <= 0.0.0-12's
+  `vlt-workspaces.json`) is wired at the root only, because vlt runs the
+  root hook once per install. The `setup --json` `packageManager` and the
+  `patch_setup` telemetry `manager` report `vlt`. vlt before 1.0.0-rc.13
+  never runs a root `postinstall`: `setup` still wires the project and
+  warns `vlt_root_scripts_not_run` — definitely when the `vlt` on `PATH`
+  reports such a version, and as a "may" when `vlt-lock.json` has
+  `lockfileVersion` 0 or none and no usable `vlt` is found, or the one
+  found would not write that lock (a v0 lock beside vlt 1.0.0-rc.15 or
+  later). `setup --remove` also clears the hooks earlier releases wrote
+  into vlt workspace members.
+- **vlt support is proven against real vlt releases.** Every supported vlt
+  release (0.0.0-1 … 1.2.0, see `docs/testing/vlt-compatibility.md` for the
+  excluded ones) ran the five real-vlt capstones locally; CI now runs 35 of
+  those cells on every pull request (ci.yml's `e2e` vlt rows, each checked
+  by `scripts/check-vlt-legs.py` against the leg manifest), the vlt legs of
+  the required `hosted-e2e` production job (hosted and vendored), and the
+  advisory `vlt-compatibility.yml`: every capstone on every era of Linux,
+  macOS and Windows, the Node engine floors, the store linkers,
+  `scripts/backtest-vlt.py` against the production service, a cross-OS
+  `vlt-lock.json` comparison, and nightly `vlt@latest`, release-watchdog and
+  downgrade jobs. `vlt-serve-watchdog.yml` probes the public patch artifact
+  every 6 hours the way vlt fetches it. vlt releases are installed from a
+  sha512-checked `npm pack` (`scripts/install-vlt.sh`, pins in
+  `scripts/vlt-historical-integrity.json`). Hosted vlt projects stay
+  refused (`redirect_vlt_artifact_unverifiable`) until patch.socket.dev
+  stops re-encoding artifacts; vendored and agent mode work against
+  production today.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare
@@ -626,6 +791,38 @@ into the new version's section — see docs/releasing.md.
   (parity with rollback/repair/`scan --prune`).
 
 ### Fixed
+
+- **`rollback` fetches a before-blob that only a store peer variant
+  needs.** The before-blob gate now probes every pnpm and vlt store variant
+  copy the rollback restores, so an online rollback no longer fails
+  `Before blob not found` for a still-patched variant beside an
+  already-original copy.
+
+- **Re-vendoring under a newer patch never builds from the old patch's
+  artifact.** With no installed copy, `vendor` staged the committed
+  artifact of the previous patch as the build source, so a file only the
+  old patch changed reached the new artifact unnoticed. The committed
+  artifact is now staged only for the patch that built it; a newer patch
+  fetches the pristine package per the lockfile (`--offline` skips it).
+
+- **Ledgers written by a newer socket-patch are never half-reverted.**
+  A hosted redirect edit kind this release does not understand used to
+  let `rollback` drop the npm record beside it, leaving that lockfile
+  redirected with nothing tracking it. Such an edit now holds every
+  record in the redirect ledger ("the redirect ledger holds a {kind}
+  edit this socket-patch release does not understand; upgrade
+  socket-patch"). When it names a purl, that purl's own revert in
+  `rollback <purl>`, `remove` and the hosted-to-vendored takeover
+  refuses with nothing written, and the takeover's ledger reconcile
+  leaves the purl for the manual cleanup. When the scope still covers
+  every hosted record, the whole-ledger replay goes on to unwind the
+  lockfiles this release understands, but keeps every record and the
+  unknown edit.
+  `repair` skips vendored npm entries whose `flavor` it does not know
+  (`vendor_wiring_unknown_revert_blocked`) instead of rebuilding them
+  with the wrong layout rules. vlt ledgers (`redirect_vlt_lock_node`,
+  `flavor: "vlt"`) require the socket-patch release that adds vlt
+  support.
 
 - **Hosted Go redirects no longer claim patches that did not land.**
   `scan`/`get --mode hosted` counted a Go module as redirected (recorded

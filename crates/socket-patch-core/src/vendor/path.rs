@@ -20,7 +20,7 @@
 //!
 //! | eco      | leaf                                   |
 //! |----------|----------------------------------------|
-//! | npm      | `[@scope/]<name>-<version>.tgz`        |
+//! | npm      | `[@scope/]<name>-<version>.tgz`; vlt: `[@scope/]<bare>-<version>/node_modules/<name>/` |
 //! | cargo    | `<name>-<version>/`                    |
 //! | golang   | `<module>@<version>/` (nested dirs)    |
 //! | composer | `<vendor>/<name>@<version>/`           |
@@ -230,11 +230,16 @@ fn split_nuget_leaf(stem: &str) -> Option<(&str, &str)> {
 /// the latter for lockfile-discovered references.
 pub(crate) fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
     match eco {
-        "npm" => {
-            let stem = leaf.strip_suffix(".tgz")?;
-            let (name, version) = split_name_version(stem)?;
-            Some(format!("pkg:npm/{name}@{version}"))
-        }
+        "npm" => match leaf.strip_suffix(".tgz") {
+            Some(stem) => {
+                let (name, version) = split_name_version(stem)?;
+                Some(format!("pkg:npm/{name}@{version}"))
+            }
+            None => {
+                let (name, version) = super::vlt_lock_text::parse_vendored_dir_leaf(leaf)?;
+                Some(format!("pkg:npm/{name}@{version}"))
+            }
+        },
         "cargo" => {
             let (name, version) = split_name_version(leaf)?;
             Some(format!("pkg:cargo/{name}@{version}"))
@@ -405,6 +410,55 @@ mod tests {
     use super::*;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    #[test]
+    fn vlt_dir_leaves_name_their_package() {
+        for (leaf, want) in [
+            (
+                "left-pad-1.3.0/node_modules/left-pad",
+                Some("pkg:npm/left-pad@1.3.0"),
+            ),
+            (
+                "@s/b-2.0.0-rc.1/node_modules/@s/b",
+                Some("pkg:npm/@s/b@2.0.0-rc.1"),
+            ),
+            (
+                "base-64-1.0.0/node_modules/base-64",
+                Some("pkg:npm/base-64@1.0.0"),
+            ),
+            (
+                "a-1.0.0-1.0.0/node_modules/a-1.0.0",
+                Some("pkg:npm/a-1.0.0@1.0.0"),
+            ),
+            ("@s/b-1.0.0/node_modules/@t/b", None),
+            ("left-pad-1.3.0/node_modules/right-pad", None),
+            ("left-pad-1.3/node_modules/left-pad", None),
+            ("left-pad-1.3.0", None),
+        ] {
+            assert_eq!(leaf_to_purl("npm", leaf).as_deref(), want, "{leaf}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_recognizes_a_vlt_dir_and_never_descends_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join(format!(
+            ".socket/vendor/npm/{UUID}/@s/b-1.0.0/node_modules/@s/b"
+        ));
+        tokio::fs::create_dir_all(pkg.join("node_modules/dep-9.9.9/node_modules/dep"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}/.gitignore")),
+            "",
+        )
+        .await
+        .unwrap();
+        let swept = sweep_vendor_dirs(tmp.path()).await;
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].purls, ["pkg:npm/@s/b@1.0.0"]);
+    }
 
     #[test]
     fn uuid_dir_is_validated() {

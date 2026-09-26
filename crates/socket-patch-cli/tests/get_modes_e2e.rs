@@ -1103,6 +1103,114 @@ async fn get_save_only_agent_ignores_bun_preflight() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// vlt vendored-mode preflight through `get` (DESIGN §4.6)
+// ---------------------------------------------------------------------------
+
+const VLT_SYNC_CODE: &str = "vendor_vlt_lock_out_of_sync";
+
+/// `write_project` re-locked by vlt, with package.json edited afterwards
+/// (`^1.0.0` against the lock's `1.0.0` edge): the vlt backend refuses it,
+/// and so must every vendored `get` before fetching or writing anything.
+fn write_vlt_out_of_sync_project(root: &Path) {
+    write_project(root);
+    std::fs::remove_file(root.join("package-lock.json")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        format!(r#"{{ "name": "consumer", "dependencies": {{ "{NAME}": "^1.0.0" }} }}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("vlt-lock.json"),
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+             \"~npm~{NAME}@1.0.0\": [0,\"{NAME}\",\"sha512-UPSTREAMupstream==\"]\n  }},\n  \
+             \"edges\": {{\n    \"file~_d {NAME}\": \"prod 1.0.0 ~npm~{NAME}@1.0.0\"\n  }}\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn get_vendored_vlt_refusal_visible_under_silent() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_by_package(&server).await;
+    for (label, ident) in [("purl", PURL1), ("uuid", UUID1)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_vlt_out_of_sync_project(tmp.path());
+        let lock_before = std::fs::read(tmp.path().join("vlt-lock.json")).unwrap();
+        let (code, stdout, stderr) = run_get(
+            tmp.path(),
+            &server.uri(),
+            &[
+                ident,
+                "--mode",
+                "vendored",
+                "--vendor-source",
+                "build",
+                "--silent",
+            ],
+        );
+        assert_eq!(code, 1, "{label}: stdout={stdout}\nstderr={stderr}");
+        assert!(stdout.trim().is_empty(), "{label}: {stdout}");
+        assert!(stderr.contains(VLT_SYNC_CODE), "{label}: {stderr}");
+        let download_line = format!("[error] {PURL1} ({VLT_SYNC_CODE}):");
+        if label == "purl" {
+            assert!(stderr.contains(&download_line), "{label}: {stderr}");
+        } else {
+            assert!(
+                stderr.contains(&format!("Error ({VLT_SYNC_CODE}):")),
+                "the uuid path refuses before the download: {stderr}"
+            );
+            assert!(!stderr.contains(&download_line), "{label}: {stderr}");
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join("vlt-lock.json")).unwrap(),
+            lock_before,
+            "{label}"
+        );
+        assert!(!tmp.path().join(".socket/vendor").exists(), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn get_vendored_dry_run_reports_vlt_refusal() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_by_package(&server).await;
+    for (label, ident) in [("purl", PURL1), ("uuid", UUID1)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_vlt_out_of_sync_project(tmp.path());
+        let (code, stdout, stderr) = run_get(
+            tmp.path(),
+            &server.uri(),
+            &[ident, "--mode", "vendored", "--dry-run", "--json"],
+        );
+        assert_eq!(code, 0, "{label}: stdout={stdout}\nstderr={stderr}");
+        let v = parse_single_json_doc(&stdout);
+        let rec = &v["vendor"]["patches"][0];
+        assert_eq!(rec["action"], "would_refuse", "{label}: {v}");
+        assert_eq!(rec["errorCode"], VLT_SYNC_CODE, "{label}: {v}");
+        assert!(!tmp.path().join(".socket").exists(), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn get_save_only_agent_ignores_vlt_preflight() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_by_package(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_vlt_out_of_sync_project(tmp.path());
+    let (code, stdout, stderr) =
+        run_get(tmp.path(), &server.uri(), &[PURL1, "--save-only", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["patches"][0]["action"], "added", "{v}");
+    assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
+}
+
 /// Manifest-less VEX over what `get <uuid> --mode hosted` and `get <uuid>
 /// --mode vendored` commit for an npm project: a checkout of package.json,
 /// the lock and `.socket/` (no manifest — hosted never writes one, vendored's

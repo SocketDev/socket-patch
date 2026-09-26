@@ -949,3 +949,77 @@ async fn get_ghsa_unknown_ecosystem_is_never_narrowed() {
         "an unknown-ecosystem purl must be kept, never claimed not-installed"
     );
 }
+
+/// A vlt project: `getmodes-pkg@1.0.0` direct from the root in
+/// `vlt-lock.json`, installed in vlt's store; `spec` is the package.json
+/// range (the lock's edge says `1.0.0`).
+fn write_vlt_project(root: &Path, spec: &str) {
+    std::fs::write(
+        root.join("package.json"),
+        format!("{{\n  \"name\": \"consumer\",\n  \"dependencies\": {{\n    \"{NAME}\": \"{spec}\"\n  }}\n}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("vlt-lock.json"),
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+             \"~npm~{NAME}@1.0.0\": [0,\"{NAME}\",\"sha512-UPSTREAMupstream==\"]\n  }},\n  \
+             \"edges\": {{\n    \"file~_d {NAME}\": \"prod 1.0.0 ~npm~{NAME}@1.0.0\"\n  }}\n}}\n"
+        ),
+    )
+    .unwrap();
+    let store = root.join(format!(
+        "node_modules/.vlt/~npm~{NAME}@1.0.0/node_modules/{NAME}"
+    ));
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "1.0.0" }}"#),
+    )
+    .unwrap();
+    std::fs::write(store.join("index.js"), BEFORE_BYTES).unwrap();
+}
+
+/// `get <uuid> --mode vendored` on a vlt project vendors the directory
+/// artifact; on an out-of-sync package.json the vlt preflight refuses it
+/// with nothing written, and agent mode (`get` without `--mode`) never runs
+/// that preflight.
+#[tokio::test]
+#[serial]
+async fn get_uuid_vendored_vlt_vendors_refuses_and_agent_bypasses() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_vlt_project(tmp.path(), "1.0.0");
+    let mut args = get_args(UUID1, tmp.path(), server.uri());
+    args.mode = Some(ScanMode::Vendored);
+    assert_eq!(socket_patch_cli::commands::get::run(args).await, 0);
+    let rel = format!(".socket/vendor/npm/{UUID1}/{NAME}-1.0.0/node_modules/{NAME}");
+    assert_eq!(
+        std::fs::read(tmp.path().join(&rel).join("index.js")).unwrap(),
+        AFTER_BYTES
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap();
+    assert!(lock.contains(&format!("file:./{rel}")), "{lock}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_vlt_project(tmp.path(), "^1.0.0");
+    let lock = std::fs::read(tmp.path().join("vlt-lock.json")).unwrap();
+    let mut args = get_args(UUID1, tmp.path(), server.uri());
+    args.mode = Some(ScanMode::Vendored);
+    assert_eq!(socket_patch_cli::commands::get::run(args).await, 1);
+    assert_eq!(
+        std::fs::read(tmp.path().join("vlt-lock.json")).unwrap(),
+        lock
+    );
+    assert!(!tmp.path().join(".socket").exists());
+
+    let args = get_args(UUID1, tmp.path(), server.uri());
+    assert_eq!(socket_patch_cli::commands::get::run(args).await, 0);
+    assert_eq!(read_manifest_purls(tmp.path()), vec![PURL1.to_string()]);
+    let store = tmp.path().join(format!(
+        "node_modules/.vlt/~npm~{NAME}@1.0.0/node_modules/{NAME}"
+    ));
+    assert_eq!(std::fs::read(store.join("index.js")).unwrap(), AFTER_BYTES);
+}

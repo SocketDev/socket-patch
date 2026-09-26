@@ -1,0 +1,24 @@
+[
+  {
+    "ecosystem": "npm",
+    "name": "semver",
+    "version": "7.6.0",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    "artifactUrl": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/ffffffff-ffff-4fff-8fff-ffffffffffff/semver-7.6.0.tgz",
+    "integrity": {
+      "sha512": "sha512-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF=="
+    }
+  },
+  {
+    "ecosystem": "npm",
+    "name": "fsevents",
+    "version": "2.3.3",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "00000000-0000-4000-8000-000000000000",
+    "artifactUrl": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/00000000-0000-4000-8000-000000000000/fsevents-2.3.3.tgz",
+    "integrity": {
+      "sha512": "sha512-00000000000000000000000000000000000000000000000000000000000000000000000000000000000000=="
+    }
+  }
+]

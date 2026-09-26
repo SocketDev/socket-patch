@@ -1042,6 +1042,20 @@ pub(crate) async fn run_hosted_leg(
     };
 
     let mut out = HostedLegOutcome::default();
+    // The vlt nodes the unwound purls pin, read before the revert drops
+    // their edits: the heal below invalidates the patched installed copies
+    // once the registry pins are back.
+    let vlt_scope: Vec<String> = if replay_eligible {
+        purls
+            .iter()
+            .cloned()
+            .chain(state.records.keys().cloned())
+            .collect()
+    } else {
+        purls.to_vec()
+    };
+    let vlt_targets =
+        socket_patch_core::patch::redirect::vlt_heal::ledger_targets(state, &vlt_scope);
     // When the whole-ledger replay will run anyway (the scope covers every
     // record), npm purls on Bun projects defer to it so all lockfile edits
     // are staged together atomically. A scoped unwind of one of several
@@ -1138,6 +1152,17 @@ pub(crate) async fn run_hosted_leg(
             }
         }
     }
+    let unwound: Vec<_> = vlt_targets
+        .into_iter()
+        .filter(|t| {
+            out.reverted.iter().any(|p| {
+                socket_patch_core::utils::purl::canonical_purl(p)
+                    == socket_patch_core::utils::purl::canonical_purl(&t.purl)
+            }) || (replay_eligible && !out.failed.iter().any(|(p, _)| p.starts_with("group:")))
+        })
+        .collect();
+    out.warnings
+        .extend(crate::commands::scan::vlt_rollback_heal(common, &unwound).await);
     out
 }
 
@@ -2531,14 +2556,32 @@ pub(crate) async fn rollback_patches_inner(
             // only a representative copy skipped the download and wedged the
             // online rollback with a mid-run `MissingBlob` failure. Mirrors
             // apply's `mismatch_blob_gaps`.
-            let pkg_paths = all_packages_multi
+            let mut pkg_paths = all_packages_multi
                 .get(purl)
-                .expect("gate manifest holds only attempted targets, which the crawler discovered");
+                .expect("gate manifest holds only attempted targets, which the crawler discovered")
+                .clone();
+            // The engine also restores every pnpm/vlt store peer variant of
+            // an npm copy, so each of those is a copy that may need a blob.
+            if purl.starts_with("pkg:npm/") {
+                let found = pkg_paths.clone();
+                for path in &found {
+                    for copy in
+                        socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies(
+                            path,
+                        )
+                        .await
+                    {
+                        if !pkg_paths.contains(&copy) {
+                            pkg_paths.push(copy);
+                        }
+                    }
+                }
+            }
             for (file, info) in &patch.files {
                 if info.before_hash.is_empty() || !absent_blobs.contains(&info.before_hash) {
                     continue;
                 }
-                for pkg_path in pkg_paths {
+                for pkg_path in &pkg_paths {
                     let v = verify_file_rollback(pkg_path, file, info, &blobs_path).await;
                     if v.status == VerifyRollbackStatus::MissingBlob {
                         missing_blobs.insert(info.before_hash.clone());

@@ -252,6 +252,32 @@ pub async fn first_symlink<'a>(
     None
 }
 
+/// Remove the link at `path` itself — never its target. A symlink (file or
+/// directory) on Unix, and a directory symlink or NTFS junction (which
+/// `FileType` reports as `is_symlink()`; vlt and pnpm link packages with
+/// junctions) on Windows, where the directory flavors need `remove_dir`
+/// (`RemoveDirectoryW` deletes the reparse point and leaves the target) and
+/// `remove_file` fails. Anything that is not a link fails with
+/// `InvalidInput` and nothing is removed, so a caller that expected a link
+/// never deletes a real file or directory in its place.
+pub async fn remove_link(path: &Path) -> std::io::Result<()> {
+    let file_type = tokio::fs::symlink_metadata(path).await?.file_type();
+    if !file_type.is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a link", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+        if file_type.is_symlink_dir() {
+            return tokio::fs::remove_dir(path).await;
+        }
+    }
+    tokio::fs::remove_file(path).await
+}
+
 /// Return the raw `FileType` for `entry`, swallowing stat errors.
 ///
 /// Use this instead of `entry_is_dir` when the caller needs to
@@ -1115,5 +1141,143 @@ mod tests {
             Some("dangling.lock"),
             "a dangling link is still a link the rename would replace"
         );
+    }
+
+    /// `remove_link` deletes the link and never its target; a real file or
+    /// directory in its place is refused and kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_link_removes_only_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store/pkg");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("index.js"), b"x").await.unwrap();
+        let file = tmp.path().join("file.txt");
+        tokio::fs::write(&file, b"y").await.unwrap();
+
+        let dir_link = tmp.path().join("dir_link");
+        tokio::fs::symlink("store/pkg", &dir_link).await.unwrap();
+        let file_link = tmp.path().join("file_link");
+        tokio::fs::symlink(&file, &file_link).await.unwrap();
+        let dangling = tmp.path().join("dangling");
+        tokio::fs::symlink(tmp.path().join("absent"), &dangling)
+            .await
+            .unwrap();
+
+        for link in [&dir_link, &file_link, &dangling] {
+            remove_link(link).await.unwrap();
+            assert!(tokio::fs::symlink_metadata(link).await.is_err(), "{link:?}");
+        }
+        assert_eq!(tokio::fs::read(dir.join("index.js")).await.unwrap(), b"x");
+        assert_eq!(tokio::fs::read(&file).await.unwrap(), b"y");
+
+        for real in [&dir, &file] {
+            let err = remove_link(real).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{real:?}");
+            assert!(tokio::fs::symlink_metadata(real).await.is_ok(), "{real:?}");
+        }
+        let err = remove_link(&tmp.path().join("absent")).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Windows link shapes vlt produces: junctions (absolute targets, vlt
+    /// >= 1.0.0-rc.22 and pnpm) and directory symlinks (older vlt). Both
+    /// read as links through `entry_file_type` and `symlink_metadata`, are
+    /// followed by `is_dir`, report their target through `read_link`, and
+    /// `remove_link` deletes them while the target survives.
+    #[cfg(windows)]
+    async fn assert_windows_dir_link(tmp: &Path, link: &Path, target: &Path) {
+        let entry = list_dir_entries(tmp)
+            .await
+            .into_iter()
+            .find(|e| e.path() == link)
+            .expect("link entry listed");
+        let ft = entry_file_type(&entry).await.expect("file_type available");
+        assert!(ft.is_symlink() && !ft.is_dir(), "{link:?}");
+        assert!(is_dir(link).await, "is_dir follows the link");
+        let meta = tokio::fs::symlink_metadata(link).await.unwrap();
+        assert!(meta.file_type().is_symlink() && !meta.is_dir());
+
+        let read = std::fs::read_link(link).unwrap();
+        let resolved = if read.is_absolute() {
+            read
+        } else {
+            link.parent().unwrap().join(read)
+        };
+        assert_eq!(
+            std::fs::canonicalize(resolved).unwrap(),
+            std::fs::canonicalize(target).unwrap()
+        );
+        assert_eq!(
+            std::fs::canonicalize(link).unwrap(),
+            std::fs::canonicalize(target).unwrap()
+        );
+
+        remove_link(link).await.unwrap();
+        assert!(tokio::fs::symlink_metadata(link).await.is_err());
+        assert_eq!(
+            tokio::fs::read(target.join("package.json")).await.unwrap(),
+            b"{}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_junction_is_a_link_and_remove_link_keeps_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store").join("pkg");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("package.json"), b"{}").unwrap();
+        let link = tmp.path().join("junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        assert!(
+            std::fs::read_link(&link).unwrap().is_absolute(),
+            "junction targets are absolute"
+        );
+        assert_windows_dir_link(tmp.path(), &link, &target).await;
+
+        std::fs::remove_dir_all(tmp.path().join("store")).unwrap();
+        assert!(!tmp.path().join("store").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_dir_symlink_is_a_link_and_remove_link_keeps_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store").join("pkg");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("package.json"), b"{}").unwrap();
+        let link = tmp.path().join("dir_symlink");
+        std::os::windows::fs::symlink_dir(&target, &link).unwrap();
+        assert_windows_dir_link(tmp.path(), &link, &target).await;
+    }
+
+    /// `remove_dir_all` on a tree holding a junction removes the junction
+    /// without traversing into its target (what deleting a vlt store entry
+    /// relies on).
+    #[cfg(windows)]
+    #[test]
+    fn windows_remove_dir_all_does_not_follow_junctions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("sibling").join("pkg");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("package.json"), b"{}").unwrap();
+        let entry_nm = tmp.path().join("entry").join("node_modules");
+        std::fs::create_dir_all(&entry_nm).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(entry_nm.join("pkg"))
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        std::fs::remove_dir_all(tmp.path().join("entry")).unwrap();
+        assert_eq!(std::fs::read(target.join("package.json")).unwrap(), b"{}");
     }
 }

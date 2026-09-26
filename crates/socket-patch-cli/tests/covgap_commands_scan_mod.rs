@@ -32,6 +32,10 @@
 
 #[path = "common/pty_io.rs"]
 mod pty_io;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -692,7 +696,9 @@ async fn scan_human_detail_fetch_failure_errors_once() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains(&format!("Error: could not fetch patch details for {purl}: ")),
+        stderr.contains(&format!(
+            "Error: could not fetch patch details for {purl}: "
+        )),
         "the terminal error names the purl and the cause; got {stderr:?}"
     );
     assert!(
@@ -751,7 +757,10 @@ async fn scan_human_partial_detail_fetch_failure_warns_per_package() {
         1,
         "one warning naming the failed purl; got {stderr:?}"
     );
-    assert!(!stderr.contains("Error:"), "a partial failure is not an error: {stderr:?}");
+    assert!(
+        !stderr.contains("Error:"),
+        "a partial failure is not an error: {stderr:?}"
+    );
     assert!(
         stdout.contains("[dry-run] Would download and apply 1 patch."),
         "the resolved package still goes through; got {stdout:?}"
@@ -798,7 +807,9 @@ async fn scan_human_skips_vendored_purls_without_downloading() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.contains(&format!("[skip] {purl} (vendored; run `socket-patch scan --mode vendored` to update it)")),
+        stdout.contains(&format!(
+            "[skip] {purl} (vendored; run `socket-patch scan --mode vendored` to update it)"
+        )),
         "the vendored skip line must name the purl and the remedy; got {stdout:?}"
     );
     assert!(
@@ -1285,7 +1296,8 @@ async fn scan_bare_human_non_tty_is_report_only() {
         "the per-patch preview still prints; got {stdout:?}"
     );
     assert!(
-        stdout.contains("To apply a single patch, run:") && stdout.contains("socket-patch get <CVE-ID>"),
+        stdout.contains("To apply a single patch, run:")
+            && stdout.contains("socket-patch get <CVE-ID>"),
         "the get-hint must print; got {stdout:?}"
     );
     assert!(
@@ -1495,8 +1507,7 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
         "the summary must print in hosted mode; got {stdout:?}"
     );
     assert!(
-        stdout.contains("[UPDATE]")
-            && stdout.contains("1 package has a newer patch available."),
+        stdout.contains("[UPDATE]") && stdout.contains("1 package has a newer patch available."),
         "update detection must run in hosted mode; got {stdout:?}"
     );
     // `--mode hosted` is explicit intent: the new prompt auto-accepts on a
@@ -1604,9 +1615,8 @@ mod pty {
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let reader_handle = crate::pty_io::PtyOutput::spawn(
-            pair.master.try_clone_reader().expect("clone reader"),
-        );
+        let reader_handle =
+            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -1828,8 +1838,8 @@ mod pty {
         assert_eq!(code, 0, "the run must finish on its own; output:\n{output}");
         // The pty merges stdout and stderr; the envelope is the only `{…}`.
         let text = output.replace("\r\n", "\n");
-        let json_text = &text[text.find('{').expect("JSON envelope")
-            ..=text.rfind('}').expect("JSON envelope end")];
+        let json_text = &text
+            [text.find('{').expect("JSON envelope")..=text.rfind('}').expect("JSON envelope end")];
         let json: serde_json::Value = serde_json::from_str(json_text)
             .unwrap_or_else(|e| panic!("envelope must parse ({e}); got:\n{output}"));
         assert_eq!(json["status"], "success", "{json}");
@@ -1898,7 +1908,11 @@ mod pty {
             "screen:\n{}",
             screen.join("\n")
         );
-        for transient in ["Scanning packages", "Querying API", "Fetching patch details"] {
+        for transient in [
+            "Scanning packages",
+            "Querying API",
+            "Fetching patch details",
+        ] {
             assert!(
                 !screen.iter().any(|l| l.contains(transient)),
                 "transient status {transient:?} must not stay on screen:\n{}",
@@ -2337,7 +2351,10 @@ async fn scan_human_prune_runs_gc_even_when_no_patches_are_available() {
         "the dry run previews the GC; got {stdout:?}"
     );
     let manifest = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
-    assert!(manifest.contains("pkg:npm/gone@1.0.0"), "a preview must not prune");
+    assert!(
+        manifest.contains("pkg:npm/gone@1.0.0"),
+        "a preview must not prune"
+    );
 
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--prune"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
@@ -2367,7 +2384,10 @@ fn scan_prune_on_empty_crawl_warns_the_gc_was_skipped() {
     assert!(stdout.contains("No packages found."), "{stdout:?}");
     let (code, stdout, stderr) = run_scan(tmp.path(), &["--prune", "--silent"]);
     assert_eq!(code, 0);
-    assert!(stdout.is_empty() && stderr.is_empty(), "{stdout:?} {stderr:?}");
+    assert!(
+        stdout.is_empty() && stderr.is_empty(),
+        "{stdout:?} {stderr:?}"
+    );
 }
 
 /// `--ecosystems` that filters everything out names the filter instead of
@@ -2474,7 +2494,11 @@ async fn scan_human_does_not_offer_an_already_recorded_patch() {
     );
     assert!(!stdout.contains("Patches to apply:"), "{stdout:?}");
     assert!(!stderr.contains("Download and apply"), "{stderr:?}");
-    assert_eq!(view_gets(&recorded(&mock).await), 0, "nothing is downloaded");
+    assert_eq!(
+        view_gets(&recorded(&mock).await),
+        0,
+        "nothing is downloaded"
+    );
 }
 
 /// The human table's PACKAGE column grows to fit the PURL (the old fixed
@@ -2514,4 +2538,147 @@ async fn scan_human_table_shows_full_purl_with_version() {
     // The rule is exactly as wide as the widest table line.
     let rule = stdout.lines().find(|l| l.starts_with("===")).unwrap();
     assert_eq!(rule.len(), header.len().max(row.len()), "{stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// vlt vendored ledgers: the GC probe and the degraded-ledger `~` boundary
+// ---------------------------------------------------------------------------
+
+/// `scan --mode vendored --prune`: the lock-driven GC keeps the vlt entry
+/// `vlt-lock.json` still resolves to its dir (`vendored_entry_in_use` is
+/// structural: a `file` node under the uuid) and reclaims one it does not.
+#[tokio::test]
+async fn scan_prune_keeps_a_wired_vlt_uuid_and_sweeps_an_unwired_one() {
+    use vlt_hosted_common as hosted;
+    let server = MockServer::start().await;
+    hosted::mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, false);
+    let unwired = "22222222-2222-4222-8222-222222222222";
+    let other = "pkg:npm/right-pad@1.0.0";
+    let other_rel = format!(".socket/vendor/npm/{unwired}/right-pad-1.0.0/node_modules/right-pad");
+    std::fs::create_dir_all(root.join(&other_rel)).unwrap();
+    std::fs::write(root.join(&other_rel).join("index.js"), "x\n").unwrap();
+    let mut state = vlt_vendored::state(root);
+    let mut entry = state["entries"][hosted::PURL].clone();
+    entry["basePurl"] = serde_json::json!(other);
+    entry["uuid"] = serde_json::json!(unwired);
+    entry["artifact"]["path"] = serde_json::json!(other_rel);
+    entry["artifact"]["fileInventory"] = serde_json::json!({ "index.js": "0" });
+    entry["wiring"] = serde_json::json!([]);
+    state["entries"][other] = entry;
+    std::fs::write(
+        root.join(".socket/vendor/state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    let cwd = root.to_str().unwrap().to_string();
+    let uri = server.uri();
+    let (code, env, stderr) = hosted::run_json(
+        root,
+        &[
+            "scan",
+            "--mode",
+            "vendored",
+            "--prune",
+            "--yes",
+            "--cwd",
+            &cwd,
+            "--api-url",
+            &uri,
+            "--org",
+            hosted::ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[],
+    );
+    assert!(code == 0 || code == 1, "{env:#}\n{stderr}");
+    let after = vlt_vendored::state(root);
+    assert!(
+        after["entries"][hosted::PURL].is_object(),
+        "the wired entry stays: {after:#}\n{env:#}"
+    );
+    assert!(root.join(vlt_vendored::rel()).join("index.js").is_file());
+    assert!(
+        after["entries"].get(other).is_none(),
+        "the unwired entry is reclaimed: {after:#}\n{env:#}"
+    );
+    assert!(
+        !root.join(format!(".socket/vendor/npm/{unwired}")).exists(),
+        "{env:#}"
+    );
+}
+
+/// The degraded-ledger overlap through the CLI: a redirect ledger holding
+/// only a vlt node edit (no records) keyed at a peer variant of the
+/// vendored package's DepID is superseded by the vendored wiring (warned
+/// and reconciled), at the `~` boundary only.
+#[tokio::test]
+async fn scan_vendored_warns_on_a_degraded_vlt_edit_at_the_tilde_boundary() {
+    use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
+    use vlt_hosted_common as hosted;
+    for (key, overlaps) in [
+        ("left-pad@1.3.0~peer.2", true),
+        ("left-pad@1.3.00~peer.2", false),
+    ] {
+        let server = MockServer::start().await;
+        hosted::mock_all(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        vlt_vendored::vendored_project(root, false);
+        let mut ledger = RedirectState::new();
+        ledger.edits = vec![FileEdit {
+            path: "vlt-lock.json".to_string(),
+            kind: socket_patch_core::patch::redirect::vlt::KIND.to_string(),
+            action: "modified".to_string(),
+            key: Some(key.to_string()),
+            original: None,
+            new: None,
+        }];
+        std::fs::write(
+            hosted::ledger_path(root),
+            serde_json::to_string_pretty(&ledger).unwrap(),
+        )
+        .unwrap();
+        let cwd = root.to_str().unwrap().to_string();
+        let uri = server.uri();
+        let (_, env, stderr) = hosted::run_json(
+            root,
+            &[
+                "scan",
+                "--mode",
+                "vendored",
+                "--yes",
+                "--cwd",
+                &cwd,
+                "--api-url",
+                &uri,
+                "--org",
+                hosted::ORG,
+                "--api-token",
+                "fake",
+            ],
+            &[],
+        );
+        let text = env.to_string();
+        let warned = text.contains("vendor_supersedes_redirect");
+        assert_eq!(warned, overlaps, "{key}: {env:#}\n{stderr}");
+        let edits = std::fs::read(hosted::ledger_path(root))
+            .ok()
+            .map(|b| {
+                serde_json::from_slice::<RedirectState>(&b)
+                    .unwrap()
+                    .edits
+                    .len()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            edits,
+            usize::from(!overlaps),
+            "{key}: the reconciliation drops exactly the claimed edit: {env:#}"
+        );
+    }
 }

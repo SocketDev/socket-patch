@@ -1,7 +1,8 @@
 //! In-process + envelope contract tests for `socket-patch vendor` (npm
 //! backend, plus the golang apply-yields-to-vendor handshake, plus the gem
 //! backend's `scan --vendor` arm — the one route into the vendor engine no
-//! gem project had ever been driven through).
+//! gem project had ever been driven through). The vlt legs live in
+//! `in_process_vendor/vlt.rs`.
 //!
 //! The lifecycle tests call `socket_patch_cli::commands::vendor::run(args)`
 //! directly (the in-process convention of `in_process_cargo_apply.rs` /
@@ -31,6 +32,10 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 mod npm_e2e_common;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
+#[path = "in_process_vendor/vlt.rs"]
+mod vlt;
+#[path = "vlt_vendor_common/mod.rs"]
+mod vlt_vendor;
 
 /// Canonical-grammar patch UUID — the vendor path layer validates the uuid
 /// path level fail-closed, so fixtures must use the real shape.

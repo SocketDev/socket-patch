@@ -426,7 +426,9 @@ pub async fn vendor_npm(
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
 /// shared by the four TEXTUAL npm-family backends (npm / yarn classic /
 /// yarn berry / bun) — the flavor-parameterized sibling of
-/// [`super::pnpm_lock::guard_unwired_revert`].
+/// [`super::pnpm_lock::guard_unwired_revert`]. vlt has its own structural
+/// guard in [`super::vlt_lock`]: its lock names the artifact in DepID keys
+/// and slot [3], so the textual probe is not exact there.
 ///
 /// Such entries come out of `repair`'s no-ledger reconstruction (the
 /// npm-family pre-vendor lock fragments are not offline-recoverable, so the

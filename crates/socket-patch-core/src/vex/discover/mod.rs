@@ -31,9 +31,10 @@
 //! through ONE shared reader that yields EVERY entry, Socket-owned ones
 //! included: the npm-family entry models in `lock_inventory`
 //! (`npm_lock_nodes`, `pnpm::pnpm_packages`, `yarn::classic_entries` /
-//! `berry_entries`, `BunLockb::parse_packages`) and, for the other formats,
-//! the readers the writers own (`cargo_lock` / `cargo_config`, `go_mod_edit`
-//! / `go_sum_edit`, `gemfile_lock`, `composer_lock_packages`, the
+//! `berry_entries`, `BunLockb::parse_packages`, `vlt::vlt_lock_model`) and,
+//! for the other formats, the readers the writers own (`cargo_lock` /
+//! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `gemfile_lock`,
+//! `composer_lock_packages`, the
 //! `utils::python_lock` / `poetry_lock` / `requirements` / `hatch` readers,
 //! `maven_pom`, `nuget_config` / `nuget_feed`). The inventory's registry
 //! views drop the Socket-owned entries (they feed registry discovery and
@@ -46,8 +47,9 @@
 //!
 //! One submodule per package-manager group — [`npm`] (package-lock /
 //! npm-shrinkwrap, pnpm modern + legacy), [`yarn`] (classic + berry),
-//! [`bun`] (`bun.lock` text + `bun.lockb`), [`cargo`], [`golang`],
-//! [`pypi_locks`] (uv.lock, poetry.lock, pdm.lock, pylock.toml),
+//! [`bun`] (`bun.lock` text + `bun.lockb`), [`vlt`] (`vlt-lock.json`),
+//! [`cargo`], [`golang`], [`pypi_locks`] (uv.lock, poetry.lock, pdm.lock,
+//! pylock.toml),
 //! [`pypi_other`] (Pipfile.lock, requirements*.txt, hatch), [`gem`],
 //! [`composer`], [`maven`], [`nuget`], [`deno`]. Each exports exactly
 //!
@@ -169,12 +171,13 @@
 //!     name whose own element (a maven `<repository>`, a nuget `<add>`) is
 //!     on the Socket host but names another patch.
 //! 12. **npm-family extractors iterate the entry models only.** The npm,
-//!     pnpm, yarn and bun extractors walk the `lock_inventory` entry models,
-//!     never the grammar primitives those wrap (`scan_blocks`, the pnpm
-//!     grammar's `entries` / `resolution`, `bun_lock_text`'s section reader,
-//!     `BunLockb::parse`) nor a parser of their own (a JSON read of
-//!     `bun.lock`), so discovery and the inventory see one entry walk per
-//!     format (an architecture test in this module enforces it).
+//!     pnpm, yarn, bun and vlt extractors walk the `lock_inventory` entry
+//!     models, never the grammar primitives those wrap (`scan_blocks`, the
+//!     pnpm grammar's `entries` / `resolution`, `bun_lock_text`'s section
+//!     reader, `BunLockb::parse`, `vlt_lock_text`'s sniff and DepID split)
+//!     nor a parser of their own (a JSON read of `bun.lock` or
+//!     `vlt-lock.json`), so discovery and the inventory see one entry walk
+//!     per format (an architecture test in this module enforces it).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -202,6 +205,7 @@ pub(crate) mod npm;
 pub(crate) mod nuget;
 pub(crate) mod pypi_locks;
 pub(crate) mod pypi_other;
+pub(crate) mod vlt;
 pub(crate) mod yarn;
 
 // ── diagnostics ──────────────────────────────────────────────────────────
@@ -708,6 +712,7 @@ pub async fn discover_patched_refs_with(root: &Path, opts: &DiscoverOptions) -> 
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
+    vlt::extract(&ctx, &mut out).await;
     cargo::extract(&ctx, &mut out).await;
     golang::extract(&ctx, &mut out).await;
     pypi_locks::extract(&ctx, &mut out).await;
@@ -894,7 +899,9 @@ pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<Strin
 ///
 /// * [`WiringMode::Vendored`]: `.socket/vendor/<eco>/<uuid>` ANYWHERE — a
 ///   `../` / absolute / other-checkout spelling or a traversal leaf
-///   included (the ledger's raw-text fallback would match those too);
+///   included (the ledger's raw-text fallback would match those too) — and
+///   the same path as a vlt `file` DepID spells it (`/` as `+` in tilde
+///   ids, `§` in legacy ids), since a vlt node key may be its only mention;
 /// * [`WiringMode::Hosted`]: every canonical-uuid path segment of a url on
 ///   an accepted patch-server origin
 ///   ([`crate::patch::redirect::hosted_patch_url_uuids`]: plain,
@@ -916,17 +923,19 @@ fn socket_identities(text: &str, origins: &[String]) -> BTreeSet<(String, Wiring
         .replace('\\', "/");
     let bytes = norm.as_bytes();
 
-    let anchor = format!("{VENDOR_DIR}/");
-    for (at, _) in norm.match_indices(anchor.as_str()) {
-        let rest = &norm[at + anchor.len()..];
-        for eco in ECOSYSTEM_DIRS {
-            let uuid = rest
-                .strip_prefix(eco)
-                .and_then(|r| r.strip_prefix('/'))
-                .and_then(|r| r.get(..36))
-                .filter(|u| is_canonical_uuid(u));
-            if let Some(uuid) = uuid {
-                found.insert((uuid.to_string(), WiringMode::Vendored));
+    for sep in ['/', '+', '§'] {
+        let anchor = format!("{VENDOR_DIR}/").replace('/', &sep.to_string());
+        for (at, _) in norm.match_indices(anchor.as_str()) {
+            let rest = &norm[at + anchor.len()..];
+            for eco in ECOSYSTEM_DIRS {
+                let uuid = rest
+                    .strip_prefix(eco)
+                    .and_then(|r| r.strip_prefix(sep))
+                    .and_then(|r| r.get(..36))
+                    .filter(|u| is_canonical_uuid(u));
+                if let Some(uuid) = uuid {
+                    found.insert((uuid.to_string(), WiringMode::Vendored));
+                }
             }
         }
     }
@@ -1714,8 +1723,9 @@ pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uui
 }
 
 /// The root files a vendored `eco` artifact can be wired from — every
-/// vendor backend's lockfile / wiring config for that ecosystem (npm: all
-/// five npm-family locks; cargo: the `[patch.crates-io]` config; maven /
+/// vendor backend's lockfile / wiring config for that ecosystem (npm: every
+/// npm-family lock the `vendor_probe` table flags, `vlt-lock.json`
+/// included; cargo: the `[patch.crates-io]` config; maven /
 /// nuget: the repository / source that serves the vendored dir). Manifests
 /// such as package.json are deliberately absent: the lock is what the
 /// install consumes.
@@ -1880,6 +1890,7 @@ fn hosted_file_role(rel: &str) -> HostedFileRole {
                 | ".yarnrc.yml"
                 | "pnpm-workspace.yaml"
                 | "bunfig.toml"
+                | "vlt.json"
                 | "settings.xml"
                 | "go.sum"
                 | "go.work.sum"
@@ -2770,6 +2781,10 @@ mod tests {
             format!("registry=https://patch.socket.dev/{a}/\n"),
         );
         p.write("settings.xml", format!("<id>socket-patch-{a}</id>"));
+        p.write(
+            "vlt.json",
+            format!("{{\"registries\":{{\"npm\":\"https://patch.socket.dev/{a}/\"}}}}\n"),
+        );
         // maven: `<repository>` without the version-suffix pin.
         let repo = format!(
             "<repositories><repository><id>socket-patch-{a}</id>\
@@ -2805,6 +2820,7 @@ mod tests {
             "go.sum",
             ".npmrc",
             "settings.xml",
+            "vlt.json",
             "pom.xml",
             "nuget.config",
             "pyproject.toml",
@@ -2840,8 +2856,21 @@ mod tests {
                 "[project]\ndependencies = [\n  \"six @ https://patch.socket.dev/patch/pypi/six/1.16.0/{TOKEN}/{a}/six-1.16.0.whl\",\n]\n"
             ),
         );
+        q.write(
+            "vlt-lock.json",
+            format!(
+                "{{\"nodes\":{{\"~npm~x@1.0.0\":[0,\"x\",\"sha512-x\",\"{}\"]}}}}\n",
+                hosted_url("npm", "x", "1.0.0", a, "x-1.0.0.tgz")
+            ),
+        );
         let root = q.root();
-        for file in ["Cargo.toml", "pom.xml", "nuget.config", "pyproject.toml"] {
+        for file in [
+            "Cargo.toml",
+            "pom.xml",
+            "nuget.config",
+            "pyproject.toml",
+            "vlt-lock.json",
+        ] {
             assert!(
                 hosted_wiring_in_files(root, &[file], a).await,
                 "{file}: a pin proves hosted wiring"
@@ -2904,6 +2933,7 @@ mod tests {
                     "npm-shrinkwrap.json",
                     "package-lock.json",
                     "pnpm-lock.yaml",
+                    "vlt-lock.json",
                     "yarn.lock",
                 ],
             ),
@@ -3232,6 +3262,8 @@ mod tests {
             format!("<url>file://${{project.basedir}}/.socket/vendor/maven/{a}</url>"),
             format!(".socket/vendor/npm/{a}/../../../etc/passwd"),
             format!("# ./.socket/vendor/pypi/{a}/six-1.16.0-py3-none-any.whl"),
+            format!("\"file~.socket+vendor+npm+{a}+x-1.0.0+node__modules+x\": [0,\"x\"]"),
+            format!("\"file·.socket§vendor§npm§{a}§x-1.0.0§node_modules§x\": [0,\"x\"]"),
         ] {
             assert_eq!(vendored(&text), vec![a.to_string()], "{text}");
             assert!(hosted(&text).is_empty(), "{text}");
@@ -3245,6 +3277,8 @@ mod tests {
             format!("registry = \"socket-patch-{a}\""),
             format!("<id>socket-patch-vendor-{a}</id>"),
             format!(".socket/vendor/jsr/{a}/x.tgz"),
+            format!("file~.socket+vendor+jsr+{a}+x"),
+            format!("file~.socket+vendor/npm+{a}+x"),
             format!(".socket/vendor/npm/{}/x.tgz", a.to_ascii_uppercase()),
             ".socket/vendor/npm/not-a-uuid/x.tgz".to_string(),
             "https://patch.socket.dev/patch/npm/x/1.0.0/tok/placeholder/x.tgz".to_string(),
@@ -3521,14 +3555,28 @@ mod tests {
         ];
         // Per-file: a second whole-document parser of a lock whose entry
         // model already exists.
-        let per_file: &[(&str, &[&str])] = &[(
-            "bun.rs",
-            &[
-                "serde_json::from_str(",
-                "serde_json::from_slice(",
-                "check_lock_version(",
-            ],
-        )];
+        let per_file: &[(&str, &[&str])] = &[
+            (
+                "bun.rs",
+                &[
+                    "serde_json::from_str(",
+                    "serde_json::from_slice(",
+                    "check_lock_version(",
+                ],
+            ),
+            (
+                "vlt.rs",
+                &[
+                    "serde_json::from_str(",
+                    "serde_json::from_slice(",
+                    "sniff_lock(",
+                    "split_dep_id(",
+                    "nodes_block(",
+                    "parse_node_line(",
+                    "parse_node_entry_text(",
+                ],
+            ),
+        ];
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).expect("read discover dir") {
             let path = entry.expect("dir entry").path();

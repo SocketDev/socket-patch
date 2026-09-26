@@ -14,7 +14,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
-| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ six lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
+| npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write); `setup` postinstall hook | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ `.pth` startup hook via `setup` | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
 | RubyGems (`gem`) | ✅ Bundler plugin via `setup` — needs bundler ≥ 2.2 (1.x cannot load `plugin ... path:` directives; `setup` refuses below the floor and `setup --check` red-flags a wired 1.x project) | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
@@ -115,6 +115,9 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   tuples from 1.2.0), so on 1.1.39–1.3.9 a hosted or vendored rewrite removes digest
   enforcement for the patched package. Every boundary here is measured against real
   Bun releases — see [Bun compatibility](testing/bun-compatibility.md).
+- **vlt** — `vlt-lock.json` default-registry nodes of the patched `name@version` keep
+  their DepID and get the patched sha512 in slot [2] and the hosted URL in slot [3]; see
+  [vlt notes](#npm-vlt-notes).
 
 ## npm: Rush monorepos
 
@@ -134,6 +137,147 @@ Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
 `rush install` fails until `rush update` refreshes it (a `redirect_rush_repo_state_stale`
 warning flags this; the redirect survives the refresh — pnpm keeps locked resolutions for
 unchanged specifiers).
+
+## npm: vlt notes
+
+[vlt](https://www.vlt.sh) is supported in agent and hosted mode on every release from
+0.0.0-1 to 1.2.0, and in vendored mode from 0.0.0-19 (the first release whose lock has a
+`lockfileVersion`; older locks are refused with `vendor_lockfile_version_unsupported`),
+excluding the broken and never-published releases listed in
+[vlt compatibility](testing/vlt-compatibility.md#releases). vlt's lock is
+`vlt-lock.json`; its installed tree is `node_modules/.vlt/<DepID>/node_modules/<name>`
+plus the hidden lock `node_modules/.vlt-lock.json`, which vlt trusts as the installed
+graph. From 1.2.0 vlt also keeps a machine-wide content store (`store-linker`, hardlinked
+on Linux by default).
+
+**Eras.** The lock format and the DepID grammar changed several times, and every mode
+reads all of them:
+
+| Era | Releases | `lockfileVersion` | DepIDs |
+|---|---|---|---|
+| A0 | 0.0.0-1, 0.0.0-11 … 0.0.0-18 | absent | legacy `·`/`§` (`··name@ver`) |
+| A | 0.0.0-19 … 1.0.0-rc.8 | `0` | legacy, default registry `''` |
+| B | 1.0.0-rc.9 … rc.14 | `0` | legacy, default registry `npm` |
+| C | rc.15 … rc.32 | `1` | tilde (`~npm~name@ver`), 3-tuples |
+| D | rc.33 … 1.0.7 | `1` | tilde, the registry URL in slot [3] |
+| E | 1.0.8 … 1.1.1 | `1` | tilde, hashed peer extras (`~peer.<hex>`) |
+| F | 1.2.0 | `1` | as E, plus the global store |
+
+A lock socket-patch cannot read exactly as vlt does (a UTF-8 BOM, another
+`lockfileVersion`, a `nodes` section outside vlt's one-node-per-line layout) is refused:
+`redirect_vlt_lock_unsupported` (hosted) or `vendor_lockfile_version_unsupported`
+(vendored). Agent mode never needs the lock.
+
+**Hosted: the slot rewrite.** Only nodes on vlt's default registry (the `''` / `npm`
+segment, or a URL segment equal to the lock's scalar `registry`) are redirected, every
+peer and modifier variant of the `name@version` included. Instances under a named alias,
+a scoped registry or jsr stay untouched (`redirect_vlt_custom_registry_skipped`) and keep
+the run's `--vex` from attesting the package. `options` is never edited: vlt fails `vlt
+ci` on any change there. Before anything is written, each artifact is fetched the way
+vlt fetches it (`accept-encoding: gzip;q=1.0, identity;q=0.5`, raw body hashed); vlt
+fails `EINTEGRITY` on a content-encoded response, so such a dependency is withheld
+(`redirect_vlt_artifact_unverifiable`) instead of pinning a lock `vlt ci` cannot install.
+
+**Hosted: which lock confirms.** vlt drives a project when its install state
+(`node_modules/.vlt-lock.json` or `node_modules/.vlt/`) is present or no other npm-family
+lock is. Then only `vlt-lock.json` can confirm a redirect, and a dependency vlt refuses is
+refused for every lock. With a sibling `package-lock.json` (or another npm-family lock)
+and no vlt install state, both are rewritten and `redirect_vlt_sibling_lockfiles` asks you
+to delete the lock your installs do not use.
+
+**Hosted: reinstall and heal.** vlt never re-extracts an installed package when only its
+lock integrity or URL changes, so after a rewrite the installed tree is stale. `scan` and
+`get --mode hosted` remove `node_modules/.vlt-lock.json` and each stale
+`node_modules/.vlt/<DepID>` of a Socket-owned node, so the next `vlt install` extracts the
+patched packages; `rollback` and `remove` do the same for the registry bytes. Nothing
+outside the project, no link target and no copy socket-patch cannot judge is ever
+removed. A stale copy of an optional dependency is kept, because `vlt install` does not
+put back a removed optional dependency; the advisory says to run `vlt ci` instead, and to
+upgrade to vlt 1.0.5 first when every dependency is optional (earlier releases install no
+optional dependency from the lock of such a project; mixed projects install it on every
+release). The advisory names the kept copies by what they are: unpatched copies after
+`scan`/`get`, patched copies after `rollback`/`remove`, and, after a hosted → vendored
+takeover, the installed copies of the now-vendored optional dependencies (whatever bytes
+the hosted pin left installed). `--no-vlt-install-cleanup` (or
+`SOCKET_NO_VLT_INSTALL_CLEANUP`) keeps the tree. `redirect_vlt_reinstall_required` says
+what happened and what to run; a stale or unchecked copy is never attested by the run's
+`--vex`.
+
+**Hosted: vlt behaviors to know.**
+- The pin survives `vlt ci`, frozen installs and `vlt install <new>`, except that
+  1.0.0-rc.6 … rc.17 drop slot [3] of every default-registry node on a re-save and keep
+  the patched integrity: the next `vlt ci` then fails `EINTEGRITY` (loudly, never
+  silently unpatched) until `scan --mode hosted` re-pins, and `rollback` reports drift
+  with that remedy.
+- `vlt update` re-resolves an unchanged exact spec from 1.0.8 on, dropping the redirect
+  (and the run's VEX then no longer attests it); 0.0.0-20 … 1.0.7 keep the locked node.
+- vlt enforces tarball integrity only on a cold fetch (every release except 0.0.0-1): a
+  warm cache keyed by URL serves stale bytes even when the integrity differs. Hosted
+  artifact URLs are immutable per artifact for that reason.
+- 0.0.0-16 … 0.0.0-24 ignore `vlt-lock.json` unless `vlt.json` declares `"modifiers": {}`
+  (`redirect_vlt_old_lockfile_ignored`), rc.7 … rc.29 re-resolve from public npm when a
+  scalar `registry` is configured (`redirect_vlt_scalar_registry_ignored`), and a lock
+  with no `lockfileVersion` is silently re-resolved by vlt ≥ rc.15
+  (`redirect_vlt_lockfile_version_missing`). Each keeps the run's VEX from attesting.
+- **Documented gap:** a `lockfileVersion` 1 lock that sets both `registry` and
+  `registries.npm` may come from rc.15 … rc.29 (which ignore the lock) or from ≥ rc.30
+  (which do not); the lock cannot tell them apart, and 1.x users commonly set both, so
+  no warning fires for it.
+- From rc.33 every install, `vlt ci` included, needs registry config (`vlt.json`
+  `config.registries.npm` / `config.registry`, `VLT_REGISTRY`, or `vlt setup`), and from
+  1.0.5 `registries.npm` specifically. socket-patch never writes `vlt.json`.
+
+**Vendored: directory artifacts (the D19 layout).** A direct dependency of the root or of
+a workspace member is vendored as a patched package directory,
+`.socket/vendor/npm/<uuid>/<name>-<version>/node_modules/<name>/`, never a tarball: vlt
+links a `file:` directory in place, and the extra `node_modules/<name>` level lets a
+package that `require()`s its own name resolve itself. The payload's `devDependencies`
+are dropped from its `package.json` (vlt would otherwise try to install them). The uuid
+directory carries a `.gitignore` that re-includes the payload (`!*`) against the project's
+own ignores (`node_modules`, `dist/`, `*.map`, …) while ignoring the links vlt creates
+inside it, and a `.gitattributes` that turns EOL conversion off so an `autocrlf` checkout
+stays byte-exact. The lock's node becomes a `file` node, the importer edges and the
+importers' `package.json` specs move to the `file:` path, and every moved entry is placed
+where vlt's own serializer puts it, so `vlt ci` keeps the lock byte-identical. Transitive
+targets are refused (`vendor_vlt_transitive_unsupported`: vlt silently reverts
+transitive lock surgery), as are several instances of one `name@version`, modifier
+variants, importer peer edges, foreign registries and a dependency declared in several
+fields (`vendor_lock_entry_unsupported`); use hosted mode for those. From vlt 1.0.8 a root
+dependency with resolved peers carries a `~peer.<hex>` extra even with one peer context (a
+workspace member's a `~peer.N` one from rc.15): vendored mode writes its `file` node
+without the extra, exactly as vlt writes a `file:` dependency, keeps its peer edges, and
+`vendor --revert` restores the extra. Before rc.6 vlt cannot reinstall a vendored `file:`
+dependency without the lock (`vendor_vlt_legacy_lockfile` on era-A locks: `··` ids, or
+URL-segment ids equal to a scalar `registry`), and A0 locks are refused. From 0.0.0-30 a
+plain `vlt install` keeps an optional dependency's installed upstream copy after
+vendoring; `vendor_vlt_reinstall_required` says to run `vlt ci` (or delete `node_modules`
+and run `vlt install`) to link the vendored directory, and to upgrade to vlt 1.0.5 first
+when every dependency is optional. The same advisory names any dependency whose
+`node_modules` link still resolves to vlt's store, and `vendor --revert` repeats it for an
+optional dependency (a plain `vlt install` keeps the link to the removed vendored
+directory) or a link still into the vendored directory.
+
+**Agent mode.** `apply` and `rollback` patch every store copy of a `name@version`
+(legacy and tilde DepIDs, peer and modifier variants, transitive-only packages) and
+replace each file instead of writing through it, so vlt 1.2's shared store (hardlinked on
+Linux) and every other project linked to it keep their bytes. A patch survives `vlt
+install`, `install <new>`, `uninstall` and frozen installs; `vlt ci` and deleting
+`node_modules` restore the upstream bytes, which is what the setup hook is for.
+
+**Setup.** vlt gets npm's `npx @socketsecurity/socket-patch apply --silent --ecosystems
+npm` postinstall hook, wired at the workspace root only (vlt runs the root hook once per
+install that changes the graph, never on a no-op install). vlt before 1.0.0-rc.13 never
+runs a root `postinstall` without an `install` script: `setup` still wires it and warns
+`vlt_root_scripts_not_run`. A failing hook aborts and rolls back the whole `vlt install`.
+
+**Locale.** vlt sorts its lock with the process locale for one key, so byte-stability is
+claimed only for `en`-equivalent locales (`LANG` unset, `C`, `POSIX` or `en_US`); every vlt
+test job sets `LANG=C` and `LC_ALL=C`. Vendored ownership and revert match by entry text,
+so they do not depend on the order.
+
+**Compatibility of ledgers.** vlt ledgers (`redirect_vlt_lock_node` hosted edits and
+`flavor: "vlt"` vendored entries) require the socket-patch release that adds vlt support:
+an older release does not understand them.
 
 ## Maven & NuGet caveats
 

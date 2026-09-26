@@ -548,6 +548,7 @@ jobs:
             nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
             pypi)     EXTRA="--test docker_e2e_vendor_pypi_pm" ;;
           esac
+          # shellcheck disable=SC2086 # EXTRA is intentionally word-split
           cargo llvm-cov \
             --features docker-e2e \
             --no-report \
@@ -890,6 +891,55 @@ jobs:
           - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.2.23', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
+          # Real-vlt capstones (DESIGN §8.4): wiremock patch service and a local
+          # npm registry fed from npmjs, driven by the pinned vlt release
+          # (`node vlt.js`, installed below from a sha512-checked `npm pack`).
+          # Every test is `#[ignore]`d and named `vlt_pinned_matrix_*`, so the
+          # filter must be `--include-ignored vlt_pinned_matrix` (the job
+          # default `--ignored` selects nothing). The run pipes through
+          # scripts/check-vlt-legs.py, which fails on `0 passed` or any leg
+          # line the manifest does not predict. The eras: A0 0.0.0-16, A
+          # 0.0.0-32, B rc.12/rc.14 (rc.14 legs reach public npm), C rc.32,
+          # D 1.0.4/1.0.7, E 1.1.1, F 1.2.0.
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_redirect_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-16', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_redirect_vlt_build, vlt: '1.1.1', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.4', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_vendor_vlt_build, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix, vlt_upgrade: '1.2.0'}
+          - {os: windows-latest, suite: mode_migration_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
+          # Linux `auto` hardlinks from the global store; every OS gets the
+          # explicit hardlink linker.
+          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
+          - {os: macos-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
+          - {os: windows-latest, suite: e2e_safety_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix, vlt_store_linker: 'hardlink'}
+          # rc.12 gets the definite no-hook advisory; windows rc.14 runs the
+          # legacy DepIDs on NTFS with pre-junction symlinks.
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: macos-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_vlt, vlt: '1.2.0', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '0.0.0-32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.12', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.0-rc.32', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: ubuntu-latest, suite: e2e_vlt, vlt: '1.0.7', test_filter: --include-ignored vlt_pinned_matrix}
+          - {os: windows-latest, suite: e2e_vlt, vlt: '1.0.0-rc.14', test_filter: --include-ignored vlt_pinned_matrix}
           # The named corepack pnpm hosted legs (pnpm 7-11, get-uuid,
           # zero-touch, --trust-lockfile). `#[ignore]`d and previously run in
           # no job; the pinned matrix inside the same suite runs in
@@ -1035,8 +1085,9 @@ jobs:
           # same-OS legs wins the cache reserve and the rest fail to save.
           # Several suites run one leg per pinned toolchain release (bun, uv,
           # poetry, pdm, hatch, pipenv, pip, bundler, composer, maven, dotnet,
-          # deno), so the release is part of the key too.
-          key: ${{ matrix.suite }}-${{ matrix.bun || matrix.uv || matrix.poetry || matrix.pdm || matrix.hatch || matrix.pipenv || matrix.pip || matrix.bundler || matrix.composer || matrix.maven || matrix.dotnet || matrix.deno || 'default' }}
+          # deno, vlt), so the release is part of the key too, plus the vlt
+          # store linker of the two ubuntu e2e_safety_vlt legs.
+          key: ${{ matrix.suite }}-${{ matrix.vlt || matrix.bun || matrix.uv || matrix.poetry || matrix.pdm || matrix.hatch || matrix.pipenv || matrix.pip || matrix.bundler || matrix.composer || matrix.maven || matrix.dotnet || matrix.deno || 'default' }}${{ matrix.vlt_store_linker && format('-{0}', matrix.vlt_store_linker) || '' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
@@ -1210,7 +1261,45 @@ jobs:
         with:
           bun-version: ${{ matrix.bun }}
 
+      - name: Setup Node.js 24 (vlt legs)
+        if: matrix.vlt != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+
+      - name: Setup vlt
+        if: matrix.vlt != ''
+        # The pinned release (and, for the upgrade legs, the second vlt):
+        # `npm pack`, sha512 against the registry and the committed pin, then
+        # a prefix install run as `node vlt.js`. The store-linker knob is a
+        # harness variable because the harness scrubs ambient VLT_*.
+        shell: bash
+        env:
+          VLT_TEST_VERSION: ${{ matrix.vlt }}
+          VLT_TEST_UPGRADE: ${{ matrix.vlt_upgrade }}
+          VLT_TEST_STORE_LINKER: ${{ matrix.vlt_store_linker }}
+        run: |
+          set -euo pipefail
+          js=$(scripts/install-vlt.sh "$VLT_TEST_VERSION" "$RUNNER_TEMP/vlt-tool")
+          {
+            echo "SOCKET_PATCH_VLT_E2E_JS=$js"
+            echo "SOCKET_PATCH_VLT_E2E_VERSION=$VLT_TEST_VERSION"
+            echo "SOCKET_PATCH_VLT_E2E_REQUIRED=1"
+            echo "LANG=C"
+            echo "LC_ALL=C"
+          } >> "$GITHUB_ENV"
+          if [ -n "$VLT_TEST_STORE_LINKER" ]; then
+            echo "SOCKET_PATCH_VLT_E2E_STORE_LINKER=$VLT_TEST_STORE_LINKER" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$VLT_TEST_UPGRADE" ]; then
+            up=$(scripts/install-vlt.sh "$VLT_TEST_UPGRADE" "$RUNNER_TEMP/vlt-upgrade")
+            echo "SOCKET_PATCH_VLT_E2E_UPGRADE_JS=$up" >> "$GITHUB_ENV"
+            echo "SOCKET_PATCH_VLT_E2E_UPGRADE_VERSION=$VLT_TEST_UPGRADE" >> "$GITHUB_ENV"
+          fi
+          node --version
+
       - name: Run e2e tests
+        if: matrix.vlt == ''
         # Suites are `#[ignore]`-gated out of the unpinned `test` job by
         # default, hence `--ignored`; an entry that sets `test_filter`
         # overrides the selector for itself only.
@@ -1256,6 +1345,25 @@ jobs:
           SOCKET_PATCH_DENO_E2E_REQUIRED: ${{ matrix.deno != '' && '1' || '' }}
           SOCKET_PATCH_DENO_E2E_VERSION: ${{ matrix.deno }}
         run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- ${{ matrix.test_filter || '--ignored' }}
+
+      - name: Run vlt e2e tests
+        if: matrix.vlt != ''
+        # One capstone binary per row, through the leg checker: it fails on
+        # `0 passed`, a crashed binary, a missing `ran`, an unexpected skip or
+        # an unknown leg (crates/socket-patch-cli/tests/vlt-leg-manifest.json).
+        shell: bash
+        env:
+          SOCKET_PATCH_VLT_E2E_REQUIRED: ${{ matrix.vlt != '' && '1' || '' }}
+          VLT_SUITE: ${{ matrix.suite }}
+          VLT_TEST_FILTER: ${{ matrix.test_filter }}
+        run: |
+          set -uo pipefail
+          status=0
+          # shellcheck disable=SC2086 # the filter is several libtest arguments
+          cargo test -p socket-patch-cli --all-features --test "$VLT_SUITE" -- $VLT_TEST_FILTER 2>&1 | tee vlt-leg.log || status=1
+          py=$(command -v python3 || command -v python)
+          "$py" scripts/check-vlt-legs.py --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json vlt-leg.log || status=1
+          exit "$status"
 
   # ----------------------------------------------------------------------
   # Docker-driven real-package e2e suite.
@@ -1694,10 +1802,19 @@ jobs:
           corepack prepare yarn@1.22.22 --activate
           corepack prepare yarn@4.6.0 --activate
           npm install -g bun@1
+          # vlt: the same sha512-checked pack-and-install as the e2e rows.
+          js=$(scripts/install-vlt.sh 1.2.0 "$RUNNER_TEMP/vlt-tool")
+          {
+            echo "SOCKET_PATCH_VLT_E2E_JS=$js"
+            echo "SOCKET_PATCH_VLT_E2E_VERSION=1.2.0"
+            echo "SOCKET_PATCH_VLT_E2E_REQUIRED=1"
+            echo "SOCKET_PATCH_HOSTED_E2E_STRICT=1"
+          } >> "$GITHUB_ENV"
           node --version
           npm --version
           pnpm --version
           bun --version
+          node --no-warnings "$js" --version
 
       - name: Setup Python + uv
         if: steps.gate.outputs.run == 'true'
@@ -1741,18 +1858,48 @@ jobs:
           # suites were pulled from the PR matrix (see the `e2e` job). Retry the
           # whole suite a couple of times before calling it a real failure, so a
           # transient 503 does not block merges through a required check.
+          set -o pipefail
           for attempt in 1 2 3; do
             echo "::group::hosted-e2e attempt $attempt"
+            # The step shell runs with -e: keep a failed attempt from ending it.
+            status=0
             cargo test -p socket-patch-cli --test e2e_hosted_production -- \
-              --ignored --nocapture --test-threads=4
-            status=$?
+              --ignored --nocapture --test-threads=4 2>&1 | tee hosted-e2e.log || status=$?
             echo "::endgroup::"
             if [ "$status" -eq 0 ]; then
-              exit 0
+              # The vlt leg (probe-driven: the clean refusal while the artifact
+              # is content-encoded, the full install proof once it is not).
+              python3 scripts/check-vlt-legs.py \
+                --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json hosted-e2e.log
+              exit $?
             fi
             echo "::warning title=hosted-e2e attempt $attempt failed::retrying"
             sleep $((attempt * 20))
           done
           echo "::error title=hosted-e2e::suite failed on all 3 attempts"
           exit 1
-          if-no-files-found: warn
+
+      - name: Run vendored-mode production e2e (vlt)
+        if: steps.gate.outputs.run == 'true'
+        # The vendored vlt install proof against production: the service's
+        # directory artifact in the D19 layout, then a fresh `vlt ci`.
+        env:
+          SOCKET_PATCH_VENDORED_E2E_STRICT: '1'
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            echo "::group::vendored vlt production attempt $attempt"
+            status=0
+            cargo test -p socket-patch-cli --test e2e_vendored_production -- \
+              --include-ignored vlt_pinned_matrix --nocapture 2>&1 | tee vlt-vendored-production.log || status=$?
+            echo "::endgroup::"
+            if [ "$status" -eq 0 ]; then
+              python3 scripts/check-vlt-legs.py \
+                --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json vlt-vendored-production.log
+              exit $?
+            fi
+            echo "::warning title=vendored vlt production attempt $attempt failed::retrying"
+            sleep $((attempt * 20))
+          done
+          echo "::error title=hosted-e2e::the vendored vlt production proof failed on all 3 attempts"
+          exit 1

@@ -60,6 +60,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
     // VendorArgs-specific
     "SOCKET_FORCE",
     "SOCKET_VENDOR_REVERT",
@@ -630,4 +631,17 @@ fn bare_force_does_not_consume_next_token() {
         Ok(_) => panic!("`vendor --force stray` must reject the stray positional"),
         Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn no_vlt_install_cleanup_is_accepted_silently_by_vendor() {
+    assert!(
+        parse_vendor(&["--no-vlt-install-cleanup"])
+            .common
+            .no_vlt_install_cleanup
+    );
+    let from_env =
+        parse_vendor_with_env(&[("SOCKET_NO_VLT_INSTALL_CLEANUP", "true")], &[]).expect("parse");
+    assert!(from_env.common.no_vlt_install_cleanup);
 }

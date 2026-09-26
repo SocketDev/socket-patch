@@ -52,6 +52,10 @@ async fn download_and_apply_patches(
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
 
 const ORG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -3056,4 +3060,64 @@ async fn human_vendored_search_all_downloads_failed_prints_empty_run_line() {
         stdout.contains("No vendorable patches in scope."),
         "stdout={stdout}\nstderr={stderr}"
     );
+}
+
+/// The human vendored dry run of `get <purl>` on a vlt project the vlt
+/// preflight refuses (a transitive target) prints the code-tagged
+/// `[would-refuse]` line and writes nothing.
+#[tokio::test]
+async fn get_vendored_dry_run_human_prints_the_vlt_would_refuse_line() {
+    use vlt_hosted_common as hosted;
+    let server = wiremock::MockServer::start().await;
+    hosted::mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::write_project(root);
+    let lock = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+         \"~npm~has@1.0.0\": [0,\"has\",\"sha512-H==\"],\n    {}\n  }},\n  \"edges\": {{\n    \
+         \"file~_d has\": \"prod 1.0.0 ~npm~has@1.0.0\",\n    \"~npm~has@1.0.0 left-pad\": \
+         \"prod 1.3.0 {}\"\n  }}\n}}\n",
+        hosted::registry_node(hosted::TILDE_ID),
+        hosted::TILDE_ID
+    );
+    std::fs::write(root.join("vlt-lock.json"), &lock).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        "{\n  \"dependencies\": {\n    \"has\": \"1.0.0\"\n  }\n}\n",
+    )
+    .unwrap();
+    let cwd = root.to_str().unwrap().to_string();
+    let uri = server.uri();
+    let out = hosted::scrubbed_cli()
+        .args([
+            "get",
+            hosted::PURL,
+            "--mode",
+            "vendored",
+            "--dry-run",
+            "--yes",
+            "--cwd",
+            &cwd,
+            "--api-url",
+            &uri,
+            "--org",
+            hosted::ORG,
+            "--api-token",
+            "fake",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "[would-refuse] {} (vendor_vlt_transitive_unsupported)",
+            hosted::PURL
+        )),
+        "{stdout}"
+    );
+    assert_eq!(hosted::read(root, "vlt-lock.json"), lock);
+    assert!(!root.join(".socket").exists());
 }

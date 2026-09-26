@@ -158,6 +158,19 @@ pub mod npm_family {
             redirect_candidate: true,
             detects_pnpm: false,
         },
+        FileRow {
+            name: "vlt-lock.json",
+            vendor_probe: true,
+            redirect_candidate: true,
+            detects_pnpm: false,
+        },
+        // vlt's config: a read-only redirect input, never wired.
+        FileRow {
+            name: "vlt.json",
+            vendor_probe: false,
+            redirect_candidate: true,
+            detects_pnpm: false,
+        },
         // deno.lock is deliberately absent: deno is its own ecosystem
         // (JSR-crawled); no npm-family vendor/redirect/detection path treats
         // deno.lock as an npm lock today. Adding it here is a feature
@@ -194,4 +207,19 @@ pub mod npm_family {
     pub const BUN_LOCK: &str = "bun.lock";
     /// Bun's binary lock.
     pub const BUN_LOCKB: &str = "bun.lockb";
+    /// vlt's committed lock (the root one only; a nested lock is its own
+    /// project).
+    pub const VLT_LOCK: &str = "vlt-lock.json";
+    /// vlt's project config, read-only for every mode.
+    pub const VLT_CONFIG: &str = "vlt.json";
+    /// vlt's hidden lock, the installed graph vlt trusts without re-checking.
+    pub const VLT_HIDDEN_LOCK_REL: &str = "node_modules/.vlt-lock.json";
+    /// vlt's per-project package store, one `<DepID>/` entry per node.
+    pub const VLT_STORE_DIR: &str = "node_modules/.vlt";
+    /// Workspace globs of vlt <= 0.0.0-12 (`{"packages": ...}`).
+    pub const VLT_LEGACY_WORKSPACES: &str = "vlt-workspaces.json";
+    /// Any one in the cwd makes setup treat the project as vlt's
+    /// (`VLT_STORE_DIR` only as a directory).
+    pub const VLT_SETUP_MARKERS: [&str; 4] =
+        [VLT_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_STORE_DIR];
 }

@@ -11,11 +11,11 @@
 //! package dirs) because the file: rewiring is unvalidated under that
 //! linker — each with its own code and remedy.
 //!
-//! The router fans `vendor`/`revert` out per detected flavor. All five
-//! flavors have real backends: package-lock ([`super::npm_lock`]),
-//! yarn classic ([`super::yarn_classic_lock`]), yarn berry
-//! ([`super::yarn_berry_lock`]), pnpm ([`super::pnpm_lock`]), and bun
-//! ([`super::bun_lock`]); a lockfile the probe can't classify refuses with
+//! The router fans `vendor`/`revert` out per detected flavor. Every flavor
+//! has a real backend: package-lock ([`super::npm_lock`]), yarn classic
+//! ([`super::yarn_classic_lock`]), yarn berry ([`super::yarn_berry_lock`]),
+//! pnpm ([`super::pnpm_lock`]), bun ([`super::bun_lock`]) and vlt
+//! ([`super::vlt_lock`]); a lockfile the probe can't classify refuses with
 //! a stable code. Reverts fail CLOSED on a flavor this build has no
 //! backend for — never guess at another flavor's wiring records.
 
@@ -28,7 +28,7 @@ use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use super::pnpm_lock_legacy::PnpmLockGrammar;
 use super::state::VendorEntry;
 use super::{
-    bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, yarn_berry_lock, yarn_classic_lock,
+    bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, vlt_lock, yarn_berry_lock, yarn_classic_lock,
     RevertOpts, RevertOutcome, VendorOutcome, VendorWarning,
 };
 
@@ -48,6 +48,8 @@ pub(crate) enum NpmLockFlavor {
     PnpmLegacy,
     /// `bun.lock` or native binary `bun.lockb`.
     Bun,
+    /// `vlt-lock.json`, lockfileVersion 0 or 1.
+    Vlt,
 }
 
 impl NpmLockFlavor {
@@ -60,13 +62,33 @@ impl NpmLockFlavor {
             NpmLockFlavor::Pnpm => "pnpm",
             NpmLockFlavor::PnpmLegacy => pnpm_lock_legacy::FLAVOR,
             NpmLockFlavor::Bun => "bun",
+            NpmLockFlavor::Vlt => vlt_lock::FLAVOR,
+        }
+    }
+
+    /// The flavor a [`VendorEntry::flavor`] names, `None` for one this build
+    /// has no backend for. A pre-flavor ledger (`None`) is package-lock. The
+    /// revert and in-use dispatch go through this, so every flavor they can
+    /// route is known to [`npm_flavor_is_known`].
+    fn from_recorded(flavor: Option<&str>) -> Option<Self> {
+        match flavor {
+            None | Some("package-lock") => Some(NpmLockFlavor::PackageLock),
+            Some("yarn-classic") => Some(NpmLockFlavor::YarnClassic),
+            Some("yarn-berry") => Some(NpmLockFlavor::YarnBerry),
+            Some("pnpm") => Some(NpmLockFlavor::Pnpm),
+            Some(pnpm_lock_legacy::FLAVOR) => Some(NpmLockFlavor::PnpmLegacy),
+            Some("bun") => Some(NpmLockFlavor::Bun),
+            Some(vlt_lock::FLAVOR) => Some(NpmLockFlavor::Vlt),
+            Some(_) => None,
         }
     }
 }
 
 /// Yarn berry Plug'n'Play loaders: packages live inside `.yarn/cache/` zips,
 /// so there is nothing on disk to stage and no lockfile entry to rewire.
-use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS};
+use crate::constants::npm_family::{
+    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
+};
 
 /// How many head lines the yarn content sniff reads (the v1 header sits in
 /// the leading comment block; berry's `__metadata:` is the first top-level
@@ -76,7 +98,8 @@ const YARN_SNIFF_HEAD_LINES: usize = 30;
 /// Every lockfile name the probe knows, grouped into wiring families: the
 /// flavor that owns a family wires (or supersedes) every file in it, so only
 /// files OUTSIDE the detected family get the multiple-lockfiles warning.
-const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
+const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 5] = [
+    (NpmLockFlavor::Vlt, &[VLT_LOCK]),
     // npm itself ignores package-lock.json when npm-shrinkwrap.json exists,
     // so the npm family never warns about its own sibling.
     (NpmLockFlavor::PackageLock, &NPM_LOCKS),
@@ -106,19 +129,23 @@ pub(super) fn project_root_location(project_root: &Path) -> String {
 ///    pnpm store + no yarn.lock, see
 ///    [`crate::crawlers::pkg_managers::pnpm_pnp_layout`]) → Err
 ///    `vendor_pnpm_pnp_unsupported` with a pnpm remedy;
-/// 2. `bun.lock` or `bun.lockb` → Bun (text takes precedence);
-/// 3. `pnpm-lock.yaml` → head-sniff `lockfileVersion`: `'9.0'` → Pnpm;
+/// 2. `vlt-lock.json` → Vlt when it is a BOM-less JSON object with
+///    `lockfileVersion` 0 or 1; any other shape → Err
+///    `vendor_lockfile_version_unsupported` (the layout is not checked here,
+///    so read-only consumers still read a pretty-printed lock);
+/// 3. `bun.lock` or `bun.lockb` → Bun (text takes precedence);
+/// 4. `pnpm-lock.yaml` → head-sniff `lockfileVersion`: `'9.0'` → Pnpm;
 ///    `5.4`/`'6.0'` (pnpm 7/8) → PnpmLegacy; anything else → Err
 ///    `vendor_lockfile_version_unsupported` (version-aware remedy);
-/// 4. `yarn.lock` → head-sniff: column-0 `__metadata:` → Err
+/// 5. `yarn.lock` → head-sniff: column-0 `__metadata:` → Err
 ///    `vendor_yarn_berry_unsupported`; `# yarn lockfile v1` → YarnClassic;
 ///    neither → Err `vendor_lockfile_version_unsupported`;
-/// 5. `npm-shrinkwrap.json` | `package-lock.json` → PackageLock;
-/// 6. nothing recognized, but `rush.json` present → Err
+/// 6. `npm-shrinkwrap.json` | `package-lock.json` → PackageLock;
+/// 7. nothing recognized, but `rush.json` present → Err
 ///    `vendor_rush_unsupported` (Rush's generated-workspace install model
 ///    can't carry vendor's relative `file:` specs — hosted mode edits the
 ///    lock in place instead);
-/// 7. nothing → Err `vendor_lockfile_missing`.
+/// 8. nothing → Err `vendor_lockfile_missing`.
 ///
 /// `Ok` carries one `vendor_multiple_lockfiles` warning per OTHER known
 /// lockfile present (outside the detected flavor's family): installs driven
@@ -166,13 +193,22 @@ pub(crate) async fn detect_npm_lock_flavor(
     }
 
     let detected = 'flavor: {
-        // 2. Bun's native backend accepts text and binary locks. Selection
+        // 2. vlt wins every other lock once PnP is ruled out.
+        if exists(VLT_LOCK).await {
+            let text = read_lock(project_root, VLT_LOCK).await?;
+            match vlt_lock::sniff_vendor_lock(&text) {
+                Ok(_) => break 'flavor NpmLockFlavor::Vlt,
+                Err(detail) => return Err(("vendor_lockfile_version_unsupported", detail)),
+            }
+        }
+
+        // 3. Bun's native backend accepts text and binary locks. Selection
         // inside the backend and inventory preserves bun.lock precedence.
         if exists(BUN_LOCK).await || exists(BUN_LOCKB).await {
             break 'flavor NpmLockFlavor::Bun;
         }
 
-        // 3. pnpm: lockfileVersion 9.0 routes to the v9 backend, the legacy
+        // 4. pnpm: lockfileVersion 9.0 routes to the v9 backend, the legacy
         //    grammars 5.4 (pnpm 7) / 6.0 (pnpm 8) to the legacy backend;
         //    anything else refuses with the sniff's version-aware remedy.
         if exists(PNPM_LOCK).await {
@@ -188,17 +224,17 @@ pub(crate) async fn detect_npm_lock_flavor(
             }
         }
 
-        // 4. yarn: classic v1 vs berry (node-modules linker), decided by content.
+        // 5. yarn: classic v1 vs berry (node-modules linker), decided by content.
         if exists("yarn.lock").await {
             break 'flavor sniff_yarn_lock(project_root).await?;
         }
 
-        // 5. npm (npm_lock itself prefers the shrinkwrap when both exist).
+        // 6. npm (npm_lock itself prefers the shrinkwrap when both exist).
         if exists(NPM_LOCKS[0]).await || exists(NPM_LOCKS[1]).await {
             break 'flavor NpmLockFlavor::PackageLock;
         }
 
-        // 6. nothing recognizable at the root. A Rush monorepo keeps its
+        // 7. nothing recognizable at the root. A Rush monorepo keeps its
         //    single source-of-truth lock under common/config/rush/ (no root
         //    package.json/lock pair), and its overrides live in
         //    common/config/rush/pnpm-config.json rather than the lockfile —
@@ -225,7 +261,7 @@ pub(crate) async fn detect_npm_lock_flavor(
             "vendor_lockfile_missing",
             format!(
                 "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, \
-                 bun.lock, or bun.lockb {} — vendoring rewires the lockfile, so one must \
+                 bun.lock, bun.lockb, or vlt-lock.json {} — vendoring rewires the lockfile, so one must \
                  exist (run your package manager's install first)",
                 project_root_location(project_root)
             ),
@@ -331,6 +367,12 @@ pub async fn vendor_npm_any(
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
+    if let Some(detail) = flavor_change_refusal(project_root, purl, flavor).await {
+        return VendorOutcome::Refused {
+            code: "vendor_flavor_changed",
+            detail,
+        };
+    }
     // Every backend takes the identical 9-argument tuple; the macro collapses
     // the five-way repetition (same shape as the CLI dispatcher's `vend!`).
     macro_rules! vend {
@@ -356,6 +398,7 @@ pub async fn vendor_npm_any(
         NpmLockFlavor::Pnpm => vend!(pnpm_lock::vendor_pnpm),
         NpmLockFlavor::PnpmLegacy => vend!(pnpm_lock_legacy::vendor_pnpm_legacy),
         NpmLockFlavor::Bun => vend!(bun_lock::vendor_bun),
+        NpmLockFlavor::Vlt => vend!(vlt_lock::vendor_vlt),
     };
     // Probe warnings (e.g. a sibling lockfile that will install UNPATCHED
     // bytes) precede the backend's own; the ledger records which flavor wired
@@ -374,6 +417,74 @@ pub async fn vendor_npm_any(
     outcome
 }
 
+/// The refusal for re-vendoring `purl` under `detected` when its ledger
+/// entry was wired by a different flavor and either side is vlt: the other
+/// backend's records name a lock this run never reads, so a revert through
+/// either flavor would leave half of the wiring behind. Unreadable ledgers
+/// are left to the caller's own persist step.
+async fn flavor_change_refusal(
+    project_root: &Path,
+    purl: &str,
+    detected: NpmLockFlavor,
+) -> Option<String> {
+    let state = super::state::load_state(project_root).await.ok()?;
+    flavor_change_detail(&state.entries, purl, detected)
+}
+
+/// [`flavor_change_refusal`] for a project [`vlt_routes`] routes to vlt,
+/// over a ledger the caller already loaded (the vendored preflight).
+pub fn vlt_flavor_change_refusal(
+    entries: &std::collections::HashMap<String, VendorEntry>,
+    purl: &str,
+) -> Option<String> {
+    flavor_change_detail(entries, purl, NpmLockFlavor::Vlt)
+}
+
+fn flavor_change_detail(
+    entries: &std::collections::HashMap<String, VendorEntry>,
+    purl: &str,
+    detected: NpmLockFlavor,
+) -> Option<String> {
+    entries.iter().find_map(|(key, entry)| {
+        if entry.ecosystem != "npm" || !entry.covers_purl(key, purl) {
+            return None;
+        }
+        let prior = NpmLockFlavor::from_recorded(entry.flavor.as_deref());
+        if prior == Some(detected)
+            || (prior != Some(NpmLockFlavor::Vlt) && detected != NpmLockFlavor::Vlt)
+        {
+            return None;
+        }
+        let prior = entry.flavor.as_deref().unwrap_or("package-lock");
+        Some(format!(
+            "{purl} is vendored through the `{prior}` lockfile flavor, but this project now \
+             installs through `{}`; run `socket-patch vendor --revert` for it while the lock it \
+             was vendored under still drives installs, then vendor it again",
+            detected.as_str()
+        ))
+    })
+}
+
+/// Does the router send this project's npm purls to the vlt backend?
+/// `Some(Ok(()))` when it detects [`NpmLockFlavor::Vlt`], `Some(Err(_))`
+/// with the refusal the §4.1 `vlt-lock.json` sniff raised, `None` when a
+/// PnP loader, another lockfile or no lockfile decides.
+pub async fn vlt_routes(project_root: &Path) -> Option<Result<(), (&'static str, String)>> {
+    match detect_npm_lock_flavor(project_root).await {
+        Ok((NpmLockFlavor::Vlt, _)) => Some(Ok(())),
+        Ok(_) => None,
+        Err(refusal) => {
+            let pnp = PNP_MARKERS
+                .iter()
+                .any(|m| std::fs::symlink_metadata(project_root.join(m)).is_ok());
+            let vlt = tokio::fs::metadata(project_root.join(VLT_LOCK))
+                .await
+                .is_ok();
+            (vlt && !pnp).then_some(Err(refusal))
+        }
+    }
+}
+
 /// Is this npm-vendored entry still consumed by its lockfile's dependency
 /// graph?
 ///
@@ -388,9 +499,9 @@ pub async fn vendor_npm_any(
 /// fail-safe. Detached entries are wired into the lock exactly like
 /// manifest-tracked ones, so the probe applies to every entry.
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    match entry.flavor.as_deref() {
-        Some("pnpm") => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
-        Some("pnpm-legacy") => {
+    match NpmLockFlavor::from_recorded(entry.flavor.as_deref())? {
+        NpmLockFlavor::Pnpm => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
+        NpmLockFlavor::PnpmLegacy => {
             pnpm_lock_legacy::pnpm_legacy_entry_in_use(entry, project_root).await
         }
         // The remaining flavors wire resolutions into the lock itself
@@ -399,13 +510,13 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
         // resolution still points at the artifact. Both npm locks are
         // probed: npm <= 11 installs from the shrinkwrap, npm 12 from the
         // package-lock beside it.
-        None | Some("package-lock") => {
+        NpmLockFlavor::PackageLock => {
             lock_text_mentions_uuid(project_root, &NPM_LOCKS, &entry.uuid).await
         }
-        Some("yarn-classic") | Some("yarn-berry") => {
+        NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry => {
             lock_text_mentions_uuid(project_root, &["yarn.lock"], &entry.uuid).await
         }
-        Some("bun") => {
+        NpmLockFlavor::Bun => {
             if super::lock_inventory::bun::bun_text_lock_present(project_root).await {
                 return lock_text_mentions_uuid(project_root, &[BUN_LOCK], &entry.uuid).await;
             }
@@ -422,7 +533,7 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
                     .any(|package| package.resolution.contains(&needle)),
             )
         }
-        Some(_) => None, // unknown flavor: cannot determine
+        NpmLockFlavor::Vlt => vlt_lock::vlt_entry_in_use(entry, project_root).await,
     }
 }
 
@@ -454,6 +565,14 @@ pub(super) async fn lock_text_mentions_uuid(
     any_readable.then_some(false)
 }
 
+/// Does this build have a backend for an npm entry's recorded flavor?
+/// `None` is a pre-flavor (package-lock) ledger. An unknown flavor was
+/// wired by a newer socket-patch, so health checks and rebuilds must not
+/// judge it by this build's layout rules.
+pub fn npm_flavor_is_known(flavor: Option<&str>) -> bool {
+    NpmLockFlavor::from_recorded(flavor).is_some()
+}
+
 /// Revert one recorded npm vendor entry through the flavor that wired it.
 /// Entries from before the flavor field existed (`None`) are package-lock
 /// wirings; an unknown flavor fails CLOSED (an older binary must not guess
@@ -473,23 +592,27 @@ pub async fn revert_npm_any_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
-    match entry.flavor.as_deref() {
-        None | Some("package-lock") => npm_lock::revert_npm_opts(entry, project_root, opts).await,
-        Some("yarn-classic") => {
+    let Some(flavor) = NpmLockFlavor::from_recorded(entry.flavor.as_deref()) else {
+        return RevertOutcome::failed(format!(
+            "this socket-patch build cannot revert npm vendor flavor `{}` — upgrade \
+             socket-patch and re-run",
+            entry.flavor.as_deref().unwrap_or_default()
+        ));
+    };
+    match flavor {
+        NpmLockFlavor::PackageLock => npm_lock::revert_npm_opts(entry, project_root, opts).await,
+        NpmLockFlavor::YarnClassic => {
             yarn_classic_lock::revert_yarn_classic_opts(entry, project_root, opts).await
         }
-        Some("yarn-berry") => {
+        NpmLockFlavor::YarnBerry => {
             yarn_berry_lock::revert_yarn_berry_opts(entry, project_root, opts).await
         }
-        Some("pnpm") => pnpm_lock::revert_pnpm_opts(entry, project_root, opts).await,
-        Some("pnpm-legacy") => {
+        NpmLockFlavor::Pnpm => pnpm_lock::revert_pnpm_opts(entry, project_root, opts).await,
+        NpmLockFlavor::PnpmLegacy => {
             pnpm_lock_legacy::revert_pnpm_legacy_opts(entry, project_root, opts).await
         }
-        Some("bun") => bun_lock::revert_bun_opts(entry, project_root, opts).await,
-        Some(other) => RevertOutcome::failed(format!(
-            "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
-             socket-patch and re-run"
-        )),
+        NpmLockFlavor::Bun => bun_lock::revert_bun_opts(entry, project_root, opts).await,
+        NpmLockFlavor::Vlt => vlt_lock::revert_vlt_opts(entry, project_root, opts).await,
     }
 }
 
@@ -530,8 +653,8 @@ mod tests {
         assert_eq!(
             detail,
             "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, bun.lock, \
-             or bun.lockb at /nonexistent-socket-patch-root — vendoring rewires the lockfile, \
-             so one must exist (run your package manager's install first)"
+             bun.lockb, or vlt-lock.json at /nonexistent-socket-patch-root — vendoring rewires \
+             the lockfile, so one must exist (run your package manager's install first)"
         );
     }
     use crate::manifest::schema::PatchFileInfo;
@@ -554,11 +677,31 @@ mod tests {
 
     #[test]
     fn flavor_strings_are_stable() {
+        use NpmLockFlavor::*;
+        for flavor in [
+            PackageLock,
+            YarnClassic,
+            YarnBerry,
+            Pnpm,
+            PnpmLegacy,
+            Bun,
+            Vlt,
+        ] {
+            match flavor {
+                PackageLock | YarnClassic | YarnBerry | Pnpm | PnpmLegacy | Bun | Vlt => {}
+            }
+            assert_eq!(
+                NpmLockFlavor::from_recorded(Some(flavor.as_str())),
+                Some(flavor)
+            );
+        }
+        assert_eq!(NpmLockFlavor::from_recorded(None), Some(PackageLock));
         assert_eq!(NpmLockFlavor::PackageLock.as_str(), "package-lock");
         assert_eq!(NpmLockFlavor::YarnClassic.as_str(), "yarn-classic");
         assert_eq!(NpmLockFlavor::Pnpm.as_str(), "pnpm");
         assert_eq!(NpmLockFlavor::PnpmLegacy.as_str(), "pnpm-legacy");
         assert_eq!(NpmLockFlavor::Bun.as_str(), "bun");
+        assert_eq!(NpmLockFlavor::Vlt.as_str(), "vlt");
     }
 
     #[tokio::test]
@@ -816,6 +959,159 @@ mod tests {
         assert_eq!(flavor, NpmLockFlavor::PackageLock);
     }
 
+    const VLT_V1: &str = "{\n  \"lockfileVersion\": 1,\n  \"nodes\": {},\n  \"edges\": {}\n}\n";
+
+    #[tokio::test]
+    async fn vlt_lock_sniff_accepts_v0_v1_and_refuses_every_other_shape() {
+        for version in ["0", "1"] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(
+                tmp.path(),
+                "vlt-lock.json",
+                &format!("{{\"lockfileVersion\":{version},\n\"nodes\":{{\"a\": [0,\"a\"]}}}}"),
+            )
+            .await;
+            let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+            assert_eq!(
+                flavor,
+                NpmLockFlavor::Vlt,
+                "{version}: layout is not checked here"
+            );
+            assert!(warnings.is_empty());
+        }
+        for (lock, needle) in [
+            ("{\"nodes\": {}}", "has no lockfileVersion (vlt ≤ 0.0.0-18)"),
+            (
+                "{\"lockfileVersion\": 2}",
+                "lockfileVersion 2; update socket-patch",
+            ),
+            (
+                "{\"lockfileVersion\": 1e0}",
+                "lockfileVersion 1e0; update socket-patch",
+            ),
+            (
+                "\u{feff}{\"lockfileVersion\": 1}",
+                "re-save vlt-lock.json with `vlt install`",
+            ),
+            (
+                "{\"lockfileVersion\": 1",
+                "re-save vlt-lock.json with `vlt install`",
+            ),
+            ("[1]", "re-save vlt-lock.json with `vlt install`"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "vlt-lock.json", lock).await;
+            touch(tmp.path(), "package-lock.json", "{}").await;
+            let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+            assert_eq!(code, "vendor_lockfile_version_unsupported", "{lock}");
+            assert!(detail.contains(needle), "{lock}: {detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vlt_outranks_every_other_lock_after_pnp() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "vlt-lock.json", VLT_V1).await;
+        touch(tmp.path(), "bun.lock", "{}").await;
+        touch(tmp.path(), "bun.lockb", "binary").await;
+        touch(tmp.path(), "pnpm-lock.yaml", PNPM_9).await;
+        touch(tmp.path(), "yarn.lock", YARN_V1).await;
+        touch(tmp.path(), "package-lock.json", "{}").await;
+        touch(tmp.path(), "npm-shrinkwrap.json", "{}").await;
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Vlt);
+        let mut named: Vec<&str> = warnings
+            .iter()
+            .map(|w| {
+                assert_eq!(w.code, "vendor_multiple_lockfiles");
+                assert!(w.detail.contains("vlt vendor backend"), "{}", w.detail);
+                w.detail.split('`').nth(1).unwrap()
+            })
+            .collect();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            [
+                "bun.lock",
+                "bun.lockb",
+                "npm-shrinkwrap.json",
+                "package-lock.json",
+                "pnpm-lock.yaml",
+                "yarn.lock"
+            ]
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), ".pnp.cjs", "/* pnp */").await;
+        touch(tmp.path(), "vlt-lock.json", VLT_V1).await;
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(
+            code, "vendor_yarn_berry_unsupported",
+            "PnP is still refused first"
+        );
+    }
+
+    #[tokio::test]
+    async fn flavor_change_to_or_from_vlt_refuses_before_any_write() {
+        let (tmp, record) = npm_project().await;
+        let mut state = super::super::state::VendorState::new();
+        state.entries.insert(
+            "pkg:npm/left-pad@1.3.0".into(),
+            probe_entry(Some("package-lock")),
+        );
+        super::super::state::save_state(tmp.path(), &state)
+            .await
+            .unwrap();
+        touch(tmp.path(), "vlt-lock.json", VLT_V1).await;
+        let lock_before = tokio::fs::read(tmp.path().join("vlt-lock.json"))
+            .await
+            .unwrap();
+        let VendorOutcome::Refused { code, detail } = vendor_any(tmp.path(), &record).await else {
+            panic!("expected the flavor guard");
+        };
+        assert_eq!(code, "vendor_flavor_changed");
+        assert!(
+            detail.contains("`package-lock`") && detail.contains("`vlt`"),
+            "{detail}"
+        );
+        assert_eq!(
+            tokio::fs::read(tmp.path().join("vlt-lock.json"))
+                .await
+                .unwrap(),
+            lock_before
+        );
+        assert!(!tmp
+            .path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+
+        // vlt → package-lock refuses the same way.
+        tokio::fs::remove_file(tmp.path().join("vlt-lock.json"))
+            .await
+            .unwrap();
+        state
+            .entries
+            .insert("pkg:npm/left-pad@1.3.0".into(), probe_entry(Some("vlt")));
+        super::super::state::save_state(tmp.path(), &state)
+            .await
+            .unwrap();
+        let VendorOutcome::Refused { code, .. } = vendor_any(tmp.path(), &record).await else {
+            panic!("expected the flavor guard");
+        };
+        assert_eq!(code, "vendor_flavor_changed");
+
+        // Switches between the other flavors are not this guard's to judge.
+        state.entries.insert(
+            "pkg:npm/left-pad@1.3.0".into(),
+            probe_entry(Some("yarn-classic")),
+        );
+        super::super::state::save_state(tmp.path(), &state)
+            .await
+            .unwrap();
+        let outcome = vendor_any(tmp.path(), &record).await;
+        assert!(matches!(outcome, VendorOutcome::Done { .. }), "{outcome:?}");
+    }
+
     #[tokio::test]
     async fn precedence_and_multiple_lockfile_warnings() {
         // bun.lock beats pnpm beats yarn beats package-lock; every unwired
@@ -1046,6 +1342,9 @@ mod tests {
         assert!(!outcome.success);
         assert!(outcome.error.as_deref().unwrap().contains("future-pm"));
 
+        assert!(!npm_flavor_is_known(Some("future-pm")));
+        assert!(npm_flavor_is_known(Some("vlt")));
+
         // Every known flavor routes to its backend; with no wiring records and
         // nothing on disk each reverts trivially (None = a pre-flavor ledger).
         for flavor in [
@@ -1056,7 +1355,9 @@ mod tests {
             Some("pnpm".to_string()),
             Some("pnpm-legacy".to_string()),
             Some("bun".to_string()),
+            Some("vlt".to_string()),
         ] {
+            assert!(npm_flavor_is_known(flavor.as_deref()), "{flavor:?}");
             entry.flavor = flavor.clone();
             let outcome = revert_npm_any(&entry, tmp.path(), false).await;
             assert!(outcome.success, "flavor {flavor:?}: {:?}", outcome.error);
@@ -1142,6 +1443,35 @@ mod tests {
 
         // Unknown flavor: undeterminable, fail-safe keep.
         let entry = probe_entry(Some("future-pm"));
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+
+        // vlt is structural: only a `file` node under the uuid dir counts,
+        // never a mention in an edge spec or another node's slot.
+        let entry = probe_entry(Some("vlt"));
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        let file_id =
+            format!("file~.socket+vendor+npm+{UUID}+left-pad-1.3.0+node__modules+left-pad");
+        touch(
+            tmp.path(),
+            "vlt-lock.json",
+            &format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"{file_id}\": [0,\"left-pad\",null,\"{rel}\"]\n  }},\n  \"edges\": {{}}\n}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        touch(
+            tmp.path(),
+            "vlt-lock.json",
+            &format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n    \"~npm~x@1.0.0\": [0,\"x\",null,\"{rel}\"]\n  }},\n  \"edges\": {{\n    \"file~_d x\": \"prod file:./{rel} ~npm~x@1.0.0\"\n  }}\n}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+        touch(tmp.path(), "vlt-lock.json", "\u{feff}{}").await;
         assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
     }
 
@@ -1296,12 +1626,15 @@ mod tests {
         mkfifo(&pnpm_dir.path().join("pnpm-lock.yaml"));
         let yarn_dir = tempfile::tempdir().unwrap();
         mkfifo(&yarn_dir.path().join("yarn.lock"));
+        let vlt_dir = tempfile::tempdir().unwrap();
+        mkfifo(&vlt_dir.path().join("vlt-lock.json"));
         let in_use_dir = tempfile::tempdir().unwrap();
-        const IN_USE_LOCKS: [&str; 4] = [
+        const IN_USE_LOCKS: [&str; 5] = [
             "npm-shrinkwrap.json",
             "package-lock.json",
             "yarn.lock",
             "bun.lock",
+            "vlt-lock.json",
         ];
         for name in IN_USE_LOCKS {
             mkfifo(&in_use_dir.path().join(name));
@@ -1312,12 +1645,14 @@ mod tests {
             (
                 detect_npm_lock_flavor(pnpm_dir.path()).await,
                 detect_npm_lock_flavor(yarn_dir.path()).await,
+                detect_npm_lock_flavor(vlt_dir.path()).await,
                 vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path()).await,
                 vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path()).await,
                 vendored_entry_in_use(&probe_entry(Some("bun")), in_use_dir.path()).await,
+                vendored_entry_in_use(&probe_entry(Some("vlt")), in_use_dir.path()).await,
             )
         };
-        let Ok((pnpm, yarn, npm_use, yarn_use, bun_use)) =
+        let Ok((pnpm, yarn, vlt, npm_use, yarn_use, bun_use, vlt_use)) =
             tokio::time::timeout(deadline, all).await
         else {
             // On timeout the open is wedged in a `spawn_blocking` thread the
@@ -1327,6 +1662,7 @@ mod tests {
             let stuck = [
                 pnpm_dir.path().join("pnpm-lock.yaml"),
                 yarn_dir.path().join("yarn.lock"),
+                vlt_dir.path().join("vlt-lock.json"),
             ];
             for path in stuck
                 .iter()
@@ -1354,5 +1690,9 @@ mod tests {
         assert_eq!(npm_use, None);
         assert_eq!(yarn_use, None);
         assert_eq!(bun_use, None);
+        let (code, detail) = vlt.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing", "{detail}");
+        assert!(detail.contains("vlt-lock.json"), "{detail}");
+        assert_eq!(vlt_use, None);
     }
 }

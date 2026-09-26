@@ -4,13 +4,16 @@
 
 use std::path::Path;
 
-use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_SHRINKWRAP_LEGACY};
+use crate::constants::npm_family::{
+    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_SHRINKWRAP_LEGACY, VLT_LOCK,
+};
 use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
 
 use super::bun::{bun_text_lock_present, inventory_bun, inventory_bun_binary};
 use super::npm::inventory_package_lock;
 use super::pnpm::{inventory_pnpm_lock, inventory_pnpm_lock_at, inventory_rush_pnpm_locks};
+use super::vlt::inventory_vlt;
 use super::yarn::{inventory_yarn_berry, inventory_yarn_classic};
 use super::{dedup_prefer_integrity, LockfileEntry, UnsupportedNpmLayout};
 
@@ -142,6 +145,7 @@ pub(super) async fn inventory_npm_lock_raw(
                 Some(inventory_bun_binary(project_root).await?)
             }
         }
+        NpmLockFlavor::Vlt => inventory_vlt(project_root).await,
     };
     Ok(raw.map(|raw| (flavor, guard_npm(raw))))
 }
@@ -150,8 +154,8 @@ pub(super) async fn inventory_npm_lock_raw(
 /// shadowing, or `None` when no sibling lock file exists at all.
 ///
 /// [`detect_npm_lock_flavor`] cannot be re-asked (it already refused on its
-/// pnpm step), so this mirrors the rest of its precedence by hand — bun,
-/// then yarn, then npm — on file EXISTENCE, and returns the first present
+/// pnpm step), so this mirrors the rest of its precedence by hand — vlt,
+/// bun, then yarn, then npm — on file EXISTENCE, and returns the first present
 /// sibling's inventory (possibly empty: presence alone proves the pnpm lock
 /// is migration debris, so the caller must not fall back to it). Raw
 /// entries — the caller guards and collapses them.
@@ -162,7 +166,13 @@ pub(super) async fn inventory_live_sibling_lock(
         let p = root.join(name);
         async move { tokio::fs::metadata(&p).await.is_ok() }
     };
-    // bun.lock — router step 2. That step runs BEFORE the pnpm sniff, so
+    if exists(VLT_LOCK).await {
+        return Some((
+            NpmLockFlavor::Vlt,
+            inventory_vlt(root).await.unwrap_or_default(),
+        ));
+    }
+    // bun.lock — router step 3. That step runs BEFORE the pnpm sniff, so
     // when the version refusal fired no bun.lock can actually be present;
     // probed anyway to keep this a literal transcription of the router's
     // order. The binary lock shares the same routing precedence.
@@ -178,7 +188,7 @@ pub(super) async fn inventory_live_sibling_lock(
             inventory_bun_binary(root).await.unwrap_or_default(),
         ));
     }
-    // yarn.lock — router step 4, where classic vs berry is a content
+    // yarn.lock — router step 5, where classic vs berry is a content
     // decision. Rather than re-deriving that head sniff, try both readers:
     // each yields entries only for its own grammar (classic's `version "…"`
     // fields vs berry's `resolution:` lines), so a non-empty result is the
@@ -194,7 +204,7 @@ pub(super) async fn inventory_live_sibling_lock(
             inventory_yarn_berry(root).await.unwrap_or_default(),
         ));
     }
-    // npm — router step 5 (`inventory_package_lock` itself prefers the
+    // npm — router step 6 (`inventory_package_lock` itself prefers the
     // shrinkwrap when both exist, mirroring npm).
     if exists(NPM_LOCKS[0]).await || exists(NPM_LOCKS[1]).await {
         return Some((

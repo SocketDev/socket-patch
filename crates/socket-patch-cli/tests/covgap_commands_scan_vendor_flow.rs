@@ -659,3 +659,47 @@ async fn scan_vendor_staging_error_interactive_prints_error_line() {
         "an aborted step leaves no .socket/ behind; stdout={stdout}; stderr={stderr}"
     );
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// The dry-run preview over a vlt project already vendored at the offered
+/// uuid: the lock's `file` node is ours, so the vlt preflight exempts it
+/// and the record reads `already_vendored`, never `would_refuse`.
+#[tokio::test]
+async fn scan_vendor_dry_run_reports_already_vendored_for_vlt() {
+    use vlt_hosted_common as hosted;
+    let server = MockServer::start().await;
+    hosted::mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, false);
+    let lock = hosted::read(root, "vlt-lock.json");
+    let cwd = root.to_str().unwrap().to_string();
+    let uri = server.uri();
+    let (code, env, stderr) = hosted::run_json(
+        root,
+        &[
+            "scan",
+            "--mode",
+            "vendored",
+            "--dry-run",
+            "--yes",
+            "--cwd",
+            &cwd,
+            "--api-url",
+            &uri,
+            "--org",
+            hosted::ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    let rec = &env["vendor"]["patches"][0];
+    assert_eq!(rec["action"], "already_vendored", "{env:#}");
+    assert_eq!(hosted::read(root, "vlt-lock.json"), lock);
+}

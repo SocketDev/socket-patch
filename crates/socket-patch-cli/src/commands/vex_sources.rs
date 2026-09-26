@@ -771,8 +771,14 @@ fn vendored_entry_for(cand: &Cand, vref: &PatchedRef) -> VendorEntry {
         wiring: Vec::new(),
         lock: None,
         took_over_go_patches: false,
-        // Bun's workspace-mirror integrity check keys off the flavor.
-        flavor: (source == "bun.lock" || source == "bun.lockb").then(|| "bun".to_string()),
+        // Bun's workspace-mirror integrity check and the vlt package-dir
+        // verifier (structure rule, manifest exemption by the local blob,
+        // since there is no inventory pin) key off the flavor.
+        flavor: match source.as_ref() {
+            "bun.lock" | "bun.lockb" => Some("bun".to_string()),
+            "vlt-lock.json" => Some("vlt".to_string()),
+            _ => None,
+        },
         uv: None,
         pnpm: None,
         poetry: None,
@@ -1034,6 +1040,35 @@ mod tests {
             d.push(r);
         }
         d
+    }
+
+    #[test]
+    fn a_synthesized_vendored_entry_carries_the_source_locks_flavor() {
+        let vendor = VendorState::new();
+        for (source, artifact, flavor) in [
+            (
+                "vlt-lock.json",
+                format!(".socket/vendor/npm/{U1}/x-1.0.0/node_modules/x"),
+                Some("vlt"),
+            ),
+            (
+                "bun.lock",
+                format!(".socket/vendor/npm/{U1}/x-1.0.0.tgz"),
+                Some("bun"),
+            ),
+            (
+                "package-lock.json",
+                format!(".socket/vendor/npm/{U1}/x-1.0.0.tgz"),
+                None,
+            ),
+        ] {
+            let vref = vendor_ref(&artifact).unwrap();
+            let r = PatchedRef::vendored("pkg:npm/x@1.0.0".into(), &vref, source, None);
+            let entry = vendored_entry_for(&Cand::from_ref(&r, &vendor), &r);
+            assert_eq!(entry.flavor.as_deref(), flavor, "{source}");
+            assert_eq!(entry.artifact.path, artifact, "{source}");
+            assert!(entry.detached && entry.artifact.file_inventory.is_none());
+        }
     }
 
     /// The lockfile wires U2; the manifest records U1 and the redirect

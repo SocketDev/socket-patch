@@ -1,0 +1,21 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "nodes": {
+    "·npm·use-sync-external-store@1.2.0·%E1%B9%97%3A3": [0,"use-sync-external-store","sha512-eEgnFxGQ1Ife9bzYs6VLi8/4X6CObHMw9Qr9tPY43iKwsPw8xE8+EFsf/2cFZ5S3esXgpWgtSCtLNS41F+sKPA=="],
+    "~npm~react@18.2.0": [0,"react","sha512-/3IjMdb2L9QbBdWiW5e3P2/npwMBaU9mHCSCUzNln0ZCYbcfTsGbTJrU/kGemdH2IWmB2ioZ+zkxtmq6g09fGQ==","https://registry.npmjs.org/react/-/react-18.2.0.tgz"],
+    "~npm~use-sync-external-store@1.2.0~peer.0df72515a50372ba": [0,"use-sync-external-store","sha512-eEgnFxGQ1Ife9bzYs6VLi8/4X6CObHMw9Qr9tPY43iKwsPw8xE8+EFsf/2cFZ5S3esXgpWgtSCtLNS41F+sKPA==","https://registry.npmjs.org/use-sync-external-store/-/use-sync-external-store-1.2.0.tgz"],
+    "~npm~use-sync-external-store@1.2.0~peer.2": [0,"use-sync-external-store","sha512-eEgnFxGQ1Ife9bzYs6VLi8/4X6CObHMw9Qr9tPY43iKwsPw8xE8+EFsf/2cFZ5S3esXgpWgtSCtLNS41F+sKPA==","https://registry.npmjs.org/use-sync-external-store/-/use-sync-external-store-1.2.0.tgz"]
+  },
+  "edges": {
+    "file~_d react": "prod 18.2.0 ~npm~react@18.2.0",
+    "file~_d use-sync-external-store": "prod 1.2.0 ~npm~use-sync-external-store@1.2.0~peer.0df72515a50372ba",
+    "workspace~packages+a use-sync-external-store": "prod 1.2.0 ~npm~use-sync-external-store@1.2.0~peer.2",
+    "~npm~use-sync-external-store@1.2.0~peer.0df72515a50372ba react": "peer ^16.8.0 || ^17.0.0 || ^18.0.0 ~npm~react@18.2.0",
+    "~npm~use-sync-external-store@1.2.0~peer.2 react": "peer ^16.8.0 || ^17.0.0 || ^18.0.0 ~npm~react@18.2.0"
+  }
+}

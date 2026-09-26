@@ -351,10 +351,10 @@ pub async fn rollback_package_patch(
 ) -> RollbackResult {
     let mut result =
         rollback_package_patch_at(package_key, pkg_path, files, blobs_path, dry_run).await;
-    // Only npm purls can name pnpm store copies; everything else skips the
+    // Only npm purls can name pnpm or vlt store copies; everything else skips the
     // (already cheap) discovery outright.
     if result.success && package_key.starts_with("pkg:npm/") {
-        for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
+        for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
             let copy_result =
                 rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
             fold_copy_result(&mut result, &copy, copy_result);
@@ -363,8 +363,8 @@ pub async fn rollback_package_patch(
     result
 }
 
-/// Merge one pnpm store copy's result into the primary's. A failed copy
-/// fails the whole result with a `pnpm store copy <path> failed to roll
+/// Merge one pnpm or vlt store copy's result into the primary's. A failed
+/// copy fails the whole result with a `store copy <path> failed to roll
 /// back: …` note; a copy that restored fine but carries an advisory
 /// (`success: true, error: Some(…)` — e.g. "…ownership could not be
 /// restored…") keeps `success` and appends the advisory verbatim, so the
@@ -379,7 +379,7 @@ fn fold_copy_result(result: &mut RollbackResult, copy: &Path, copy_result: Rollb
     } else {
         result.success = false;
         format!(
-            "pnpm store copy {} failed to roll back: {}",
+            "store copy {} failed to roll back: {}",
             copy.display(),
             copy_result
                 .error
@@ -1996,8 +1996,8 @@ mod tests {
         );
     }
 
-    /// The pnpm fan-out merge: a failed copy fails the whole result with the
-    /// `pnpm store copy … failed to roll back` note; a copy that restored fine
+    /// The store fan-out merge: a failed copy fails the whole result with the
+    /// `store copy … failed to roll back` note; a copy that restored fine
     /// but carries an ownership advisory keeps `success` and appends the
     /// advisory verbatim (it already names the copy's file path); a clean copy
     /// changes nothing.
@@ -2046,7 +2046,7 @@ mod tests {
         assert!(!primary.success);
         assert_eq!(
             primary.error.as_deref(),
-            Some("first; pnpm store copy /store/pkg@1.0.0_peer failed to roll back: boom")
+            Some("first; store copy /store/pkg@1.0.0_peer failed to roll back: boom")
         );
     }
 

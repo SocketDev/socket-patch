@@ -268,6 +268,58 @@ pub(crate) async fn reusable_committed_artifact(
     verify_committed_artifact(project_root, &entry, record).await
 }
 
+/// DESIGN §4.3 step 2: the committed vlt package dir at `rel_dir`, when
+/// the ledger records it for `record.uuid` with an inventory and the tree
+/// still verifies (no link on the path, the structure rule, only links and
+/// `.bin/` scripts under its `node_modules/`, every member and the whole
+/// inventory). Returns the recorded inventory. Read-only.
+pub(crate) async fn reusable_committed_dir(
+    project_root: &Path,
+    record: &PatchRecord,
+    rel_dir: &str,
+) -> Result<std::collections::BTreeMap<String, String>, ReuseMiss> {
+    if record.files.is_empty() {
+        return Err(ReuseMiss::NoFiles);
+    }
+    let state = load_state(project_root)
+        .await
+        .map_err(|_| ReuseMiss::NoLedger)?;
+    let mut hits: Vec<VendorEntry> = state
+        .entries
+        .into_values()
+        .filter(|e| {
+            e.ecosystem == "npm"
+                && e.uuid == record.uuid
+                && e.flavor.as_deref() == Some(super::vlt_lock::FLAVOR)
+                && norm(&e.artifact.path) == rel_dir
+                && e.artifact.file_inventory.is_some()
+        })
+        .collect();
+    let Some(entry) = hits.pop() else {
+        return Err(ReuseMiss::NoEntry);
+    };
+    if hits
+        .iter()
+        .any(|e| e.artifact.file_inventory != entry.artifact.file_inventory)
+    {
+        return Err(ReuseMiss::Ambiguous);
+    }
+    let mut prefix = project_root.to_path_buf();
+    for seg in rel_dir.split('/') {
+        prefix.push(seg);
+        match tokio::fs::symlink_metadata(&prefix).await {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(ReuseMiss::NotRegular),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ReuseMiss::Missing),
+            Err(_) => return Err(ReuseMiss::Unreadable),
+        }
+    }
+    super::verify::verify_vendored_patch_record(project_root, &entry, record)
+        .await
+        .map_err(ReuseMiss::MemberMismatch)?;
+    Ok(entry.artifact.file_inventory.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

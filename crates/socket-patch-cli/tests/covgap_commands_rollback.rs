@@ -2218,9 +2218,8 @@ mod interactive {
             .expect("spawn socket-patch in PTY");
         drop(pair.slave);
 
-        let reader_handle = crate::pty_io::PtyOutput::spawn(
-            pair.master.try_clone_reader().expect("clone reader"),
-        );
+        let reader_handle =
+            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -2270,9 +2269,7 @@ mod interactive {
         );
         assert_eq!(code, 0, "declining must exit 0; got: {output}");
         assert!(
-            output.contains(
-                "Roll back 1 patch and remove it from the local manifest? [Y/n]"
-            ),
+            output.contains("Roll back 1 patch and remove it from the local manifest? [Y/n]"),
             "the composed confirm prompt must render verbatim; got: {output}"
         );
         assert!(
@@ -3344,4 +3341,107 @@ fn empty_manifest_announces_no_patches() {
         stdout.contains("No patches found in manifest"),
         "the empty-manifest announce must print; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
+}
+
+// ───────────────────────── hosted vlt heal ─────────────────────────
+
+const VLT_UUID: &str = "88888888-8888-4888-8888-888888888888";
+const VLT_ID: &str = "~npm~left-pad@1.3.0";
+const VLT_REGISTRY_SHA: &str = "sha512-REGISTRY==";
+const VLT_PATCHED_SHA: &str = "sha512-PATCHED==";
+
+fn vlt_entry(sha: &str, url: &str) -> String {
+    format!("\"{VLT_ID}\": [0,\"left-pad\",\"{sha}\",\"{url}\"]")
+}
+
+fn vlt_lock_text(entry: &str) -> String {
+    format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    {entry}\n  }},\n  \"edges\": {{}}\n}}\n"
+    )
+}
+
+/// A redirected vlt project whose store holds the patched copy `vlt
+/// install` extracted, with the hidden lock recording the hosted pin.
+fn write_vlt_hosted_fixture(root: &Path) -> (String, PathBuf) {
+    let registry = vlt_entry(
+        VLT_REGISTRY_SHA,
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+    );
+    let hosted = vlt_entry(
+        VLT_PATCHED_SHA,
+        &format!("https://patch.socket.dev/patch/npm/t/{VLT_UUID}/left-pad-1.3.0.tgz"),
+    );
+    std::fs::write(root.join("vlt-lock.json"), vlt_lock_text(&hosted)).unwrap();
+    let store = root
+        .join("node_modules/.vlt")
+        .join(VLT_ID)
+        .join("node_modules/left-pad");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("index.js"), b"patched").unwrap();
+    std::fs::write(
+        root.join("node_modules/.vlt-lock.json"),
+        vlt_lock_text(&hosted),
+    )
+    .unwrap();
+    let mut record = hosted_record(VLT_UUID);
+    record.files.insert(
+        "package/index.js".to_string(),
+        PatchFileInfo {
+            before_hash: git_sha256(b"pristine"),
+            after_hash: git_sha256(b"patched"),
+        },
+    );
+    write_hosted_ledger(
+        root,
+        vec![("pkg:npm/left-pad@1.3.0", record)],
+        vec![FileEdit {
+            path: "vlt-lock.json".to_string(),
+            kind: "redirect_vlt_lock_node".to_string(),
+            action: "rewritten".to_string(),
+            key: Some("left-pad@1.3.0".to_string()),
+            original: Some(json!(registry)),
+            new: Some(json!(hosted)),
+        }],
+    );
+    (vlt_lock_text(&registry), store)
+}
+
+/// A dry-run rollback previews the vlt unwind but deletes nothing and
+/// says nothing about installed copies; the wet human run restores the
+/// registry pin, invalidates the patched store entry and prints the
+/// advisory as a warning line.
+#[test]
+fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (registry_lock, store) = write_vlt_hosted_fixture(root);
+    let hosted_lock = std::fs::read_to_string(root.join("vlt-lock.json")).unwrap();
+
+    let (code, stdout, stderr) = run(root, &["rollback", "--dry-run", "--yes", "--offline"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        !stderr.contains("redirect_vlt_reinstall_required"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("vlt-lock.json")).unwrap(),
+        hosted_lock
+    );
+    assert!(store.join("index.js").exists());
+
+    let (code, stdout, stderr) = run(root, &["rollback", "--yes", "--offline"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("vlt-lock.json")).unwrap(),
+        registry_lock
+    );
+    assert!(
+        stderr.contains(
+            "Warning (redirect_vlt_reinstall_required): restored registry pins for 1 packages; \
+             removed the patched installed copies"
+        ),
+        "{stderr}"
+    );
+    assert!(!store.exists());
+    assert!(!root.join("node_modules/.vlt-lock.json").exists());
 }

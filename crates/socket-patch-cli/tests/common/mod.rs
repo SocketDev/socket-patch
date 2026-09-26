@@ -217,6 +217,96 @@ pub fn cargo_run(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Outpu
     cmd.output().expect("failed to run cargo")
 }
 
+/// Preloaded into every harness vlt run (`--import`, so vlt's own
+/// children do not inherit it). vlt finishes work in detached, unref'd
+/// children after the command returns: the global-store explode and the
+/// cache unzip (`cache-unzip`, spawned on `beforeExit`), the deletion of
+/// `.VLT.DELETE.*` staging dirs (`rollback-remove`) and cache
+/// revalidation. The legs assert the tree vlt leaves once that work is
+/// done, so where vlt would exit (`beforeExit` with nothing left to run,
+/// or an explicit `process.exit`) the hook closes those children's stdin,
+/// as the exit would (0.0.0-1 never ends it), and exits only after they
+/// have. Children are spawned exactly as vlt asks. One still running after
+/// 120 s is no longer awaited.
+const VLT_SETTLE_JS: &str = r#"import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+const spawn = cp.spawn;
+const pending = new Set();
+let spawned = 0;
+let settled = -1;
+cp.spawn = function (file, args, opts) {
+  const child = spawn.apply(this, arguments);
+  const o = Array.isArray(args) ? opts : args;
+  if (!o || !o.detached || child.pid === undefined) return child;
+  spawned++;
+  pending.add(child);
+  const cap = setTimeout(() => pending.delete(child), 120000);
+  cap.unref();
+  child.once('exit', () => { clearTimeout(cap); pending.delete(child); });
+  return child;
+};
+syncBuiltinESMExports();
+const drain = (done) => {
+  settled = spawned;
+  for (const c of pending) {
+    try { if (c.stdin && !c.stdin.writableEnded) c.stdin.end(); } catch {}
+  }
+  const wait = () => {
+    if (pending.size) setTimeout(wait, 20);
+    else done();
+  };
+  wait();
+};
+process.on('beforeExit', () => {
+  if (settled !== spawned || pending.size) setImmediate(() => drain(() => {}));
+});
+const exit = process.exit;
+process.exit = function (code) {
+  if (!pending.size) return exit.call(process, code);
+  if (code !== undefined && code !== null) process.exitCode = code;
+  drain(() => exit.call(process, process.exitCode));
+};
+"#;
+
+/// [`VLT_SETTLE_JS`] as a `data:` URL for `node --import`.
+fn vlt_settle_import() -> String {
+    let mut url = String::from("data:text/javascript,");
+    for b in VLT_SETTLE_JS.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            url.push(char::from(b));
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
+}
+
+/// Run the vlt at `vlt_js` (`node --no-warnings <vlt.js> <args>`) in
+/// `cwd`: ambient vlt/npm/socket config scrubbed, caches sandboxed,
+/// telemetry off and the `C` locale (vlt's edge order follows it), then
+/// `extra_env`. Spawning `node` directly keeps Windows off the `vlt.cmd`
+/// shim `Command::new` cannot see. The run returns once vlt's background
+/// children have exited too ([`VLT_SETTLE_JS`]).
+pub fn vlt_run(cwd: &Path, vlt_js: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new("node");
+    cmd.arg("--no-warnings")
+        .arg("--import")
+        .arg(vlt_settle_import())
+        .arg(vlt_js)
+        .args(args)
+        .current_dir(cwd);
+    cache_env::scrub_ambient_vlt_env(&mut cmd);
+    cache_env::isolate(&mut cmd);
+    cmd.env("VLT_TELEMETRY", "0")
+        .env("NO_COLOR", "1")
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("failed to run node vlt.js")
+}
+
 fn run_toolchain(cwd: &Path, exe: &str, args: &[&str], extra_env: &[(&str, &str)]) {
     let mut cmd = Command::new(exe);
     cmd.args(args).current_dir(cwd);

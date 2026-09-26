@@ -63,6 +63,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
     // RepairArgs-specific
     "SOCKET_DOWNLOAD_ONLY",
 ];
@@ -546,4 +547,15 @@ fn gc_alias_parses_as_repair() {
         ),
         Err(e) => panic!("gc alias should parse: {e}"),
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn no_vlt_install_cleanup_is_accepted_silently_by_repair() {
+    assert!(!parse_repair(&[]).common.no_vlt_install_cleanup);
+    assert!(
+        parse_repair(&["--no-vlt-install-cleanup"])
+            .common
+            .no_vlt_install_cleanup
+    );
 }
