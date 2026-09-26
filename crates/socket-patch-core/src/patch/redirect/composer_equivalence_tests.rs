@@ -147,7 +147,11 @@ fn rewrite_composer_lock_oracle(
             });
             continue;
         };
-        let block = content[dist_start..=dist_end].to_string();
+        // The dist's own members only: a `mirrors` entry listed before the
+        // dist `url` would otherwise take the redirected url.
+        let current = &content[dist_start..=dist_end];
+        let block =
+            composer_source::strip_dist_mirrors(current).unwrap_or_else(|| current.to_string());
         // Already redirected (either slash spelling): only the source/mirrors
         // heal applies, so a re-run over a healed lock records no edit and
         // the ledger never grows.

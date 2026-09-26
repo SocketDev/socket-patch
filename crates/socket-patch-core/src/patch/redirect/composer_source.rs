@@ -32,7 +32,7 @@ use super::{FileEdit, RewriteWarning};
 /// One `"key": value` member of a JSON object, by byte offset. `key` is the
 /// raw text between the key's quotes; `value_end` is inclusive.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Member {
+pub(crate) struct Member {
     pub key: String,
     pub key_start: usize,
     pub value_start: usize,
@@ -115,7 +115,7 @@ fn container_end(bytes: &[u8], open: usize, limit: usize) -> Option<usize> {
 }
 
 /// Inclusive end of the JSON value starting at `start`.
-fn value_end_at(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+pub(crate) fn value_end_at(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
     match bytes[start] {
         b'"' => string_end(bytes, start, limit),
         b'{' | b'[' => container_end(bytes, start, limit),
@@ -170,7 +170,7 @@ pub(super) fn entry_object_start(text: &str, name_key_start: usize) -> Option<us
 /// The members of the object spanning `object_open` (`{`) to `object_end`
 /// (`}`), in document order. Scanning stops at the first token that is not a
 /// well-formed member.
-pub(super) fn top_level_members(text: &str, object_open: usize, object_end: usize) -> Vec<Member> {
+pub(crate) fn top_level_members(text: &str, object_open: usize, object_end: usize) -> Vec<Member> {
     let bytes = text.as_bytes();
     let object_end = object_end.min(bytes.len());
     let mut members = Vec::new();
@@ -283,10 +283,12 @@ pub(super) struct DistSpan {
 
 /// Splice the redirected dist (or, when `rewritten_dist` is `None` because
 /// the dist is already redirected, the current one) into the entry, dropping
-/// the entry's top-level `source` and the dist's `mirrors`. The recorded edit
-/// spans the dist block AND the removed `source` member, so the ledger's
-/// fragment revert restores both byte-for-byte. `None` — no edit, no ledger
-/// growth — when nothing changes (an idempotent re-run over a healed lock).
+/// the entry's top-level `source` and the dist's `mirrors` (warned about when
+/// the lock's dist had them, whether or not `rewritten_dist` still does).
+/// The recorded edit spans the dist block AND the removed `source` member,
+/// so the ledger's fragment revert restores both byte-for-byte. `None` — no
+/// edit, no ledger growth — when nothing changes (an idempotent re-run over
+/// a healed lock).
 pub(super) fn apply_dist_edit(
     content: &mut String,
     span: DistSpan,
@@ -300,11 +302,10 @@ pub(super) fn apply_dist_edit(
         dist_start,
         dist_end,
     } = span;
-    let mut dist = rewritten_dist
-        .map(str::to_string)
-        .unwrap_or_else(|| content[dist_start..=dist_end].to_string());
-    if let Some(stripped) = strip_dist_mirrors(&dist) {
-        dist = stripped;
+    let current = &content[dist_start..=dist_end];
+    let spliced = rewritten_dist.unwrap_or(current);
+    let dist = strip_dist_mirrors(spliced).unwrap_or_else(|| spliced.to_string());
+    if strip_dist_mirrors(current).is_some() {
         warnings.push(RewriteWarning {
             code: "redirect_composer_dist_mirrors_removed".into(),
             detail: format!(

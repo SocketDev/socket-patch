@@ -4732,7 +4732,7 @@ fn rewrite_uv_lock(
     }
 }
 
-mod composer_source;
+pub(crate) mod composer_source;
 
 // ── composer.lock ────────────────────────────────────────────────────────────
 /// Whether `text` points at `artifact_url` in any spelling a rewritten file may
@@ -4881,23 +4881,6 @@ static COMPOSER_DIST_SHASUM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"("shasum": ")[^"]*(")"#).expect("static dist shasum regex is valid")
 });
 
-/// Byte offset of the entry's `"source": {` key when that object is the
-/// dist block's IMMEDIATE predecessor (only `,` + whitespace between them) —
-/// the layout composer itself always writes (`source` then `dist`).
-/// `None` when the entry has no source object there.
-#[allow(dead_code)]
-fn composer_source_before_dist(
-    content: &str,
-    entry_start: usize,
-    dist_start: usize,
-) -> Option<usize> {
-    const SOURCE_KEY: &str = "\"source\": {";
-    let source_start = entry_start + content[entry_start..dist_start].rfind(SOURCE_KEY)?;
-    let source_end = json_object_end_from(content, source_start + SOURCE_KEY.len())?;
-    (source_end < dist_start && content[source_end + 1..dist_start].trim() == ",")
-        .then_some(source_start)
-}
-
 fn rewrite_composer_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -4982,7 +4965,13 @@ fn rewrite_composer_lock(
             });
             continue;
         };
-        let block = content[dist_start..=dist_end].to_string();
+        // The dist's own members only: a `mirrors` entry listed before the
+        // dist `url` would otherwise take the redirected url and then be
+        // dropped with the mirrors, leaving the upstream url pinned to the
+        // patched sha1.
+        let current = &content[dist_start..=dist_end];
+        let block =
+            composer_source::strip_dist_mirrors(current).unwrap_or_else(|| current.to_string());
         // Already redirected (either slash spelling): only the source/mirrors
         // heal applies, so a re-run over a healed lock records no edit and
         // the ledger never grows.
