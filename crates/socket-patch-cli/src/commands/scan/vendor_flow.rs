@@ -31,7 +31,9 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
+use crate::commands::fetch_stage::{
+    drop_unstageable, stage_vendor_sources_in_memory, MemStageOutcome,
+};
 use crate::commands::get::{download_patch_records_with, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
@@ -275,6 +277,11 @@ async fn stage_and_vendor(
         }
     };
     let sources = staged.as_patch_sources();
+    // A record whose content this run could not obtain is an unsatisfiable
+    // PACKAGE, reported per-package and left out of the engine run — the
+    // rest of the selection still vendors (the stager reserves its
+    // whole-run `no_local_source` bail for "nothing is stageable").
+    let (records, staging_errors) = drop_unstageable(env, &manifest.patches, staged.unavailable());
     // Honor `--vendor-source` (and `--vendor-url` / `--patch-server-url`)
     // exactly as the `vendor` command does: the SAME service-config
     // assembler, over the run's one client, so `scan --mode vendored` and a
@@ -282,15 +289,9 @@ async fn stage_and_vendor(
     // service-download under `auto`) instead of scan silently building
     // locally.
     let service = common.vendor_service_config(Some(client), use_public_proxy);
-    Ok(boxed_vendor_records(
-        common,
-        &manifest.patches,
-        &sources,
-        Some(&service),
-        ledger,
-        env,
-    )
-    .await)
+    let engine_errors =
+        boxed_vendor_records(common, &records, &sources, Some(&service), ledger, env).await;
+    Ok(staging_errors || engine_errors)
 }
 
 /// The ledger key addressable as `purl`: the exact key, else the entry

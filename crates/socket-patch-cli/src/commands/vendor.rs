@@ -40,7 +40,9 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
-use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
+use crate::commands::fetch_stage::{
+    drop_unstageable, stage_vendor_sources_in_memory, MemStageOutcome,
+};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::rollback::VendorRevertStep;
 use crate::commands::vex::{
@@ -947,13 +949,19 @@ async fn run_vendor(
         }
     };
     let sources = staged.as_patch_sources();
+    // A patch whose content this run could not obtain is an unsatisfiable
+    // PACKAGE, reported per-package and left out of the engine run — the
+    // rest of the manifest still vendors (the stager reserves its
+    // whole-run `no_local_source` bail for "nothing is stageable").
+    let (records, staging_errors) = drop_unstageable(env, &manifest.patches, staged.unavailable());
+    has_errors |= staging_errors;
 
     if manifest.patches.is_empty() && !common.json && !common.silent {
         println!("The manifest has no patches; nothing to vendor.");
     }
     has_errors |= vendor_records(
         common,
-        &manifest.patches,
+        &records,
         &sources,
         false,
         args.force,
@@ -1357,6 +1365,62 @@ pub(crate) async fn vendor_records(
                     inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
                 }
                 let inv = inventory.as_deref().expect("filled just above");
+                // A NOT-INSTALLED gem can only be vendored through the patch
+                // service. The bundler path source the gem backend wires
+                // needs the eval-able stub gemspec rubygems writes into
+                // `<gem home>/specifications/` at INSTALL time; a fetched
+                // `.gem` carries its gemspec only as YAML in `metadata.gz`,
+                // which is exactly why the service serves a converted
+                // `gem-stub-gemspec` second artifact. With the service off
+                // (`--vendor-source build`, or no config at all) the fetched
+                // copy is unusable, so the backend refused `gem_spec_missing`
+                // — AFTER paying for the download, on every run. Refuse here
+                // instead, with the same code and a detail that names the
+                // real remedy. The backend keeps its own refusal as the
+                // backstop for every other route into it.
+                //
+                // Scoped to the purls a DOWNLOAD would actually happen for,
+                // since a wasted download is the whole point — mirroring
+                // `fetch_pristine_package`'s own `fetchable` filter:
+                //
+                //  * a gem the lock cannot VERIFY (no `CHECKSUMS` section —
+                //    every bundler < 2.6 lock) is never fetched at all
+                //    (`registry_fetch::fetch_and_stage` refuses a
+                //    `LockIntegrity::None` entry before any network I/O), so
+                //    it keeps its documented `vendor_fetch_unverifiable`
+                //    warning + calm `package_not_installed` skip — all the
+                //    more so because the remedy below cannot help it: the
+                //    purl never reaches the gem backend in ANY mode.
+                //  * a gem the ledger already holds is the already-vendored
+                //    fresh-clone case the ladder exists for: its committed
+                //    copy is re-confirmed by the backend's idempotent hot
+                //    path, which needs no stub gemspec of its own, and the
+                //    run is green. Never refuse it.
+                //  * a gem that resolves from nowhere has nothing to say
+                //    about gemspecs and keeps the calm skip below.
+                if purl.starts_with("pkg:gem/")
+                    && !service.is_some_and(VendorServiceConfig::service_enabled)
+                    && ledger_entry.is_none()
+                    && lock_inventory::lookup(inv, purl)
+                        .is_some_and(|e| e.integrity != lock_inventory::LockIntegrity::None)
+                {
+                    fetch_failed.insert(purl.clone());
+                    let detail = format!(
+                        "{} is not installed, and a local build cannot vendor a fetched \
+                         gem: the bundler path source needs the stub gemspec rubygems \
+                         writes into specifications/ when the gem is installed, which a \
+                         downloaded .gem does not carry. Install the gem (e.g. \
+                         `bundle install`) and re-run, or use --vendor-source=auto to \
+                         vendor it from the patch service.",
+                        normalize_purl(purl)
+                    );
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, purl.clone())
+                            .with_error("gem_spec_missing", detail.clone()),
+                    );
+                    report_vendor_failure(common, purl, &detail);
+                    continue;
+                }
                 match fetch_pristine_package(&common.cwd, inv, &client, purl, ledger_entry).await {
                     PristineFetch::Fetched(fetched) => {
                         record_warning(

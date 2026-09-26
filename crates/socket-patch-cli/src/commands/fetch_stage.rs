@@ -7,6 +7,7 @@
 //! cache is `repair`'s job, keeping these commands read-only against
 //! `.socket/`).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -15,13 +16,14 @@ use socket_patch_core::api::blob_fetcher::{
     DownloadMode, FetchMissingBlobsResult,
 };
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, PatchSources};
 use tempfile::TempDir;
 
 use super::get::base64_decode;
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::LedgerLoad;
+use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
 use crate::ui::{plural, StatusLine};
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
@@ -439,6 +441,13 @@ pub(crate) struct MemStagedSources {
     diffs: PathBuf,
     packages: PathBuf,
     mem: HashMap<String, Vec<u8>>,
+    /// The purls this staging could NOT obtain patch content for, each with
+    /// the reason, while at least one other patch staged fine. Each is an
+    /// unsatisfiable package the caller reports per-package (and leaves out
+    /// of the engine run) — see [`stage_vendor_sources_in_memory`]. Sorted
+    /// by purl, so the per-package reports come out in the same order every
+    /// run.
+    unavailable: Vec<(String, String)>,
 }
 
 impl MemStagedSources {
@@ -452,12 +461,29 @@ impl MemStagedSources {
             mem_blobs: Some(&self.mem),
         }
     }
+
+    /// See [`MemStagedSources::unavailable`].
+    pub(crate) fn unavailable(&self) -> &[(String, String)] {
+        &self.unavailable
+    }
 }
 
 /// The in-memory staging outcome (mirror of [`StageOutcome`]).
 pub(crate) enum MemStageOutcome {
     Ready(MemStagedSources),
     Unavailable,
+}
+
+/// Does vendoring this file need the patch's after-BLOB?
+///
+/// No, when the patch does not change it (`beforeHash == afterHash`): the
+/// pristine copy already carries the patched bytes, and the apply pipeline
+/// answers `AlreadyPatched` for it without writing anything. The patch view
+/// says the same thing by serving such a file with hashes and no
+/// `blobContent`, so treating it as a failed fetch made any patch with a
+/// zero-delta file permanently unvendorable.
+fn needs_blob(file: &PatchFileInfo) -> bool {
+    file.before_hash != file.after_hash
 }
 
 /// Stage patch sources for a VENDOR run without writing anything:
@@ -471,6 +497,16 @@ pub(crate) enum MemStageOutcome {
 /// disk stager there is no hard-failure mode (no download-mode parse, no
 /// tempdir), so this returns the outcome directly — every failure is the
 /// soft `Unavailable`.
+///
+/// A patch whose content the VIEW cannot supply (a 404, a transport error,
+/// or a file the server serves with no `blobContent` — which is how it
+/// serves a zero-delta file, `beforeHash == afterHash`) is an unsatisfiable
+/// PACKAGE, not a broken run: its purl comes back in
+/// [`MemStagedSources::unavailable`] for the caller to report per-package,
+/// and the patches that did stage still run. `Unavailable` is reserved for
+/// the case it was written for — NOTHING in the manifest can be staged, so
+/// there are no per-package events to report and the caller's pre-event
+/// `no_local_source` error is the whole story.
 ///
 /// `ledger` is the caller's single `load_state` outcome (the harvest reads
 /// the committed artifacts it names; an unreadable ledger harvests
@@ -498,6 +534,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     let missing_blobs = get_missing_blobs(manifest, &blobs).await;
     let missing_package_archives = get_missing_archives(manifest, &packages).await;
     let mut mem = seed;
+    let mut unavailable: Vec<(String, String)> = Vec::new();
 
     // A diff archive alone is NOT a sufficient source here, unlike the disk
     // stager: vendoring runs the auto-force policy, where a beforeHash
@@ -506,12 +543,22 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     // produce. On-disk diffs still serve Strategy 2 for clean files; the
     // after-blob content must additionally exist (disk, seed/harvest, or
     // fetch).
+    //
+    // …for the files the patch CHANGES. A ZERO-DELTA file
+    // (`beforeHash == afterHash`) is already at its patched content in the
+    // pristine copy — `verify_file_patch` answers `AlreadyPatched` as soon
+    // as the on-disk hash equals `afterHash` — so it needs no blob, which
+    // is exactly why the view serves it with hashes and no `blobContent`.
+    // Demanding it made such a patch permanently unvendorable (JS-7:
+    // `pkg:npm/tar-fs@2.1.1`, seven zero-delta fixture files). This
+    // predicate is the AUTHORITY the fetch loop below agrees with, so the
+    // two can never disagree about which files a fetch must bring back.
     let covered = |record: &PatchRecord, mem: &HashMap<String, Vec<u8>>| {
-        record
-            .files
-            .values()
-            .all(|f| !missing_blobs.contains(&f.after_hash) || mem.contains_key(&f.after_hash))
-            || !missing_package_archives.contains(&record.uuid)
+        record.files.values().all(|f| {
+            !needs_blob(f)
+                || !missing_blobs.contains(&f.after_hash)
+                || mem.contains_key(&f.after_hash)
+        }) || !missing_package_archives.contains(&record.uuid)
     };
     let mut to_fetch: Vec<(&str, &str)> = manifest
         .patches
@@ -564,7 +611,12 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                 &built
             }
         };
-        let mut failed: Vec<&str> = Vec::new();
+        // Each dropped purl with WHY it was dropped. The reason is the only
+        // machine-readable explanation the caller can put in that package's
+        // `failed` event, and the human `[error]` lines below are printed
+        // exclusively under `!--json` — so without it a `--json` consumer
+        // learned nothing about which file was contentless.
+        let mut failed: Vec<(&str, String)> = Vec::new();
         for (i, (purl, uuid)) in to_fetch.iter().enumerate() {
             if to_fetch.len() > 1 {
                 status.set(format!(
@@ -574,26 +626,44 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                     to_fetch.len()
                 ));
             }
+            // The record is what `covered` above judged, so it is also what
+            // decides which of this view's files actually need bytes.
+            let record = manifest.patches.get(*purl);
             match client.fetch_patch(uuid).await {
                 Ok(Some(patch)) => {
-                    let mut complete = true;
+                    // Named so the per-file report is the same on every run:
+                    // `patch.files` is a `HashMap`, so "the first file with
+                    // no content" is otherwise bucket order.
+                    let mut contentless: Vec<&str> = Vec::new();
+                    let mut malformed: Option<String> = None;
                     for (file, info) in &patch.files {
-                        let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
-                            // An error, not progress chatter: prints even
-                            // under --silent (same rule as
-                            // report_offline_missing above).
-                            if !common.json {
-                                status.println(format!(
-                                    "  [error] {purl}: no blob content served for {file}"
-                                ));
+                        let Some(b64) = &info.blob_content else {
+                            // A zero-delta file is served without content
+                            // because it needs none (see `covered` above).
+                            // Anything else the patch changes is genuinely
+                            // unsatisfiable — collect them all rather than
+                            // abandoning the view's remaining files in
+                            // `HashMap` order.
+                            if record
+                                .and_then(|r| r.files.get(file))
+                                .is_some_and(|f| !needs_blob(f))
+                            {
+                                continue;
                             }
-                            complete = false;
+                            contentless.push(file);
+                            continue;
+                        };
+                        let Some(hash) = &info.after_hash else {
+                            malformed =
+                                Some(format!("the patch view served no afterHash for {file}"));
                             break;
                         };
                         // Same key guard as the disk writer: the hash names the
                         // lookup key the apply pipeline gates writes on.
                         if !is_valid_blob_hash(hash) {
-                            complete = false;
+                            malformed = Some(format!(
+                                "the patch view served an invalid afterHash for {file}"
+                            ));
                             break;
                         }
                         match base64_decode(b64) {
@@ -601,16 +671,29 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                                 mem.insert(hash.clone(), bytes);
                             }
                             Err(_) => {
-                                complete = false;
+                                malformed = Some(format!(
+                                    "the patch view served undecodable blob content for {file}"
+                                ));
                                 break;
                             }
                         }
                     }
-                    if !complete {
-                        failed.push(purl);
+                    contentless.sort_unstable();
+                    // An error, not progress chatter: prints even under
+                    // --silent (same rule as report_offline_missing above).
+                    if !common.json {
+                        for file in &contentless {
+                            status.println(format!(
+                                "  [error] {purl}: no blob content served for {file}"
+                            ));
+                        }
+                    }
+                    if let Some(reason) = malformed.or_else(|| contentless_reason(&contentless)) {
+                        failed.push((purl, reason));
                     }
                 }
-                _ => failed.push(purl),
+                Ok(None) => failed.push((purl, format!("no patch view is served for {uuid}"))),
+                Err(e) => failed.push((purl, format!("the patch view could not be fetched: {e}"))),
             }
         }
         status.finish();
@@ -619,17 +702,31 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             // the envelope (printed exclusively under --json), so muting
             // this under --silent meant exit 1 with zero output — the
             // CLI_CONTRACT violation ("errors only", NEVER nothing) fixed
-            // for the disk stager's arms above.
+            // for the disk stager's arms above. It stays the ONE human
+            // channel for these purls in both arms below: the per-package
+            // arm only records events.
             if !common.json {
+                let purls: Vec<&str> = failed.iter().map(|(purl, _)| *purl).collect();
                 eprintln!(
                     "Error: Could not fetch patch content for {}:",
                     plural(failed.len(), "patch", "patches")
                 );
-                for line in format_purl_list(&failed, 5) {
+                for line in format_purl_list(&purls, 5) {
                     eprintln!("{line}");
                 }
             }
-            return MemStageOutcome::Unavailable;
+            // Nothing in the manifest is usable ⇒ the pre-event bail (no
+            // events to report). Otherwise these purls are unsatisfiable
+            // packages the caller reports one by one, and the rest of the
+            // run continues.
+            if failed.len() == manifest.patches.len() {
+                return MemStageOutcome::Unavailable;
+            }
+            unavailable = failed
+                .into_iter()
+                .map(|(purl, reason)| (purl.to_string(), reason))
+                .collect();
+            unavailable.sort();
         }
     }
 
@@ -638,12 +735,71 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         diffs,
         packages,
         mem,
+        unavailable,
+    })
+}
+
+/// Record the per-package `failed` event for every purl
+/// [`stage_vendor_sources_in_memory`] could not obtain patch content for,
+/// and hand back the records the run can still vendor. `true` when at least
+/// one purl was dropped (the run has errors). Borrows `records` untouched
+/// on the overwhelmingly common empty path.
+pub(crate) fn drop_unstageable<'a>(
+    env: &mut Envelope,
+    records: &'a HashMap<String, PatchRecord>,
+    unavailable: &[(String, String)],
+) -> (Cow<'a, HashMap<String, PatchRecord>>, bool) {
+    if unavailable.is_empty() {
+        return (Cow::Borrowed(records), false);
+    }
+    for (purl, reason) in unavailable {
+        env.record(
+            PatchEvent::new(PatchAction::Failed, purl.clone())
+                .with_error("no_local_source", reason.clone()),
+        );
+    }
+    let mut kept = records.clone();
+    kept.retain(|purl, _| !unavailable.iter().any(|(dropped, _)| dropped == purl));
+    (Cow::Owned(kept), true)
+}
+
+/// The reason string for a view that came back missing the blob content of
+/// `contentless` (already sorted). `None` when nothing was missing.
+fn contentless_reason(contentless: &[&str]) -> Option<String> {
+    let (first, rest) = contentless.split_first()?;
+    Some(match rest.len() {
+        0 => format!("the patch view served no blob content for {first}"),
+        n => format!(
+            "the patch view served no blob content for {first} (and {n} more file{})",
+            if n == 1 { "" } else { "s" }
+        ),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-package `no_local_source` detail is the ONE machine-readable
+    /// explanation a `--json` consumer gets (every human channel in the
+    /// stager is gated on `!--json`), so its wording is pinned here —
+    /// including the count, which `plural` already carries.
+    #[test]
+    fn contentless_reason_names_the_file_and_counts_the_rest() {
+        assert_eq!(contentless_reason(&[]), None);
+        assert_eq!(
+            contentless_reason(&["package/index.js"]).as_deref(),
+            Some("the patch view served no blob content for package/index.js")
+        );
+        assert_eq!(
+            contentless_reason(&["a.js", "b.js"]).as_deref(),
+            Some("the patch view served no blob content for a.js (and 1 more file)")
+        );
+        assert_eq!(
+            contentless_reason(&["a.js", "b.js", "c.js"]).as_deref(),
+            Some("the patch view served no blob content for a.js (and 2 more files)")
+        );
+    }
 
     #[test]
     fn progress_lines_name_no_internal_tags() {

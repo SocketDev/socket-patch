@@ -1295,7 +1295,10 @@ fn crawler_options_for(common: &GlobalArgs) -> CrawlerOptions {
 /// those from memory instead of fetching every view a second time. Only
 /// successful fetches are cached: a variant whose view errored or 404'd is
 /// re-fetched by the loop so the failure surfaces per patch as before.
-/// With `--all-releases` set this is a verbatim pass-through.
+/// With `--all-releases` set no variant is narrowed away and no view is
+/// fetched — the whole selection comes back, in the same purl order
+/// ([`sort_by_purl`]) as the narrowed arm, so both arms of this function
+/// share one output contract.
 async fn filter_to_installed_releases(
     selected: &[PatchSearchResult],
     all_releases: bool,
@@ -1309,7 +1312,9 @@ async fn filter_to_installed_releases(
 ) {
     let mut views: HashMap<String, PatchResponse> = HashMap::new();
     if all_releases {
-        return (selected.to_vec(), Vec::new(), views);
+        let mut kept = selected.to_vec();
+        sort_by_purl(&mut kept);
+        return (kept, Vec::new(), views);
     }
 
     // Group release-variant ecosystem selections (PyPI / RubyGems / Maven)
@@ -1341,8 +1346,18 @@ async fn filter_to_installed_releases(
             multi.push((base, variants));
         }
     }
+    // `variant_groups` is a HashMap, so both drains above are in bucket
+    // order — which is this function's OUTPUT order, and therefore the
+    // order the download loop emits `download.patches` / `apply.patches`
+    // in. Two identical runs produced different JSON. Sort the multi-
+    // variant bases so their warnings and kept variants are stable, and
+    // sort the whole kept list by purl before returning (below and at the
+    // early return): every sibling collection in the same envelope —
+    // scan's `packages`, the agent flow's `skip_records` — is purl-sorted.
+    multi.sort_by(|a, b| a.0.cmp(&b.0));
 
     if multi.is_empty() {
+        sort_by_purl(&mut kept);
         return (kept, warnings, views);
     }
 
@@ -1425,7 +1440,16 @@ async fn filter_to_installed_releases(
     let kept_uuids: std::collections::HashSet<&str> =
         kept.iter().map(|s| s.uuid.as_str()).collect();
     views.retain(|uuid, _| kept_uuids.contains(uuid.as_str()));
+    sort_by_purl(&mut kept);
     (kept, warnings, views)
+}
+
+/// Order a patch selection the way every other collection in the JSON
+/// envelope is ordered: by purl, uuid breaking a tie (a release-variant
+/// base can keep several qualified purls, and `--all-releases` can keep
+/// several patches for one purl).
+fn sort_by_purl(patches: &mut [PatchSearchResult]) {
+    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| a.uuid.cmp(&b.uuid)));
 }
 
 /// Does this purl carry an exact version (`pkg:type/name@version`)? An
@@ -6843,5 +6867,127 @@ mod tests {
             "drop must restore the pre-scrub value"
         );
         std::env::remove_var("COVGAP_GET_GUARD_PROBE");
+    }
+
+    /// Release-variant narrowing must not randomize the selection order.
+    ///
+    /// `filter_to_installed_releases` buckets every release-variant purl
+    /// (PyPI / RubyGems / Maven) into a `HashMap` keyed by base purl and
+    /// then drains it, so the singleton bases — the common case — came back
+    /// in `HashMap` iteration order. That order is the download loop's
+    /// order, which is the order `download.patches` / `apply.patches` are
+    /// emitted in, so two identical runs produced different JSON. Every
+    /// sibling collection in the same envelope is purl-sorted
+    /// (`scan`'s `packages`, the agent flow's `skip_records`), so this one
+    /// must be too.
+    #[tokio::test]
+    async fn release_narrowing_keeps_a_stable_purl_order() {
+        let names = [
+            "urllib3",
+            "requests",
+            "idna",
+            "certifi",
+            "charset-normalizer",
+            "jinja2",
+            "markupsafe",
+            "werkzeug",
+            "click",
+            "itsdangerous",
+            "blinker",
+            "flask",
+        ];
+        let selected: Vec<PatchSearchResult> = {
+            let mut v: Vec<PatchSearchResult> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    mk_patch(
+                        &format!("uuid-{i}"),
+                        &format!("pkg:pypi/{n}@1.0.0?artifact_id=wheel"),
+                        "free",
+                        "2026-01-01T00:00:00Z",
+                    )
+                })
+                .collect();
+            v.sort_by(|a, b| a.purl.cmp(&b.purl));
+            v
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let options = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        // No mock server is needed: every base has exactly one variant, so
+        // the narrowing returns before it queries the crawler or the API.
+        let client = test_client("http://127.0.0.1:1").await;
+        let (kept, _warnings, _views) =
+            filter_to_installed_releases(&selected, false, &options, true, &client).await;
+        let got: Vec<&str> = kept.iter().map(|p| p.purl.as_str()).collect();
+        let want: Vec<&str> = selected.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(
+            got, want,
+            "the narrowing must preserve the caller's purl order, not the \
+             HashMap's bucket order"
+        );
+    }
+
+    /// The vendored/agent envelope's `download.patches` array must come out
+    /// in the same order on every run. It is built by walking the narrowed
+    /// selection, so the `HashMap`-ordered narrowing above leaked straight
+    /// into the JSON: two identical runs of the same project emitted the
+    /// same records in different orders. No view is mounted — wiremock
+    /// answers 404, so every purl lands on the fetch-miss arm and records
+    /// one `patches[]` entry, which is all this pins.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patches_json_is_purl_ordered() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let names = [
+            "urllib3",
+            "requests",
+            "idna",
+            "certifi",
+            "charset-normalizer",
+            "jinja2",
+            "markupsafe",
+            "werkzeug",
+            "click",
+            "itsdangerous",
+            "blinker",
+            "flask",
+        ];
+        let mut selected: Vec<PatchSearchResult> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                mk_patch(
+                    &format!("{:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa", i),
+                    &format!("pkg:pypi/{n}@1.0.0?artifact_id=wheel"),
+                    "free",
+                    "2026-01-01T00:00:00Z",
+                )
+            })
+            .collect();
+        selected.sort_by(|a, b| a.purl.cmp(&b.purl));
+
+        let (_code, json, _records) =
+            download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
+
+        let got: Vec<&str> = json["patches"]
+            .as_array()
+            .expect("patches[]")
+            .iter()
+            .map(|p| p["purl"].as_str().expect("purl"))
+            .collect();
+        let want: Vec<&str> = selected.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(
+            got, want,
+            "download.patches must be emitted in the selection's purl order; json={json}"
+        );
     }
 }

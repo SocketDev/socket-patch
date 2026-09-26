@@ -82,7 +82,7 @@ mod pypi_lock;
 pub mod pypi_pdm;
 pub mod pypi_pipenv;
 pub mod pypi_poetry;
-mod pypi_requirements;
+pub(crate) mod pypi_requirements;
 mod pypi_uv;
 mod pypi_wheel;
 pub mod registry_fetch;
