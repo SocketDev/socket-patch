@@ -765,7 +765,8 @@ pub async fn run(args: ApplyArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
 
     // No manifest → nothing to apply: a clean exit-0 no-op (load-bearing
-    // for the install hooks, which run `apply --silent` on every install).
+    // for CI steps and legacy install hooks that run `apply --silent` on
+    // every install).
     // Nothing below this gate is touched — no API client (its config read,
     // stderr advisory and org-slug round-trip), no lock, no `.socket/`.
     if tokio::fs::metadata(&manifest_path).await.is_err() {

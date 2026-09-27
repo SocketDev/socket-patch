@@ -30,10 +30,9 @@ RUN for i in 1 2 3; do \
     done \
  && ln -s /root/.bun/bin/bun /usr/local/bin/bun
 
-# Enable pnpm and yarn via corepack (bundled with Node 22). The
-# setup-matrix suite (tests/setup_matrix/) drives the npm-family
-# package managers — npm, yarn, pnpm, bun and (installed below) vlt —
-# through the `socket-patch setup` install-hook flow. `corepack prepare … --activate` pins and
+# Enable pnpm and yarn via corepack (bundled with Node 22) so the image
+# carries every npm-family package manager — npm, yarn, pnpm, bun and
+# (installed below) vlt. `corepack prepare … --activate` pins and
 # activates a known version so the binaries resolve without a network
 # round-trip at test time. Additive: the existing docker_e2e_npm tests
 # are unaffected.
@@ -49,8 +48,8 @@ RUN corepack enable \
 # the activated versions.
 ENV COREPACK_DEFAULT_TO_LATEST=0
 
-# vlt, for the setup-matrix `pm: vlt` cases (non-gating extras: the
-# gating vlt setup assertions live in the real-vlt capstones). Retried like
+# vlt (a non-gating extra: the gating vlt assertions live in the real-vlt
+# capstones). Retried like
 # bun: one registry blip must not fail the image build. Its telemetry is
 # off for every test run.
 RUN for i in 1 2 3; do \

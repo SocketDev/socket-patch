@@ -17,8 +17,8 @@ restoring every byte.  Hosted and vendored cases also run manifest-less VEX
 over the installed fresh clone: `.socket/manifest.json` deleted (online, and
 offline from the ledger), the ledgers deleted too (lockfile discovery + the
 public patch API), `--offline` without ledgers (`record_unavailable`) and the
-lock reverted with the ledgers kept (never attested, `--no-verify` too).  Extra modes: `agent-oot` (Poetry's default out-of-tree
-venv) and `setup`.  Shapes: `direct` (native lock), `populated` (legacy locks
+lock reverted with the ledgers kept (never attested, `--no-verify` too).  Extra mode: `agent-oot` (Poetry's default out-of-tree
+venv).  Shapes: `direct` (native lock), `populated` (legacy locks
 with real hashes filled in, as 2020-era locks have), `crlf`, `pep621` (2.x).
 
 Needs network (PyPI + patch.socket.dev), uv, and no Socket token.
@@ -55,7 +55,7 @@ VERSIONS = [
     "2.3.4",
     "2.4.3",
 ]
-MODES = ["hosted", "vendored", "agent", "agent-oot", "setup"]
+MODES = ["hosted", "vendored", "agent", "agent-oot"]
 SHAPES = ["direct", "populated", "crlf", "pep621"]
 
 PROJECT = """[tool.poetry]
@@ -443,31 +443,6 @@ def main():
         venv = project / ".venv"
         python = venv / "bin/python"
 
-        # ------------------------------------------------------------ setup
-        if mode == "setup":
-            senv = dict(env)
-            senv["PATH"] = str(tool / "bin") + os.pathsep + senv.get("PATH", "")
-            # `setup` shells out to that Poetry; give it the case's isolated
-            # HOME too (Poetry <= 1.1's shared HTTP-cache lock, see poetry_env).
-            senv["HOME"] = poetry_env(project)["HOME"]
-            r = Run(cli_cmd(project, "setup"), project, senv, case / "setup.log")
-            info["setupExit"] = r.rc
-            try:
-                info["setupEnvelope"] = r.json()
-            except Exception:
-                info["setupOutput"] = (r.out + r.err)[-1500:]
-            info["pyprojectChanged"] = (project / "pyproject.toml").read_bytes() != pristine_pyproject
-            info["pyprojectDiff"] = (project / "pyproject.toml").read_text()
-            info["lockChanged"] = (project / "poetry.lock").read_bytes() != pristine_lock
-            # Can Poetry itself resolve the committed hook dependency?
-            rl = Run([poetry, "lock", "-n"] + (["--no-update"] if (1, 1) <= v < (2, 0) else []), project, poetry_env(project), case / "setup-relock.log")
-            info["poetryLockAfterSetup"] = {"exit": rl.rc, "tail": (rl.out + rl.err)[-600:]}
-            chk = Run(cli_cmd(project, "setup", "--check"), project, senv, case / "setup-check.log")
-            info["setupCheckExit"] = chk.rc
-            row["passed"] = r.rc == 0 and info["pyprojectChanged"] and rl.rc == 0
-            row["expected"] = "informational: setup edits pyproject; poetry must resolve socket-patch[hook]"
-            return row
-
         # -------------------------------------------------------- agent-oot
         if mode == "agent-oot":
             penv = dict(env)
@@ -537,8 +512,10 @@ def main():
             res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-4.log")
             check("rollbackRestoresUpstream", rb.ok() and bool(before) and all(res.get(n) == h for n, h in before.items()), {"exit": rb.rc, "oracle": res})
             check("rollbackClearsManifest", not (project / ".socket/manifest.json").exists() or json.loads((project / ".socket/manifest.json").read_text()).get("patches") == {})
-            row["passed"] = all(checks[k] for k in checks if k != "bareScanSeesPoetryVenv")
-            row["expected"] = "bareScanSeesPoetryVenv is informational (known crawler gap); the rest must pass"
+            # The crawler finds Poetry's out-of-tree venv (virtualenvs.path), so
+            # the bare scan seeing it is required like every other check.
+            row["passed"] = all(checks.values())
+            row["expected"] = "every check must pass, bareScanSeesPoetryVenv included"
             return row
 
         # ------------------------------------------------- hosted / vendored / agent
@@ -735,13 +712,11 @@ def main():
             return False
         if shape == "pep621" and v < (2, 0):
             return False
-        if shape in ("crlf", "pep621") and mode in ("agent", "agent-oot", "setup"):
+        if shape in ("crlf", "pep621") and mode in ("agent", "agent-oot"):
             return False
-        if shape == "populated" and mode in ("agent", "agent-oot", "setup"):
+        if shape == "populated" and mode in ("agent", "agent-oot"):
             return False
         if mode == "agent-oot" and version.startswith("0."):
-            return False
-        if mode == "setup" and version not in ("1.1.15", "1.8.5", "2.4.3"):
             return False
         return True
 
@@ -856,8 +831,6 @@ def render_table(summary):
         if "manifestlessVex" in info:
             ml = [k for k in ("vexManifestDeleted", "vexLedgerOffline", "vexLedgersDeleted", "vexOfflineRecordUnavailable", "vexRevertedUnwired") if r["checks"].get(k)]
             notes.append(f"manifest-less vex {len(ml)}/5")
-        if "poetryLockAfterSetup" in info:
-            notes.append(f"poetry lock after setup exit {info['poetryLockAfterSetup']['exit']}")
         lines.append(f"| {r['poetry']} | {r['shape']} | {r['mode']} | {'PASS' if r['passed'] else 'FAIL'} | {failed} | {'; '.join(notes)} |")
     for e in summary.get("errors", []):
         lines.append(f"| {e.get('poetry')} | {e.get('shape')} | {e.get('mode')} | ERROR | {e['error'][-160:].replace(chr(10), ' ')} | |")

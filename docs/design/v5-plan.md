@@ -120,6 +120,18 @@ patch-UI review.
   `socket-patch-hook` wheel publishing (or mark them deprecated/unpublished;
   confirm with owner before deleting release workflows). Keep `apply`.
   Docs: agent mode = `scan --mode agent` + `socket-patch apply` in CI.
+- **Status (branch `v5/remove-setup-and-ui`):** subcommand, core `setup/` +
+  `package_json/`, setup tests, `setup-e2e` feature, setup-matrix CI job,
+  `tests/setup_matrix/`, `scripts/setup-matrix.sh` and the setup-only
+  `Dockerfile.gem-b1`/`gem-b4` are deleted. vex's "Property 7" filter went
+  with it (agent patches attest on verification; `setup.manual` is parsed
+  but ignored). The `socket-patch-hook` wheel and `socket-patch-bundler` gem
+  are out of `publish-pypi.yml` / `publish-rubygems.yml`,
+  `build-pypi-wheels.py` and `version-sync.sh`, and the `socket-patch[hook]`
+  extra is dropped. **Owner decision pending:** `pypi/socket-patch-hook/`
+  and `gem/socket-patch-bundler/` sources are kept (frozen, README marked
+  deprecated) — delete them, and optionally yank/deprecate the published
+  packages and remove their PyPI/RubyGems trusted publishers, once confirmed.
 
 ### WS8 — Patch UI streamlining  *(branch `v5/ui`)*
 - `-h` shows ~8 options (hide_short_help for the rest); hide deprecated

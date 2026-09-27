@@ -13,7 +13,7 @@ use serial_test::serial;
 use socket_patch_cli::commands::scan::{run, ScanArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -472,12 +472,7 @@ async fn redirect_vex_verifies_manifest_patches_normally() {
             "GHSA-ctrl-bad",
         ),
     );
-    // npm declared `manual` so property-7 admits the controls — what drops
-    // GHSA-ctrl-bad must be VERIFICATION, not the ecosystem filter.
-    manifest.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: vec!["npm".to_string()],
-    });
+    // What drops GHSA-ctrl-bad must be VERIFICATION.
     let socket_dir = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket_dir).unwrap();
     std::fs::write(

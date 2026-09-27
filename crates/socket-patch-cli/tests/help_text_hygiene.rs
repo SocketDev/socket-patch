@@ -151,8 +151,10 @@ fn root_command_list_uses_the_verb_form() {
         "{text}"
     );
     assert!(!text.contains("Rollback patches"), "{text}");
+    // v5 removed `setup`; its install-hook summary must not come back.
+    assert!(!text.contains("install hooks"), "{text}");
     assert!(
-        text.contains("Agent mode: wire install hooks (npm, Python, Bundler, Composer)"),
+        !text.lines().any(|l| l.trim_start().starts_with("setup ")),
         "{text}"
     );
 }
@@ -167,18 +169,14 @@ fn root_command_list_leads_with_the_v5_workflow() {
         .filter_map(|l| l.split_whitespace().next())
         .filter(|w| {
             [
-                "scan", "vex", "vendor", "list", "get", "apply", "setup", "rollback", "remove",
-                "repair",
+                "scan", "vex", "vendor", "list", "get", "apply", "rollback", "remove", "repair",
             ]
             .contains(w)
         })
         .collect();
     assert_eq!(
-        &order[..10],
-        [
-            "scan", "vex", "vendor", "list", "get", "apply", "setup", "rollback", "remove",
-            "repair"
-        ],
+        &order[..9],
+        ["scan", "vex", "vendor", "list", "get", "apply", "rollback", "remove", "repair"],
         "{text}"
     );
     assert!(text.contains("Typical workflow:"), "{text}");

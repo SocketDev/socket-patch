@@ -1120,9 +1120,6 @@ fn scan_human_vex_success_prints_wrote_line() {
     std::fs::write(
         socket.join("manifest.json"),
         serde_json::to_string_pretty(&serde_json::json!({
-            // npm declared `manual` so VEX generation does not omit the
-            // patch (ecosystem_not_setup) and fail the run.
-            "setup": { "exclude": [], "manual": ["npm"] },
             "patches": {
                 "pkg:npm/vuln-pkg@1.0.0": {
                     "uuid": UUID,

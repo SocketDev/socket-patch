@@ -4,8 +4,7 @@
 //!   caller passes `default_yes = true`, so this IS the "Enter proceeds
 //!   with the destructive action" contract — the sibling pty suite drives
 //!   `y`, `n`, and non-UTF-8 answers through `ui::confirm` but never a
-//!   bare Enter (its bare-Enter test hits `setup`'s default-no
-//!   `confirm_or_proceed`).
+//!   bare Enter.
 //! * `select_one()`'s `dialoguer::Select` branch, whose
 //!   sole production caller is `get`'s free-user multi-patch selection:
 //!   the Enter-accepts-first-ranked-option happy path and the

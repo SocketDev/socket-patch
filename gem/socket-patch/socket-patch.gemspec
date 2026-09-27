@@ -4,8 +4,8 @@
 # run it downloads the prebuilt binary for the host platform from the matching
 # GitHub release (`v<version>`), verifies it against SHA256SUMS, caches it, and
 # execs it. `gem install socket-patch` therefore puts `socket-patch` on PATH —
-# useful in Bundler/Ruby environments where the gem ecosystem's setup hook needs
-# the CLI present. Set `SOCKET_PATCH_BIN` to an existing binary to skip the
+# useful in Bundler/Ruby environments (e.g. a CI `socket-patch apply` step after
+# `bundle install`). Set `SOCKET_PATCH_BIN` to an existing binary to skip the
 # download (airgapped CI). The version is synced with the workspace by
 # `scripts/version-sync.sh`.
 Gem::Specification.new do |s|

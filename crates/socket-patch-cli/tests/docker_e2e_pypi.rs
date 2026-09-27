@@ -215,13 +215,10 @@ pip install --disable-pip-version-check --quiet --no-cache-dir six==1.16.0
 mkdir -p /workspace/proj && cd /workspace/proj
 ln -sf /workspace/venv .venv
 
-# Pre-seed setup.manual so the agent-mode VEX leg keeps the pypi patch through
-# property 7 (this venv project isn't `socket-patch setup`-configured; agent
-# patches are applied by hand/CI — exactly what `manual` declares). scan --sync
-# merges the downloaded patch into this manifest and preserves the setup block.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["pypi"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # Locate the installed six.py file.

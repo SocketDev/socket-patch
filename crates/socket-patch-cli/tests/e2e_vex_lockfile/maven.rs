@@ -1230,16 +1230,6 @@ impl Fx {
         }
     }
 
-    /// Declare `eco` in the manifest's `setup.manual` (CLI_CONTRACT property
-    /// 7): maven has no install hook, so agent-mode patches are attested
-    /// only for an ecosystem the user declares they `apply` by hand.
-    fn declare_manual(&self, eco: &str) {
-        let path = self.cwd.join(".socket/manifest.json");
-        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        manifest["setup"] = serde_json::json!({ "manual": [eco] });
-        std::fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
-    }
-
     fn embedded_doc(&self) -> Value {
         doc_at(&self.cwd.join("embedded.vex.json"))
     }
@@ -1523,7 +1513,6 @@ fn maven_apply_vex_attests_but_agent_mode_needs_the_manifest() {
     put(&base, "slf4j-api-1.7.36.pom", b"<project><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></project>");
     put(&base, MVN_JAR_KEY, MVN_PRISTINE);
     fx.stage_manifest(MVN_PURL, MVN_HOSTED_UUID, &mvn_files());
-    fx.declare_manual("maven");
     let embedded = fx.cwd.join("embedded.vex.json");
     let (code, env, stderr) = fx.run(&[
         "apply",

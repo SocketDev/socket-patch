@@ -548,7 +548,7 @@ fn apply_with_unreadable_socket_dir_fails_closed() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope must be valid JSON");
     assert_ne!(
         v["status"], "noManifest",
-        "\"cannot read\" is not \"not set up\"; envelope: {v}"
+        "\"cannot read\" is not \"no manifest\"; envelope: {v}"
     );
     assert_eq!(
         v["error"]["code"], "manifest_unreadable",

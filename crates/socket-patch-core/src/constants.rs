@@ -70,20 +70,18 @@ mod tests {
 /// npm, pnpm, yarn (classic and berry) and bun spell their lockfiles and
 /// layout markers across several subsystems — the vendor flavor probe
 /// (`vendor::npm_flavor`), the hosted-redirect candidate list (the CLI's
-/// `scan::hosted`), the crawler layout probe (`crawlers::pkg_managers`) and
-/// setup's PM detection (`package_json::find`). Those sites accept
-/// INTENTIONALLY divergent subsets: binary locks have a native byte reader, and the
-/// `pnpm-lock.yml` spelling is accepted only by setup detection. This table
-/// encodes each divergence once, visibly, instead of homogenizing them.
+/// `scan::hosted`) and the crawler layout probe (`crawlers::pkg_managers`).
+/// Those sites accept INTENTIONALLY divergent subsets (binary locks have a
+/// native byte reader; `.yarnrc.yml`/`vlt.json` are redirect inputs only).
+/// This table encodes each divergence once, visibly, instead of
+/// homogenizing them.
 ///
 /// What is actually guard-tested (equality against the flagged rows):
-/// `vendor::npm_flavor`'s wiring-family list, `scan::hosted`'s
-/// REDIRECT_CANDIDATE_FILES npm subset, and `package_json::find`'s pnpm
-/// markers (plus a hardcoded pin so the table and its consumers cannot
-/// shrink together). NOT table-guarded: `crawlers::pkg_managers`' own
-/// bun/yarn lockfile literals and `npm_flavor`'s probe decision literals —
-/// those are pinned behaviorally by their unit tests instead; only
-/// PNP_MARKERS is shared with the crawler.
+/// `vendor::npm_flavor`'s wiring-family list and `scan::hosted`'s
+/// REDIRECT_CANDIDATE_FILES npm subset. NOT table-guarded:
+/// `crawlers::pkg_managers`' own bun/yarn lockfile literals and
+/// `npm_flavor`'s probe decision literals — those are pinned behaviorally by
+/// their unit tests instead; only PNP_MARKERS is shared with the crawler.
 pub mod npm_family {
     /// One file-name row and the roles in which consumers accept it.
     pub struct FileRow {
@@ -92,9 +90,6 @@ pub mod npm_family {
         pub vendor_probe: bool,
         /// `scan::hosted` hands it to `rewrite_registry_redirect`.
         pub redirect_candidate: bool,
-        /// `package_json::find::detect_package_manager` treats it as a pnpm
-        /// marker.
-        pub detects_pnpm: bool,
     }
 
     pub const FILES: &[FileRow] = &[
@@ -102,73 +97,49 @@ pub mod npm_family {
             name: "package-lock.json",
             vendor_probe: true,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         FileRow {
             name: "npm-shrinkwrap.json",
             vendor_probe: true,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         FileRow {
             name: "pnpm-lock.yaml",
             vendor_probe: true,
             redirect_candidate: true,
-            detects_pnpm: true,
-        },
-        // Setup-detection-only spellings: the vendor probe and redirect
-        // rewriters have never accepted these, and widening them there is a
-        // behavior change to make deliberately, not by table accident.
-        FileRow {
-            name: "pnpm-lock.yml",
-            vendor_probe: false,
-            redirect_candidate: false,
-            detects_pnpm: true,
-        },
-        FileRow {
-            name: "pnpm-workspace.yaml",
-            vendor_probe: false,
-            redirect_candidate: false,
-            detects_pnpm: true,
         },
         FileRow {
             name: "yarn.lock",
             vendor_probe: true,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         // Berry's cache-config gate: read by the redirect rewriters only.
         FileRow {
             name: ".yarnrc.yml",
             vendor_probe: false,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         FileRow {
             name: "bun.lock",
             vendor_probe: true,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         // Binary Bun locks are read and rewritten natively.
         FileRow {
             name: "bun.lockb",
             vendor_probe: true,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         FileRow {
             name: "vlt-lock.json",
             vendor_probe: true,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         // vlt's config: a read-only redirect input, never wired.
         FileRow {
             name: "vlt.json",
             vendor_probe: false,
             redirect_candidate: true,
-            detects_pnpm: false,
         },
         // deno.lock is deliberately absent: deno is its own ecosystem
         // (JSR-crawled); no npm-family vendor/redirect/detection path treats
@@ -217,8 +188,4 @@ pub mod npm_family {
     pub const VLT_STORE_DIR: &str = "node_modules/.vlt";
     /// Workspace globs of vlt <= 0.0.0-12 (`{"packages": ...}`).
     pub const VLT_LEGACY_WORKSPACES: &str = "vlt-workspaces.json";
-    /// Any one in the cwd makes setup treat the project as vlt's
-    /// (`VLT_STORE_DIR` only as a directory).
-    pub const VLT_SETUP_MARKERS: [&str; 4] =
-        [VLT_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_STORE_DIR];
 }

@@ -841,7 +841,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the blob sweep below can still preview against the post-removal
     // reference set. `--preserve-state` deliberately touches neither the
     // manifest nor the blobs. An emptied manifest stays on disk as
-    // `{"patches": {}}` — it carries the setup block and the
+    // `{"patches": {}}` — it carries any legacy setup block and the
     // empty-vs-missing exit codes of `list`/`apply`/`repair`.
     let mut updated_manifest = manifest.clone();
     let removed = if args.preserve_state {

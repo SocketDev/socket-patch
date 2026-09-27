@@ -1,8 +1,7 @@
 //! Terminal UI: everything that decides *how* human output looks.
 //!
 //! - [`StatusLine`]: the one self-rewriting progress line.
-//! - [`confirm`], [`confirm_or_proceed`], [`select_one`]:
-//!   prompts.
+//! - [`confirm`], [`select_one`]: prompts.
 //! - [`print_json`]: the one `--json` document writer.
 //! - [`plural`], [`truncate`]: text shaping.
 //! - [`color_enabled`], [`paint`], [`severity`], [`pad`]: color policy and
@@ -21,7 +20,7 @@ use std::io::IsTerminal;
 
 use crate::args::GlobalArgs;
 
-pub(crate) use prompt::{confirm, confirm_or_proceed};
+pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{plural, truncate};

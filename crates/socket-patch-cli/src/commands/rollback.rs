@@ -1760,7 +1760,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
             // The manifest is rewritten only when an entry actually leaves
             // it; an emptied manifest stays on disk as `{"patches": {}}`
-            // (it carries the setup block and `list`/`apply`/`repair`'s
+            // (it carries any legacy setup block and `list`/`apply`/`repair`'s
             // empty-vs-missing exit codes) — never deleted.
             let mut removed: Vec<String> = Vec::new();
             let mut updated_manifest = manifest.clone();

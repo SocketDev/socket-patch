@@ -54,24 +54,6 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
-      # Moved-module aliases (patch::vendor → vendor, patch::go_mod_edit →
-      # vendor::go_mod_edit, patch::go_redirect → patch::redirect::golang_local)
-      # exist only for external consumers of the published core crate.
-      # #[deprecated] on a `pub use` re-export emits no warnings
-      # (rust-lang/rust#30827), so the compiler cannot pressure internal code
-      # off the old paths — this grep is the guard instead.
-      - name: Reject internal uses of moved-module alias paths
-        run: |
-          if grep -rn --include='*.rs' \
-              -e 'patch::vendor' -e 'patch::go_mod_edit' \
-              -e 'patch::go_redirect' -e 'patch::bun_lock_text' \
-              -e 'utils::telemetry' -e 'utils::cleanup_blobs' \
-              -e 'utils::date' -e 'utils::fuzzy_match' \
-              -e 'gem_setup::' -e 'composer_setup::' -e 'pth_hook::' \
-              crates; then
-            echo '::error::use the canonical module paths (crate::vendor, patch::redirect::golang_local, crate::telemetry, manifest::cleanup_blobs, api::date, crawlers::fuzzy_match); the old-path aliases exist only for external consumers'
-            exit 1
-          fi
 
   # The napi addon is only ever loaded by Node, so cargo's own tests never
   # exercise its JS loader or the engine/provider boundary.
@@ -106,7 +88,7 @@ jobs:
         run: node --test crates/socket-patch-node/npm/test/smoke.mjs
 
   # Lint the out-of-workspace packaging artifacts: the RubyGems CLI launcher
-  # gem + the Bundler plugin gem (Ruby), and the curl|sh installer. Ruby is
+  # gem (Ruby), and the curl|sh installer. Ruby is
   # pre-installed on the ubuntu-latest runner.
   lint-ecosystems:
     runs-on: ubuntu-latest
@@ -117,13 +99,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Ruby — syntax-check + build the launcher gem and Bundler plugin
+      - name: Ruby — syntax-check + build the launcher gem
         run: |
           ( cd gem/socket-patch && ruby -c lib/socket_patch/launcher.rb && ruby -c exe/socket-patch && gem build socket-patch.gemspec )
-          ( cd gem/socket-patch-bundler && ruby -c plugins.rb && gem build socket-patch-bundler.gemspec )
-          # The generated-plugin templates are pure Ruby — keep them parseable.
-          ruby -c crates/socket-patch-core/src/setup/gem/templates/plugins.rb.tmpl
-          ruby -c crates/socket-patch-core/src/setup/gem/templates/gemspec.tmpl
 
       - name: Python — test native installer harnesses
         run: python3 -B -m unittest discover -s scripts/tests -v
@@ -308,13 +286,13 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run tests
-        # `--all-features` would also RUN the docker-e2e / setup-e2e suites,
+        # `--all-features` would also RUN the docker-e2e suites,
         # which soft-skip as "ok" in this job (no images are built here, and
         # macOS/Windows have no Docker at all) — dozens of fake greens per OS
         # that would hide a broken skip-guard behind a passing checkmark.
         # Build them with --all-features (compile rot is real coverage), but
-        # run only the default-feature suites; the dedicated e2e-docker and
-        # setup-matrix jobs run the gated suites for real.
+        # run only the default-feature suites; the dedicated e2e-docker
+        # job runs the gated suites for real.
         #
         # `--no-fail-fast`: without it cargo stops at the first failing test
         # BINARY, so one bad file hides every later binary's result on that
@@ -365,7 +343,7 @@ jobs:
         # profile's comment in Cargo.toml). Same opt-level/debug-assertion
         # semantics this job exists to validate; ~23m of LTO relinking gone.
         # Build/run split for the same reason as the `test` job: the gated
-        # docker-e2e / setup-e2e suites only soft-skip here — compile them,
+        # docker-e2e suites only soft-skip here — compile them,
         # don't count their skips as passes.
         run: |
           set -euo pipefail
@@ -678,10 +656,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            suite: e2e_cargo
-          - os: ubuntu-latest
-            suite: e2e_golang
+          # (No e2e_cargo / e2e_golang rows: neither suite has an
+          # `#[ignore]`-gated test or needs a real toolchain, so the
+          # unfiltered `test` job already runs all of them and the rows'
+          # `--ignored` legs selected zero tests.)
           - os: ubuntu-latest
             suite: e2e_maven
           - os: ubuntu-latest
@@ -714,9 +692,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2'}
           - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2.2'}
           - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '1'}
-          # setup-e2e host guards run in no other job (test job = default
-          # features; setup-matrix job = shell script).
-          - {os: ubuntu-latest, suite: setup_matrix_composer, test_filter: host_guard}
           # Real-bundler gem capstones, one leg per bundler era. Boundaries:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
           # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
@@ -738,8 +713,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
-          # not #[ignore]-gated -> --include-ignored is mandatory
-          - {os: ubuntu-latest, suite: setup_matrix_gem, ruby: '3.3', bundler: '2.7.2', test_filter: --include-ignored}
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at
@@ -1611,78 +1584,6 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p socket-patch-cli --test e2e_vendor_cargo_build -- old_toolchain --nocapture
-
-  # ----------------------------------------------------------------------
-  # Experimental `setup`-flow matrix (NON-BLOCKING).
-  #
-  # For each ecosystem/package manager, drives the full intended flow —
-  # prepare deps + a committed patch set, run `socket-patch setup`, run
-  # the native install, check whether the patch was applied — plus the
-  # negative controls (no setup, empty/wrong/alt patch sets). See
-  # tests/setup_matrix/ and scripts/setup-matrix.sh.
-  #
-  # This is EXPERIMENTAL and intentionally not required to pass yet:
-  # `setup` configures install hooks for npm, PyPI, Bundler and Composer
-  # only, so the other ecosystems' `baseline_with_setup` cases are
-  # EXPECTED to fail (a baseline of what `setup` must eventually support). `continue-on-error: true`
-  # means this job never blocks a PR — it must ALSO be left OUT of the
-  # repo's required status checks (configured in the branch-protection
-  # UI, not in this file). The orchestrator exits non-zero only on a
-  # *regression* vs the recorded baseline; the full per-case result set
-  # is uploaded as a JSON artifact for inspection.
-  # ----------------------------------------------------------------------
-  setup-matrix:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    continue-on-error: true
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        ecosystem: [npm, pypi, cargo, gem, golang, maven, composer, nuget, deno]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Set up Docker Buildx
-        # `driver: docker` — the per-ecosystem image's `FROM
-        # socket-patch-test-base:latest` only resolves when buildx talks
-        # directly to the host docker daemon (see e2e-docker above).
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          driver: docker
-
-      - name: Install Rust
-        run: rustup show
-
-      - name: Build base image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: tests/docker/Dockerfile.base
-          tags: socket-patch-test-base:latest
-          load: true
-
-      - name: Build ${{ matrix.ecosystem }} image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
-          tags: socket-patch-test-${{ matrix.ecosystem }}:latest
-          load: true
-
-      - name: Run ${{ matrix.ecosystem }} setup-matrix
-        run: scripts/setup-matrix.sh run --ecosystem ${{ matrix.ecosystem }} --out "report-${{ matrix.ecosystem }}.json"
-
-      - name: Upload ${{ matrix.ecosystem }} setup-matrix report
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: setup-matrix-${{ matrix.ecosystem }}
-          path: report-${{ matrix.ecosystem }}.json
 
   # ----------------------------------------------------------------------
   # Hosted-mode production e2e — REQUIRED status check, with a kill switch.

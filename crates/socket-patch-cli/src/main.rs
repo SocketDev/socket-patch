@@ -100,7 +100,6 @@ async fn main() {
         Commands::Apply(args) => commands::apply::run(args).await,
         Commands::Vex(args) => commands::vex::run(args).await,
         Commands::Vendor(args) => commands::vendor::run(args).await,
-        Commands::Setup(args) => commands::setup::run(args).await,
         Commands::Rollback(args) => commands::rollback::run(args).await,
         Commands::Get(args) => commands::get::run(args).await,
         Commands::List(args) => commands::list::run(args).await,
