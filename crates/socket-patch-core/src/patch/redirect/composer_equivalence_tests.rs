@@ -6,6 +6,8 @@
 //! output bytes, FileEdit list and warnings on randomized locks.
 
 use super::*;
+use crate::crawlers::composer_crawler::normalize_version;
+use crate::formats::composer::hosted::*;
 
 fn json_object_end_from_oracle(text: &str, from: usize) -> Option<usize> {
     let mut depth = 0usize;

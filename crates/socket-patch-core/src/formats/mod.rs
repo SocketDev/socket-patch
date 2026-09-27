@@ -24,6 +24,7 @@
 //! its wiring, and in which roles.
 
 pub mod cargo;
+pub mod composer;
 pub mod pnpm;
 pub mod registry;
 

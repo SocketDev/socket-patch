@@ -6,6 +6,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::formats::composer::ComposerLockPackage;
 use crate::utils::digest::{is_hex, is_sri_pin, sha256_hex};
 use crate::utils::purl::percent_decode_purl_component;
 
@@ -63,22 +64,19 @@ pub async fn recover_lock_entry(
         "composer" => {
             let original = wiring_original(entry, &["composer_lock_package"])
                 .ok_or_else(|| "no pre-vendor composer.lock fragment recorded".to_string())?;
-            let dist = original
-                .get("dist")
-                .ok_or_else(|| "the pre-vendor composer.lock fragment has no dist".to_string())?;
-            let url = dist
-                .get("url")
-                .and_then(serde_json::Value::as_str)
+            // The fragment is the entry as the lock held it; read it with
+            // the lock model's own field rules.
+            let pkg = ComposerLockPackage::of("packages", 0, original);
+            if pkg.dist.is_none() {
+                return Err("the pre-vendor composer.lock fragment has no dist".to_string());
+            }
+            let url = pkg
+                .dist_str("url")
                 .and_then(http_url)
                 .ok_or_else(|| "the pre-vendor dist has no http(s) url".to_string())?;
-            let shasum = dist
-                .get("shasum")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| is_hex(s, 40))
-                .ok_or_else(|| {
-                    "the pre-vendor dist records no shasum; refusing an unverifiable fetch"
-                        .to_string()
-                })?;
+            let integrity = pkg.dist_sha1().ok_or_else(|| {
+                "the pre-vendor dist records no shasum; refusing an unverifiable fetch".to_string()
+            })?;
             Ok(LockfileEntry {
                 ecosystem: "composer",
                 source_kind: SourceKind::Unspecified,
@@ -86,7 +84,7 @@ pub async fn recover_lock_entry(
                 name,
                 version,
                 resolved: Some(url),
-                integrity: LockIntegrity::Sha1Hex(shasum.to_ascii_lowercase()),
+                integrity,
             })
         }
         "gem" => {

@@ -70,7 +70,6 @@ pub mod view;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
-pub(crate) use self::composer::{composer_lock_packages, ComposerLockPackage};
 pub(crate) use self::npm::{npm_lock_nodes, NpmLockNode};
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
