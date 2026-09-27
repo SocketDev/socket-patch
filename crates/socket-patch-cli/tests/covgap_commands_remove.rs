@@ -1014,7 +1014,7 @@ fn remove_hosted_ledger_persist_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("failed to persist the hosted redirect ledger"),
+        msg.contains("failed to persist the hosted ledger"),
         "the error must name the persist failure; got: {msg}"
     );
     assert_eq!(
@@ -1061,7 +1061,7 @@ fn remove_hosted_only_ledger_persist_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("failed to persist the hosted redirect ledger"),
+        msg.contains("failed to persist the hosted ledger"),
         "the error must name the persist failure; got: {msg}"
     );
     assert_eq!(

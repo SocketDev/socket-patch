@@ -1949,7 +1949,7 @@ fn hosted_persist_failure_lands_in_hosted_failed() {
         failed.iter().any(|f| f["purl"] == "ledger"
             && f["error"]
                 .as_str()
-                .is_some_and(|e| e.contains("failed to persist the hosted redirect ledger"))),
+                .is_some_and(|e| e.contains("failed to persist the hosted ledger"))),
         "the persist failure must be reported under the 'ledger' key; stdout=\n{stdout}"
     );
     // The replay itself ran before the persist: the wired file is restored.
@@ -2531,7 +2531,7 @@ fn hosted_persist_failure_prints_human_error_line() {
         "a ledger persist failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Error: Failed to persist the hosted redirect ledger"),
+        stderr.contains("Error: Failed to persist the hosted ledger"),
         "the human persist-failure line must print on stderr; stderr=\n{stderr}"
     );
     assert_eq!(
