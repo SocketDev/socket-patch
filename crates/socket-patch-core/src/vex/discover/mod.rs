@@ -33,7 +33,7 @@
 //! (`npm_lock_nodes`, `pnpm::pnpm_packages`, `yarn::classic_entries` /
 //! `berry_entries`, `BunLockb::parse_packages`, `vlt::vlt_lock_model`) and,
 //! for the other formats, the readers the writers own (`cargo_lock` /
-//! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `gemfile_lock`,
+//! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `formats::gem`,
 //! `composer_lock_packages`, the
 //! `utils::python_lock` / `poetry_lock` / `requirements` / `hatch` readers,
 //! `maven_pom`, `nuget_config` / `nuget_feed`). The inventory's registry

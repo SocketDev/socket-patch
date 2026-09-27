@@ -36,7 +36,7 @@
 //!    [`inventory_project_every_lock`] unions for ledger liveness).
 //!
 //! Formats whose reader a writer already owns keep the model there
-//! (`cargo_lock::locked_packages`, `gemfile_lock`, `utils::python_lock` /
+//! (`formats::cargo`, `formats::gem`, `utils::python_lock` /
 //! `poetry_lock`, `utils::requirements`), and only the registry view lives
 //! here. [`LockfileEntry::source_kind`] carries provenance a view knows
 //! positively (crates.io), which ledger liveness reads instead of inferring

@@ -25,6 +25,7 @@
 
 pub mod cargo;
 pub mod composer;
+pub mod gem;
 pub mod pnpm;
 pub mod registry;
 
