@@ -6,6 +6,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item};
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK};
+use crate::formats::pnpm::PnpmLock;
 use crate::utils::digest::is_sri_pin;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::utils::python_lock::{
@@ -23,9 +24,9 @@ use super::LockIntegrity;
 /// anchor for repair's no-ledger reconstruction: a rebuilt tarball that
 /// matches it is exactly what the package manager would have installed.
 ///
-/// package-lock/shrinkwrap are parsed as JSON; the text formats (pnpm,
-/// yarn classic/berry, bun) are scanned with a bounded forward window from
-/// each reference line. vlt yields `None`: its `file` nodes pin no
+/// package-lock/shrinkwrap are parsed as JSON, pnpm through its format
+/// model; the other text formats (yarn classic/berry, bun) are scanned with
+/// a bounded forward window from each reference line. vlt yields `None`: its `file` nodes pin no
 /// integrity (slot [2] is `null`), and `vlt-lock.json` is never scanned,
 /// because the forward window would pick up a neighbouring node's sha512.
 pub async fn wired_vendor_integrity(
@@ -130,9 +131,16 @@ pub async fn wired_vendor_integrity(
         }
     }
 
-    // Text locks: any line referencing the artifact path, integrity within
-    // a short forward window (the same block).
-    for lock in [PNPM_LOCK, "yarn.lock", BUN_LOCK] {
+    // pnpm: the format model's vendored entry (every key generation).
+    if let Ok(text) = read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
+        if let Some(sri) = PnpmLock::parse(&text).wired_integrity(rel) {
+            return Some(LockIntegrity::Sri(sri));
+        }
+    }
+
+    // yarn / bun text locks: any line referencing the artifact path,
+    // integrity within a short forward window (the same block).
+    for lock in ["yarn.lock", BUN_LOCK] {
         let Ok(text) = read_regular_to_string(&project_root.join(lock)).await else {
             continue;
         };
@@ -142,8 +150,7 @@ pub async fn wired_vendor_integrity(
                 continue;
             }
             for probe in lines.iter().take((i + 6).min(lines.len())).skip(i) {
-                // pnpm `resolution: {integrity: …}` / classic `integrity …`
-                // / bun tuple `"sha512-…"`.
+                // classic `integrity …` / bun tuple `"sha512-…"`.
                 if let Some(v) = inline_yaml_field(probe, "integrity:") {
                     if is_sri_pin(&v) {
                         return Some(LockIntegrity::Sri(v));
