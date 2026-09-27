@@ -452,7 +452,18 @@ pub async fn lock_text_refusals(
         return vec![None; packages.len()];
     }
     let verdicts = preflight_packages(project_root, packages).await;
-    let nowhere = Path::new("");
+    if verdicts.iter().all(Result::is_ok) {
+        return vec![None; packages.len()];
+    }
+    // No installed copy and no patch content: a path inside a fresh, empty
+    // private directory is guaranteed not to exist (an empty path would
+    // resolve against the process cwd if anything ever read it).
+    let scratch = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(_) => return vec![None; packages.len()],
+    };
+    let nowhere_buf = scratch.path().join("no-installed-copy");
+    let nowhere = nowhere_buf.as_path();
     let no_sources = PatchSources {
         blobs_path: nowhere,
         packages_path: None,
