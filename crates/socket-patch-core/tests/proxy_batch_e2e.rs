@@ -242,8 +242,8 @@ async fn proxy_batch_over_capacity_503_surfaces_without_fallback() {
         .await
         .expect_err("over-capacity 503 must surface");
     assert!(
-        matches!(&err, ApiError::Other(msg) if msg.contains("503")),
-        "over-capacity 503 must be Other with the status embedded; got: {err:?}"
+        matches!(&err, ApiError::ServiceUnavailable(msg) if msg.contains("503")),
+        "over-capacity 503 must be ServiceUnavailable with the status embedded; got: {err:?}"
     );
 }
 
