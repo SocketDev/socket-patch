@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vendor::state::VendorState;
 use socket_patch_core::vex::{
@@ -179,6 +179,7 @@ impl VexEmbedArgs {
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: None,
+            hosted_records: Default::default(),
         }
     }
 }
@@ -219,6 +220,12 @@ pub(crate) struct VexBuildParams {
     /// choice and order are unchanged. Ignored when taken with other crawler
     /// options. The standalone `vex` passes `None` and walks the tree.
     pub npm_prior: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    /// Embedded hosted `scan --vex` only: the patch records THIS RUN
+    /// fetched for the pins it confirmed, keyed by purl. v5 hosted mode
+    /// keeps no ledger, so these are the in-run attestation's hosted
+    /// records (the post-install standalone `vex` fetches them from the
+    /// API instead). Empty everywhere else.
+    pub hosted_records: std::collections::BTreeMap<String, PatchRecord>,
 }
 
 /// Successful result of [`generate_vex`].
@@ -337,6 +344,7 @@ pub async fn run(args: VexArgs) -> i32 {
         dry_run: args.common.dry_run,
         product_flag: "--product",
         npm_prior: None,
+        hosted_records: Default::default(),
     };
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -1109,6 +1117,16 @@ async fn generate_vex_from_manifest_path_inner(
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }
+    // This run's hosted records (embedded hosted `scan --vex`) join a
+    // pre-v5 ledger's as the hosted record source, newest wins.
+    let redirect = if params.hosted_records.is_empty() {
+        redirect
+    } else {
+        let mut state =
+            redirect.unwrap_or_else(socket_patch_core::patch::redirect::RedirectState::new);
+        state.records.extend(params.hosted_records.clone());
+        Some(state)
+    };
     let sources = Sources {
         manifest: manifest_file.unwrap_or_else(PatchManifest::new),
         vendor,
@@ -1962,6 +1980,7 @@ mod npm_prior_tests {
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: prior,
+            hosted_records: Default::default(),
         };
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {

@@ -2943,6 +2943,9 @@ pub(crate) async fn run_redirect_selected(
         // it was taken with these crawler options). `get --mode hosted`
         // passes none.
         params.npm_prior = npm_prior.cloned();
+        // v5 keeps no hosted ledger: this run's fetched records are the
+        // hosted record source of the in-run attestation.
+        params.hosted_records = records.clone();
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
