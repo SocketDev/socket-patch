@@ -460,7 +460,32 @@
     {
       "input": "20231001.0",
       "composerNormalized": "20231001.0",
-      "identity": "20231001.0"
+      "identity": "20231001"
+    },
+    {
+      "input": "v20231001.0",
+      "composerNormalized": "20231001.0",
+      "identity": "20231001"
+    },
+    {
+      "input": "20231001.0.0",
+      "composerNormalized": "20231001.0.0",
+      "identity": "20231001"
+    },
+    {
+      "input": "202301.1",
+      "composerNormalized": "202301.1",
+      "identity": "202301.1"
+    },
+    {
+      "input": "202301.1.0",
+      "composerNormalized": "202301.1.0",
+      "identity": "202301.1"
+    },
+    {
+      "input": "202301.1.0.0",
+      "composerNormalized": null,
+      "identity": "202301.1"
     },
     {
       "input": "20231001.0.0.0",
@@ -1007,7 +1032,32 @@
     {
       "left": "20231001.0",
       "right": "20231001.0.0.0",
-      "equivalent": false
+      "equivalent": true
+    },
+    {
+      "left": "v20231001.0",
+      "right": "20231001.0.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "20231001.0.0",
+      "right": "20231001.0.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "20231001",
+      "right": "20231001.0",
+      "equivalent": true
+    },
+    {
+      "left": "202301.1.0",
+      "right": "202301.1.0.0",
+      "equivalent": true
+    },
+    {
+      "left": "202301.1",
+      "right": "202301.1.0",
+      "equivalent": true
     },
     {
       "left": "20231001.1.0.0",

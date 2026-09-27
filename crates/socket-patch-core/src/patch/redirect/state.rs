@@ -1029,7 +1029,7 @@ mod tests {
         const UUID_OTHER: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0f9e8d7c6b5a";
         let composer_edit = |uuid: &str| FileEdit {
             path: "composer.lock".to_string(),
-            kind: "redirect_composer_lock_entry".to_string(),
+            kind: "redirect_composer_dist".to_string(),
             action: "rewritten".to_string(),
             key: Some("psr/log".to_string()),
             original: Some(serde_json::json!("orig")),

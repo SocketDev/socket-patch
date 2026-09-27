@@ -15,7 +15,9 @@
 //! `composerPatchIdentityVersion` twin asserts byte for byte. A 2-4 part
 //! numeric spelling Composer rejects (the SBOM's four-part padding of a date
 //! version, `20231001.0.0.0`) is normalized with its trailing `.0` parts
-//! dropped. Any other spelling Composer rejects keys as itself minus one
+//! dropped, and a date release (6+ digit major) drops its trailing `.0`
+//! parts too, since that padding erases whether the lock said `X`, `X.0` or
+//! `X.0.0`. Any other spelling Composer rejects keys as itself minus one
 //! leading `v`, and is equivalent only to other rejected spellings with the
 //! same key.
 //!
@@ -196,7 +198,7 @@ fn strip_leading_v(version: &str) -> &str {
 /// Composer rejects, the normalized form with its trailing `.0` parts dropped.
 /// SBOM rows pad every numeric version to four parts, which Composer rejects
 /// for a 6+ digit (date) major (`20231001` → `20231001.0.0.0`).
-fn identity_normalize(version: &str) -> Option<String> {
+fn normalize_unpadded(version: &str) -> Option<String> {
     if let Some(normalized) = composer_version_normalize(version) {
         return Some(normalized);
     }
@@ -219,10 +221,38 @@ fn identity_normalize(version: &str) -> Option<String> {
     composer_version_normalize(&parts[..keep].join("."))
 }
 
+/// [`normalize_unpadded`], with a date release's trailing `.0` parts dropped:
+/// that padding also erases whether the lock said `X`, `X.0` or `X.0.0`, so
+/// they cannot tell date releases apart (`20231001.0` ≡ `20231001`).
+fn identity_normalize(version: &str) -> Option<String> {
+    let normalized = normalize_unpadded(version)?;
+    let mut parts = normalized.split('.');
+    let date_numeric = parts
+        .next()
+        .is_some_and(|major| major.len() >= 6 && major.bytes().all(|b| b.is_ascii_digit()))
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    if !date_numeric {
+        return Some(normalized);
+    }
+    let mut trimmed = normalized.as_str();
+    while let Some(rest) = trimmed.strip_suffix(".0") {
+        trimmed = rest;
+    }
+    Some(trimmed.to_string())
+}
+
 /// The identity key of a composer version: its normalized form (see
 /// [`identity_normalize`]), else the spelling minus one leading `v`.
 pub fn composer_version_key(version: &str) -> String {
     identity_normalize(version).unwrap_or_else(|| strip_leading_v(version).to_string())
+}
+
+/// A key two spellings share exactly when [`composer_versions_equivalent`]
+/// holds, for map and set lookups: [`identity_normalize`], else the spelling
+/// minus one leading `v` behind a `\u{1}` so that versions Composer rejects
+/// get their own key space (depscan's `composerVersionIdentityKey`).
+pub fn composer_version_identity_key(version: &str) -> String {
+    identity_normalize(version).unwrap_or_else(|| format!("\u{1}{}", strip_leading_v(version)))
 }
 
 /// Whether two composer version spellings name the same release
@@ -230,11 +260,7 @@ pub fn composer_version_key(version: &str) -> String {
 /// Composer rejects matches only another rejected spelling with the same
 /// `v`-stripped text.
 pub fn composer_versions_equivalent(a: &str, b: &str) -> bool {
-    match (identity_normalize(a), identity_normalize(b)) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => strip_leading_v(a) == strip_leading_v(b),
-        _ => false,
-    }
+    composer_version_identity_key(a) == composer_version_identity_key(b)
 }
 
 /// `(lowercased vendor/name, version)` of an already-decoded,
@@ -254,13 +280,14 @@ fn composer_base_parts(base: &str) -> Option<(String, &str)> {
 
 /// `pkg:composer/<vendor>/<name>@<key>` for a composer purl in any spelling
 /// (qualifiers and subpath stripped, percent-decoded, name lowercased,
-/// version through [`composer_version_key`]); `None` for anything else.
+/// version through [`composer_version_identity_key`]); `None` for anything
+/// else.
 pub fn composer_purl_identity(purl: &str) -> Option<String> {
     let base = canonical_purl(purl);
     let (name, version) = composer_base_parts(&base)?;
     Some(format!(
         "pkg:composer/{name}@{}",
-        composer_version_key(version)
+        composer_version_identity_key(version)
     ))
 }
 
@@ -350,14 +377,43 @@ mod tests {
     }
 
     #[test]
+    fn identity_key_equality_is_equivalence_over_every_vector_pair() {
+        let v = vectors();
+        let mut inputs: Vec<&str> = v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| case["input"].as_str().unwrap())
+            .collect();
+        for case in v["equivalence"].as_array().unwrap() {
+            inputs.push(case["left"].as_str().unwrap());
+            inputs.push(case["right"].as_str().unwrap());
+        }
+        let mut failures = Vec::new();
+        for a in &inputs {
+            for b in &inputs {
+                let keyed = composer_version_identity_key(a) == composer_version_identity_key(b);
+                let rejected = |x: &str| identity_normalize(x).is_none();
+                let spec = match (rejected(a), rejected(b)) {
+                    (false, false) => composer_version_key(a) == composer_version_key(b),
+                    (true, true) => strip_leading_v(a) == strip_leading_v(b),
+                    _ => false,
+                };
+                if keyed != spec || keyed != composer_versions_equivalent(a, b) {
+                    failures.push(format!("{a:?} vs {b:?}: key {keyed}, spec {spec}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn sbom_padded_date_versions_match_their_lock_spelling() {
         assert_eq!(composer_version_key("20231001.0.0.0"), "20231001");
         assert!(composer_versions_equivalent("20231001", "20231001.0.0.0"));
         assert!(composer_versions_equivalent("123456.1", "123456.1.0.0"));
-        assert!(!composer_versions_equivalent(
-            "20231001.0",
-            "20231001.0.0.0"
-        ));
+        assert!(composer_versions_equivalent("20231001.0", "20231001.0.0.0"));
+        assert!(composer_versions_equivalent("202301.1", "202301.1.0"));
         assert!(!composer_versions_equivalent("1.2.3.4.5", "1.2.3.4.5.0"));
         assert_eq!(
             composer_purl_identity("pkg:composer/acme/dated@20231001.0.0.0"),
