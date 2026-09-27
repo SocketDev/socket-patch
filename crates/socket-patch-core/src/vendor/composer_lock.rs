@@ -28,7 +28,8 @@
 //! (matching `JSON_UNESCAPED_SLASHES`).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
@@ -73,6 +74,145 @@ static LOCK_MEMO: ParseMemo<Value> = ParseMemo::new();
 /// package name, so the encoding is unambiguous.
 const WIRING_KIND: &str = "composer_lock_package";
 
+/// Everything [`vendor_composer`] decides before it can first ask the patch
+/// service: the coordinate guards, the no-op of an empty patch, the lock's
+/// presence and entry, and whether that entry already wires an intact copy.
+/// The download plan evaluates the same function ahead of the vendor loop
+/// ([`service_preflight`]), so a package this refuses is never granted.
+struct ComposerPrelude {
+    vendor: String,
+    name: String,
+    pkg: String,
+    version: String,
+    copy_rel: String,
+    uuid_dir: PathBuf,
+    copy_dir: PathBuf,
+    lock_path: PathBuf,
+    lock: Arc<Value>,
+    section: &'static str,
+    idx: usize,
+    /// The lock entry already points at this uuid's copy.
+    wired: bool,
+    /// ...and the committed copy carries every afterHash (the in-sync hot
+    /// path, which never asks the service).
+    in_sync: bool,
+}
+
+async fn composer_prelude(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Result<ComposerPrelude, VendorOutcome> {
+    // ── coordinates ──────────────────────────────────────────────────────
+    let Some(((vendor, name), version)) = parse_composer_purl(purl) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a composer purl: {purl}"),
+        ));
+    };
+    let version = version.to_string();
+    let version = version.as_str();
+    // Canonical (packagist) lowercase form keys the on-disk copy dir and the
+    // dist URL; the lock's own pretty casing is preserved untouched.
+    let vendor = vendor.to_lowercase();
+    let name = name.to_lowercase();
+    let pkg = format!("{vendor}/{name}");
+
+    // SECURITY: `uuid`, `vendor/name` and `version` come from committed,
+    // tamper-able manifest data and key the copy dir that vendor creates and
+    // `--revert` deletes. A `..` segment, separator, or non-canonical uuid
+    // would escape `.socket/vendor/composer/` — reject fail-closed before any
+    // disk access.
+    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("composer", &record.uuid) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("non-canonical patch uuid {:?}", record.uuid),
+        ));
+    };
+    if !is_safe_multi_segment(&pkg) || !is_safe_single_segment(version) {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("unsafe composer coordinates `{pkg}` @ `{version}`"),
+        ));
+    }
+
+    let copy_rel = format!("{uuid_dir_rel}/{pkg}@{version}");
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    let copy_dir = project_root.join(&copy_rel);
+
+    // A patch with no files is meaningless to vendor: no-op success, no edits.
+    if record.files.is_empty() {
+        let result = synthesized_result(purl, &copy_dir, Vec::new(), true, None);
+        return Err(done(result, None, Vec::new()));
+    }
+
+    // ── lock presence + entry ────────────────────────────────────────────
+    let lock_path = project_root.join(COMPOSER_LOCK);
+    let lock_text = match read_regular_to_string(&lock_path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(refused(
+                "vendor_lockfile_missing",
+                format!("no composer.lock at {}", lock_path.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(refused(
+                "vendor_lockfile_missing",
+                format!("unreadable composer.lock: {e}"),
+            ));
+        }
+    };
+    // An unparseable lock is as unusable as a missing one — same refusal code.
+    let lock = match LOCK_MEMO.parse(lock_text.as_bytes(), || {
+        serde_json::from_str::<Value>(&lock_text)
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(refused(
+                "vendor_lockfile_missing",
+                format!("unparseable composer.lock: {e}"),
+            ));
+        }
+    };
+    let Some((section, idx)) = find_lock_entry(&lock, &pkg, version) else {
+        return Err(refused(
+            "vendor_lock_entry_not_found",
+            format!("{pkg}@{version} is in neither packages[] nor packages-dev[] of composer.lock"),
+        ));
+    };
+
+    let wired = entry_is_wired(&lock[section][idx], &copy_rel);
+    let in_sync = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
+    Ok(ComposerPrelude {
+        vendor,
+        name,
+        pkg,
+        version: version.to_string(),
+        copy_rel,
+        uuid_dir,
+        copy_dir,
+        lock_path,
+        lock,
+        section,
+        idx,
+        wired,
+        in_sync,
+    })
+}
+
+/// Whether [`vendor_composer`] — a wet run with the service enabled — asks
+/// the patch service for `record`: past every refusal it raises first and
+/// not answered by the in-sync hot path. The vendor loop's download plan
+/// consults this, so it only ever names downloads the loop will make.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> bool {
+    matches!(composer_prelude(purl, project_root, record).await, Ok(p) if !p.in_sync)
+}
+
 /// Vendor a composer package: materialize a patched copy under
 /// `.socket/vendor/composer/<uuid>/<vendor>/<name>@<version>` and rewire the
 /// matching `composer.lock` entry at it (see the module doc for the surgery).
@@ -94,88 +234,33 @@ pub async fn vendor_composer<'a>(
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     let installed_dir = installed_dir.into();
-    // ── coordinates ──────────────────────────────────────────────────────
-    let Some(((vendor, name), version)) = parse_composer_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a composer purl: {purl}"));
+    let ComposerPrelude {
+        vendor,
+        name,
+        pkg,
+        version,
+        copy_rel,
+        uuid_dir,
+        copy_dir,
+        lock_path,
+        lock,
+        section,
+        idx,
+        wired,
+        in_sync,
+    } = match composer_prelude(purl, project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
     };
-    let version = version.as_ref();
-    // Canonical (packagist) lowercase form keys the on-disk copy dir and the
-    // dist URL; the lock's own pretty casing is preserved untouched.
-    let vendor = vendor.to_lowercase();
-    let name = name.to_lowercase();
-    let pkg = format!("{vendor}/{name}");
-
-    // SECURITY: `uuid`, `vendor/name` and `version` come from committed,
-    // tamper-able manifest data and key the copy dir that vendor creates and
-    // `--revert` deletes. A `..` segment, separator, or non-canonical uuid
-    // would escape `.socket/vendor/composer/` — reject fail-closed before any
-    // disk access.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("composer", &record.uuid) else {
-        return refused(
-            "unsafe_coordinates",
-            format!("non-canonical patch uuid {:?}", record.uuid),
-        );
-    };
-    if !is_safe_multi_segment(&pkg) || !is_safe_single_segment(version) {
-        return refused(
-            "unsafe_coordinates",
-            format!("unsafe composer coordinates `{pkg}` @ `{version}`"),
-        );
-    }
-
-    let copy_rel = format!("{uuid_dir_rel}/{pkg}@{version}");
-    let uuid_dir = project_root.join(&uuid_dir_rel);
-    let copy_dir = project_root.join(&copy_rel);
-
-    // A patch with no files is meaningless to vendor: no-op success, no edits.
-    if record.files.is_empty() {
-        let result = synthesized_result(purl, &copy_dir, Vec::new(), true, None);
-        return done(result, None, Vec::new());
-    }
-
-    // ── lock presence + entry ────────────────────────────────────────────
-    let lock_path = project_root.join(COMPOSER_LOCK);
-    let lock_text = match read_regular_to_string(&lock_path).await {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("no composer.lock at {}", lock_path.display()),
-            );
-        }
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("unreadable composer.lock: {e}"),
-            );
-        }
-    };
-    // An unparseable lock is as unusable as a missing one — same refusal code.
-    let lock = match LOCK_MEMO.parse(lock_text.as_bytes(), || {
-        serde_json::from_str::<Value>(&lock_text)
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("unparseable composer.lock: {e}"),
-            );
-        }
-    };
-    let Some((section, idx)) = find_lock_entry(&lock, &pkg, version) else {
-        return refused(
-            "vendor_lock_entry_not_found",
-            format!("{pkg}@{version} is in neither packages[] nor packages-dev[] of composer.lock"),
-        );
-    };
+    let version = version.as_str();
 
     // ── idempotent hot path ──────────────────────────────────────────────
     // Copy already carries every afterHash and the lock entry already points
     // at the uuid path → touch nothing, report AlreadyPatched. `entry` stays
     // `None`: the first run's ledger entry holds the only copy of the
     // verbatim pre-vendor original, and re-recording here would clobber it.
-    if entry_is_wired(&lock[section][idx], &copy_rel) {
-        if copy_matches_after_hashes(&copy_dir, &record.files).await {
+    if wired {
+        if in_sync {
             let result = already_patched_result(purl, &copy_dir, &record.files);
             return done(result, None, Vec::new());
         }
@@ -1119,6 +1204,62 @@ mod tests {
             VendorOutcome::Refused { code, detail } => (code, detail),
             VendorOutcome::Done { result, .. } => panic!("not refused: {result:?}"),
         }
+    }
+
+    /// The download plan's gate names exactly the packages whose vendor call
+    /// asks the patch service for a grant: none the lock does not carry or
+    /// whose uuid is not canonical, not the empty patch's no-op, and — once
+    /// vendored — not the in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_packages_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (dir, blobs, installed, record) = fixture(&lock_value("psr/log", "3.0.2", false)).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (
+                "pkg:composer/psr/log@9.9.9",
+                with_uuid(&record, PLAN_UUID_B),
+            ),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            (
+                "pkg:composer/monolog/monolog@1.0.0",
+                with_uuid(&record, PLAN_UUID_C),
+            ),
+            (PURL, empty_patch(&record, PLAN_UUID_B)),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (installed, sources, cfg) = (&installed, &sources, &cfg);
+            Box::pin(async move {
+                vendor_composer(
+                    &purl,
+                    installed.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string()]);
+        // Vendored now: the re-run is in sync and asks nothing.
+        let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
+        assert!(rerun.is_empty(), "{rerun:?}");
     }
 
     async fn run_vendor(

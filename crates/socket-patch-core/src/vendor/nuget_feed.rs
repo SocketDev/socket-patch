@@ -215,52 +215,65 @@ fn locked_at<'a>(
     })
 }
 
-/// Vendor a NuGet package: rebuild a patched `.nupkg` under
-/// `.socket/vendor/nuget/<uuid>/`, wire `nuget.config` to serve it, and pin its
-/// `contentHash` in `packages.lock.json` (see the module doc).
-///
-/// `installed_dir` is the crawler's package dir
-/// (`~/.nuget/packages/<idLower>/<verLower>/` or the legacy
-/// `packages/<Name>.<Version>/`), which holds the cached pristine `.nupkg` the
-/// rebuild extracts from and against which the manifest's package-relative file
-/// keys resolve.
-#[allow(clippy::too_many_arguments)]
-pub async fn vendor_nuget(
+/// Everything [`vendor_nuget`] decides before it can first ask the patch
+/// service: the coordinate guards, the no-op of an empty patch, the
+/// nuget.config and packages.lock.json reads, and whether the feed already
+/// serves an in-sync nupkg. The download plan evaluates the same function
+/// ahead of the vendor loop ([`service_preflight`]).
+struct NugetPrelude {
+    name: String,
+    version: String,
+    version_norm: String,
+    uuid_dir_rel: String,
+    copy_rel: String,
+    uuid_dir: PathBuf,
+    nupkg_path: PathBuf,
+    source_key: String,
+    config_path: Option<PathBuf>,
+    config_text: Option<String>,
+    lock_path: PathBuf,
+    lock_text: Option<String>,
+    /// nuget.config already carries this uuid's source.
+    config_wired: bool,
+    /// ...and the committed nupkg plus the lock pin are in sync (the hot
+    /// path, which never asks the service).
+    in_sync: bool,
+}
+
+async fn nuget_prelude(
     purl: &str,
-    installed_dir: &Path,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    vendored_at: &str,
-    dry_run: bool,
-    force: bool,
-    service: Option<&VendorServiceConfig>,
-) -> VendorOutcome {
+) -> Result<NugetPrelude, VendorOutcome> {
     // ── coordinates ──────────────────────────────────────────────────────
     let Some((name, version)) = parse_nuget_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a nuget purl: {purl}"));
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a nuget purl: {purl}"),
+        ));
     };
-    let (name, version) = (name.as_ref(), version.as_ref());
+    let (name, version) = (name.to_string(), version.to_string());
+    let (name, version) = (name.as_str(), version.as_str());
     // SECURITY: `uuid`, `name`, and `version` come from committed, tamper-able
     // manifest data. They key the uuid dir vendor creates and `--revert`
     // deletes, the vendored filename, and — via `nuget.config` — XML attribute
     // values. Reject anything but the plain NuGet token charset fail-closed
     // before any disk access.
     let Some(uuid_dir_rel) = vendor_uuid_dir_rel("nuget", &record.uuid) else {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!("non-canonical patch uuid {:?}", record.uuid),
-        );
+        ));
     };
     if !is_safe_single_segment(name)
         || !is_safe_single_segment(version)
         || !is_plain_nuget_token(name)
         || !is_plain_nuget_token(version)
     {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!("unsafe nuget coordinates `{name}` @ `{version}`"),
-        );
+        ));
     }
 
     let id_lower = name.to_lowercase();
@@ -273,11 +286,11 @@ pub async fn vendor_nuget(
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
-        return done(
+        return Err(done(
             synthesized_result(purl, &nupkg_path, Vec::new(), true, None),
             None,
             Vec::new(),
-        );
+        ));
     }
 
     let config_path = existing_config_path(project_root).await;
@@ -285,10 +298,10 @@ pub async fn vendor_nuget(
         Some(p) => match read_regular_to_string(p).await {
             Ok(t) => Some(t),
             Err(e) => {
-                return refused(
+                return Err(refused(
                     "vendor_nuget_config_unreadable",
                     format!("unreadable {}: {e}", p.display()),
-                );
+                ));
             }
         },
         None => None,
@@ -298,23 +311,18 @@ pub async fn vendor_nuget(
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            return refused(
+            return Err(refused(
                 "vendor_nuget_lock_unreadable",
                 format!("unreadable {}: {e}", lock_path.display()),
-            );
+            ));
         }
     };
 
-    // ── idempotent hot path ──────────────────────────────────────────────
-    // nuget.config already carries our source, the committed nupkg already
-    // hashes its patched entries, and the lock (if any) already pins that
-    // nupkg → touch nothing, report AlreadyPatched. `entry` stays `None`: the
-    // first run's ledger entry holds the only copy of the verbatim pre-vendor
-    // originals, and re-recording here would clobber them.
+    // The idempotent hot path's test (see `vendor_nuget`).
     let config_wired = config_text
         .as_deref()
         .is_some_and(|t| t.contains(&source_key));
-    if config_wired {
+    let in_sync = config_wired && {
         // One guarded read of the committed nupkg serves both the member-hash
         // check and the lock's content-hash pin.
         let nupkg_bytes = read_zip_artifact(&nupkg_path).await;
@@ -337,7 +345,88 @@ pub async fn vendor_nuget(
             }
             _ => false,
         };
-        if nupkg_ok && lock_ok {
+        nupkg_ok && lock_ok
+    };
+    Ok(NugetPrelude {
+        name: name.to_string(),
+        version: version.to_string(),
+        version_norm,
+        uuid_dir_rel,
+        copy_rel,
+        uuid_dir,
+        nupkg_path,
+        source_key,
+        config_path,
+        config_text,
+        lock_path,
+        lock_text,
+        config_wired,
+        in_sync,
+    })
+}
+
+/// Whether [`vendor_nuget`] — a wet run with the service enabled — asks the
+/// patch service for `record`: past every refusal it raises first and not
+/// answered by the in-sync hot path. The vendor loop's download plan
+/// consults this.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> bool {
+    matches!(nuget_prelude(purl, project_root, record).await, Ok(p) if !p.in_sync)
+}
+
+/// Vendor a NuGet package: rebuild a patched `.nupkg` under
+/// `.socket/vendor/nuget/<uuid>/`, wire `nuget.config` to serve it, and pin its
+/// `contentHash` in `packages.lock.json` (see the module doc).
+///
+/// `installed_dir` is the crawler's package dir
+/// (`~/.nuget/packages/<idLower>/<verLower>/` or the legacy
+/// `packages/<Name>.<Version>/`), which holds the cached pristine `.nupkg` the
+/// rebuild extracts from and against which the manifest's package-relative file
+/// keys resolve.
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_nuget(
+    purl: &str,
+    installed_dir: &Path,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let NugetPrelude {
+        name,
+        version,
+        version_norm,
+        uuid_dir_rel,
+        copy_rel,
+        uuid_dir,
+        nupkg_path,
+        source_key,
+        config_path,
+        config_text,
+        lock_path,
+        lock_text,
+        config_wired,
+        in_sync,
+    } = match nuget_prelude(purl, project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
+    };
+    let (name, version) = (name.as_str(), version.as_str());
+
+    // ── idempotent hot path ──────────────────────────────────────────────
+    // nuget.config already carries our source, the committed nupkg already
+    // hashes its patched entries, and the lock (if any) already pins that
+    // nupkg → touch nothing, report AlreadyPatched. `entry` stays `None`: the
+    // first run's ledger entry holds the only copy of the verbatim pre-vendor
+    // originals, and re-recording here would clobber them.
+    if config_wired {
+        if in_sync {
             return done(
                 already_patched_result(purl, &nupkg_path, &record.files),
                 None,
@@ -2138,6 +2227,58 @@ mod tests {
             VendorOutcome::Refused { code, detail } => (code, detail),
             VendorOutcome::Done { result, .. } => panic!("not refused: {result:?}"),
         }
+    }
+
+    /// The download plan's gate names exactly the packages whose vendor call
+    /// asks the patch service for a grant: none with unsafe coordinates or a
+    /// non-canonical uuid, not the empty patch's no-op, and — once vendored
+    /// — not the in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_packages_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            (PURL, empty_patch(&record, PLAN_UUID_B)),
+            (
+                "pkg:nuget/Bad%20Name@1.0.0",
+                with_uuid(&record, PLAN_UUID_C),
+            ),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (installed, sources, cfg) = (&installed, &sources, &cfg);
+            Box::pin(async move {
+                vendor_nuget(
+                    &purl,
+                    installed.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string()]);
+        // Vendored now: the re-run is in sync and asks nothing.
+        let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
+        assert!(rerun.is_empty(), "{rerun:?}");
     }
 
     async fn run_vendor(

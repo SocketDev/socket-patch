@@ -108,6 +108,333 @@ const LOCK_CHECKSUM_WIRING_KIND: &str = "gemfile_lock_checksum";
 const MANAGED_OPEN: &str = "# >>> socket-patch vendor (managed) >>>";
 const MANAGED_CLOSE: &str = "# <<< socket-patch vendor (managed) <<<";
 
+/// Everything [`vendor_gem`] decides before it can first ask the patch
+/// service, up to its dry-run branch: the coordinate guards, the no-op of an
+/// empty patch, the platform refusals, the Gemfile and Gemfile.lock reads,
+/// the local stub gemspec and its native-extension refusal, and the hot
+/// path's tests (with the stale-CHECKSUMS refusal). With [`gem_edits`] it is
+/// every refusal a wet run raises before its first service call, so the
+/// download plan evaluates the same functions ahead of the vendor loop
+/// ([`service_preflight`]). `installed_path` is the source's
+/// [`PackageSource::path`] — only its name and parents are read.
+struct GemPrelude {
+    name: String,
+    version: String,
+    copy_rel: String,
+    uuid_dir: PathBuf,
+    copy_dir: PathBuf,
+    gemfile_path: PathBuf,
+    gemfile_text: String,
+    lock_path: PathBuf,
+    lock_text: String,
+    local_stub: Option<(PathBuf, String)>,
+    /// Gemfile and Gemfile.lock already wire this uuid's copy.
+    lock_wired: bool,
+    /// ...and the committed copy is intact (the in-sync hot path, which
+    /// never asks the service).
+    copy_ok: bool,
+}
+
+async fn gem_prelude(
+    purl: &str,
+    installed_path: &Path,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Result<GemPrelude, VendorOutcome> {
+    // ── coordinates ──────────────────────────────────────────────────────
+    let Some((name, version)) = parse_gem_purl(purl) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a gem purl: {purl}"),
+        ));
+    };
+    let (name, version) = (name.to_string(), version.to_string());
+    let (name, version) = (name.as_str(), version.as_str());
+    // SECURITY: `uuid`, `name` and `version` come from committed, tamper-able
+    // manifest data. They key the copy dir vendor creates and `--revert`
+    // deletes, and — stricter than the path guard — they are embedded
+    // VERBATIM into the user's Gemfile (ruby source executed on every
+    // `bundle`) and into Gemfile.lock's line grammar. A quote, space, paren,
+    // or newline would be a code/grammar injection, so only the plain gem
+    // token charset is accepted. Reject fail-closed before any disk access.
+    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("gem", &record.uuid) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("non-canonical patch uuid {:?}", record.uuid),
+        ));
+    };
+    if !is_safe_single_segment(name)
+        || !is_safe_single_segment(version)
+        || !is_plain_gem_token(name)
+        || !is_plain_gem_token(version)
+    {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("unsafe gem coordinates `{name}` @ `{version}`"),
+        ));
+    }
+
+    let leaf = format!("{name}-{version}");
+    let copy_rel = format!("{uuid_dir_rel}/{leaf}");
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    let copy_dir = project_root.join(&copy_rel);
+
+    // A patch with no files is meaningless to vendor: no-op success, no edits.
+    if record.files.is_empty() {
+        return Err(done(
+            synthesized_result(purl, &copy_dir, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        ));
+    }
+
+    // Platform-specific (precompiled) gem builds ship machine-specific
+    // artifacts — committing one would break every other platform — so they
+    // are refused, not guessed at. Two independent signals decide this:
+    //
+    //   1. The purl's own `?platform=` qualifier (the AUTHORITATIVE production
+    //      key). RubyGems' default portable platform is `ruby`; a bare purl
+    //      (no qualifier) is likewise the portable build. Only a *native*
+    //      platform value (`x86_64-linux`, `arm64-darwin`, `java`,
+    //      `x64-mingw32`, …) is refused.
+    //   2. Defense in depth: the resolved install dir's own name. A
+    //      locally-installed native variant is `<name>-<version>-<platform>`
+    //      even when the manifest purl looked portable (the crawler strips the
+    //      suffix to the base purl, so a `?platform=ruby` lookup can still land
+    //      on a native install dir).
+    //
+    // The old gate tested only `dir_name != leaf`, which spuriously refused
+    // EVERY pure-ruby gem fetched via the registry auto-fetch ladder: that
+    // path stages the pristine `.gem` into a private tempdir named literally
+    // `gem` (see registry_fetch::fetch_gem), so `dir_name` was `gem`, never
+    // `<name>-<version>`. Gating on the platform (not the staging dir name)
+    // lets `?platform=ruby` and bare purls vendor while still refusing true
+    // native builds by either signal.
+    if let Some(platform) = purl_qualifier(purl, "platform") {
+        if !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby") {
+            return Err(refused(
+                "platform_gem_unsupported",
+                format!(
+                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably"
+                ),
+            ));
+        }
+    }
+    let dir_name = installed_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Fail closed: only two dir names are legitimate here — the installed
+    // gem's own `<name>-<version>` leaf, and the literal `gem` staging dir
+    // created by the registry auto-fetch ladder (registry_fetch::fetch_gem).
+    // Everything else is refused, including a `<name>-<version>-<platform>`
+    // precompiled build; an allowlist (not a suffix match) means an unexpected
+    // install dir name can never slip through into a vendored copy.
+    if dir_name != leaf && dir_name != "gem" {
+        return Err(refused(
+            "platform_gem_unsupported",
+            format!(
+                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably)"
+            ),
+        ));
+    }
+
+    // ── project files ────────────────────────────────────────────────────
+    let gemfile_path = project_root.join(GEMFILE);
+    let gemfile_text = match read_regular_to_string(&gemfile_path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(refused(
+                "gemfile_missing",
+                format!("no Gemfile at {}", gemfile_path.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(refused(
+                "gemfile_missing",
+                format!("unreadable Gemfile: {e}"),
+            ));
+        }
+    };
+    let lock_path = project_root.join(GEMFILE_LOCK);
+    let lock_text = match read_regular_to_string(&lock_path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(refused(
+                "vendor_lockfile_missing",
+                format!(
+                    "no Gemfile.lock at {} (the pair edit needs the lock)",
+                    lock_path.display()
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(refused(
+                "vendor_lockfile_missing",
+                format!("unreadable Gemfile.lock: {e}"),
+            ));
+        }
+    };
+
+    // ── stub gemspec (local) ─────────────────────────────────────────────
+    // `specifications/` is a sibling of `gems/`; derive it from installed_dir
+    // ONLY when installed_dir actually sits inside a gem home's `gems/` dir.
+    // SECURITY: the registry auto-fetch ladder stages a not-installed gem at
+    // `<private tempdir>/<name>-<version>` (registry_fetch::fetch_gem);
+    // walking two parents up from THERE escapes the private dir into the
+    // SHARED temp root, making `$TMPDIR/specifications/<leaf>.gemspec` a
+    // predictable, attacker-plantable path on multi-user hosts — one whose
+    // contents would be committed into the project and later eval'd as Ruby
+    // by every `bundle install`. A staging dir has no local stub, period.
+    //
+    // The read is non-fatal: the LOCAL build needs this stub, but the service
+    // path brings its own (the converter-generated `gem-stub-gemspec`), so an
+    // auto-fetched (not-installed) gem whose only `installed_dir` is a bare
+    // `data.tar.gz` extraction can still vendor via the service. The
+    // `gem_spec_missing` refusal moves into the local-build fallback, where the
+    // stub is actually required.
+    let local_stub: Option<(PathBuf, String)> = {
+        let spec_src = installed_path
+            .parent()
+            .filter(|gems| gems.file_name().is_some_and(|n| n == "gems"))
+            .and_then(Path::parent)
+            .map(|home| home.join("specifications").join(format!("{leaf}.gemspec")));
+        match spec_src {
+            Some(p) => read_regular_to_string(&p).await.ok().map(|t| (p, t)),
+            None => None,
+        }
+    };
+    // Textual heuristic, deliberately fail-closed on a match: bundler skips
+    // extension builds for path sources entirely, so a native gem would
+    // install fine and then fail at `require` time with a missing `.so`.
+    // Only the local stub is checked here (when present); the service stub is
+    // re-checked in `gem_service_copy`, and a native gem emits no service stub
+    // at all (the converter refuses it), so the service path also misses.
+    if let Some((_, text)) = &local_stub {
+        if gemspec_declares_extensions(text) {
+            return Err(refused(
+                "native_extensions_unsupported",
+                format!(
+                    "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems"
+                ),
+            ));
+        }
+    }
+
+    // The idempotent hot path's tests (see `vendor_gem`): the pair edit
+    // already wires this uuid's copy; the lock's CHECKSUMS entry is in the
+    // bare path form (a stale registry line is refused, dry run or not); and
+    // the committed copy — gemspec included — is intact.
+    let remote_line = format!("  remote: {copy_rel}");
+    let lock_wired =
+        lock_text.split('\n').any(|l| l == remote_line) && gemfile_text.contains(&copy_rel);
+    let mut copy_ok = false;
+    if lock_wired {
+        if lock_checksum_in_sync(&lock_text, name, version) {
+            // Probe the copy only once the lock is known to be wired (the
+            // common fresh vendor has no copy to hash). D4 heal: a project
+            // vendored before the invalid-stub hardening carries the
+            // defective SERVED stub on disk, so EXISTS is not enough — an
+            // on-disk stub that fails the required-attribute bar routes into
+            // the artifact rebuild (which re-materialises a valid stub)
+            // instead of the silent `already_vendored` no-op. The stub read
+            // runs second so a hash mismatch short-circuits it.
+            copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await
+                && match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await {
+                    Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
+                    Err(_) => false,
+                };
+        } else {
+            // Wired everywhere EXCEPT the lock's CHECKSUMS entry, which still
+            // carries the registry form — a lock wired by a pre-CHECKSUMS-aware
+            // socket-patch. Bundler never repairs this itself (spike G4: install,
+            // frozen install and `bundle lock` all silently preserve a stale
+            // token), and we cannot strip it here: this run records no ledger
+            // entry, so a revert would put back everything EXCEPT the token —
+            // leaving a bare CHECKSUMS entry on a registry-sourced gem, which
+            // hard-fails frozen installs (exit 16). Refuse with the repair path
+            // instead of the generic "already carries `path:`" Gemfile refusal.
+            return Err(refused(
+                "vendor_stale_lock_checksum",
+                format!(
+                    "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); run `vendor --revert` for {purl} and re-vendor to repair it"
+                ),
+            ));
+        }
+    }
+    Ok(GemPrelude {
+        name: name.to_string(),
+        version: version.to_string(),
+        copy_rel,
+        uuid_dir,
+        copy_dir,
+        gemfile_path,
+        gemfile_text,
+        lock_path,
+        lock_text,
+        local_stub,
+        lock_wired,
+        copy_ok,
+    })
+}
+
+/// A fresh wet vendor's pure edits, computed before any download or write:
+/// the Gemfile declaration plan (refused when not editable) and the
+/// Gemfile.lock surgery (a failed `Done` when the lock's shape defeats it).
+fn gem_edits(
+    purl: &str,
+    prelude: &GemPrelude,
+) -> Result<(GemfilePlan, LockEdit), Box<VendorOutcome>> {
+    let (name, version) = (prelude.name.as_str(), prelude.version.as_str());
+    // ── Gemfile edit plan (refusals before any write) ────────────────────
+    let plan = match plan_gemfile_edit(&prelude.gemfile_text, name, version, &prelude.copy_rel) {
+        Ok(p) => p,
+        Err(detail) => {
+            return Err(Box::new(refused(
+                "gemfile_declaration_not_editable",
+                detail,
+            )))
+        }
+    };
+    // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
+    // A lock-shape failure therefore costs no download / copy / patch and no
+    // Gemfile write — the same failed `Done` outcome the unwind path used to
+    // produce, minus the unwind.
+    let lock_edit = match edit_lock(&prelude.lock_text, name, version, &prelude.copy_rel) {
+        Ok(edit) => edit,
+        Err(e) => {
+            return Err(Box::new(done(
+                failed_result(
+                    purl,
+                    &prelude.copy_dir,
+                    format!("failed to edit Gemfile.lock: {e}"),
+                ),
+                None,
+                Vec::new(),
+            )));
+        }
+    };
+    Ok((plan, lock_edit))
+}
+
+/// Whether [`vendor_gem`] — a wet run with the service enabled — asks the
+/// patch service for `record`: past every refusal it raises first
+/// ([`gem_prelude`], [`gem_edits`]) and not answered by the in-sync hot
+/// path. The vendor loop's download plan consults this; the `.gem`'s
+/// `gem-stub-gemspec` secondary rides the same planned download.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    installed_path: &Path,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> bool {
+    match gem_prelude(purl, installed_path, project_root, record).await {
+        Ok(prelude) if prelude.lock_wired => !prelude.copy_ok,
+        Ok(prelude) => gem_edits(purl, &prelude).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Vendor a gem: materialize a patched copy (plus its stub gemspec) under
 /// `.socket/vendor/gem/<uuid>/<name>-<version>` and pair-edit Gemfile +
 /// Gemfile.lock at it (see the module doc).
@@ -141,289 +468,103 @@ pub async fn vendor_gem<'a>(
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     let installed_dir = installed_dir.into();
-    // ── coordinates ──────────────────────────────────────────────────────
-    let Some((name, version)) = parse_gem_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a gem purl: {purl}"));
+    let prelude = match gem_prelude(purl, installed_dir.path(), project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
     };
-    let (name, version) = (name.as_ref(), version.as_ref());
-    // SECURITY: `uuid`, `name` and `version` come from committed, tamper-able
-    // manifest data. They key the copy dir vendor creates and `--revert`
-    // deletes, and — stricter than the path guard — they are embedded
-    // VERBATIM into the user's Gemfile (ruby source executed on every
-    // `bundle`) and into Gemfile.lock's line grammar. A quote, space, paren,
-    // or newline would be a code/grammar injection, so only the plain gem
-    // token charset is accepted. Reject fail-closed before any disk access.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("gem", &record.uuid) else {
-        return refused(
-            "unsafe_coordinates",
-            format!("non-canonical patch uuid {:?}", record.uuid),
-        );
-    };
-    if !is_safe_single_segment(name)
-        || !is_safe_single_segment(version)
-        || !is_plain_gem_token(name)
-        || !is_plain_gem_token(version)
-    {
-        return refused(
-            "unsafe_coordinates",
-            format!("unsafe gem coordinates `{name}` @ `{version}`"),
-        );
-    }
-
-    let leaf = format!("{name}-{version}");
-    let copy_rel = format!("{uuid_dir_rel}/{leaf}");
-    let uuid_dir = project_root.join(&uuid_dir_rel);
-    let copy_dir = project_root.join(&copy_rel);
-
-    // A patch with no files is meaningless to vendor: no-op success, no edits.
-    if record.files.is_empty() {
-        return done(
-            synthesized_result(purl, &copy_dir, Vec::new(), true, None),
-            None,
-            Vec::new(),
-        );
-    }
-
-    // Platform-specific (precompiled) gem builds ship machine-specific
-    // artifacts — committing one would break every other platform — so they
-    // are refused, not guessed at. Two independent signals decide this:
-    //
-    //   1. The purl's own `?platform=` qualifier (the AUTHORITATIVE production
-    //      key). RubyGems' default portable platform is `ruby`; a bare purl
-    //      (no qualifier) is likewise the portable build. Only a *native*
-    //      platform value (`x86_64-linux`, `arm64-darwin`, `java`,
-    //      `x64-mingw32`, …) is refused.
-    //   2. Defense in depth: the resolved install dir's own name. A
-    //      locally-installed native variant is `<name>-<version>-<platform>`
-    //      even when the manifest purl looked portable (the crawler strips the
-    //      suffix to the base purl, so a `?platform=ruby` lookup can still land
-    //      on a native install dir).
-    //
-    // The old gate tested only `dir_name != leaf`, which spuriously refused
-    // EVERY pure-ruby gem fetched via the registry auto-fetch ladder: that
-    // path stages the pristine `.gem` into a private tempdir named literally
-    // `gem` (see registry_fetch::fetch_gem), so `dir_name` was `gem`, never
-    // `<name>-<version>`. Gating on the platform (not the staging dir name)
-    // lets `?platform=ruby` and bare purls vendor while still refusing true
-    // native builds by either signal.
-    if let Some(platform) = purl_qualifier(purl, "platform") {
-        if !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby") {
-            return refused(
-                "platform_gem_unsupported",
-                format!(
-                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably"
-                ),
-            );
-        }
-    }
-    let dir_name = installed_dir
-        .path()
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    // Fail closed: only two dir names are legitimate here — the installed
-    // gem's own `<name>-<version>` leaf, and the literal `gem` staging dir
-    // created by the registry auto-fetch ladder (registry_fetch::fetch_gem).
-    // Everything else is refused, including a `<name>-<version>-<platform>`
-    // precompiled build; an allowlist (not a suffix match) means an unexpected
-    // install dir name can never slip through into a vendored copy.
-    if dir_name != leaf && dir_name != "gem" {
-        return refused(
-            "platform_gem_unsupported",
-            format!(
-                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably)"
-            ),
-        );
-    }
-
-    // ── project files ────────────────────────────────────────────────────
-    let gemfile_path = project_root.join(GEMFILE);
-    let gemfile_text = match read_regular_to_string(&gemfile_path).await {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return refused(
-                "gemfile_missing",
-                format!("no Gemfile at {}", gemfile_path.display()),
-            );
-        }
-        Err(e) => {
-            return refused("gemfile_missing", format!("unreadable Gemfile: {e}"));
-        }
-    };
-    let lock_path = project_root.join(GEMFILE_LOCK);
-    let lock_text = match read_regular_to_string(&lock_path).await {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!(
-                    "no Gemfile.lock at {} (the pair edit needs the lock)",
-                    lock_path.display()
-                ),
-            );
-        }
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("unreadable Gemfile.lock: {e}"),
-            );
-        }
-    };
-
-    // ── stub gemspec (local) ─────────────────────────────────────────────
-    // `specifications/` is a sibling of `gems/`; derive it from installed_dir
-    // ONLY when installed_dir actually sits inside a gem home's `gems/` dir.
-    // SECURITY: the registry auto-fetch ladder stages a not-installed gem at
-    // `<private tempdir>/<name>-<version>` (registry_fetch::fetch_gem);
-    // walking two parents up from THERE escapes the private dir into the
-    // SHARED temp root, making `$TMPDIR/specifications/<leaf>.gemspec` a
-    // predictable, attacker-plantable path on multi-user hosts — one whose
-    // contents would be committed into the project and later eval'd as Ruby
-    // by every `bundle install`. A staging dir has no local stub, period.
-    //
-    // The read is non-fatal: the LOCAL build needs this stub, but the service
-    // path brings its own (the converter-generated `gem-stub-gemspec`), so an
-    // auto-fetched (not-installed) gem whose only `installed_dir` is a bare
-    // `data.tar.gz` extraction can still vendor via the service. The
-    // `gem_spec_missing` refusal moves into the local-build fallback, where the
-    // stub is actually required.
-    let local_stub: Option<(PathBuf, String)> = {
-        let spec_src = installed_dir
-            .path()
-            .parent()
-            .filter(|gems| gems.file_name().is_some_and(|n| n == "gems"))
-            .and_then(Path::parent)
-            .map(|home| home.join("specifications").join(format!("{leaf}.gemspec")));
-        match spec_src {
-            Some(p) => read_regular_to_string(&p).await.ok().map(|t| (p, t)),
-            None => None,
-        }
-    };
-    // Textual heuristic, deliberately fail-closed on a match: bundler skips
-    // extension builds for path sources entirely, so a native gem would
-    // install fine and then fail at `require` time with a missing `.so`.
-    // Only the local stub is checked here (when present); the service stub is
-    // re-checked in `gem_service_copy`, and a native gem emits no service stub
-    // at all (the converter refuses it), so the service path also misses.
-    if let Some((_, text)) = &local_stub {
-        if gemspec_declares_extensions(text) {
-            return refused(
-                "native_extensions_unsupported",
-                format!(
-                    "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems"
-                ),
-            );
-        }
-    }
+    let GemPrelude {
+        name,
+        version,
+        copy_rel,
+        uuid_dir,
+        copy_dir,
+        gemfile_path,
+        gemfile_text,
+        lock_path,
+        lock_text: _,
+        local_stub,
+        lock_wired,
+        copy_ok,
+    } = &prelude;
+    let (name, version) = (name.as_str(), version.as_str());
+    let (copy_rel, uuid_dir, copy_dir) =
+        (copy_rel.as_str(), uuid_dir.as_path(), copy_dir.as_path());
+    let (lock_wired, copy_ok) = (*lock_wired, *copy_ok);
 
     // ── idempotent hot path ──────────────────────────────────────────────
     // Copy (incl. the gemspec) already carries every afterHash and both files
     // already reference the uuid path → touch nothing. `entry` stays `None`:
     // the first run's ledger entry holds the only copy of the pre-vendor
     // originals.
-    let remote_line = format!("  remote: {copy_rel}");
-    let lock_wired =
-        lock_text.split('\n').any(|l| l == remote_line) && gemfile_text.contains(&copy_rel);
     if lock_wired {
-        if lock_checksum_in_sync(&lock_text, name, version) {
-            // Probe the copy only once the lock is known to be wired (the
-            // common fresh vendor has no copy to hash). D4 heal: a project
-            // vendored before the invalid-stub hardening carries the
-            // defective SERVED stub on disk, so EXISTS is not enough — an
-            // on-disk stub that fails the required-attribute bar routes into
-            // the artifact rebuild below (which re-materialises a valid
-            // stub) instead of the silent `already_vendored` no-op. The stub
-            // read runs second so a hash mismatch short-circuits it.
-            let copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await
-                && match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await {
-                    Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
-                    Err(_) => false,
-                };
-            if copy_ok {
-                return done(
-                    already_patched_result(purl, &copy_dir, &record.files),
-                    None,
-                    Vec::new(),
-                );
-            }
-            // Wired (Gemfile + lock + CHECKSUMS) but the committed copy is
-            // missing/stale: rebuild the ARTIFACT only — the pair edit is
-            // already correct and the full path would re-record the live
-            // vendored fragments as `original`, breaking a later --revert.
-            // Service-preferred like the full path (an auto-fetched gem has no
-            // local stub to rebuild from — only the service can). The rebuild
-            // is staged: a failure must leave the previous (drifted-but-
-            // buildable) copy and the live pair edit exactly as they were,
-            // never a deleted uuid dir under a still-pointing `path:`.
-            if !dry_run {
-                if let Some(refusal) = service_offline_conflict(service) {
-                    return refusal;
-                }
-                let mut warnings: Vec<VendorWarning> = Vec::new();
-                let result = match materialise_patched_copy(
-                    purl,
-                    installed_dir,
-                    &copy_dir,
-                    &uuid_dir,
-                    name,
-                    version,
-                    local_stub.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
-                    record,
-                    sources,
-                    force,
-                    false, // live-wired: never unwind the uuid dir on failure
-                    service,
-                    &mut warnings,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(outcome) => return *outcome,
-                };
-                if !result.success {
-                    return done(result, None, warnings);
-                }
-                warnings.push(VendorWarning::new(
-                    "vendor_artifact_rebuilt",
-                    format!(
-                        "the committed vendored copy for {name}@{version} was missing or \
-                         stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
-                    ),
-                ));
-                // The rebuilt tree may differ from the one the ledger
-                // inventoried (a service ↔ local flip swaps the stub gemspec):
-                // hand back a refreshed entry. Its wiring is empty ON PURPOSE —
-                // the caller's `carry_forward_wiring` (same uuid) re-attaches the
-                // first run's records, the only copy of the pre-vendor originals.
-                let file_inventory =
-                    gem_inventory_or_warn(&copy_dir, name, version, &mut warnings).await;
-                let entry = gem_entry(
-                    build_gem_purl(name, version),
-                    record,
-                    copy_rel,
-                    file_inventory,
-                    Vec::new(),
-                );
-                return done(result, Some(entry), warnings);
-            }
-            // Dry runs fall through to the verify-only preview below.
-        } else {
-            // Wired everywhere EXCEPT the lock's CHECKSUMS entry, which still
-            // carries the registry form — a lock wired by a pre-CHECKSUMS-aware
-            // socket-patch. Bundler never repairs this itself (spike G4: install,
-            // frozen install and `bundle lock` all silently preserve a stale
-            // token), and we cannot strip it here: this run records no ledger
-            // entry, so a revert would put back everything EXCEPT the token —
-            // leaving a bare CHECKSUMS entry on a registry-sourced gem, which
-            // hard-fails frozen installs (exit 16). Refuse with the repair path
-            // instead of the generic "already carries `path:`" Gemfile refusal.
-            return refused(
-                "vendor_stale_lock_checksum",
-                format!(
-                    "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); run `vendor --revert` for {purl} and re-vendor to repair it"
-                ),
+        if copy_ok {
+            return done(
+                already_patched_result(purl, copy_dir, &record.files),
+                None,
+                Vec::new(),
             );
         }
+        // Wired (Gemfile + lock + CHECKSUMS) but the committed copy is
+        // missing/stale: rebuild the ARTIFACT only — the pair edit is
+        // already correct and the full path would re-record the live
+        // vendored fragments as `original`, breaking a later --revert.
+        // Service-preferred like the full path (an auto-fetched gem has no
+        // local stub to rebuild from — only the service can). The rebuild
+        // is staged: a failure must leave the previous (drifted-but-
+        // buildable) copy and the live pair edit exactly as they were,
+        // never a deleted uuid dir under a still-pointing `path:`.
+        if !dry_run {
+            if let Some(refusal) = service_offline_conflict(service) {
+                return refusal;
+            }
+            let mut warnings: Vec<VendorWarning> = Vec::new();
+            let result = match materialise_patched_copy(
+                purl,
+                installed_dir,
+                copy_dir,
+                uuid_dir,
+                name,
+                version,
+                local_stub.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
+                record,
+                sources,
+                force,
+                false, // live-wired: never unwind the uuid dir on failure
+                service,
+                &mut warnings,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(outcome) => return *outcome,
+            };
+            if !result.success {
+                return done(result, None, warnings);
+            }
+            warnings.push(VendorWarning::new(
+                "vendor_artifact_rebuilt",
+                format!(
+                    "the committed vendored copy for {name}@{version} was missing or \
+                     stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
+                ),
+            ));
+            // The rebuilt tree may differ from the one the ledger
+            // inventoried (a service ↔ local flip swaps the stub gemspec):
+            // hand back a refreshed entry. Its wiring is empty ON PURPOSE —
+            // the caller's `carry_forward_wiring` (same uuid) re-attaches the
+            // first run's records, the only copy of the pre-vendor originals.
+            let file_inventory =
+                gem_inventory_or_warn(copy_dir, name, version, &mut warnings).await;
+            let entry = gem_entry(
+                build_gem_purl(name, version),
+                record,
+                copy_rel.to_string(),
+                file_inventory,
+                Vec::new(),
+            );
+            return done(result, Some(entry), warnings);
+        }
+        // Dry runs fall through to the verify-only preview below.
     }
 
     // ── dry run: verify-only against the installed dir, no writes ────────
@@ -437,7 +578,7 @@ pub async fn vendor_gem<'a>(
                 return done(
                     synthesized_result(
                         purl,
-                        &copy_dir,
+                        copy_dir,
                         Vec::new(),
                         false,
                         Some(format!("failed to copy installed gem: {e}")),
@@ -463,24 +604,10 @@ pub async fn vendor_gem<'a>(
         return done(result, None, dry_warnings);
     }
 
-    // ── Gemfile edit plan (refusals before any write) ────────────────────
-    let plan = match plan_gemfile_edit(&gemfile_text, name, version, &copy_rel) {
-        Ok(p) => p,
-        Err(detail) => return refused("gemfile_declaration_not_editable", detail),
-    };
-    // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
-    // A lock-shape failure therefore costs no download / copy / patch and no
-    // Gemfile write — the same failed `Done` outcome the unwind path used to
-    // produce, minus the unwind.
-    let lock_edit = match edit_lock(&lock_text, name, version, &copy_rel) {
-        Ok(edit) => edit,
-        Err(e) => {
-            return done(
-                failed_result(purl, &copy_dir, format!("failed to edit Gemfile.lock: {e}")),
-                None,
-                Vec::new(),
-            );
-        }
+    // ── Gemfile + Gemfile.lock edits (pure, computed before any write) ────
+    let (plan, lock_edit) = match gem_edits(purl, &prelude) {
+        Ok(edits) => edits,
+        Err(outcome) => return *outcome,
     };
 
     // ── materialise the patched copy ──────────────────────────────────────
@@ -494,8 +621,8 @@ pub async fn vendor_gem<'a>(
     let mut result = match materialise_patched_copy(
         purl,
         installed_dir,
-        &copy_dir,
-        &uuid_dir,
+        copy_dir,
+        uuid_dir,
         name,
         version,
         local_stub.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
@@ -520,30 +647,28 @@ pub async fn vendor_gem<'a>(
 
     // ── Gemfile edit ─────────────────────────────────────────────────────
     // Both project files are user-owned: preserve their permission bits.
-    let new_gemfile = apply_gemfile_plan(&gemfile_text, &plan);
-    if let Err(e) = atomic_write_bytes_preserving_mode(&gemfile_path, new_gemfile.as_bytes()).await
-    {
-        let _ = remove_tree(&uuid_dir).await;
-        prune_empty_vendor_levels(&uuid_dir).await;
+    let new_gemfile = apply_gemfile_plan(gemfile_text, &plan);
+    if let Err(e) = atomic_write_bytes_preserving_mode(gemfile_path, new_gemfile.as_bytes()).await {
+        let _ = remove_tree(uuid_dir).await;
+        prune_empty_vendor_levels(uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write Gemfile: {e}"));
         return done(result, None, warnings);
     }
 
     // ── Gemfile.lock write (a failure here unwinds the Gemfile) ──────────
-    if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_edit.text.as_bytes()).await
-    {
+    if let Err(e) = atomic_write_bytes_preserving_mode(lock_path, lock_edit.text.as_bytes()).await {
         let mut detail = format!("failed to write Gemfile.lock: {e}");
         // Unwind: a Gemfile pointing at a path the lock doesn't agree with
         // is exactly the half-wired state the pair edit exists to prevent —
         // restore the recorded original bytes.
         if let Err(e) =
-            atomic_write_bytes_preserving_mode(&gemfile_path, gemfile_text.as_bytes()).await
+            atomic_write_bytes_preserving_mode(gemfile_path, gemfile_text.as_bytes()).await
         {
             detail.push_str(&format!(" (Gemfile unwind also failed: {e})"));
         }
-        let _ = remove_tree(&uuid_dir).await;
-        prune_empty_vendor_levels(&uuid_dir).await;
+        let _ = remove_tree(uuid_dir).await;
+        prune_empty_vendor_levels(uuid_dir).await;
         result.success = false;
         result.error = Some(detail);
         return done(result, None, warnings);
@@ -552,7 +677,7 @@ pub async fn vendor_gem<'a>(
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_gem_purl(name, version);
     let marker = VendorMarker::new("gem", &base_purl, record, vendored_at);
-    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
+    write_marker_or_warn(uuid_dir, &marker, &mut warnings).await;
 
     let gemfile_record = match &plan {
         GemfilePlan::Rewrite {
@@ -665,8 +790,14 @@ pub async fn vendor_gem<'a>(
         }
     }
 
-    let file_inventory = gem_inventory_or_warn(&copy_dir, name, version, &mut warnings).await;
-    let entry = gem_entry(base_purl, record, copy_rel, file_inventory, wiring);
+    let file_inventory = gem_inventory_or_warn(copy_dir, name, version, &mut warnings).await;
+    let entry = gem_entry(
+        base_purl,
+        record,
+        copy_rel.to_string(),
+        file_inventory,
+        wiring,
+    );
 
     done(result, Some(entry), warnings)
 }
@@ -753,7 +884,7 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
 /// the `.gem` (mirrors npm's `yarn-berry-zip`). The converter generates it
 /// because a `.gem` only carries the gemspec as YAML in `metadata.gz`, not the
 /// eval-able Ruby form a bundler path source loads.
-const GEM_STUB_ARTIFACT_KIND: &str = "gem-stub-gemspec";
+pub(crate) const GEM_STUB_ARTIFACT_KIND: &str = "gem-stub-gemspec";
 
 /// Outcome of attempting to materialise the gem copy from the patch service.
 enum GemServiceCopy {
@@ -2851,6 +2982,61 @@ mod tests {
             VendorOutcome::Refused { code, detail } => (code, detail),
             VendorOutcome::Done { result, .. } => panic!("not refused: {result:?}"),
         }
+    }
+
+    /// The download plan's gate names exactly the gems whose vendor call asks
+    /// the patch service for a grant: none it refuses first (a native
+    /// platform, an installed dir that is not the gem's, a non-canonical
+    /// uuid), not the empty patch's no-op, and — once vendored — not the
+    /// in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_gems_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let root = root.as_path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (
+                "pkg:gem/rack@3.2.6?platform=x86_64-linux",
+                with_uuid(&record, PLAN_UUID_B),
+            ),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            ("pkg:gem/absent@1.0.0", with_uuid(&record, PLAN_UUID_C)),
+            (PURL, empty_patch(&record, PLAN_UUID_C)),
+        ];
+        let installed = &installed;
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, installed, root, &rec).await })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (sources, cfg) = (&sources, &cfg);
+            Box::pin(async move {
+                vendor_gem(
+                    &purl,
+                    installed.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string()]);
+        // Vendored now: the re-run is in sync and asks nothing.
+        let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
+        assert!(rerun.is_empty(), "{rerun:?}");
     }
 
     async fn run_vendor(

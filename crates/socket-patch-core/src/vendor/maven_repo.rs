@@ -56,7 +56,7 @@
 //! artifact never leaves a dangling `<repository>`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -141,6 +141,169 @@ fn group_id_to_path(group_id: &str) -> String {
     group_id.replace('.', "/")
 }
 
+/// Everything [`vendor_maven`] decides before it can first ask the patch
+/// service: the coordinate guards, the no-op of an empty patch, the project
+/// pom.xml refusals, and whether pom.xml already wires an in-sync artifact.
+/// The download plan evaluates the same function ahead of the vendor loop
+/// ([`service_preflight`]).
+struct MavenPrelude {
+    group_id: String,
+    artifact_id: String,
+    version: String,
+    uuid_dir_rel: String,
+    group_path: String,
+    leaf_rel: String,
+    jar_leaf: String,
+    pom_leaf: String,
+    jar_copy_rel: String,
+    uuid_dir: PathBuf,
+    leaf_dir: PathBuf,
+    jar_path: PathBuf,
+    repo_id: String,
+    pom_xml_path: PathBuf,
+    pom_xml_text: String,
+    /// pom.xml already carries this uuid's `<repository>`.
+    wired: bool,
+    /// ...and the committed jar/pom/sidecars are in sync (the hot path,
+    /// which never asks the service).
+    in_sync: bool,
+}
+
+async fn maven_prelude(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Result<MavenPrelude, VendorOutcome> {
+    // ── coordinates ──────────────────────────────────────────────────────
+    let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a maven purl: {purl}"),
+        ));
+    };
+    let (group_id, artifact_id, version) = (
+        group_id.to_string(),
+        artifact_id.to_string(),
+        version.to_string(),
+    );
+    let (group_id, artifact_id, version) =
+        (group_id.as_str(), artifact_id.as_str(), version.as_str());
+    // SECURITY: `uuid`, `group_id`, `artifact_id`, and `version` come from
+    // committed, tamper-able manifest data. They key the uuid dir vendor
+    // creates and `--revert` deletes, the nested maven2 path, the vendored
+    // filenames, and — via `pom.xml` — an XML attribute value. Reject anything
+    // that could traverse out of `.socket/vendor/maven/` fail-closed before any
+    // disk access.
+    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("maven", &record.uuid) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("non-canonical patch uuid {:?}", record.uuid),
+        ));
+    };
+    // Each dot-delimited groupId segment must be a safe path segment on its
+    // own (which also rejects an empty groupId and leading/trailing/double
+    // dots), as must the artifactId and version.
+    if !is_safe_maven_coordinate(group_id, artifact_id, version) {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
+        ));
+    }
+
+    let group_path = group_id_to_path(group_id);
+    let leaf_rel = format!("{uuid_dir_rel}/{group_path}/{artifact_id}/{version}");
+    let jar_leaf = format!("{artifact_id}-{version}.jar");
+    let pom_leaf = format!("{artifact_id}-{version}.pom");
+    let jar_copy_rel = format!("{leaf_rel}/{jar_leaf}");
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    let leaf_dir = project_root.join(&leaf_rel);
+    // Join the full forward-slash rel rather than `leaf_dir.join(&jar_leaf)`:
+    // the joined form puts an OS separator (`\` on Windows) before the leaf
+    // while every other reported path keeps the rel's forward slashes —
+    // `package_path` reports (and tests compare) this as a display string.
+    let jar_path = project_root.join(&jar_copy_rel);
+    let repo_id = format!("{VENDOR_REPO_ID_PREFIX}{}", record.uuid);
+
+    // A patch with no files is meaningless to vendor: no-op success, no edits.
+    if record.files.is_empty() {
+        return Err(done(
+            synthesized_result(purl, &jar_path, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        ));
+    }
+
+    // ── project pom.xml: presence + aggregator/gradle refusals ────────────
+    let pom_xml_path = project_root.join(PROJECT_POM);
+    let pom_xml_text: Option<String> = match read_regular_to_string(&pom_xml_path).await {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(refused(
+                "vendor_maven_pom_unreadable",
+                format!("unreadable {}: {e}", pom_xml_path.display()),
+            ));
+        }
+    };
+    let Some(pom_xml_text) = pom_xml_text else {
+        // No project pom.xml: a gradle-only project has no <repositories> to
+        // wire (and Gradle ignores it); anything else is not a Maven project.
+        if project_has_gradle(project_root).await {
+            return Err(refused(
+                "vendor_gradle_unsupported",
+                "this is a Gradle project (no pom.xml); vendoring wires a Maven \
+                 <repository>, which Gradle does not consume",
+            ));
+        }
+        return Err(refused(
+            "vendor_maven_pom_project_missing",
+            format!("no {PROJECT_POM} at the project root to wire a vendored <repository> into"),
+        ));
+    };
+    if declares_modules(&pom_xml_text) {
+        return Err(refused(
+            "vendor_maven_multimodule_unsupported",
+            "the root pom.xml declares <modules> (a multi-module aggregator); \
+             ${project.basedir} would resolve to each submodule, not the root, so a \
+             file:// vendored repository cannot be wired here",
+        ));
+    }
+
+    let wired = pom_xml_text.contains(&repo_id);
+    let in_sync = wired && artifact_in_sync(&leaf_dir, &jar_leaf, &pom_leaf, &record.files).await;
+    Ok(MavenPrelude {
+        group_id: group_id.to_string(),
+        artifact_id: artifact_id.to_string(),
+        version: version.to_string(),
+        uuid_dir_rel,
+        group_path,
+        leaf_rel,
+        jar_leaf,
+        pom_leaf,
+        jar_copy_rel,
+        uuid_dir,
+        leaf_dir,
+        jar_path,
+        repo_id,
+        pom_xml_path,
+        pom_xml_text,
+        wired,
+        in_sync,
+    })
+}
+
+/// Whether [`vendor_maven`] — a wet run with the service enabled — asks the
+/// patch service for `record`: past every refusal it raises first and not
+/// answered by the in-sync hot path. The vendor loop's download plan
+/// consults this.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> bool {
+    matches!(maven_prelude(purl, project_root, record).await, Ok(p) if !p.in_sync)
+}
+
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
 /// repository at `.socket/vendor/maven/<uuid>/`, copy the real upstream pom
 /// beside it, and wire the project `pom.xml` with a `<repository>` serving it
@@ -161,92 +324,30 @@ pub async fn vendor_maven(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
-    // ── coordinates ──────────────────────────────────────────────────────
-    let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a maven purl: {purl}"));
+    let MavenPrelude {
+        group_id,
+        artifact_id,
+        version,
+        uuid_dir_rel,
+        group_path,
+        leaf_rel,
+        jar_leaf,
+        pom_leaf,
+        jar_copy_rel,
+        uuid_dir,
+        leaf_dir,
+        jar_path,
+        repo_id,
+        pom_xml_path,
+        pom_xml_text,
+        wired,
+        in_sync,
+    } = match maven_prelude(purl, project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
     };
     let (group_id, artifact_id, version) =
-        (group_id.as_ref(), artifact_id.as_ref(), version.as_ref());
-    // SECURITY: `uuid`, `group_id`, `artifact_id`, and `version` come from
-    // committed, tamper-able manifest data. They key the uuid dir vendor
-    // creates and `--revert` deletes, the nested maven2 path, the vendored
-    // filenames, and — via `pom.xml` — an XML attribute value. Reject anything
-    // that could traverse out of `.socket/vendor/maven/` fail-closed before any
-    // disk access.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("maven", &record.uuid) else {
-        return refused(
-            "unsafe_coordinates",
-            format!("non-canonical patch uuid {:?}", record.uuid),
-        );
-    };
-    // Each dot-delimited groupId segment must be a safe path segment on its
-    // own (which also rejects an empty groupId and leading/trailing/double
-    // dots), as must the artifactId and version.
-    if !is_safe_maven_coordinate(group_id, artifact_id, version) {
-        return refused(
-            "unsafe_coordinates",
-            format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
-        );
-    }
-
-    let group_path = group_id_to_path(group_id);
-    let leaf_rel = format!("{uuid_dir_rel}/{group_path}/{artifact_id}/{version}");
-    let jar_leaf = format!("{artifact_id}-{version}.jar");
-    let pom_leaf = format!("{artifact_id}-{version}.pom");
-    let jar_copy_rel = format!("{leaf_rel}/{jar_leaf}");
-    let uuid_dir = project_root.join(&uuid_dir_rel);
-    let leaf_dir = project_root.join(&leaf_rel);
-    // Join the full forward-slash rel rather than `leaf_dir.join(&jar_leaf)`:
-    // the joined form puts an OS separator (`\` on Windows) before the leaf
-    // while every other reported path keeps the rel's forward slashes —
-    // `package_path` reports (and tests compare) this as a display string.
-    let jar_path = project_root.join(&jar_copy_rel);
-    let repo_id = format!("{VENDOR_REPO_ID_PREFIX}{}", record.uuid);
-
-    // A patch with no files is meaningless to vendor: no-op success, no edits.
-    if record.files.is_empty() {
-        return done(
-            synthesized_result(purl, &jar_path, Vec::new(), true, None),
-            None,
-            Vec::new(),
-        );
-    }
-
-    // ── project pom.xml: presence + aggregator/gradle refusals ────────────
-    let pom_xml_path = project_root.join(PROJECT_POM);
-    let pom_xml_text: Option<String> = match read_regular_to_string(&pom_xml_path).await {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return refused(
-                "vendor_maven_pom_unreadable",
-                format!("unreadable {}: {e}", pom_xml_path.display()),
-            );
-        }
-    };
-    let Some(pom_xml_text) = pom_xml_text else {
-        // No project pom.xml: a gradle-only project has no <repositories> to
-        // wire (and Gradle ignores it); anything else is not a Maven project.
-        if project_has_gradle(project_root).await {
-            return refused(
-                "vendor_gradle_unsupported",
-                "this is a Gradle project (no pom.xml); vendoring wires a Maven \
-                 <repository>, which Gradle does not consume",
-            );
-        }
-        return refused(
-            "vendor_maven_pom_project_missing",
-            format!("no {PROJECT_POM} at the project root to wire a vendored <repository> into"),
-        );
-    };
-    if declares_modules(&pom_xml_text) {
-        return refused(
-            "vendor_maven_multimodule_unsupported",
-            "the root pom.xml declares <modules> (a multi-module aggregator); \
-             ${project.basedir} would resolve to each submodule, not the root, so a \
-             file:// vendored repository cannot be wired here",
-        );
-    }
+        (group_id.as_str(), artifact_id.as_str(), version.as_str());
 
     // The local-cache shadow is inherent to Maven's resolution order, so the
     // advisory is emitted on every run (including dry runs and the idempotent
@@ -258,8 +359,8 @@ pub async fn vendor_maven(
     // sidecars are all in sync → touch nothing, report AlreadyPatched. `entry`
     // stays `None`: the first run's ledger entry holds the only copy of the
     // verbatim pre-vendor pom.xml, and re-recording here would clobber it.
-    if pom_xml_text.contains(&repo_id) {
-        if artifact_in_sync(&leaf_dir, &jar_leaf, &pom_leaf, &record.files).await {
+    if wired {
+        if in_sync {
             return done(
                 already_patched_result(purl, &jar_path, &record.files),
                 None,
@@ -1513,6 +1614,56 @@ mod tests {
             VendorOutcome::Refused { code, detail } => (code, detail),
             VendorOutcome::Done { result, .. } => panic!("not refused: {result:?}"),
         }
+    }
+
+    /// The download plan's gate names exactly the artifacts whose vendor call
+    /// asks the patch service for a grant: not a non-canonical uuid, not the
+    /// empty patch's no-op, and — once vendored — not the in-sync re-run; a
+    /// second patch uuid for the same artifact asks again.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_artifacts_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            (PURL, empty_patch(&record, PLAN_UUID_B)),
+            (
+                "pkg:maven/org..bad/commons-text@1.10.0",
+                with_uuid(&record, PLAN_UUID_B),
+            ),
+            (PURL, with_uuid(&record, PLAN_UUID_C)),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (installed, sources, cfg) = (&installed, &sources, &cfg);
+            Box::pin(async move {
+                vendor_maven(
+                    &purl,
+                    installed.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string(), PLAN_UUID_C.to_string()]);
     }
 
     async fn run_vendor(

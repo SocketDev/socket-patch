@@ -884,6 +884,41 @@ pub fn is_vendorable(purl: &str) -> bool {
     ecosystem_dir_for_purl(purl).is_some()
 }
 
+/// Whether the vendor loop's backend call for `purl` — a wet run with the
+/// patch service enabled — asks the service for `record`'s prebuilt
+/// archive: past every refusal the backend raises before that call, and
+/// answered neither by its in-sync hot path nor by the reuse of a committed
+/// artifact. Each backend answers with the same functions its `vendor_*`
+/// entry point runs first, so a download plan built from this never names a
+/// package the loop refuses before asking (a grant can start a server-side
+/// build and counts against quota). `source_path` is the package source's
+/// [`PackageSource::path`] (the gem backend reads its name and parents);
+/// `pipenv_version` and `installed_sites` are the loop's own pypi caches.
+/// npm is planned in one batch by [`npm_flavor::preflight_packages`] and
+/// answers `false` here, as does anything without a service path.
+pub async fn service_preflight(
+    purl: &str,
+    source_path: &Path,
+    project_root: &Path,
+    record: &crate::manifest::schema::PatchRecord,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &pypi::InstalledSiteListings,
+) -> bool {
+    match ecosystem_dir_for_purl(purl) {
+        Some("cargo") => cargo::service_preflight(purl, project_root, record).await,
+        Some("composer") => composer_lock::service_preflight(purl, project_root, record).await,
+        Some("gem") => gem::service_preflight(purl, source_path, project_root, record).await,
+        Some("golang") => golang::service_preflight(purl, project_root, record).await,
+        Some("maven") => maven_repo::service_preflight(purl, project_root, record).await,
+        Some("nuget") => nuget_feed::service_preflight(purl, project_root, record).await,
+        Some("pypi") => {
+            pypi::service_preflight(purl, project_root, record, pipenv_version, installed_sites)
+                .await
+        }
+        _ => false,
+    }
+}
+
 /// [`VendorState::purl_keys`] over the ledger in `project_root`, loaded
 /// once for callers that match whole purl sets against vendor ownership
 /// (apply / rollback / scan prune). An unreadable ledger degrades to the

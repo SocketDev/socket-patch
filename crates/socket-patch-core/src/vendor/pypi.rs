@@ -659,31 +659,47 @@ async fn pipenv_stale_install_warning(
     ))
 }
 
+/// Everything [`vendor_pypi_with_pipenv_version`] decides before it can
+/// first ask the patch service: the purl and uuid guards, the flavor route
+/// and every wiring pre-flight guard, the in-sync hot path, the ledger entry
+/// anchoring this uuid, and the fresh-path reuse of a committed wheel (which
+/// asks no service either). The download plan evaluates the same function
+/// ahead of the vendor loop ([`service_preflight`]).
+struct PypiPrelude<'p> {
+    base: &'p str,
+    raw_name: String,
+    version: String,
+    canon_name: String,
+    uuid_dir_rel: String,
+    flavor: PypiFlavor,
+    plan: WiringPlan,
+    warnings: Vec<VendorWarning>,
+    in_sync: bool,
+    prior: Option<VendorEntry>,
+    expected_pin: Option<(String, String)>,
+    reused_wheel: Option<AcquiredWheel>,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pypi_with_pipenv_version<'a>(
-    purl: &str,
-    site_packages: impl Into<PackageSource<'a>>,
+async fn pypi_prelude<'p>(
+    purl: &'p str,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    vendored_at: &str,
     dry_run: bool,
-    force: bool,
-    service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &InstalledSiteListings,
-) -> VendorOutcome {
-    let site_packages = site_packages.into();
+) -> Result<PypiPrelude<'p>, VendorOutcome> {
     // The purl may carry `?artifact_id=` variant qualifiers; everything here
     // keys off the qualifier-free base.
     let base = strip_purl_qualifiers(purl);
     let Some((raw_name, version)) = parse_pypi_purl(base) else {
-        return refused(
+        return Err(refused(
             "pypi_invalid_purl",
             format!("{purl} is not a pkg:pypi PURL with a version"),
-        );
+        ));
     };
-    let (raw_name, version) = (raw_name.as_ref(), version.as_ref());
+    let (raw_name, version) = (raw_name.to_string(), version.to_string());
+    let (raw_name, version) = (raw_name.as_str(), version.as_str());
     let canon_name = canonicalize_pypi_name(raw_name);
 
     // SECURITY: the uuid comes from a committed, tamper-able manifest and
@@ -691,20 +707,20 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     // deletes). Anything but the canonical UUID grammar is rejected
     // fail-closed before any disk access.
     let Some(uuid_dir_rel) = vendor_uuid_dir_rel("pypi", &record.uuid) else {
-        return refused(
+        return Err(refused(
             "vendor_unsafe_uuid",
             format!(
                 "patch uuid {:?} is not a canonical lowercase uuid; refusing to derive a \
                  vendor path from it",
                 record.uuid
             ),
-        );
+        ));
     };
 
     let (flavor, flavor_warnings) =
         match detect_pypi_flavor(project_root, Some((&canon_name, version))).await {
             Ok(f) => f,
-            Err((code, detail)) => return refused(code, detail),
+            Err((code, detail)) => return Err(refused(code, detail)),
         };
 
     // Pre-flight the wiring guards BEFORE building anything, so refusals
@@ -723,7 +739,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         PypiFlavor::UvProject => {
             let project = match load_uv_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             match check_target_guards(&project, &canon_name, &record.uuid) {
                 Ok(UvTarget::InSync) => {
@@ -734,7 +750,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Uv(Box::new(project))
                 }
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::PythonLocks => {
@@ -747,7 +763,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             .await
             {
                 Ok(project) => project,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             if project.in_sync {
                 wired_pin = project.pin;
@@ -763,7 +779,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                     WiringPlan::InSync
                 }
                 Ok(project) => WiringPlan::Hatch(project),
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Requirements => {
@@ -773,13 +789,13 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                     WiringPlan::InSync
                 }
                 Ok(RequirementsTarget::Fresh) => WiringPlan::Requirements,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Poetry => {
             let project = match super::pypi_poetry::load_poetry_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             match super::pypi_poetry::check_target_guards(
                 &project,
@@ -795,13 +811,13 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Poetry(Box::new(project))
                 }
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Pdm => {
             let project = match super::pypi_pdm::load_pdm_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             match super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid)
             {
@@ -813,19 +829,19 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Pdm(Box::new(project))
                 }
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Pipenv => {
             let project = match super::pypi_pipenv::load_pipenv_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             let installer = *pipenv_version
                 .get_or_init(|| crate::utils::pipenv::installed_major(project_root))
                 .await;
             if installer.is_some_and(|major| major < 2018) {
-                return refused("pypi_pipenv_installer_unsupported", "vendored wheel references require Pipenv 2018 or later; upgrade Pipenv or use hosted mode");
+                return Err(refused("pypi_pipenv_installer_unsupported", "vendored wheel references require Pipenv 2018 or later; upgrade Pipenv or use hosted mode"));
             }
             if installer.is_none() {
                 // Fail-open like hosted, but say so: the wiring assumes a
@@ -847,7 +863,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             ) {
                 Ok(target) => target,
                 // A refusal carries no warnings: probe nothing for it.
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             if target == PipenvTarget::Fresh {
                 warnings.extend(project.warnings.iter().cloned());
@@ -887,11 +903,11 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await
         };
         if artifact_present || dry_run {
-            return done(
+            return Err(done(
                 already_patched_result(base, Path::new(""), &record.files),
                 None,
                 warnings,
-            );
+            ));
         }
     }
 
@@ -955,14 +971,13 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                     acquired.rel_wheel
                 ),
             ));
-            return done(
+            return Err(done(
                 reuse_preview_result(base, &project_root.join(&acquired.rel_wheel), record),
                 None,
                 warnings,
-            );
+            ));
         }
     }
-    let reused = reused_wheel.is_some();
     if let Some(acquired) = &reused_wheel {
         warnings.push(VendorWarning::new(
             "vendor_artifact_reused",
@@ -972,6 +987,83 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             ),
         ));
     }
+    Ok(PypiPrelude {
+        base,
+        raw_name: raw_name.to_string(),
+        version: version.to_string(),
+        canon_name,
+        uuid_dir_rel,
+        flavor,
+        plan,
+        warnings,
+        in_sync,
+        prior,
+        expected_pin,
+        reused_wheel,
+    })
+}
+
+/// Whether [`vendor_pypi_with_pipenv_version`] — a wet run with the service
+/// enabled — asks the patch service for `record`: past every refusal it
+/// raises first, and answered neither by the in-sync hot path nor by the
+/// reuse of a committed wheel. The vendor loop's download plan consults
+/// this, with the loop's own Pipenv-release cell and site listings.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &InstalledSiteListings,
+) -> bool {
+    matches!(
+        pypi_prelude(purl, project_root, record, false, pipenv_version, installed_sites).await,
+        Ok(p) if p.reused_wheel.is_none()
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_pypi_with_pipenv_version<'a>(
+    purl: &str,
+    site_packages: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &InstalledSiteListings,
+) -> VendorOutcome {
+    let site_packages = site_packages.into();
+    let PypiPrelude {
+        base,
+        raw_name,
+        version,
+        canon_name,
+        uuid_dir_rel,
+        flavor,
+        plan,
+        mut warnings,
+        in_sync,
+        prior,
+        expected_pin,
+        reused_wheel,
+    } = match pypi_prelude(
+        purl,
+        project_root,
+        record,
+        dry_run,
+        pipenv_version,
+        installed_sites,
+    )
+    .await
+    {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
+    };
+    let (raw_name, version) = (raw_name.as_str(), version.as_str());
+    let reused = reused_wheel.is_some();
 
     // Acquire the patched wheel: prefer the prebuilt service artifact (which
     // skips needing the package installed), else build it locally. A refusal /
@@ -2897,6 +2989,61 @@ wheels = [
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
             .mount(server)
             .await;
+    }
+
+    /// The download plan's gate names exactly the packages whose vendor call
+    /// asks the patch service for a grant: none it refuses first (not a pypi
+    /// purl, a non-canonical uuid) — a package the requirements do not list
+    /// is only refused at wiring time, after the download — and, once
+    /// vendored, not the in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_packages_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed, PLAN_UUID_B,
+            PLAN_UUID_C,
+        };
+        let fx = e2e_fixture().await;
+        let (root, site_packages, record) = (fx.root.as_path(), &fx.site_packages, &fx.record);
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let pipenv_version = tokio::sync::OnceCell::new();
+        let installed_sites = InstalledSiteListings::default();
+        let (pv, sites) = (&pipenv_version, &installed_sites);
+        let cases = [
+            ("pkg:pypi/six@1.16.0", record.clone()),
+            ("pkg:pypi/six@1.16.0", with_uuid(record, "not-a-uuid")),
+            ("pkg:pypi/absent@1.0.0", with_uuid(record, PLAN_UUID_B)),
+            ("pkg:npm/six@1.16.0", with_uuid(record, PLAN_UUID_C)),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec, pv, sites).await })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (sources, cfg) = (&sources, &cfg);
+            Box::pin(async move {
+                vendor_pypi_with_pipenv_version(
+                    &purl,
+                    site_packages.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                    pv,
+                    sites,
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string(), PLAN_UUID_B.to_string()]);
+        // Vendored now: the re-run is in sync and asks nothing.
+        let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
+        assert!(rerun.is_empty(), "{rerun:?}");
     }
 
     /// Service success (requirements flavor): the prebuilt wheel is written, the

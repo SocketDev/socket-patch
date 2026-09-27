@@ -16,7 +16,7 @@
 //! recorded ([`VendorEntry::took_over_go_patches`]) so `--revert` can tell
 //! the user the redirect is NOT restored (re-run `apply` for that).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{MismatchPolicy, PatchSources};
@@ -43,60 +43,63 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
-/// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
-/// `replace` directive + marker, returning the ledger entry to persist.
-///
-/// * `pristine_src` — the crawler's module-cache dir (case-encoded on disk).
-///   It is copied, never mutated.
-/// * `vendored_at` — caller-formatted RFC3339 timestamp for the marker.
-///
-/// `dry_run` writes nothing (read-only verify against `pristine_src`);
-/// `entry` is then `None`. A user-authored `replace` for the same
-/// module+version surfaces as a failed result (the engine's `go.mod` editor
-/// refuses it), not a refusal — the verify report is still useful.
-#[allow(clippy::too_many_arguments)]
-pub async fn vendor_go_module<'a>(
+/// Everything [`vendor_go_module`] decides before it can first ask the patch
+/// service: the coordinate guards, the socket-owned `replace` already in
+/// go.mod, and whether it wires an intact copy of this uuid. The download
+/// plan evaluates the same function ahead of the vendor loop
+/// ([`service_preflight`]).
+struct GoPrelude {
+    module: String,
+    version: String,
+    base_rel: String,
+    takeover: bool,
+    hosted_takeover: bool,
+    prior_target: Option<String>,
+    wired: bool,
+    wired_version_ok: bool,
+    copy_dir: PathBuf,
+    copy_was_ok: bool,
+}
+
+async fn go_prelude(
     purl: &str,
-    pristine_src: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    vendored_at: &str,
-    dry_run: bool,
-    force: bool,
-    service: Option<&VendorServiceConfig>,
-) -> VendorOutcome {
-    let pristine_src = pristine_src.into();
+) -> Result<GoPrelude, VendorOutcome> {
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((module, version)) = parse_golang_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a golang purl: {purl}"));
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a golang purl: {purl}"),
+        ));
     };
-    let (module, version) = (module.as_ref(), version.as_ref());
+    let (module, version) = (module.to_string(), version.to_string());
+    let (module, version) = (module.as_str(), version.as_str());
     // SECURITY: `module`+`version` key the on-disk copy dir
     // (`.socket/vendor/golang/<uuid>/<module>@<version>/`) and the `replace`
     // target path. A `..` segment / absolute path / backslash from a tampered
     // manifest PURL would let the copy escape `.socket/vendor/` — refuse
     // before any disk access (same guard the redirect engine applies).
     if !are_safe_redirect_coords(module, version) {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!(
                 "refusing to vendor unsafe golang coordinates `{module}`/`{version}` \
                  (a `..` segment, absolute path, or separator would escape \
                  .socket/vendor/golang/)"
             ),
-        );
+        ));
     }
     // SECURITY: the uuid is a dedicated path level created here and deleted by
     // `--revert`; anything but the canonical UUID grammar is rejected.
     let Some(base_rel) = vendor_uuid_dir_rel("golang", &record.uuid) else {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!(
                 "refusing to vendor {purl}: patch uuid `{}` is not a canonical uuid",
                 record.uuid
             ),
-        );
+        ));
     };
 
     // Detect an existing socket-owned directive BEFORE the engine rewrites it:
@@ -148,6 +151,73 @@ pub async fn vendor_go_module<'a>(
     let copy_dir = copy_dir_for(project_root, &base_rel, module, version);
     let copy_was_ok =
         wired && wired_version_ok && copy_matches_after_hashes(&copy_dir, &record.files).await;
+    Ok(GoPrelude {
+        module: module.to_string(),
+        version: version.to_string(),
+        base_rel,
+        takeover,
+        hosted_takeover,
+        prior_target,
+        wired,
+        wired_version_ok,
+        copy_dir,
+        copy_was_ok,
+    })
+}
+
+/// Whether [`vendor_go_module`] — a wet run with the service enabled — asks
+/// the patch service for `record`: past its coordinate guards, not answered
+/// by the wired-and-intact hot path, and not the empty patch the service
+/// leg skips. The vendor loop's download plan consults this.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> bool {
+    matches!(go_prelude(purl, project_root, record).await, Ok(p) if !p.copy_was_ok)
+        && !record.files.is_empty()
+}
+
+/// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
+/// `replace` directive + marker, returning the ledger entry to persist.
+///
+/// * `pristine_src` — the crawler's module-cache dir (case-encoded on disk).
+///   It is copied, never mutated.
+/// * `vendored_at` — caller-formatted RFC3339 timestamp for the marker.
+///
+/// `dry_run` writes nothing (read-only verify against `pristine_src`);
+/// `entry` is then `None`. A user-authored `replace` for the same
+/// module+version surfaces as a failed result (the engine's `go.mod` editor
+/// refuses it), not a refusal — the verify report is still useful.
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_go_module<'a>(
+    purl: &str,
+    pristine_src: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let pristine_src = pristine_src.into();
+    let GoPrelude {
+        module,
+        version,
+        base_rel,
+        takeover,
+        hosted_takeover,
+        prior_target,
+        wired,
+        wired_version_ok,
+        copy_dir,
+        copy_was_ok,
+    } = match go_prelude(purl, project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
+    };
+    let (module, version) = (module.as_str(), version.as_str());
 
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
@@ -871,6 +941,59 @@ mod tests {
         .unwrap();
 
         (dir, blobs, pristine, record_with(files))
+    }
+
+    /// The download plan's gate names exactly the modules whose vendor call
+    /// asks the patch service for a grant: none with unsafe coordinates or a
+    /// non-canonical uuid, not the empty patch (the service leg skips it),
+    /// and — once vendored and wired — not the in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_modules_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            (
+                "pkg:golang/github.com/foo/../evil@v1.0.0",
+                with_uuid(&record, PLAN_UUID_C),
+            ),
+            (PURL, empty_patch(&record, PLAN_UUID_C)),
+            (
+                "pkg:golang/github.com/foo/bar@v9.9.9",
+                with_uuid(&record, PLAN_UUID_B),
+            ),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (pristine, sources, cfg) = (&pristine, &sources, &cfg);
+            Box::pin(async move {
+                vendor_go_module(
+                    &purl,
+                    pristine.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string(), PLAN_UUID_B.to_string()]);
     }
 
     async fn run_vendor(
