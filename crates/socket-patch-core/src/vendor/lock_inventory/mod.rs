@@ -74,7 +74,6 @@ pub(crate) use self::composer::{composer_lock_packages, ComposerLockPackage};
 pub(crate) use self::npm::{npm_lock_nodes, NpmLockNode};
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
-pub(crate) use self::pnpm::pnpm_registry_key;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
 pub use self::view::{MemoryEntry, MemoryProject, ProjectView};
@@ -173,7 +172,7 @@ pub struct LockfileEntry {
 }
 
 impl LockfileEntry {
-    fn npm(
+    pub(crate) fn npm(
         name: impl Into<String>,
         version: impl Into<String>,
         resolved: Option<String>,
@@ -364,7 +363,7 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
 /// (drops `git+…`, `file:…`, `link:…` — content the registry conventions
 /// cannot reproduce; such entries stay listed for discovery but the fetch
 /// layer's integrity rule decides fetchability).
-fn http_url(raw: &str) -> Option<String> {
+pub(crate) fn http_url(raw: &str) -> Option<String> {
     (raw.starts_with("https://") || raw.starts_with("http://")).then(|| raw.to_string())
 }
 

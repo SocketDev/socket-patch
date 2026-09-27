@@ -320,21 +320,16 @@ fn recover_npm_fragment(
             return Ok(mk(resolved, LockIntegrity::Sri(sri.to_string())));
         }
     }
-    // pnpm: the original is the packages block's lines; pull
-    // `resolution: {integrity: …, tarball: …}`.
+    // pnpm: the original is the packages block's lines, read with the
+    // format model's entry grammar.
     if let Some(lines) = wiring_original(entry, &["pnpm_lock_package"]).and_then(lines_of) {
-        let mut sri = None;
-        let mut tarball = None;
-        for line in &lines {
-            if let Some(v) = inline_yaml_field(line, "integrity:") {
-                sri = sri.or(Some(v));
+        if let Some((Some(sri), tarball)) = crate::formats::pnpm::fragment_resolution(&lines) {
+            if is_sri_pin(&sri) {
+                return Ok(mk(
+                    tarball.as_deref().and_then(http_url),
+                    LockIntegrity::Sri(sri),
+                ));
             }
-            if let Some(v) = inline_yaml_field(line, "tarball:") {
-                tarball = tarball.or(http_url(&v));
-            }
-        }
-        if let Some(sri) = sri.filter(|s| is_sri_pin(s)) {
-            return Ok(mk(tarball, LockIntegrity::Sri(sri)));
         }
     }
     // yarn classic: block lines carry `integrity <sri>` (preferred) and/or

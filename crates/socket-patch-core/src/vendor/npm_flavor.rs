@@ -25,7 +25,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
-use super::pnpm_lock_legacy::PnpmLockGrammar;
+use crate::formats::pnpm::PnpmLockGrammar;
 use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
@@ -215,7 +215,7 @@ pub(crate) async fn detect_npm_lock_flavor(
         //    anything else refuses with the sniff's version-aware remedy.
         if exists(PNPM_LOCK).await {
             let text = read_lock(project_root, PNPM_LOCK).await?;
-            match pnpm_lock_legacy::sniff_lock_grammar(&text) {
+            match crate::formats::pnpm::sniff_lock_grammar(&text) {
                 Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
                 Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
                     break 'flavor NpmLockFlavor::PnpmLegacy

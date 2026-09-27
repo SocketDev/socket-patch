@@ -304,15 +304,12 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     }
     if let Some(text) = read("pnpm-lock.yaml").await {
         if text.contains(&needle) {
-            // Same version allowlist as core's `sniff_lock_grammar`.
-            return match text
-                .lines()
-                .find_map(|l| l.strip_prefix("lockfileVersion:"))
-                .map(|v| v.trim().trim_matches(['\'', '"']))
-            {
-                Some("9.0") => Some("pnpm".to_string()),
-                Some("5.4") | Some("6.0") => Some("pnpm-legacy".to_string()),
-                _ => None,
+            // The format model's vendor allowlist sniff.
+            use socket_patch_core::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
+            return match sniff_lock_grammar(&text) {
+                Ok(PnpmLockGrammar::V9) => Some("pnpm".to_string()),
+                Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => Some("pnpm-legacy".to_string()),
+                Err(_) => None,
             };
         }
     }

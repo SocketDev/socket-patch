@@ -313,41 +313,11 @@ pub(crate) fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run:
     )
 }
 
-/// `lockfileVersion` major sniffed from a pnpm-lock.yaml head. pnpm 9-12
-/// emit `lockfileVersion: '9.0'` (single doc, first line); pnpm 8 emits
-/// `'6.0'`, pnpm 7 an unquoted `5.4`. `None` when no parseable version line
-/// exists — callers treat that as "not trust-policy era" and stay
-/// hands-off (fail closed: never write config for a lock we can't read).
-pub(crate) fn pnpm_lock_version_major(lock_text: &str) -> Option<u32> {
-    lock_text.lines().find_map(|line| {
-        let rest = line.strip_prefix("lockfileVersion:")?;
-        let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-        value.split('.').next()?.parse::<u32>().ok()
-    })
-}
-
-/// Whether a pnpm lock may belong to pnpm 1–4, which spell the store flag
-/// `--store` (pnpm 1–3 can silently ignore `--store-dir`; early pnpm 4
-/// rejects it): a `shrinkwrapVersion` lock (pnpm 1–2) or lockfileVersion
-/// 5.0–5.2 (pnpm 3–5). Later locks never get the `--store` note.
-pub(crate) fn pnpm_lock_may_need_store_flag(lock_text: &str) -> bool {
-    lock_text.lines().any(|line| {
-        if line.starts_with("shrinkwrapVersion:") {
-            return true;
-        }
-        let Some(rest) = line.strip_prefix("lockfileVersion:") else {
-            return false;
-        };
-        let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-        let mut parts = value.split('.');
-        let major = parts.next().and_then(|m| m.parse::<u32>().ok());
-        let minor = parts
-            .next()
-            .and_then(|m| m.parse::<u32>().ok())
-            .unwrap_or(0);
-        major == Some(5) && minor <= 2
-    })
-}
+// The pnpm lock-version sniffs live with the format's model.
+pub(crate) use socket_patch_core::formats::pnpm::{
+    lock_version_major as pnpm_lock_version_major,
+    may_need_store_flag as pnpm_lock_may_need_store_flag,
+};
 
 /// The planned pnpm-workspace.yaml `trustLockfile: true` edit.
 pub(crate) enum TrustPlan {
