@@ -544,6 +544,19 @@ a scan starts reporting fewer patches than it should because some requests are b
 rejected. `SOCKET_API_CONCURRENCY=1` sends one request at a time, the slowest and most
 conservative setting. An unset, empty or non-numeric value leaves the defaults in place.
 
+A throttled patch API is retried, within bounds. An HTTP `429` or `503` answer to any
+patch-API query (batch search, patch lists, patch views, VEX record fetches, hosted
+package references) is retried up to 3 times, waiting as long as the server's
+`Retry-After` asks (seconds or an HTTP date, at most 30 s per wait) or, without one,
+0.5 s, 1 s, 2 s with jitter. All waits in one run share a 60 s budget, so a heavily
+throttled run gives up quickly instead of hanging. `SOCKET_API_MAX_RETRIES=<n>` changes
+the per-request count (`0`-`10`; `0` turns retries off). Other errors are never retried.
+A query still throttled after its retries is reported, never dropped: a failed batch
+prints `Warning: API batch <n> of <total> failed: …` (under `--json`, a top-level
+`warnings[]` entry with code `api_batch_failed`), a failed patch-list lookup prints
+`Warning: could not fetch details for <purl>: …` (`--json`: `patch_details_failed`), and
+if every query fails the scan exits 1 with an error, as before.
+
 The crawl has a pacing knob too. Its directory walks (`node_modules`, and the Maven
 repository with its POM parse) run on a small pool of threads: 4 by default (fewer on a machine with fewer performance cores), because the walk is bound
 by the kernel's directory cache and more threads only add system time.

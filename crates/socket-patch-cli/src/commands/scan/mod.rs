@@ -446,7 +446,10 @@ async fn embed_vex_human(
 /// human-only output knobs of [`fetch_patch_details`] (the JSON callers pass
 /// `false, false`; the hosted human arm passes the same values as the agent
 /// human arm, so the two print the same progress counter and per-package
-/// warnings).
+/// warnings). `json_warnings` is the JSON callers' envelope: a partial
+/// failure (some queries failed, not all) adds one
+/// [`PATCH_DETAILS_FAILED`] run-level warning per failed package to it.
+#[allow(clippy::too_many_arguments)]
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
@@ -455,6 +458,7 @@ async fn discover_selected(
     show_progress: bool,
     warn: bool,
     telemetry: &mut PendingTelemetry,
+    json_warnings: Option<&mut serde_json::Value>,
 ) -> Result<Vec<PatchSearchResult>, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
@@ -471,6 +475,18 @@ async fn discover_selected(
         let message = format!("all {error_count} patch-detail queries failed: {err}");
         eprintln!("Error: {message}");
         return Err((1, message));
+    }
+    // Some queries failed, some succeeded: a `--json` run has no stderr
+    // warning (`warn` is human-only), so each failed package becomes a
+    // run-level `warnings[]` entry — never a silent drop from the envelope.
+    if let Some(result) = json_warnings {
+        for (purl, e) in &failures {
+            push_scan_json_warning(
+                result,
+                PATCH_DETAILS_FAILED,
+                &format!("could not fetch details for {purl}: {e}"),
+            );
+        }
     }
     if all_search_results.is_empty() {
         return Ok(Vec::new());
@@ -1269,6 +1285,21 @@ pub(super) const HOSTED_WIRING_RETAINED: &str = "hosted_wiring_retained";
 /// package(s) did NOT convert to agent mode.
 pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retained";
 
+/// Run-level `--json` warning: one API batch query failed (after the
+/// client's bounded 429 / 503 retry) while others succeeded, so the
+/// packages in that batch were not checked for patches. The detail is the
+/// human `Warning: API batch <n> of <total> failed: <error>` line without
+/// its prefix. (Every batch failing is the all-batches-failed error
+/// envelope instead.)
+pub(super) const API_BATCH_FAILED: &str = "api_batch_failed";
+
+/// Run-level `--json` warning: one package's patch-detail query failed
+/// (after the client's bounded 429 / 503 retry) while others succeeded, so
+/// its patch was left out of the selection. The detail is the human
+/// `Warning: could not fetch details for <purl>: <error>` line without its
+/// prefix. (Every query failing is the discovery error envelope instead.)
+pub(super) const PATCH_DETAILS_FAILED: &str = "patch_details_failed";
+
 /// The scanned purls whose HOSTED redirect wiring is still live: the
 /// redirect ledger records the purl AND lockfile discovery proves the
 /// current lockfile still routes it to that hosted patch — core
@@ -1927,6 +1958,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let total_batches = all_purls.len().div_ceil(batch_size);
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
+    // `--json` twin of the per-batch stderr warnings: `(batch, error)` in
+    // chunk order, surfaced as run-level `warnings[]` when some batch
+    // succeeded (all failing is the error envelope below).
+    let mut failed_batches: Vec<(usize, String)> = Vec::new();
 
     // Fold one batch outcome, in chunk order. Every caller below consumes
     // outcomes strictly by chunk index, so the per-batch warnings,
@@ -1948,6 +1983,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         Err(e) => {
             batch_error_count += 1;
             last_batch_error = Some(e.to_string());
+            failed_batches.push((batch_idx + 1, e.to_string()));
             // Not fatal by itself: the scan goes on with the other
             // batches. A one-batch scan says it once, below.
             if !args.common.json && !args.common.silent && total_batches > 1 {
@@ -2225,6 +2261,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         if !layout_refusals.is_empty() {
             result["warnings"] = layout_refusal_json(&layout_refusals);
         }
+        // A batch that failed while others succeeded left its packages
+        // unchecked; the human run warns on stderr, the envelope carries
+        // the same line per batch (additive, status and exit unchanged).
+        for (batch, err) in &failed_batches {
+            let line = render::batch_failed_warning(*batch, total_batches, err);
+            let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
+            push_scan_json_warning(&mut result, API_BATCH_FAILED, detail);
+        }
         // Flag lockfile-only packages so JSON consumers can tell "patch
         // available but not installed" from the installed case. Additive
         // field; absent means installed. Matching bridges the API's
@@ -2303,6 +2347,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 false,
                 false,
                 telemetry,
+                Some(&mut result),
             )
             .await
             {
@@ -2700,6 +2745,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             human,
             !silent,
             telemetry,
+            None,
         )
         .await
         {
