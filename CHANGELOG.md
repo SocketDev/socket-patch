@@ -371,7 +371,8 @@ into the new version's section — see docs/releasing.md.
   (`redirect_vlt_sibling_lockfiles`). Before anything is written, each
   artifact is fetched as vlt fetches it: a response vlt would reject
   (re-gzipped, wrong sha512, HTTP error, unreachable) withholds the dep
-  (`redirect_vlt_artifact_unverifiable`) instead of pinning a lock `vlt ci`
+  (`redirect_vlt_artifact_unverifiable`, whose detail spells the URL's
+  grant-token level `<redacted>`) instead of pinning a lock `vlt ci`
   cannot install. After the write, stale installed copies of the
   Socket-owned nodes (`node_modules/.vlt-lock.json` and their
   `node_modules/.vlt/<DepID>` entries) are removed so the next `vlt install`
@@ -411,7 +412,8 @@ into the new version's section — see docs/releasing.md.
   locks vlt
   cannot read and specs that no longer match the lock
   (`vendor_vlt_lock_out_of_sync`); a payload git would ignore refuses with
-  `vendor_artifact_gitignored`, and a package already vendored through
+  `vendor_artifact_gitignored` (git failing to answer warns
+  `vendor_artifact_gitignore_unchecked`), and a package already vendored through
   another lockfile flavor with `vendor_flavor_changed`. `vendor --revert`
   restores the registry node, edges and specs (keeping flags, trailing
   slots and outgoing edge values vlt rewrote since) or keeps everything on

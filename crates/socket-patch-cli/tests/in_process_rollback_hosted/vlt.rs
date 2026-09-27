@@ -434,3 +434,102 @@ async fn vlt_scoped_rollback_of_one_of_two_heals_only_that_package() {
     let ledger = read(root, ".socket/vendor/redirect-state.json");
     assert!(ledger.contains(OTHER_UUID), "{ledger}");
 }
+
+/// Hosted rollback reads `vlt-lock.json` before any revert (to find the
+/// store copies to heal). A FIFO planted at that path must fail the read at
+/// once through the FIFO-safe opener, never block the process in open(2)
+/// waiting for a writer, and the rollback then fails closed: the ledger
+/// keeps the record and the FIFO is left as it was.
+#[cfg(unix)]
+#[tokio::test]
+async fn vlt_hosted_rollback_fails_fast_on_a_fifo_lock() {
+    use std::os::unix::fs::FileTypeExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let _server = hosted_vlt_project(root).await;
+    let lock = root.join("vlt-lock.json");
+    std::fs::remove_file(&lock).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&lock)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let ledger_before = read(root, ".socket/vendor/redirect-state.json");
+
+    let cwd = root.to_str().unwrap().to_string();
+    let mut child = scrubbed_cli()
+        .args(["rollback", "--json", "--yes", "--offline", "--cwd", &cwd])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let exit = loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            break exit;
+        }
+        if std::time::Instant::now() > deadline {
+            // Release a wedged open before failing, so the suite never hangs.
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&lock);
+            let _ = child.kill();
+            panic!("rollback must fail fast on a FIFO vlt-lock.json, not block in open(2)");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    assert!(!exit.success(), "a lock that cannot be read fails closed");
+    assert!(std::fs::symlink_metadata(&lock)
+        .unwrap()
+        .file_type()
+        .is_fifo());
+    assert_eq!(
+        read(root, ".socket/vendor/redirect-state.json"),
+        ledger_before,
+        "nothing is half-reverted"
+    );
+}
+
+/// Replay groups commit on their own: when an unscoped rollback's
+/// package-lock.json group refuses (drifted since the redirect) while the
+/// vlt group restores the registry pins, the patched store copy the
+/// restored vlt-lock.json no longer names is still removed. The heal keys
+/// off the vlt group's own outcome, not off any group's refusal.
+#[tokio::test]
+async fn vlt_heal_follows_the_vlt_group_when_another_group_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    write_vlt_project(root, Era::V1);
+    std::fs::write(root.join("package-lock.json"), package_lock()).unwrap();
+    let (_, doc) = scan_hosted(root, &server, &["--no-npm-allow-remote-config"], &[]);
+    assert_eq!(redirected(&doc), 1, "the scan redirects both locks");
+    vlt_install_patched(root, &server);
+    let drifted = read(root, "package-lock.json")
+        .replace(&artifact_url(&server), "https://example.invalid/left-pad-1.3.0.tgz");
+    std::fs::write(root.join("package-lock.json"), &drifted).unwrap();
+
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, doc, _) = run_json(
+        root,
+        &["rollback", "--yes", "--offline", "--cwd", &cwd],
+        &[],
+    );
+
+    assert_ne!(code, 0, "the refused package-lock.json group fails the run");
+    assert_eq!(
+        read(root, "vlt-lock.json"),
+        vlt_lock(Era::V1, &[registry_node(TILDE_ID)]),
+        "the vlt group restored the registry pins"
+    );
+    assert_eq!(read(root, "package-lock.json"), drifted, "the refused group wrote nothing");
+    assert!(
+        !store_dir(root, TILDE_ID).exists(),
+        "the patched store copy is removed for the restored pins"
+    );
+    assert_eq!(advisory_details(&doc), [RESTORED], "the heal advisory is reported");
+}

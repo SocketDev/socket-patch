@@ -5560,6 +5560,27 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
+/// What [`redact_grant_token`] puts where a hosted URL's grant token was.
+pub const REDACTED_GRANT_TOKEN: &str = "<redacted>";
+
+/// `text` with every `/<token>/<patch_uuid>` pair of `url` spelled
+/// `/<redacted>/<patch_uuid>`: the grant token is the path level just
+/// before the patch-uuid level ([`grant_token_path_segment`]), and it
+/// authorizes the org's download, so a warning, detail or log line that
+/// quotes a hosted artifact URL (the URL itself, or an error that echoes
+/// it) keeps the host, every other path level, the uuid, the leaf and any
+/// query, and loses only the token. `text` comes back unchanged when `url`
+/// has no uuid level or nothing precedes it.
+pub fn redact_grant_token(text: &str, url: &str, patch_uuid: &str) -> String {
+    match grant_token_path_segment(url, patch_uuid) {
+        Some(token) => text.replace(
+            &format!("/{token}/{patch_uuid}"),
+            &format!("/{REDACTED_GRANT_TOKEN}/{patch_uuid}"),
+        ),
+        None => text.to_string(),
+    }
+}
+
 /// Public host of Socket's patch server: the origin every production hosted
 /// artifact / registry URL is served from (`https://patch.socket.dev/patch/…`,
 /// `…/patch-registry/…`), and the root of the Go module namespace
@@ -11589,6 +11610,48 @@ mod tests {
             !warning.detail.contains("vendor --revert"),
             "a user path: dep is not socket wiring: {}",
             warning.detail
+        );
+    }
+
+    /// `redact_grant_token` replaces only the token level before the patch
+    /// uuid, in the URL and in any text quoting it (an error echoing the
+    /// URL included), keeping host, uuid, leaf and query; a URL with no
+    /// token level leaves the text as it was.
+    #[test]
+    fn redact_grant_token_hides_only_the_token_level() {
+        let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        let token = "0f1e2d3c-4b5a-4968-8776-655443322110";
+        let url = format!(
+            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/{token}/{uuid}/left-pad-1.3.0.tgz?x=1"
+        );
+        let redacted = format!(
+            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
+        );
+        assert_eq!(redact_grant_token(&url, &url, uuid), redacted, "the URL alone");
+        let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
+        let want = format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
+        assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
+        assert!(!redact_grant_token(&text, &url, uuid).contains(token), "no token left");
+        let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
+        assert_eq!(
+            redact_grant_token(&registry, &registry, uuid),
+            format!("https://patch.socket.dev/patch-registry/npm/<redacted>/{uuid}"),
+            "a trailing uuid level"
+        );
+        for untouched in [
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".to_string(),
+            format!("https://patch.socket.dev/{uuid}/left-pad-1.3.0.tgz"),
+        ] {
+            assert_eq!(
+                redact_grant_token(&untouched, &untouched, uuid),
+                untouched,
+                "no token level"
+            );
+        }
+        assert_eq!(
+            redact_grant_token(&url, &url, ""),
+            url,
+            "no uuid, nothing to anchor on"
         );
     }
 

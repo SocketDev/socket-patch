@@ -136,6 +136,11 @@ pub fn artifact_url(server: &MockServer) -> String {
     format!("{}{}", server.uri(), artifact_path())
 }
 
+/// [`artifact_url`] as warnings quote it: the grant-token level redacted.
+pub fn redacted_artifact_url(server: &MockServer) -> String {
+    artifact_url(server).replace(&format!("/{TOKEN}/"), "/<redacted>/")
+}
+
 pub async fn mock_discovery(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))

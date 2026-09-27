@@ -258,7 +258,7 @@ async fn assert_preflight_refuses(response: ResponseTemplate, reason: &str) {
         warning_detail(&doc, UNVERIFIABLE),
         format!(
             "vlt would fail to verify {}: {reason}; nothing was written for {PURL}",
-            artifact_url(&server)
+            redacted_artifact_url(&server)
         )
     );
     assert_eq!(skipped_reasons(&doc), [UNVERIFIABLE]);
@@ -333,11 +333,13 @@ async fn scan_redirect_vlt_artifact_fetch_error() {
     assert_eq!(redirected(&doc), 0);
     assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
     let detail = warning_detail(&doc, UNVERIFIABLE);
+    let redacted = url.replace(&format!("/{TOKEN}/"), "/<redacted>/");
     assert!(
-        detail.starts_with(&format!("vlt would fail to verify {url}: fetch error "))
+        detail.starts_with(&format!("vlt would fail to verify {redacted}: fetch error "))
             && detail.ends_with(&format!("; nothing was written for {PURL}")),
-        "{detail}"
+        "the fetch-error refusal quotes the redacted URL"
     );
+    assert!(!detail.contains(TOKEN), "the grant token never reaches the warning");
 }
 
 async fn redirect_chain(hops: usize) -> (Value, tempfile::TempDir) {
@@ -485,7 +487,7 @@ async fn scan_redirect_vlt_artifact_ambiguous_withholds_vlt_only() {
         format!(
             "vlt would fail to verify {}: content-encoding gzip; vlt-lock.json was not changed \
              for {PURL}",
-            artifact_url(&server)
+            redacted_artifact_url(&server)
         )
     );
     assert!(skipped_reasons(&doc).is_empty(), "{doc:#}");
@@ -533,7 +535,7 @@ async fn scan_redirect_vlt_artifact_ambiguous_earlier_pin_is_not_confirmed() {
         format!(
             "vlt would fail to verify {}: content-encoding gzip; {PURL} was left pinned by an \
              earlier run and `vlt ci` will fail until the artifact verifies",
-            artifact_url(&server)
+            redacted_artifact_url(&server)
         )
     );
 }
@@ -563,7 +565,7 @@ async fn scan_redirect_vlt_store_dir_without_hidden_lock_drives() {
         warning_detail(&doc, UNVERIFIABLE),
         format!(
             "vlt would fail to verify {}: content-encoding gzip; nothing was written for {PURL}",
-            artifact_url(&server)
+            redacted_artifact_url(&server)
         )
     );
 }
@@ -882,7 +884,7 @@ async fn scan_redirect_vlt_artifact_already_pinned_failure_left_pinned() {
         format!(
             "vlt would fail to verify {}: content-encoding gzip; {PURL} was left pinned by an \
              earlier run and `vlt ci` will fail until the artifact verifies",
-            artifact_url(&server)
+            redacted_artifact_url(&server)
         )
     );
 }

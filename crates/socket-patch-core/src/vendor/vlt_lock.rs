@@ -3906,7 +3906,10 @@ mod tests {
         plant(true);
         let warning = keep_vlt_links(&first, &kept, &fx.root).await.unwrap();
         assert_eq!(warning.code, REINSTALL_REQUIRED);
-        assert!(warning.detail.contains("run `vlt ci`"), "{warning:?}");
+        assert!(
+            warning.detail.contains("run `vlt ci`"),
+            "the planted-link advisory names `vlt ci`"
+        );
         assert!(!live_links.exists());
 
         std::fs::remove_dir_all(&kept).unwrap();

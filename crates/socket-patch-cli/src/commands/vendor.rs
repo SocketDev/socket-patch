@@ -2661,8 +2661,8 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 } else if claimed {
                     let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
-                    let vlt_lock = tokio::fs::read_to_string(
-                        common
+                    let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
+                        &common
                             .cwd
                             .join(socket_patch_core::constants::npm_family::VLT_LOCK),
                     )

@@ -1054,8 +1054,10 @@ pub(crate) async fn run_hosted_leg(
     } else {
         purls.to_vec()
     };
-    let vlt_lock = tokio::fs::read_to_string(
-        common
+    // FIFO-safe: a FIFO or device planted at the lock path must fail this
+    // read at once, not block the rollback in open(2).
+    let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
+        &common
             .cwd
             .join(socket_patch_core::constants::npm_family::VLT_LOCK),
     )
@@ -1162,13 +1164,18 @@ pub(crate) async fn run_hosted_leg(
             }
         }
     }
+    // A target's registry pins are back when its purl reverted, or when the
+    // whole-ledger replay committed the vlt group: groups commit on their
+    // own, so another lock's refusal (a drifted package-lock.json) leaves
+    // the restored vlt-lock.json pins restored.
+    let vlt_group_refused = out.failed.iter().any(|(p, _)| p == "group:vlt");
     let unwound: Vec<_> = vlt_targets
         .into_iter()
         .filter(|t| {
             out.reverted.iter().any(|p| {
                 socket_patch_core::utils::purl::canonical_purl(p)
                     == socket_patch_core::utils::purl::canonical_purl(&t.purl)
-            }) || (replay_eligible && !out.failed.iter().any(|(p, _)| p.starts_with("group:")))
+            }) || (replay_eligible && !vlt_group_refused)
         })
         .collect();
     out.warnings

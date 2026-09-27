@@ -432,18 +432,38 @@ async fn git_output(
 
 /// DESIGN §4.2 probe: `git check-ignore -v --no-index` over `paths`
 /// (project-relative). `Some(rules)` names what ignores them; `None` when
-/// nothing is ignored, git is absent or the root is not a work tree.
+/// nothing is ignored, git is absent or the root is not a work tree, and
+/// also when git could not answer (see [`gitignore_probe`] for the
+/// distinction).
 pub(crate) async fn gitignored(project_root: &Path, paths: &[String]) -> Option<String> {
-    let git = crate::utils::process::resolve_tool("git")?;
-    let (_, inside) = git_output(
+    gitignore_probe(project_root, paths).await.ok().flatten()
+}
+
+/// [`gitignored`], telling "git could not answer" apart: `Err(why)` when
+/// git is installed but failed to start, timed out, or `rev-parse` /
+/// `check-ignore` exited with an error (128: a broken repository, an
+/// unreadable ignore file). Git absent, or a root outside any work tree,
+/// is `Ok(None)`: nothing there will commit the artifact.
+pub(crate) async fn gitignore_probe(
+    project_root: &Path,
+    paths: &[String],
+) -> Result<Option<String>, String> {
+    let Some(git) = crate::utils::process::resolve_tool("git") else {
+        return Ok(None);
+    };
+    let (code, inside) = git_output(
         &git,
         project_root,
         &["rev-parse", "--is-inside-work-tree"],
         None,
     )
-    .await?;
+    .await
+    .ok_or("`git rev-parse` did not run to completion")?;
     if inside.trim() != "true" {
-        return None;
+        return match code {
+            0 | 128 => Ok(None),
+            code => Err(format!("`git rev-parse` exited {code}")),
+        };
     }
     let input: String = paths.iter().map(|p| format!("{p}\0")).collect();
     let (code, out) = git_output(
@@ -452,9 +472,13 @@ pub(crate) async fn gitignored(project_root: &Path, paths: &[String]) -> Option<
         &["check-ignore", "-v", "-z", "--no-index", "--stdin"],
         Some(input),
     )
-    .await?;
+    .await
+    .ok_or("`git check-ignore` did not run to completion")?;
+    if code != 0 && code != 1 {
+        return Err(format!("`git check-ignore` exited {code}"));
+    }
     let lines = ignoring_rules(&out);
-    (code == 0 && !lines.is_empty()).then(|| {
+    Ok((code == 0 && !lines.is_empty()).then(|| {
         let shown: Vec<&str> = lines.iter().take(3).map(String::as_str).collect();
         let more = lines.len().saturating_sub(shown.len());
         let mut detail = shown.join("; ");
@@ -462,7 +486,7 @@ pub(crate) async fn gitignored(project_root: &Path, paths: &[String]) -> Option<
             detail.push_str(&format!("; and {more} more"));
         }
         detail
-    })
+    }))
 }
 
 /// The non-negated matches of `git check-ignore -v -z` output
@@ -483,6 +507,17 @@ fn gitignored_refusal(rel_dir: &str, rules: &str) -> VendorOutcome {
 }
 
 pub(crate) const GITIGNORED: &str = "vendor_artifact_gitignored";
+
+/// The vendored dir was written, but git could not say whether it would
+/// commit it.
+pub(crate) const GITIGNORE_UNCHECKED: &str = "vendor_artifact_gitignore_unchecked";
+
+fn gitignore_unchecked_detail(rel: &str, why: &str) -> String {
+    format!(
+        "could not check whether git would commit the vendored artifact at {rel} ({why}); \
+         make sure no ignore rule covers .socket/ before committing it"
+    )
+}
 
 pub(crate) fn gitignored_detail(rel: &str, rules: &str) -> String {
     format!(
@@ -659,9 +694,16 @@ pub(super) async fn stage_patch_dir(
     for name in [VENDOR_MARKER_FILE, GITIGNORE, GITATTRIBUTES] {
         probe.push(format!("{}/{name}", coords.uuid_dir_rel));
     }
-    if let Some(rules) = gitignored(project_root, &probe).await {
-        let _ = unstage(String::new()).await;
-        return Err(Box::new(gitignored_refusal(&rel_dir, &rules)));
+    match gitignore_probe(project_root, &probe).await {
+        Ok(Some(rules)) => {
+            let _ = unstage(String::new()).await;
+            return Err(Box::new(gitignored_refusal(&rel_dir, &rules)));
+        }
+        Ok(None) => {}
+        Err(why) => warnings.push(VendorWarning::new(
+            GITIGNORE_UNCHECKED,
+            gitignore_unchecked_detail(&rel_dir, &why),
+        )),
     }
     let staged_pkg_json = if touches_manifest {
         match read_manifest(&rel_abs).await {
@@ -1178,6 +1220,37 @@ mod tests {
         assert!(gitignored(&tmp.path().join("missing"), &paths)
             .await
             .is_none());
+    }
+
+    /// Git failing to answer is not "not ignored": `gitignore_probe` says
+    /// so (`gitignored` keeps its fail-open `None`), while git absent or a
+    /// root outside any work tree still has nothing to check.
+    #[tokio::test]
+    async fn the_gitignore_probe_reports_a_git_failure() {
+        let Some(git) = crate::utils::process::resolve_tool("git") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            gitignore_probe(&root, &["a".to_string()]).await,
+            Ok(None),
+            "outside a work tree"
+        );
+        let status = std::process::Command::new(&git)
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // A path outside the repository makes `check-ignore` fail (128).
+        let outside = vec!["../elsewhere/x.js".to_string()];
+        let why = gitignore_probe(&root, &outside).await.unwrap_err();
+        assert!(why.contains("`git check-ignore` exited 128"), "{why}");
+        assert_eq!(gitignored(&root, &outside).await, None);
+        assert!(gitignore_unchecked_detail(".socket/vendor/npm/u/a-1.0.0", &why)
+            .contains("make sure no ignore rule covers .socket/"));
     }
 
     #[cfg(unix)]

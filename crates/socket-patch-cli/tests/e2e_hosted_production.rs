@@ -2615,15 +2615,11 @@ async fn vlt_pinned_matrix_production_hosted_install_proof() {
     let lock = read_lock(&proj);
     let id = node_id(&lock, NPM_NAME, NPM_VERSION);
     let pinned_url = lock["nodes"][&id][3].as_str().map(str::to_string);
+    // A refusal quotes the artifact URL with its grant token redacted, so
+    // the URL to probe comes from the public reference endpoint scan used.
     let url = match pinned_url.filter(|u| u.contains(PATCH_HOST)) {
         Some(u) => u,
-        None => {
-            let detail = warning_detail(&doc, "redirect_vlt_artifact_unverifiable");
-            let rest = detail
-                .strip_prefix("vlt would fail to verify ")
-                .unwrap_or_else(|| panic!("{detail}"));
-            rest.split(": ").next().unwrap().to_string()
-        }
+        None => public_reference_url(NPM_UUID).await,
     };
     assert!(url.contains(NPM_UUID), "{url}");
     let client = reqwest::Client::builder().build().unwrap();
@@ -2661,4 +2657,24 @@ async fn vlt_pinned_matrix_production_hosted_install_proof() {
         assert_patched(&minimist_entry(&co), PATCH_MARKER, "vlt hosted production");
     }
     leg.ran();
+}
+
+/// The hosted artifact URL the public proxy grants for `uuid` — the
+/// reference `scan --mode hosted` resolves on a token-less run.
+async fn public_reference_url(uuid: &str) -> String {
+    use socket_patch_core::api::client::{ApiClient, ApiClientOptions};
+    let client = ApiClient::new(ApiClientOptions {
+        api_url: PROXY.to_string(),
+        api_token: None,
+        use_public_proxy: true,
+        org_slug: None,
+    });
+    let references = client
+        .fetch_registry_references(&[uuid.to_string()])
+        .await
+        .expect("the public proxy answers the reference request");
+    references
+        .get(uuid)
+        .and_then(|r| r.url.clone())
+        .expect("the public proxy grants the free patch's artifact URL")
 }

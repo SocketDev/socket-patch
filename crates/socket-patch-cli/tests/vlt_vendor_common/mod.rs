@@ -426,9 +426,13 @@ pub fn codes(env: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The `failed` event's `(errorCode, error)` for `purl`.
+/// The `failed` event's `(errorCode, error)` for `purl`. The panic names
+/// each event's action and code, never the envelope: its details carry the
+/// patch uuid, which CodeQL flags in panic messages
+/// (`rust/cleartext-logging`).
 pub fn failure(env: &Value, purl: &str) -> (String, String) {
-    events(env)
+    let events = events(env);
+    events
         .iter()
         .find(|e| e["action"] == "failed" && e["purl"] == purl)
         .map(|e| {
@@ -437,7 +441,16 @@ pub fn failure(env: &Value, purl: &str) -> (String, String) {
                 e["error"].as_str().unwrap_or_default().to_string(),
             )
         })
-        .unwrap_or_else(|| panic!("expected a failed event for {purl}: {env:#}"))
+        .unwrap_or_else(|| {
+            let seen: Vec<String> = events
+                .iter()
+                .map(|e| {
+                    let code = e["errorCode"].as_str().or(e["reason"].as_str());
+                    format!("{} {}", e["action"], code.unwrap_or("-"))
+                })
+                .collect();
+            panic!("expected a failed event for {purl}; events: {seen:?}")
+        })
 }
 
 pub fn read(root: &Path, rel: &str) -> String {

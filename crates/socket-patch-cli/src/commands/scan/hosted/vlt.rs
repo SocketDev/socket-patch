@@ -14,7 +14,7 @@ use socket_patch_core::patch::redirect::vlt_heal::{
     self, classify_target, read_install_state, Expected, LedgerTarget, Target, TargetState,
 };
 use socket_patch_core::patch::redirect::vlt_preflight::{self, OFFLINE_REASON};
-use socket_patch_core::patch::redirect::{vlt, DepOverride};
+use socket_patch_core::patch::redirect::{redact_grant_token, vlt, DepOverride};
 
 use super::StaleInstallOutcome;
 
@@ -140,6 +140,7 @@ pub(super) async fn artifact_preflight(
     } else {
         vlt_preflight::probe_artifacts(api_client, &urls).await
     };
+    let mut passed_urls: BTreeSet<&str> = BTreeSet::new();
     for dep in &scope {
         let reason = match probes.get(&dep.artifact_url) {
             None => Some(OFFLINE_REASON.to_string()),
@@ -147,9 +148,7 @@ pub(super) async fn artifact_preflight(
         };
         let Some(reason) = reason else {
             out.passed.insert(dep.patch_uuid.clone());
-            if let Some(body) = probes.get(&dep.artifact_url).and_then(|p| p.body.clone()) {
-                out.artifacts.insert(dep.artifact_url.clone(), body);
-            }
+            passed_urls.insert(&dep.artifact_url);
             continue;
         };
         let purl = deps
@@ -157,21 +156,31 @@ pub(super) async fn artifact_preflight(
             .find(|(_, d)| d.patch_uuid == dep.patch_uuid)
             .map_or("", |(purl, _)| *purl);
         let everywhere = drives || dep.vendored;
+        let detail = unverifiable_detail(
+            &dep.artifact_url,
+            &reason,
+            purl,
+            dep.already_pinned,
+            everywhere,
+        );
         out.warnings.push(serde_json::json!({
             "code": ARTIFACT_UNVERIFIABLE,
-            "detail": unverifiable_detail(
-                &dep.artifact_url,
-                &reason,
-                purl,
-                dep.already_pinned,
-                everywhere,
-            ),
+            "detail": redact_grant_token(&detail, &dep.artifact_url, &dep.patch_uuid),
         }));
         if everywhere {
             out.withheld_everywhere
                 .insert(dep.patch_uuid.clone(), purl.to_string());
         } else {
             out.withheld_from_vlt.insert(dep.patch_uuid.clone());
+        }
+    }
+    // Moved, not copied: every dep has been judged, and the probes are not
+    // read again, so a verified body is held once.
+    for (url, probe) in probes {
+        if passed_urls.contains(url.as_str()) {
+            if let Some(body) = probe.body {
+                out.artifacts.insert(url, body);
+            }
         }
     }
     out

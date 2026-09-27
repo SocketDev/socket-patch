@@ -422,6 +422,35 @@ fn rebuild_reason_label(code: &str) -> &str {
 /// fingerprint — the legacy member-only state pass 1 keeps warning about
 /// (`vendor_inventory_missing` for gems) — and the gap is surfaced, instead
 /// of either failing the repair or canonizing the unverifiable live tree.
+/// The npm-family lockfiles and the vlt importers' package.json files as
+/// they are now, for the unverified-source rebuild's put-back. Read through
+/// the FIFO-safe opener: a FIFO or device at one of these paths is left out
+/// of the snapshot at once instead of blocking the repair in open(2), like
+/// any other file that cannot be read.
+async fn snapshot_npm_wiring_files(cwd: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut names: Vec<String> = [
+        "vlt-lock.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    ]
+    .iter()
+    .map(|n| (*n).to_string())
+    .collect();
+    names.extend(vendor::vlt_lock::vlt_importer_package_jsons(cwd).await);
+    let mut snap = Vec::new();
+    for name in names {
+        let p = cwd.join(name);
+        if let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&p).await {
+            snap.push((p, Some(bytes)));
+        }
+    }
+    snap
+}
+
 /// The entry itself was already persisted by the pre-rebuild restore.
 fn soft_restore_without_fingerprint(
     env: &mut Envelope,
@@ -1568,25 +1597,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         continue;
                     }
                 };
-                let mut names: Vec<String> = [
-                    "vlt-lock.json",
-                    "package-lock.json",
-                    "npm-shrinkwrap.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                    "bun.lock",
-                    "bun.lockb",
-                ]
-                .iter()
-                .map(|n| (*n).to_string())
-                .collect();
-                names.extend(vendor::vlt_lock::vlt_importer_package_jsons(&common.cwd).await);
-                for name in names {
-                    let p = common.cwd.join(name);
-                    if let Ok(bytes) = tokio::fs::read(&p).await {
-                        snap.push((p, Some(bytes)));
-                    }
-                }
+                snap.extend(snapshot_npm_wiring_files(&common.cwd).await);
                 Some(snap)
             } else {
                 None
@@ -1973,6 +1984,49 @@ fn npm_coords(base_purl: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unverified-rebuild snapshot reads vlt-lock.json and the other
+    /// npm-family locks through the FIFO-safe opener: a FIFO at any of them
+    /// is left out of the snapshot at once instead of blocking the repair
+    /// in open(2), and the regular files are still captured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wiring_snapshot_skips_fifo_locks_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let fifos = [root.join("vlt-lock.json"), root.join("package-lock.json")];
+        for fifo in &fifos {
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: plain libc call on a valid C string.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        }
+        std::fs::write(root.join("pnpm-lock.yaml"), b"lockfileVersion: '9.0'\n").unwrap();
+
+        let snap = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            snapshot_npm_wiring_files(root),
+        )
+        .await
+        {
+            Ok(snap) => snap,
+            Err(_) => {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                for fifo in &fifos {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(fifo);
+                }
+                panic!("the wiring snapshot must fail fast on FIFO locks");
+            }
+        };
+        let names: Vec<String> = snap
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["pnpm-lock.yaml"]);
+        assert_eq!(snap[0].1.as_deref(), Some(&b"lockfileVersion: '9.0'\n"[..]));
+    }
 
     /// Build a local native binary resolution through the public binary
     /// rewrite entry point, which shares the codec with vendor's backend.
