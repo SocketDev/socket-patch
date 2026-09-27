@@ -1,15 +1,16 @@
 //! `package-lock.json` / `npm-shrinkwrap.json`: the shared entry walk
 //! ([`npm_lock_nodes`]) and its registry view.
 
+#[cfg(test)]
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::constants::npm_family::NPM_LOCKS;
 use crate::utils::digest::is_sri_pin;
-use crate::utils::fs::read_regular_to_bytes;
 use crate::vendor::path::parse_vendor_path;
 
+use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry};
 
 // ── entry model ──
@@ -105,11 +106,18 @@ fn walk_npm_legacy_dependencies<'a>(
 
 // ── registry view ──
 
+#[cfg(test)]
 pub(super) async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
+    inventory_package_lock_in(&ProjectView::Disk(root)).await
+}
+
+pub(super) async fn inventory_package_lock_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
     // Shrinkwrap wins, mirroring `npm_lock::select_lockfile`.
     let mut bytes = None;
     for lock in NPM_LOCKS {
-        if let Ok(b) = read_regular_to_bytes(&root.join(lock)).await {
+        if let Ok(b) = view.read_bytes(lock).await {
             bytes = Some(b);
             break;
         }

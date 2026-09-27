@@ -1,6 +1,7 @@
 //! `composer.lock`: the shared entry walk ([`composer_lock_packages`]) and
 //! its registry view.
 
+#[cfg(test)]
 use std::path::Path;
 
 use serde_json::Value;
@@ -8,9 +9,9 @@ use serde_json::Value;
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::patch::path_safety;
 use crate::utils::digest::sha1_hex;
-use crate::utils::fs::read_regular_to_bytes;
 use crate::vendor::path::{parse_vendor_path, VendorPathParts};
 
+use super::view::ProjectView;
 use super::{dedup_prefer_integrity, http_url, LockIntegrity, LockfileEntry, SourceKind};
 
 // ── entry model ──
@@ -90,18 +91,26 @@ pub(crate) fn composer_lock_packages(doc: &Value) -> Vec<ComposerLockPackage<'_>
 /// discovery-only. Names lowercase to the canonical packagist form;
 /// versions drop the pretty leading `v`/`V` through the crawler's
 /// [`normalize_version`], so installed and lockfile rows agree.
+#[cfg(test)]
 pub(super) async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    inventory_composer_lock_raw(project_root)
+    inventory_composer_lock_in(&ProjectView::Disk(project_root)).await
+}
+
+/// [`inventory_composer_lock`] over a [`ProjectView`].
+pub(super) async fn inventory_composer_lock_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
+    inventory_composer_lock_raw_in(view)
         .await
         .map(dedup_prefer_integrity)
 }
 
 /// [`inventory_composer_lock`] before its collapse: every instance
 /// ([`super::inventory_project_every_lock`]).
-pub(super) async fn inventory_composer_lock_raw(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let bytes = read_regular_to_bytes(&project_root.join("composer.lock"))
-        .await
-        .ok()?;
+pub(super) async fn inventory_composer_lock_raw_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
+    let bytes = view.read_bytes("composer.lock").await.ok()?;
     let doc: Value = serde_json::from_slice(&bytes).ok()?;
     let mut out = Vec::new();
     for pkg in composer_lock_packages(&doc) {

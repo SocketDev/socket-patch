@@ -86,7 +86,7 @@ fn validate_hosted_wheel_sha256(sha256: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn decode_hosted_wheel_metadata(bytes: &[u8], sha256: &str) -> Result<Option<String>, String> {
+pub fn decode_hosted_wheel_metadata(bytes: &[u8], sha256: &str) -> Result<Option<String>, String> {
     validate_hosted_wheel_sha256(sha256)?;
     if !hex::encode(Sha256::digest(bytes)).eq_ignore_ascii_case(sha256) {
         return Err("hosted wheel sha256 does not match the published artifact".to_string());

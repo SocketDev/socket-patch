@@ -74,6 +74,38 @@ jobs:
             exit 1
           fi
 
+  # The napi addon is only ever loaded by Node, so cargo's own tests never
+  # exercise its JS loader or the engine/provider boundary.
+  node-addon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20.20.2'
+
+      - name: Build addon
+        env:
+          SOCKET_PATCH_NODE_CARGO_PROFILE: dev
+        run: node crates/socket-patch-node/npm/scripts/build-addon.mjs
+
+      - name: Smoke-test addon
+        run: node --test crates/socket-patch-node/npm/test/smoke.mjs
+
   # Lint the out-of-workspace packaging artifacts: the RubyGems CLI launcher
   # gem + the Bundler plugin gem (Ruby), and the curl|sh installer. Ruby is
   # pre-installed on the ubuntu-latest runner.

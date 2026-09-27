@@ -3,10 +3,10 @@
 use std::path::Path;
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
-use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::vendor::bun_lock_text::{self, BunEntry};
 use crate::vendor::bun_lockb::BunLockb;
 
+use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
 
 /// Every `packages` entry of a text `bun.lock`, read with the ONE
@@ -30,21 +30,25 @@ pub(crate) fn bun_text_entries(text: &str) -> Result<Vec<BunEntry>, String> {
 /// `bun.lockb` beside it is not the live lock. Lockfile discovery answers
 /// the same question with `DiscoverCtx::exists` (the same lstat).
 pub(crate) async fn bun_text_lock_present(root: &Path) -> bool {
-    tokio::fs::symlink_metadata(root.join(BUN_LOCK))
-        .await
-        .is_ok()
+    bun_text_lock_present_in(&ProjectView::Disk(root)).await
+}
+
+/// [`bun_text_lock_present`] over a [`ProjectView`].
+pub(crate) async fn bun_text_lock_present_in(view: &ProjectView<'_>) -> bool {
+    view.exists_no_follow(BUN_LOCK).await
 }
 
 // ── registry view ──
 
-pub(super) async fn inventory_bun_binary(
-    root: &Path,
+pub(super) async fn inventory_bun_binary_in(
+    view: &ProjectView<'_>,
 ) -> Result<Vec<LockfileEntry>, UnsupportedNpmLayout> {
     let invalid = |detail: String| UnsupportedNpmLayout {
         code: "bun_lockb_invalid",
         detail: format!("cannot inventory bun.lockb: {detail}"),
     };
-    let bytes = read_regular_to_bytes(&root.join(BUN_LOCKB))
+    let bytes = view
+        .read_bytes(BUN_LOCKB)
         .await
         .map_err(|error| invalid(error.to_string()))?;
     let packages = BunLockb::parse_packages(&bytes).map_err(invalid)?;
@@ -71,8 +75,13 @@ pub(super) async fn inventory_bun_binary(
         .collect())
 }
 
+#[cfg(test)]
 pub(super) async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&root.join(BUN_LOCK)).await.ok()?;
+    inventory_bun_in(&ProjectView::Disk(root)).await
+}
+
+pub(super) async fn inventory_bun_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text(BUN_LOCK).await.ok()?;
     let entries = bun_text_entries(&text).ok()?;
 
     let mut out = Vec::new();
