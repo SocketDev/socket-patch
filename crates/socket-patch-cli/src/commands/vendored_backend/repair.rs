@@ -808,7 +808,17 @@ impl VendoredBackend<'_> {
                     refreshed.artifact.file_inventory = Some(inv);
                     if check_vendored_artifact(&common.cwd, &refreshed, &c.record).await
                         == ArtifactHealth::Healthy
-                        && !persist_vendor_entry(
+                    {
+                        record_warning(
+                            env,
+                            &c.purl,
+                            &VendorWarning::new(
+                                "vendor_inventory_refreshed",
+                                INVENTORY_REFRESHED_DETAIL,
+                            ),
+                            common,
+                        );
+                        if persist_vendor_entry(
                             common,
                             env,
                             &mut state,
@@ -818,7 +828,16 @@ impl VendoredBackend<'_> {
                             &c.record,
                         )
                         .await
-                    {
+                        {
+                            // The write failure is the outcome (already
+                            // recorded): keep the member-verified rebuild
+                            // on disk, but never claim it `rebuilt`.
+                            env.mark_partial_failure();
+                            if let Some((_, kept)) = &kept {
+                                let _ = remove_tree(kept).await;
+                            }
+                            continue;
+                        }
                         entry = refreshed;
                         health = ArtifactHealth::Healthy;
                         inventory_refreshed = true;
@@ -843,9 +862,9 @@ impl VendoredBackend<'_> {
                 // A carried inventory that the re-vendor replaced: the
                 // entry was built elsewhere (the patch service) and this
                 // run's source produced a different, member-verified tree.
-                if inventory_refreshed
-                    || (c.entry.artifact.file_inventory.is_some()
-                        && entry.artifact.file_inventory != c.entry.artifact.file_inventory)
+                if !inventory_refreshed
+                    && c.entry.artifact.file_inventory.is_some()
+                    && entry.artifact.file_inventory != c.entry.artifact.file_inventory
                 {
                     record_warning(
                         env,
