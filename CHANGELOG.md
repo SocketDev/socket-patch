@@ -921,6 +921,15 @@ into the new version's section — see docs/releasing.md.
   NU1100 / NU1101 for the patched package. Both now land after the last
   `<clear />`.
 
+- **nuget redirects and vendoring edit the config NuGet actually reads.**
+  NuGet reads the first of `nuget.config`, `NuGet.config` and
+  `NuGet.Config` in a directory. Hosted mode only knew `nuget.config`
+  and vendored mode missed `NuGet.config`, so on a case-sensitive
+  filesystem they created a fresh `nuget.config` that shadowed the
+  project's own file: its sources and mappings vanished and private
+  packages failed restore. Both modes now edit the existing spelling in
+  place.
+
 - **`rollback` fetches a before-blob that only a store peer variant
   needs.** The before-blob gate now probes every pnpm and vlt store variant
   copy the rollback restores, so an online rollback no longer fails

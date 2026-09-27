@@ -5125,6 +5125,11 @@ fn rewrite_composer_lock(
 }
 
 // ── nuget (nuget.config + packages.lock.json) ────────────────────────────────
+/// NuGet's per-directory config spellings, in the order it probes them on a
+/// case-sensitive filesystem (NuGet.Configuration `Settings`).
+pub(crate) const NUGET_CONFIG_FILE_NAMES: [&str; 3] =
+    ["nuget.config", "NuGet.config", "NuGet.Config"];
+
 fn default_nuget_config() -> String {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n".to_string()
 }
@@ -5343,13 +5348,19 @@ fn rewrite_nuget(
     if nuget.is_empty() {
         return;
     }
+    // NuGet reads the first of these spellings present in a directory; a
+    // fresh `nuget.config` beside a `NuGet.config` would shadow it.
+    let config_path = NUGET_CONFIG_FILE_NAMES
+        .into_iter()
+        .find(|name| files.contains_key(*name))
+        .unwrap_or(NUGET_CONFIG_FILE_NAMES[0]);
     let mut config = files
-        .get("nuget.config")
+        .get(config_path)
         .cloned()
         .unwrap_or_else(default_nuget_config);
     // A config this run authors from scratch records its source edits as
     // `added` — the spelling every other rewriter uses for a created file.
-    let source_action = if files.contains_key("nuget.config") {
+    let source_action = if files.contains_key(config_path) {
         "rewritten"
     } else {
         "added"
@@ -5428,7 +5439,7 @@ fn rewrite_nuget(
             config = updated;
             config_changed = true;
             result.edits.push(FileEdit {
-                path: "nuget.config".into(),
+                path: config_path.into(),
                 kind: "redirect_nuget_source".into(),
                 action: source_action.into(),
                 key: Some(reg.clone()),
@@ -5491,7 +5502,7 @@ fn rewrite_nuget(
     }
 
     if config_changed {
-        result.files.insert("nuget.config".into(), config);
+        result.files.insert(config_path.into(), config);
     }
     if lock_changed {
         if let Some(lock_val) = lock {
@@ -8335,6 +8346,43 @@ mod tests {
             out.contains("  <disabledPackageSources>\n    <clear />\n  </disabledPackageSources>"),
             "a <clear /> in another section is not an anchor: {out}"
         );
+    }
+
+    /// NuGet reads the first of `nuget.config`, `NuGet.config`,
+    /// `NuGet.Config` present; authoring `nuget.config` beside another
+    /// spelling would shadow the project's sources.
+    #[test]
+    fn nuget_config_spelling_is_rewritten_in_place() {
+        let config = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"corp-feed\" value=\"https://nuget.corp.example/v3/index.json\" />\n  </packageSources>\n</configuration>\n";
+        for (present, expected) in [
+            (&["NuGet.config"][..], "NuGet.config"),
+            (&["NuGet.Config"][..], "NuGet.Config"),
+            (&["NuGet.Config", "NuGet.config"][..], "NuGet.config"),
+            (&["NuGet.Config", "nuget.config"][..], "nuget.config"),
+        ] {
+            let files: BTreeMap<String, String> = present
+                .iter()
+                .map(|name| (name.to_string(), config.to_string()))
+                .collect();
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert_eq!(
+                r.files.keys().collect::<Vec<_>>(),
+                vec![expected],
+                "{present:?}"
+            );
+            assert!(
+                r.files[expected].contains("key=\"corp-feed\""),
+                "{present:?}: {}",
+                r.files[expected]
+            );
+            let source_edit = r
+                .edits
+                .iter()
+                .find(|e| e.kind == "redirect_nuget_source")
+                .expect("source edit recorded");
+            assert_eq!(source_edit.path, expected, "{present:?}");
+            assert_eq!(source_edit.action, "rewritten", "{present:?}");
+        }
     }
 
     fn berry_override(name: &str, version: &str, url: &str, checksum: &str) -> DepOverride {
