@@ -2347,6 +2347,197 @@ snapshots:
             .collect()
     }
 
+    /// Composer twins of the three npm packages: `psr/log` and `psr/cache`
+    /// are installed AND locked; `monolog/monolog` is installed but absent
+    /// from composer.lock, which the composer backend refuses as
+    /// `vendor_lock_entry_not_found` before it asks the service.
+    const COMPOSER: [(&str, &str, &str); 3] = [
+        ("pkg:composer/psr/log@3.0.2", "psr/log", UUID_A),
+        (
+            "pkg:composer/monolog/monolog@2.0.0",
+            "monolog/monolog",
+            UUID_B,
+        ),
+        ("pkg:composer/psr/cache@1.0.0", "psr/cache", UUID_C),
+    ];
+
+    fn write_composer_fixture(root: &Path) {
+        std::fs::write(root.join("composer.json"), r#"{"require":{}}"#).unwrap();
+        let locked: Vec<serde_json::Value> = COMPOSER
+            .iter()
+            .filter(|(_, name, _)| *name != "monolog/monolog")
+            .map(|(purl, name, _)| {
+                let version = purl.rsplit('@').next().unwrap();
+                serde_json::json!({
+                    "name": name, "version": version,
+                    "dist": {"type": "zip", "url": format!("https://example.invalid/{name}.zip"),
+                             "reference": "abc", "shasum": ""},
+                    "type": "library"
+                })
+            })
+            .collect();
+        std::fs::write(
+            root.join("composer.lock"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "content-hash": "x", "packages": locked, "packages-dev": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let installed: Vec<serde_json::Value> = COMPOSER
+            .iter()
+            .map(|(purl, name, _)| {
+                serde_json::json!({
+                    "name": name, "version": purl.rsplit('@').next().unwrap(),
+                    "install-path": format!("../{name}")
+                })
+            })
+            .collect();
+        std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+        std::fs::write(
+            root.join("vendor/composer/installed.json"),
+            serde_json::to_vec(&serde_json::json!({ "packages": installed })).unwrap(),
+        )
+        .unwrap();
+        for (_, name, _) in COMPOSER {
+            let pkg = root.join("vendor").join(name);
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+    }
+
+    /// [`mount_three_patch_api`] for arbitrary `(purl, uuid)` pairs whose
+    /// patch rewrites `file`.
+    async fn mount_patch_api(mock: &MockServer, patches: &[(&str, &str)], file: &str) {
+        let before_hash = git_sha256(BEFORE);
+        let after_hash = git_sha256(AFTER);
+        let packages: Vec<serde_json::Value> = patches
+            .iter()
+            .map(|(purl, uuid)| {
+                serde_json::json!({
+                    "purl": purl,
+                    "patches": [{
+                        "uuid": uuid, "purl": purl, "tier": "free",
+                        "cveIds": ["CVE-2026-0001"], "ghsaIds": [], "severity": "high",
+                        "title": "plan target"
+                    }]
+                })
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": packages,
+                "canAccessPaidPatches": false,
+            })))
+            .mount(mock)
+            .await;
+        for (purl, uuid) in patches {
+            let encoded = purl
+                .replace(':', "%3A")
+                .replace('/', "%2F")
+                .replace('@', "%40");
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "patches": [{
+                        "uuid": uuid, "purl": purl,
+                        "publishedAt": "2026-01-01T00:00:00Z",
+                        "description": "plan target", "license": "MIT", "tier": "free",
+                        "vulnerabilities": {}
+                    }],
+                    "canAccessPaidPatches": false,
+                })))
+                .mount(mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": uuid,
+                    "purl": purl,
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "files": {
+                        file: {
+                            "beforeHash": before_hash,
+                            "afterHash": after_hash,
+                            "blobContent": AFTER_B64,
+                        }
+                    },
+                    "vulnerabilities": {
+                        "GHSA-aaaa-bbbb-cccc": {
+                            "cves": ["CVE-2026-0001"], "summary": "test vuln",
+                            "severity": "high", "description": "details"
+                        }
+                    },
+                    "description": "plan target", "license": "MIT", "tier": "free",
+                })))
+                .mount(mock)
+                .await;
+        }
+        let results: serde_json::Map<String, serde_json::Value> = patches
+            .iter()
+            .map(|(_, uuid)| {
+                (
+                    uuid.to_string(),
+                    serde_json::json!({ "status": "not_found", "url": null, "artifacts": [] }),
+                )
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path_regex(format!("^/v0/orgs/{ORG_SLUG}/patches/package$")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": results })),
+            )
+            .mount(mock)
+            .await;
+    }
+
+    /// The plan is exact beyond npm: every ecosystem's backend gate keeps
+    /// the packages it refuses before its first service call out of the
+    /// plan. Here the composer backend refuses `monolog/monolog` (not in
+    /// composer.lock) — zero grants — while the two locked packages it
+    /// does ask the service for cost exactly one grant each.
+    #[tokio::test]
+    async fn a_composer_package_the_loop_refuses_costs_zero_grants() {
+        assert!(
+            !socket_patch_core::crawlers::walk_pool::fd_limit_is_tight(),
+            "the descriptor limit is too tight for the download plan to be built, so this \
+             test cannot exercise the pre-flight it pins; raise `ulimit -n` and re-run"
+        );
+        let mock = MockServer::start().await;
+        let patches: Vec<(&str, &str)> = COMPOSER.iter().map(|(p, _, u)| (*p, *u)).collect();
+        mount_patch_api(&mock, &patches, "index.js").await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_composer_fixture(tmp.path());
+
+        let (_code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
+        let events = v["vendor"]["events"].as_array().expect("vendor events");
+        let event_for = |purl: &str| {
+            events
+                .iter()
+                .find(|e| e["purl"] == purl && e["action"] != "skipped")
+                .unwrap_or_else(|| panic!("no vendor event for {purl}: {v}"))
+        };
+        assert_eq!(event_for(COMPOSER[0].0)["action"], "applied", "{v}");
+        assert_eq!(event_for(COMPOSER[2].0)["action"], "applied", "{v}");
+        let refused = event_for(COMPOSER[1].0);
+        assert_eq!(refused["action"], "failed", "{v}");
+        assert_eq!(refused["errorCode"], "vendor_lock_entry_not_found", "{v}");
+
+        let mut granted = granted_uuids(&mock).await;
+        granted.sort();
+        assert_eq!(
+            granted,
+            vec![UUID_A.to_string(), UUID_C.to_string()],
+            "exactly one grant per package the loop reaches the service for, and none \
+             for the package it refuses first"
+        );
+    }
+
     /// A package the loop refuses before its first service call costs ZERO
     /// download grants: the plan is built from the backend's own pre-flight,
     /// so `pkg-b` is never asked for, while `pkg-a` and `pkg-c` — which the

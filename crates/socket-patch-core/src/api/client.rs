@@ -143,6 +143,11 @@ impl<T> HeldBack<T> {
         &self.value
     }
 
+    /// The output, mutably, without releasing the debug lines.
+    pub(crate) fn peek_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
     /// The output, printing the held-back debug lines first.
     pub fn release(self) -> T {
         flush_deferred_debug(self.debug);
@@ -1168,7 +1173,7 @@ impl ApiClient {
     /// most `window` requests ahead of the loop) — see
     /// [`super::vendor_prefetch`] for why nothing observable changes, and
     /// what the plan may cost (it is exact: the CLI gates it with the
-    /// backends' own pre-flights,
+    /// backends' own pre-flights, [`crate::vendor::service_preflight`] and
     /// [`crate::vendor::npm_flavor::preflight_packages`], so it names only
     /// the downloads the loop will ask for). A uuid this method refuses
     /// without any I/O is dropped from the plan, so the prefetch never
@@ -1182,13 +1187,46 @@ impl ApiClient {
         patch_server_url: Option<&str>,
         window: usize,
     ) -> VendorPrefetchGuard {
-        let planned: Vec<String> = uuids.into_iter().filter(|u| is_valid_uuid(u)).collect();
+        self.prefetch_vendor_downloads(
+            uuids
+                .into_iter()
+                .map(|uuid| PlannedDownload {
+                    uuid,
+                    secondary: None,
+                })
+                .collect(),
+            free_only,
+            vendor_url,
+            patch_server_url,
+            window,
+            usize::MAX,
+        )
+    }
+
+    /// [`Self::prefetch_vendor_packages`] with a planned secondary artifact
+    /// per download (see [`PlannedDownload::secondary`]) and a bound on the
+    /// fetched archive bytes waiting for the loop: while `byte_budget` bytes
+    /// are held, only the download the loop is waiting on may start.
+    pub fn prefetch_vendor_downloads(
+        &self,
+        downloads: Vec<PlannedDownload>,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+        window: usize,
+        byte_budget: usize,
+    ) -> VendorPrefetchGuard {
+        let planned: Vec<PlannedDownload> = downloads
+            .into_iter()
+            .filter(|d| is_valid_uuid(&d.uuid))
+            .collect();
         let plan = Arc::new(VendorPrefetch::new(
             planned,
             free_only,
             vendor_url,
             patch_server_url,
             window,
+            byte_budget,
         ));
         if let Ok(mut slot) = self.vendor_prefetch.lock() {
             *slot = Some(Arc::clone(&plan));
@@ -1294,6 +1332,7 @@ impl ApiClient {
                     kind: a.kind.clone(),
                     url,
                     integrity_sri: normalize_sha512_sri(sha512),
+                    prefetched: None,
                 });
             }
         }
@@ -1709,6 +1748,49 @@ pub(crate) struct SecondaryArtifact {
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
     pub integrity_sri: String,
+    /// The download a vendor prefetch plan already made for it, taken by
+    /// the backend's own call in its place (see [`PlannedDownload`]).
+    pub prefetched: Option<PrefetchedSecondary>,
+}
+
+/// One download in a vendor prefetch plan (see
+/// [`ApiClient::prefetch_vendor_downloads`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedDownload {
+    /// The patch uuid the vendor loop will ask the service for.
+    pub uuid: String,
+    /// The kind of served secondary artifact (e.g. `gem-stub-gemspec`) the
+    /// loop's backend downloads right after the verified archive. The plan
+    /// fetches it along with the archive — only when the archive is ready,
+    /// passes its integrity checks and the service served that kind, the
+    /// backend's own conditions — and the backend takes it in its place.
+    pub secondary: Option<String>,
+}
+
+/// A secondary artifact's download made ahead of the backend's call, with
+/// its debug lines held back until that call takes it. Shared, so the
+/// artifact reference stays `Clone`; taken at most once.
+#[derive(Clone)]
+pub(crate) struct PrefetchedSecondary(Arc<std::sync::Mutex<Option<HeldDownload>>>);
+
+/// A download's bytes (or failure), debug lines held back.
+pub(crate) type HeldDownload = HeldBack<Result<Vec<u8>, ApiError>>;
+
+impl PrefetchedSecondary {
+    pub(crate) fn new(downloaded: HeldDownload) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(downloaded))))
+    }
+
+    /// The download, once; `None` after it was taken.
+    pub(crate) fn take(&self) -> Option<HeldDownload> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+impl std::fmt::Debug for PrefetchedSecondary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrefetchedSecondary")
+    }
 }
 
 /// Outcome of [`ApiClient::fetch_vendor_package`].

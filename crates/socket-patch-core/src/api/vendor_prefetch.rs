@@ -33,11 +33,12 @@
 //! a server-side build and counts against quota — so the plan is EXACT:
 //! the CLI names only the packages the loop will ask the service for. It
 //! evaluates every refusal a backend raises before its first service call
-//! with the backend's own gates
-//! ([`crate::vendor::npm_flavor::preflight_packages`]) and leaves out the
-//! re-runs whose committed artifact the ledger anchors, so a package the
-//! loop refuses is never granted on its behalf (on a depscan vendored run,
-//! 71 grants — the serial loop's own count). The task is still bounded in
+//! with the backend's own gates — for every ecosystem
+//! ([`crate::vendor::service_preflight`], npm's
+//! [`crate::vendor::npm_flavor::preflight_packages`]) — and leaves out the
+//! re-runs a backend answers without the service, so a package the loop
+//! refuses is never granted on its behalf (on a depscan vendored run, 71
+//! grants — the serial loop's own count). The task is still bounded in
 //! requests, not just in time, as a second line of defence should a plan
 //! ever name a position the loop then passes over:
 //!
@@ -67,6 +68,16 @@
 //!   can it spend up to `window - 1` retry ladders the serial loop, one
 //!   failure from opening its own breaker, would not have spent.
 //!
+//! Memory is bounded too: at most `window` downloads are in flight, and
+//! while the fetched archives waiting for the loop add up to the plan's
+//! byte budget, only the position the loop is at may start.
+//!
+//! A planned download may name a secondary artifact (the gem stub
+//! gemspec) its backend fetches right after a verified archive; the task
+//! fetches it along with the archive, under the backend's own conditions,
+//! and the backend's call takes it (see
+//! [`super::client::PlannedDownload`]).
+//!
 //! Outcomes are delivered as they finish, not in plan order: a passed-over
 //! download must never hold up the package the loop is actually waiting
 //! for (that would make the loop slower than serial, on a request serial
@@ -81,8 +92,11 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 
 use super::client::{
-    hold_back_debug, ApiClient, HeldBack, VendorServiceOutcome, VENDOR_BREAKER_THRESHOLD,
+    hold_back_debug, ApiClient, HeldBack, PlannedDownload, PrefetchedSecondary,
+    VendorServiceOutcome, VENDOR_BREAKER_THRESHOLD,
 };
+use crate::vendor::lock_inventory::LockIntegrity;
+use crate::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 
 /// One fetched outcome: `(outcome, retryable failure)` as
 /// `fetch_vendor_package_once` returned it, debug lines held back.
@@ -97,6 +111,10 @@ pub(crate) struct VendorPrefetch {
     patch_server_url: Option<String>,
     /// Planned uuids, in the order the vendor loop consumes them.
     planned: Vec<String>,
+    /// Per planned uuid, the kind of the served secondary artifact the
+    /// loop's backend downloads right after a verified archive (the gem
+    /// stub gemspec), fetched along with it.
+    secondary: Vec<Option<String>>,
     /// Most downloads in flight at once, and the most the task may run
     /// ahead of the loop.
     window: usize,
@@ -131,6 +149,12 @@ struct Lookahead {
     /// own requests answered. Purely a stop signal for the speculation —
     /// the observable breaker is the client's, folded at consumption time.
     failures: AtomicU32,
+    /// Archive bytes fetched and not yet taken (or passed over) by the loop.
+    held: AtomicUsize,
+    /// While `held` is at or above this, only the position the loop is at
+    /// may start: the window bounds how many archives are in flight, this
+    /// bounds how many finished ones wait in memory for the loop.
+    budget: usize,
     /// Set once `failures` reached the threshold: nothing more is STARTED.
     /// Sticky, unlike `failures` itself — a success draining out from
     /// behind the failures resets the count, and must not let the
@@ -141,8 +165,10 @@ struct Lookahead {
 }
 
 impl Lookahead {
-    fn new() -> Self {
+    fn new(budget: usize) -> Self {
         Self {
+            held: AtomicUsize::new(0),
+            budget,
             at: AtomicUsize::new(0),
             // Opens at one request: a service that is down from the first
             // package then costs what the serial loop cost.
@@ -188,6 +214,12 @@ impl Lookahead {
         self.moved.notify_waiters();
     }
 
+    /// `bytes` of fetched archive left memory (taken or passed over).
+    fn drained(&self, bytes: usize) {
+        self.held.fetch_sub(bytes, Ordering::Relaxed);
+        self.moved.notify_waiters();
+    }
+
     /// The task's own breaker opened: start nothing more, for good.
     fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
@@ -205,8 +237,10 @@ impl Lookahead {
             if index < self.at.load(Ordering::Relaxed) || self.stopped.load(Ordering::Relaxed) {
                 return false;
             }
+            let at = self.at.load(Ordering::Relaxed);
             if index <= self.barrier.load(Ordering::Relaxed)
-                && index < self.at.load(Ordering::Relaxed) + self.reach.load(Ordering::Relaxed)
+                && index < at + self.reach.load(Ordering::Relaxed)
+                && (index == at || self.held.load(Ordering::Relaxed) < self.budget)
             {
                 return true;
             }
@@ -239,19 +273,22 @@ impl Drop for PrefetchState {
 
 impl VendorPrefetch {
     pub(crate) fn new(
-        planned: Vec<String>,
+        planned: Vec<PlannedDownload>,
         free_only: bool,
         vendor_url: Option<&str>,
         patch_server_url: Option<&str>,
         window: usize,
+        byte_budget: usize,
     ) -> Self {
+        let (planned, secondary) = planned.into_iter().map(|d| (d.uuid, d.secondary)).unzip();
         Self {
             free_only,
             vendor_url: vendor_url.map(str::to_string),
             patch_server_url: patch_server_url.map(str::to_string),
             planned,
+            secondary,
             window: window.max(1),
-            look: Arc::new(Lookahead::new()),
+            look: Arc::new(Lookahead::new(byte_budget)),
             state: tokio::sync::Mutex::new(PrefetchState::default()),
         }
     }
@@ -286,24 +323,37 @@ impl VendorPrefetch {
         state.next = position + 1;
         // Everything BELOW this position was passed over; this position's
         // own outcome, if it already answered, is the one being taken.
-        state.ready.retain(|index, _| *index >= position);
+        let look = &self.look;
+        state.ready.retain(|index, fetched| {
+            let keep = *index >= position;
+            if !keep {
+                look.drained(archive_bytes(fetched));
+            }
+            keep
+        });
         self.look.arrive(position);
         if state.task.is_none() {
             self.start(&mut state, client, position);
         }
         let PrefetchState { rx, ready, .. } = &mut *state;
         if let Some(fetched) = ready.remove(&position) {
+            self.look.drained(archive_bytes(&fetched));
             return Some(fetched);
         }
         let rx = rx.as_mut()?;
         loop {
             match rx.recv().await {
-                Some((index, fetched)) if index == position => return Some(fetched),
+                Some((index, fetched)) if index == position => {
+                    self.look.drained(archive_bytes(&fetched));
+                    return Some(fetched);
+                }
                 // A later position answered first: keep it for its own
                 // call. An earlier one was passed over — drop it here.
                 Some((index, fetched)) => {
                     if index > position {
                         ready.insert(index, fetched);
+                    } else {
+                        self.look.drained(archive_bytes(&fetched));
                     }
                 }
                 // The task stopped (its breaker, or the plan ran out) and
@@ -321,7 +371,11 @@ impl VendorPrefetch {
     fn start(&self, state: &mut PrefetchState, client: &ApiClient, from: usize) {
         let (tx, rx) = tokio::sync::mpsc::channel(self.window);
         let client = client.clone();
-        let planned: Vec<String> = self.planned[from..].to_vec();
+        let planned: Vec<(String, Option<String>)> = self.planned[from..]
+            .iter()
+            .cloned()
+            .zip(self.secondary[from..].iter().cloned())
+            .collect();
         let (free_only, window) = (self.free_only, self.window);
         let vendor_url = self.vendor_url.clone();
         let patch_server_url = self.patch_server_url.clone();
@@ -334,25 +388,33 @@ impl VendorPrefetch {
             // nothing observable is folded here, and a passed-over
             // download must not delay the one the loop is waiting for.
             // `take` puts each outcome back on its own call.
-            let mut fetched =
-                std::pin::pin!(futures_util::stream::iter(planned.into_iter().enumerate())
-                    .map(move |(offset, uuid): (usize, String)| async move {
-                        let index = from + offset;
-                        if !look.admits(index).await {
-                            return None;
-                        }
-                        let held = hold_back_debug(client.fetch_vendor_package_once(
-                            &uuid,
-                            free_only,
-                            vendor_url,
-                            patch_server_url,
-                        ))
-                        .await;
-                        Some((index, held))
-                    })
-                    .buffer_unordered(window));
+            let mut fetched = std::pin::pin!(futures_util::stream::iter(
+                planned.into_iter().enumerate()
+            )
+            .map(
+                move |(offset, (uuid, secondary)): (usize, (String, Option<String>))| async move {
+                    let index = from + offset;
+                    if !look.admits(index).await {
+                        return None;
+                    }
+                    let mut held = hold_back_debug(client.fetch_vendor_package_once(
+                        &uuid,
+                        free_only,
+                        vendor_url,
+                        patch_server_url,
+                    ))
+                    .await;
+                    if let Some(kind) = secondary {
+                        prefetch_secondary(client, &mut held, &kind).await;
+                    }
+                    Some((index, held))
+                }
+            )
+            .buffer_unordered(window));
             while let Some(item) = fetched.next().await {
                 let Some((index, held)) = item else { continue };
+                // Counted before the send, released by `take`.
+                look.held.fetch_add(archive_bytes(&held), Ordering::Relaxed);
                 let availability_failure =
                     matches!(held.peek(), (VendorServiceOutcome::Failed(_), true));
                 if availability_failure {
@@ -388,6 +450,44 @@ impl VendorPrefetch {
         }));
         state.rx = Some(rx);
     }
+}
+
+/// The archive bytes a fetched outcome holds in memory.
+fn archive_bytes(fetched: &Fetched) -> usize {
+    match fetched.peek() {
+        (VendorServiceOutcome::Ready(pkg), _) => pkg.tarball.len(),
+        _ => 0,
+    }
+}
+
+/// Fetch a planned download's secondary artifact of `kind` along with it —
+/// exactly when the loop's backend would ask for it: the archive is ready,
+/// passes the integrity checks `fetch_verified_archive` runs before
+/// handing it over, and the service served an artifact of that kind (the
+/// first one, as `fetch_verified_secondary` picks). Its outcome and debug
+/// lines are held on the artifact for `fetch_verified_secondary` to take.
+async fn prefetch_secondary(client: &ApiClient, held: &mut Fetched, kind: &str) {
+    let (VendorServiceOutcome::Ready(pkg), _) = held.peek_mut() else {
+        return;
+    };
+    let intact = artifact_matches_integrity(
+        &pkg.tarball,
+        "",
+        &LockIntegrity::Sri(pkg.integrity_sri.clone()),
+    )
+    .is_ok()
+        && pkg
+            .dirhash_h1
+            .as_deref()
+            .is_none_or(|h1| verify_go_h1(&pkg.tarball, h1).is_ok());
+    if !intact {
+        return;
+    }
+    let Some(artifact) = pkg.secondary_artifacts.iter_mut().find(|a| a.kind == kind) else {
+        return;
+    };
+    let downloaded = hold_back_debug(client.download_artifact(&artifact.url)).await;
+    artifact.prefetched = Some(PrefetchedSecondary::new(downloaded));
 }
 
 /// Keeps a [`VendorPrefetch`] plan attached to its client; dropping it
@@ -924,5 +1024,162 @@ mod tests {
         // One grant + one archive: the inner plan served the call, so the
         // live path never repeated them.
         assert_eq!(request_log(&server).await.len(), 2);
+    }
+
+    /// A tiny byte budget only holds the speculation back: every call
+    /// still gets exactly the serial loop's outcome, at the serial loop's
+    /// request cost.
+    #[tokio::test]
+    async fn a_byte_budget_holds_back_speculation_without_changing_outcomes() {
+        let scripts: Vec<Script> = (0..6).map(|i| Script::Granted(5 * (6 - i))).collect();
+        let all: Vec<usize> = (0..6).collect();
+        let server = serve(&scripts).await;
+        let serial = run(&server, None, &all).await;
+        let serial_requests = request_log(&server).await.len();
+
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_downloads(
+            all.iter()
+                .map(|&i| PlannedDownload {
+                    uuid: uuid(i),
+                    secondary: None,
+                })
+                .collect(),
+            false,
+            None,
+            None,
+            4,
+            1,
+        );
+        let mut out = Vec::new();
+        for &i in &all {
+            out.push(summary(
+                &c.fetch_vendor_package(&uuid(i), false, None, None).await,
+            ));
+        }
+        assert_eq!((out, c.vendor_outage_count()), serial);
+        assert_eq!(
+            request_log(&server).await.len() - serial_requests,
+            serial_requests
+        );
+    }
+
+    /// A planned secondary artifact (the gem stub gemspec) rides its
+    /// archive's download and is taken by the backend's own
+    /// `fetch_verified_secondary` in place of the live request: the same
+    /// outcomes, the same requests — and none for the archive whose bytes
+    /// fail integrity verification, which the backend never gets past.
+    #[tokio::test]
+    async fn a_planned_secondary_rides_its_archive_and_is_taken_in_its_place() {
+        use crate::vendor::service_fetch::{
+            fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult,
+            ServiceArtifact,
+        };
+        const KIND: &str = "gem-stub-gemspec";
+        let server = MockServer::start().await;
+        for i in 0..3 {
+            let u = uuid(i);
+            let archive = format!("archive {i}").into_bytes();
+            let stub = format!("stub {i}").into_bytes();
+            let sri = |b: &[u8]| {
+                format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b))
+                )
+            };
+            // The last archive is served with an SRI its bytes do not match.
+            let archive_sri = if i == 2 { sri(b"other") } else { sri(&archive) };
+            let archive_url = format!("{}/serve/{u}.gem", server.uri());
+            let stub_url = format!("{}/serve/{u}.gemspec", server.uri());
+            Mock::given(method("POST"))
+                .and(path(POST_PATH))
+                .and(body_partial_json(
+                    serde_json::json!({ "uuids": [u.clone()] }),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": { u.clone(): { "status": "granted", "url": archive_url,
+                        "artifacts": [
+                            { "kind": "tarball", "url": archive_url,
+                              "integrity": { "sha512": archive_sri } },
+                            { "kind": KIND, "url": stub_url,
+                              "integrity": { "sha512": sri(&stub) } }
+                        ] } }
+                })))
+                .mount(&server)
+                .await;
+            for (p, body) in [
+                (format!("/serve/{u}.gem"), archive),
+                (format!("/serve/{u}.gemspec"), stub),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(p))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                    .mount(&server)
+                    .await;
+            }
+        }
+        async fn vendor_like(
+            cfg: &crate::vendor::VendorServiceConfig,
+            planned: bool,
+        ) -> Vec<String> {
+            let _guard = planned.then(|| {
+                cfg.client.as_ref().unwrap().prefetch_vendor_downloads(
+                    (0..3)
+                        .map(|i| PlannedDownload {
+                            uuid: uuid(i),
+                            secondary: Some(KIND.to_string()),
+                        })
+                        .collect(),
+                    false,
+                    None,
+                    None,
+                    4,
+                    usize::MAX,
+                )
+            });
+            let mut out = Vec::new();
+            for i in 0..3 {
+                match fetch_verified_archive(cfg, &uuid(i)).await {
+                    ServiceArtifact::Ready(archive) => {
+                        out.push(format!("ready {}", String::from_utf8_lossy(&archive.bytes)));
+                        out.push(match fetch_verified_secondary(cfg, &archive, KIND).await {
+                            SecondaryArtifactResult::Ready(b) => {
+                                format!("stub {}", String::from_utf8_lossy(&b))
+                            }
+                            _ => "stub miss".to_string(),
+                        });
+                    }
+                    ServiceArtifact::IntegrityMismatch(_) => out.push("tampered".to_string()),
+                    _ => out.push("other".to_string()),
+                }
+            }
+            out
+        }
+        let cfg = crate::vendor::VendorServiceConfig {
+            source: crate::vendor::VendorSource::Auto,
+            client: Some(client(&server.uri())),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        };
+        let serial = vendor_like(&cfg, false).await;
+        assert_eq!(
+            serial,
+            [
+                "ready archive 0",
+                "stub stub 0",
+                "ready archive 1",
+                "stub stub 1",
+                "tampered"
+            ]
+        );
+        let mut serial_requests = request_log(&server).await;
+        let before = serial_requests.len();
+        assert_eq!(vendor_like(&cfg, true).await, serial);
+        let mut planned_requests = request_log(&server).await.split_off(before);
+        serial_requests.sort();
+        planned_requests.sort();
+        assert_eq!(planned_requests, serial_requests);
     }
 }

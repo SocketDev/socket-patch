@@ -278,13 +278,13 @@ pub struct VendorServiceConfig {
     pub offline: bool,
 }
 
-/// Most prebuilt archives the vendor prefetch keeps outstanding, below the
-/// patch API's own in-flight cap. An archive is a whole tarball in memory
-/// where the serial loop held exactly one, so the window is bounded by
-/// what it costs, not only by what it saves: the wiring loop is fsync-
-/// bound between packages, so four downloads ahead already keep it fed,
-/// and one more only raises peak memory by another artifact.
-const ARCHIVE_PREFETCH_WINDOW: usize = 4;
+/// Most fetched prebuilt archive bytes the vendor prefetch keeps waiting
+/// for the loop. An archive is a whole tarball in memory where the serial
+/// loop held exactly one; the download window (the API's own in-flight
+/// cap) already keeps at most that many archives ahead of the loop, and
+/// this bounds what they may add up to when a few are large: past it, only
+/// the download the loop is waiting on may start.
+const ARCHIVE_PREFETCH_BYTES: usize = 128 * 1024 * 1024;
 
 impl VendorServiceConfig {
     /// Whether this run may actually attempt a service download right now:
@@ -305,26 +305,30 @@ impl VendorServiceConfig {
             && crate::utils::concurrent::api_concurrency(self.use_public_proxy) > 1
     }
 
-    /// Attach a download plan to this config's client: `uuids` are the
+    /// Attach a download plan to this config's client: `downloads` are the
     /// records the vendor loop is expected to download from the service,
-    /// in loop order (see [`crate::api::client::ApiClient::prefetch_vendor_packages`]).
+    /// in loop order, each with the secondary artifact its backend fetches
+    /// right after the archive (see
+    /// [`crate::api::client::ApiClient::prefetch_vendor_downloads`]). As
+    /// many downloads run at once as the API's in-flight cap allows, and at
+    /// most [`ARCHIVE_PREFETCH_BYTES`] of fetched archives wait for the loop.
     /// `None` — nothing attached — when [`Self::wants_prefetch`] is false,
     /// or when fewer than two downloads are planned (nothing to overlap).
     pub fn prefetch_archives(
         &self,
-        uuids: Vec<String>,
+        downloads: Vec<crate::api::client::PlannedDownload>,
     ) -> Option<crate::api::client::VendorPrefetchGuard> {
-        if !self.wants_prefetch() || uuids.len() < 2 {
+        if !self.wants_prefetch() || downloads.len() < 2 {
             return None;
         }
         let client = self.client.as_ref()?;
-        Some(client.prefetch_vendor_packages(
-            uuids,
+        Some(client.prefetch_vendor_downloads(
+            downloads,
             self.use_public_proxy,
             self.vendor_url.as_deref(),
             self.patch_server_url.as_deref(),
-            crate::utils::concurrent::api_concurrency(self.use_public_proxy)
-                .min(ARCHIVE_PREFETCH_WINDOW),
+            crate::utils::concurrent::api_concurrency(self.use_public_proxy),
+            ARCHIVE_PREFETCH_BYTES,
         ))
     }
 }
@@ -882,6 +886,13 @@ impl RevertOutcome {
 /// True iff this build can vendor this PURL's ecosystem.
 pub fn is_vendorable(purl: &str) -> bool {
     ecosystem_dir_for_purl(purl).is_some()
+}
+
+/// The served secondary artifact `purl`'s backend downloads right after a
+/// verified prebuilt archive — gem's stub gemspec — for the download plan to
+/// fetch along with it; `None` for every other ecosystem.
+pub fn service_secondary_kind(purl: &str) -> Option<&'static str> {
+    (ecosystem_dir_for_purl(purl) == Some("gem")).then_some(gem::GEM_STUB_ARTIFACT_KIND)
 }
 
 /// Whether the vendor loop's backend call for `purl` — a wet run with the

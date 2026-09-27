@@ -1461,6 +1461,158 @@ fn deferred_miss(
     }
 }
 
+/// The patch-service downloads the vendor loop will make, in the loop's
+/// order: `all_packages` walked as the loop walks it — release-variant
+/// bases fanned out once to their manifest variants, each variant through
+/// the same installed-variant probe — past the Bun refusal and the hosted
+/// takeover gate, then through the record's backend gate (see
+/// [`vendor::service_preflight`], and npm's one-read
+/// [`vendor::npm_flavor::preflight_packages`] with the committed-artifact
+/// reuse the npm backends answer from the ledger). Only reads: the probe
+/// extracts a fetched artifact the loop's own probe would, and a variant
+/// whose probe needs a download not made yet is left out — unplanned, the
+/// loop simply fetches it live. Every doubt resolves to "not planned",
+/// never to a grant the loop does not ask for.
+#[allow(clippy::too_many_arguments)]
+async fn plan_service_downloads(
+    cwd: &Path,
+    force: bool,
+    all_packages: &[(String, StagedSource)],
+    (fetched_holders, deferred_holders): (&[registry_fetch::FetchedPackage], &[DeferredPackage]),
+    variant_groups: &HashMap<String, Vec<String>>,
+    records: &HashMap<String, PatchRecord>,
+    ledger: &VendorState,
+    bun_refusal: Option<&crate::commands::bun_preflight::BunVendorRefusal>,
+    takeover_blocked: &dyn Fn(&str) -> bool,
+    (pipenv_version, installed_sites): (
+        &tokio::sync::OnceCell<Option<u32>>,
+        &vendor::pypi::InstalledSiteListings,
+    ),
+) -> Vec<socket_patch_core::api::client::PlannedDownload> {
+    // Each loop candidate that reaches its backend, in loop order.
+    let mut reaching: Vec<(&str, &PatchRecord, &Path)> = Vec::new();
+    let mut handled_bases: HashSet<String> = HashSet::new();
+    for (purl, staged) in all_packages {
+        let source = staged.as_source(fetched_holders, deferred_holders);
+        let deferred = match staged {
+            StagedSource::Deferred(at) => Some(&deferred_holders[*at]),
+            _ => None,
+        };
+        let is_variant_eco =
+            Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
+        let candidates: Vec<String> = if is_variant_eco {
+            let base = strip_purl_qualifiers(purl).to_string();
+            if !handled_bases.insert(base.clone()) {
+                continue;
+            }
+            variant_groups
+                .get(&base)
+                .cloned()
+                .unwrap_or_else(|| vec![base])
+        } else {
+            vec![purl.clone()]
+        };
+        for candidate in &candidates {
+            let Some((candidate, record)) = records.get_key_value(candidate) else {
+                continue;
+            };
+            // The loop's installed-variant probe (see there).
+            let probe_applicable = is_variant_eco
+                && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
+            let ledger_answers_probe = deferred.is_some_and(|d| d.outcome().is_none())
+                && lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
+            if probe_applicable && !force && !ledger_answers_probe {
+                if let Some((file, info)) = representative_file(&record.files) {
+                    if matches!(source, PackageSource::Deferred(_)) {
+                        continue;
+                    }
+                    let Ok(dir) = source.materialize().await else {
+                        continue;
+                    };
+                    let status = verify_file_patch(dir, file, info).await.status;
+                    if !variant_matches_installed(Some(&status)) {
+                        continue;
+                    }
+                }
+            }
+            if bun_refusal.is_some_and(|r| r.applies_to(candidate)) {
+                continue;
+            }
+            if socket_patch_core::patch::redirect::redirect_revert_supported(candidate)
+                && takeover_blocked(candidate)
+            {
+                continue;
+            }
+            // The npm backends re-wire a committed artifact the ledger
+            // anchors at this uuid without asking the service.
+            if candidate.starts_with("pkg:npm/")
+                && ledger.entries.values().any(|e| {
+                    e.ecosystem == "npm" && e.uuid == record.uuid && !e.artifact.sha256.is_empty()
+                })
+            {
+                continue;
+            }
+            // A purl the ledger already records at this record's uuid is a
+            // re-run, which every backend's in-sync hot path answers without
+            // the service; proving it costs the verification of the whole
+            // committed artifact, which the loop's own call repeats. Left
+            // out of the plan: should the artifact need rebuilding after all,
+            // the loop fetches it live.
+            if lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid) {
+                continue;
+            }
+            reaching.push((candidate.as_str(), record, source.path()));
+        }
+    }
+
+    let npm: Vec<(&str, &PatchRecord)> = reaching
+        .iter()
+        .filter(|(purl, _, _)| purl.starts_with("pkg:npm/"))
+        .map(|(purl, record, _)| (*purl, *record))
+        .collect();
+    let mut npm_verdicts = if npm.is_empty() {
+        Vec::new()
+    } else {
+        vendor::npm_flavor::preflight_packages(cwd, &npm).await
+    }
+    .into_iter();
+    // One gate at a time: several at once would each hold their own parse
+    // of the project's lockfiles (a cargo gate clones the whole Cargo.lock
+    // document), which a monorepo pays for in peak memory.
+    let mut others: Vec<bool> = Vec::with_capacity(reaching.len());
+    for (purl, record, source_path) in &reaching {
+        others.push(
+            !purl.starts_with("pkg:npm/")
+                && vendor::service_preflight(
+                    purl,
+                    source_path,
+                    cwd,
+                    record,
+                    pipenv_version,
+                    installed_sites,
+                )
+                .await,
+        );
+    }
+    reaching
+        .iter()
+        .zip(others)
+        .filter(|((purl, _, _), other)| {
+            if purl.starts_with("pkg:npm/") {
+                npm_verdicts.next().is_some_and(|verdict| verdict.is_ok())
+            } else {
+                *other
+            }
+        })
+        .map(
+            |((purl, record, _), _)| socket_patch_core::api::client::PlannedDownload {
+                uuid: record.uuid.clone(),
+                secondary: vendor::service_secondary_kind(purl).map(str::to_string),
+            },
+        )
+        .collect()
+}
+
 /// The vendoring engine, decoupled from the manifest file. `records` is the
 /// purl → [`PatchRecord`] view to vendor: `manifest.patches` for the
 /// manifest-driven `vendor` command, or the in-memory record map
@@ -2005,57 +2157,44 @@ pub(crate) async fn vendor_records_reusing(
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
     // Service downloads, fetched ahead of this serial loop (the wiring and
-    // every write stay here, in order). The plan is EXACT — the npm records
-    // the loop will ask the service for, in loop order: past the Bun
-    // refusal and the takeover gate below, past every refusal the flavor
-    // backend raises before its first service call (evaluated here with
-    // the backend's own gates, `preflight_packages`), and with no committed
-    // artifact the ledger anchors at the record's uuid (those re-runs reuse
-    // it and never ask the service). A download grant can start a
+    // every write stay here, in order). The plan is EXACT — the records the
+    // loop will ask the service for, in loop order, across every ecosystem:
+    // past the variant probe, the Bun refusal and the takeover gate below,
+    // and past every refusal the backend raises before its first service
+    // call (evaluated here with the backend's own gates — npm's
+    // `preflight_packages`, the others' `service_preflight`), and not
+    // answered by a backend's in-sync hot path or a committed-artifact
+    // reuse (those never ask the service). A download grant can start a
     // server-side build and counts against quota, so a package the loop
     // refuses is never granted on its behalf. The plan stays advisory —
     // the breaker and every outcome are still decided at the loop's own
     // call (see `VendorPrefetch`). Asking `wants_prefetch` first keeps the
     // walk off the runs that would drop the plan anyway (`--vendor-source
-    // build`, `--offline`, one request at a time), and a plan of fewer
-    // than two downloads has nothing to overlap, so the backend gates are
-    // only consulted past that.
+    // build`, `--offline`, one request at a time).
     let _service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
         Some(cfg) => {
-            let candidates: Vec<(&str, &PatchRecord)> = all_packages
-                .iter()
-                .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Npm))
-                .filter(|(purl, _)| bun_refusal.as_ref().is_none_or(|r| !r.applies_to(purl)))
-                .filter(|(purl, _)| {
-                    redirect_ledger_corrupt.is_none()
-                        && redirect_ledger.as_ref().is_none_or(|l| {
-                            !l.records
-                                .keys()
-                                .any(|k| canonical_purl(k) == canonical_purl(purl))
-                        })
-                })
-                .filter_map(|(purl, _)| records.get(purl).map(|record| (purl.as_str(), record)))
-                .filter(|(_, record)| {
-                    !state.entries.values().any(|e| {
-                        e.ecosystem == "npm"
-                            && e.uuid == record.uuid
-                            && !e.artifact.sha256.is_empty()
+            let takeover_blocked = |purl: &str| {
+                redirect_ledger_corrupt.is_some()
+                    || redirect_ledger.as_ref().is_some_and(|l| {
+                        l.records
+                            .keys()
+                            .any(|k| canonical_purl(k) == canonical_purl(purl))
                     })
-                })
-                .collect();
-            if candidates.len() < 2 {
-                None
-            } else {
-                let admitted =
-                    vendor::npm_flavor::preflight_packages(&common.cwd, &candidates).await;
-                let planned: Vec<String> = candidates
-                    .iter()
-                    .zip(admitted)
-                    .filter(|(_, verdict)| verdict.is_ok())
-                    .map(|((_, record), _)| record.uuid.clone())
-                    .collect();
-                cfg.prefetch_archives(planned)
-            }
+            };
+            let planned = plan_service_downloads(
+                &common.cwd,
+                force,
+                &all_packages,
+                (&fetched_holders, &deferred_holders),
+                &variant_groups,
+                records,
+                &state,
+                bun_refusal.as_ref(),
+                &takeover_blocked,
+                (&pipenv_version, &installed_sites),
+            )
+            .await;
+            cfg.prefetch_archives(planned)
         }
         None => None,
     };

@@ -274,7 +274,13 @@ pub(crate) async fn fetch_verified_secondary(
         return SecondaryArtifactResult::Absent;
     };
 
-    let bytes = match client.download_artifact(&artifact.url).await {
+    // A download the vendor prefetch plan already made stands in for the
+    // live request (its debug lines print here, where this call's would).
+    let downloaded = match artifact.prefetched.as_ref().and_then(|p| p.take()) {
+        Some(held) => held.release(),
+        None => client.download_artifact(&artifact.url).await,
+    };
+    let bytes = match downloaded {
         Ok(bytes) => bytes,
         Err(e) => return SecondaryArtifactResult::Failed(e.to_string()),
     };
@@ -773,6 +779,7 @@ mod tests {
             sha256_hex: std::sync::OnceLock::new(),
             source_url: String::new(),
             secondary: vec![SecondaryArtifact {
+                prefetched: None,
                 kind: "gem-stub-gemspec".into(),
                 url: format!("{}/stub", server.uri()),
                 integrity_sri: PackedTarball::from_bytes(b"x").integrity,
