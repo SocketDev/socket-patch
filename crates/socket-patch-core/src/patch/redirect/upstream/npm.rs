@@ -18,13 +18,13 @@ use super::{Ctx, FormatResult, HostedPin, View};
 use crate::utils::line_endings::{to_lf, LineEndings};
 
 /// The pins by uuid.
-fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
+pub(super) fn by_uuid<'p>(pins: &[&'p HostedPin]) -> BTreeMap<&'p str, &'p HostedPin> {
     pins.iter().map(|p| (p.uuid.as_str(), *p)).collect()
 }
 
 /// Resolve the dist of every `(uuid, name, version)` wanted, concurrently.
 /// A failed lookup refuses its pin.
-async fn fetch_dists(
+pub(super) async fn fetch_dists(
     wanted: &BTreeSet<(String, String, String)>,
     ctx: &Ctx<'_>,
     result: &mut FormatResult,
@@ -192,7 +192,7 @@ pub(crate) async fn restore_npm_locks(
 
 /// Read `rel` through the view; a missing or unreadable file refuses every
 /// pin discovery found in it.
-async fn read_or_refuse(
+pub(super) async fn read_or_refuse(
     view: &mut View<'_>,
     rel: &str,
     pins: &BTreeMap<&str, &HostedPin>,
@@ -211,7 +211,7 @@ async fn read_or_refuse(
     }
 }
 
-fn refuse_all_in(
+pub(super) fn refuse_all_in(
     pins: &BTreeMap<&str, &HostedPin>,
     rel: &str,
     result: &mut FormatResult,

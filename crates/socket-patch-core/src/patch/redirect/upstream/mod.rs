@@ -30,10 +30,13 @@ mod client;
 mod composer;
 mod gem;
 mod golang;
+mod maven;
 mod npm;
+mod nuget;
 mod pypi;
 mod pypi_locks;
 mod uv;
+mod vlt;
 
 pub(crate) use client::UpstreamClient;
 
@@ -277,6 +280,9 @@ enum Format {
     /// uv.lock, PEP 723 script locks and PEP 751 pylock files (the uv
     /// restorer also edits their paired `pyproject.toml` / script).
     PythonLock,
+    VltLock,
+    Maven,
+    NuGet,
     Unsupported,
 }
 
@@ -298,6 +304,9 @@ fn format_of(rel: &str) -> Format {
         leaf if crate::utils::python_lock::is_python_lock_name(leaf) => Format::PythonLock,
         // The root requirements.txt and the `-r` includes discovery walks.
         leaf if leaf.ends_with(".txt") => Format::Requirements,
+        "vlt-lock.json" => Format::VltLock,
+        "pom.xml" => Format::Maven,
+        "nuget.config" | "NuGet.config" | "NuGet.Config" | "packages.lock.json" => Format::NuGet,
         _ => Format::Unsupported,
     }
 }
@@ -420,6 +429,9 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::Requirements => pypi::restore_requirements(view, &pins, &files, ctx).await,
             Format::Hatch => pypi::restore_hatch(view, &pins, &files, ctx).await,
             Format::PythonLock => uv::restore(view, &pins, &files, ctx).await,
+            Format::VltLock => vlt::restore(view, &pins, &files, ctx).await,
+            Format::Maven => maven::restore(view, &pins, &files, ctx).await,
+            Format::NuGet => nuget::restore(view, &pins, &files, ctx).await,
             Format::Unsupported => {
                 let mut r = FormatResult::default();
                 for pin in &pins {

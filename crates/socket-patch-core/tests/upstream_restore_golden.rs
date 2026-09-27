@@ -1594,3 +1594,197 @@ async fn uv_refusals() {
     let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
     assert!(why.contains("interpreter-specific wheels"), "{why}");
 }
+
+/// Serve each override's npm version document with the slot-[2] integrity
+/// its `input/` vlt-lock.json node records.
+async fn vlt_mock(case: &Case) -> MockServer {
+    let server = MockServer::start().await;
+    let lock: serde_json::Value = case
+        .input
+        .get("vlt-lock.json")
+        .and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or_default();
+    let empty = serde_json::Map::new();
+    let nodes = lock["nodes"].as_object().unwrap_or(&empty);
+    for o in &case.overrides {
+        let name = match o["namespace"].as_str() {
+            Some(ns) if !ns.is_empty() => format!("{ns}/{}", o["name"].as_str().unwrap()),
+            _ => o["name"].as_str().unwrap().to_string(),
+        };
+        let version = o["version"].as_str().unwrap();
+        let integrity = nodes.iter().find_map(|(id, tuple)| {
+            (tuple[1].as_str() == Some(name.as_str()) && id.contains(&format!("@{version}")))
+                .then(|| tuple[2].as_str().map(str::to_string))
+                .flatten()
+        });
+        let leaf = name.rsplit('/').next().unwrap();
+        let mut dist = serde_json::json!({
+            "tarball": format!("https://registry.npmjs.org/{name}/-/{leaf}-{version}.tgz"),
+        });
+        if let Some(integrity) = integrity {
+            dist["integrity"] = integrity.into();
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/{}/{version}", name.replace('/', "%2f"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "name": name, "version": version, "dist": dist }),
+            ))
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
+#[tokio::test]
+#[serial]
+async fn vlt_goldens_round_trip() {
+    // sibling-package-lock-vlt-installed, sibling-refused-in-vlt: vlt-lock.json
+    // refused a package whose package-lock.json entry the rewrite still
+    // pinned; with vlt-lock.json upstream that pin is not live wiring, so
+    // discovery (rightly) reports no pin to restore there.
+    let not_invertible = ["sibling-package-lock-vlt-installed", "sibling-refused-in-vlt"];
+    let mut ran = 0;
+    for case in load("npm/vlt") {
+        let name = case.dir.file_name().unwrap().to_string_lossy().into_owned();
+        if not_invertible.contains(&name.as_str()) {
+            continue;
+        }
+        let server = vlt_mock(&case).await;
+        let _env = EnvGuard::set(&[("SOCKET_NPM_REGISTRY", server.uri())]);
+        let (after, statuses) = run_case(&case).await;
+        assert_round_trip(&case, &after, &statuses);
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn maven_goldens_round_trip() {
+    // mvn-config-merge: `.mvn/maven.config` existed, so whether the appended
+    // resolver lines were the user's is not derivable; they stay (warned).
+    // no-suffix-fallback: a same-GAV repository is tied to no artifact, so
+    // discovery reports no pin to restore.
+    let not_invertible = ["mvn-config-merge", "no-suffix-fallback"];
+    let mut ran = 0;
+    for case in load("maven/pom") {
+        let name = case.dir.file_name().unwrap().to_string_lossy().into_owned();
+        if not_invertible.contains(&name.as_str()) {
+            continue;
+        }
+        let (after, statuses) = run_case(&case).await;
+        assert_round_trip(&case, &after, &statuses);
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn maven_config_merge_keeps_the_resolver_lines() {
+    let case = load("maven/pom")
+        .into_iter()
+        .find(|c| c.dir.ends_with("mvn-config-merge"))
+        .unwrap();
+    let (after, statuses) = run_case(&case).await;
+    assert!(matches!(statuses[..], [(_, PinStatus::Restored)]), "{statuses:?}");
+    for rel in ["pom.xml", ".mvn/checksums/checksums.sha256"] {
+        assert_eq!(after.get(rel), case.input.get(rel), "{rel}");
+    }
+    assert_eq!(
+        after.get(".mvn/maven.config"),
+        case.expected.get(".mvn/maven.config")
+    );
+}
+
+/// Serve nuget.org's registration leaf and catalog entry for every package
+/// the `input/` lock pins, with the contentHash it records.
+async fn nuget_mock(case: &Case) -> MockServer {
+    let server = MockServer::start().await;
+    let lock: serde_json::Value =
+        serde_json::from_str(case.input.get("packages.lock.json").unwrap()).unwrap();
+    for fw in lock["dependencies"].as_object().unwrap().values() {
+        for (id, entry) in fw.as_object().unwrap() {
+            let (id, version) = (id.to_lowercase(), entry["resolved"].as_str().unwrap());
+            let catalog = format!("{}/catalog0/data/{id}.{version}.json", server.uri());
+            Mock::given(method("GET"))
+                .and(path(format!("/v3/registration5-gz-semver2/{id}/{version}.json")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "catalogEntry": catalog })),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/catalog0/data/{id}.{version}.json")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id,
+                    "version": version,
+                    "packageHash": entry["contentHash"],
+                    "packageHashAlgorithm": "SHA512",
+                })))
+                .mount(&server)
+                .await;
+        }
+    }
+    server
+}
+
+/// The NuGet cases that do not round-trip byte for byte, and why.
+const NUGET_NOT_INVERTIBLE: [&str; 3] = [
+    // The rewriter seeded a nuget.org source into a source-less config,
+    // which reads exactly like a user's own nuget.org source (`basic`); it
+    // stays.
+    "empty-sources",
+    "empty-sources-selfclosing",
+    // Two feeds serve every package once the Socket mapping is gone, so the
+    // original contentHash's feed is ambiguous: refused.
+    "no-preexisting-mapping",
+];
+
+#[tokio::test]
+#[serial]
+async fn nuget_goldens_round_trip() {
+    let mut ran = 0;
+    for case in load("nuget/packages-lock") {
+        let name = case.dir.file_name().unwrap().to_string_lossy().into_owned();
+        if NUGET_NOT_INVERTIBLE.contains(&name.as_str()) {
+            continue;
+        }
+        let server = nuget_mock(&case).await;
+        let _env = EnvGuard::set(&[("SOCKET_NUGET_URL", server.uri())]);
+        let (after, statuses) = run_case(&case).await;
+        assert_round_trip(&case, &after, &statuses);
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn nuget_non_invertible_goldens_restore_or_refuse_as_documented() {
+    for name in NUGET_NOT_INVERTIBLE {
+        let case = load("nuget/packages-lock")
+            .into_iter()
+            .find(|c| c.dir.ends_with(name))
+            .unwrap();
+        let server = nuget_mock(&case).await;
+        let _env = EnvGuard::set(&[("SOCKET_NUGET_URL", server.uri())]);
+        let (after, statuses) = run_case(&case).await;
+        let [(_, status)] = &statuses[..] else {
+            panic!("{name}: {statuses:?}");
+        };
+        if name == "no-preexisting-mapping" {
+            let PinStatus::Refused(why) = status else {
+                panic!("{name}: {status:?}");
+            };
+            assert!(why.contains("corp-feed") && why.contains("git checkout"), "{why}");
+            assert_eq!(after, case.expected, "{name}: a refusal changes nothing");
+        } else {
+            assert_eq!(*status, PinStatus::Restored, "{name}");
+            assert_eq!(after.get("packages.lock.json"), case.input.get("packages.lock.json"));
+            let config = &after["nuget.config"];
+            assert!(!config.contains("socket-patch") && !config.contains("packageSourceMapping"));
+        }
+    }
+}

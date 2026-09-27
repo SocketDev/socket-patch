@@ -38,7 +38,7 @@ pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 /// Whole-package caps — wider than `patch/package.rs`'s patch-archive caps
 /// because these are full upstream packages, but still bounded so a
 /// poisoned lockfile cannot turn the fetch into a disk/memory bomb.
-const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
 // `pub(crate)`: `common::read_zip_members` is the in-memory twin of
 // [`extract_zip`] and must refuse exactly the same archives, so it reads the
 // one set of caps rather than carrying a copy that can drift.
