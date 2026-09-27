@@ -1266,6 +1266,32 @@ into the new version's section — see docs/releasing.md.
   answers in request order — but a large monorepo's hosted scan at 100 ms of
   latency drops from ~20 s to ~9 s.
 
+- **Behavior change: a throttled patch API is retried, and a batch that
+  still fails is reported under `--json`.** An HTTP 429 or 503 from the
+  patch API made the affected batch (or patch-list query) fail on the first
+  answer; under `--json` a failed batch among successful ones then vanished
+  from the envelope without a trace, exit 0 — likelier now that up to 32
+  requests are in flight. Now every patch-API JSON call (batch search,
+  per-package patch lists, patch views and VEX record fetches, hosted
+  package references) retries a 429 / 503 up to 3 times: it waits as long
+  as `Retry-After` asks (delta-seconds or HTTP-date, at most 30 s per
+  wait), otherwise 0.5 s, 1 s, 2 s (steps capped at 8 s, jittered into
+  their upper half), and every wait in the run draws from one 60 s budget
+  so a throttled run cannot hang. `SOCKET_API_MAX_RETRIES=<n>` (0-10)
+  changes the count; `0` restores the old single attempt. Nothing else is
+  retried (401/403 still trigger the proxy fallback at once), and output
+  folds in request order exactly as an unthrottled run's. A query still
+  throttled after that is a failure where its siblings already report
+  theirs: the human `Warning: API batch <n> of <total> failed: …` /
+  `Warning: could not fetch details for <purl>: …` lines, and — new — the
+  same text as run-level `warnings[]` entries (`api_batch_failed`,
+  `patch_details_failed`) in the `--json` envelope (additive; status and
+  exit code unchanged while some query succeeded, the all-failed error
+  and exit 1 when none did). The error text names the retries (`Rate
+  limit exceeded (HTTP 429, gave up after 3 retries). Please try again
+  later.`). On the token-less legacy per-package proxy path a package
+  still throttled now fails its batch instead of being skipped silently.
+
 - **The crawl's directory walks run on 4 threads by default.** The walk
   pool behind the `node_modules` walk and the Maven repository walk (and its
   POM parse) used one thread per logical CPU (up to 16), but the walk is

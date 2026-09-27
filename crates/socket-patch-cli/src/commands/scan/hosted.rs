@@ -1075,6 +1075,7 @@ pub(super) async fn run_redirect(
         false,
         false,
         telemetry,
+        scan_result.as_mut(),
     )
     .await
     {

@@ -482,6 +482,7 @@ async fn run_vendor_json_path(
         false,
         false,
         telemetry,
+        Some(&mut *result),
     )
     .await
     {
