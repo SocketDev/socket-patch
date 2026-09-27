@@ -45,40 +45,7 @@ pub(super) struct LockfileSupplement {
     pub(super) unsupported: Vec<socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout>,
 }
 
-/// Map a core npm-layout refusal onto scan's warning channel as
-/// `(code, detail)`. The yarn code matches apply's refusal errorCode
-/// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
-/// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
-/// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
-pub(crate) fn unsupported_layout_warnings(
-    unsupported: &[socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout],
-) -> Vec<(String, String)> {
-    unsupported
-        .iter()
-        .map(|diag| match diag.code {
-            "vendor_yarn_berry_unsupported" => (
-                "yarn_pnp_unsupported".to_string(),
-                "this project uses yarn Plug'n'Play (a `.pnp.*` loader is present): its npm \
-                 packages live inside `.yarn/cache/*.zip`, not `node_modules/`, so socket-patch \
-                 cannot discover or patch them in ANY mode (agent, hosted, or vendored) — npm \
-                 dependencies were NOT scanned. Use `yarn patch <pkg>` to patch them instead."
-                    .to_string(),
-            ),
-            "vendor_pnpm_pnp_unsupported" => (
-                "pnpm_pnp_unsupported".to_string(),
-                "this project uses pnpm's Plug'n'Play linker (`node-linker=pnp` in .npmrc): \
-                 lockfile discovery is skipped under this layout, so lockfile-only npm \
-                 dependencies were NOT scanned. Switch .npmrc to `node-linker=isolated`, run \
-                 `pnpm install`, and re-run — or use `socket-patch scan --mode hosted`, which \
-                 edits pnpm-lock.yaml in place."
-                    .to_string(),
-            ),
-            // Forward-compat: a new refusal code surfaces verbatim rather
-            // than being swallowed back into silence.
-            other => (other.to_string(), diag.detail.clone()),
-        })
-        .collect()
-}
+pub(crate) use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 
 /// Inventory the project's lockfile(s) and fabricate crawl entries for
 /// dependencies that are not installed. The fabricated `path` is the
