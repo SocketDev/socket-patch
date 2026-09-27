@@ -46,6 +46,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
@@ -494,6 +495,7 @@ pub(super) fn preflight_package(
         Err(detail) => return Err(Box::new(refused("vendor_override_conflict", detail))),
     };
     let effective_key = disposition.effective_key(override_key).to_string();
+    project.lines.note_probe();
     if let Err(detail) = check_lock_override(&project.lines, name, version, &effective_key) {
         return Err(Box::new(refused("vendor_override_conflict", detail)));
     }
@@ -567,15 +569,19 @@ pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Opti
     }
     // Every `packages:`/`snapshots:` block key resolving into
     // `.socket/vendor/npm/<uuid>/`, collected once per lock bytes (see
-    // [`LockIndex`]); [`pnpm_entry_in_use_scan`] is the per-call scan it
-    // answers for.
+    // [`LockIndex`]) once these bytes are probed again; the first probe
+    // runs [`pnpm_entry_in_use_scan`], the per-call scan it answers for.
     let doc = LOCK_MEMO.parse_infallible(text.as_bytes(), || LockDoc::new(split_lines(&text)));
-    Some(doc.index().vendored_npm_uuids.contains(&entry.uuid))
+    doc.note_probe();
+    Some(match doc.index() {
+        Some(index) => index.vendored_npm_uuids.contains(&entry.uuid),
+        None => pnpm_entry_in_use_scan(&entry.uuid, &doc.lines),
+    })
 }
 
-/// The pre-index [`pnpm_entry_in_use`] body over already-split lines — the
-/// equivalence oracle for the indexed answer.
-#[cfg(test)]
+/// The pre-index [`pnpm_entry_in_use`] body over already-split lines: the
+/// answer for a lock probed once, and the equivalence oracle for the
+/// indexed answer.
 fn pnpm_entry_in_use_scan(uuid: &str, lines: &[String]) -> bool {
     for section in ["packages", "snapshots"] {
         let Some((start, end)) = section_bounds(lines, section) else {
@@ -2292,23 +2298,50 @@ fn matching_blocks<L: EditLines>(
 /// is split afresh. The backend re-seeds the slot with the lock it wrote.
 static LOCK_MEMO: ParseMemo<LockDoc> = ParseMemo::new();
 
-/// One lock's lines plus, built on first use, their [`LockIndex`] — a pure
-/// function of the lines, so of the bytes the memo keys on.
+/// One lock's lines plus their [`LockIndex`] — a pure function of the
+/// lines, so of the bytes the memo keys on — built only once the same lines
+/// are probed a second time ([`INDEX_AFTER_PROBES`]).
 struct LockDoc {
     lines: Vec<String>,
+    /// Package probes against these lines so far ([`Self::note_probe`]).
+    probes: AtomicUsize,
     index: OnceLock<LockIndex>,
 }
+
+/// How many package probes the same lock lines must see before their
+/// [`LockIndex`] is built. Building it costs several whole-lock scans, so
+/// it pays only when the lines are asked about again: an idempotent re-run
+/// (and the download plan's batch pre-flight) probes one unchanged lock
+/// once per package, while a fresh run rewrites the lock after every
+/// package, so each lock it re-seeds is probed exactly once — and answering
+/// that one probe with the scans is cheaper than indexing lines nobody will
+/// query again.
+const INDEX_AFTER_PROBES: usize = 2;
 
 impl LockDoc {
     fn new(lines: Vec<String>) -> Self {
         Self {
             lines,
+            probes: AtomicUsize::new(0),
             index: OnceLock::new(),
         }
     }
 
-    fn index(&self) -> &LockIndex {
-        self.index.get_or_init(|| LockIndex::build(&self.lines))
+    /// Count one package's probe of these lines (one pre-flight, one in-use
+    /// check), however many lookups it goes on to make.
+    fn note_probe(&self) {
+        self.probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The index, once these lines have seen [`INDEX_AFTER_PROBES`] probes;
+    /// `None` before that, and every caller then runs the scan it answers
+    /// for (the answers are equal either way).
+    fn index(&self) -> Option<&LockIndex> {
+        if let Some(index) = self.index.get() {
+            return Some(index);
+        }
+        (self.probes.load(Ordering::Relaxed) >= INDEX_AFTER_PROBES)
+            .then(|| self.index.get_or_init(|| LockIndex::build(&self.lines)))
     }
 }
 
@@ -2356,6 +2389,15 @@ impl EditLines for Vec<String> {
     }
 }
 
+impl LockLines {
+    /// [`LockDoc::note_probe`] while the lines are the memoized split.
+    fn note_probe(&self) {
+        if let LockLines::Shared(doc) = self {
+            doc.note_probe();
+        }
+    }
+}
+
 impl EditLines for LockLines {
     fn read(&self) -> &Vec<String> {
         match self {
@@ -2376,7 +2418,7 @@ impl EditLines for LockLines {
 
     fn index(&self) -> Option<&LockIndex> {
         match self {
-            LockLines::Shared(doc) => Some(doc.index()),
+            LockLines::Shared(doc) => doc.index(),
             LockLines::Owned(_) => None,
         }
     }
@@ -8493,8 +8535,15 @@ snapshots:
     /// One lock edit over `L` lines, as `vendor_pnpm`'s edit array holds it.
     type Edit<L> = fn(&mut L, &EditCtx<'_>, &mut Vec<WiringRecord>) -> Result<bool, String>;
 
+    /// The memoized split of `lines`, already probed often enough that its
+    /// index answers (so the indexed paths are the ones exercised).
     fn shared(lines: &[String]) -> LockLines {
-        LockLines::Shared(Arc::new(LockDoc::new(lines.to_vec())))
+        let doc = LockDoc::new(lines.to_vec());
+        for _ in 0..INDEX_AFTER_PROBES {
+            doc.note_probe();
+        }
+        assert!(doc.index().is_some());
+        LockLines::Shared(Arc::new(doc))
     }
 
     /// V-2: every indexed answer equals the scan it replaces — section
@@ -8621,6 +8670,62 @@ snapshots:
             indexed_rewrites > 1000,
             "indexed rewrites {indexed_rewrites}"
         );
+    }
+
+    /// V-2: a lock probed by ONE package is answered by the scans and never
+    /// indexed — the fresh-run shape, where every package re-seeds the memo
+    /// with the lock it wrote and the next package probes it exactly once —
+    /// and the second package probing the same lines (an idempotent re-run)
+    /// builds the index once for every later probe.
+    #[test]
+    fn lock_index_is_built_only_when_the_same_lines_are_probed_again() {
+        let project = || PnpmProject {
+            pkg_bytes: b"{}".to_vec(),
+            pkg: serde_json::json!({}),
+            lines: LockLines::Shared(Arc::new(LockDoc::new(split_lines(P1_BEFORE_LOCK)))),
+            ws_text: None,
+        };
+        let doc_of = |p: &PnpmProject| match &p.lines {
+            LockLines::Shared(doc) => Arc::clone(doc),
+            LockLines::Owned(_) => unreachable!(),
+        };
+
+        // One package: the pre-flight passes on the scans alone.
+        let fresh = project();
+        let doc = doc_of(&fresh);
+        let key = preflight_package(&fresh, "left-pad", "1.3.0", "left-pad@1.3.0")
+            .map_err(|_| ())
+            .unwrap();
+        assert_eq!(key, "left-pad@1.3.0");
+        assert!(fresh.lines.index().is_none());
+        assert!(
+            doc.index.get().is_none(),
+            "one probe must not build the index"
+        );
+        // Its edits (which take the private copy) leave it unbuilt too.
+        let ctx = EditCtx {
+            name: "left-pad",
+            version: "1.3.0",
+            rel_tgz: ".socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            spec: "file:.socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            integrity: "sha512-x",
+            override_key: "left-pad@1.3.0",
+        };
+        let mut lines = fresh.lines;
+        let mut wiring = Vec::new();
+        assert_eq!(edit_overrides(&mut lines, &ctx, &mut wiring), Ok(true));
+        assert!(doc.index.get().is_none());
+
+        // A second package probing the same lines builds it, once.
+        let rerun = project();
+        let doc = doc_of(&rerun);
+        for _ in 0..3 {
+            preflight_package(&rerun, "left-pad", "1.3.0", "left-pad@1.3.0")
+                .map_err(|_| ())
+                .unwrap();
+        }
+        assert!(doc.index.get().is_some());
+        assert_eq!(doc.probes.load(Ordering::Relaxed), 3);
     }
 
     /// V-2: the memoized split is keyed on the bytes read, so a lock edited
