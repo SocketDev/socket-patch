@@ -7,10 +7,10 @@ use serde_json::{json, Value};
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 
-struct Property {
-    name: String,
-    range: Range<usize>,
-    value: Value,
+pub(super) struct Property {
+    pub(super) name: String,
+    pub(super) range: Range<usize>,
+    pub(super) value: Value,
 }
 
 fn properties(text: &str, offset: usize) -> Result<Vec<Property>, String> {
@@ -82,7 +82,7 @@ fn properties(text: &str, offset: usize) -> Result<Vec<Property>, String> {
     }
 }
 
-fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
+pub(super) fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
     // A UTF-8 BOM (Windows editors) is not JSON; parse past it. Offsets
     // below come from `text.find('{')`, so they stay byte-accurate.
     let value =
@@ -111,7 +111,7 @@ fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
     Ok(result)
 }
 
-fn format_entry(value: &Value, text: &str, start: usize) -> Result<String, String> {
+pub(super) fn format_entry(value: &Value, text: &str, start: usize) -> Result<String, String> {
     let mut bytes = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
     value

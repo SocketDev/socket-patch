@@ -7,14 +7,14 @@ use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::purl::percent_decode_purl_component;
 
-struct LogicalRequirement {
-    original: String,
-    text: String,
-    ending: String,
-    unterminated: bool,
+pub(super) struct LogicalRequirement {
+    pub(super) original: String,
+    pub(super) text: String,
+    pub(super) ending: String,
+    pub(super) unterminated: bool,
 }
 
-fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
+pub(super) fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
     let physical: Vec<&str> = content.split_inclusive('\n').collect();
     let mut requirements = Vec::new();
     let mut index = 0;
@@ -62,7 +62,7 @@ fn logical_requirements(content: &str) -> Vec<LogicalRequirement> {
     requirements
 }
 
-fn unquoted_index(text: &str, target: char, after_whitespace: bool) -> Option<usize> {
+pub(super) fn unquoted_index(text: &str, target: char, after_whitespace: bool) -> Option<usize> {
     let mut quote = None;
     let mut escaped = false;
     let mut previous = None;
@@ -87,7 +87,7 @@ fn unquoted_index(text: &str, target: char, after_whitespace: bool) -> Option<us
     None
 }
 
-fn requirement_tokens(text: &str) -> Vec<&str> {
+pub(super) fn requirement_tokens(text: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut start = None;
     let mut quote = None;

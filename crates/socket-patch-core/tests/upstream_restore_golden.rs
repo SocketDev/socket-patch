@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serial_test::serial;
+use socket_patch_core::patch::redirect::{rewrite_registry_redirect_with_pipenv_version, DepOverride};
 use socket_patch_core::patch::redirect::upstream::{
     restore_upstream, HostedPin, PinStatus, RestoreOptions,
 };
@@ -898,4 +899,698 @@ async fn composer_refusals_leave_everything_hosted() {
     }
     let (after, statuses) = composer_run(&custom, |_| {}).await;
     assert_refused(&custom, &after, &statuses, "composer.lock", "custom repositories");
+}
+
+// ── PyPI ─────────────────────────────────────────────────────────────────────
+//
+// The shared goldens hold one requirements and one uv case; the other
+// formats round-trip their native fixtures (`tests/fixtures/poetry`,
+// `pdm-native`, `pipenv`) and synthetic locks through the REAL hosted
+// rewriter, with a mock PyPI JSON API serving the release files the input
+// pins.
+
+const PYPI_UUID: &str = "33333333-3333-3333-3333-333333333333";
+const URLLIB3_WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
+const URLLIB3_WHEEL_SHA: &str = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
+const URLLIB3_SDIST: &str = "urllib3-1.26.18.tar.gz";
+const URLLIB3_SDIST_SHA: &str = "f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0";
+
+fn pypi_dep(name: &str, version: &str, leaf: &str, uuid: &str) -> DepOverride {
+    serde_json::from_value(serde_json::json!({
+        "ecosystem": "pypi", "name": name, "version": version,
+        "token": "11111111-1111-1111-1111-111111111111",
+        "patchUuid": uuid,
+        "artifactUrl": format!(
+            "https://patch.socket.dev/patch/pypi/{name}/{version}/11111111-1111-1111-1111-111111111111/{uuid}/{leaf}"
+        ),
+        "integrity": { "sha256": "d".repeat(64) }
+    }))
+    .unwrap()
+}
+
+fn urllib3_dep() -> DepOverride {
+    pypi_dep("urllib3", "1.26.18", URLLIB3_WHEEL, PYPI_UUID)
+}
+
+/// The mock PyPI URL of a release file.
+fn pypi_file_url(filename: &str) -> String {
+    format!("https://files.pythonhosted.org/packages/ab/cd/{filename}")
+}
+
+/// One PyPI JSON API release: name, version, `(filename, sha256, size,
+/// upload_time_iso_8601)` per file.
+type Release<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str, u64, &'a str)>);
+
+fn urllib3_release() -> Release<'static> {
+    (
+        "urllib3",
+        "1.26.18",
+        vec![
+            (URLLIB3_WHEEL, URLLIB3_WHEEL_SHA, 143835, "2023-10-17T17:46:21.184066Z"),
+            (URLLIB3_SDIST, URLLIB3_SDIST_SHA, 305687, "2023-10-17T17:46:24.000000Z"),
+        ],
+    )
+}
+
+/// Serve `GET /pypi/<name>/<version>/json` for every release, with
+/// `SOCKET_PYPI_JSON_API` pointed at it for the guard's lifetime.
+async fn pypi_mock(releases: &[Release<'_>]) -> (MockServer, EnvGuard) {
+    let server = MockServer::start().await;
+    for (name, version, files) in releases {
+        let urls: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(filename, sha, size, uploaded)| {
+                serde_json::json!({
+                    "filename": filename,
+                    "url": pypi_file_url(filename),
+                    "digests": { "sha256": sha },
+                    "size": size,
+                    "upload_time_iso_8601": uploaded,
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{name}/{version}/json")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "urls": urls })),
+            )
+            .mount(&server)
+            .await;
+    }
+    let env = EnvGuard::set(&[("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()))]);
+    (server, env)
+}
+
+fn tree(files: &[(&str, String)]) -> BTreeMap<String, String> {
+    files.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+}
+
+/// `input` as the real hosted rewriter leaves it.
+fn hosted(
+    input: &BTreeMap<String, String>,
+    deps: &[DepOverride],
+    pipenv: Option<u32>,
+) -> BTreeMap<String, String> {
+    let result =
+        rewrite_registry_redirect_with_pipenv_version(input, deps, &BTreeMap::new(), pipenv, false);
+    let mut out = input.clone();
+    out.extend(result.files);
+    out
+}
+
+/// Discover and restore `files` in a scratch project.
+async fn restore_tree(
+    files: &BTreeMap<String, String>,
+    opts: &RestoreOptions,
+) -> (BTreeMap<String, String>, Vec<(String, PinStatus)>) {
+    let tmp = tempfile::tempdir().unwrap();
+    for (rel, text) in files {
+        let p = tmp.path().join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    }
+    let discovery = socket_patch_core::vex::discover_patched_refs(tmp.path()).await;
+    let pins = HostedPin::all(&discovery);
+    let outcome = restore_upstream(tmp.path(), &pins, opts).await;
+    assert!(outcome.flush_error.is_none(), "{:?}", outcome.flush_error);
+    let statuses = outcome
+        .pins
+        .iter()
+        .map(|p| (p.purl.clone(), p.status.clone()))
+        .collect();
+    (walk(tmp.path()), statuses)
+}
+
+/// Hosted-rewrite `input`, restore it, and require the input bytes back.
+async fn assert_pypi_round_trip(
+    label: &str,
+    input: &BTreeMap<String, String>,
+    deps: &[DepOverride],
+    pipenv: Option<u32>,
+) {
+    let rewritten = hosted(input, deps, pipenv);
+    assert_ne!(&rewritten, input, "{label}: the hosted rewrite changed nothing");
+    let (after, statuses) = restore_tree(&rewritten, &RestoreOptions::default()).await;
+    assert!(!statuses.is_empty(), "{label}: discovery found no hosted pin");
+    for (purl, status) in &statuses {
+        assert_eq!(*status, PinStatus::Restored, "{label}: {purl}");
+    }
+    for (rel, want) in input {
+        assert_eq!(after.get(rel), Some(want), "{label}: {rel} did not round-trip");
+    }
+    let extra: Vec<&String> = after.keys().filter(|k| !input.contains_key(*k)).collect();
+    assert!(extra.is_empty(), "{label}: left behind {extra:?}");
+}
+
+/// Hosted-rewrite `input` and restore it, expecting every pin refused:
+/// the joined refusals, the hosted tree and the tree after the restore.
+async fn pypi_refusal(
+    input: &BTreeMap<String, String>,
+    deps: &[DepOverride],
+    opts: &RestoreOptions,
+) -> (String, BTreeMap<String, String>, BTreeMap<String, String>) {
+    let rewritten = hosted(input, deps, None);
+    assert_ne!(&rewritten, input, "the hosted rewrite changed nothing");
+    let (after, statuses) = restore_tree(&rewritten, opts).await;
+    let refusals: Vec<String> = statuses
+        .iter()
+        .filter_map(|(_, s)| match s {
+            PinStatus::Refused(why) => Some(why.clone()),
+            PinStatus::Restored => None,
+        })
+        .collect();
+    assert!(!refusals.is_empty() && refusals.len() == statuses.len(), "{statuses:?}");
+    (refusals.join("\n"), rewritten, after)
+}
+
+fn fixture(rel: &str) -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel))
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn requirements_golden_restores_modulo_name_casing() {
+    // NOT byte-invertible: the hosted line spells the name as the grant does
+    // (`Requests`); the original spelling (`requests`) is not recorded.
+    let mut ran = 0;
+    for case in load("pypi/requirements") {
+        let (after, statuses) = run_case(&case).await;
+        assert!(!statuses.is_empty());
+        for (purl, status) in &statuses {
+            assert_eq!(*status, PinStatus::Restored, "{}: {purl}", case.dir.display());
+        }
+        assert_eq!(
+            after["requirements.txt"].to_ascii_lowercase(),
+            case.input["requirements.txt"].to_ascii_lowercase()
+        );
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn uv_golden_without_a_registry_sibling_is_refused() {
+    // NOT invertible: the lock holds no other registry package, so which
+    // artifact fields this uv release records (`size`, `upload-time`) and
+    // how it lays out `wheels` is not derivable.
+    let (_server, _env) = pypi_mock(&[(
+        "click",
+        "8.1.7",
+        vec![("click-8.1.7-py3-none-any.whl", URLLIB3_WHEEL_SHA, 1, "2023-08-17T17:29:10Z")],
+    )])
+    .await;
+    let mut ran = 0;
+    for case in load("pypi/uv") {
+        let (after, statuses) = run_case(&case).await;
+        assert!(!statuses.is_empty());
+        for (purl, status) in &statuses {
+            assert!(
+                matches!(status, PinStatus::Refused(why)
+                    if why.contains("sibling") && why.contains("git checkout -- uv.lock")),
+                "{}: {purl} {status:?}",
+                case.dir.display()
+            );
+        }
+        assert_eq!(after, case.expected, "a refused pin must leave the files untouched");
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn poetry_every_lock_generation_round_trips() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let files = format!(
+        "urllib3 = [\n    {{file = \"{URLLIB3_WHEEL}\", hash = \"sha256:{URLLIB3_WHEEL_SHA}\"}},\n    {{file = \"{URLLIB3_SDIST}\", hash = \"sha256:{URLLIB3_SDIST_SHA}\"}},\n]"
+    );
+    for version in [
+        "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.5.1", "1.6.1", "1.7.1", "1.8.5", "2.0.1",
+        "2.1.4", "2.2.1", "2.3.4", "2.4.3",
+    ] {
+        // The 1.0/1.1 fixtures were locked without hashes (`urllib3 = []`);
+        // a real lock lists every release file.
+        let lock =
+            fixture(&format!("poetry/{version}/poetry.lock")).replace("urllib3 = []", &files);
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[("poetry.lock", lock.replace('\n', eol))]);
+            let label = format!("poetry {version} {eol:?}");
+            assert_pypi_round_trip(&label, &input, &[urllib3_dep()], None).await;
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn poetry_multi_package_lock_restores_only_the_pin() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let lock = fixture("poetry/2.4.3/poetry.lock").replace(
+        "\n[metadata]",
+        "\n[[package]]\nname = \"idna\"\nversion = \"3.4\"\ndescription = \"x\"\noptional = false\npython-versions = \">=3.5\"\ngroups = [\"main\"]\nfiles = [\n    {file = \"idna-3.4-py3-none-any.whl\", hash = \"sha256:aaaa\"},\n]\n\n[metadata]",
+    );
+    let input = tree(&[("poetry.lock", lock)]);
+    assert_pypi_round_trip("poetry siblings", &input, &[urllib3_dep()], None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pdm_every_supported_format_round_trips() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let mut ran = 0;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pdm-native");
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lock") {
+            continue;
+        }
+        let lock = fs::read_to_string(&path).unwrap();
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[("pdm.lock", lock.replace('\n', eol))]);
+            // Formats the hosted rewriter refuses (PDM 1.15, 2.0–2.7) have
+            // nothing to restore.
+            if hosted(&input, &[urllib3_dep()], None) == input {
+                continue;
+            }
+            let label = format!("{} {eol:?}", path.display());
+            assert_pypi_round_trip(&label, &input, &[urllib3_dep()], None).await;
+            ran += 1;
+        }
+    }
+    assert!(ran >= 10, "{ran}");
+}
+
+#[tokio::test]
+#[serial]
+async fn pdm_static_urls_round_trip() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let lock = fixture("pdm-native/2.29.2.lock")
+        .replace(
+            "strategy = [\"inherit_metadata\"]",
+            "strategy = [\"inherit_metadata\", \"static_urls\"]",
+        )
+        .replace(
+            &format!("{{file = \"{URLLIB3_WHEEL}\""),
+            &format!("{{url = \"{}\"", pypi_file_url(URLLIB3_WHEEL)),
+        )
+        .replace(
+            &format!("{{file = \"{URLLIB3_SDIST}\""),
+            &format!("{{url = \"{}\"", pypi_file_url(URLLIB3_SDIST)),
+        );
+    assert!(lock.contains("{url = \"https://files.pythonhosted.org"));
+    let input = tree(&[("pdm.lock", lock)]);
+    assert_pypi_round_trip("pdm static_urls", &input, &[urllib3_dep()], None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pdm_narrowed_lock_with_platform_wheels_is_refused() {
+    let wheel = "urllib3-1.26.18-cp311-cp311-manylinux_2_17_x86_64.whl";
+    let mut release = urllib3_release();
+    release.2.push((wheel, URLLIB3_WHEEL_SHA, 1, "2023-10-17T17:46:21Z"));
+    let (_server, _env) = pypi_mock(&[release]).await;
+    let input = tree(&[("pdm.lock", fixture("pdm-native/2.29.2.lock"))]);
+    let (why, rewritten, after) =
+        pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(why.contains("not derivable") && why.contains("cross_platform"), "{why}");
+    assert!(why.contains("git checkout -- pdm.lock"), "{why}");
+    assert_eq!(after, rewritten);
+    // A cross-platform lock records every file, whatever its tags.
+    let input = tree(&[("pdm.lock", fixture("pdm-native/2.11.2.lock"))]);
+    let rewritten = hosted(&input, &[urllib3_dep()], None);
+    let (after, statuses) = restore_tree(&rewritten, &RestoreOptions::default()).await;
+    assert_eq!(statuses[0].1, PinStatus::Restored);
+    assert!(after["pdm.lock"].contains(wheel));
+}
+
+/// serde_json's 2-space pretty output re-indented to Pipenv's 4 spaces.
+fn reindent4(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let n = l.len() - l.trim_start().len();
+            format!("{}{}", " ".repeat(n * 2), l.trim_start())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+#[serial]
+async fn pipfile_lock_fixture_and_every_category_round_trip() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let dir = "pipenv/2026.8.0";
+    let input = tree(&[
+        ("Pipfile.lock", fixture(&format!("{dir}/Pipfile.lock"))),
+        ("Pipfile", fixture(&format!("{dir}/Pipfile"))),
+    ]);
+    assert_pypi_round_trip("pipenv fixture", &input, &[urllib3_dep()], None).await;
+
+    // Several categories (a custom one too), extras, markers, a registry
+    // sibling; LF and CRLF.
+    let hashes = serde_json::json!([
+        format!("sha256:{URLLIB3_WHEEL_SHA}"),
+        format!("sha256:{URLLIB3_SDIST_SHA}")
+    ]);
+    let lock = serde_json::json!({
+        "_meta": { "hash": { "sha256": "x" }, "pipfile-spec": 6, "requires": {},
+                   "sources": [{ "name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true }] },
+        "default": {
+            "idna": { "hashes": ["sha256:aaaa"], "index": "pypi", "version": "==3.4" },
+            "urllib3": { "extras": ["socks"], "hashes": hashes, "index": "pypi",
+                         "markers": "python_version >= '3'", "version": "==1.26.18" }
+        },
+        "develop": { "urllib3": { "hashes": hashes, "index": "pypi", "version": "==1.26.18" } },
+        "tests": { "urllib3": { "hashes": hashes, "index": "pypi", "version": "==1.26.18" } }
+    });
+    let text = reindent4(&serde_json::to_string_pretty(&lock).unwrap()) + "\n";
+    for eol in ["\n", "\r\n"] {
+        let input = tree(&[
+            ("Pipfile.lock", text.replace('\n', eol)),
+            ("Pipfile", "[packages]\nurllib3 = \"*\"\n".into()),
+        ]);
+        let label = format!("pipenv categories {eol:?}");
+        assert_pypi_round_trip(&label, &input, &[urllib3_dep()], None).await;
+    }
+    // Pipenv 7.x–2017 writes `path` (and, before 2018, no `index`).
+    let old = text.replace(",\n            \"index\": \"pypi\"", "").replace("\"index\": \"pypi\",\n            ", "");
+    assert!(!old.contains("\"index\""), "{old}");
+    let input = tree(&[("Pipfile.lock", old), ("Pipfile", "[packages]\n".into())]);
+    assert_pypi_round_trip("pipenv 2017", &input, &[urllib3_dep()], Some(11)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pipfile_lock_refusals() {
+    let dir = "pipenv/2026.8.0";
+    let pipfile = fixture(&format!("{dir}/Pipfile"));
+    let lock = fixture(&format!("{dir}/Pipfile.lock"));
+    {
+        let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+        // Offline: the hashes need PyPI.
+        let input = tree(&[("Pipfile.lock", lock.clone()), ("Pipfile", pipfile.clone())]);
+        let offline = RestoreOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let (why, rewritten, after) = pypi_refusal(&input, &[urllib3_dep()], &offline).await;
+        assert!(why.contains("offline") && why.contains("git checkout -- Pipfile.lock"), "{why}");
+        assert_eq!(after, rewritten);
+        // A mirror as the only source.
+        let mirror = lock.replace("https://pypi.org/simple", "https://mirror.example/simple");
+        let input = tree(&[("Pipfile.lock", mirror), ("Pipfile", pipfile.clone())]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("is PyPI"), "{why}");
+        // The Pipfile routes the package to another index.
+        let routed = pipfile.replace(
+            "urllib3 = \"==1.26.18\"",
+            "urllib3 = { version = \"==1.26.18\", index = \"private\" }",
+        );
+        let input = tree(&[("Pipfile.lock", lock.clone()), ("Pipfile", routed)]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("not PyPI"), "{why}");
+    }
+    // PyPI does not know the release.
+    let (_server, _env) = pypi_mock(&[]).await;
+    let input = tree(&[("Pipfile.lock", lock), ("Pipfile", pipfile)]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(why.contains("404"), "{why}");
+}
+
+#[tokio::test]
+#[serial]
+async fn requirements_round_trips_in_both_hash_modes() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    // pip-compile --generate-hashes: continuation lines, `# via` comments.
+    let compiled = format!(
+        "#\n# pip-compile --generate-hashes\n#\nidna==3.4 \\\n    --hash=sha256:aaaa \\\n    --hash=sha256:bbbb\n    # via foo\nurllib3[socks]==1.26.18 ; python_version >= \"3\" \\\n    --hash=sha256:{URLLIB3_WHEEL_SHA} \\\n    --hash=sha256:{URLLIB3_SDIST_SHA}\n    # via -r requirements.in\n"
+    );
+    // Single-line hashes, a BOM, indentation, an inline comment, an option.
+    let single = format!(
+        "\u{feff}idna==3.4 --hash=sha256:aaaa\n  urllib3==1.26.18 --no-binary :none: --hash=sha256:{URLLIB3_WHEEL_SHA} --hash=sha256:{URLLIB3_SDIST_SHA} # keep\n"
+    );
+    let plain =
+        "-i https://pypi.org/simple\nflask==2.0.1\nurllib3[socks]==1.26.18 ; sys_platform == \"linux\" # pinned\n"
+            .to_string();
+    for (label, text) in [("compiled", compiled), ("single", single), ("plain", plain)] {
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[("requirements.txt", text.replace('\n', eol))]);
+            let label = format!("requirements {label} {eol:?}");
+            assert_pypi_round_trip(&label, &input, &[urllib3_dep()], None).await;
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn requirements_hash_mode_ambiguity_is_refused() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let input = tree(&[("requirements.txt", "urllib3==1.26.18\n".into())]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(why.contains("hash-checking mode") && why.contains("not derivable"), "{why}");
+    let input = tree(&[(
+        "requirements.txt",
+        "idna==3.4 --hash=sha256:aaaa\nsix==1.16.0\nurllib3==1.26.18\n".into(),
+    )]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(why.contains("mixes hashed and unhashed"), "{why}");
+    // `--require-hashes` alone settles it.
+    let input = tree(&[(
+        "requirements.txt",
+        format!("--require-hashes\nurllib3==1.26.18 --hash=sha256:{URLLIB3_WHEEL_SHA} --hash=sha256:{URLLIB3_SDIST_SHA}\n"),
+    )]);
+    assert_pypi_round_trip("require-hashes", &input, &[urllib3_dep()], None).await;
+    // Offline needs no lookup without hashes…
+    let offline = RestoreOptions {
+        offline: true,
+        ..Default::default()
+    };
+    let input = tree(&[("requirements.txt", "flask==2.0.1\nurllib3==1.26.18\n".into())]);
+    let rewritten = hosted(&input, &[urllib3_dep()], None);
+    let (after, statuses) = restore_tree(&rewritten, &offline).await;
+    assert_eq!(statuses[0].1, PinStatus::Restored);
+    assert_eq!(after["requirements.txt"], input["requirements.txt"]);
+    // …and is refused in hash mode.
+    let input = tree(&[(
+        "requirements.txt",
+        format!("idna==3.4 --hash=sha256:aaaa\nurllib3==1.26.18 --hash=sha256:{URLLIB3_WHEEL_SHA}\n"),
+    )]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &offline).await;
+    assert!(why.contains("offline"), "{why}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_refused_pin_leaves_the_other_pins_restored() {
+    // PyPI knows urllib3 only: idna's hashes cannot be re-derived.
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let idna = pypi_dep("idna", "3.4", "idna-3.4-py3-none-any.whl", "44444444-4444-4444-4444-444444444444");
+    let input = tree(&[(
+        "requirements.txt",
+        format!(
+            "six==1.16.0 --hash=sha256:aaaa\nidna==3.4 --hash=sha256:bbbb\nurllib3==1.26.18 --hash=sha256:{URLLIB3_WHEEL_SHA} --hash=sha256:{URLLIB3_SDIST_SHA}\n"
+        ),
+    )]);
+    let rewritten = hosted(&input, &[urllib3_dep(), idna], None);
+    let (after, statuses) = restore_tree(&rewritten, &RestoreOptions::default()).await;
+    let status = |purl: &str| &statuses.iter().find(|(p, _)| p == purl).unwrap().1;
+    assert_eq!(*status("pkg:pypi/urllib3@1.26.18"), PinStatus::Restored);
+    assert!(matches!(status("pkg:pypi/idna@3.4"), PinStatus::Refused(why) if why.contains("404")));
+    let lines: Vec<&str> = after["requirements.txt"].lines().collect();
+    assert_eq!(lines[0], "six==1.16.0 --hash=sha256:aaaa");
+    assert!(lines[1].starts_with("idna @ https://patch.socket.dev/"), "{lines:?}");
+    assert_eq!(lines[2], input["requirements.txt"].lines().nth(2).unwrap());
+}
+
+#[tokio::test]
+#[serial]
+async fn hatch_round_trips_with_the_direct_reference_permission() {
+    let (_server, _env) = pypi_mock(&[]).await;
+    let cases = [
+        // The permission tables did not exist.
+        "[project]\nname = \"x\"\ndependencies = [\"Urllib3[socks]==1.26.18 ; python_version >= '3'\", \"idna\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n",
+        // `[tool.hatch]` existed; extras and environments too.
+        "[project]\nname = \"x\"\ndependencies = [\n    \"urllib3==1.26.18\",\n]\n\n[project.optional-dependencies]\nsocks = [\"urllib3[socks]==1.26.18\"]\n\n[tool.hatch.envs.default]\ndependencies = [\"urllib3==1.26.18\"]\n",
+        // Environment-only: no permission is written.
+        "[project]\nname = \"x\"\ndependencies = []\n\n[tool.hatch.envs.test]\nextra-dependencies = [\"urllib3==1.26.18\"] # pinned\n",
+    ];
+    for text in cases {
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[("pyproject.toml", text.replace('\n', eol))]);
+            let label = format!("hatch {text:?} {eol:?}");
+            assert_pypi_round_trip(&label, &input, &[urllib3_dep()], None).await;
+        }
+    }
+    // hatch.toml environments and its `[metadata]` permission.
+    let input = tree(&[
+        ("pyproject.toml", "[project]\nname = \"x\"\ndependencies = [\"urllib3==1.26.18\"]\n".into()),
+        ("hatch.toml", "[metadata]\nallow-direct-references = true\n\n[envs.default]\ndependencies = [\"urllib3==1.26.18\"]\n".into()),
+    ]);
+    let rewritten = hosted(&input, &[urllib3_dep()], None);
+    assert!(rewritten["hatch.toml"].contains("allow-direct-references = true"));
+    let (after, statuses) = restore_tree(&rewritten, &RestoreOptions::default()).await;
+    assert_eq!(statuses[0].1, PinStatus::Restored, "{statuses:?}");
+    assert_eq!(after["pyproject.toml"], input["pyproject.toml"]);
+    // The permission governs nothing once no direct reference is left.
+    assert!(!after["hatch.toml"].contains("allow-direct-references"));
+    assert!(after["hatch.toml"].contains("dependencies = [\"urllib3==1.26.18\"]"));
+}
+
+// ── uv ───────────────────────────────────────────────────────────────────────
+
+/// A uv.lock (revision 2 artifact shape) holding a registry `idna`, the
+/// virtual root `proj` and `urllib3`; `root_deps` / `requires_dist` are the
+/// root's `dependencies` and `requires-dist` entries.
+fn uv_lock(root_deps: &str, requires_dist: &str, tail: &str) -> String {
+    format!(
+        "version = 1\nrevision = 2\nrequires-python = \">=3.8\"\n\n\
+[[package]]\nname = \"idna\"\nversion = \"3.4\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n\
+sdist = {{ url = \"https://files.pythonhosted.org/packages/aa/idna-3.4.tar.gz\", hash = \"sha256:{a}\", size = 183077, upload-time = \"2022-09-14T19:41:00.123Z\" }}\n\
+wheels = [\n    {{ url = \"https://files.pythonhosted.org/packages/bb/idna-3.4-py3-none-any.whl\", hash = \"sha256:{b}\", size = 61538, upload-time = \"2022-09-14T19:40:59.1Z\" }},\n]\n\n\
+[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\ndependencies = [\n{root_deps}]\n\n\
+[package.metadata]\nrequires-dist = [\n{requires_dist}]\n\n\
+[[package]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n\
+sdist = {{ url = \"{sdist_url}\", hash = \"sha256:{URLLIB3_SDIST_SHA}\", size = 305687, upload-time = \"2023-10-17T17:46:24Z\" }}\n\
+wheels = [\n    {{ url = \"{wheel_url}\", hash = \"sha256:{URLLIB3_WHEEL_SHA}\", size = 143835, upload-time = \"2023-10-17T17:46:21.184Z\" }},\n]\n\n\
+[package.optional-dependencies]\nsocks = [\n    {{ name = \"pysocks\" }},\n]\n{tail}",
+        a = "a".repeat(64),
+        b = "b".repeat(64),
+        sdist_url = pypi_file_url(URLLIB3_SDIST),
+        wheel_url = pypi_file_url(URLLIB3_WHEEL),
+    )
+}
+
+#[tokio::test]
+#[serial]
+async fn uv_project_locks_round_trip() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    // A direct dependency (extras, a multi-clause specifier whose spelling
+    // the idna entry shows), LF and CRLF.
+    let lock = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\", extra = [\"socks\"] },\n",
+        "    { name = \"idna\", specifier = \">=3, <4\" },\n    { name = \"urllib3\", extras = [\"socks\"], specifier = \">=1.26, <2\" },\n",
+        "",
+    );
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna>=3,<4\", \"urllib3[socks] >= 1.26, < 2\"]\n";
+    for eol in ["\n", "\r\n"] {
+        let input = tree(&[
+            ("uv.lock", lock.replace('\n', eol)),
+            ("pyproject.toml", pyproject.replace('\n', eol)),
+        ]);
+        assert_pypi_round_trip(&format!("uv direct {eol:?}"), &input, &[urllib3_dep()], None).await;
+    }
+    // A transitive dependency: the override the rewrite pins in the
+    // pyproject and the lock's `[manifest]` both go again.
+    let lock = uv_lock(
+        "    { name = \"idna\" },\n",
+        "    { name = \"idna\", specifier = \">=3\" },\n",
+        "",
+    );
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna>=3\"]\n\n[tool.uv]\ndev-dependencies = []\n";
+    let input = tree(&[("uv.lock", lock), ("pyproject.toml", pyproject.into())]);
+    let rewritten = hosted(&input, &[urllib3_dep()], None);
+    assert!(rewritten["pyproject.toml"].contains("override-dependencies"));
+    assert!(rewritten["uv.lock"].contains("[manifest]"));
+    assert_pypi_round_trip("uv transitive", &input, &[urllib3_dep()], None).await;
+    // A lock-only checkout, with a dependent's source-qualified reference.
+    let lock = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\", source = { registry = \"https://pypi.org/simple\" } },\n",
+        "    { name = \"idna\", specifier = \">=3\" },\n",
+        "",
+    );
+    let input = tree(&[("uv.lock", lock)]);
+    assert_pypi_round_trip("uv lock-only", &input, &[urllib3_dep()], None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn uv_script_lock_round_trips() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let script = "#!/usr/bin/env python3\n# /// script\n# dependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n# ///\nprint('hi')\n";
+    let lock = uv_lock("", "", "\n[manifest]\nrequirements = [\n    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n]\n")
+        .replace(
+            "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [\n]\n\n[package.metadata]\nrequires-dist = [\n]\n\n",
+            "",
+        );
+    assert!(!lock.contains("proj"), "{lock}");
+    let input = tree(&[("tool.py", script.into()), ("tool.py.lock", lock)]);
+    assert_pypi_round_trip("uv script", &input, &[urllib3_dep()], None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pylock_round_trips() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let lock = format!(
+        "lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \">=3.8\"\n\n\
+[[packages]]\nname = \"idna\"\nversion = \"3.4\"\nindex = \"https://pypi.org/simple\"\n\
+sdist = {{ url = \"https://files.pythonhosted.org/packages/aa/idna-3.4.tar.gz\", upload-time = 2022-09-14T19:41:00.123Z, size = 183077, hashes = {{ sha256 = \"{a}\" }} }}\n\
+wheels = [{{ url = \"https://files.pythonhosted.org/packages/bb/idna-3.4-py3-none-any.whl\", upload-time = 2022-09-14T19:40:59.1Z, size = 61538, hashes = {{ sha256 = \"{b}\" }} }}]\n\n\
+[[packages]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nindex = \"https://pypi.org/simple\"\n\
+sdist = {{ url = \"{sdist_url}\", upload-time = 2023-10-17T17:46:24Z, size = 305687, hashes = {{ sha256 = \"{URLLIB3_SDIST_SHA}\" }} }}\n\
+wheels = [{{ url = \"{wheel_url}\", upload-time = 2023-10-17T17:46:21.184Z, size = 143835, hashes = {{ sha256 = \"{URLLIB3_WHEEL_SHA}\" }} }}]\n",
+        a = "a".repeat(64),
+        b = "b".repeat(64),
+        sdist_url = pypi_file_url(URLLIB3_SDIST),
+        wheel_url = pypi_file_url(URLLIB3_WHEEL),
+    );
+    let input = tree(&[("pylock.toml", lock)]);
+    assert_pypi_round_trip("pylock", &input, &[urllib3_dep()], None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn uv_refusals() {
+    let direct = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\" },\n",
+        "    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \">=1.26, <2\" },\n",
+        "",
+    );
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna>=3\", \"urllib3>=1.26,<2\"]\n";
+    {
+        let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+        // No other entry shows how this uv joins specifier clauses.
+        let input = tree(&[("uv.lock", direct.clone()), ("pyproject.toml", pyproject.into())]);
+        let (why, rewritten, after) =
+            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("multi-clause"), "{why}");
+        assert!(why.contains("git checkout -- uv.lock"), "{why}");
+        assert_eq!(after, rewritten, "a refused pin leaves every file hosted");
+        // Another registry than PyPI.
+        let mirror = direct.replace("https://pypi.org/simple", "https://mirror.example/simple");
+        let input = tree(&[("uv.lock", mirror)]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("not PyPI"), "{why}");
+        // Several registries.
+        let mixed = direct.replace(
+            "[[package]]\nname = \"proj\"",
+            "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://mirror.example/simple\" }\n\n[[package]]\nname = \"proj\"",
+        );
+        let input = tree(&[("uv.lock", mixed)]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("several registries"), "{why}");
+        // `exclude-newer` filters files by upload time.
+        let newer = direct.replace(
+            "requires-python = \">=3.8\"\n",
+            "requires-python = \">=3.8\"\n\n[options]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
+        );
+        let input = tree(&[("uv.lock", newer)]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("exclude-newer"), "{why}");
+        // Offline.
+        let input = tree(&[("uv.lock", direct.clone())]);
+        let offline = RestoreOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &offline).await;
+        assert!(why.contains("offline"), "{why}");
+    }
+    // A release with interpreter-specific wheels.
+    let mut release = urllib3_release();
+    release.2.push(("urllib3-1.26.18-cp311-cp311-win_amd64.whl", URLLIB3_WHEEL_SHA, 1, "2023-10-17T17:46:21Z"));
+    let (_server, _env) = pypi_mock(&[release]).await;
+    let input = tree(&[("uv.lock", direct)]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(why.contains("interpreter-specific wheels"), "{why}");
 }

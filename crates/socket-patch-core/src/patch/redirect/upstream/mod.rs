@@ -31,6 +31,9 @@ mod composer;
 mod gem;
 mod golang;
 mod npm;
+mod pypi;
+mod pypi_locks;
+mod uv;
 
 pub(crate) use client::UpstreamClient;
 
@@ -265,6 +268,15 @@ enum Format {
     Golang,
     Gem,
     Composer,
+    PipfileLock,
+    PoetryLock,
+    PdmLock,
+    Requirements,
+    /// Hatch direct references (`pyproject.toml`, `hatch.toml`).
+    Hatch,
+    /// uv.lock, PEP 723 script locks and PEP 751 pylock files (the uv
+    /// restorer also edits their paired `pyproject.toml` / script).
+    PythonLock,
     Unsupported,
 }
 
@@ -279,6 +291,13 @@ fn format_of(rel: &str) -> Format {
         "go.mod" | "go.sum" | "go.work" => Format::Golang,
         "Gemfile.lock" | "gems.locked" | "Gemfile" | "gems.rb" => Format::Gem,
         "composer.lock" => Format::Composer,
+        "Pipfile.lock" => Format::PipfileLock,
+        "poetry.lock" => Format::PoetryLock,
+        "pdm.lock" => Format::PdmLock,
+        "pyproject.toml" | "hatch.toml" => Format::Hatch,
+        leaf if crate::utils::python_lock::is_python_lock_name(leaf) => Format::PythonLock,
+        // The root requirements.txt and the `-r` includes discovery walks.
+        leaf if leaf.ends_with(".txt") => Format::Requirements,
         _ => Format::Unsupported,
     }
 }
@@ -395,6 +414,12 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::Golang => golang::restore(view, &pins, &files, ctx).await,
             Format::Gem => gem::restore(view, &pins, &files, ctx).await,
             Format::Composer => composer::restore(view, &pins, &files, ctx).await,
+            Format::PipfileLock => pypi::restore_pipfile_lock(view, &pins, &files, ctx).await,
+            Format::PoetryLock => pypi_locks::restore_poetry(view, &pins, &files, ctx).await,
+            Format::PdmLock => pypi_locks::restore_pdm(view, &pins, &files, ctx).await,
+            Format::Requirements => pypi::restore_requirements(view, &pins, &files, ctx).await,
+            Format::Hatch => pypi::restore_hatch(view, &pins, &files, ctx).await,
+            Format::PythonLock => uv::restore(view, &pins, &files, ctx).await,
             Format::Unsupported => {
                 let mut r = FormatResult::default();
                 for pin in &pins {

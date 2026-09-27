@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::vendor::registry_fetch::{build_registry_client, npm_registry_base, RegistryClient};
+use crate::vendor::registry_fetch::{
+    build_registry_client, npm_registry_base, pypi_json_api_base, RegistryClient,
+};
 
 /// An npm version's `dist` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,23 @@ pub(crate) struct GoSums {
     pub zip_h1: String,
     /// `h1:` of the module's go.mod.
     pub mod_h1: String,
+}
+
+/// One release file of a PyPI version, from the JSON API's `urls[]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PypiFile {
+    /// The distribution filename (`<name>-<ver>-<tags>.whl`, `.tar.gz`, …).
+    pub filename: String,
+    /// The file's download URL (files.pythonhosted.org on PyPI).
+    pub url: String,
+    /// Lowercase hex sha256 (`digests.sha256`).
+    pub sha256: String,
+    /// Size in bytes.
+    pub size: Option<u64>,
+    /// `upload_time_iso_8601` (microsecond precision, `Z`): the same instant
+    /// the PEP 691 simple API reports as `upload-time`, which is what uv
+    /// records.
+    pub upload_time: Option<String>,
 }
 
 /// The sparse crates.io index; override with `SOCKET_CRATES_INDEX`.
@@ -142,6 +161,7 @@ pub(crate) struct UpstreamClient {
     go: Cache<GoSums>,
     rubygems: Cache<String>,
     packagist: Cache<Vec<Value>>,
+    pypi: Cache<Vec<PypiFile>>,
 }
 
 impl UpstreamClient {
@@ -155,6 +175,7 @@ impl UpstreamClient {
             go: Mutex::default(),
             rubygems: Mutex::default(),
             packagist: Mutex::default(),
+            pypi: Mutex::default(),
         }
     }
 
@@ -272,6 +293,38 @@ impl UpstreamClient {
         result
     }
 
+    /// Every release file of `name@version` from PyPI's JSON API (`GET
+    /// <api>/<name>/<version>/json`, base overridable with
+    /// `SOCKET_PYPI_JSON_API`), sorted by filename — the order Poetry, PDM,
+    /// Pipenv and pip-compile record them in. `name` is PEP 503
+    /// canonicalized first (PyPI redirects every other spelling to it).
+    pub(crate) async fn pypi_files(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<PypiFile>, String> {
+        let name = crate::crawlers::python_crawler::canonicalize_pypi_name(name);
+        let key = (name.clone(), version.to_string());
+        if let Some(hit) = self.pypi.lock().await.get(&key) {
+            return hit.clone();
+        }
+        let result = async {
+            if self.offline {
+                return Err(OFFLINE.to_string());
+            }
+            let url = format!(
+                "{}/{name}/{}/json",
+                pypi_json_api_base(),
+                crate::utils::uri::encode_uri_component(version)
+            );
+            let doc = self.get_json(&url).await?;
+            pypi_release_files(&doc).map_err(|why| format!("{url} {why}"))
+        }
+        .await;
+        self.pypi.lock().await.insert(key, result.clone());
+        result
+    }
+
     /// The go.sum hashes of `module@version`, computed from the module
     /// proxy's `.zip` and `.mod` the way `go` computes them.
     pub(crate) async fn go_sums(&self, module: &str, version: &str) -> Result<GoSums, String> {
@@ -385,6 +438,42 @@ impl UpstreamClient {
     }
 }
 
+/// The release files of a PyPI JSON API version document, sorted by
+/// filename.
+fn pypi_release_files(doc: &Value) -> Result<Vec<PypiFile>, String> {
+    let urls = doc
+        .get("urls")
+        .and_then(Value::as_array)
+        .ok_or("carries no `urls` list")?;
+    let mut files = Vec::with_capacity(urls.len());
+    for file in urls {
+        let str_field = |k: &str| file.get(k).and_then(Value::as_str).map(str::to_string);
+        let filename = str_field("filename")
+            .filter(|f| !f.is_empty() && !f.contains(['/', '\\']))
+            .ok_or("lists a file without a plain filename")?;
+        let url = str_field("url").ok_or_else(|| format!("lists {filename} without a url"))?;
+        let sha256 = file
+            .get("digests")
+            .and_then(|d| d.get("sha256"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .filter(|h| crate::utils::digest::is_hex64_lower(h))
+            .ok_or_else(|| format!("lists {filename} without a sha256 digest"))?;
+        files.push(PypiFile {
+            filename,
+            url,
+            sha256,
+            size: file.get("size").and_then(Value::as_u64),
+            upload_time: str_field("upload_time_iso_8601"),
+        });
+    }
+    if files.is_empty() {
+        return Err("lists no release files".to_string());
+    }
+    files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(files)
+}
+
 /// Go's checksum database, `sum.golang.org`; `SOCKET_GOSUMDB_URL` names
 /// another (tests, mirrors).
 pub(crate) const DEFAULT_GOSUMDB: &str = "https://sum.golang.org";
@@ -466,6 +555,25 @@ mod tests {
         assert_eq!(expanded[2]["dist"]["url"], "y");
         let raw = expand_packagist_versions(versions.as_array().unwrap(), false);
         assert!(raw[1].get("name").is_none());
+    }
+
+    #[test]
+    fn pypi_release_files_are_validated_and_sorted() {
+        let doc = serde_json::json!({ "urls": [
+            { "filename": "x-1.tar.gz", "url": "https://f/x-1.tar.gz",
+              "digests": { "sha256": "B".repeat(64) }, "size": 3,
+              "upload_time_iso_8601": "2023-01-01T00:00:00.123456Z" },
+            { "filename": "x-1-py3-none-any.whl", "url": "https://f/x.whl",
+              "digests": { "sha256": "a".repeat(64) } },
+        ]});
+        let files = pypi_release_files(&doc).unwrap();
+        assert_eq!(files[0].filename, "x-1-py3-none-any.whl");
+        assert_eq!(files[1].sha256, "b".repeat(64));
+        assert_eq!(files[1].size, Some(3));
+        assert!(pypi_release_files(&serde_json::json!({ "urls": [] })).is_err());
+        let bad = serde_json::json!({ "urls": [{ "filename": "x.whl", "url": "u",
+            "digests": { "sha256": "zz" } }] });
+        assert!(pypi_release_files(&bad).unwrap_err().contains("sha256"));
     }
 
     #[test]
