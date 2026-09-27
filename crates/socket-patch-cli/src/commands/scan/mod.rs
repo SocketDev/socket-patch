@@ -2373,10 +2373,25 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             }
         }
     };
+    // The hosted pins the lockfiles wire count too: the lockfile is the
+    // record of a hosted redirect even where no ledger was committed.
+    let hosted_pins: Vec<(String, String)> =
+        if args.common.global || args.common.global_prefix.is_some() {
+            Vec::new()
+        } else {
+            crate::commands::discover_wiring(&args.common, &args.common.cwd)
+                .await
+                .refs
+                .into_iter()
+                .filter(|r| r.mode == socket_patch_core::vex::discover::WiringMode::Hosted)
+                .map(|r| (r.purl, r.uuid))
+                .collect()
+        };
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
         redirect_state.as_ref(),
         vendor_state.as_ref().ok(),
+        &hosted_pins,
     );
     let updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
 

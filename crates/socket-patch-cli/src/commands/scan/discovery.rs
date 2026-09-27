@@ -418,21 +418,23 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 /// CLI_CONTRACT.md) is structurally empty and a superseding patch is never
 /// reported. Precedence on a collision: manifest > redirect ledger > vendor
 /// ledger (a manifest PURL is manifest-owned, matching VEX's candidate merge
-/// in `commands::vex_sources` for purls no lockfile wires to another patch).
+/// in `commands::vex_sources` for purls no lockfile wires to another patch),
+/// then the lockfile's hosted pins (`hosted_pins`, uuid only).
 /// Vendor entries are keyed by their ledger map key
 /// (the manifest-form purl, qualifiers included — `detect_updates` bridges
 /// the spellings); a legacy entry without an embedded record contributes its
 /// uuid alone, which is all update detection reads. Borrows the manifest
-/// untouched when neither ledger contributes. Pure / no I/O so it's
+/// untouched when nothing else contributes. Pure / no I/O so it's
 /// unit-testable.
 pub(super) fn merge_ledger_records_for_updates<'a>(
     manifest: Option<&'a PatchManifest>,
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: Option<&VendorState>,
+    hosted_pins: &[(String, String)],
 ) -> Option<Cow<'a, PatchManifest>> {
     let redirect_records = redirect.map(|s| &s.records).filter(|r| !r.is_empty());
     let vendor_entries = vendor.map(|s| &s.entries).filter(|e| !e.is_empty());
-    if redirect_records.is_none() && vendor_entries.is_none() {
+    if redirect_records.is_none() && vendor_entries.is_none() && hosted_pins.is_empty() {
         return manifest.map(Cow::Borrowed);
     }
     let mut merged = manifest.cloned().unwrap_or_default();
@@ -454,6 +456,20 @@ pub(super) fn merge_ledger_records_for_updates<'a>(
                 tier: String::new(),
             })
         });
+    }
+    for (purl, uuid) in hosted_pins {
+        merged
+            .patches
+            .entry(purl.clone())
+            .or_insert_with(|| PatchRecord {
+                uuid: uuid.clone(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            });
     }
     Some(Cow::Owned(merged))
 }
@@ -1048,7 +1064,7 @@ mod tests {
         // uuid. The merged view must make detect_updates flag it — this was
         // structurally impossible before the fold (manifest-only detection).
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-old")]);
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None);
+        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None, &[]);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
@@ -1064,7 +1080,7 @@ mod tests {
         // record still contributes its uuid — all detection reads.
         for detached in [true, false] {
             let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-old", detached)]);
-            let merged = merge_ledger_records_for_updates(None, None, Some(&vendor));
+            let merged = merge_ledger_records_for_updates(None, None, Some(&vendor), &[]);
             let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
             let updates = detect_updates(merged.as_deref(), &pkgs);
             assert_eq!(updates.len(), 1, "detached={detached}");
@@ -1073,7 +1089,7 @@ mod tests {
         }
         // Still the top offer — no nag.
         let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-a", true)]);
-        let merged = merge_ledger_records_for_updates(None, None, Some(&vendor));
+        let merged = merge_ledger_records_for_updates(None, None, Some(&vendor), &[]);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
         assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
     }
@@ -1082,7 +1098,7 @@ mod tests {
     fn ledger_record_matching_the_candidate_is_not_an_update() {
         // The redirected patch is still the top offer — no nag.
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None);
+        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None, &[]);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
         assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
     }
@@ -1097,12 +1113,12 @@ mod tests {
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-ledger")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-vendor", true)]);
         let merged =
-            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
+            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor), &[]);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].old_uuid, "uuid-manifest");
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), Some(&vendor));
+        let merged = merge_ledger_records_for_updates(None, Some(&ledger), Some(&vendor), &[]);
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates[0].old_uuid, "uuid-ledger");
     }
@@ -1117,7 +1133,7 @@ mod tests {
         let ledger = ledger_with(&[("pkg:npm/bar@2.0", "uuid-b1")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/baz@3.0", "uuid-z1", true)]);
         let merged =
-            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
+            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor), &[]);
         let pkgs = vec![
             batch_with("pkg:npm/foo@1.0", &["uuid-f2"]),
             batch_with("pkg:npm/bar@2.0", &["uuid-b2"]),
@@ -1133,15 +1149,18 @@ mod tests {
 
     #[test]
     fn absent_or_empty_ledgers_leave_the_manifest_view_untouched() {
-        assert!(merge_ledger_records_for_updates(None, None, None).is_none());
+        assert!(merge_ledger_records_for_updates(None, None, None, &[]).is_none());
+        let pins = vec![("pkg:npm/foo@1.0.0".to_string(), "uuid-pin".to_string())];
+        let merged = merge_ledger_records_for_updates(None, None, None, &pins).expect("pinned");
+        assert_eq!(merged.patches["pkg:npm/foo@1.0.0"].uuid, "uuid-pin");
         let empty = socket_patch_core::patch::redirect::RedirectState::new();
         let empty_vendor = VendorState::new();
         assert!(
-            merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor)).is_none()
+            merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor), &[]).is_none()
         );
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty), None)
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty), None, &[])
             .expect("manifest present");
         assert!(
             matches!(merged, Cow::Borrowed(_)),
