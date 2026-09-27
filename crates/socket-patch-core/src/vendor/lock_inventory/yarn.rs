@@ -1,10 +1,10 @@
 //! `yarn.lock`, classic and berry: the entry models lockfile discovery
 //! shares ([`classic_entries`], [`berry_entries`]) and the registry views.
 
+#[cfg(test)]
 use std::path::Path;
 
 use crate::utils::digest::is_hex;
-use crate::utils::fs::read_regular_to_string;
 use crate::vendor::yarn_berry_lock::{
     berry_field, berry_metadata, parse_berry_locator, BerryLocator,
 };
@@ -13,6 +13,7 @@ use crate::vendor::yarn_classic_lock::{
     split_resolved_sha1, LockBlock,
 };
 
+use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry};
 
 // ── entry model ──
@@ -105,8 +106,15 @@ pub(crate) fn berry_checksum_pin(value: &str, cache_key: Option<&str>) -> Option
 
 // ── registry view ──
 
+#[cfg(test)]
 pub(super) async fn inventory_yarn_classic(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&root.join("yarn.lock")).await.ok()?;
+    inventory_yarn_classic_in(&ProjectView::Disk(root)).await
+}
+
+pub(super) async fn inventory_yarn_classic_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text("yarn.lock").await.ok()?;
     Some(classic_registry_view(&text))
 }
 
@@ -147,8 +155,13 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
     out
 }
 
+#[cfg(test)]
 pub(super) async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&root.join("yarn.lock")).await.ok()?;
+    inventory_yarn_berry_in(&ProjectView::Disk(root)).await
+}
+
+pub(super) async fn inventory_yarn_berry_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text("yarn.lock").await.ok()?;
     Some(berry_registry_view(&text))
 }
 

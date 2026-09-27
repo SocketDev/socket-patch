@@ -2465,6 +2465,21 @@ async fn already_redirected_requirements_lines_stay_in_the_inventory() {
         "a user's own file reference stays out; ours come back as the \
          package they replace: {entries:?}"
     );
+    // The in-memory hosted engine inventories through the same reader
+    // over a `ProjectView::Memory`: it must see the same packages.
+    let mut project = MemoryProject::new();
+    project.insert_text(
+        "requirements.txt",
+        std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap(),
+    );
+    let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted_pairs(&in_memory),
+        sorted_pairs(&entries),
+        "the in-memory view reads a rewired requirements.txt the same way: {in_memory:?}"
+    );
     // Discovery-only, exactly like the `==` pins beside them: the pinned
     // artifact is the PATCHED one, so it must never be fetched as pristine.
     for e in &entries {

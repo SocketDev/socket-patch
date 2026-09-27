@@ -2,19 +2,20 @@
 //! requirements): the registry views, with the Pipfile.lock entry walk
 //! lockfile discovery shares ([`pipfile_lock_entries`]).
 
+#[cfg(test)]
 use std::path::Path;
 
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::read_regular_to_string;
 use crate::utils::purl::{percent_decode_purl_component, pypi_purl};
 use crate::utils::python_lock::{lock_package_collection, package_artifacts, UvSource};
 use crate::utils::requirements::archive_filename_coords;
 
 use crate::utils::digest::{sha256_hex, sha256_prefixed};
 
+use super::view::ProjectView;
 use super::{dedup_prefer_integrity, http_url, LockIntegrity, LockfileEntry, SourceKind};
 
 // pypi purls and lock entries compare in PEP 503 normalized form
@@ -171,21 +172,45 @@ pub(crate) fn hosted_artifact_url(url: &str) -> Result<HostedArtifactUrl, String
 /// choice is not derivable offline). `pdm.lock` contributes discovery-only
 /// entries. Pipfile.lock contributes entries whose integrity is its digest SET
 /// (see `inventory_pipfile_lock`).
+#[cfg(test)]
 pub(super) async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    inventory_pypi_locks_raw(project_root)
+    inventory_pypi_locks_in(&ProjectView::Disk(project_root)).await
+}
+
+/// [`inventory_pypi_locks`] over a [`ProjectView`].
+pub(super) async fn inventory_pypi_locks_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    inventory_pypi_locks_raw_in(view)
         .await
         .map(dedup_prefer_integrity)
 }
 
+/// The project-root Python lock names ([`crate::utils::python_lock::python_lock_paths`]
+/// on disk; the in-memory project's root-level names otherwise), sorted.
+pub(crate) fn python_lock_paths_in(view: &ProjectView<'_>) -> std::io::Result<Vec<String>> {
+    match view {
+        ProjectView::Disk(root) => crate::utils::python_lock::python_lock_paths(root),
+        ProjectView::Memory(project) => Ok(project
+            .children("")
+            .into_iter()
+            .filter(|(name, is_dir)| {
+                !is_dir && crate::utils::python_lock::is_python_lock_name(name)
+            })
+            .map(|(name, _)| name)
+            .collect()),
+    }
+}
+
 /// [`inventory_pypi_locks`] before its collapse: every instance
 /// ([`super::inventory_project_every_lock`]).
-pub(super) async fn inventory_pypi_locks_raw(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+pub(super) async fn inventory_pypi_locks_raw_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
     let mut out = Vec::new();
     let mut found = false;
     let mut uv_lock = false;
-    if let Ok(paths) = crate::utils::python_lock::python_lock_paths(project_root) {
+    if let Ok(paths) = python_lock_paths_in(view) {
         for path in paths {
-            let Ok(text) = read_regular_to_string(&project_root.join(&path)).await else {
+            let Ok(text) = view.read_text(&path).await else {
                 continue;
             };
             if let Some(entries) = python_lock_inventory(&text) {
@@ -209,10 +234,10 @@ pub(super) async fn inventory_pypi_locks_raw(project_root: &Path) -> Option<Vec<
     // must not hide every poetry.lock / requirements.txt pin from scan's
     // lockfile supplement and vendor's lookup.
     if !uv_lock {
-        if let Some(entries) = inventory_poetry_lock(project_root).await {
+        if let Some(entries) = inventory_poetry_lock(view).await {
             found = true;
             out.extend(entries);
-        } else if let Some(entries) = inventory_pdm_lock(project_root).await {
+        } else if let Some(entries) = inventory_pdm_lock(view).await {
             found = true;
             out.extend(entries);
         } else {
@@ -222,11 +247,11 @@ pub(super) async fn inventory_pypi_locks_raw(project_root: &Path) -> Option<Vec<
             // a requirements project must not hide the pins the project
             // actually installs from (the hosted rewriter judges each file on
             // its own).
-            if let Some(entries) = inventory_pipfile_lock(project_root).await {
+            if let Some(entries) = inventory_pipfile_lock(view).await {
                 found = true;
                 out.extend(entries);
             }
-            if let Some(entries) = inventory_requirements_txt(project_root).await {
+            if let Some(entries) = inventory_requirements_txt(view).await {
                 found = true;
                 out.extend(entries);
             }
@@ -318,10 +343,8 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// API; it stays discovery-only otherwise (Poetry 0.12's
 /// `[metadata.hashes]` lists bare digests without filenames, so no wheel
 /// can be chosen there). A lock that is not TOML contributes nothing.
-async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&project_root.join("poetry.lock"))
-        .await
-        .ok()?;
+async fn inventory_poetry_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text("poetry.lock").await.ok()?;
     let document: DocumentMut = text.parse().ok()?;
     let pure_wheel_sha = |files: Vec<&dyn TableLike>| {
         files.into_iter().find_map(|entry| {
@@ -428,10 +451,8 @@ pub(super) fn socket_reference_coords(reference: &str) -> Option<(String, String
 /// our own already-wired file references. An unparseable lock contributes
 /// nothing, so the caller falls through to requirements.txt like an absent
 /// lock would.
-async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&project_root.join("Pipfile.lock"))
-        .await
-        .ok()?;
+async fn inventory_pipfile_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text("Pipfile.lock").await.ok()?;
     let value = parse_pipfile_lock(&text).ok()?;
     let root = value.as_object()?;
     // Digests are only fetchable through PyPI's JSON API when the lock
@@ -515,10 +536,8 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
 /// (`vendor_fetch_unverifiable`): vendoring rebuilds the wheel from the
 /// INSTALLED package, and PDM installs into a `__pypackages__` tree the crawler
 /// does not probe, so a lock-only vendored path would not survive a re-scan.
-async fn inventory_pdm_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&project_root.join("pdm.lock"))
-        .await
-        .ok()?;
+async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text("pdm.lock").await.ok()?;
     let document: DocumentMut = text.parse().ok()?;
     let out: Vec<LockfileEntry> = toml_package_coords(&document)
         .into_iter()
@@ -563,10 +582,8 @@ async fn inventory_pdm_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
 ///
 /// A user's OWN file/url/path reference is not ours to resolve and stays
 /// out, exactly as before.
-async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&project_root.join("requirements.txt"))
-        .await
-        .ok()?;
+async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text("requirements.txt").await.ok()?;
     let mut out = Vec::new();
     for line in crate::utils::requirements::logical_lines(&text) {
         let (code, comment) = crate::utils::requirements::split_comment(&line.text);
