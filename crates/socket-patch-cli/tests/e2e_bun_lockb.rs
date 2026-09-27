@@ -877,18 +877,11 @@ async fn native_binary_alias_and_transitive() {
                 mirror.is_file(),
                 "workspace requires its committed tarball copy"
             );
-            for (label, corrupt, remove_ledger) in [
-                ("missing-mirror", false, false),
-                ("corrupt-mirror", true, false),
-                ("ledgerless-mirror", false, true),
-            ] {
+            for (label, corrupt) in [("missing-mirror", false), ("corrupt-mirror", true)] {
                 if corrupt {
                     std::fs::write(&mirror, b"corrupt workspace artifact").unwrap();
                 } else {
                     std::fs::remove_file(&mirror).unwrap();
-                }
-                if remove_ledger {
-                    std::fs::remove_file(&ledger).unwrap();
                 }
                 let repaired = cli(&fixture.project, &["repair", "--offline", "--yes"]);
                 assert_eq!(
@@ -897,9 +890,9 @@ async fn native_binary_alias_and_transitive() {
                 );
                 fixture.frozen(label, &fixture.patched, target);
             }
-            // The separately proven ledgerless recovery cannot recover an
-            // original registry snapshot. Restore it to exercise exact revert.
-            std::fs::write(&ledger, original_state).unwrap();
+            // Repair keeps the ledger byte-identical (the exact revert below
+            // replays its originals).
+            assert_eq!(std::fs::read(&ledger).unwrap(), original_state);
         }
         cli(&fixture.project, &["vendor", "--revert"]);
         fixture.pristine();
