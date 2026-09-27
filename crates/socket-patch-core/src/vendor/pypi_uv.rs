@@ -18,6 +18,7 @@
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Table, Value};
 
@@ -34,6 +35,7 @@ use crate::utils::python_lock::preserve_line_endings;
 use super::common::{
     ensure_unchanged, item_get, pep508_name, pyproject_dependency_specs, record, refuse_symlinked,
 };
+use super::parse_memo::ParseMemo;
 use super::state::{UvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::toml_surgery::{
     balanced_span, find_unit_span, line_index, remove_exact_line, remove_substring,
@@ -62,13 +64,27 @@ enum UvDepClass {
     Transitive,
 }
 
+/// The run's uv-pair parses. `load_uv_project` runs once per patched
+/// package and a uv.lock runs to megabytes; an idempotent re-run parses the
+/// same bytes for every package. Neither memo is re-seeded after a write:
+/// the lock rewrite is text surgery, so there is no mutated document to
+/// hand back, and the pyproject's emitted text may have had its CRLF line
+/// endings restored — the document those bytes parse to is not the one in
+/// hand. A write simply costs the next package one parse, as before, and
+/// every write path here drops the slot it just made unreachable rather
+/// than leaving a megabyte of document for the next read to evict.
+static PYPROJECT_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
+static LOCK_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
+
 /// A loaded-and-guard-checked uv project pair.
 #[derive(Debug)]
 pub(super) struct UvProject {
     pub pyproject_text: String,
     pub lock_text: String,
-    pub pyproject: DocumentMut,
-    pub lock: DocumentMut,
+    /// Shared: nothing here mutates either document — the pyproject edit
+    /// takes its own copy and the lock rewrite is text surgery.
+    pub pyproject: Arc<DocumentMut>,
+    pub lock: Arc<DocumentMut>,
     /// uv.lock `revision` (diagnostics; recorded into [`UvMeta`]).
     pub lock_revision: Option<u64>,
     /// Non-fatal advisories raised during load (untested lock revision).
@@ -95,18 +111,24 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
                 format!("cannot read uv.lock: {e}"),
             )
         })?;
-    let pyproject: DocumentMut = pyproject_text.parse().map_err(|e| {
-        (
-            "pypi_uv_lock_parse_failed",
-            format!("pyproject.toml does not parse: {e}"),
-        )
-    })?;
-    let lock: DocumentMut = lock_text.parse().map_err(|e| {
-        (
-            "pypi_uv_lock_parse_failed",
-            format!("uv.lock does not parse: {e}"),
-        )
-    })?;
+    let pyproject = PYPROJECT_MEMO
+        .parse(pyproject_text.as_bytes(), || {
+            pyproject_text.parse::<DocumentMut>()
+        })
+        .map_err(|e| {
+            (
+                "pypi_uv_lock_parse_failed",
+                format!("pyproject.toml does not parse: {e}"),
+            )
+        })?;
+    let lock = LOCK_MEMO
+        .parse(lock_text.as_bytes(), || lock_text.parse::<DocumentMut>())
+        .map_err(|e| {
+            (
+                "pypi_uv_lock_parse_failed",
+                format!("uv.lock does not parse: {e}"),
+            )
+        })?;
 
     // Real-binary behavior behind the wording: <= 0.2.6 cannot parse a
     // relative path source at all; 0.2.17–0.2.34 install one under --frozen
@@ -465,7 +487,7 @@ pub(super) async fn wire_uv(
     let mut advisories: Vec<VendorWarning> = Vec::new();
 
     // ── pyproject.toml (computed in memory; committed before the lock) ────
-    let mut doc = p.pyproject.clone();
+    let mut doc = (*p.pyproject).clone();
     let had_uv_table = doc.get("tool").and_then(|t| item_get(t, "uv")).is_some();
     let created_sources_table = doc
         .get("tool")
@@ -697,14 +719,19 @@ pub(super) async fn wire_uv(
                 format!("cannot write pyproject.toml: {e}"),
             )
         })?;
-    if let Err(e) =
-        atomic_write_bytes_preserving_mode(&root.join("uv.lock"), new_lock.as_bytes()).await
-    {
+    PYPROJECT_MEMO.invalidate();
+    let write =
+        atomic_write_bytes_preserving_mode(&root.join("uv.lock"), new_lock.as_bytes()).await;
+    // Dropped whether or not the write landed: a torn one leaves bytes
+    // nobody holds behind too (same posture as `revert_uv`).
+    LOCK_MEMO.invalidate();
+    if let Err(e) = write {
         // Unwind so a sources-bearing pyproject is never paired with the old
         // registry lock (that combo makes `uv lock --check` fail and plain
         // `uv sync` rewrite the lock under the user).
         let _ =
             atomic_write_bytes_preserving_mode(&pyproject_path, p.pyproject_text.as_bytes()).await;
+        PYPROJECT_MEMO.invalidate();
         return Err((
             "pypi_uv_write_failed",
             format!("cannot write uv.lock: {e}; pyproject.toml was restored"),
@@ -918,7 +945,9 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
     if !dry_run {
         // Reverse of the wire order: the lock first, then the pyproject.
-        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await {
+        let write = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await;
+        LOCK_MEMO.invalidate();
+        if let Err(e) = write {
             return RevertOutcome {
                 kept_artifact: false,
                 success: false,
@@ -926,9 +955,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 error: Some(format!("cannot write uv.lock: {e}")),
             };
         }
-        if let Err(e) =
-            atomic_write_bytes_preserving_mode(&pyproject_path, pyproject_text.as_bytes()).await
-        {
+        let write =
+            atomic_write_bytes_preserving_mode(&pyproject_path, pyproject_text.as_bytes()).await;
+        PYPROJECT_MEMO.invalidate();
+        if let Err(e) = write {
             return RevertOutcome {
                 kept_artifact: false,
                 success: false,
@@ -4323,8 +4353,8 @@ wheels = [
         UvProject {
             pyproject_text: pyproject.to_string(),
             lock_text: lock.to_string(),
-            pyproject: pyproject.parse().unwrap(),
-            lock: lock.parse().unwrap(),
+            pyproject: Arc::new(pyproject.parse().unwrap()),
+            lock: Arc::new(lock.parse().unwrap()),
             lock_revision: None,
             warnings: Vec::new(),
         }

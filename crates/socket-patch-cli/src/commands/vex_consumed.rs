@@ -53,18 +53,24 @@ use socket_patch_core::vex::HostedCopies;
 
 use crate::args::GlobalArgs;
 use crate::commands::vex_sources::HostedWiring;
-use crate::ecosystem_dispatch::{npm_paths_by_identity, partition_purls};
+use crate::ecosystem_dispatch::{
+    npm_paths_by_identity, npm_paths_by_identity_in, partition_purls, NpmCrawlSnapshot,
+};
 
 /// Resolve [`HostedCopies`] for every hosted-basis purl of `hosted` (see the
 /// module docs), under the same crawler options and `--ecosystems` scope as
 /// the installed-tree lookup. `installed` is that lookup's every-copy
 /// result ([`crate::ecosystem_dispatch::find_manifest_package_copies`] over
 /// the record view, which holds every hosted purl): the shared-location
-/// ecosystems read it instead of crawling the tree a second time.
+/// ecosystems read it instead of crawling the tree a second time. `prior`
+/// (embedded hosted `scan --vex` only) is scan's npm crawl of the same
+/// tree: the alias walk takes its `node_modules` roots and the identity
+/// fallback its packages instead of walking the tree again.
 pub(crate) async fn hosted_consumed_copies(
     common: &GlobalArgs,
     hosted: &BTreeMap<String, HostedWiring>,
     installed: &HashMap<String, Vec<PathBuf>>,
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, HostedCopies> {
     let mut out = HashMap::new();
     if hosted.is_empty() {
@@ -91,10 +97,17 @@ pub(crate) async fn hosted_consumed_copies(
             .filter_map(|purl| Some((purl.clone(), installed.get(purl)?.clone())))
             .collect();
         let mut aliases = match shared.get(&Ecosystem::Npm) {
-            Some(npm) => npm_alias_copies(&options, npm).await,
+            Some(npm) => npm_alias_copies_reusing(&options, npm, prior).await,
             None => HashMap::new(),
         };
-        npm_identity_fallback(shared.get(&Ecosystem::Npm), &options, &mut all, &aliases).await;
+        npm_identity_fallback_reusing(
+            shared.get(&Ecosystem::Npm),
+            &options,
+            &mut all,
+            &aliases,
+            prior,
+        )
+        .await;
         let npm: Vec<&String> = shared.get(&Ecosystem::Npm).into_iter().flatten().collect();
         for purl in shared.values().flatten() {
             let mut paths = all.remove(purl).unwrap_or_default();
@@ -167,9 +180,22 @@ const ALIAS_WALK_MAX_DIRS: usize = 200_000;
 /// identity fallback covers the rest). A plain `--global` run is not
 /// walked: its roots come from spawning every package manager again, and
 /// the identity fallback covers an alias that is the only global copy.
+#[cfg(test)]
 async fn npm_alias_copies(
     options: &CrawlerOptions,
     purls: &[String],
+) -> HashMap<String, Vec<PathBuf>> {
+    npm_alias_copies_reusing(options, purls, None).await
+}
+
+/// [`npm_alias_copies`], taking the importer `node_modules` roots from
+/// `prior` when it was crawled with `options` (the same roots
+/// `NpmCrawler::get_node_modules_paths` returns) instead of walking the tree
+/// for them; the per-root BFS below is unchanged.
+async fn npm_alias_copies_reusing(
+    options: &CrawlerOptions,
+    purls: &[String],
+    prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
     let wanted: HashMap<(String, String), &String> = purls
         .iter()
@@ -185,10 +211,13 @@ async fn npm_alias_copies(
     if options.global && options.global_prefix.is_none() {
         return out;
     }
-    let roots = NpmCrawler::new()
-        .get_node_modules_paths(options)
-        .await
-        .unwrap_or_default();
+    let roots = match prior.and_then(|p| p.roots_for(options)) {
+        Some(roots) => roots.to_vec(),
+        None => NpmCrawler::new()
+            .get_node_modules_paths(options)
+            .await
+            .unwrap_or_default(),
+    };
     let mut queue = std::collections::VecDeque::from(roots);
     let mut visited = 0usize;
     while let Some(nm) = queue.pop_front() {
@@ -260,11 +289,25 @@ async fn real_subdirs(dir: &Path) -> Vec<(PathBuf, String)> {
 /// hash-verified ("installed evidence wins"). Resolve every npm purl the
 /// targeted lookup missed by the installed `package.json` identity instead
 /// — the same fallback `vendor` uses before declaring a package missing.
+#[cfg(test)]
 async fn npm_identity_fallback(
     npm: Option<&Vec<String>>,
     options: &CrawlerOptions,
     all: &mut HashMap<String, Vec<PathBuf>>,
     aliases: &HashMap<String, Vec<PathBuf>>,
+) {
+    npm_identity_fallback_reusing(npm, options, all, aliases, None).await
+}
+
+/// [`npm_identity_fallback`], answering from `prior`'s crawled packages
+/// when it was crawled with `options` (the whole `NpmCrawler::crawl_all`
+/// output for them) instead of crawling again.
+async fn npm_identity_fallback_reusing(
+    npm: Option<&Vec<String>>,
+    options: &CrawlerOptions,
+    all: &mut HashMap<String, Vec<PathBuf>>,
+    aliases: &HashMap<String, Vec<PathBuf>>,
+    prior: Option<&NpmCrawlSnapshot>,
 ) {
     let missing: Vec<&String> = npm
         .into_iter()
@@ -273,7 +316,10 @@ async fn npm_identity_fallback(
             all.get(*purl).is_none_or(Vec::is_empty) && aliases.get(*purl).is_none_or(Vec::is_empty)
         })
         .collect();
-    all.extend(npm_paths_by_identity(options, &missing).await);
+    match prior.and_then(|p| p.packages_for(options)) {
+        Some(installed) => all.extend(npm_paths_by_identity_in(installed, &missing)),
+        None => all.extend(npm_paths_by_identity(options, &missing).await),
+    }
 }
 
 /// `paths` plus every store variant of each (a pnpm peer suffix, a vlt peer
@@ -619,6 +665,70 @@ mod tests {
         let walked = HashMap::from([(purls[0].clone(), vec![found.clone()])]);
         npm_identity_fallback(Some(&purls), &options, &mut all, &walked).await;
         assert!(!all.contains_key(&purls[0]), "{all:?}");
+    }
+
+    /// H3: the identity fallback answered from the crawl snapshot finds the
+    /// same copies as crawling again — here an alias installed through a
+    /// symlink (yarn's pnpm linker, `npm link`), which neither the targeted
+    /// lookup nor the alias walk (it skips symlinks) finds, among other
+    /// crawled packages so it is not the snapshot's first entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_identity_fallback_from_the_snapshot_matches_the_crawl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pkg(root, "node_modules/aaa", "aaa", "1.0.0");
+        write_pkg(root, "node_modules/left-pad", "left-pad", "1.2.0");
+        write_pkg(root, "node_modules/zzz", "zzz", "1.0.0");
+        // Two such packages, so an answer drawn from only part of the
+        // snapshot (whatever its directory order) cannot match.
+        for (store, link, name) in [
+            ("store/a", "node_modules/lp", "left-pad"),
+            ("store/b", "node_modules/odd", "is-odd"),
+        ] {
+            write_pkg(root, store, name, "1.3.0");
+            std::os::unix::fs::symlink(root.join(store), root.join(link)).unwrap();
+        }
+        let options = local(root);
+        let purls = vec![
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            "pkg:npm/is-odd@1.3.0".to_string(),
+            "pkg:npm/absent@2.0.0".to_string(),
+        ];
+        let aliases = npm_alias_copies(&options, &purls).await;
+        assert!(
+            aliases.is_empty(),
+            "the alias walk skips symlinks: {aliases:?}"
+        );
+
+        let (_, _, _, snapshot) =
+            crate::ecosystem_dispatch::crawl_ecosystems_with_npm(&options, None).await;
+        let snapshot = snapshot.expect("npm crawled");
+        assert!(
+            snapshot.packages_for(&options).is_some_and(|p| p.len() > 1),
+            "several crawled packages"
+        );
+
+        let mut walked: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        npm_identity_fallback(Some(&purls), &options, &mut walked, &aliases).await;
+        let mut reused: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        npm_identity_fallback_reusing(
+            Some(&purls),
+            &options,
+            &mut reused,
+            &aliases,
+            Some(&snapshot),
+        )
+        .await;
+        assert_eq!(reused, walked);
+        for purl in &purls[..2] {
+            assert_eq!(
+                reused.get(purl).map(Vec::len),
+                Some(1),
+                "{purl}: {reused:?}"
+            );
+        }
+        assert!(!reused.contains_key("pkg:npm/absent@2.0.0"), "{reused:?}");
     }
 
     /// Only dirs whose install key differs from the package name are

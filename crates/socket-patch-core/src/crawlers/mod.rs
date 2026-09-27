@@ -3,13 +3,19 @@ pub mod composer_crawler;
 pub mod deno_crawler;
 pub mod fuzzy_match;
 pub mod go_crawler;
+mod listing;
 pub mod maven_crawler;
+#[cfg(test)]
+mod maven_pom_equivalence_tests;
 pub mod npm_crawler;
 pub mod nuget_crawler;
+#[cfg(test)]
+pub(crate) mod oracle_support;
 pub mod pkg_managers;
 pub mod python_crawler;
 pub mod ruby_crawler;
 pub mod types;
+pub mod walk_pool;
 
 pub use cargo_crawler::CargoCrawler;
 pub use composer_crawler::ComposerCrawler;

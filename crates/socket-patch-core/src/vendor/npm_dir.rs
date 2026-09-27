@@ -35,6 +35,7 @@ use super::npm_common::{
     declares_bundled_deps, done_failure, done_failure_unstage, guard_coordinates,
 };
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::VENDOR_MARKER_FILE;
 use super::vlt_lock_text::vendored_dir_rel;
 use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -500,7 +501,7 @@ pub(crate) fn gitignored_detail(rel: &str, rules: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_dir(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -589,7 +590,7 @@ pub(super) async fn stage_patch_dir(
             result
         }
         None => {
-            if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+            if let Err(e) = installed_dir.stage_into(&stage, None).await {
                 return Err(Box::new(done_failure(
                     purl,
                     format!("cannot stage a copy of the installed package: {e}"),

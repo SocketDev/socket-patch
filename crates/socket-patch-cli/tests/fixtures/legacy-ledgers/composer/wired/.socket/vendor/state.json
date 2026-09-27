@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "entries": {
+    "pkg:composer/fx/alpha@1.0.0": {
+      "ecosystem": "composer",
+      "basePurl": "pkg:composer/fx/alpha@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000001",
+      "artifact": {
+        "path": ".socket/vendor/composer/11111111-1111-4111-8111-000000000001/fx/alpha@1.0.0"
+      },
+      "wiring": [
+        {
+          "file": "composer.lock",
+          "kind": "composer_lock_package",
+          "action": "rewritten",
+          "key": "packages:fx/alpha",
+          "original": {
+            "name": "fx/alpha",
+            "version": "1.0.0",
+            "source": {
+              "type": "git",
+              "url": "https://github.com/fx/alpha.git",
+              "reference": "aaaa"
+            },
+            "dist": {
+              "type": "zip",
+              "url": "https://api.github.com/repos/fx/alpha/zipball/aaaa",
+              "reference": "aaaa",
+              "shasum": ""
+            },
+            "type": "library"
+          },
+          "new": {
+            "name": "fx/alpha",
+            "version": "1.0.0",
+            "dist": {
+              "type": "path",
+              "url": ".socket/vendor/composer/11111111-1111-4111-8111-000000000001/fx/alpha@1.0.0",
+              "reference": "11111111-1111-4111-8111-000000000001"
+            },
+            "transport-options": {
+              "symlink": false
+            },
+            "type": "library"
+          }
+        }
+      ],
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000001",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "src/Lib.php": {
+            "beforeHash": "78b3130524b747d69f0f73976b69af77fdb540b61014435f7ede15b5f388505b",
+            "afterHash": "76ec0f946f1b365b8eb01cd36f7d517309649502886cb5b6587fec526ed71535"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    },
+    "pkg:composer/fx/beta@1.0.0": {
+      "ecosystem": "composer",
+      "basePurl": "pkg:composer/fx/beta@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000002",
+      "artifact": {
+        "path": ".socket/vendor/composer/11111111-1111-4111-8111-000000000002/fx/beta@1.0.0"
+      },
+      "wiring": [
+        {
+          "file": "composer.lock",
+          "kind": "composer_lock_package",
+          "action": "rewritten",
+          "key": "packages:fx/beta",
+          "original": {
+            "name": "fx/beta",
+            "version": "1.0.0",
+            "source": {
+              "type": "git",
+              "url": "https://github.com/fx/beta.git",
+              "reference": "aaaa"
+            },
+            "dist": {
+              "type": "zip",
+              "url": "https://api.github.com/repos/fx/beta/zipball/aaaa",
+              "reference": "aaaa",
+              "shasum": ""
+            },
+            "type": "library"
+          },
+          "new": {
+            "name": "fx/beta",
+            "version": "1.0.0",
+            "dist": {
+              "type": "path",
+              "url": ".socket/vendor/composer/11111111-1111-4111-8111-000000000002/fx/beta@1.0.0",
+              "reference": "11111111-1111-4111-8111-000000000002"
+            },
+            "transport-options": {
+              "symlink": false
+            },
+            "type": "library"
+          }
+        }
+      ],
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000002",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "src/Lib.php": {
+            "beforeHash": "6647d84bc9d78ca7485e3579d2ac9a195f02f40c941946258b5fd249a1578ef7",
+            "afterHash": "3a1b30750274c070fa015f0b1205fc1b958a96ecd69d79c15ce7a87b1ddce606"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    }
+  }
+}

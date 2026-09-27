@@ -3140,7 +3140,7 @@ snapshots:
                 yes: true,
                 ..GlobalArgs::default()
             },
-            batch_size: 100,
+            batch_size: Some(100),
             apply: false,
             prune: false,
             sync: false,

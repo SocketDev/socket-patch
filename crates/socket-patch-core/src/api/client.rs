@@ -12,7 +12,13 @@ use serde::Serialize;
 // different ones came to exist; there is now exactly one, in `api::ranking`.
 use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
+use crate::api::retry::{
+    is_retryable_status, jitter_sample as retry_jitter, parse_retry_after, ApiRetry,
+    ApiRetryPolicy, RetryHooks,
+};
 use crate::api::types::*;
+use crate::api::vendor_prefetch::VendorPrefetch;
+pub use crate::api::vendor_prefetch::VendorPrefetchGuard;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
@@ -76,9 +82,84 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
 
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
-    if is_debug_enabled() {
+    if is_debug_enabled() && !defer_debug_line(message) {
         eprintln!("[socket-patch debug] {}", message);
     }
+}
+
+/// Hold `message` back for [`with_deferred_debug`]'s caller when the current
+/// task runs inside it; `false` (print it now) otherwise.
+fn defer_debug_line(message: &str) -> bool {
+    DEFERRED_DEBUG
+        .try_with(|lines| {
+            lines
+                .borrow_mut()
+                .push(format!("[socket-patch debug] {}", message));
+        })
+        .is_ok()
+}
+
+tokio::task_local! {
+    /// Set around a speculative (concurrent) request so its debug lines are
+    /// held back and the caller can print them, or drop them, in the order a
+    /// one-at-a-time loop would have produced.
+    static DEFERRED_DEBUG: std::cell::RefCell<Vec<String>>;
+}
+
+/// Run `fut` with its [`debug_log`] lines captured instead of printed;
+/// returns its output and the captured lines, in emission order.
+pub(crate) async fn with_deferred_debug<T>(
+    fut: impl std::future::Future<Output = T>,
+) -> (T, Vec<String>) {
+    DEFERRED_DEBUG
+        .scope(std::cell::RefCell::new(Vec::new()), async move {
+            let out = fut.await;
+            (out, DEFERRED_DEBUG.with(|lines| lines.take()))
+        })
+        .await
+}
+
+/// Print lines captured by [`with_deferred_debug`] (already prefixed).
+pub(crate) fn flush_deferred_debug(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("{line}");
+    }
+}
+
+/// A request's output fetched ahead of the loop that consumes it, with its
+/// `--debug` lines held back until [`Self::release`] — call that where the
+/// one-at-a-time loop would have issued the request, so the debug stream
+/// keeps the serial interleaving with the loop's own stderr lines. Dropping
+/// it unreleased discards the lines (the serial loop never made the call).
+#[derive(Debug)]
+pub struct HeldBack<T> {
+    value: T,
+    debug: Vec<String>,
+}
+
+impl<T> HeldBack<T> {
+    /// The output, without releasing the debug lines.
+    pub(crate) fn peek(&self) -> &T {
+        &self.value
+    }
+
+    /// The output, mutably, without releasing the debug lines.
+    pub(crate) fn peek_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    /// The output, printing the held-back debug lines first.
+    pub fn release(self) -> T {
+        flush_deferred_debug(self.debug);
+        self.value
+    }
+}
+
+/// Run `fut` (a request made ahead of its turn) with its debug lines held
+/// back; see [`HeldBack`].
+pub async fn hold_back_debug<T>(fut: impl std::future::Future<Output = T>) -> HeldBack<T> {
+    let (value, debug) = with_deferred_debug(fut).await;
+    HeldBack { value, debug }
 }
 
 /// Options for constructing an [`ApiClient`].
@@ -118,7 +199,44 @@ pub struct ApiClient {
     /// retryable failure (transport / 429 / 5xx after every retry) — the
     /// run-level circuit breaker. Shared by clones: one CLI run, one count.
     vendor_outage: Arc<AtomicU32>,
+    /// In-flight slots for the public proxy's batch path — the
+    /// `/patch/batch` POSTs and the legacy per-package GETs they degrade
+    /// to. Shared by clones, so concurrent [`Self::search_patches_batch`]
+    /// calls on one client (scan's batch windows) stay within
+    /// [`PROXY_BATCH_PATH_CONCURRENCY`] requests in total: the peak the
+    /// serial batch loop reached, never that peak times the window.
+    proxy_batch_slots: Arc<tokio::sync::Semaphore>,
+    /// The vendor loop's download plan, while one is attached
+    /// ([`Self::prefetch_vendor_packages`]): [`Self::fetch_vendor_package`]
+    /// takes a planned uuid's outcome from it instead of requesting it.
+    /// Shared by clones, like the breaker it defers to.
+    vendor_prefetch: Arc<std::sync::Mutex<Option<Arc<VendorPrefetch>>>>,
+    /// Bounded 429 / 503 retry for the JSON calls ([`crate::api::retry`]):
+    /// the policy, the run-wide retry window (shared by clones, and by
+    /// every default client in the process) and the clock hooks.
+    api_retry: ApiRetry,
 }
+
+/// A JSON request's answer after [`ApiClient::send_json_request`]'s retry
+/// loop: the live response, or a 429 / 503 that is final (retries off,
+/// exhausted, refused by the caller's predicate, a `Retry-After` over the
+/// cap, or past the run's retry window) with
+/// its body already read.
+enum Sent {
+    Response(reqwest::Response),
+    Throttled {
+        status: StatusCode,
+        text: String,
+        /// Why no further retry was made, for the error message; `None`
+        /// when retries are off (the message stays the pre-retry one).
+        gave_up: Option<String>,
+    },
+}
+
+/// Most requests the public proxy's batch path keeps in flight per client:
+/// the legacy per-package fallback's fan-out (one call runs its PURLs in
+/// groups of this size), and the cap all concurrent calls share.
+const PROXY_BATCH_PATH_CONCURRENCY: usize = 10;
 
 /// Retry policy for the vendoring service's package-reference POST and
 /// archive GET: `attempts` tries in total, exponential delays from `base`
@@ -181,7 +299,7 @@ impl VendorRetryPolicy {
 /// Consecutive retryable vendor-service failures after which the rest of the
 /// run skips the service without any I/O (`auto` then builds locally,
 /// `service` fails closed — the existing miss policy).
-const VENDOR_BREAKER_THRESHOLD: u32 = 2;
+pub(crate) const VENDOR_BREAKER_THRESHOLD: u32 = 2;
 
 /// A jitter sample in `[0, 1)` from std's randomly keyed hasher (no RNG
 /// dependency; the quality needed here is "not synchronized").
@@ -271,7 +389,28 @@ impl ApiClient {
             org_slug: options.org_slug,
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
+            proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(PROXY_BATCH_PATH_CONCURRENCY)),
+            vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
+            api_retry: ApiRetry::from_env(),
         }
+    }
+
+    /// Override the JSON calls' 429 / 503 retry policy and clock hooks
+    /// (tests inject a recording sleep and a fixed jitter seed). The client
+    /// and its clones get a fresh retry window of `policy.retry_window`,
+    /// detached from the process-wide one; [`ApiRetryPolicy::none`] turns
+    /// retries off.
+    pub fn with_api_retry(mut self, policy: ApiRetryPolicy, hooks: RetryHooks) -> Self {
+        self.api_retry = ApiRetry::with_policy(policy, hooks);
+        self
+    }
+
+    /// Wait for a [`Self::proxy_batch_slots`] slot; held until dropped.
+    async fn proxy_batch_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.proxy_batch_slots)
+            .acquire_owned()
+            .await
+            .expect("proxy_batch_slots is never closed")
     }
 
     /// Override the vendoring-service retry policy (tests; a policy of
@@ -287,6 +426,12 @@ impl ApiClient {
         &self.plain
     }
 
+    /// The run-level breaker's consecutive-failure count (tests).
+    #[cfg(test)]
+    pub(crate) fn vendor_outage_count(&self) -> u32 {
+        self.vendor_outage.load(Ordering::Relaxed)
+    }
+
     /// Returns the API token, if set.
     pub fn api_token(&self) -> Option<&String> {
         self.api_token.as_ref()
@@ -297,7 +442,98 @@ impl ApiClient {
         self.org_slug.as_ref()
     }
 
+    /// Whether this client talks to the public patch proxy (vs. the
+    /// authenticated org API) — picks the concurrency cap
+    /// ([`crate::utils::concurrent::api_concurrency`]).
+    pub fn uses_public_proxy(&self) -> bool {
+        self.use_public_proxy
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Send one JSON request (`build` makes a fresh builder per attempt),
+    /// retrying 429 / 503 per [`crate::api::retry`]. `label` (`"GET <url>"`)
+    /// names the request in `--debug` lines and keys its jitter.
+    /// `retryable` can veto a retry after seeing the body (the proxy's
+    /// permanent "Patch API is not configured" 503, which every JSON path
+    /// vetoes). Transport errors are never retried.
+    async fn send_json_request(
+        &self,
+        label: &str,
+        build: impl Fn() -> reqwest::RequestBuilder,
+        retryable: impl Fn(StatusCode, &str) -> bool,
+    ) -> Result<Sent, ApiError> {
+        let retry = &self.api_retry;
+        let max = retry.policy.max_retries;
+        let mut retries = 0u32;
+        loop {
+            let resp = build().send().await.map_err(|e| {
+                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+            })?;
+            let status = resp.status();
+            if !is_retryable_status(status) {
+                return Ok(Sent::Response(resp));
+            }
+            let retry_after = parse_retry_after(resp.headers(), (retry.hooks.now_unix_secs)());
+            let text = resp.text().await.unwrap_or_default();
+            let throttled = |gave_up: Option<String>| {
+                Ok(Sent::Throttled {
+                    status,
+                    text: text.clone(),
+                    gave_up: gave_up.filter(|_| max > 0),
+                })
+            };
+            if !retryable(status, &text) {
+                return throttled(None);
+            }
+            if retries >= max {
+                return throttled(Some(format!(
+                    "gave up after {}",
+                    if retries == 1 {
+                        "1 retry".to_string()
+                    } else {
+                        format!("{retries} retries")
+                    }
+                )));
+            }
+            let next = retries + 1;
+            let Some(delay) = retry.policy.delay(
+                next,
+                retry_after,
+                retry_jitter(retry.hooks.jitter_seed, label, next),
+            ) else {
+                // A server asking for more than the cap will refuse an
+                // earlier retry too: report now instead of waiting.
+                let why = format!(
+                    "Retry-After {} s exceeds the {} s retry cap",
+                    retry_after.unwrap_or_default().as_secs(),
+                    retry.policy.max_retry_after.as_secs()
+                );
+                debug_log(&format!(
+                    "{label} returned {}; not retrying: {why}",
+                    status.as_u16()
+                ));
+                return throttled(Some(why));
+            };
+            if !retry.reserve(delay) {
+                let why = format!(
+                    "the run's {} s retry window has closed",
+                    retry.policy.retry_window.as_secs()
+                );
+                debug_log(&format!(
+                    "{label} returned {}; not retrying: {why}",
+                    status.as_u16()
+                ));
+                return throttled(Some(why));
+            }
+            debug_log(&format!(
+                "{label} returned {}; retry {next}/{max} in {delay:?}",
+                status.as_u16()
+            ));
+            (retry.hooks.sleep)(delay).await;
+            retries = next;
+        }
+    }
 
     /// Internal GET that deserialises JSON. Returns `Ok(None)` on 404.
     async fn get_json<T: serde::de::DeserializeOwned>(
@@ -307,11 +543,14 @@ impl ApiClient {
         let url = format!("{}{}", self.api_url, path);
         debug_log(&format!("GET {}", url));
 
-        let resp = self.client.get(&url).send().await.map_err(|e| {
-            ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-        })?;
-
-        Self::handle_json_response(resp, self.use_public_proxy).await
+        let sent = self
+            .send_json_request(
+                &format!("GET {url}"),
+                || self.client.get(&url),
+                |status, text| !is_patch_api_unconfigured(status, text),
+            )
+            .await?;
+        Self::handle_json_response(sent, self.use_public_proxy).await
     }
 
     /// Internal POST that deserialises JSON. Returns `Ok(None)` on 404.
@@ -323,25 +562,34 @@ impl ApiClient {
         let url = format!("{}{}", self.api_url, path);
         debug_log(&format!("POST {}", url));
 
-        let resp = self
-            .client
-            .post(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| {
-                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-            })?;
-
-        Self::handle_json_response(resp, self.use_public_proxy).await
+        let sent = self
+            .send_json_request(
+                &format!("POST {url}"),
+                || {
+                    self.client
+                        .post(&url)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .json(body)
+                },
+                |status, text| !is_patch_api_unconfigured(status, text),
+            )
+            .await?;
+        Self::handle_json_response(sent, self.use_public_proxy).await
     }
 
     /// Map an HTTP response to `Ok(Some(T))`, `Ok(None)` (404), or `Err`.
     async fn handle_json_response<T: serde::de::DeserializeOwned>(
-        resp: reqwest::Response,
+        sent: Sent,
         use_public_proxy: bool,
     ) -> Result<Option<T>, ApiError> {
+        let resp = match sent {
+            Sent::Response(resp) => resp,
+            Sent::Throttled {
+                status,
+                text,
+                gave_up,
+            } => return Err(throttled_error(status, &text, use_public_proxy, gave_up)),
+        };
         let status = resp.status();
 
         if status == StatusCode::OK {
@@ -547,42 +795,66 @@ impl ApiClient {
     /// Auth / rate-limit statuses are classified via `classify_auth_error`
     /// exactly like the JSON transport — 401/403 keep feeding
     /// `is_fallback_candidate` and 429 stays visible — and any other
-    /// failure (including over-capacity 503s) surfaces as an error.
+    /// failure (including over-capacity 503s) surfaces as an error. A 429
+    /// or over-capacity 503 is first retried per [`crate::api::retry`];
+    /// the permanent "not configured" 503 degrades at once.
     async fn proxy_batch_post(
         &self,
         purls: &[String],
     ) -> Result<Option<BatchSearchResponse>, ApiError> {
         let url = format!("{}/patch/batch", self.api_url);
-        debug_log(&format!("POST {}", url));
-
         let body = BatchSearchBody::new(purls);
 
-        let resp = self
-            .client
-            .post(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-            })?;
+        // Held until this call returns, response body read.
+        let _slot = self.proxy_batch_slot().await;
+        // Logged AFTER the permit, not before: the line announces a request
+        // that is about to go out, and a caller queued behind the proxy's
+        // in-flight limit would otherwise print it and then wait. The slot
+        // stays held through any 429 / 503 retry wait: a throttled proxy
+        // is exactly when the other callers should not pile on.
+        debug_log(&format!("POST {}", url));
+        let sent = self
+            .send_json_request(
+                &format!("POST {url}"),
+                || {
+                    self.client
+                        .post(&url)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .json(&body)
+                },
+                // "Patch API is not configured" is permanent: degrade to
+                // the per-package path at once instead of retrying it.
+                |status, text| !is_batch_unsupported(status, text),
+            )
+            .await?;
 
-        let status = resp.status();
-
-        if status == StatusCode::OK {
-            let parsed = resp
-                .json::<BatchSearchResponse>()
-                .await
-                .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
-            return Ok(Some(parsed));
-        }
-
-        if let Some(err) = classify_auth_error(status, true) {
-            return Err(err);
-        }
-
-        let text = resp.text().await.unwrap_or_default();
+        let (status, text) = match sent {
+            Sent::Response(resp) => {
+                let status = resp.status();
+                if status == StatusCode::OK {
+                    let parsed = resp
+                        .json::<BatchSearchResponse>()
+                        .await
+                        .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
+                    return Ok(Some(parsed));
+                }
+                if let Some(err) = classify_auth_error(status, true) {
+                    return Err(err);
+                }
+                (status, resp.text().await.unwrap_or_default())
+            }
+            Sent::Throttled {
+                status,
+                text,
+                gave_up,
+            } => {
+                if is_batch_unsupported(status, &text) {
+                    (status, text)
+                } else {
+                    return Err(throttled_error(status, &text, true, gave_up));
+                }
+            }
+        };
         let fallback_reason = if is_batch_unsupported(status, &text) {
             Some("proxy batch endpoint unavailable")
         } else if status == StatusCode::BAD_REQUEST {
@@ -613,31 +885,40 @@ impl ApiClient {
     /// proxy gained `POST /patch/batch`, this is the legacy path for
     /// deployments that predate it.
     ///
-    /// Processes PURLs in batches of `CONCURRENCY_LIMIT` to avoid
-    /// overwhelming the server while remaining efficient.
+    /// Processes PURLs in batches of `PROXY_BATCH_PATH_CONCURRENCY` to
+    /// avoid overwhelming the server while remaining efficient; each GET
+    /// also takes a [`Self::proxy_batch_slots`] slot, so concurrent calls
+    /// on one client share that cap instead of multiplying it.
     async fn search_patches_batch_via_individual_queries(
         &self,
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
-        const CONCURRENCY_LIMIT: usize = 10;
-
         // Collect all (purl, response) pairs
         let mut all_results: Vec<(String, Option<SearchResponse>)> = Vec::new();
+        // The first (in input order) package still throttled after its
+        // retries. Its error fails the whole call — a per-package miss is
+        // swallowed for an unresolvable PURL, but swallowing a throttle
+        // would drop the package from the scan without a word.
+        let mut throttled: Option<(usize, ApiError)> = None;
 
-        for chunk in purls.chunks(CONCURRENCY_LIMIT) {
+        for (chunk_idx, chunk) in purls.chunks(PROXY_BATCH_PATH_CONCURRENCY).enumerate() {
             // Use tokio::JoinSet for concurrent execution within each chunk
             let mut join_set = tokio::task::JoinSet::new();
 
-            for purl in chunk {
+            for (offset, purl) in chunk.iter().enumerate() {
+                let index = chunk_idx * PROXY_BATCH_PATH_CONCURRENCY + offset;
                 let purl = purl.clone();
                 let client = self.clone();
                 join_set.spawn(async move {
+                    let slot = client.proxy_batch_slot().await;
                     let resp = client.search_patches_by_package(&purl).await;
+                    drop(slot);
                     match resp {
-                        Ok(r) => (purl, Some(r)),
+                        Ok(r) => (index, purl, Ok(Some(r))),
+                        Err(e) if is_throttle_error(&e) => (index, purl, Err(e)),
                         Err(e) => {
                             debug_log(&format!("Error fetching patches for {}: {}", purl, e));
-                            (purl, None)
+                            (index, purl, Ok(None))
                         }
                     }
                 });
@@ -645,12 +926,20 @@ impl ApiClient {
 
             while let Some(result) = join_set.join_next().await {
                 match result {
-                    Ok(pair) => all_results.push(pair),
+                    Ok((_, purl, Ok(resp))) => all_results.push((purl, resp)),
+                    Ok((index, _, Err(e))) => {
+                        if throttled.as_ref().is_none_or(|(first, _)| index < *first) {
+                            throttled = Some((index, e));
+                        }
+                    }
                     Err(e) => {
                         debug_log(&format!("Task join error: {}", e));
                     }
                 }
             }
+        }
+        if let Some((_, e)) = throttled {
+            return Err(e);
         }
 
         // Convert the individual SearchResponse results into the batch shape.
@@ -848,9 +1137,28 @@ impl ApiClient {
                  this run"
             )));
         }
-        let (outcome, retryable_failure) = self
-            .fetch_vendor_package_once(uuid, free_only, vendor_url, patch_server_url)
-            .await;
+        // A download the attached plan already fetched stands in for the
+        // live requests; everything around it (the breaker check above, the
+        // counter update below) runs here, in call order, as before.
+        let plan = self
+            .vendor_prefetch
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let prefetched = match plan {
+            Some(plan) => {
+                plan.take(self, uuid, free_only, vendor_url, patch_server_url)
+                    .await
+            }
+            None => None,
+        };
+        let (outcome, retryable_failure) = match prefetched {
+            Some(fetched) => fetched.release(),
+            None => {
+                self.fetch_vendor_package_once(uuid, free_only, vendor_url, patch_server_url)
+                    .await
+            }
+        };
         match &outcome {
             VendorServiceOutcome::Failed(_) if retryable_failure => {
                 self.vendor_outage.fetch_add(1, Ordering::Relaxed);
@@ -863,9 +1171,75 @@ impl ApiClient {
         outcome
     }
 
+    /// Attach a download plan: `uuids` are the packages the vendor loop is
+    /// expected to download from the service, in loop order, with these
+    /// request parameters. Until the guard drops, the loop's
+    /// [`Self::fetch_vendor_package`] call for a planned uuid takes an
+    /// outcome fetched ahead of it (at most `window` in flight, and at
+    /// most `window` requests ahead of the loop) — see
+    /// [`super::vendor_prefetch`] for why nothing observable changes, and
+    /// what the plan may cost (it is exact: the CLI gates it with the
+    /// backends' own pre-flights, [`crate::vendor::service_preflight`] and
+    /// [`crate::vendor::npm_flavor::preflight_packages`], so it names only
+    /// the downloads the loop will ask for). A uuid this method refuses
+    /// without any I/O is dropped from the plan, so the prefetch never
+    /// sends what the loop's own call would not. The plan replaces any plan
+    /// already attached.
+    pub fn prefetch_vendor_packages(
+        &self,
+        uuids: Vec<String>,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+        window: usize,
+    ) -> VendorPrefetchGuard {
+        self.prefetch_vendor_downloads(
+            uuids.into_iter().map(PlannedDownload::archive).collect(),
+            free_only,
+            vendor_url,
+            patch_server_url,
+            window,
+            usize::MAX,
+        )
+    }
+
+    /// [`Self::prefetch_vendor_packages`] with a planned secondary artifact
+    /// per download (see [`PlannedDownload::secondary`]) and a bound on the
+    /// fetched archive bytes waiting for the loop: while `byte_budget` bytes
+    /// are held, only the download the loop is waiting on may start.
+    pub fn prefetch_vendor_downloads(
+        &self,
+        downloads: Vec<PlannedDownload>,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+        window: usize,
+        byte_budget: usize,
+    ) -> VendorPrefetchGuard {
+        let planned: Vec<PlannedDownload> = downloads
+            .into_iter()
+            .filter(|d| is_valid_uuid(&d.uuid))
+            .collect();
+        let plan = Arc::new(VendorPrefetch::new(
+            planned,
+            free_only,
+            vendor_url,
+            patch_server_url,
+            window,
+            byte_budget,
+        ));
+        if let Ok(mut slot) = self.vendor_prefetch.lock() {
+            *slot = Some(Arc::clone(&plan));
+        }
+        VendorPrefetchGuard {
+            slot: Arc::clone(&self.vendor_prefetch),
+            plan,
+        }
+    }
+
     /// [`Self::fetch_vendor_package`] without the breaker: the outcome, and
     /// whether a `Failed` one was a retryable (availability) failure.
-    async fn fetch_vendor_package_once(
+    pub(crate) async fn fetch_vendor_package_once(
         &self,
         uuid: &str,
         free_only: bool,
@@ -958,6 +1332,7 @@ impl ApiClient {
                     kind: a.kind.clone(),
                     url,
                     integrity_sri: normalize_sha512_sri(sha512),
+                    prefetched: None,
                 });
             }
         }
@@ -971,6 +1346,7 @@ impl ApiClient {
                     dirhash_h1: artifact.integrity.dirhash_h1.clone(),
                     source_url: download_url,
                     secondary_artifacts,
+                    prestaged: Default::default(),
                 }))
             }
             (ServeDownload::NotFound, _) => done(VendorServiceOutcome::Unavailable(
@@ -1133,20 +1509,42 @@ impl ApiClient {
     /// [`VendorRetryPolicy`]; the flag says whether a final `Failed` was a
     /// retryable (availability) failure.
     async fn download_vendor_archive_retrying(&self, url: &str) -> (ServeDownload, bool) {
+        self.download_vendor_archive_from(url, 1).await
+    }
+
+    /// [`Self::download_vendor_archive_retrying`] starting at attempt
+    /// `attempt` — 2 when attempt 1 was made elsewhere and deferred (see
+    /// [`Self::download_artifact_resuming`]), so a split download still
+    /// costs the policy's `attempts` requests, not one budget per split.
+    async fn download_vendor_archive_from(
+        &self,
+        url: &str,
+        mut attempt: u32,
+    ) -> (ServeDownload, bool) {
         let attempts = self.vendor_retry.attempts.max(1);
-        let mut attempt = 1;
         loop {
             match self.download_vendor_archive_once(url).await {
                 (ServeDownload::Failed(e), Some(retry_after)) if attempt < attempts => {
-                    debug_log(&format!(
-                        "vendor package download attempt {attempt} failed: {e}"
-                    ));
-                    self.vendor_backoff(attempt, retry_after).await;
+                    self.vendor_download_retry(attempt, &e, retry_after).await;
                     attempt += 1;
                 }
                 (outcome, hint) => return (outcome, hint.is_some()),
             }
         }
+    }
+
+    /// Report attempt `attempt`'s retryable failure and pause before the
+    /// next one.
+    async fn vendor_download_retry(
+        &self,
+        attempt: u32,
+        e: &ApiError,
+        retry_after: Option<Duration>,
+    ) {
+        debug_log(&format!(
+            "vendor package download attempt {attempt} failed: {e}"
+        ));
+        self.vendor_backoff(attempt, retry_after).await;
     }
 
     /// [`Self::download_vendor_archive_retrying`] without the flag.
@@ -1257,18 +1655,68 @@ impl ApiClient {
     /// integrity. A 404/410/408 surfaces as an error (a secondary the
     /// reference promised should be present).
     pub(crate) async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
-        match self.download_vendor_archive(url).await {
-            ServeDownload::Ok(bytes) => Ok(bytes),
-            ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
-            ServeDownload::Pending => {
-                Err(ApiError::Other(format!("artifact still building: {url}")))
+        artifact_download_result(self.download_vendor_archive(url).await, url)
+    }
+
+    /// The first attempt of [`Self::download_artifact`] alone: `Ok` with
+    /// exactly the result `download_artifact` would return when that attempt
+    /// settles it (success, or a failure it would not retry), `Err` with the
+    /// budget the attempt left unspent when it would retry. That `Err` goes
+    /// to [`Self::download_artifact_resuming`], which spends the REST of the
+    /// budget — so however a caller splits the two, the host sees the single
+    /// request sequence `download_artifact` would have made.
+    pub(crate) async fn download_artifact_first_attempt(
+        &self,
+        url: &str,
+    ) -> Result<Result<Vec<u8>, ApiError>, DeferredAttempt> {
+        match self.download_vendor_archive_once(url).await {
+            (ServeDownload::Failed(error), Some(retry_after))
+                if self.vendor_retry.attempts.max(1) > 1 =>
+            {
+                Err(DeferredAttempt { error, retry_after })
             }
-            ServeDownload::Failed(e) => Err(e),
+            (outcome, _) => Ok(artifact_download_result(outcome, url)),
         }
+    }
+
+    /// [`Self::download_artifact`] resumed from the attempt
+    /// [`Self::download_artifact_first_attempt`] deferred: that attempt's
+    /// failure is reported and its `Retry-After` waited out exactly where
+    /// the retry loop would have, then the remaining attempts run.
+    pub(crate) async fn download_artifact_resuming(
+        &self,
+        url: &str,
+        deferred: DeferredAttempt,
+    ) -> Result<Vec<u8>, ApiError> {
+        self.vendor_download_retry(1, &deferred.error, deferred.retry_after)
+            .await;
+        artifact_download_result(self.download_vendor_archive_from(url, 2).await.0, url)
     }
 }
 
+/// The unspent remainder of a retry budget: a first attempt that failed
+/// retryably and was set aside, carrying the failure its retry still owes a
+/// debug line and the `Retry-After` it still owes a pause. Only
+/// [`ApiClient::download_artifact_first_attempt`] makes one (and only when
+/// the policy has an attempt left to give), and only
+/// [`ApiClient::download_artifact_resuming`] spends it.
+#[derive(Debug)]
+pub(crate) struct DeferredAttempt {
+    error: ApiError,
+    retry_after: Option<Duration>,
+}
+
 // ── Free functions ────────────────────────────────────────────────────
+
+/// [`ApiClient::download_artifact`]'s mapping of a serve outcome.
+fn artifact_download_result(outcome: ServeDownload, url: &str) -> Result<Vec<u8>, ApiError> {
+    match outcome {
+        ServeDownload::Ok(bytes) => Ok(bytes),
+        ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
+        ServeDownload::Pending => Err(ApiError::Other(format!("artifact still building: {url}"))),
+        ServeDownload::Failed(e) => Err(e),
+    }
+}
 
 /// Cap on a single prebuilt-archive download (defensive bound against a
 /// runaway / hostile serve response). Generous enough for any real package.
@@ -1291,6 +1739,9 @@ pub(crate) struct FetchedVendorPackage {
     /// each with a host-rewritten URL + normalized sha512, for a backend to
     /// download + verify lazily via [`ApiClient::download_artifact`].
     pub secondary_artifacts: Vec<SecondaryArtifact>,
+    /// What the vendor prefetch plan already did with these bytes ahead of
+    /// the backend (see [`crate::vendor::prestage`]).
+    pub prestaged: crate::vendor::prestage::Prestaged,
 }
 
 /// A non-tarball served artifact reference (e.g. `gem-stub-gemspec`): its kind,
@@ -1301,6 +1752,65 @@ pub(crate) struct SecondaryArtifact {
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
     pub integrity_sri: String,
+    /// The download a vendor prefetch plan already made for it, taken by
+    /// the backend's own call in its place (see [`PlannedDownload`]).
+    pub prefetched: Option<PrefetchedSecondary>,
+}
+
+/// One download in a vendor prefetch plan (see
+/// [`ApiClient::prefetch_vendor_downloads`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedDownload {
+    /// The patch uuid the vendor loop will ask the service for.
+    pub uuid: String,
+    /// The kind of served secondary artifact (e.g. `gem-stub-gemspec`) the
+    /// loop's backend downloads right after the verified archive. The plan
+    /// fetches it along with the archive — only when the archive is ready,
+    /// passes its integrity checks and the service served that kind, the
+    /// backend's own conditions — and the backend takes it in its place.
+    pub secondary: Option<String>,
+    /// What to do with the archive once it has landed and passed its
+    /// integrity checks, ahead of the backend: extract it next to the
+    /// backend's stage, or run its afterHash check (see
+    /// [`crate::vendor::prestage`]). Built by the backends' plan gates.
+    pub stage: Option<crate::vendor::prestage::PrestageRecipe>,
+}
+
+impl PlannedDownload {
+    /// A plain archive download: no secondary artifact, nothing staged.
+    pub fn archive(uuid: String) -> Self {
+        Self {
+            uuid,
+            secondary: None,
+            stage: None,
+        }
+    }
+}
+
+/// A secondary artifact's download made ahead of the backend's call, with
+/// its debug lines held back until that call takes it. Shared, so the
+/// artifact reference stays `Clone`; taken at most once.
+#[derive(Clone)]
+pub(crate) struct PrefetchedSecondary(Arc<std::sync::Mutex<Option<HeldDownload>>>);
+
+/// A download's bytes (or failure), debug lines held back.
+pub(crate) type HeldDownload = HeldBack<Result<Vec<u8>, ApiError>>;
+
+impl PrefetchedSecondary {
+    pub(crate) fn new(downloaded: HeldDownload) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(downloaded))))
+    }
+
+    /// The download, once; `None` after it was taken.
+    pub(crate) fn take(&self) -> Option<HeldDownload> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+impl std::fmt::Debug for PrefetchedSecondary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrefetchedSecondary")
+    }
 }
 
 /// Outcome of [`ApiClient::fetch_vendor_package`].
@@ -1744,6 +2254,55 @@ fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<Api
     }
 }
 
+/// Is `e` a throttling answer (429, or an over-capacity 503) the retry
+/// loop left final? Keyed on the variants [`throttled_error`] produces —
+/// never on message text — so the proxy's permanent "not configured" 503
+/// (an [`ApiError::Other`]) is not one.
+fn is_throttle_error(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::RateLimited(_) | ApiError::ServiceUnavailable(_)
+    )
+}
+
+/// The public proxy's permanent "Patch API is not configured" 503
+/// (patch endpoints disabled on that deployment). Not throttling: no JSON
+/// path retries it, and it stays the plain [`ApiError::Other`] status
+/// error it always was.
+fn is_patch_api_unconfigured(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::SERVICE_UNAVAILABLE && body.contains("Patch API is not configured")
+}
+
+/// The error for a 429 / 503 the retry loop left final: 429 →
+/// [`ApiError::RateLimited`], an over-capacity 503 →
+/// [`ApiError::ServiceUnavailable`] with the status and body, naming why
+/// the loop stopped (`gave_up`, e.g. "gave up after 3 retries") when
+/// retries were on. The permanent "not configured" 503 keeps its
+/// pre-retry [`ApiError::Other`].
+fn throttled_error(
+    status: StatusCode,
+    text: &str,
+    use_public_proxy: bool,
+    gave_up: Option<String>,
+) -> ApiError {
+    match (classify_auth_error(status, use_public_proxy), gave_up) {
+        (Some(ApiError::RateLimited(_)), Some(why)) => ApiError::RateLimited(format!(
+            "Rate limit exceeded (HTTP 429, {why}). Please try again later."
+        )),
+        (Some(err), _) => err,
+        (None, why) => {
+            let msg = status_error("API request failed with status", status, text);
+            if is_patch_api_unconfigured(status, text) {
+                return ApiError::Other(msg);
+            }
+            ApiError::ServiceUnavailable(match why {
+                Some(why) => format!("{msg} ({why})"),
+                None => msg,
+            })
+        }
+    }
+}
+
 /// Decide whether a public-proxy response to `POST /patch/batch` means the
 /// endpoint is unsupported on that deployment, in which case
 /// [`ApiClient::search_patches_batch`] degrades to per-package GETs (which
@@ -1762,7 +2321,7 @@ fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<Api
 fn is_batch_unsupported(status: StatusCode, body: &str) -> bool {
     match status {
         StatusCode::BAD_REQUEST => body.contains("Unsupported endpoint"),
-        StatusCode::SERVICE_UNAVAILABLE => body.contains("Patch API is not configured"),
+        StatusCode::SERVICE_UNAVAILABLE => is_patch_api_unconfigured(status, body),
         // A deployment / CDN layer with no route for POST /patch/batch.
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => true,
         _ => false,
@@ -1995,6 +2554,14 @@ pub enum ApiError {
 
     #[error("{0}")]
     RateLimited(String),
+
+    /// An HTTP 503 (over capacity, maintenance) still failing after the
+    /// bounded retry ([`crate::api::retry`]). The text is the plain status
+    /// error (`API request failed with status 503: <body>`, plus the retry
+    /// note). The proxy's permanent "Patch API is not configured" 503 is
+    /// [`ApiError::Other`] instead: it is not throttling.
+    #[error("{0}")]
+    ServiceUnavailable(String),
 
     #[error("{0}")]
     InvalidHash(String),
@@ -4082,6 +4649,117 @@ mod vendor_retry_tests {
         .with_vendor_retry(policy)
     }
 
+    /// `download_artifact_first_attempt` settles exactly what
+    /// `download_artifact` would return on its first attempt, and defers
+    /// (one request, no backoff) wherever `download_artifact` would retry —
+    /// unless the policy has no retry to give, where it settles.
+    #[tokio::test]
+    async fn first_attempt_settles_or_defers_like_download_artifact() {
+        let server = MockServer::start().await;
+        for (route, status) in [("/ok", 200), ("/gone", 404), ("/busy", 429), ("/down", 503)] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(status).set_body_bytes(BYTES.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        let url = |route: &str| format!("{}{route}", server.uri());
+        let retrying = client(&server.uri(), fast());
+
+        let ok = retrying.download_artifact_first_attempt(&url("/ok")).await;
+        assert_eq!(ok.expect("200 settles").expect("200 is Ok"), BYTES);
+        let gone = retrying
+            .download_artifact_first_attempt(&url("/gone"))
+            .await
+            .expect("404 is terminal, so it settles")
+            .expect_err("404 is an error");
+        let full = retrying
+            .download_artifact(&url("/gone"))
+            .await
+            .expect_err("404 is an error");
+        assert_eq!(gone.to_string(), full.to_string());
+        for route in ["/busy", "/down"] {
+            assert!(
+                retrying
+                    .download_artifact_first_attempt(&url(route))
+                    .await
+                    .is_err(),
+                "{route} is retried by download_artifact, so it defers"
+            );
+        }
+        let gets = |route: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| r.url.path() == route)
+                    .count()
+            }
+        };
+        assert_eq!(gets("/busy").await, 1, "a deferral makes one request");
+        assert_eq!(gets("/down").await, 1, "a deferral makes one request");
+
+        let single = client(&server.uri(), VendorRetryPolicy::none());
+        let settled = single
+            .download_artifact_first_attempt(&url("/down"))
+            .await
+            .expect("with no retry budget the first attempt is final")
+            .expect_err("503 is an error");
+        let full = single
+            .download_artifact(&url("/down"))
+            .await
+            .expect_err("503 is an error");
+        assert_eq!(settled.to_string(), full.to_string());
+    }
+
+    /// A deferral RESUMES the budget: a first attempt plus
+    /// `download_artifact_resuming` costs the host exactly the requests one
+    /// `download_artifact` costs — never the deferred attempt plus a fresh
+    /// budget, which would give a flapping host one extra try and turn the
+    /// serial loop's failure into a success.
+    #[tokio::test]
+    async fn resuming_a_deferral_spends_one_budget_not_two() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down"))
+            .respond_with(ResponseTemplate::new(503).set_body_bytes(BYTES.to_vec()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/down", server.uri());
+        let gets = || async {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/down")
+                .count()
+        };
+        let client = client(&server.uri(), fast());
+
+        let whole = client.download_artifact(&url).await.expect_err("503");
+        let serial = gets().await;
+        assert_eq!(serial, fast().attempts as usize, "the policy's attempts");
+
+        let deferred = client
+            .download_artifact_first_attempt(&url)
+            .await
+            .expect_err("503 defers");
+        let resumed = client
+            .download_artifact_resuming(&url, deferred)
+            .await
+            .expect_err("503");
+        assert_eq!(resumed.to_string(), whole.to_string(), "same final error");
+        assert_eq!(
+            gets().await - serial,
+            serial,
+            "the split download costs the same budget as the whole one"
+        );
+    }
+
     fn granted(server: &MockServer, uuid: &str) -> ResponseTemplate {
         let url = format!("{}{SERVE}", server.uri());
         let sri = format!(
@@ -4695,5 +5373,112 @@ mod authenticated_batch_tests {
             .expect("200 with empty packages is the legitimate no-patches shape");
         assert!(result.packages.is_empty());
         assert!(result.can_access_paid_patches);
+    }
+}
+
+#[cfg(test)]
+mod proxy_batch_path_cap_tests {
+    //! Concurrent `search_patches_batch` calls on one public-proxy client
+    //! (scan's batch windows) must share the batch path's in-flight cap,
+    //! not multiply it: when every chunk degrades to the legacy per-package
+    //! GETs, the proxy sees at most `PROXY_BATCH_PATH_CONCURRENCY` of them
+    //! at once — what the serial batch loop peaked at.
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// Every by-package answer takes this long, so the requests in flight
+    /// at an arrival are exactly those that arrived less than this before.
+    const GET_DELAY: Duration = Duration::from_millis(300);
+
+    /// Records each by-package GET's arrival time, then answers it (empty,
+    /// after [`GET_DELAY`]).
+    struct Arrivals(Arc<Mutex<Vec<Instant>>>);
+
+    impl Respond for Arrivals {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            self.0.lock().unwrap().push(Instant::now());
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "patches": [],
+                    "canAccessPaidPatches": false,
+                }))
+                .set_delay(GET_DELAY)
+        }
+    }
+
+    /// Most GETs whose arrivals fall inside one window shorter than
+    /// [`GET_DELAY`] — a lower bound on the peak in flight that a capped
+    /// run cannot exceed (a slot frees only when its answer, `GET_DELAY`
+    /// after its arrival, is back).
+    fn peak_in_flight(arrivals: &[Instant]) -> usize {
+        let mut sorted = arrivals.to_vec();
+        sorted.sort();
+        let window = GET_DELAY.mul_f32(0.8);
+        (0..sorted.len())
+            .map(|i| {
+                sorted[i..]
+                    .iter()
+                    .take_while(|t| t.duration_since(sorted[i]) < window)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn concurrent_batches_share_the_legacy_fallback_cap() {
+        let server = MockServer::start().await;
+        // A validation 400 for every chunk: each degrades to per-package
+        // GETs (one exotic PURL per chunk is enough in the wild).
+        Mock::given(method("POST"))
+            .and(path("/patch/batch"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad purl"))
+            .mount(&server)
+            .await;
+        let arrivals = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .and(path_regex("^/patch/by-package/"))
+            .respond_with(Arrivals(Arc::clone(&arrivals)))
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        });
+        // Four windows of 10 PURLs, as scan's proxy batch windows run them.
+        let chunks: Vec<Vec<String>> = (0..4)
+            .map(|c| {
+                (0..PROXY_BATCH_PATH_CONCURRENCY)
+                    .map(|i| format!("pkg:npm/cap-{c}-{i}@1.0.0"))
+                    .collect()
+            })
+            .collect();
+        let results = futures_util::future::join_all(
+            chunks
+                .iter()
+                .map(|chunk| client.search_patches_batch(chunk)),
+        )
+        .await;
+        for result in results {
+            let response = result.expect("the per-package path swallows nothing here");
+            assert!(response.packages.is_empty());
+        }
+
+        let arrivals = arrivals.lock().unwrap();
+        assert_eq!(arrivals.len(), 40, "one GET per PURL");
+        let peak = peak_in_flight(&arrivals);
+        assert!(
+            peak <= PROXY_BATCH_PATH_CONCURRENCY,
+            "{peak} by-package GETs in flight at once; the cap is \
+             {PROXY_BATCH_PATH_CONCURRENCY}"
+        );
+        // And the cap is reached, not undershot: the calls still overlap.
+        assert_eq!(peak, PROXY_BATCH_PATH_CONCURRENCY);
     }
 }

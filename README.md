@@ -550,6 +550,40 @@ warning — it never breaks a command or pollutes `--json` output. `socket-patch
 cloned repo must never be able to redirect where patches come from or spend your token.
 (Full rationale: [docs/design/configuration.md](docs/design/configuration.md).)
 
+One more env-only knob tunes *pacing* rather than routing. `scan` queries the patch API
+with several requests in flight: against the authenticated endpoint, a quarter of the
+requests a step has to make, between 8 and 32 (so a step with 128 or more requests runs
+32 at once, one with 32 or fewer runs 8); against the public proxy, which shares one
+server-side limit across anonymous callers, 4. The patch-record fetches behind `vex` and
+`scan --vex` run up to 10 at once (4 on the proxy).
+`SOCKET_API_CONCURRENCY=<n>` overrides that, clamped to `1`-`32`; on the public proxy it
+can only lower it. Set it when an endpoint in front of the API caps in-flight requests
+per client — a self-hosted `--api-url`, a corporate reverse proxy, a WAF or a CDN — and
+a scan starts reporting fewer patches than it should because some requests are being
+rejected. `SOCKET_API_CONCURRENCY=1` sends one request at a time, the slowest and most
+conservative setting. An unset, empty or non-numeric value leaves the defaults in place.
+
+A throttled patch API is retried, within bounds. An HTTP `429` or `503` answer to any
+patch-API query (batch search, patch lists, patch views, VEX record fetches, hosted
+package references) is retried up to 3 times, waiting as long as the server's
+`Retry-After` asks (seconds or an HTTP date; a request asked to wait more than 30 s gives
+up at once) or, without one, 0.5 s, 1 s, 2 s with jitter. All retries in one run must
+finish within 60 s of the run's first retry (wall-clock: requests waiting in parallel
+don't add up), so a heavily throttled run gives up instead of hanging. `SOCKET_API_MAX_RETRIES=<n>` changes
+the per-request count (`0`-`10`; `0` turns retries off). Other errors are never retried.
+A query still throttled after its retries is reported, never dropped: a failed batch
+prints `Warning: API batch <n> of <total> failed: …` (under `--json`, a top-level
+`warnings[]` entry with code `api_batch_failed`), a failed patch-list lookup prints
+`Warning: could not fetch details for <purl>: …` (`--json`: `patch_details_failed`), and
+if every query fails the scan exits 1 with an error, as before.
+
+The crawl has a pacing knob too. Its directory walks (`node_modules`, and the Maven
+repository with its POM parse) run on a small pool of threads: 4 by default (fewer on a machine with fewer performance cores), because the walk is bound
+by the kernel's directory cache and more threads only add system time.
+`SOCKET_WALK_THREADS=<n>` overrides that, clamped to `1`-`16` and to the machine's CPU
+count; an unset, empty or non-numeric value leaves the default in place. A soft open-file
+limit below 128 still runs the walk on one thread, whatever the knob says.
+
 The sections below list only each command's **command-specific** flags.
 
 ### `scan`
@@ -585,7 +619,7 @@ socket-patch scan [options]
 | `--mode <hosted\|vendored\|agent>` | — | Selects one of the three [patch modes](#three-patch-modes), summarized above. Combining `--mode` with a legacy boolean flag of a *different* mode is an error (exit 2); the same mode spelled both ways is accepted. |
 | `--prune` | — | Garbage-collect after the scan: remove manifest entries for packages no longer present in the crawl (installed trees + lockfiles — a wiped `node_modules` alone doesn't prune lockfile-listed entries) and delete orphan blob/diff/package-archive files. Off by default. [Vendored](#vendor) packages are exempt from the crawl-based prune (an absent installed copy is their normal state), but a vendored entry whose dependency has left the lockfile is reverted (and any manifest entry it still had dropped). Orthogonal to `--mode` — combines with any mode. |
 | `--detached` | — | Hidden compatibility no-op. Vendored mode is manifest-free by default: the vendor ledger (`.socket/vendor/state.json`) embeds the patch records and `.socket/manifest.json` is never written, so this former opt-in changes nothing. Still an error without `--mode vendored`. |
-| `--batch-size <n>` | `SOCKET_BATCH_SIZE` | Packages per API request (default: `100`). |
+| `--batch-size <n>` | `SOCKET_BATCH_SIZE` | Packages per API request (default: `500` on the authenticated API, `100` on the public proxy). A request whose body would exceed 256 KiB is split into smaller ones. |
 | `--all-releases` | `SOCKET_ALL_RELEASES` | Store patches for every release/distribution variant, not just the installed one — PyPI wheel/sdist, RubyGems platform, Maven classifier. Makes the manifest portable across environments (e.g. cross-platform CI caches). |
 | `--vex <path>` | `SOCKET_VEX` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan--vendor). |
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_*` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |

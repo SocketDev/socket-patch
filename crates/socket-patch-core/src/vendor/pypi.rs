@@ -7,15 +7,16 @@
 //! byte-untouched and an artifact failure never leaves half-wired lockfiles.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::api::client::ApiClient;
+use crate::api::client::{ApiClient, DeferredAttempt};
 use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::utils::fs::{atomic_write_bytes, read_regular_to_string};
+use crate::utils::fs::{atomic_write_artifact, read_regular_to_string};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::toml_edit_ext::has_table;
@@ -40,6 +41,7 @@ use super::pypi_wheel::{
 };
 use super::reuse;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
     VendorMarker,
@@ -134,6 +136,91 @@ pub async fn fetch_hosted_wheel_metadata(
         .await
         .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))?;
     decode_hosted_wheel_metadata(&bytes, sha256)
+}
+
+/// [`fetch_hosted_wheel_metadata`]'s FIRST attempt, for running several
+/// wheels' first attempts concurrently while keeping the one-at-a-time
+/// loop's per-wheel request sequence. Opaque; hand it back to
+/// [`finish_hosted_wheel_metadata`], which either reports what it settled or
+/// spends the rest of its retry budget.
+pub struct HostedWheelMetadataAttempt {
+    outcome: WheelAttemptOutcome,
+    /// The attempt's `debug_log` lines, held back so they print where the
+    /// one-at-a-time loop's would have — its GET really happened, so they
+    /// are printed, never dropped.
+    debug: Vec<String>,
+}
+
+enum WheelAttemptOutcome {
+    /// Settled on the first attempt: exactly what
+    /// `fetch_hosted_wheel_metadata` would have returned.
+    Settled(Result<Option<String>, String>),
+    /// The first attempt failed in a way `fetch_hosted_wheel_metadata`
+    /// retries, with the rest of its budget still unspent.
+    Retry(DeferredAttempt),
+}
+
+impl HostedWheelMetadataAttempt {
+    /// Did the first attempt fail in a way the retry budget covers? Such an
+    /// attempt is finished one at a time, so a caller fanning out stops
+    /// widening at the first one: the host is struggling.
+    pub fn needs_retry(&self) -> bool {
+        matches!(self.outcome, WheelAttemptOutcome::Retry(_))
+    }
+}
+
+/// [`fetch_hosted_wheel_metadata`]'s first attempt only, with its debug
+/// lines held back (see [`HostedWheelMetadataAttempt`]).
+pub async fn try_fetch_hosted_wheel_metadata_once(
+    client: &ApiClient,
+    url: &str,
+    sha256: &str,
+) -> HostedWheelMetadataAttempt {
+    if let Err(error) = validate_hosted_wheel_sha256(sha256) {
+        return HostedWheelMetadataAttempt {
+            outcome: WheelAttemptOutcome::Settled(Err(error)),
+            debug: Vec::new(),
+        };
+    }
+    let (attempt, debug) =
+        crate::api::client::with_deferred_debug(client.download_artifact_first_attempt(url)).await;
+    HostedWheelMetadataAttempt {
+        outcome: match attempt {
+            Err(deferred) => WheelAttemptOutcome::Retry(deferred),
+            Ok(downloaded) => WheelAttemptOutcome::Settled(
+                downloaded
+                    .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))
+                    .and_then(|bytes| decode_hosted_wheel_metadata(&bytes, sha256)),
+            ),
+        },
+        debug,
+    }
+}
+
+/// Finish a wheel's metadata fetch where the one-at-a-time loop would have
+/// run it: the first attempt's held-back debug lines print here, and an
+/// attempt that earned a retry spends the REST of its budget here, pausing
+/// as its `Retry-After` asked. `None` (no attempt was ever started) runs the
+/// whole of [`fetch_hosted_wheel_metadata`]. Either way this wheel costs the
+/// host the one-at-a-time loop's requests, at most `attempts` of them.
+pub async fn finish_hosted_wheel_metadata(
+    client: &ApiClient,
+    url: &str,
+    sha256: &str,
+    attempt: Option<HostedWheelMetadataAttempt>,
+) -> Result<Option<String>, String> {
+    let Some(attempt) = attempt else {
+        return fetch_hosted_wheel_metadata(client, url, sha256).await;
+    };
+    crate::api::client::flush_deferred_debug(attempt.debug);
+    match attempt.outcome {
+        WheelAttemptOutcome::Settled(result) => result,
+        WheelAttemptOutcome::Retry(deferred) => client
+            .download_artifact_resuming(url, deferred)
+            .await
+            .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))
+            .and_then(|bytes| decode_hosted_wheel_metadata(&bytes, sha256)),
+    }
 }
 
 const SETUP_ALTERNATIVE: &str =
@@ -436,9 +523,9 @@ fn pipenv_wired_pin(lock: &serde_json::Value, uuid_dir_rel: &str) -> Option<(Str
 /// the patched wheel at `.socket/vendor/pypi/<uuid>/<wheel>`, write the
 /// marker, then wire the project files (LAST).
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pypi(
+pub async fn vendor_pypi<'a>(
     purl: &str,
-    site_packages: &Path,
+    site_packages: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -458,8 +545,49 @@ pub async fn vendor_pypi(
         force,
         service,
         &tokio::sync::OnceCell::new(),
+        &InstalledSiteListings::default(),
     )
     .await
+}
+
+/// The run's listings of the project's virtualenv `site-packages`, keyed by
+/// site.
+///
+/// [`pipenv_stale_install_warning`] judges every patched package against the
+/// same venvs, and each judgement re-listed the whole directory (a
+/// `.dist-info` scan plus a METADATA read per installed package) to answer
+/// one question about one purl. A vendor run never writes into a venv, so
+/// one listing per site answers for every package that asks.
+///
+/// The ONE thing this gives up, deliberately (plan §2.1 row 11): an
+/// EXTERNAL installer landing mid-run — `pip install -U`, `pipenv sync` in
+/// another terminal — is no longer seen by the packages judged after the
+/// first ask for that site, where re-listing per package would have seen
+/// it. Only the `(canonicalized name, version)` SET is frozen: which files
+/// are stale is still read live, per package, through `verify_file_patch`.
+#[derive(Default)]
+pub struct InstalledSiteListings(tokio::sync::Mutex<SiteListings>);
+
+/// Each listed site's `(canonicalized name, version)` pairs, in listing
+/// order — the shape [`crate::crawlers::python_crawler::PythonCrawler::find_by_purls_listed`]
+/// matches against.
+type SiteListings = std::collections::HashMap<std::path::PathBuf, Arc<Vec<(String, String)>>>;
+
+impl InstalledSiteListings {
+    /// `site`'s installed packages, listed on the first ask of the run.
+    async fn of(&self, site: &Path) -> Arc<Vec<(String, String)>> {
+        if let Some(listed) = self.0.lock().await.get(site) {
+            return Arc::clone(listed);
+        }
+        // Listed outside the lock: two packages racing here simply list
+        // twice and agree, and neither blocks the other's judgement.
+        let listed = Arc::new(crate::crawlers::python_crawler::list_dist_info_packages(site).await);
+        self.0
+            .lock()
+            .await
+            .insert(site.to_path_buf(), Arc::clone(&listed));
+        listed
+    }
 }
 
 /// Pipenv never reinstalls a release that is already present — measured on
@@ -473,6 +601,7 @@ async fn pipenv_stale_install_warning(
     project_root: &Path,
     purl: &str,
     record: &PatchRecord,
+    listings: &InstalledSiteListings,
 ) -> Option<VendorWarning> {
     use crate::crawlers::python_crawler::{find_local_venv_site_packages, PythonCrawler};
     use crate::patch::apply::{verify_file_patch, VerifyStatus};
@@ -482,14 +611,14 @@ async fn pipenv_stale_install_warning(
     // Judged over the PROJECT'S venvs (VIRTUAL_ENV, ./.venv, ./venv, Pipenv's
     // WORKON_HOME venv) — never the staging dir a lock-only vendor fetched
     // the pristine wheel into, and never the global interpreters.
+    // The caller refused an unparseable purl long before this probe, so the
+    // lookup below is never the empty one `find_by_purls` short-circuits on.
     let base = strip_purl_qualifiers(purl).to_string();
     let crawler = PythonCrawler::new();
     let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
     for site in find_local_venv_site_packages(project_root).await {
-        let found = crawler
-            .find_by_purls(&site, std::slice::from_ref(&base))
-            .await
-            .unwrap_or_default();
+        let listed = listings.of(&site).await;
+        let found = crawler.find_by_purls_listed(&site, &listed, std::slice::from_ref(&base));
         if !found.contains_key(&base) {
             continue;
         }
@@ -530,29 +659,47 @@ async fn pipenv_stale_install_warning(
     ))
 }
 
+/// Everything [`vendor_pypi_with_pipenv_version`] decides before it can
+/// first ask the patch service: the purl and uuid guards, the flavor route
+/// and every wiring pre-flight guard, the in-sync hot path, the ledger entry
+/// anchoring this uuid, and the fresh-path reuse of a committed wheel (which
+/// asks no service either). The download plan evaluates the same function
+/// ahead of the vendor loop ([`service_preflight`]).
+struct PypiPrelude<'p> {
+    base: &'p str,
+    raw_name: String,
+    version: String,
+    canon_name: String,
+    uuid_dir_rel: String,
+    flavor: PypiFlavor,
+    plan: WiringPlan,
+    warnings: Vec<VendorWarning>,
+    in_sync: bool,
+    prior: Option<VendorEntry>,
+    expected_pin: Option<(String, String)>,
+    reused_wheel: Option<AcquiredWheel>,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pypi_with_pipenv_version(
-    purl: &str,
-    site_packages: &Path,
+async fn pypi_prelude<'p>(
+    purl: &'p str,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    vendored_at: &str,
     dry_run: bool,
-    force: bool,
-    service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
-) -> VendorOutcome {
+    installed_sites: &InstalledSiteListings,
+) -> Result<PypiPrelude<'p>, VendorOutcome> {
     // The purl may carry `?artifact_id=` variant qualifiers; everything here
     // keys off the qualifier-free base.
     let base = strip_purl_qualifiers(purl);
     let Some((raw_name, version)) = parse_pypi_purl(base) else {
-        return refused(
+        return Err(refused(
             "pypi_invalid_purl",
             format!("{purl} is not a pkg:pypi PURL with a version"),
-        );
+        ));
     };
-    let (raw_name, version) = (raw_name.as_ref(), version.as_ref());
+    let (raw_name, version) = (raw_name.to_string(), version.to_string());
+    let (raw_name, version) = (raw_name.as_str(), version.as_str());
     let canon_name = canonicalize_pypi_name(raw_name);
 
     // SECURITY: the uuid comes from a committed, tamper-able manifest and
@@ -560,20 +707,20 @@ pub async fn vendor_pypi_with_pipenv_version(
     // deletes). Anything but the canonical UUID grammar is rejected
     // fail-closed before any disk access.
     let Some(uuid_dir_rel) = vendor_uuid_dir_rel("pypi", &record.uuid) else {
-        return refused(
+        return Err(refused(
             "vendor_unsafe_uuid",
             format!(
                 "patch uuid {:?} is not a canonical lowercase uuid; refusing to derive a \
                  vendor path from it",
                 record.uuid
             ),
-        );
+        ));
     };
 
     let (flavor, flavor_warnings) =
         match detect_pypi_flavor(project_root, Some((&canon_name, version))).await {
             Ok(f) => f,
-            Err((code, detail)) => return refused(code, detail),
+            Err((code, detail)) => return Err(refused(code, detail)),
         };
 
     // Pre-flight the wiring guards BEFORE building anything, so refusals
@@ -592,7 +739,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         PypiFlavor::UvProject => {
             let project = match load_uv_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             match check_target_guards(&project, &canon_name, &record.uuid) {
                 Ok(UvTarget::InSync) => {
@@ -603,7 +750,7 @@ pub async fn vendor_pypi_with_pipenv_version(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Uv(Box::new(project))
                 }
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::PythonLocks => {
@@ -616,7 +763,7 @@ pub async fn vendor_pypi_with_pipenv_version(
             .await
             {
                 Ok(project) => project,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             if project.in_sync {
                 wired_pin = project.pin;
@@ -632,7 +779,7 @@ pub async fn vendor_pypi_with_pipenv_version(
                     WiringPlan::InSync
                 }
                 Ok(project) => WiringPlan::Hatch(project),
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Requirements => {
@@ -642,13 +789,13 @@ pub async fn vendor_pypi_with_pipenv_version(
                     WiringPlan::InSync
                 }
                 Ok(RequirementsTarget::Fresh) => WiringPlan::Requirements,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Poetry => {
             let project = match super::pypi_poetry::load_poetry_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             match super::pypi_poetry::check_target_guards(
                 &project,
@@ -664,13 +811,13 @@ pub async fn vendor_pypi_with_pipenv_version(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Poetry(Box::new(project))
                 }
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Pdm => {
             let project = match super::pypi_pdm::load_pdm_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             match super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid)
             {
@@ -682,19 +829,19 @@ pub async fn vendor_pypi_with_pipenv_version(
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Pdm(Box::new(project))
                 }
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             }
         }
         PypiFlavor::Pipenv => {
             let project = match super::pypi_pipenv::load_pipenv_project(project_root).await {
                 Ok(p) => p,
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             let installer = *pipenv_version
                 .get_or_init(|| crate::utils::pipenv::installed_major(project_root))
                 .await;
             if installer.is_some_and(|major| major < 2018) {
-                return refused("pypi_pipenv_installer_unsupported", "vendored wheel references require Pipenv 2018 or later; upgrade Pipenv or use hosted mode");
+                return Err(refused("pypi_pipenv_installer_unsupported", "vendored wheel references require Pipenv 2018 or later; upgrade Pipenv or use hosted mode"));
             }
             if installer.is_none() {
                 // Fail-open like hosted, but say so: the wiring assumes a
@@ -716,14 +863,16 @@ pub async fn vendor_pypi_with_pipenv_version(
             ) {
                 Ok(target) => target,
                 // A refusal carries no warnings: probe nothing for it.
-                Err((code, detail)) => return refused(code, detail),
+                Err((code, detail)) => return Err(refused(code, detail)),
             };
             if target == PipenvTarget::Fresh {
                 warnings.extend(project.warnings.iter().cloned());
             }
             // Both a fresh vendor and a re-run over an already-wired lock
             // keep warning while the venv still holds the upstream release.
-            if let Some(stale) = pipenv_stale_install_warning(project_root, purl, record).await {
+            if let Some(stale) =
+                pipenv_stale_install_warning(project_root, purl, record, installed_sites).await
+            {
                 warnings.push(stale);
             }
             match target {
@@ -754,11 +903,11 @@ pub async fn vendor_pypi_with_pipenv_version(
             uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await
         };
         if artifact_present || dry_run {
-            return done(
+            return Err(done(
                 already_patched_result(base, Path::new(""), &record.files),
                 None,
                 warnings,
-            );
+            ));
         }
     }
 
@@ -822,14 +971,13 @@ pub async fn vendor_pypi_with_pipenv_version(
                     acquired.rel_wheel
                 ),
             ));
-            return done(
+            return Err(done(
                 reuse_preview_result(base, &project_root.join(&acquired.rel_wheel), record),
                 None,
                 warnings,
-            );
+            ));
         }
     }
-    let reused = reused_wheel.is_some();
     if let Some(acquired) = &reused_wheel {
         warnings.push(VendorWarning::new(
             "vendor_artifact_reused",
@@ -839,6 +987,96 @@ pub async fn vendor_pypi_with_pipenv_version(
             ),
         ));
     }
+    Ok(PypiPrelude {
+        base,
+        raw_name: raw_name.to_string(),
+        version: version.to_string(),
+        canon_name,
+        uuid_dir_rel,
+        flavor,
+        plan,
+        warnings,
+        in_sync,
+        prior,
+        expected_pin,
+        reused_wheel,
+    })
+}
+
+/// Whether [`vendor_pypi_with_pipenv_version`] — a wet run with the service
+/// enabled — asks the patch service for `record`: past every refusal it
+/// raises first, and answered neither by the in-sync hot path nor by the
+/// reuse of a committed wheel. The vendor loop's download plan consults
+/// this, with the loop's own Pipenv-release cell and site listings.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &InstalledSiteListings,
+) -> Option<crate::api::client::PlannedDownload> {
+    pypi_prelude(
+        purl,
+        project_root,
+        record,
+        false,
+        pipenv_version,
+        installed_sites,
+    )
+    .await
+    .ok()
+    .filter(|p| p.reused_wheel.is_none())?;
+    // `try_pypi_service_wheel` checks the wheel's members against the
+    // afterHashes before pinning the lockfile to it.
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::verify_zip(&record.files)),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_pypi_with_pipenv_version<'a>(
+    purl: &str,
+    site_packages: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &InstalledSiteListings,
+) -> VendorOutcome {
+    let site_packages = site_packages.into();
+    let PypiPrelude {
+        base,
+        raw_name,
+        version,
+        canon_name,
+        uuid_dir_rel,
+        flavor,
+        plan,
+        mut warnings,
+        in_sync,
+        prior,
+        expected_pin,
+        reused_wheel,
+    } = match pypi_prelude(
+        purl,
+        project_root,
+        record,
+        dry_run,
+        pipenv_version,
+        installed_sites,
+    )
+    .await
+    {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
+    };
+    let (raw_name, version) = (raw_name.as_str(), version.as_str());
+    let reused = reused_wheel.is_some();
 
     // Acquire the patched wheel: prefer the prebuilt service artifact (which
     // skips needing the package installed), else build it locally. A refusal /
@@ -1547,7 +1785,7 @@ async fn acquire_patched_wheel(
     base: &str,
     raw_name: &str,
     version: &str,
-    site_packages: &Path,
+    site_packages: PackageSource<'_>,
     uuid_dir_rel: &str,
     project_root: &Path,
     record: &PatchRecord,
@@ -1583,7 +1821,17 @@ async fn acquire_patched_wheel(
         }
     }
 
-    // Local build from the installed dist.
+    // Local build from the installed dist — the first branch that reads the
+    // site-packages tree, so a lazily-fetched wheel is extracted here.
+    let site_packages = match site_packages.materialize().await {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Err(refused(
+                "pypi_dist_not_found",
+                format!("cannot stage a copy of the installed distribution: {e}"),
+            ))
+        }
+    };
     let dist = match locate_installed_dist(site_packages, raw_name, version).await {
         Ok(d) => d,
         Err((code, detail)) => return Err(refused(code, detail)),
@@ -1677,7 +1925,11 @@ async fn try_pypi_service_wheel(
             // members are site-packages-relative (the `record.files` keys),
             // so require each patched file to carry its afterHash before
             // reporting the package patched and pinning the lockfile to it.
-            if !zip_bytes_match_after_hashes(&archive.bytes, &record.files) {
+            if !archive
+                .prestaged
+                .zip_verdict(&record.files)
+                .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files))
+            {
                 return miss(
                     warnings,
                     "vendor_prebuilt_layout_mismatch",
@@ -1688,7 +1940,8 @@ async fn try_pypi_service_wheel(
                 );
             }
             let rel_wheel = format!("{uuid_dir_rel}/{wheel_name}");
-            let sha256_hex = hex::encode(Sha256::digest(&archive.bytes));
+            // Digested on first ask: pypi is the only backend that pins it.
+            let sha256_hex = archive.sha256_hex().to_string();
             // In-sync rebuild: the lockfile still pins the first vendor's
             // wheel path + sha256, and a prebuilt wheel that differs would
             // break every subsequent hash-checked install the moment vendor
@@ -1717,7 +1970,7 @@ async fn try_pypi_service_wheel(
                     );
                 }
             }
-            if let Err(e) = atomic_write_bytes(&dest, &archive.bytes).await {
+            if let Err(e) = atomic_write_artifact(&dest, &archive.bytes).await {
                 return hard_fail(
                     "vendor_prebuilt_write_failed",
                     format!("cannot write the vendored wheel: {e}"),
@@ -2753,6 +3006,65 @@ wheels = [
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
             .mount(server)
             .await;
+    }
+
+    /// The download plan's gate names exactly the packages whose vendor call
+    /// asks the patch service for a grant: none it refuses first (not a pypi
+    /// purl, a non-canonical uuid) — a package the requirements do not list
+    /// is only refused at wiring time, after the download — and, once
+    /// vendored, not the in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_packages_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed, PLAN_UUID_B,
+            PLAN_UUID_C,
+        };
+        let fx = e2e_fixture().await;
+        let (root, site_packages, record) = (fx.root.as_path(), &fx.site_packages, &fx.record);
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let pipenv_version = tokio::sync::OnceCell::new();
+        let installed_sites = InstalledSiteListings::default();
+        let (pv, sites) = (&pipenv_version, &installed_sites);
+        let cases = [
+            ("pkg:pypi/six@1.16.0", record.clone()),
+            ("pkg:pypi/six@1.16.0", with_uuid(record, "not-a-uuid")),
+            ("pkg:pypi/absent@1.0.0", with_uuid(record, PLAN_UUID_B)),
+            ("pkg:npm/six@1.16.0", with_uuid(record, PLAN_UUID_C)),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move {
+                service_preflight(&purl, root, &rec, pv, sites)
+                    .await
+                    .is_some()
+            })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (sources, cfg) = (&sources, &cfg);
+            Box::pin(async move {
+                vendor_pypi_with_pipenv_version(
+                    &purl,
+                    site_packages.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                    pv,
+                    sites,
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string(), PLAN_UUID_B.to_string()]);
+        // Vendored now: the re-run is in sync and asks nothing.
+        let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
+        assert!(rerun.is_empty(), "{rerun:?}");
     }
 
     /// Service success (requirements flavor): the prebuilt wheel is written, the

@@ -119,6 +119,30 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   their DepID and get the patched sha512 in slot [2] and the hosted URL in slot [3]; see
   [vlt notes](#npm-vlt-notes).
 
+## npm: which `node_modules` trees are crawled
+
+A local scan collects the project root's `node_modules` and every
+`node_modules` found in the directories below it (workspace members, nested
+projects), at any depth. The walk does not descend into symlinked
+directories, hidden directories (`.git`, `.cache`, ...), `node_modules`
+itself (packages are read from it, not searched for workspaces), or
+directories named `dist`, `build`, `coverage`, `tmp`, `temp`, `__pycache__`
+or `vendor`. It also prunes every directory that carries a
+[Cache Directory Tagging](https://bford.info/cachedir/) `CACHEDIR.TAG` file
+beginning with the standard signature — a cargo `target/`, and caches of
+other tools that follow the convention: neither that directory's own
+`node_modules` nor anything below it is crawled. The scan root is always
+crawled, even when it is tagged itself. A `CACHEDIR.TAG` that lacks the
+signature, is a directory or is a symlink prunes nothing.
+
+Every command that looks for installed npm copies walks these same trees, not
+only `scan`. A package installed only under a pruned directory is therefore
+"not installed" to `scan --prune` / `--sync`, which garbage-collect its
+manifest entry and blobs unless a lockfile still resolves it, and `apply`,
+`rollback`, `remove`, `repair`, `vendor` and `vex` do not find that copy:
+`remove` drops the manifest entry but leaves the copy's patched files in
+place.
+
 ## npm: Rush monorepos
 
 A Rush repo has no root `package.json`/lockfile pair — its pnpm source-of-truth locks
@@ -317,6 +341,22 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
   *mismatch* fails.
+* **Local-repository discovery reads coordinates from the path.** `scan` (and every
+  other crawl of `~/.m2/repository`) takes a POM's groupId / artifactId / version from
+  its directory when the file sits at the canonical
+  `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom` — the only place Maven
+  writes one — without opening it. The path spells the group relative to the scan root,
+  so each top-level group directory (`org/`, `com/`, ...) is confirmed first: the first
+  canonical POM under it whose contents parse must name the coordinates its path does.
+  A directory that fails that check — all of them when `--global-prefix` /
+  `SOCKET_GLOBAL_PREFIX` / `MAVEN_REPO_LOCAL` names a directory above or inside the
+  repository rather than the repository itself — is read content-first, as before. Any
+  other `.pom` (a SNAPSHOT dir's timestamped POM, a hand-placed `extra.pom`, a group
+  directory whose name holds a `.`) is parsed as before, falling back to the directory
+  path when the POM names no usable coordinates. The one visible consequence: under a
+  confirmed directory, a POM at a canonical path whose contents disagree with its
+  directory (hand-placed, or a legacy upstream POM with mismatched coordinates) reports
+  the directory's coordinates.
 * **Warm `~/.m2` shadowing (vendored Maven only).** Maven consults the *local repository*
   before any configured `<repository>`, so with vendored mode a warm `~/.m2` copy of the
   same GAV silently wins over the committed `file://` repository — the build succeeds

@@ -53,7 +53,7 @@ use sha2::{Digest, Sha256};
 use crate::manifest::schema::PatchRecord;
 use crate::utils::env_compat::is_debug_enabled;
 
-use super::state::{load_state, VendorEntry};
+use super::state::{load_state_shared, VendorEntry};
 use super::verify::{
     checked_artifact_path, read_zip_bytes_to_map_strict, verify_member_map, MAX_HEALTH_HASH_BYTES,
 };
@@ -110,13 +110,72 @@ fn norm(path: &str) -> String {
 /// carry an entry for the same uuid; they must all agree on (path, sha256)
 /// or the answer is [`ReuseMiss::Ambiguous`]. An unreadable ledger is
 /// [`ReuseMiss::NoLedger`] (reuse is skipped; acquisition runs as before).
+///
+/// The ledger comes from [`load_state_shared`]: the run asks it once per
+/// npm/pypi package, and on a big monorepo the ledger runs to megabytes,
+/// so re-parsing (or, inside a group commit, deep-cloning) it per package
+/// was the vendored re-run's dominant cost. The shared read still reads
+/// the bytes every time and re-parses whenever they changed, answers from
+/// the group commit's captured ledger when there is one, and fails exactly
+/// where [`super::state::load_state`] fails. Only the one matching entry is
+/// cloned.
 pub(crate) async fn prior_entry(
     project_root: &Path,
     ecosystem: &str,
     record: &PatchRecord,
     expected_rel: Option<&str>,
 ) -> Result<VendorEntry, ReuseMiss> {
-    let state = load_state(project_root)
+    let state = load_state_shared(project_root)
+        .await
+        .map_err(|_| ReuseMiss::NoLedger)?;
+    select_prior_entry(state.entries.values(), ecosystem, record, expected_rel).cloned()
+}
+
+/// [`prior_entry`]'s choice over the ledger's entries, in the ledger map's
+/// iteration order: the LAST match is the answer, the rest must agree with
+/// it on (path, sha256).
+fn select_prior_entry<'a>(
+    entries: impl Iterator<Item = &'a VendorEntry>,
+    ecosystem: &str,
+    record: &PatchRecord,
+    expected_rel: Option<&str>,
+) -> Result<&'a VendorEntry, ReuseMiss> {
+    let expected = expected_rel.map(norm);
+    let mut hits: Vec<&VendorEntry> = entries
+        .filter(|e| {
+            e.ecosystem == ecosystem
+                && e.uuid == record.uuid
+                && !e.artifact.sha256.is_empty()
+                && expected
+                    .as_deref()
+                    .is_none_or(|want| norm(&e.artifact.path) == want)
+        })
+        .collect();
+    let Some(first) = hits.pop() else {
+        return Err(ReuseMiss::NoEntry);
+    };
+    let agree = hits.iter().all(|e| {
+        norm(&e.artifact.path) == norm(&first.artifact.path)
+            && e.artifact
+                .sha256
+                .eq_ignore_ascii_case(&first.artifact.sha256)
+    });
+    if !agree {
+        return Err(ReuseMiss::Ambiguous);
+    }
+    Ok(first)
+}
+
+/// The pre-SC1 [`prior_entry`], kept as the equivalence oracle: a full
+/// [`super::state::load_state`] per call, entries taken by value.
+#[cfg(test)]
+pub(crate) async fn prior_entry_reloading(
+    project_root: &Path,
+    ecosystem: &str,
+    record: &PatchRecord,
+    expected_rel: Option<&str>,
+) -> Result<VendorEntry, ReuseMiss> {
+    let state = super::state::load_state(project_root)
         .await
         .map_err(|_| ReuseMiss::NoLedger)?;
     let expected = expected_rel.map(norm);
@@ -281,12 +340,12 @@ pub(crate) async fn reusable_committed_dir(
     if record.files.is_empty() {
         return Err(ReuseMiss::NoFiles);
     }
-    let state = load_state(project_root)
+    let state = load_state_shared(project_root)
         .await
         .map_err(|_| ReuseMiss::NoLedger)?;
     let mut hits: Vec<VendorEntry> = state
         .entries
-        .into_values()
+        .values()
         .filter(|e| {
             e.ecosystem == "npm"
                 && e.uuid == record.uuid
@@ -294,6 +353,7 @@ pub(crate) async fn reusable_committed_dir(
                 && norm(&e.artifact.path) == rel_dir
                 && e.artifact.file_inventory.is_some()
         })
+        .cloned()
         .collect();
     let Some(entry) = hits.pop() else {
         return Err(ReuseMiss::NoEntry);
@@ -953,5 +1013,111 @@ mod tests {
         );
         // The canonical wheel is still reused.
         assert!(wheel_reuse(&zip_of(&[("index.js", PATCHED)])).await.is_ok());
+    }
+
+    /// SC1: the shared-ledger [`prior_entry`] answers exactly what the
+    /// reloading oracle answers — hits, path filters, twins that agree or
+    /// disagree, a missing or corrupt ledger — including after the ledger
+    /// changes between two calls (the memo must miss) and inside a group
+    /// commit that captured a newer ledger.
+    #[tokio::test]
+    async fn shared_prior_entry_matches_the_reloading_oracle() {
+        use crate::utils::group_commit::GroupCommit;
+        async fn both(root: &Path, rec: &PatchRecord, rel: Option<&str>) {
+            for eco in ["npm", "pypi"] {
+                assert_eq!(
+                    prior_entry(root, eco, rec, rel).await,
+                    prior_entry_reloading(root, eco, rec, rel).await,
+                    "eco {eco}, rel {rel:?}"
+                );
+            }
+        }
+        let bytes = good_tgz();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = rel_for(UUID);
+        let other_rel = rel_for(OTHER_UUID);
+        let rec = record(UUID);
+        let rels = [None, Some(rel.as_str()), Some(other_rel.as_str())];
+
+        // Missing ledger.
+        for r in rels {
+            both(root, &rec, r).await;
+        }
+        // One entry.
+        let entry = entry_for(UUID, &rel, &bytes);
+        write_ledger(root, &[("pkg:npm/left-pad@1.3.0", entry.clone())]).await;
+        for r in rels {
+            both(root, &rec, r).await;
+        }
+        // Agreeing twins (a qualified twin, backslash-spelled path, upper
+        // hex) — the answer is one of identical-anchor entries.
+        let mut twin = entry.clone();
+        twin.artifact.path = rel.replace('/', "\\");
+        twin.artifact.sha256 = twin.artifact.sha256.to_ascii_uppercase();
+        write_ledger(
+            root,
+            &[
+                ("pkg:npm/left-pad@1.3.0", entry.clone()),
+                ("pkg:npm/left-pad@1.3.0?x=1", twin),
+            ],
+        )
+        .await;
+        for r in rels {
+            let (a, b) = (
+                prior_entry(root, "npm", &rec, r).await,
+                prior_entry_reloading(root, "npm", &rec, r).await,
+            );
+            assert_eq!(a.is_ok(), b.is_ok());
+            match (a, b) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(norm(&a.artifact.path), norm(&b.artifact.path));
+                    assert!(a.artifact.sha256.eq_ignore_ascii_case(&b.artifact.sha256));
+                }
+                (a, b) => assert_eq!(a.unwrap_err(), b.unwrap_err()),
+            }
+        }
+        // Disagreeing twins, an empty-sha entry, another ecosystem.
+        let mut bad = entry.clone();
+        bad.artifact.sha256 = "0".repeat(64);
+        let mut empty = entry.clone();
+        empty.artifact.sha256.clear();
+        let mut pypi = entry.clone();
+        pypi.ecosystem = "pypi".into();
+        write_ledger(
+            root,
+            &[
+                ("pkg:npm/left-pad@1.3.0", entry.clone()),
+                ("pkg:npm/left-pad@1.3.0?x=1", bad),
+                ("pkg:npm/left-pad@1.3.0?x=2", empty),
+                ("pkg:pypi/left-pad@1.3.0", pypi),
+            ],
+        )
+        .await;
+        for r in rels {
+            both(root, &rec, r).await;
+        }
+        // Rewritten between two calls: the memo holds the old parse and
+        // must not answer from it.
+        write_ledger(root, &[("pkg:npm/left-pad@1.3.0", entry.clone())]).await;
+        for r in rels {
+            both(root, &rec, r).await;
+        }
+        // Inside a group commit, after a captured save of a different
+        // ledger: both answer from the captured value.
+        let group = GroupCommit::begin(root);
+        let moved = entry_for(UUID, &other_rel, &bytes);
+        write_ledger(root, &[("pkg:npm/left-pad@1.3.0", moved)]).await;
+        for r in rels {
+            both(root, &rec, r).await;
+        }
+        drop(group);
+        // Corrupt ledger.
+        tokio::fs::write(root.join(".socket/vendor/state.json"), b"{not json")
+            .await
+            .unwrap();
+        for r in rels {
+            both(root, &rec, r).await;
+        }
     }
 }

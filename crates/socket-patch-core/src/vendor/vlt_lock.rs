@@ -34,6 +34,7 @@ use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, parse_npm_purl,
 };
 use super::npm_dir::{dependency_token, replace_dependency_token, stage_patch_dir, SpanError};
+use super::source::PackageSource;
 use super::state::{
     load_state, write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
     WiringRecord,
@@ -1240,9 +1241,9 @@ pub async fn keep_vlt_links(
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
 /// re-run synthesizes AlreadyPatched with no entry.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn vendor_vlt(
+pub(crate) async fn vendor_vlt<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -1251,6 +1252,7 @@ pub(crate) async fn vendor_vlt(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let coords = match guard_coordinates(purl, record) {
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
@@ -1380,6 +1382,42 @@ pub(crate) async fn vendor_vlt(
     }
     write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
     done(result, Some(entry_for(wiring.records)), warnings)
+}
+
+/// Which of `packages` [`vendor_vlt`] would refuse before it first asks
+/// the patch service (see `npm_flavor::preflight_packages`): the flavor
+/// change, the coordinates guard, the lock analysis with its declaration
+/// checks and the wiring plan — every gate ahead of [`stage_patch_dir`],
+/// in the backend's order, against the project as it is now.
+pub(super) async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    let mut verdicts = Vec::with_capacity(packages.len());
+    for (purl, record) in packages {
+        verdicts.push(preflight_package(project_root, purl, record).await);
+    }
+    verdicts
+}
+
+async fn preflight_package(
+    project_root: &Path,
+    purl: &str,
+    record: &PatchRecord,
+) -> Result<(), &'static str> {
+    if let Ok(state) = super::state::load_state_shared(project_root).await {
+        if super::npm_flavor::vlt_flavor_change_refusal(&state.entries, purl).is_some() {
+            return Err("vendor_flavor_changed");
+        }
+    }
+    let coords =
+        guard_coordinates(purl, record).map_err(|o| super::npm_common::refusal_code(&o))?;
+    let analysis = analyze(project_root, &coords.name, &coords.version, &record.uuid)
+        .await
+        .map_err(|(code, _)| code)?;
+    let prior = prior_vlt_entry(project_root, purl).await;
+    plan_wiring(&analysis, prior.as_ref()).map_err(|(code, _)| code)?;
+    Ok(())
 }
 
 /// Rewrite a vlt entry's `<uuid>/.gitignore` and `<uuid>/.gitattributes`

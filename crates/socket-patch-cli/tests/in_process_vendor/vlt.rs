@@ -1565,13 +1565,16 @@ fn vendor_vlt_workspace_member_cwd_sees_no_root_lock() {
     assert!(changed.is_empty(), "{changed:?}");
 }
 
-/// The lock is written last; when that write fails the package.json files
-/// already rewritten go back and the staged artifact is unwound. An
-/// immutable file (`chflags uchg`) is the one hermetic way to fail only
-/// the lock's rename.
+/// The run's one group commit writes the lock with the package.json
+/// rewires and the ledger; when the lock's write fails nothing is
+/// committed: the package.json files and the lock keep their pre-run
+/// bytes, no ledger appears, and the run exits 1 with
+/// `vendor_commit_failed`. The artifact the backend wrote is an orphan the
+/// next run re-vendors over. An immutable file (`chflags uchg`) is the one
+/// hermetic way to fail only the lock's rename.
 #[cfg(target_os = "macos")]
 #[test]
-fn vendor_vlt_lock_write_failure_unwinds_package_json() {
+fn vendor_vlt_lock_write_failure_commits_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     direct_project(root);
@@ -1590,14 +1593,11 @@ fn vendor_vlt_lock_write_failure_unwinds_package_json() {
     let (code, env, stderr) = vendor(root, &[]);
     assert!(chflags("nouchg"));
     assert_eq!(code, 1, "{env:#}\n{stderr}");
-    assert!(
-        env.to_string().contains("package.json files restored"),
-        "{env:#}"
-    );
+    assert_eq!(env["error"]["code"], "vendor_commit_failed", "{env:#}");
     assert_eq!(read(root, "package.json"), ROOT_PKG);
     assert_eq!(read(root, VLT_LOCK), lock);
     assert!(
-        !uuid_dir(root, UUID).exists(),
-        "the staged artifact is unwound"
+        !root.join(".socket/vendor/state.json").exists(),
+        "the ledger is committed with the lock or not at all"
     );
 }

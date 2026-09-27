@@ -16,3 +16,9 @@ crates/socket-patch-core/tests/fixtures/vlt-locks/** -text
 
 # The vendored vlt fixtures pin locks real vlt wrote, byte for byte.
 crates/socket-patch-core/tests/fixtures/vendor/** -text
+
+# The legacy vendor ledgers are what the base binary wrote, byte for byte:
+# vendor_ledger_schema_e2e replays them through `vendor --revert` and
+# compares the result byte for byte, so a CRLF checkout would change both
+# the replayed wiring files and the expected revert.
+crates/socket-patch-cli/tests/fixtures/legacy-ledgers/** -text

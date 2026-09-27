@@ -72,7 +72,7 @@ fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
             yes: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         apply: false,
         prune: false,
         sync: false,

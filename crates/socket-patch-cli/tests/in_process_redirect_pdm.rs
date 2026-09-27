@@ -76,7 +76,7 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
         paths: Vec::new(),
         common: global(cwd, api_url),
-        batch_size: 100,
+        batch_size: Some(100),
         apply: false,
         prune: false,
         sync: false,
