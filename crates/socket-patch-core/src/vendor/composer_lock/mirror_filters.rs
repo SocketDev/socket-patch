@@ -27,7 +27,8 @@ use std::io;
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::patch::apply::normalize_file_path;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes};
 
 use crate::vendor::VendorWarning;
 
@@ -97,7 +98,8 @@ fn strip_export_ignore(text: &str) -> (String, usize) {
 /// The neutralized bytes for one filter file, `None` when it is already
 /// neutral (absent, or nothing to drop). A symlink is always replaced by an
 /// empty regular file: its target may sit outside the copy and is never
-/// read.
+/// read. Any other non-regular file (a directory, a FIFO) is left alone;
+/// the guarded read refuses a FIFO without blocking in `open(2)`.
 async fn plan(path: &Path, file: &'static str) -> io::Result<Option<(Vec<u8>, usize)>> {
     let meta = match tokio::fs::symlink_metadata(path).await {
         Ok(meta) => meta,
@@ -107,10 +109,21 @@ async fn plan(path: &Path, file: &'static str) -> io::Result<Option<(Vec<u8>, us
     if meta.file_type().is_symlink() {
         return Ok(Some((Vec::new(), 0)));
     }
-    if !meta.is_file() {
+    if meta.is_dir() {
         return Ok(None);
     }
-    let bytes = tokio::fs::read(path).await?;
+    let bytes = match read_regular_to_bytes(path).await {
+        Ok(bytes) => bytes,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(e) => return Err(e),
+    };
     if file != GITATTRIBUTES {
         return Ok((!bytes.is_empty()).then(|| (Vec::new(), 0)));
     }
@@ -130,7 +143,8 @@ pub(super) async fn neutralize_mirror_filters(
     for file in [GITIGNORE, HGIGNORE, GITATTRIBUTES] {
         let path = copy_dir.join(file);
         if let Some(change) = plan(&path, file).await.map_err(MirrorFilterError::Io)? {
-            if patched_files.iter().any(|p| p == file) {
+            // API records key files as `package/<path>`.
+            if patched_files.iter().any(|p| normalize_file_path(p) == file) {
                 return Err(MirrorFilterError::PatchedFilterFile(file));
             }
             planned.push((file, path, change));
@@ -315,6 +329,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_package_prefixed_patched_filter_file_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), GITIGNORE, "/build\n").await;
+        let err = neutralize_mirror_filters(dir.path(), &[format!("package/{GITIGNORE}")])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MirrorFilterError::PatchedFilterFile(GITIGNORE)
+        ));
+        assert_eq!(read(dir.path(), GITIGNORE).await, "/build\n");
+    }
+
+    #[tokio::test]
     async fn neutralization_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), GITIGNORE, "/src\n").await;
@@ -346,5 +374,37 @@ mod tests {
         let meta = std::fs::symlink_metadata(dir.path().join(GITIGNORE)).unwrap();
         assert!(meta.is_file());
         assert_eq!(read(outside.path(), "target").await, "/src\n");
+    }
+
+    /// A FIFO planted as a filter file is skipped, not opened: a blocking
+    /// `open(2)` would wait forever for a writer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_filter_file_is_skipped_without_wedging() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join(GITIGNORE);
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        write(dir.path(), GITATTRIBUTES, "/tests export-ignore\n").await;
+
+        let run = neutralize_mirror_filters(dir.path(), &[]);
+        let Ok(report) = tokio::time::timeout(std::time::Duration::from_secs(5), run).await else {
+            // Release the wedged blocking open so the test fails, not hangs.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+            panic!("a FIFO filter file must not wedge neutralization");
+        };
+        let report = report.unwrap();
+        assert!(!report.gitignore_neutralized);
+        assert_eq!(report.export_ignore_rules_removed, 1);
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
     }
 }
