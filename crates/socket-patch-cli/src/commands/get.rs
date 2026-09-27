@@ -71,10 +71,8 @@ pub(crate) enum PatchAction {
 ///
 /// A non-zero exit code must ALWAYS pair with a non-`success` status:
 /// both are derived from the same predicate here so a JSON consumer
-/// reading `status` and a shell reading `$?` can never disagree. The
-/// historical bug was a `status` of `success` (keyed only on download
-/// failures) sitting next to an exit code of `1` produced by a failed
-/// *apply* step.
+/// reading `status` and a shell reading `$?` can never disagree (a failed
+/// *apply* step must not report `success`).
 fn run_outcome(patches_failed: bool, apply_failed: bool) -> (&'static str, i32) {
     if patches_failed || apply_failed {
         ("partial_failure", 1)
@@ -438,10 +436,9 @@ fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInf
 /// This is the shared record-building rule for the scan/download/vendor
 /// flows AND the single-uuid apply path, so `get <uuid>` and
 /// `scan`/`apply`/`vendor` all record and write the same set of files.
-/// The previous both-hashes-only rule silently dropped every added file,
-/// e.g. the whole-crate cargo export where ALL files lack a `beforeHash`
-/// (recorded `files:{}` → reported `applied:1` while writing nothing) and
-/// a gem patch's genuinely-new runtime-guard file.
+/// A both-hashes rule here would drop every added file (e.g. a whole-crate
+/// cargo export where ALL files lack a `beforeHash`, recorded as `files:{}`
+/// while reporting `applied:1`).
 fn files_for_manifest(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
     let mut files = HashMap::new();
     for (file_path, file_info) in &patch.files {
@@ -495,8 +492,7 @@ pub struct GetArgs {
     // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
     // clap's default bool parser accepts only the literal strings
     // `true`/`false` from the env binding, so `SOCKET_SAVE_ONLY=1` (or an
-    // exported-but-empty `SOCKET_SAVE_ONLY=`) aborted every `get`
-    // invocation.
+    // exported-but-empty `SOCKET_SAVE_ONLY=`) would abort every `get`.
     #[arg(
         long = "save-only",
         alias = "no-apply",
@@ -511,9 +507,9 @@ pub struct GetArgs {
     // Hidden: it always fails with "not yet implemented" (see `run`), but
     // stays parseable so scripts and `SOCKET_ONE_OFF` keep getting that
     // explicit error instead of a clap parse failure.
-    // `value_parser = parse_bool_flag`: same env-crash fix as `--save-only`
-    // above — and `SOCKET_ONE_OFF` is shared with `rollback --one-off`,
-    // which already parses boolishly; the two must not diverge.
+    // `value_parser = parse_bool_flag`: same reason as `--save-only` above —
+    // and `SOCKET_ONE_OFF` is shared with `rollback --one-off`, which parses
+    // boolishly too; the two must not diverge.
     #[arg(
         long = "one-off",
         env = "SOCKET_ONE_OFF",
@@ -542,7 +538,7 @@ pub struct GetArgs {
     pub all_releases: bool,
 
     /// How to consume the patches: the same modes as `scan --mode`
-    /// (default: agent).
+    /// [default: hosted; agent with `--save-only` or `--global`]
     // agent = record in .socket/manifest.json + blobs and apply in place;
     // hosted = rewrite lockfiles so the patched deps resolve to Socket's
     // hosted patch server (no manifest, no blobs; state lives in the
@@ -1079,9 +1075,10 @@ fn forced_identifier_error(identifier: &str, id_type: IdentifierType) -> Option<
 /// Select one patch per PURL from available patches.
 ///
 /// Within a PURL, candidates are ranked by [`cmp_search_results`]: merged
-/// patches first, then by severity (critical → low), then most recently
-/// published. `tier` is an access filter here, not a ranking signal — a
-/// free critical patch outranks a paid low one.
+/// patches first (newest first, whatever their severity); other patches by
+/// severity (critical → low), then most recently published. `tier` is an
+/// access filter here, not a ranking signal — a free critical patch
+/// outranks a paid low one.
 ///
 /// - Users with paid access: auto-select the top-ranked patch per PURL.
 /// - Free users with one patch, or with `--yes`: auto-select the
@@ -1102,7 +1099,6 @@ pub(crate) fn select_patches(
     can_access_paid: bool,
     common: &GlobalArgs,
 ) -> Result<Vec<PatchSearchResult>, i32> {
-    // Group accessible patches by PURL
     let mut by_purl: HashMap<String, Vec<&PatchSearchResult>> = HashMap::new();
     for p in patches {
         if p.tier == "free" || can_access_paid {
@@ -1126,8 +1122,8 @@ pub(crate) fn select_patches(
 
         if can_access_paid {
             // Take the top-ranked patch. Note this is NOT "prefer paid":
-            // tier only breaks ties once merge status, severity and recency
-            // have all tied.
+            // tier only breaks ties once the merged/severity/recency ranking
+            // (see `api::ranking`) has tied.
             selected.push(group[0].clone());
         } else if group.len() == 1 || (common.yes && !common.json) {
             // One candidate, or `--yes` (which answers every prompt with its
@@ -1208,19 +1204,18 @@ pub struct DownloadParams {
     pub silent: bool,
     /// `--download-mode` value forwarded to the apply step.
     pub download_mode: String,
-    /// When `false` (the default — narrow), a PyPI package with multiple
-    /// release variants (`?artifact_id=...`) is filtered down to the one
-    /// matching the locally-installed distribution before download. When
-    /// `true` (`--all-releases`), every variant is downloaded. No effect
-    /// on ecosystems without per-release artifact_id variants.
+    /// When `false` (the default — narrow), a release-variant package (PyPI
+    /// `?artifact_id=`, RubyGems `?platform=`, Maven `?classifier=`) is
+    /// filtered down to the variant(s) matching the locally-installed
+    /// distribution before download. When `true` (`--all-releases`), every
+    /// variant is downloaded. No effect on ecosystems without per-release
+    /// variants.
     pub all_releases: bool,
     /// `--strict` forwarded to the nested apply (a beforeHash mismatch
     /// fails instead of warn-and-overwrite).
     pub strict: bool,
-    /// `--ecosystems` forwarded to the nested apply. Without this the
-    /// nested apply ran UNSCOPED over the whole manifest, so
-    /// `scan --ecosystems gem --sync` could mutate other ecosystems'
-    /// packages the user had explicitly filtered out.
+    /// `--ecosystems` forwarded to the nested apply, so it never touches
+    /// other ecosystems' packages the user filtered out.
     pub ecosystems: Option<Vec<String>>,
     /// Persist downloaded blob content into `.socket/blobs` (the apply
     /// flows need it for later hook/rollback runs). Vendor flows pass
@@ -1346,10 +1341,9 @@ async fn filter_to_installed_releases(
     // `variant_groups` is a HashMap, so both drains above are in bucket
     // order — which is this function's OUTPUT order, and therefore the
     // order the download loop emits `download.patches` / `apply.patches`
-    // in. Two identical runs produced different JSON. Sort the multi-
-    // variant bases so their warnings and kept variants are stable, and
-    // sort the whole kept list by purl before returning (below and at the
-    // early return): every sibling collection in the same envelope —
+    // in. Sort the multi-variant bases so their warnings and kept variants
+    // are stable, and sort the whole kept list by purl before returning
+    // (below and at the early return): every sibling collection in the same envelope —
     // scan's `packages`, the agent flow's `skip_records` — is purl-sorted.
     multi.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1367,7 +1361,8 @@ async fn filter_to_installed_releases(
         .iter()
         .flat_map(|(_, variants)| variants.iter().map(|s| s.purl.clone()))
         .collect();
-    // All collected PURLs are PyPI; no ecosystem filter needed.
+    // Release-variant PURLs only (PyPI / RubyGems / Maven); partition_purls
+    // splits them by ecosystem, so no filter is needed.
     let partitioned = partition_purls(&all_qualified, None);
     let paths = find_packages_for_rollback(&partitioned, crawler_options, true).await;
 
@@ -1375,7 +1370,7 @@ async fn filter_to_installed_releases(
     // `api_concurrency` in flight) in the order the loop below consumes
     // them: bases in `multi` order, skipping the uninstalled ones, each
     // base's variants in order. Nothing here prints between fetches, and
-    // each request's `--debug` lines are released at its old turn.
+    // each request's `--debug` lines are released at its turn in that order.
     let installed_variants: Vec<String> = multi
         .iter()
         .filter(|(_, variants)| variants.iter().any(|s| paths.contains_key(&s.purl)))
@@ -1432,7 +1427,7 @@ async fn filter_to_installed_releases(
                     views.insert(s.uuid.clone(), patch);
                 }
                 // On a fetch error/miss, keep the variant so the main
-                // download loop can record the failure as it would today.
+                // download loop records the failure.
                 _ => candidates.push((s.purl.clone(), HashMap::new())),
             }
         }
@@ -1501,8 +1496,8 @@ fn purl_has_version(purl: &str) -> bool {
 }
 
 /// Does the raw pnpm-lock text RESOLVE `name@version`? Boundary-anchored
-/// probes over the three lock grammars — a plain `contains` collided on
-/// version prefixes (`left-pad@1.3.0` matched inside
+/// probes over the three lock grammars — a plain `contains` collides on
+/// version prefixes (`left-pad@1.3.0` matches inside
 /// `left-pad@1.3.0-beta.1`), name suffixes (`pad@1.3.0` inside
 /// `left-pad@1.3.0`), and unscoped-inside-scoped names (`name@1.0.0` inside
 /// `@scope/name@1.0.0`). The needles cover v6/v9's `name@version` and v5's
@@ -1943,7 +1938,7 @@ async fn fetch_selected_patches(
     // --all-releases was passed (a no-op for non-variant ecosystems and
     // single-variant packages). The views it fetched serve the loop below.
     // The narrowing queries the API: show that something is happening
-    // right after the confirm prompt.
+    // once selection (and get's confirm prompt) is done.
     let mut status = crate::ui::StatusLine::stderr(params.json, params.silent);
     status.set("Preparing download...");
     let (selected, warnings, views) = filter_to_installed_releases(
@@ -1956,7 +1951,8 @@ async fn fetch_selected_patches(
     .await;
     status.finish();
     prefetched.extend(views);
-    // No leading blank line: the prompt's answer already ended its line.
+    // No leading blank line: the caller's prompt or summary already ended
+    // its line.
     if matches!(store, RecordStore::Manifest(_)) && !quiet {
         eprintln!(
             "Downloading {}...",
@@ -1979,10 +1975,9 @@ async fn fetch_selected_patches(
     // (the same three checks, in the loop's order, over inputs the loop
     // never mutates) — run concurrently ahead of it, at most
     // `api_concurrency` in flight, and come back in selection order. The
-    // loop takes the next one exactly where it used to await the request,
-    // and each request's `--debug` lines print there too, so stdout, the
-    // per-patch stderr lines and the JSON records fold exactly as the
-    // serial loop's did.
+    // loop takes the next one where it would await the request, and each
+    // request's `--debug` lines print there too, so stdout, the per-patch
+    // stderr lines and the JSON records fold in selection order.
     let mut held: std::collections::HashSet<&str> = prefetched.keys().map(String::as_str).collect();
     let to_fetch: Vec<&str> = selected
         .iter()
@@ -2228,8 +2223,8 @@ pub(crate) type DetachedDownload = (
 ///
 /// `api_client` is the run's client (built once, proxy fallback included).
 /// `prefetched` maps uuid → an already-fetched view: the `get <uuid>` path
-/// resolved its identifier by fetching the view, and scan's interactive
-/// arm pre-verified baselines from the views — neither must fetch again (a
+/// resolved its identifier by fetching the view, and scan's vendored arm
+/// pre-verified baselines from the views — neither must fetch again (a
 /// fresh fetch could re-hit the 401 the proxy fallback just recovered
 /// from). The ledger idempotency check runs before the cache lookup, and a
 /// cache miss still fetches.
@@ -2264,9 +2259,9 @@ pub(crate) async fn download_patch_records_reusing(
     let vendor_state = load_state(&params.cwd).await;
     // Bun preflight (see `BunVendorRefusal`): this phase feeds the vendor
     // engine, so it must refuse the same projects BEFORE fetching —
-    // otherwise the view was downloaded for nothing and a package
-    // resolvable only through the unreadable bun.lockb inventory
-    // misreported `package_not_installed` instead of the real
+    // otherwise the view is downloaded for nothing and a package
+    // resolvable only through the unreadable bun.lockb inventory is
+    // misreported as `package_not_installed` instead of the real
     // `vendor_bun_*` code. npm-only, so release narrowing (PyPI / RubyGems /
     // Maven variants) cannot change its verdict.
     let bun_refusal = bun_vendor_preflight_with_ledger(
@@ -2441,10 +2436,9 @@ fn nested_apply_args_from_params(
         global_prefix: params.global_prefix.clone(),
         download_mode: params.download_mode.clone(),
         strict: params.strict,
-        // Scope the nested apply like the caller was scoped: leaving this
-        // at the default `None` made `scan --ecosystems gem --sync` apply
-        // the WHOLE manifest, mutating other ecosystems' packages the user
-        // filtered out.
+        // Scope the nested apply like the caller was scoped: `None` would
+        // apply the WHOLE manifest, mutating other ecosystems' packages the
+        // user filtered out.
         ecosystems: params.ecosystems.clone(),
         lock_timeout: run.lock_timeout,
         verbose: run.verbose,
@@ -2460,9 +2454,9 @@ fn nested_apply_args_from_params(
 /// its last mutation is done. Returns whether apply exited 0. Callers print
 /// their own "Applying patches..." line. `json` is the caller's flag: a
 /// JSON caller gets no human error lines, from this function or from the
-/// nested apply (`common` itself is never JSON). The read-only cargo-redirect verifier stays off
-/// and embedded VEX is opt-in on the top-level command only, never on this
-/// internal invocation.
+/// nested apply (`common` itself is never JSON). The read-only `--check`
+/// redirect verifier stays off and embedded VEX is opt-in on the top-level
+/// command only, never on this internal invocation.
 async fn run_nested_apply(
     common: GlobalArgs,
     json: bool,
@@ -2488,7 +2482,7 @@ async fn run_nested_apply(
 
 /// Download the selected patches into `.socket/` (manifest records +
 /// blobs) and, unless `save_only`, apply them in place — the agent-mode
-/// engine behind `get` and `scan --apply/--sync`, over the caller's
+/// engine behind `get` and `scan --mode agent`, over the caller's
 /// run-level context (`run`: the client the run already built, plus the
 /// `--lock-timeout` / `--verbose` the manifest lock and the nested apply
 /// honor). Returns `(exit_code, json)`.
@@ -2504,8 +2498,8 @@ pub async fn download_and_apply_patches_with(
 
     // The manifest read-modify-write — and the blob writes it records —
     // runs under the apply lock: `remove`/`rollback` RMW the same file under
-    // it, and an unlocked writer here lost their update or had its own
-    // record clobbered. `acquire` creates `.socket/` itself; the guard's
+    // it, and an unlocked writer here would lose their update or have its
+    // own record clobbered. `acquire` creates `.socket/` itself; the guard's
     // drop removes `apply.lock` and prunes an otherwise-empty `.socket/`, so
     // a run that records nothing leaves no residue. The nested apply runs
     // under this SAME guard (one lock window; see `run_nested_apply`).
@@ -2676,11 +2670,15 @@ pub async fn run(args: GetArgs) -> i32 {
         );
         return 1;
     }
-    // Mode resolution mirrors scan's enum (default = agent, today's
-    // behavior). Conflicts use get's established exit-1 report_error style
-    // (scan's self-enforced conflicts exit 2; get's have always been 1 —
-    // documented carve-out in CLI_CONTRACT.md).
-    let mode = args.mode.unwrap_or(super::scan::ScanMode::Agent);
+    // v5: hosted by default, like scan. `--save-only` (records a manifest
+    // entry) and global installs (no project lockfile) mean agent mode.
+    // Conflicts use get's exit-1 report_error style (scan's self-enforced
+    // conflicts exit 2 — documented carve-out in CLI_CONTRACT.md).
+    let mode = args.mode.unwrap_or(if args.save_only || args.common.is_global() {
+        super::scan::ScanMode::Agent
+    } else {
+        super::scan::ScanMode::Hosted
+    });
     if args.save_only && mode != super::scan::ScanMode::Agent {
         report_error(
             args.common.json,
@@ -2694,11 +2692,10 @@ pub async fn run(args: GetArgs) -> i32 {
         return 1;
     }
     if args.one_off {
-        // Honest failure instead of the historical silent no-op: the flag
-        // parsed but was never implemented, so the patch was saved to the
-        // manifest anyway — lying to the user about persistence. Mirrors
-        // `rollback --one-off`'s not-yet-implemented contract; rejected
-        // before any network or disk activity.
+        // The flag parses but is not implemented: fail loudly rather than
+        // save to the manifest anyway. Mirrors `rollback --one-off`'s
+        // not-yet-implemented contract; rejected before any network or disk
+        // activity.
         report_error(args.common.json, "One-off get mode is not yet implemented");
         return 1;
     }
@@ -2839,7 +2836,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 // 401/403 the fallback just recovered from. An explicit
                 // UUID is exempt from installed narrowing (exact intent).
                 return match mode {
-                    // Save to manifest and apply in place (today's flow).
+                    // Save to manifest and apply in place.
                     super::scan::ScanMode::Agent => {
                         save_and_apply_patch(&args, &api_client, &patch).await
                     }
@@ -3945,10 +3942,8 @@ async fn run_get_vendored(
 }
 
 /// Decode a patch view's `blobContent` (canonical, padded base64 as the API
-/// produces it). Hand-rolled only because `base64` is a dev-dependency of
-/// this crate today — once it is a plain dependency (it already is one of
-/// `socket-patch-core`, pinned workspace-wide), this body should become
-/// `base64::engine::general_purpose::STANDARD.decode(input)` with
+/// produces it). Hand-rolled; swapping in
+/// `base64::engine::general_purpose::STANDARD.decode(input)` must keep
 /// `DecodeError::InvalidByte(_, b)` mapped to the
 /// `Invalid base64 character: <b>` message below (pinned by a unit test).
 pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
@@ -3989,8 +3984,8 @@ mod tests {
     use super::*;
 
     /// The pnpm-PnP hosted lock probe must be boundary-anchored: plain
-    /// substring matching collided on version prefixes, name suffixes, and
-    /// unscoped-inside-scoped names (follow-up review finding).
+    /// substring matching collides on version prefixes, name suffixes, and
+    /// unscoped-inside-scoped names.
     #[test]
     fn pnpm_lock_resolves_is_boundary_anchored() {
         // v9/v6/v5 key spellings all resolve.
@@ -4197,9 +4192,9 @@ mod tests {
 
     #[test]
     fn select_paid_user_picks_highest_severity_not_most_recent() {
-        // The reported bug. An authorized user's package has a fresh `low`
-        // patch and an older `critical` one; the old selector took the
-        // newest and silently left the critical unfixed.
+        // An authorized user's package has a fresh `low` patch and an older
+        // `critical` one: taking the newest would leave the critical
+        // unfixed.
         let patches = vec![
             mk_patch_sev("new_low", "pkg:npm/foo@1.0", "paid", "2026-06-01", "low"),
             mk_patch_sev(
@@ -4309,8 +4304,8 @@ mod tests {
 
     #[test]
     fn select_recency_is_chronological_not_lexicographic() {
-        // `publishedAt` is RFC 2822 on the wire, so the old raw-string
-        // compare ordered by weekday name. With equal severities the newer
+        // `publishedAt` is RFC 2822 on the wire, so a raw-string compare
+        // would order by weekday name. With equal severities the newer
         // patch must win regardless of which weekday it fell on.
         let older = "Wed, 01 Jan 2025 00:00:00 GMT";
         let newer = "Fri, 01 Aug 2026 00:00:00 GMT";
@@ -4755,10 +4750,8 @@ mod tests {
 
     // --- run_outcome -----------------------------------------------------
     // The `status` field and the process exit code are derived from the
-    // same predicate. Regression guard: a failed *apply* step (no download
-    // failures) must still report `partial_failure` AND exit 1 — the old
-    // code keyed `status` only on download failures, so it printed
-    // `success` next to a non-zero exit code.
+    // same predicate: a failed *apply* step (no download failures) must
+    // still report `partial_failure` AND exit 1.
 
     #[test]
     fn run_outcome_clean_is_success_exit_zero() {
@@ -4905,12 +4898,11 @@ mod tests {
     }
 
     // --- files_for_manifest / files_with_both_hashes ---------------------
-    // Regression guards for the download/scan/vendor record builder: a
-    // net-new file (afterHash, NO beforeHash) that the patch ADDS must be
-    // retained in the manifest record, not silently dropped. Real prod
-    // repro: the whole-crate cargo export for `pkg:cargo/traitobject@0.1.1`
-    // publishes ALL files with only an afterHash — the old both-hashes rule
-    // recorded `files:{}` and reported `applied:1` while writing nothing.
+    // The download/scan/vendor record builder: a net-new file (afterHash, NO
+    // beforeHash) that the patch ADDS must be retained in the manifest
+    // record, not silently dropped. E.g. the whole-crate cargo export for
+    // `pkg:cargo/traitobject@0.1.1` publishes ALL files with only an
+    // afterHash.
 
     fn file_resp(before: Option<&str>, after: Option<&str>) -> PatchFileResponse {
         PatchFileResponse {
@@ -4960,8 +4952,8 @@ mod tests {
         assert_eq!(added.before_hash, "");
         assert_eq!(added.after_hash, "a".repeat(64));
 
-        // The old both-hashes rule (still used for installed-variant
-        // matching) DROPS the added file — this is the behavior we fixed.
+        // The both-hashes rule (used only for installed-variant matching)
+        // drops the added file.
         let strict = files_with_both_hashes(&patch);
         assert_eq!(strict.len(), 1);
         assert!(!strict.contains_key("lib/rubygems_plugin.rb"));
@@ -4969,9 +4961,8 @@ mod tests {
 
     #[test]
     fn files_for_manifest_keeps_all_new_file_whole_crate_export() {
-        // The P0 cargo case: EVERY file is a whole-crate export with only
-        // an afterHash. The old rule produced `files:{}`; the fix retains
-        // all 9 so the record is non-empty and can actually be applied.
+        // EVERY file is a whole-crate export with only an afterHash: all 9
+        // are retained so the record is non-empty and can be applied.
         let mut files = HashMap::new();
         for i in 0..9 {
             files.insert(
@@ -4985,7 +4976,7 @@ mod tests {
         assert_eq!(kept.len(), 9, "all whole-crate-export files must be kept");
         assert!(kept.values().all(|f| f.before_hash.is_empty()));
 
-        // Guardrail precondition: with the old rule this map was empty.
+        // Guardrail precondition: the both-hashes rule yields an empty map.
         assert!(files_with_both_hashes(&patch).is_empty());
     }
 
@@ -6050,7 +6041,7 @@ mod tests {
         );
     }
 
-    // --- coverage mop-up (2026-09 final wave) -------------------------------
+    // --- misc edge cases -----------------------------------------------------
 
     /// `merge_metadata` is a best-effort splice: a non-object record (or a
     /// non-object metadata value) must be left untouched, never panic —
@@ -6549,7 +6540,7 @@ mod tests {
     // The detached download phase must refuse the same Bun projects the
     // manifest-tracked one does, BEFORE any view fetch (request-log oracle),
     // and with the vendor code (never the downstream `package_not_installed`
-    // the alias-shaped lockb project used to degrade to).
+    // the alias-shaped lockb project would otherwise degrade to).
 
     /// A real bun 1.3.14 lockfileVersion-1 workspace lock (matrix capture
     /// grammar): 1-tuple `workspace:` entry, blank line between entries,
@@ -6868,9 +6859,8 @@ mod tests {
         );
     }
 
-    /// The nested apply inherits the caller's flags verbatim (`--verbose`
-    /// and `--strict` were dropped when its args were rebuilt from Default),
-    /// with `json`/`dry_run` forced off — one JSON document per run, and
+    /// The nested apply inherits the caller's flags verbatim (`--verbose`,
+    /// `--strict`, …), with `json`/`dry_run` forced off — one JSON document per run, and
     /// agent-mode `get` ignores `--dry-run` — `silent` following the caller's
     /// quiet gate, and the manifest path absolutized so apply does not
     /// re-resolve it against its own `--cwd`.

@@ -13,7 +13,7 @@
 //! file (the manifest records the hashes; the bytes are fetched on demand):
 //! `get` writes no blob, and the nested apply has to download it. Both `get`
 //! call sites are covered — the direct-UUID path (`save_and_apply_patch`) and
-//! the search path (`download_and_apply_patches`).
+//! the search path (`download_and_apply_patches_with`).
 //!
 //! Hermetic by construction: the *env* API/proxy URLs point at a dead local
 //! port, so a run that ignores the flags fails on a refused connection rather
@@ -162,6 +162,8 @@ async fn get_by_uuid_nested_apply_uses_api_flags_not_env() {
         &[
             "get",
             UUID,
+            "--mode",
+            "agent",
             "--yes",
             "--json",
             // `file` mode goes straight for the per-file blob endpoint; the
@@ -216,6 +218,8 @@ async fn get_by_purl_nested_apply_uses_api_flags_not_env() {
         &[
             "get",
             PURL,
+            "--mode",
+            "agent",
             "--yes",
             "--json",
             "--download-mode",
@@ -296,6 +300,8 @@ async fn get_by_uuid_nested_apply_uses_proxy_url_flag_when_tokenless() {
         &[
             "get",
             UUID,
+            "--mode",
+            "agent",
             "--yes",
             "--json",
             "--download-mode",

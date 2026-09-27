@@ -75,7 +75,7 @@ pub enum Commands {
     /// references plus any agent-mode manifest entries
     List(commands::list::ListArgs),
 
-    /// Agent mode: get a patch from the Socket API and apply it
+    /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
     #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
@@ -106,10 +106,10 @@ pub enum Commands {
     // in `parse_argv_with_shortcuts`). Hidden: the public contract
     // surface is `socket-patch --update`, and this name carries no
     // stability guarantee (documented as internal in CLI_CONTRACT.md).
-    // Plain `//` comments plus an explicit `about`/`override_usage`: a doc
-    // comment here is what `socket-patch --update --help` printed, and the
-    // derived usage line named the hidden subcommand, and so did the
-    // `--update --version` line until `display_name` pinned it.
+    // Plain `//` comments plus an explicit `about`/`override_usage`/
+    // `display_name`: a doc comment here would become
+    // `socket-patch --update --help` text, and the derived usage and
+    // `--update --version` lines would name the hidden subcommand.
     #[command(
         hide = true,
         name = "self-update",
