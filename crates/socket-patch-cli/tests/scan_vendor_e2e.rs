@@ -2347,25 +2347,31 @@ snapshots:
             .collect()
     }
 
-    /// Composer twins of the three npm packages: `psr/log` and `psr/cache`
-    /// are installed AND locked; `monolog/monolog` is installed but absent
+    /// Composer twins of the three npm packages: `psr/cache` and `psr/log`
+    /// are installed AND locked; `psr/http-message` is installed but absent
     /// from composer.lock, which the composer backend refuses as
-    /// `vendor_lock_entry_not_found` before it asks the service.
+    /// `vendor_lock_entry_not_found` before it asks the service. It sorts
+    /// BETWEEN the two, in the middle of the loop (and plan) order: the
+    /// prefetch only ever requests positions at or past the loop's, so a
+    /// refused package the loop meets FIRST would be passed over before
+    /// any request whether the plan named it or not — only one behind a
+    /// granted position shows whether the gate kept it out of the plan.
     const COMPOSER: [(&str, &str, &str); 3] = [
-        ("pkg:composer/psr/log@3.0.2", "psr/log", UUID_A),
+        ("pkg:composer/psr/cache@1.0.0", "psr/cache", UUID_A),
         (
-            "pkg:composer/monolog/monolog@2.0.0",
-            "monolog/monolog",
+            "pkg:composer/psr/http-message@1.1.0",
+            "psr/http-message",
             UUID_B,
         ),
-        ("pkg:composer/psr/cache@1.0.0", "psr/cache", UUID_C),
+        ("pkg:composer/psr/log@3.0.2", "psr/log", UUID_C),
     ];
+    const COMPOSER_REFUSED: &str = "psr/http-message";
 
     fn write_composer_fixture(root: &Path) {
         std::fs::write(root.join("composer.json"), r#"{"require":{}}"#).unwrap();
         let locked: Vec<serde_json::Value> = COMPOSER
             .iter()
-            .filter(|(_, name, _)| *name != "monolog/monolog")
+            .filter(|(_, name, _)| *name != COMPOSER_REFUSED)
             .map(|(purl, name, _)| {
                 let version = purl.rsplit('@').next().unwrap();
                 serde_json::json!({
@@ -2496,9 +2502,11 @@ snapshots:
 
     /// The plan is exact beyond npm: every ecosystem's backend gate keeps
     /// the packages it refuses before its first service call out of the
-    /// plan. Here the composer backend refuses `monolog/monolog` (not in
-    /// composer.lock) — zero grants — while the two locked packages it
-    /// does ask the service for cost exactly one grant each.
+    /// plan. Here the composer backend refuses `psr/http-message` (not in
+    /// composer.lock, and in the middle of the loop order, behind a
+    /// package the service answers) — zero grants — while the two locked
+    /// packages it does ask the service for cost exactly one grant each.
+    /// (`plan_gate_tests` in `commands/vendor.rs` pins the plan itself.)
     #[tokio::test]
     async fn a_composer_package_the_loop_refuses_costs_zero_grants() {
         assert!(

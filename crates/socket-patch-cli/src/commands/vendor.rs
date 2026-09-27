@@ -3578,6 +3578,102 @@ mod dispatch_tests {
 }
 
 #[cfg(test)]
+mod plan_gate_tests {
+    use super::*;
+    use socket_patch_core::manifest::schema::PatchFileInfo;
+
+    const UUID_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const UUID_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const UUID_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+    fn record(uuid: &str) -> PatchRecord {
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: String::new(),
+            files: HashMap::from([(
+                "index.php".to_string(),
+                PatchFileInfo {
+                    before_hash: "1".repeat(64),
+                    after_hash: "2".repeat(64),
+                },
+            )]),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    /// The download plan runs every record through its backend's own gate:
+    /// a package the backend refuses before its first service call is
+    /// never planned, wherever it sits in the loop order. Here the refused
+    /// composer package (`psr/http-message`, absent from composer.lock)
+    /// sorts BETWEEN the two locked ones, so a plan that skipped the gate
+    /// would name it at a position the prefetch reaches ahead of the loop.
+    #[tokio::test]
+    async fn the_plan_leaves_out_a_package_its_backend_refuses_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("composer.json"), r#"{"require":{}}"#).unwrap();
+        let locked: Vec<serde_json::Value> = [("psr/cache", "1.0.0"), ("psr/log", "3.0.2")]
+            .iter()
+            .map(|(name, version)| {
+                serde_json::json!({
+                    "name": name, "version": version,
+                    "dist": {"type": "zip", "url": format!("https://example.invalid/{name}.zip"),
+                             "reference": "abc", "shasum": ""},
+                    "type": "library"
+                })
+            })
+            .collect();
+        std::fs::write(
+            root.join("composer.lock"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "content-hash": "x", "packages": locked, "packages-dev": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let packages = [
+            ("pkg:composer/psr/cache@1.0.0", "psr/cache", UUID_A),
+            ("pkg:composer/psr/http-message@1.1.0", "psr/http-message", UUID_B),
+            ("pkg:composer/psr/log@3.0.2", "psr/log", UUID_C),
+        ];
+        let mut all_packages: Vec<(String, StagedSource)> = Vec::new();
+        let mut records: HashMap<String, PatchRecord> = HashMap::new();
+        for (purl, name, uuid) in packages {
+            let dir = root.join("vendor").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            all_packages.push((purl.to_string(), StagedSource::Installed(dir)));
+            records.insert(purl.to_string(), record(uuid));
+        }
+        let planned = plan_service_downloads(
+            root,
+            false,
+            &all_packages,
+            (&[], &[]),
+            &HashMap::new(),
+            &records,
+            &VendorState::default(),
+            None,
+            &|_| false,
+            (
+                &tokio::sync::OnceCell::new(),
+                &vendor::pypi::InstalledSiteListings::default(),
+            ),
+        )
+        .await;
+        let uuids: Vec<&str> = planned.iter().map(|d| d.uuid.as_str()).collect();
+        assert_eq!(
+            uuids,
+            vec![UUID_A, UUID_C],
+            "one planned download per package the loop asks the service for, in loop \
+             order, and none for the package its backend refuses first"
+        );
+    }
+}
+
+#[cfg(test)]
 mod warning_counting_tests {
     use super::*;
 
