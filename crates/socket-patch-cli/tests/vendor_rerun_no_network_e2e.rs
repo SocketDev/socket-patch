@@ -1184,3 +1184,65 @@ fn a_package_absent_from_the_lock_keeps_the_not_installed_skip() {
         );
     }
 }
+
+/// A `<copy>.socket-prestage` tree a crashed or interrupted run left
+/// behind is swept at the start of the next wet vendor loop — whatever
+/// that run vendors, `--offline` and `--vendor-source build` included —
+/// while a `--dry-run` deletes nothing.
+#[test]
+fn a_stale_prestage_tree_is_swept_by_the_next_wet_run_only() {
+    const UUID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const OLD: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let dead = dead_endpoint();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "t", "version": "0.0.0", "dependencies": {} }"#,
+    )
+    .unwrap();
+    write_manifest(
+        root,
+        "pkg:npm/pkg-z@1.0.0",
+        UUID,
+        "package/index.js",
+        b"before\n",
+        b"after\n",
+    );
+    let litter = [
+        format!(".socket/vendor/cargo/{OLD}/foo-1.0.0.socket-prestage"),
+        format!(".socket/vendor/composer/{OLD}/psr/log@3.0.2.socket-prestage"),
+    ];
+    let plant = || {
+        for dir in &litter {
+            std::fs::create_dir_all(root.join(dir).join("src")).unwrap();
+            std::fs::write(root.join(dir).join("src/lib.rs"), b"stale").unwrap();
+        }
+    };
+    plant();
+
+    let (_code, v, stderr) = run_vendor(root, &dead, &["--dry-run"], &[]);
+    for dir in &litter {
+        assert!(root.join(dir).exists(), "a dry run deletes nothing: {dir}\n{v:#}\n{stderr}");
+    }
+    assert!(
+        !v.to_string().contains("socket-prestage"),
+        "and reports nothing about it: {v:#}"
+    );
+
+    for extra in [&["--offline"][..], &[][..]] {
+        let (_code, v, stderr) = run_vendor(root, &dead, extra, &[]);
+        for dir in &litter {
+            assert!(!root.join(dir).exists(), "{extra:?} sweeps {dir}\n{v:#}\n{stderr}");
+        }
+        assert!(
+            !root.join(format!(".socket/vendor/composer/{OLD}")).exists(),
+            "{extra:?}: the levels only the leftover kept alive go too"
+        );
+        assert!(
+            !v.to_string().contains("socket-prestage"),
+            "the sweep is silent: {v:#}"
+        );
+        plant();
+    }
+}

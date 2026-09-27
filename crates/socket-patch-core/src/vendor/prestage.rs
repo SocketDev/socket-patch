@@ -344,10 +344,133 @@ pub async fn settle() {
     .await;
 }
 
+/// The backends whose copy dirs get pre-staged siblings, and how deep
+/// below the uuid dir a copy dir can sit: cargo and gem copies are direct
+/// children (`<name>-<version>`); composer (`<vendor>/<name>@<version>`)
+/// and golang (`<module path>@<version>`) copies end in an `@` leaf under
+/// any number of plain path levels.
+const PRESTAGED_ECOSYSTEMS: [(&str, bool); 4] = [
+    ("cargo", false),
+    ("gem", false),
+    ("composer", true),
+    ("golang", true),
+];
+
+/// Deepest module-path nesting the sweep descends (a guard against a
+/// pathological tree, far past any real module path).
+const SWEEP_MAX_DEPTH: usize = 32;
+
+/// Remove every `<copy>.socket-prestage` tree a previous run left under
+/// `.socket/vendor/` — one that crashed or was interrupted between staging
+/// an archive and [`settle`] — with the empty vendor levels above it.
+/// [`settle`] only knows the current run's trees, and the backend only
+/// replaces a pre-stage it stages again, so without this a leftover tree
+/// whose package is never re-planned would stay forever. Run at the start
+/// of a wet vendor loop, under its apply lock, before anything is staged:
+/// every pre-stage tree on disk then is stale. Never descends into a copy
+/// dir (an `@` leaf, or any child of a cargo / gem uuid dir), so a package
+/// tree's own contents are never touched. Returns how many it removed.
+pub async fn sweep_stale(project_root: &Path) -> usize {
+    let socket_dir = project_root.join(crate::constants::SOCKET_DIR);
+    let vendor_dir = socket_dir.join("vendor");
+    tokio::task::spawn_blocking(move || {
+        let mut removed = 0;
+        for (eco, nested) in PRESTAGED_ECOSYSTEMS {
+            for uuid_dir in plain_subdirs(&vendor_dir.join(eco)) {
+                let depth = if nested { SWEEP_MAX_DEPTH } else { 1 };
+                removed += sweep_level(&uuid_dir, depth, &socket_dir);
+            }
+        }
+        removed
+    })
+    .await
+    .unwrap_or(0)
+}
+
+/// The real (non-symlink) directories directly under `dir`, sorted.
+fn plain_subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn sweep_level(dir: &Path, depth: usize, socket_dir: &Path) -> usize {
+    let mut removed = 0;
+    for child in plain_subdirs(dir) {
+        let name = child
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.ends_with(".socket-prestage") {
+            remove_abandoned(&child, socket_dir);
+            removed += 1;
+        } else if depth > 1 && !name.contains('@') {
+            removed += sweep_level(&child, depth - 1, socket_dir);
+        }
+    }
+    removed
+}
+
 /// Serializes the tests that stage and settle: the abandoned queue and
 /// the running count are process-wide, as one vendor loop per process is.
 #[cfg(test)]
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// Leftover pre-stage trees are removed wherever a copy dir's sibling
+    /// can sit, with the vendor levels only they kept alive; copy dirs,
+    /// their contents and everything else stay.
+    #[tokio::test]
+    async fn sweep_removes_only_stale_prestage_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let v = root.join(".socket/vendor");
+        let u = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let stale = [
+            format!("cargo/{u}/foo-1.0.0.socket-prestage"),
+            format!("gem/{u}/bar-2.0.0.socket-prestage"),
+            format!("composer/{u}/psr/log@3.0.2.socket-prestage"),
+            format!("golang/{u}/github.com/a/b@v1.0.0.socket-prestage"),
+        ];
+        for dir in &stale {
+            std::fs::create_dir_all(v.join(dir).join("src")).unwrap();
+            std::fs::write(v.join(dir).join("src/lib"), b"x").unwrap();
+        }
+        let kept = [
+            format!("cargo/{u}/live-1.0.0/src/x.socket-prestage"),
+            format!("cargo/{u}/live-1.0.0.socket-stage"),
+            format!("composer/{u}/psr/cache@1.0.0/deep.socket-prestage"),
+            format!("golang/{u}/github.com/a/c@v1.0.0"),
+        ];
+        for dir in &kept {
+            std::fs::create_dir_all(v.join(dir)).unwrap();
+        }
+        std::fs::write(v.join("state.json"), b"{}").unwrap();
+
+        assert_eq!(sweep_stale(root).await, stale.len());
+        for dir in &stale {
+            assert!(!v.join(dir).exists(), "{dir} swept");
+        }
+        for dir in &kept {
+            assert!(v.join(dir).exists(), "{dir} kept");
+        }
+        assert!(!v.join("gem").exists(), "the levels only the tree kept alive are pruned");
+        assert!(!v.join(format!("composer/{u}/psr/log@3.0.2")).exists());
+        assert!(v.join("state.json").exists());
+        assert_eq!(sweep_stale(root).await, 0, "idempotent");
+        assert_eq!(sweep_stale(&root.join("missing")).await, 0);
+    }
+}
 
 #[cfg(test)]
 mod tests {

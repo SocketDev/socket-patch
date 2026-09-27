@@ -1800,6 +1800,13 @@ pub(crate) async fn vendor_records_reusing(
             return true;
         }
     };
+    // Pre-stage trees a previous run left behind (it crashed or was
+    // interrupted between staging an archive and settling): nothing of
+    // this run is staged yet, and the caller holds the apply lock, so every
+    // one on disk is stale scratch. A dry run deletes nothing.
+    if !common.dry_run {
+        vendor::prestage::sweep_stale(&common.cwd).await;
+    }
 
     let crawler_options = CrawlerOptions {
         cwd: common.cwd.clone(),
