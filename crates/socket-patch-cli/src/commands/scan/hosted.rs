@@ -1409,15 +1409,12 @@ pub(crate) async fn run_redirect_selected(
     // The apply lock (see `acquire_hosted_lock`), taken only by a WET run
     // that holds at least one granted reference — the only runs that can
     // write anything: the takeover pre-reverts (lockfiles + the vendored
-    // ledger), the redirect-ledger merge and the lockfile writes. Dry runs
+    // ledger) and the lockfile writes. Dry runs
     // and zero-grant runs never touch `.socket/`, so they never lock (a
     // preview must not create `.socket/`, flip to `lock_held` under a
-    // concurrent wet run, or fail on a read-only checkout). Acquired BEFORE
-    // the ledger load so load → merge → persist is one critical section
-    // (rollback's rule: a ledger a run will persist is loaded under the
-    // lock) and held to the end of the function. Read below: it also gates
-    // the corrupt-ledger quarantine, the one write the load itself can make.
-    let lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
+    // concurrent wet run, or fail on a read-only checkout). Held to the end
+    // of the function.
+    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
         match acquire_hosted_lock(common, &mut scan_result) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
@@ -1426,36 +1423,13 @@ pub(crate) async fn run_redirect_selected(
         None
     };
 
-    // Load the existing redirect ledger before any file changes, including
-    // Cargo takeover reverts. It stores the originals a future revert needs, so
-    // a malformed (torn/hand-mangled) ledger must abort the run while the
-    // project is still untouched, or the merge below would silently
-    // overwrite that revert data. The malformed file is moved aside to
-    // redirect-state.json.corrupt (never clobbered) — but only by a run
-    // holding the apply lock; a dry run or zero-grant run reports the same
-    // error and moves nothing, so `.socket/vendor/` is never mutated
-    // lock-free.
-    //
-    // Held as the ONE in-memory ledger for the whole run: the write below
-    // merges into it in place, the stale-install probes read its records
-    // (persisted ones are the fallback when this run's /patches/view fetch
-    // fails transiently), and the takeover classification at the end reads
-    // the merged state.
-    let mut ledger =
-        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
-            Ok(state) => state.unwrap_or_else(RedirectState::new),
-            Err(mut corrupt) => {
-                if lock.is_some() {
-                    corrupt.quarantine().await;
-                }
-                let message = corrupt.to_string();
-                eprintln!("{}", format_error_line(&message));
-                if common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
-        };
+    // v5 hosted mode keeps no ledger: the lockfiles are the only record of
+    // a redirect (vex, list, vendor and rollback read the hosted pins from
+    // them). This run's edits and records still collect here in memory,
+    // for the edit rebasing below, the stale-install probes and the
+    // takeover classification. A pre-v5 ledger on disk is left untouched:
+    // it only goes stale, and replaying a stale edit fails closed.
+    let mut ledger = RedirectState::new();
     // The vendored ledger, loaded ONCE per run (under the same lock, so no
     // other writer can move the on-disk file under it): the takeover below
     // mutates it in place per reverted purl (saving after each), and the
@@ -2817,23 +2791,10 @@ pub(crate) async fn run_redirect_selected(
         status.finish();
     }
 
-    // Whether this run persisted the redirect ledger (human next steps).
-    let mut ledger_written = false;
     if !common.dry_run {
-        // Ledger (mirrors the vendor state.json shape): recorded edits for a
-        // future revert + the patch records (file hashes + vulnerabilities) so
-        // a post-install `socket-patch vex` can attest the redirected patches.
-        // MERGE with any existing ledger rather than overwriting: an idempotent
-        // re-run produces no new edits (the lockfile already points at the
-        // hosted patch), and clobbering the file would lose the original
-        // pre-redirect values a future revert needs. New edits APPEND (revert
-        // walks them in reverse), skipping byte-identical re-plans from a
-        // retried partial failure; records are keyed by PURL, newest wins.
-        //
-        // Persisted BEFORE the project files, and atomically (stage + fsync +
-        // rename): a crash between the two leaves a complete ledger whose
-        // originals match files never rewritten, never rewritten files whose
-        // originals reached no ledger.
+        // Fold this run's edits and records into the in-memory ledger.
+        // New edits append, skipping byte-identical re-plans; records are
+        // keyed by purl, newest wins.
         if !rewrite.edits.is_empty() || !records.is_empty() {
             // Older ledgers carry `"mode": "redirect"`; normalize on rewrite
             // (the loader accepts either).
@@ -2933,20 +2894,6 @@ pub(crate) async fn run_redirect_selected(
                 }
             }
             ledger.records.extend(records);
-            // The ledger is the only revert path and the VEX record store —
-            // a swallowed write failure would let the lockfile writes below
-            // proceed with no revert data persisted while reporting success.
-            let saved =
-                socket_patch_core::patch::redirect::save_redirect_state(&common.cwd, &ledger).await;
-            ledger_written = saved.is_ok();
-            if let Err(e) = saved {
-                let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
-                eprintln!("{}", format_error_line(&message));
-                if common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
         }
         for (rel, content) in rewrite
             .files
@@ -3312,7 +3259,7 @@ pub(crate) async fn run_redirect_selected(
             }
             if !common.dry_run {
                 for line in
-                    format_next_steps(&human_files, ledger_written, !takeover_migrated.is_empty())
+                    format_next_steps(&human_files, !takeover_migrated.is_empty())
                 {
                     println!("{line}");
                 }
@@ -3614,30 +3561,17 @@ fn join_names(names: &[String], max: usize) -> String {
 
 /// Next steps after a wet run that rewrote files (stdout, after the
 /// summary — the same place vendored mode prints its own): commit the
-/// ledger and the rewritten files, reinstall so the installed tree picks
-/// up the patched artifacts, then verify with `vex`. After a
-/// vendored→hosted takeover (`vendored_removed`) the commit also has to
-/// carry the deleted vendored ledger entries and artifacts, so the whole
-/// `.socket/vendor/` directory is named instead of the redirect ledger.
-fn format_next_steps(
-    files: &[String],
-    ledger_written: bool,
-    vendored_removed: bool,
-) -> Vec<String> {
+/// rewritten files, reinstall so the installed tree picks up the patched
+/// artifacts, then verify with `vex`. After a vendored→hosted takeover
+/// (`vendored_removed`) the commit also has to carry the deleted vendored
+/// ledger entries and artifacts.
+fn format_next_steps(files: &[String], vendored_removed: bool) -> Vec<String> {
     if files.is_empty() && !vendored_removed {
         return Vec::new();
     }
     let mut commit: Vec<String> = Vec::new();
     if vendored_removed {
-        commit.push(if ledger_written {
-            ".socket/vendor/ (the redirect ledger, plus the removed vendored ledger entries and \
-             artifacts)"
-                .to_string()
-        } else {
-            ".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string()
-        });
-    } else if ledger_written {
-        commit.push(".socket/vendor/redirect-state.json".to_string());
+        commit.push(".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string());
     }
     commit.extend(files.iter().cloned());
     let npm = files
@@ -5379,14 +5313,12 @@ mod tests {
     }
 
     #[test]
-    fn next_steps_name_the_ledger_files_and_reinstall() {
-        assert!(format_next_steps(&[], true, false).is_empty());
+    fn next_steps_name_the_rewritten_files_and_reinstall() {
+        assert!(format_next_steps(&[], false).is_empty());
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], true, false),
+            format_next_steps(&["package-lock.json".to_string()], false),
             vec![
-                "Commit .socket/vendor/redirect-state.json and package-lock.json to keep the \
-                 redirect."
-                    .to_string(),
+                "Commit package-lock.json to keep the redirect.".to_string(),
                 "Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages \
                  pick up the patched artifacts, then run `socket-patch vex` to verify them."
                     .to_string(),
@@ -5398,7 +5330,6 @@ mod tests {
                 "pnpm-workspace.yaml".to_string(),
             ],
             false,
-            false,
         );
         assert_eq!(
             steps[0],
@@ -5409,13 +5340,13 @@ mod tests {
 
     #[test]
     fn next_steps_add_the_vlt_ci_line_only_for_a_rewritten_vlt_lock() {
-        let steps = format_next_steps(&["vlt-lock.json".to_string()], true, false);
+        let steps = format_next_steps(&["vlt-lock.json".to_string()], false);
         assert_eq!(
             steps.last().map(String::as_str),
             Some("vlt: commit vlt-lock.json; CI should run `vlt ci`")
         );
         assert!(
-            !format_next_steps(&["package-lock.json".to_string()], true, false)
+            !format_next_steps(&["package-lock.json".to_string()], false)
                 .iter()
                 .any(|s| s.starts_with("vlt:"))
         );
@@ -5593,12 +5524,7 @@ mod tests {
     #[test]
     fn next_steps_after_a_takeover_name_the_removed_vendored_state() {
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], true, true)[0],
-            "Commit .socket/vendor/ (the redirect ledger, plus the removed vendored ledger \
-             entries and artifacts) and package-lock.json to keep the redirect."
-        );
-        assert_eq!(
-            format_next_steps(&["pnpm-lock.yaml".to_string()], false, true)[0],
+            format_next_steps(&["pnpm-lock.yaml".to_string()], true)[0],
             "Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
              pnpm-lock.yaml to keep the redirect."
         );
