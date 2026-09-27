@@ -1,7 +1,9 @@
 //! Project-root detection over a repository path list. A root is a
 //! directory holding a root LOCK marker (manifests alone never make one),
 //! outside vendored / test-fixture trees, and not an internal directory of
-//! an enclosing Rush monorepo or Cargo workspace.
+//! an enclosing Rush monorepo. A nested Cargo.lock stays a root here: only
+//! the enclosing workspace's `members`/`exclude` can say whether it is a
+//! member, so the engine demotes members once manifests are readable.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -96,13 +98,6 @@ pub(crate) fn join_root(root: &str, rel: &str) -> String {
     }
 }
 
-fn is_proper_ancestor(ancestor: &str, dir: &str) -> bool {
-    if ancestor == dir {
-        return false;
-    }
-    ancestor.is_empty() || dir.starts_with(&format!("{ancestor}/"))
-}
-
 fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
     ecosystems.is_none_or(|list| list.iter().any(|e| e == eco))
 }
@@ -153,14 +148,8 @@ pub(crate) fn detect_roots<'a>(
         .filter(|(_, m)| m.contains("rush.json"))
         .map(|(d, _)| d.clone())
         .collect();
-    let cargo_lock_dirs: Vec<String> = markers
-        .iter()
-        .filter(|(_, m)| m.contains("Cargo.lock"))
-        .map(|(d, _)| d.clone())
-        .collect();
-
     let mut roots: Vec<String> = Vec::new();
-    for (dir, set) in &markers {
+    for dir in markers.keys() {
         let rush_internal = rush_roots.iter().any(|r| {
             let internal = |sub: &str| join_root(r, sub);
             *dir == internal("common/config/rush")
@@ -168,14 +157,8 @@ pub(crate) fn detect_roots<'a>(
                 || *dir == internal("common/temp")
                 || dir.starts_with(&format!("{}/", internal("common/temp")))
         });
-        let mut remaining: BTreeSet<&str> = set.clone();
-        if cargo_lock_dirs.iter().any(|a| is_proper_ancestor(a, dir)) {
-            remaining.remove("Cargo.lock");
-        }
         let reason = if rush_internal {
             Some("rush_internal")
-        } else if remaining.is_empty() {
-            Some("cargo_member")
         } else {
             None
         };
@@ -237,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn rush_and_cargo_internals_are_not_roots() {
+    fn rush_internals_are_not_roots_but_nested_cargo_locks_are() {
         assert_eq!(
             roots(&[
                 "rush.json",
@@ -248,7 +231,7 @@ mod tests {
                 "ws/crates/b/Cargo.lock",
                 "ws/crates/b/package-lock.json",
             ]),
-            vec!["", "ws", "ws/crates/b"]
+            vec!["", "ws", "ws/crates/a", "ws/crates/b"]
         );
     }
 

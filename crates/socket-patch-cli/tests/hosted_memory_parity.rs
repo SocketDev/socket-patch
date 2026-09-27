@@ -225,7 +225,8 @@ async fn assert_native_parity(
     let project = &memory.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
     assert_eq!(
-        project.redirect, disk.envelope["redirect"],
+        without_pipenv_advice(&project.redirect),
+        without_pipenv_advice(&disk.envelope["redirect"]),
         "{}",
         disk.stderr
     );
@@ -240,6 +241,21 @@ async fn assert_native_parity(
     if expect_redirect {
         assert!(!project.redirected.is_empty(), "{:#}", project.redirect);
     }
+}
+
+/// The in-memory engine cannot find Pipenv on PATH, so its
+/// `redirect_pipenv_installer_unknown` advice names the `pipenvMajor`
+/// option instead of the disk run's PATH/env remedy.
+fn without_pipenv_advice(redirect: &Value) -> Value {
+    let mut redirect = redirect.clone();
+    if let Some(warnings) = redirect.get_mut("warnings").and_then(Value::as_array_mut) {
+        for warning in warnings.iter_mut() {
+            if warning["code"] == "redirect_pipenv_installer_unknown" {
+                warning["detail"] = Value::Null;
+            }
+        }
+    }
+    redirect
 }
 
 fn read_fixture(rel: &str) -> Vec<u8> {
@@ -612,5 +628,120 @@ async fn cargo_patch_path_into_vendor_tree_fails_closed() {
             .contains("redirect_cargo_transitive_dependents"),
         "{:#}",
         project.redirect
+    );
+}
+
+#[tokio::test]
+async fn pipfile_advice_names_the_pipenv_major_option() {
+    let files = BTreeMap::from([
+        (
+            "Pipfile.lock".to_string(),
+            read_fixture("pipenv/2026.8.0/Pipfile.lock"),
+        ),
+        (
+            "Pipfile".to_string(),
+            read_fixture("pipenv/2026.8.0/Pipfile"),
+        ),
+    ]);
+    let lock: Value = serde_json::from_slice(&files["Pipfile.lock"]).unwrap();
+    let (name, entry) = lock["default"]
+        .as_object()
+        .and_then(|m| m.iter().next())
+        .expect("a default package");
+    let version = entry["version"].as_str().unwrap().trim_start_matches("==");
+    let overrides = serde_json::json!([{
+        "ecosystem": "pypi", "name": name, "version": version,
+        "token": "22222222-2222-4222-8222-222222222222",
+        "patchUuid": "e828efa5-5c6d-43f3-9909-03f5ac232b98",
+        "artifactUrl": format!("https://patch.socket.dev/patch/pypi/{name}/{version}/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/{name}-{version}-py3-none-any.whl"),
+        "integrity": {"sha256": "c".repeat(64)}
+    }]);
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("overrides.json"), overrides.to_string()).unwrap();
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&tmp.path().join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    let memory = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let detail = memory.projects[0].redirect["warnings"]
+        .as_array()
+        .and_then(|w| {
+            w.iter()
+                .find(|x| x["code"] == "redirect_pipenv_installer_unknown")
+        })
+        .and_then(|w| w["detail"].as_str())
+        .expect("pipenv advice warning")
+        .to_string();
+    assert!(detail.contains("`pipenvMajor`"), "{detail}");
+    assert!(!detail.contains("PATH"), "{detail}");
+}
+
+#[tokio::test]
+async fn excluded_nested_cargo_project_is_its_own_root_through_selection() {
+    let ws = fixtures_root().join("redirect/cargo/cargo/workspace-member");
+    let standalone = fixtures_root().join("redirect/cargo/cargo/basic");
+    let server = MockServer::start().await;
+    let mut patches = patches_from_overrides(&ws.join("overrides.json"), Some(&server.uri()));
+    patches.extend(patches_from_overrides(
+        &standalone.join("overrides.json"),
+        Some(&server.uri()),
+    ));
+    mount_api(&server, &patches).await;
+
+    let mut repo = fixture_files(&ws.join("input"));
+    let manifest = String::from_utf8(repo["Cargo.toml"].clone())
+        .unwrap()
+        .replacen(
+            "[workspace]\n",
+            "[workspace]\nexclude = [\"tools/fuzz\"]\n",
+            1,
+        );
+    repo.insert("Cargo.toml".into(), manifest.into_bytes());
+    let stale_member_lock = repo["Cargo.lock"].clone();
+    repo.insert("a/Cargo.lock".into(), stale_member_lock);
+    let fuzz = fixture_files(&standalone.join("input"));
+    for (rel, bytes) in &fuzz {
+        repo.insert(format!("tools/fuzz/{rel}"), bytes.clone());
+    }
+
+    let memory = run_engine(&server, selected_input(&repo)).await;
+    let roots: Vec<&str> = memory.projects.iter().map(|p| p.root.as_str()).collect();
+    assert!(roots.contains(&"tools/fuzz"), "{roots:?}");
+    let changed = engine_changed(&memory);
+
+    let disk = run_disk(&server, &fuzz, false);
+    let fuzz_project = memory
+        .projects
+        .iter()
+        .find(|p| p.root == "tools/fuzz")
+        .unwrap();
+    assert!(fuzz_project.error.is_none(), "{:?}", fuzz_project.error);
+    assert_eq!(fuzz_project.redirect, disk.envelope["redirect"]);
+    let fuzz_changed: BTreeMap<String, Vec<u8>> = changed
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("tools/fuzz/")
+                .map(|rel| (rel.to_string(), v.clone()))
+        })
+        .collect();
+    assert_eq!(fuzz_changed, disk.changed);
+    assert!(
+        !fuzz_project.redirected.is_empty(),
+        "{:#}",
+        fuzz_project.redirect
+    );
+
+    let workspace = memory.projects.iter().find(|p| p.root.is_empty()).unwrap();
+    assert!(!workspace.redirected.is_empty(), "{:#}", workspace.redirect);
+    assert!(
+        !changed.contains_key("a/Cargo.lock"),
+        "{}",
+        describe(&changed)
+    );
+    assert!(
+        memory.warnings.iter().any(
+            |w| w.code == "cargo_member_lock_ignored" && w.project_root.as_deref() == Some("a")
+        ),
+        "{:?}",
+        memory.warnings
     );
 }

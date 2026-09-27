@@ -634,10 +634,7 @@ pub(crate) fn rewrite(
     if targets_pipenv_lock && pipenv_major.is_none() && rewrite.files.contains_key("Pipfile.lock") {
         rewrite.warnings.push(RewriteWarning {
             code: "redirect_pipenv_installer_unknown".into(),
-            detail: format!(
-                "Pipenv was not found on PATH, so the Pipfile.lock references use the modern `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11 needs `path` references instead: put that pipenv on PATH or set {}=<major> and re-run `scan --mode hosted`.",
-                socket_patch_core::utils::pipenv::MAJOR_OVERRIDE_ENV
-            ),
+            detail: "The scan did not set `pipenvMajor`, so the Pipfile.lock references use the modern `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11 needs `path` references instead: re-run the scan with `pipenvMajor` set to that Pipenv major version.".into(),
         });
     }
 
