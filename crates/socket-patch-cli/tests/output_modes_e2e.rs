@@ -267,19 +267,19 @@ fn list_empty_manifest_non_json() {
     let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("No patches found"),
+        stdout.contains("No patches in this project."),
         "empty manifest non-JSON message; got: {stdout}"
     );
 }
 
 #[test]
-fn list_no_manifest_non_json_prints_error_to_stderr() {
+fn list_no_manifest_non_json_prints_the_empty_project_line() {
     let tmp = tempfile::tempdir().unwrap();
-    let (code, _stdout, stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
+    let (code, stdout, stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
     assert_eq!(code, 1);
     assert!(
-        stderr.contains("Manifest not found") || stderr.contains("not found"),
-        "non-JSON list-without-manifest must print to stderr; got: {stderr}"
+        stdout.contains("No patches in this project. Run `socket-patch scan`."),
+        "non-JSON list-without-manifest names the next step; got: {stdout} / {stderr}"
     );
 }
 

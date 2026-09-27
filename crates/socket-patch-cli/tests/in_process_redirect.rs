@@ -2176,12 +2176,12 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
         "a no-op redirect still exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Redirected 0 packages; rewrote 0 files."),
+        stdout.contains("Switched 0 packages to hosted patches; rewrote 0 files."),
         "anchor: the run must have taken the human-mode redirect branch; \
          stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("Warning (redirect_npm_no_lockfile): No package-lock.json"),
+        stderr.contains("Warning: No package-lock.json"),
         "human mode must print the rewriter's no-lockfile warning (JSON mode \
          already carries it); stderr=\n{stderr}"
     );
@@ -2261,13 +2261,13 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "anchor: the dep must have been redirected so the record fetch runs; \
          stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "Warning (record_fetch_failed): {PURL} redirected, but its patch record could not \
+            "Warning: {PURL} was switched to hosted, but its patch record could not \
              be fetched"
         )),
         "the record-fetch warning must print the bare detail string, not a \

@@ -134,8 +134,8 @@ fn rollback_one_off_without_identifier_errors() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (code, stdout) = run(tmp.path(), &["--json", "--one-off"]);
     assert_eq!(
-        code, 1,
-        "--one-off w/o identifier must exit 1; stdout=\n{stdout}"
+        code, 2,
+        "--one-off w/o identifier is a usage error (exit 2); stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
@@ -160,7 +160,7 @@ fn rollback_one_off_with_identifier_reports_not_implemented() {
             "33333333-3333-4333-8333-333333333333",
         ],
     );
-    assert_eq!(code, 1, "one-off mode must exit 1 today; stdout=\n{stdout}");
+    assert_eq!(code, 2, "one-off mode is a usage error (exit 2); stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
     let err = v["error"].as_str().expect("error message string");
@@ -187,8 +187,9 @@ fn truthy_one_off_env_var_sets_flag() {
         .expect("run socket-patch");
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "SOCKET_ONE_OFF=1 must parse, not abort with a usage error; stderr=\n{}",
+        Some(2),
+        "SOCKET_ONE_OFF=1 must parse and reach the one-off stub (its JSON envelope \
+         below proves it was not a clap error); stderr=\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -244,7 +245,7 @@ fn rollback_one_off_human_reports_not_implemented_error() {
         .args(["--one-off", "33333333-3333-4333-8333-333333333333"])
         .output()
         .expect("run socket-patch");
-    assert_eq!(out.status.code(), Some(1), "one-off mode must exit 1 today");
+    assert_eq!(out.status.code(), Some(2), "one-off mode is a usage error (exit 2)");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("not yet implemented"),

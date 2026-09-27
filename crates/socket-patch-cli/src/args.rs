@@ -91,7 +91,7 @@ pub(crate) fn parse_bool_flag(s: &str) -> Result<bool, String> {
 /// flags (listed first, under "Options") are not buried among the ~24 shared
 /// ones. Set per-arg rather than as the struct's `next_help_heading`: that
 /// would leak onto the subcommand-local flags declared after the flatten.
-const GLOBAL_OPTIONS: &str = "Global options";
+pub(crate) const GLOBAL_OPTIONS: &str = "Global options";
 
 // Arguments inherited by every subcommand via `#[command(flatten)]`.
 //
@@ -303,7 +303,7 @@ pub struct GlobalArgs {
     /// backoff until the lock frees or the budget elapses. Only meaningful
     /// for the commands that take the lock (`apply`, `rollback`, `repair`,
     /// `remove`, `vendor`, `get` and `scan` when they record, apply,
-    /// vendor or redirect patches);
+    /// vendor or host patches);
     /// other commands accept it silently. Every holder removes the lock file on exit, so a leftover
     /// from a crashed run never contends.
     #[arg(help_heading = GLOBAL_OPTIONS, long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
@@ -364,7 +364,7 @@ pub struct GlobalArgs {
     pub no_npm_allow_remote_config: bool,
 
     /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
-    /// hosted redirects): do NOT remove stale vlt installed copies
+    /// hosted patches): do NOT remove stale vlt installed copies
     /// (`node_modules/.vlt-lock.json` and the stale `node_modules/.vlt`
     /// entries) after `vlt-lock.json` is repointed or restored. vlt never
     /// refreshes an installed copy on its own, so opting out means running

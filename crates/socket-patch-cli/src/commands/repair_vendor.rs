@@ -545,7 +545,7 @@ fn soft_restore_without_fingerprint(
 /// `detail` by the callers so attribution survives the run-level move.
 fn warn_wiring_unknown(env: &mut Envelope, common: &GlobalArgs, detail: String) {
     if !common.silent && !common.json {
-        eprintln!("Warning (vendor_wiring_unknown): {detail}");
+        eprintln!("Warning: {detail}");
     }
     env.warnings.push(RunWarning {
         code: "vendor_wiring_unknown".to_string(),

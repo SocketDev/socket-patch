@@ -207,15 +207,15 @@ fn rollback_prompt(
     if hosted > 0 {
         clauses.push(format!(
             "unwind {}",
-            plural(hosted, "hosted redirect", "hosted redirects")
+            plural(hosted, "hosted patch", "hosted patches")
         ));
     } else if leftover_edits > 0 {
         clauses.push(format!(
             "replay {}",
             plural(
                 leftover_edits,
-                "leftover hosted redirect edit",
-                "leftover hosted redirect edits"
+                "leftover hosted wiring edit",
+                "leftover hosted wiring edits"
             )
         ));
     }
@@ -969,7 +969,7 @@ async fn run_vendored_leg(
         let result = revert_vendor_entry(&common.cwd, key, state, opts).await;
         for w in &result.warnings {
             if loud {
-                eprintln!("Warning ({}): {}", w.code, w.detail);
+                eprintln!("Warning: {}", w.detail);
             }
             out.warnings.push((w.code.to_string(), w.detail.clone()));
         }
@@ -1085,9 +1085,9 @@ pub(crate) async fn run_hosted_leg(
                     }
                     if !common.json && !common.silent {
                         if common.dry_run {
-                            println!("Would unwind hosted redirect for {purl}");
+                            println!("Would unwind the hosted patch for {purl}");
                         } else {
-                            println!("Unwound hosted redirect for {purl}");
+                            println!("Unwound the hosted patch for {purl}");
                         }
                     }
                     out.edited_files
@@ -1096,7 +1096,7 @@ pub(crate) async fn run_hosted_leg(
                 }
                 Err(e) => {
                     if !common.json {
-                        eprintln!("Error: Failed to unwind hosted redirect for {purl}: {e}");
+                        eprintln!("Error: Failed to unwind the hosted patch for {purl}: {e}");
                     }
                     out.failed.push((purl.clone(), e));
                 }
@@ -1106,9 +1106,9 @@ pub(crate) async fn run_hosted_leg(
         } else {
             if !common.json {
                 eprintln!(
-                    "Error: Cannot unwind hosted redirect for {purl}: no per-purl revert exists for \
+                    "Error: Cannot unwind the hosted patch for {purl}: no per-purl revert exists for \
                      this ecosystem. Run an unscoped `socket-patch rollback` to unwind ALL \
-                     hosted redirects, or re-run `scan --mode hosted` to normalize."
+                     hosted patches, or re-run `scan --mode hosted` to normalize."
                 );
             }
             out.unsupported.push(purl.clone());
@@ -1130,7 +1130,7 @@ pub(crate) async fn run_hosted_leg(
             let why = format!("{} ({})", refusal.reason, files.join(", "));
             if !common.json {
                 eprintln!(
-                    "Error: Cannot unwind hosted redirect edits ({}): {why}",
+                    "Error: Cannot unwind hosted wiring edits ({}): {why}",
                     refusal.group
                 );
             }
@@ -1144,17 +1144,17 @@ pub(crate) async fn run_hosted_leg(
             if replay.dropped_records.iter().any(|p| p == &purl) {
                 if !common.json && !common.silent {
                     if common.dry_run {
-                        println!("Would unwind hosted redirect for {purl}");
+                        println!("Would unwind the hosted patch for {purl}");
                     } else {
-                        println!("Unwound hosted redirect for {purl}");
+                        println!("Unwound the hosted patch for {purl}");
                     }
                 }
                 out.reverted.push(purl);
             } else if !out.failed.iter().any(|(p, _)| p.starts_with("group:")) {
-                let why = "hosted redirect edits could not be replayed";
+                let why = "hosted wiring edits could not be replayed";
                 // Errors print even under --silent: this drives exit 1.
                 if !common.json {
-                    eprintln!("Error: Failed to unwind hosted redirect for {purl}: {why}");
+                    eprintln!("Error: Failed to unwind the hosted patch for {purl}: {why}");
                 }
                 out.failed.push((purl, why.into()));
             }
@@ -1215,7 +1215,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
         } else {
             eprintln!("Error: {msg}");
         }
-        return 1;
+        // A usage error (v5.0: exit 2, like every other one).
+        return 2;
     }
 
     // An unparseable glob is a usage error — same exit-2 stderr shape as
@@ -1570,7 +1571,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // The core error already carries the recovery steps; only say
             // what this run skipped.
             format!(
-                "the hosted leg was skipped: cannot read the hosted redirect ledger: {}",
+                "the hosted leg was skipped: cannot read the hosted ledger: {}",
                 redirect_state_result
                     .as_ref()
                     .expect_err("checked corrupt above")
@@ -1622,7 +1623,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         );
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !args.common.json && !args.common.silent {
-                println!("Rollback cancelled.");
+                println!("{}", crate::ui::CANCELLED);
             }
             return 0;
         }
@@ -1694,7 +1695,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                                 .await
                             {
                                 let msg =
-                                    format!("failed to persist the hosted redirect ledger: {e}");
+                                    format!("failed to persist the hosted ledger: {e}");
                                 if !args.common.json {
                                     eprintln!("Error: {}", capitalize_first(&msg));
                                 }
@@ -1846,7 +1847,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             if args.preserve_state && !hosted_leg.reverted.is_empty() {
                 run_warnings.push((
                     "hosted_state_not_preservable".into(),
-                    "hosted redirects have no preservable local state: their ledger \
+                    "hosted patches have no preservable local state: their ledger \
                      records were dropped with the unwound wiring; re-run \
                      `scan --mode hosted` to re-wire"
                         .into(),
@@ -2143,8 +2144,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // failures, hosted replay notes, ...): the JSON envelope's
             // `warnings[]`, one stderr line each here.
             if !args.common.json && !args.common.silent {
-                for (code, detail) in &human_warnings {
-                    eprintln!("Warning ({code}): {detail}");
+                for (_, detail) in &human_warnings {
+                    eprintln!("Warning: {detail}");
                 }
             }
 
@@ -4682,12 +4683,12 @@ mod tests {
         assert_eq!(
             rollback_prompt(1, 0, 1, 0),
             "Roll back 1 patch, remove it from the local manifest, and unwind 1 hosted \
-             redirect?"
+             patch?"
         );
-        assert_eq!(rollback_prompt(0, 0, 3, 0), "Unwind 3 hosted redirects?");
+        assert_eq!(rollback_prompt(0, 0, 3, 0), "Unwind 3 hosted patches?");
         assert_eq!(
             rollback_prompt(0, 0, 0, 1),
-            "Replay 1 leftover hosted redirect edit?"
+            "Replay 1 leftover hosted wiring edit?"
         );
         assert_eq!(
             rollback_prompt(0, 1, 0, 0),
@@ -4723,8 +4724,8 @@ mod tests {
         assert_eq!(capitalize_first("can't, really"), "Can't, really");
         // Values the user may copy back are never altered.
         assert_eq!(
-            capitalize_first("pkg:npm/a@1 matches only hosted redirect records"),
-            "pkg:npm/a@1 matches only hosted redirect records"
+            capitalize_first("pkg:npm/a@1 matches only hosted records"),
+            "pkg:npm/a@1 matches only hosted records"
         );
         assert_eq!(
             capitalize_first("a1b2c3d4-0000-4000-8000-000000000000 matches nothing"),

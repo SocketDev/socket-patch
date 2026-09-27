@@ -745,7 +745,7 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("hosted redirects have no preservable local state"),
+        stderr.contains("hosted patches have no preservable local state"),
         "the preserve-state hosted note must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -794,7 +794,7 @@ fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
         "a corrupt hosted ledger must not block the removal; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("hosted redirects were not examined"),
+        stderr.contains("hosted patches were not examined"),
         "the warning must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -887,7 +887,7 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[NPM_PURL, "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("The following hosted redirect will be unwound and removed:"),
+        stderr.contains("The following hosted patch will be unwound and removed:"),
         "the hosted-only listing must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -937,7 +937,7 @@ fn remove_hosted_revert_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("could not unwind hosted redirect for pkg:npm/left-pad@1.3.0")
+        msg.contains("could not unwind the hosted patch for pkg:npm/left-pad@1.3.0")
             && msg.contains("The manifest was not modified."),
         "the error must name the purl and promise the manifest is intact; got: {msg}"
     );
@@ -968,7 +968,7 @@ fn remove_hosted_only_revert_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("could not unwind hosted redirect for pkg:npm/left-pad@1.3.0"),
+        msg.contains("could not unwind the hosted patch for pkg:npm/left-pad@1.3.0"),
         "the error must name the purl; got: {msg}"
     );
     assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger untouched");
@@ -1799,7 +1799,7 @@ mod pty {
     }
 
     /// Declining the hosted-only confirm prompt must cancel cleanly (exit
-    /// 0, "Removal cancelled.") with the lock and ledger byte-identical.
+    /// 0, "Cancelled; no changes made.") with the lock and ledger byte-identical.
     #[test]
     fn remove_hosted_only_interactive_n_cancels() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1821,7 +1821,7 @@ mod pty {
         );
         // Vacuity guard: the hosted-only confirm prompt MUST have run.
         assert!(
-            output.contains("Remove 1 hosted redirect and unwind its lockfile wiring?"),
+            output.contains("Remove 1 hosted patch and unwind its lockfile wiring?"),
             "the hosted-only confirm prompt must have shown; got: {output}"
         );
         assert!(
@@ -1829,7 +1829,7 @@ mod pty {
             "must NOT have taken the non-interactive branch in a PTY; got: {output}"
         );
         assert!(
-            output.contains("Removal cancelled"),
+            output.contains("Cancelled; no changes made."),
             "'n' must report cancellation; got: {output}"
         );
         // Declined: nothing moved.

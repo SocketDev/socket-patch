@@ -973,7 +973,7 @@ async fn generate_vex_from_manifest_path_inner(
             // overwritten") is written for the hosted `scan` writer, and
             // `vex` only reads the ledger.
             let message = format!(
-                "The redirect ledger {} is malformed ({}); cannot attest redirected patches. \
+                "The hosted ledger {} is malformed ({}); cannot attest hosted patches. \
                  Repair its JSON or restore it from version control, then re-run.",
                 corrupt.path.display(),
                 corrupt.detail
@@ -1247,7 +1247,7 @@ fn omission_phrase(reason: &str) -> &'static str {
              package any more"
         }
         REDIRECT_UNWIRED => {
-            "the redirect ledger records it, but no lockfile wires its hosted patch to this \
+            "the hosted ledger records it, but no lockfile wires its hosted patch to this \
              package any more"
         }
         WIRING_CONFLICT => {

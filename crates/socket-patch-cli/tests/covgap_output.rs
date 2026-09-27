@@ -528,7 +528,7 @@ fn get_yes_answers_the_menu_with_its_default_without_showing_it() {
 fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
     // Cancelling the dialoguer menu → `interact_opt()` returns `Ok(None)` →
     // `select_one` maps it to `SelectError::Cancelled` (ui/prompt.rs) →
-    // get prints "Selection cancelled." and exits 0 without downloading
+    // get prints "Cancelled; no changes made." and exits 0 without downloading
     // anything (get.rs, the SelectError::Cancelled arm after select_one).
     //
     // The keystroke is `q`, not ESC: dialoguer 0.11's Select treats
@@ -577,7 +577,7 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
         "get must NOT have taken the non-TTY auto-select branch in a PTY; got: {output}"
     );
     assert!(
-        output.contains("Selection cancelled."),
+        output.contains("Cancelled; no changes made."),
         "Esc must surface the Cancelled message; got: {output}"
     );
     // dialoguer shows the cursor again itself on a clean q/Esc cancel, so
@@ -705,7 +705,7 @@ fn get_interactive_dialoguer_ctrl_c_with_sigint_ignored_cancels_cleanly() {
         "an ignored SIGINT must not kill the process; got: {output:?}"
     );
     assert!(
-        output.contains("Selection cancelled."),
+        output.contains("Cancelled; no changes made."),
         "Ctrl-C with SIGINT ignored must cancel the menu; got: {output}"
     );
     assert_eq!(code, 0, "{output}");

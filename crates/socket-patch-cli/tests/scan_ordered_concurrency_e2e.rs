@@ -903,8 +903,8 @@ async fn hosted_record_fetch_failures_keep_order_and_ledger_bytes() {
         .map(|w| w["detail"].as_str().unwrap())
         .collect();
     assert_eq!(warnings.len(), 2, "{stdout}");
-    assert!(warnings[0].starts_with(&format!("{} redirected", purl(NAMES[1]))));
-    assert!(warnings[1].starts_with(&format!("{} redirected", purl(NAMES[3]))));
+    assert!(warnings[0].starts_with(&format!("{} was switched to hosted", purl(NAMES[1]))));
+    assert!(warnings[1].starts_with(&format!("{} was switched to hosted", purl(NAMES[3]))));
     for idx in 0..NAMES.len() {
         assert!(lock.contains(&hosted_url(idx)), "{lock}");
         let has_record = ledger.contains(&format!("GHSA-conc-{idx:04}-aaaa"));

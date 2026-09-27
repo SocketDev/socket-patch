@@ -141,8 +141,24 @@ patch-UI review.
   manifest says "No patches in this project"; unify cancel/upsell strings;
   exit 2 for all usage errors; scan/get JSON onto `json_envelope`.
 - Full item list: 22 findings from the UI review (sizes S/M/L, contract flags).
+- **Status (branch `v5/remove-setup-and-ui`):** done — short `-h`
+  (`cli_command()` hides the rest; `--help` unchanged), hidden
+  `scan --apply/--vendor`, one-line npm allow-remote note (`--verbose`/JSON
+  keep the detail), code-free `Warning:`/`GC: skipped:` lines (error lines keep their code),
+  "hosted" wording in human text, `ui::next_steps` shared by hosted and
+  vendored, prompt-free hosted/vendored `get` (JSON too), `list`'s
+  `No patches in this project.` line (exit codes unchanged: 1 missing,
+  0 empty), `ui::CANCELLED` / `ui::PAID_UPGRADE`, exit 2 for `get` and
+  `rollback --one-off` usage errors. **Not done:** scan/get JSON onto
+  `json_envelope` (larger contract change; deferred). Per-row
+  `[error] <purl> (<code>)` / `[would-refuse]` lines keep their codes
+  (grep-able under `--silent`).
 
 ## Remaining small follow-ups
+*(All done on `v5/remove-setup-and-ui`: the vacuous rows are dropped,
+GEM_PATCHES has both patches, `tool_command` and the deprecated aliases —
+plus the CI grep that guarded them — are removed, and the backtest label is
+retired.)*
 - ci.yml `e2e_cargo`/`e2e_golang` rows select `--ignored` but have no ignored
   tests (vacuous legs) → give them `--include-ignored` or drop the rows.
 - `e2e_vendored_production` GEM_PATCHES lacks merged `01019627` (v5 ranking

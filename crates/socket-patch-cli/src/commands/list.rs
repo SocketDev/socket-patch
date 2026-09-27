@@ -288,11 +288,15 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
     lines.join("\n")
 }
 
+/// The human line for a project with nothing to list (an empty manifest, or
+/// no manifest and no ledger records at all).
+const NO_PATCHES: &str = "No patches in this project. Run `socket-patch scan`.";
+
 /// The whole human listing for stdout: a count header, then the entries
 /// separated by one blank line (none after the last).
 fn format_listing(entries: &[ListEntry<'_>], color: bool) -> String {
     if entries.is_empty() {
-        return "No patches found in manifest.".to_string();
+        return NO_PATCHES.to_string();
     }
     let mut out = format!(
         "Found {}:\n\n",
@@ -378,12 +382,22 @@ pub async fn run(args: ListArgs) -> i32 {
     );
     if manifest.is_none() && entries.is_empty() {
         // No manifest AND no ledger records: nothing is listable anywhere.
-        emit_error(
-            &args,
-            "manifest_not_found",
-            format!("Manifest not found at {}", manifest_path.display()),
-            warnings,
-        );
+        // Exit 1 (unchanged), so scripts can tell "nothing here" from a
+        // listing; humans get the plain empty-project line, JSON keeps the
+        // `manifest_not_found` envelope.
+        if args.common.json {
+            emit_error(
+                &args,
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+                warnings,
+            );
+        } else if args.common.silent {
+            // `--silent` is "errors only", and this run exits 1: say why.
+            eprintln!("{NO_PATCHES}");
+        } else {
+            println!("{NO_PATCHES}");
+        }
         return 1;
     }
 
@@ -973,7 +987,7 @@ mod tests {
 
     #[test]
     fn format_listing_counts_and_separates_entries() {
-        assert_eq!(format_listing(&[], false), "No patches found in manifest.");
+        assert_eq!(format_listing(&[], false), NO_PATCHES);
         let manifest = sample_manifest();
         let one = combined_entries(Some(&manifest), None, None);
         let out = format_listing(&one, false);

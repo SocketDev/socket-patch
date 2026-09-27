@@ -1879,7 +1879,7 @@ async fn repair_human_warns_wiring_unknown() {
     let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
-        stderr.contains("Warning (vendor_wiring_unknown):"),
+        stderr.contains("Warning: "),
         "the run-level advisory is printed to stderr: {stderr}"
     );
 }

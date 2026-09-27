@@ -264,7 +264,7 @@ fn corrupt_redirect_ledger_hard_errors_in_human_mode() {
     assert!(out.stdout.is_empty(), "no document on a hard error");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("redirect ledger") && stderr.contains("malformed"),
+        stderr.contains("hosted ledger") && stderr.contains("malformed"),
         "the CorruptRedirectState message must reach stderr. got: {stderr}"
     );
     // Ordering: the ledger error fires before the missing-manifest check —

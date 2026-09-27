@@ -4,6 +4,7 @@
 //! - [`confirm`], [`select_one`]: prompts.
 //! - [`print_json`]: the one `--json` document writer.
 //! - [`plural`], [`truncate`]: text shaping.
+//! - [`next_steps`]: the one "Next steps:" block (hosted and vendored).
 //! - [`color_enabled`], [`paint`], [`severity`], [`pad`]: color policy and
 //!   ANSI-aware column alignment.
 //! - [`init`] / [`quiet`]: the process-wide `--silent`/`--json` switch,
@@ -23,7 +24,15 @@ use crate::args::GlobalArgs;
 pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
-pub(crate) use text::{plural, truncate};
+pub(crate) use text::{next_steps, plural, truncate};
+
+/// The one line every declined prompt prints (get, rollback, remove,
+/// `--update`).
+pub(crate) const CANCELLED: &str = "Cancelled; no changes made.";
+
+/// The one paid-plan upsell line (scan and get).
+pub(crate) const PAID_UPGRADE: &str =
+    "Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing";
 
 /// Call once after argument parsing. Core's informational advisories (and
 /// the prompts' non-interactive notes) go quiet under `--silent`/`--json`;

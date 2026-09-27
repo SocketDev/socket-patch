@@ -518,7 +518,7 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr={stderr}");
     assert!(
-        stderr.contains("content_mismatch_overwritten"),
+        stderr.contains("did not match the patch's expected original content"),
         "stderr warning present: {stderr}"
     );
 

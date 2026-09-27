@@ -71,6 +71,36 @@ into the new version's section — see docs/releasing.md.
   `socket-patch-core`, along with the setup-only `npm_family` table column
   (`FileRow::detects_pnpm`) and `VLT_SETUP_MARKERS`.
 
+### Changed (BREAKING): patch UI streamlining
+
+- **Hosted and vendored `get` never prompt.** Like `scan`, they take the
+  top-ranked accessible patch per package with no picker and no
+  confirmation, in `--json` too (no `selection_required` outside agent
+  mode). Agent-mode `get` keeps its picker and `Download and apply N
+  patches?` prompt.
+- **`get` and `rollback` usage errors exit 2** (were 1): `get`'s
+  `--id`/`--cve`/`--ghsa`/`--package` multi-select, `--one-off --save-only`,
+  `--mode hosted|vendored --save-only`, `--one-off`, a malformed forced
+  identifier, and `rollback --one-off`. Every usage error now exits 2.
+- **`list` in a project with no patches** prints `No patches in this
+  project. Run \`socket-patch scan\`.` (stdout) instead of `Error: Manifest
+  not found at …` / `No patches found in manifest.`. Exit codes are
+  unchanged (1 with no manifest and no ledger record, 0 for an empty
+  manifest); `--json` keeps the `manifest_not_found` envelope.
+- **Human output:** warning lines no longer carry the `(code)` tag
+  (`Warning: …`, `GC: skipped: …`); the codes stay in the JSON envelope.
+  Error lines keep theirs (`Error (<code>): …`). Hosted mode is called "hosted", not "redirect", in human
+  text (`Switched 2 packages to hosted patches; rewrote 1 file.`). npm's
+  `allow-remote` notice is one line (full text under `--verbose` and in
+  `--json`). Hosted and vendored runs share one numbered `Next steps:`
+  block. Every declined prompt prints `Cancelled; no changes made.`, and
+  scan/get share one paid-plan upsell line.
+- **`-h` is short**: about eight options per command (`--json`,
+  `--verbose`, `--dry-run`, `--yes` where the command prompts, and the
+  command's main flags); `--help` still lists everything. The deprecated
+  `scan --apply` / `--vendor` spellings are hidden from both (still
+  accepted).
+
 ### Changed (BREAKING)
 
 - **Vendored runs refuse lock-text failures before downloading them.**

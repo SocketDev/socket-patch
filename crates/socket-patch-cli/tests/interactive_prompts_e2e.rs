@@ -249,7 +249,7 @@ fn remove_interactive_n_cancels() {
         "remove must NOT have taken the non-interactive branch in a PTY; got: {output}"
     );
     assert!(
-        output.contains("Removal cancelled"),
+        output.contains("Cancelled; no changes made."),
         "remove 'n' must report cancellation; got: {output}"
     );
     assert!(
@@ -315,7 +315,7 @@ fn remove_interactive_non_utf8_answer_declines_without_panic() {
         "remove must NOT have taken the non-interactive branch in a PTY; got: {output}"
     );
     assert!(
-        output.contains("Removal cancelled"),
+        output.contains("Cancelled; no changes made."),
         "non-UTF-8 answer must be treated as 'no'; got: {output}"
     );
     // Declined: the manifest entry must be intact.
@@ -390,7 +390,7 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
         "remove must NOT have taken the non-interactive branch in a PTY; got: {output}"
     );
     assert!(
-        !output.contains("Removal cancelled"),
+        !output.contains("Cancelled; no changes made."),
         "--silent must suppress the cancellation chatter; got: {output}"
     );
     // Declined: the detached ledger entry must be intact.
@@ -415,7 +415,7 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
         "declined detached remove must exit cleanly; got: {loud_output}"
     );
     assert!(
-        loud_output.contains("Removal cancelled"),
+        loud_output.contains("Cancelled; no changes made."),
         "non-silent declined detached remove must report cancellation; got: {loud_output}"
     );
     assert!(

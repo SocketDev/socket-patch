@@ -634,8 +634,8 @@ socket-patch scan [PATHS]... [options]
 | `--vex <path>` | `SOCKET_VEX` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX](#inline-vex-on-apply--scan--vendor). |
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_*` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
-> Deprecated spellings: `--apply` (== `--mode agent`) and `--vendor` (== `--mode
-> vendored`). `--detached` is a hidden no-op kept for compatibility (vendored mode is
+> Deprecated, hidden spellings (still accepted): `--apply` (== `--mode agent`) and
+> `--vendor` (== `--mode vendored`). `--detached` is a hidden no-op kept for compatibility (vendored mode is
 > always manifest-free); it is still an error without vendored mode.
 
 **Examples:**
@@ -795,9 +795,11 @@ socket-patch vendor --json
 
 ### `list`
 
-List the patches in this project: the hosted redirect ledger's records (labeled
+List the patches in this project: the hosted ledger's records (labeled
 `Mode: hosted`), the vendor ledger's (`Mode: vendored`), and any agent-mode entries in
-`.socket/manifest.json`.
+`.socket/manifest.json`. A project with none prints `No patches in this project. Run
+\`socket-patch scan\`.` (exit 1 when there is no manifest or ledger record at all, 0 for
+an empty manifest).
 
 **Usage:**
 ```bash
@@ -850,8 +852,9 @@ flag. Like `scan`, `get` defaults to hosted mode; pass `--mode vendored`, or
 `--mode agent` for the manifest + in-place apply (implied by `--save-only` and
 `--global`). When a package has
 several patches, `get` picks the same one `scan` does (see
-[Which patch is picked](#which-patch-is-picked)). Unlike `scan`, `get` prompts before
-applying (`--yes` or a non-TTY stdin accepts).
+[Which patch is picked](#which-patch-is-picked)). Hosted and vendored `get` never
+prompt, like `scan`; agent-mode `get` asks before applying (`--yes` or a non-TTY stdin
+accepts).
 
 Alias: `download`. And as a shortcut, `socket-patch <uuid>` with a bare patch UUID is
 rewritten to `socket-patch get <uuid>`.
@@ -1328,8 +1331,8 @@ socket-patch apply --json | jq '.status'
 # "success", "partialFailure", "noManifest", or "error"
 ```
 
-`scan` never prompts, so CI needs no `--yes` for it. The commands that do confirm
-(`get`, `rollback`, `remove`) auto-proceed when stdin is not a TTY. Progress
+`scan` and hosted/vendored `get` never prompt, so CI needs no `--yes` for them. The
+commands that do confirm (agent-mode `get`, `rollback`, `remove`) auto-proceed when stdin is not a TTY. Progress
 indicators and ANSI colors are automatically suppressed when output is piped.
 
 The exact JSON shapes, exit codes, and stability guarantees are specified in

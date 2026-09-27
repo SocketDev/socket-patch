@@ -1478,7 +1478,7 @@ async fn scan_agent_over_vendored_purl_surfaces_run_level_warning() {
     );
     // Mirrored to stderr (not silent).
     assert!(
-        stderr.contains("vendored_ownership_retained"),
+        stderr.contains("Warning: ") && stderr.contains("vendor --revert"),
         "warning must be mirrored to stderr when not silent: {stderr}"
     );
 }
@@ -1586,7 +1586,7 @@ async fn scan_agent_over_live_hosted_wiring_surfaces_run_level_warning() {
          revert originals): {detail}"
     );
     assert!(
-        stderr.contains("hosted_wiring_retained"),
+        stderr.contains("Warning: agent-mode scan left the hosted wiring live"),
         "warning must be mirrored to stderr when not silent: {stderr}"
     );
 }
