@@ -426,13 +426,9 @@ pub fn codes(env: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The `failed` event's `(errorCode, error)` for `purl`. The panic names
-/// each event's action and code, never the envelope: its details carry the
-/// patch uuid, which CodeQL flags in panic messages
-/// (`rust/cleartext-logging`).
+/// The `failed` event's `(errorCode, error)` for `purl`.
 pub fn failure(env: &Value, purl: &str) -> (String, String) {
-    let events = events(env);
-    events
+    events(env)
         .iter()
         .find(|e| e["action"] == "failed" && e["purl"] == purl)
         .map(|e| {
@@ -441,20 +437,14 @@ pub fn failure(env: &Value, purl: &str) -> (String, String) {
                 e["error"].as_str().unwrap_or_default().to_string(),
             )
         })
-        .unwrap_or_else(|| {
-            let seen: Vec<String> = events
-                .iter()
-                .map(|e| {
-                    let code = e["errorCode"].as_str().or(e["reason"].as_str());
-                    format!("{} {}", e["action"], code.unwrap_or("-"))
-                })
-                .collect();
-            panic!("expected a failed event for {purl}; events: {seen:?}")
-        })
+        .unwrap_or_else(|| panic!("expected a failed event for {purl}: {env:#}"))
 }
 
+/// The panic leaves `rel` out: fixture paths carry the patch uuid, which
+/// CodeQL flags in panic messages (`rust/cleartext-logging`).
 pub fn read(root: &Path, rel: &str) -> String {
-    std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    std::fs::read_to_string(root.join(rel))
+        .unwrap_or_else(|e| panic!("cannot read a project file: {e}"))
 }
 
 pub fn ledger(root: &Path) -> Value {
