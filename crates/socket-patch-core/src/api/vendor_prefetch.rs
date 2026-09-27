@@ -44,8 +44,12 @@
 //!
 //! * It only ever requests plan positions in `[at, at + reach)`, where
 //!   `at` is the position the loop has reached and `reach` is one until
-//!   the service has answered once and `window` after. So it never runs
-//!   more than `window` requests ahead of the loop, a run that stops
+//!   the service has answered once, then slow-starts: [`SLOW_START`] (4)
+//!   after the first answer, one more per good answer up to `window` (the
+//!   API's in-flight cap), and back to [`SLOW_START`] on an availability
+//!   failure. So it never runs more than `window` requests ahead of the
+//!   loop — and only as far as the service's recent answers earned — a
+//!   run that stops
 //!   consulting the plan (every remaining package refused, or the loop
 //!   finishing) leaves at most `window` requests outstanding, and a plan
 //!   the loop never consults makes no request at all.
@@ -65,12 +69,22 @@
 //!   ahead of the loop (the usual case: the loop stops to write between
 //!   packages). Only when the loop has caught up with the window — every
 //!   package up to it granted, and the first failure the whole window's —
-//!   can it spend up to `window - 1` retry ladders the serial loop, one
-//!   failure from opening its own breaker, would not have spent.
+//!   can it spend up to `reach - 1` retry ladders the serial loop, one
+//!   failure from opening its own breaker, would not have spent; `reach`
+//!   is at most `window`, and reaches it only after that many good
+//!   answers in a row.
 //!
 //! Memory is bounded too: at most `window` downloads are in flight, and
 //! while the fetched archives waiting for the loop add up to the plan's
-//! byte budget, only the position the loop is at may start.
+//! byte budget, only the position the loop is at may start. The budget
+//! gates STARTING a download, not its bytes: the downloads already in
+//! flight when it is reached still land, so the held bytes can exceed it
+//! by up to `window - 1` archives (whatever their size: the budget bounds
+//! new downloads, not the ones already running). Trees a [`PrestageRecipe`] extracts from those archives land
+//! on disk, not in memory, and are not counted against the budget at all —
+//! they are bounded by the plan (one per planned directory-shaped
+//! download, removed as soon as their package is passed over or the loop
+//! ends) and by the [`crate::vendor::prestage`] pool, not by size.
 //!
 //! A planned download may name a secondary artifact (the gem stub
 //! gemspec) its backend fetches right after a verified archive; the task
@@ -98,6 +112,22 @@ use super::client::{
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::prestage::PrestageRecipe;
 use crate::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
+
+/// Where the task's reach opens once the service has answered, and where
+/// it falls back to after an availability failure (see
+/// [`Lookahead::grow`]).
+const SLOW_START: usize = 4;
+
+/// The reach after one more good answer: [`SLOW_START`] at first, then one
+/// more per answer, never past `window`.
+fn next_reach(reach: usize, window: usize) -> usize {
+    let window = window.max(1);
+    if reach < SLOW_START {
+        SLOW_START.min(window)
+    } else {
+        (reach + 1).min(window)
+    }
+}
 
 /// One fetched outcome: `(outcome, retryable failure)` as
 /// `fetch_vendor_package_once` returned it, debug lines held back.
@@ -141,7 +171,8 @@ struct Lookahead {
     /// over and must never be requested.
     at: AtomicUsize,
     /// How far past `at` the task may run: one until the service has
-    /// answered once, then the whole window.
+    /// answered once, then [`SLOW_START`], growing by one per good answer
+    /// up to the whole window and falling back on availability failures.
     reach: AtomicUsize,
     /// Lowest position whose own fetch was an availability failure and
     /// that the loop has not consumed yet; nothing past it is started
@@ -196,9 +227,29 @@ impl Lookahead {
         self.moved.notify_waiters();
     }
 
-    /// The service answered: the task may now run the full window ahead.
-    fn widen(&self, window: usize) {
-        self.reach.store(window, Ordering::Relaxed);
+    /// The service answered: the task may run further ahead — slow start.
+    /// The first answer opens the reach to [`SLOW_START`]; every later one
+    /// adds a position, up to the full `window` (so the reach roughly
+    /// doubles per round of answers, as a TCP congestion window does). A
+    /// service that stops answering well only ever faces a reach its own
+    /// recent answers earned.
+    fn grow(&self, window: usize) {
+        let _ = self
+            .reach
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reach| {
+                Some(next_reach(reach, window))
+            });
+        self.moved.notify_waiters();
+    }
+
+    /// An availability failure: the reach falls back to [`SLOW_START`]
+    /// (never below one), and grows again only with fresh answers.
+    fn shrink(&self) {
+        let _ = self
+            .reach
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reach| {
+                Some(reach.clamp(1, SLOW_START))
+            });
         self.moved.notify_waiters();
     }
 
@@ -432,6 +483,7 @@ impl VendorPrefetch {
                     // Set BEFORE the send below, which can yield: the next
                     // poll of the stream is what pulls a new position in,
                     // and it must already see the line.
+                    look.shrink();
                     look.failed(index);
                 } else {
                     if !matches!(held.peek(), (VendorServiceOutcome::Failed(_), false)) {
@@ -441,7 +493,7 @@ impl VendorPrefetch {
                         // nor resets — exactly the client breaker's rule.
                         look.failures.store(0, Ordering::Relaxed);
                     }
-                    look.widen(window);
+                    look.grow(window);
                 }
                 if look.failures.load(Ordering::Relaxed) >= VENDOR_BREAKER_THRESHOLD {
                     // Start nothing more — but keep draining. The requests
@@ -979,6 +1031,96 @@ mod tests {
             .count();
         // Two of them are the plain client's own comparison calls.
         assert!(posts <= 2 + 2 * window, "{posts} grants for two packages");
+    }
+
+    /// The reach slow-starts: one position until the service answers,
+    /// [`SLOW_START`] after the first answer, one more per good answer up
+    /// to the window, and back to [`SLOW_START`] on an availability failure.
+    #[test]
+    fn the_reach_slow_starts_and_falls_back() {
+        let look = Lookahead::new(usize::MAX);
+        let reach = || look.reach.load(Ordering::Relaxed);
+        assert_eq!(reach(), 1);
+        look.grow(32);
+        assert_eq!(reach(), SLOW_START);
+        for expected in SLOW_START + 1..=32 {
+            look.grow(32);
+            assert_eq!(reach(), expected);
+        }
+        look.grow(32);
+        assert_eq!(reach(), 32, "never past the window");
+        look.shrink();
+        assert_eq!(reach(), SLOW_START);
+        look.grow(32);
+        assert_eq!(reach(), SLOW_START + 1);
+        // A window below the slow start caps it, and a shrink never
+        // widens.
+        let small = Lookahead::new(usize::MAX);
+        small.grow(2);
+        assert_eq!(small.reach.load(Ordering::Relaxed), 2);
+        small.shrink();
+        assert_eq!(small.reach.load(Ordering::Relaxed), 2);
+        assert_eq!(next_reach(0, 0), 1);
+    }
+
+    /// POSTs the server has seen, once they stop changing for `settle`.
+    async fn posts_when_quiet(server: &MockServer, settle: Duration) -> usize {
+        let count = |log: Vec<String>| log.iter().filter(|r| r.starts_with("POST")).count();
+        let mut last = count(request_log(server).await);
+        loop {
+            tokio::time::sleep(settle).await;
+            let now = count(request_log(server).await);
+            if now == last {
+                return now;
+            }
+            last = now;
+        }
+    }
+
+    /// However wide the window (the API's in-flight cap), the first answer
+    /// only opens [`SLOW_START`] positions: while those are unanswered, a
+    /// struggling service faces four requests, not the whole window.
+    #[tokio::test]
+    async fn the_speculation_opens_at_the_slow_start_not_the_window() {
+        let window = 32;
+        let mut scripts = vec![Script::Granted(0)];
+        scripts.extend((1..40).map(|_| Script::Granted(2_000)));
+        let server = serve(&scripts).await;
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_packages(
+            (0..scripts.len()).map(uuid).collect(),
+            false,
+            None,
+            None,
+            window,
+        );
+        c.fetch_vendor_package(&uuid(0), false, None, None).await;
+        assert_eq!(
+            posts_when_quiet(&server, Duration::from_millis(150)).await,
+            SLOW_START,
+            "position 0 plus the three the first answer opened"
+        );
+    }
+
+    /// Good answers grow the reach to the full window — and no further.
+    #[tokio::test]
+    async fn good_answers_grow_the_speculation_to_the_window() {
+        let window = 12;
+        let scripts: Vec<Script> = (0..30).map(|_| Script::Granted(0)).collect();
+        let server = serve(&scripts).await;
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_packages(
+            (0..scripts.len()).map(uuid).collect(),
+            false,
+            None,
+            None,
+            window,
+        );
+        c.fetch_vendor_package(&uuid(0), false, None, None).await;
+        assert_eq!(
+            posts_when_quiet(&server, Duration::from_millis(200)).await,
+            window
+        );
     }
 
     /// A call with other request parameters than the plan's never takes a

@@ -284,7 +284,11 @@ pub struct VendorServiceConfig {
 /// loop held exactly one; the download window (the API's own in-flight
 /// cap) already keeps at most that many archives ahead of the loop, and
 /// this bounds what they may add up to when a few are large: past it, only
-/// the download the loop is waiting on may start.
+/// the download the loop is waiting on may start. It bounds NEW downloads:
+/// the ones already in flight when it is reached still land, so the held
+/// bytes can exceed it by what they carry; and the trees pre-staged from
+/// those archives live on disk, uncounted (see
+/// [`crate::api::vendor_prefetch`]'s memory notes).
 const ARCHIVE_PREFETCH_BYTES: usize = 128 * 1024 * 1024;
 
 impl VendorServiceConfig {
