@@ -31,6 +31,29 @@ fn virtual_clock(now_unix_secs: u64) -> (RetryHooks, Arc<Mutex<Vec<Duration>>>) 
             Box::pin(async {})
         }),
         now_unix_secs: Arc::new(move || now_unix_secs),
+        // A frozen monotonic clock: the retry window never closes (the
+        // window tests drive the clock themselves).
+        monotonic_now: Arc::new(|| Duration::ZERO),
+        jitter_seed: SEED,
+    };
+    (hooks, log)
+}
+
+/// A virtual clock for ONE request's retries: each recorded wait also
+/// advances the monotonic clock by its length, as a real sleep would.
+/// (Only meaningful sequentially: parallel waits would add up here.)
+fn advancing_clock() -> (RetryHooks, Arc<Mutex<Vec<Duration>>>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let now = Arc::new(Mutex::new(Duration::from_secs(1)));
+    let (sink, tick, read) = (Arc::clone(&log), Arc::clone(&now), Arc::clone(&now));
+    let hooks = RetryHooks {
+        sleep: Arc::new(move |d| {
+            sink.lock().unwrap().push(d);
+            *tick.lock().unwrap() += d;
+            Box::pin(async {})
+        }),
+        now_unix_secs: Arc::new(|| 0),
+        monotonic_now: Arc::new(move || *read.lock().unwrap()),
         jitter_seed: SEED,
     };
     (hooks, log)
@@ -155,28 +178,33 @@ async fn a_429_then_200_matches_a_clean_run() {
     assert_eq!(requests_to(&throttled, &route).await, 2);
 
     let label = format!("GET {}{route}", throttled.uri());
-    let expected = ApiRetryPolicy::default().delay(1, None, jitter_sample(SEED, &label, 1));
+    let expected = ApiRetryPolicy::default()
+        .delay(1, None, jitter_sample(SEED, &label, 1))
+        .expect("no Retry-After");
     assert_eq!(waits(&log), vec![expected]);
     assert!(expected >= Duration::from_millis(250) && expected < Duration::from_millis(500));
 }
 
-/// `Retry-After` wins over the backoff: delta-seconds as sent, a large one
-/// capped at 30 s, an HTTP-date resolved against the (virtual) clock.
+/// `Retry-After` wins over the backoff: delta-seconds as sent (30 s, the
+/// cap, included), an HTTP-date resolved against the (virtual) clock, and
+/// a `0` or past date floored at the jittered first backoff step.
 #[tokio::test]
-async fn retry_after_is_honored_and_capped() {
+async fn retry_after_is_honored_and_floored() {
     let p = purl(2);
     let route = by_package_route(&p);
     // Fri, 27 Mar 2026 19:12:42 GMT.
     let date_at = 1_774_638_762u64;
     for (header, now, want) in [
-        ("7", 0, Duration::from_secs(7)),
-        ("120", 0, Duration::from_secs(30)),
+        ("7", 0, Some(Duration::from_secs(7))),
+        ("30", 0, Some(Duration::from_secs(30))),
         (
             "Fri, 27 Mar 2026 19:12:42 GMT",
             date_at - 12,
-            Duration::from_secs(12),
+            Some(Duration::from_secs(12)),
         ),
-        ("Fri, 27 Mar 2026 19:12:42 GMT", date_at + 5, Duration::ZERO),
+        // Floored: computed from the request's jitter below.
+        ("Fri, 27 Mar 2026 19:12:42 GMT", date_at + 5, None),
+        ("0", 0, None),
     ] {
         let server = MockServer::start().await;
         mount_get_then_ok(
@@ -195,8 +223,41 @@ async fn retry_after_is_honored_and_capped() {
         c.search_patches_by_package(&p)
             .await
             .unwrap_or_else(|e| panic!("Retry-After {header:?}: {e}"));
+        let want = want.unwrap_or_else(|| {
+            let label = format!("GET {}{route}", server.uri());
+            let floor = ApiRetryPolicy::default()
+                .delay(1, None, jitter_sample(SEED, &label, 1))
+                .expect("backoff");
+            assert!(floor >= Duration::from_millis(250) && floor < Duration::from_millis(500));
+            floor
+        });
         assert_eq!(waits(&log), vec![want], "Retry-After {header:?}");
     }
+}
+
+/// A `Retry-After` beyond the 30 s cap is not waited out (nor retried
+/// early, which the server would only refuse again): the answer is final
+/// on the first request, naming why.
+#[tokio::test]
+async fn a_retry_after_over_the_cap_gives_up_at_once() {
+    let p = purl(7);
+    let route = by_package_route(&p);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(&route))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "120"))
+        .mount(&server)
+        .await;
+    let (c, log) = client(&server.uri(), ApiRetryPolicy::default());
+    let err = c.search_patches_by_package(&p).await.expect_err("429");
+    assert!(matches!(err, ApiError::RateLimited(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "Rate limit exceeded (HTTP 429, Retry-After 120 s exceeds the 30 s retry cap). \
+         Please try again later."
+    );
+    assert_eq!(requests_to(&server, &route).await, 1);
+    assert!(waits(&log).is_empty());
 }
 
 /// A 429 that never clears: 1 + 3 requests, three waits, then the
@@ -228,7 +289,8 @@ async fn exhausted_429_is_rate_limited_after_three_retries() {
 }
 
 /// 503 on the authenticated batch POST: retried like a 429; exhausted, it
-/// keeps its `Other` status error with the body, plus the retry note.
+/// is a `ServiceUnavailable` status error with the body, plus the retry
+/// note.
 #[tokio::test]
 async fn batch_post_503_retries_then_succeeds_or_reports() {
     let route = format!("/v0/orgs/{ORG}/patches/batch");
@@ -277,7 +339,7 @@ async fn batch_post_503_retries_then_succeeds_or_reports() {
         err.to_string(),
         "API request failed with status 503: over capacity (gave up after 3 retries)"
     );
-    assert!(matches!(err, ApiError::Other(_)));
+    assert!(matches!(err, ApiError::ServiceUnavailable(_)), "{err:?}");
     assert_eq!(requests_to(&down, &route).await, 4);
     assert_eq!(waits(&log).len(), 3);
 }
@@ -333,10 +395,11 @@ async fn retries_off_answers_once_with_the_original_message() {
     assert!(waits(&log).is_empty());
 }
 
-/// The run-wide wait budget: once the summed waits would pass it, the next
-/// throttled answer is final at once, across clones and requests.
+/// The run-wide retry window is wall-clock: it opens with the first retry,
+/// and a retry whose wait would end after it closes is refused — across
+/// clones and requests.
 #[tokio::test]
-async fn the_run_wait_budget_caps_total_waiting() {
+async fn the_retry_window_bounds_wall_clock_waiting() {
     let server = MockServer::start().await;
     for i in 0..3 {
         Mock::given(method("GET"))
@@ -346,27 +409,66 @@ async fn the_run_wait_budget_caps_total_waiting() {
             .await;
     }
     let policy = ApiRetryPolicy {
-        run_wait_budget: Duration::from_secs(5),
+        retry_window: Duration::from_secs(5),
         ..ApiRetryPolicy::default()
     };
-    let (c, log) = client(&server.uri(), policy);
-    // Request A: waits 2 s + 2 s (4 of 5 spent), then its 3rd retry does
-    // not fit.
+    let (hooks, log) = advancing_clock();
+    let c = ApiClient::new(options(&server.uri(), false)).with_api_retry(policy, hooks);
+    // Request A: waits 2 s + 2 s (4 s into the window), then its 3rd
+    // retry would end at 6 s: refused.
     let a = c.search_patches_by_package(&purl(10)).await.expect_err("A");
-    assert!(
-        a.to_string().contains("the run's retry budget is spent"),
-        "{a}"
+    assert_eq!(
+        a.to_string(),
+        "Rate limit exceeded (HTTP 429, the run's 5 s retry window has closed). \
+         Please try again later."
     );
-    // Request B on a clone: no retry fits at all.
+    // Request B on a clone, 4 s in: no 2 s wait fits.
     let b = c
         .clone()
         .search_patches_by_package(&purl(11))
         .await
         .expect_err("B");
-    assert!(b.to_string().contains("retry budget is spent"), "{b}");
+    assert!(b.to_string().contains("retry window has closed"), "{b}");
     assert_eq!(waits(&log), vec![Duration::from_secs(2); 2]);
     assert_eq!(requests_to(&server, &by_package_route(&purl(10))).await, 3);
     assert_eq!(requests_to(&server, &by_package_route(&purl(11))).await, 1);
+}
+
+/// 32 requests throttled at once, all persistently: parallel waits do not
+/// add up against the window, so EVERY request gets its 3 retries (the
+/// window only bounds wall-clock time) before its `RateLimited` error.
+#[tokio::test]
+async fn thirty_two_concurrent_throttled_requests_each_get_their_retries() {
+    const N: usize = 32;
+    let purls: Vec<String> = (0..N).map(|i| purl(100 + i)).collect();
+    let server = MockServer::start().await;
+    for p in &purls {
+        Mock::given(method("GET"))
+            .and(path(by_package_route(p)))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "20"))
+            .mount(&server)
+            .await;
+    }
+    // A clock that stands still while all 32 wait in parallel: each wait
+    // (20 s) ends inside the 60 s window even though they sum to 640 s.
+    let (c, log) = client(&server.uri(), ApiRetryPolicy::default());
+    let c = &c;
+    let errors: Vec<String> = ordered_concurrent(purls.iter(), N, |p| async move {
+        c.search_patches_by_package(p)
+            .await
+            .expect_err("throttled throughout")
+            .to_string()
+    })
+    .collect()
+    .await;
+    for (p, e) in purls.iter().zip(&errors) {
+        assert_eq!(
+            e, "Rate limit exceeded (HTTP 429, gave up after 3 retries). Please try again later.",
+            "{p}"
+        );
+        assert_eq!(requests_to(&server, &by_package_route(p)).await, 4, "{p}");
+    }
+    assert_eq!(waits(&log).len(), N * 3);
 }
 
 /// A 32-wide `ordered_concurrent` window over 96 packages where every
@@ -570,4 +672,116 @@ async fn package_references_and_patch_view_retry_too() {
     let w = waits(&log);
     assert_eq!(w.len(), 2);
     assert_eq!(w[0], Duration::from_secs(1));
+}
+
+/// The proxy's permanent `503 "Patch API is not configured"` is not
+/// throttling on ANY JSON path: the per-package lookups and the patch view
+/// answer it once, with no wait, as the plain `Other` status error — so
+/// the legacy per-package path still skips such packages (an empty result,
+/// not a failed batch), exactly as before retries existed.
+#[tokio::test]
+async fn unconfigured_503_is_never_retried_on_per_package_or_view_calls() {
+    let unconfigured = || {
+        ResponseTemplate::new(503).set_body_json(json!({
+            "error": "Service Unavailable",
+            "message": "Patch API is not configured on this server"
+        }))
+    };
+    let enc = |p: &str| {
+        p.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('@', "%40")
+    };
+    let purls = [purl(50), purl(51)];
+    let server = MockServer::start().await;
+    // The batch endpoint is missing, so the legacy per-package path runs.
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for p in &purls {
+        Mock::given(method("GET"))
+            .and(path(format!("/patch/by-package/{}", enc(p))))
+            .respond_with(unconfigured())
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let uuid = "00000000-0000-4000-8000-0000000000bb";
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/view/{uuid}")))
+        .respond_with(unconfigured())
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (hooks, log) = virtual_clock(0);
+    let c = ApiClient::new(options(&server.uri(), true))
+        .with_api_retry(ApiRetryPolicy::default(), hooks);
+
+    let got = c
+        .search_patches_batch(&purls)
+        .await
+        .expect("unconfigured packages are skipped, not a failed batch");
+    assert!(got.packages.is_empty(), "{:?}", got.packages);
+
+    let err = c.fetch_patch(uuid).await.expect_err("503");
+    assert!(matches!(err, ApiError::Other(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("API request failed with status 503")
+            && !err.to_string().contains("retr"),
+        "the pre-retry text: {err}"
+    );
+    assert!(waits(&log).is_empty());
+}
+
+/// Default retry policy on the proxy `/patch/batch`: an over-capacity 503
+/// or a 429 that never clears is retried, then errors — and NEVER degrades
+/// to the per-package path (that would multiply the load on a server that
+/// is already refusing it).
+#[tokio::test]
+async fn persistent_proxy_batch_throttle_errors_without_per_package_fallback() {
+    let p = purl(60);
+    let enc = p
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+        .replace('@', "%40");
+    for (status, body) in [(503u16, "Service temporarily over capacity"), (429, "")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/patch/batch"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/patch/by-package/{enc}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(search_body(&p, 60)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (hooks, log) = virtual_clock(0);
+        let c = ApiClient::new(options(&server.uri(), true))
+            .with_api_retry(ApiRetryPolicy::default(), hooks);
+        let err = c
+            .search_patches_batch(std::slice::from_ref(&p))
+            .await
+            .expect_err("persistent throttle surfaces");
+        match status {
+            503 => {
+                assert!(matches!(err, ApiError::ServiceUnavailable(_)), "{err:?}");
+                assert_eq!(
+                    err.to_string(),
+                    "API request failed with status 503: Service temporarily over capacity \
+                     (gave up after 3 retries)"
+                );
+            }
+            _ => assert!(matches!(err, ApiError::RateLimited(_)), "{err:?}"),
+        }
+        assert!(!is_fallback_candidate(&err));
+        assert_eq!(waits(&log).len(), 3, "{status}");
+        // `expect(4)` / `expect(0)` are verified when `server` drops.
+    }
 }

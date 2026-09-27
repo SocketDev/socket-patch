@@ -207,14 +207,15 @@ pub struct ApiClient {
     /// Shared by clones, like the breaker it defers to.
     vendor_prefetch: Arc<std::sync::Mutex<Option<Arc<VendorPrefetch>>>>,
     /// Bounded 429 / 503 retry for the JSON calls ([`crate::api::retry`]):
-    /// the policy, the run-wide wait budget (shared by clones, and by
+    /// the policy, the run-wide retry window (shared by clones, and by
     /// every default client in the process) and the clock hooks.
     api_retry: ApiRetry,
 }
 
 /// A JSON request's answer after [`ApiClient::send_json_request`]'s retry
 /// loop: the live response, or a 429 / 503 that is final (retries off,
-/// exhausted, refused by the caller's predicate, or out of budget) with
+/// exhausted, refused by the caller's predicate, a `Retry-After` over the
+/// cap, or past the run's retry window) with
 /// its body already read.
 enum Sent {
     Response(reqwest::Response),
@@ -391,7 +392,7 @@ impl ApiClient {
 
     /// Override the JSON calls' 429 / 503 retry policy and clock hooks
     /// (tests inject a recording sleep and a fixed jitter seed). The client
-    /// and its clones get a fresh wait budget of `policy.run_wait_budget`,
+    /// and its clones get a fresh retry window of `policy.retry_window`,
     /// detached from the process-wide one; [`ApiRetryPolicy::none`] turns
     /// retries off.
     pub fn with_api_retry(mut self, policy: ApiRetryPolicy, hooks: RetryHooks) -> Self {
@@ -443,8 +444,8 @@ impl ApiClient {
     /// retrying 429 / 503 per [`crate::api::retry`]. `label` (`"GET <url>"`)
     /// names the request in `--debug` lines and keys its jitter.
     /// `retryable` can veto a retry after seeing the body (the proxy's
-    /// permanent "Patch API is not configured" 503). Transport errors are
-    /// never retried.
+    /// permanent "Patch API is not configured" 503, which every JSON path
+    /// vetoes). Transport errors are never retried.
     async fn send_json_request(
         &self,
         label: &str,
@@ -485,17 +486,34 @@ impl ApiClient {
                 )));
             }
             let next = retries + 1;
-            let delay = retry.policy.delay(
+            let Some(delay) = retry.policy.delay(
                 next,
                 retry_after,
                 retry_jitter(retry.hooks.jitter_seed, label, next),
-            );
-            if !retry.reserve(delay) {
+            ) else {
+                // A server asking for more than the cap will refuse an
+                // earlier retry too: report now instead of waiting.
+                let why = format!(
+                    "Retry-After {} s exceeds the {} s retry cap",
+                    retry_after.unwrap_or_default().as_secs(),
+                    retry.policy.max_retry_after.as_secs()
+                );
                 debug_log(&format!(
-                    "{label} returned {}; not retrying: the run's retry wait budget is spent",
+                    "{label} returned {}; not retrying: {why}",
                     status.as_u16()
                 ));
-                return throttled(Some("the run's retry budget is spent".to_string()));
+                return throttled(Some(why));
+            };
+            if !retry.reserve(delay) {
+                let why = format!(
+                    "the run's {} s retry window has closed",
+                    retry.policy.retry_window.as_secs()
+                );
+                debug_log(&format!(
+                    "{label} returned {}; not retrying: {why}",
+                    status.as_u16()
+                ));
+                return throttled(Some(why));
             }
             debug_log(&format!(
                 "{label} returned {}; retry {next}/{max} in {delay:?}",
@@ -515,7 +533,11 @@ impl ApiClient {
         debug_log(&format!("GET {}", url));
 
         let sent = self
-            .send_json_request(&format!("GET {url}"), || self.client.get(&url), |_, _| true)
+            .send_json_request(
+                &format!("GET {url}"),
+                || self.client.get(&url),
+                |status, text| !is_patch_api_unconfigured(status, text),
+            )
             .await?;
         Self::handle_json_response(sent, self.use_public_proxy).await
     }
@@ -538,7 +560,7 @@ impl ApiClient {
                         .header(header::CONTENT_TYPE, "application/json")
                         .json(body)
                 },
-                |_, _| true,
+                |status, text| !is_patch_api_unconfigured(status, text),
             )
             .await?;
         Self::handle_json_response(sent, self.use_public_proxy).await
@@ -2130,20 +2152,31 @@ fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<Api
     }
 }
 
-/// Is `e` a 429 / 503 answer (after the retry loop gave up)? Matches what
-/// [`throttled_error`] and the plain status path produce for those codes.
+/// Is `e` a throttling answer (429, or an over-capacity 503) the retry
+/// loop left final? Keyed on the variants [`throttled_error`] produces —
+/// never on message text — so the proxy's permanent "not configured" 503
+/// (an [`ApiError::Other`]) is not one.
 fn is_throttle_error(e: &ApiError) -> bool {
-    match e {
-        ApiError::RateLimited(_) => true,
-        ApiError::Other(msg) => msg.starts_with("API request failed with status 503"),
-        _ => false,
-    }
+    matches!(
+        e,
+        ApiError::RateLimited(_) | ApiError::ServiceUnavailable(_)
+    )
 }
 
-/// The error for a 429 / 503 the retry loop left final: the classification
-/// a first answer always got (429 → [`ApiError::RateLimited`], 503 →
-/// [`ApiError::Other`] with the status and body), naming why the loop
-/// stopped (`gave_up`, e.g. "gave up after 3 retries") when retries were on.
+/// The public proxy's permanent "Patch API is not configured" 503
+/// (patch endpoints disabled on that deployment). Not throttling: no JSON
+/// path retries it, and it stays the plain [`ApiError::Other`] status
+/// error it always was.
+fn is_patch_api_unconfigured(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::SERVICE_UNAVAILABLE && body.contains("Patch API is not configured")
+}
+
+/// The error for a 429 / 503 the retry loop left final: 429 →
+/// [`ApiError::RateLimited`], an over-capacity 503 →
+/// [`ApiError::ServiceUnavailable`] with the status and body, naming why
+/// the loop stopped (`gave_up`, e.g. "gave up after 3 retries") when
+/// retries were on. The permanent "not configured" 503 keeps its
+/// pre-retry [`ApiError::Other`].
 fn throttled_error(
     status: StatusCode,
     text: &str,
@@ -2157,7 +2190,10 @@ fn throttled_error(
         (Some(err), _) => err,
         (None, why) => {
             let msg = status_error("API request failed with status", status, text);
-            ApiError::Other(match why {
+            if is_patch_api_unconfigured(status, text) {
+                return ApiError::Other(msg);
+            }
+            ApiError::ServiceUnavailable(match why {
                 Some(why) => format!("{msg} ({why})"),
                 None => msg,
             })
@@ -2183,7 +2219,7 @@ fn throttled_error(
 fn is_batch_unsupported(status: StatusCode, body: &str) -> bool {
     match status {
         StatusCode::BAD_REQUEST => body.contains("Unsupported endpoint"),
-        StatusCode::SERVICE_UNAVAILABLE => body.contains("Patch API is not configured"),
+        StatusCode::SERVICE_UNAVAILABLE => is_patch_api_unconfigured(status, body),
         // A deployment / CDN layer with no route for POST /patch/batch.
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => true,
         _ => false,
@@ -2416,6 +2452,14 @@ pub enum ApiError {
 
     #[error("{0}")]
     RateLimited(String),
+
+    /// An HTTP 503 (over capacity, maintenance) still failing after the
+    /// bounded retry ([`crate::api::retry`]). The text is the plain status
+    /// error (`API request failed with status 503: <body>`, plus the retry
+    /// note). The proxy's permanent "Patch API is not configured" 503 is
+    /// [`ApiError::Other`] instead: it is not throttling.
+    #[error("{0}")]
+    ServiceUnavailable(String),
 
     #[error("{0}")]
     InvalidHash(String),

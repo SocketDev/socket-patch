@@ -9,15 +9,23 @@
 //! - at most [`ApiRetryPolicy::max_retries`] retries per request (3 by
 //!   default, [`API_MAX_RETRIES_ENV`] overrides, `0` disables);
 //! - the wait honors the server's `Retry-After` (delta-seconds or an
-//!   HTTP-date), capped at [`ApiRetryPolicy::max_retry_after`] (30 s);
-//!   without one it is exponential from [`ApiRetryPolicy::base_delay`]
-//!   (500 ms, 1 s, 2 s, ... capped at [`ApiRetryPolicy::max_backoff`]) with
-//!   "equal jitter" — each wait lands in `[d/2, d)`, the sample derived
-//!   deterministically from a seed, the request and the retry number;
-//! - every wait is drawn from one run-wide budget
-//!   ([`ApiRetryPolicy::run_wait_budget`], 60 s of summed waiting): once it
-//!   is spent, the next throttled answer is final at once, so a throttled
-//!   run adds at most that much waiting however many requests it makes.
+//!   HTTP-date). One longer than [`ApiRetryPolicy::max_retry_after`]
+//!   (30 s) is not waited out at all: the answer is final at once (retrying
+//!   early would only be refused again). One shorter than the jittered
+//!   first backoff step (`Retry-After: 0`, a date already past) waits that
+//!   step instead, so a server saying "now" is not hammered;
+//! - without a `Retry-After` the wait is exponential from
+//!   [`ApiRetryPolicy::base_delay`] (500 ms, 1 s, 2 s, ... capped at
+//!   [`ApiRetryPolicy::max_backoff`]) with "equal jitter" — each wait lands
+//!   in `[d/2, d)`, the sample derived deterministically from a seed, the
+//!   request and the retry number;
+//! - all retries share one run-wide WALL-CLOCK window
+//!   ([`ApiRetryPolicy::retry_window`], 60 s) that opens with the run's
+//!   first retry: a retry whose wait would end after the window closes is
+//!   refused and the answer is final. Concurrent requests wait in parallel,
+//!   so 32 throttled requests each still get their retries (their waits
+//!   overlap rather than add up), while a throttled run as a whole adds at
+//!   most about the window's length of waiting.
 //!
 //! Nothing else is retried here: other 4xx (401/403 keep driving the proxy
 //! fallback), other 5xx and transport errors surface on the first answer,
@@ -27,9 +35,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::StatusCode;
@@ -51,10 +58,12 @@ pub struct ApiRetryPolicy {
     pub base_delay: Duration,
     /// Cap on one backoff step (before jitter halves its lower bound).
     pub max_backoff: Duration,
-    /// Cap on one wait taken from a server's `Retry-After`.
+    /// Longest `Retry-After` the loop waits out; a longer one makes the
+    /// answer final at once.
     pub max_retry_after: Duration,
-    /// Summed waiting all requests sharing the budget may spend.
-    pub run_wait_budget: Duration,
+    /// Wall-clock window, opened by the first retry of the run (of the
+    /// clients sharing it), within which every retry's wait must end.
+    pub retry_window: Duration,
 }
 
 impl Default for ApiRetryPolicy {
@@ -64,7 +73,7 @@ impl Default for ApiRetryPolicy {
             base_delay: Duration::from_millis(500),
             max_backoff: Duration::from_secs(8),
             max_retry_after: Duration::from_secs(30),
-            run_wait_budget: Duration::from_secs(60),
+            retry_window: Duration::from_secs(60),
         }
     }
 }
@@ -88,20 +97,33 @@ impl ApiRetryPolicy {
         policy
     }
 
-    /// The pause before retry number `retry` (1-based): the server's
-    /// `Retry-After` under [`Self::max_retry_after`] when it sent one,
-    /// otherwise the jittered exponential step (`jitter` in `[0, 1)`).
-    pub fn delay(&self, retry: u32, retry_after: Option<Duration>, jitter: f64) -> Duration {
+    /// The pause before retry number `retry` (1-based), `jitter` in
+    /// `[0, 1)`: the server's `Retry-After` when it sent one (floored at the
+    /// jittered first backoff step), otherwise the jittered exponential
+    /// step. `None` when the `Retry-After` exceeds
+    /// [`Self::max_retry_after`]: the caller gives up instead of waiting.
+    pub fn delay(
+        &self,
+        retry: u32,
+        retry_after: Option<Duration>,
+        jitter: f64,
+    ) -> Option<Duration> {
+        // Equal jitter: [step/2, step).
+        let jittered = |step: Duration| {
+            let half = step / 2;
+            half + half.mul_f64(jitter.clamp(0.0, 1.0))
+        };
         if let Some(after) = retry_after {
-            return after.min(self.max_retry_after);
+            if after > self.max_retry_after {
+                return None;
+            }
+            return Some(after.max(jittered(self.base_delay.min(self.max_backoff))));
         }
         let step = self
             .base_delay
             .saturating_mul(1u32 << retry.saturating_sub(1).min(16))
             .min(self.max_backoff);
-        // Equal jitter: [step/2, step).
-        let half = step / 2;
-        half + half.mul_f64(jitter.clamp(0.0, 1.0))
+        Some(jittered(step))
     }
 }
 
@@ -160,14 +182,19 @@ pub type RetrySleep =
     Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// The retry loop's view of time and randomness. [`Default`] is the real
-/// thing (tokio's sleep, the system clock, a per-process random seed);
-/// tests substitute a recorder and fixed values.
+/// thing (tokio's sleep, the system and monotonic clocks, a per-process
+/// random seed); tests substitute a recorder and fixed values.
 #[derive(Clone)]
 pub struct RetryHooks {
     /// Waits out one retry delay.
     pub sleep: RetrySleep,
     /// Now, as UNIX seconds (resolves an HTTP-date `Retry-After`).
     pub now_unix_secs: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Now on a monotonic clock, as time since an arbitrary fixed epoch
+    /// (the [`ApiRetryPolicy::retry_window`] is measured on it). Every
+    /// client sharing a window must share the epoch; the default is one
+    /// per process.
+    pub monotonic_now: Arc<dyn Fn() -> Duration + Send + Sync>,
     /// Seed for [`jitter_sample`].
     pub jitter_seed: u64,
 }
@@ -181,6 +208,7 @@ impl Default for RetryHooks {
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs())
             }),
+            monotonic_now: Arc::new(process_monotonic_now),
             jitter_seed: process_seed(),
         }
     }
@@ -206,67 +234,63 @@ fn process_seed() -> u64 {
     })
 }
 
-/// The run-wide wait budget every default client draws from: one CLI run
-/// is one process, and a run builds several clients (discovery, download,
-/// the proxy fallback), so the budget is process-wide rather than
+/// Time since this process's fixed monotonic epoch (the default
+/// [`RetryHooks::monotonic_now`]).
+fn process_monotonic_now() -> Duration {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed()
+}
+
+/// When the retry window opened (on [`RetryHooks::monotonic_now`]'s
+/// clock), set by the first retry; shared by every client holding it.
+type WindowStart = Arc<OnceLock<Duration>>;
+
+/// The run-wide retry window every default client shares: one CLI run is
+/// one process, and a run builds several clients (discovery, download,
+/// the proxy fallback), so the window is process-wide rather than
 /// per-client.
-fn process_budget() -> Arc<AtomicU64> {
-    static BUDGET: OnceLock<Arc<AtomicU64>> = OnceLock::new();
-    Arc::clone(BUDGET.get_or_init(|| {
-        Arc::new(AtomicU64::new(millis(
-            ApiRetryPolicy::default().run_wait_budget,
-        )))
-    }))
+fn process_window() -> WindowStart {
+    static WINDOW: OnceLock<WindowStart> = OnceLock::new();
+    Arc::clone(WINDOW.get_or_init(WindowStart::default))
 }
 
-fn millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// A client's retry state: the policy, the shared wait budget, the hooks.
+/// A client's retry state: the policy, the shared window, the hooks.
 #[derive(Debug, Clone)]
 pub(crate) struct ApiRetry {
     pub(crate) policy: ApiRetryPolicy,
-    /// Milliseconds of waiting left, shared by every client holding it.
-    budget_ms: Arc<AtomicU64>,
+    /// When the run's first retry opened the window.
+    window_start: WindowStart,
     pub(crate) hooks: RetryHooks,
 }
 
 impl ApiRetry {
-    /// The default: [`ApiRetryPolicy::from_env`] on the process budget.
+    /// The default: [`ApiRetryPolicy::from_env`] on the process window.
     pub(crate) fn from_env() -> Self {
         Self {
             policy: ApiRetryPolicy::from_env(),
-            budget_ms: process_budget(),
+            window_start: process_window(),
             hooks: RetryHooks::default(),
         }
     }
 
-    /// `policy` on a FRESH budget of its own `run_wait_budget` (tests, or a
-    /// caller that wants isolation from the process budget).
+    /// `policy` on a FRESH window of its own (tests, or a caller that wants
+    /// isolation from the process window).
     pub(crate) fn with_policy(policy: ApiRetryPolicy, hooks: RetryHooks) -> Self {
         Self {
             policy,
-            budget_ms: Arc::new(AtomicU64::new(millis(policy.run_wait_budget))),
+            window_start: WindowStart::default(),
             hooks,
         }
     }
 
-    /// Take `delay` from the budget; `false` (nothing taken) when too
-    /// little is left.
+    /// May a retry wait `delay` now? The first call opens the window;
+    /// `true` iff the wait ends within [`ApiRetryPolicy::retry_window`] of
+    /// that opening. Waits running in parallel all fit as long as each
+    /// ends in time — only wall-clock time counts, not summed waiting.
     pub(crate) fn reserve(&self, delay: Duration) -> bool {
-        let want = millis(delay);
-        self.budget_ms
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(want)
-            })
-            .is_ok()
-    }
-
-    /// Milliseconds of waiting left (tests).
-    #[cfg(test)]
-    pub(crate) fn budget_left_ms(&self) -> u64 {
-        self.budget_ms.load(Ordering::Acquire)
+        let now = (self.hooks.monotonic_now)();
+        let start = *self.window_start.get_or_init(|| now);
+        now.saturating_add(delay) <= start.saturating_add(self.policy.retry_window)
     }
 }
 
@@ -316,18 +340,35 @@ mod tests {
         let p = ApiRetryPolicy::default();
         assert_eq!(
             p.delay(1, Some(Duration::from_secs(120)), 0.9),
-            Duration::from_secs(30),
-            "Retry-After is capped"
+            None,
+            "a Retry-After over the cap is not waited out"
+        );
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(30)), 0.9),
+            Some(Duration::from_secs(30)),
+            "the cap itself is still waited"
         );
         assert_eq!(
             p.delay(2, Some(Duration::from_secs(3)), 0.9),
-            Duration::from_secs(3),
+            Some(Duration::from_secs(3)),
             "Retry-After ignores jitter and the backoff step"
         );
+        // Retry-After: 0 (or a past date) is floored at the jittered first
+        // step, whatever the retry number.
+        for retry in [1u32, 3] {
+            assert_eq!(
+                p.delay(retry, Some(Duration::ZERO), 0.0),
+                Some(Duration::from_millis(250))
+            );
+            assert_eq!(
+                p.delay(retry, Some(Duration::from_millis(100)), 0.5),
+                Some(Duration::from_millis(375))
+            );
+        }
         // Steps 500 ms, 1 s, 2 s, 4 s, 8 s, 8 s: each wait in [step/2, step).
         for (retry, step_ms) in [(1u32, 500u64), (2, 1000), (3, 2000), (5, 8000), (9, 8000)] {
-            let lo = p.delay(retry, None, 0.0);
-            let hi = p.delay(retry, None, 0.999_999);
+            let lo = p.delay(retry, None, 0.0).unwrap();
+            let hi = p.delay(retry, None, 0.999_999).unwrap();
             assert_eq!(lo, Duration::from_millis(step_ms / 2), "retry {retry}");
             assert!(hi < Duration::from_millis(step_ms), "retry {retry}: {hi:?}");
             assert!(hi > lo);
@@ -361,24 +402,56 @@ mod tests {
         );
     }
 
+    /// A hand-driven monotonic clock (milliseconds).
+    fn manual_clock() -> (RetryHooks, Arc<std::sync::atomic::AtomicU64>) {
+        let ms = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let read = Arc::clone(&ms);
+        let hooks = RetryHooks {
+            monotonic_now: Arc::new(move || {
+                Duration::from_millis(read.load(std::sync::atomic::Ordering::SeqCst))
+            }),
+            ..RetryHooks::default()
+        };
+        (hooks, ms)
+    }
+
     #[test]
-    fn budget_reserves_until_spent_and_never_goes_negative() {
+    fn the_window_counts_wall_clock_not_summed_waits() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (hooks, clock) = manual_clock();
         let retry = ApiRetry::with_policy(
             ApiRetryPolicy {
-                run_wait_budget: Duration::from_secs(3),
+                retry_window: Duration::from_secs(3),
                 ..ApiRetryPolicy::default()
             },
-            RetryHooks::default(),
+            hooks,
         );
-        assert!(retry.reserve(Duration::from_secs(2)));
-        assert!(!retry.reserve(Duration::from_secs(2)), "only 1 s left");
-        assert_eq!(retry.budget_left_ms(), 1000);
-        assert!(retry.reserve(Duration::from_secs(1)));
-        assert!(retry.reserve(Duration::ZERO), "a zero wait is always free");
-        assert!(!retry.reserve(Duration::from_millis(1)));
-        // Clones share the budget.
+        // Parallel waits at one instant: each ends within 3 s of the
+        // window's opening, so all fit though they sum to far more.
+        for _ in 0..32 {
+            assert!(retry.reserve(Duration::from_secs(2)));
+        }
+        assert!(
+            retry.reserve(Duration::from_secs(3)),
+            "ends exactly at the close"
+        );
+        assert!(
+            !retry.reserve(Duration::from_millis(3_001)),
+            "ends after it"
+        );
+        // 2.5 s later: only a wait ending by the 3 s mark fits.
+        clock.fetch_add(2_500, SeqCst);
+        assert!(retry.reserve(Duration::from_millis(500)));
+        assert!(!retry.reserve(Duration::from_millis(501)));
+        // Clones share the window; once it has closed nothing fits.
+        clock.fetch_add(1_000, SeqCst);
         let clone = retry.clone();
-        assert!(!clone.reserve(Duration::from_millis(1)));
+        assert!(!clone.reserve(Duration::ZERO));
+        // A fresh policy client opens a window of its own.
+        let (hooks, _) = manual_clock();
+        let fresh = ApiRetry::with_policy(ApiRetryPolicy::default(), hooks);
+        assert!(fresh.reserve(Duration::from_secs(60)));
+        assert!(!fresh.reserve(Duration::from_millis(60_001)));
     }
 
     #[test]
