@@ -12,6 +12,10 @@ use serde::Serialize;
 // different ones came to exist; there is now exactly one, in `api::ranking`.
 use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
+use crate::api::retry::{
+    is_retryable_status, jitter_sample as retry_jitter, parse_retry_after, ApiRetry,
+    ApiRetryPolicy, RetryHooks,
+};
 use crate::api::types::*;
 use crate::api::vendor_prefetch::VendorPrefetch;
 pub use crate::api::vendor_prefetch::VendorPrefetchGuard;
@@ -202,6 +206,25 @@ pub struct ApiClient {
     /// takes a planned uuid's outcome from it instead of requesting it.
     /// Shared by clones, like the breaker it defers to.
     vendor_prefetch: Arc<std::sync::Mutex<Option<Arc<VendorPrefetch>>>>,
+    /// Bounded 429 / 503 retry for the JSON calls ([`crate::api::retry`]):
+    /// the policy, the run-wide wait budget (shared by clones, and by
+    /// every default client in the process) and the clock hooks.
+    api_retry: ApiRetry,
+}
+
+/// A JSON request's answer after [`ApiClient::send_json_request`]'s retry
+/// loop: the live response, or a 429 / 503 that is final (retries off,
+/// exhausted, refused by the caller's predicate, or out of budget) with
+/// its body already read.
+enum Sent {
+    Response(reqwest::Response),
+    Throttled {
+        status: StatusCode,
+        text: String,
+        /// Why no further retry was made, for the error message; `None`
+        /// when retries are off (the message stays the pre-retry one).
+        gave_up: Option<String>,
+    },
 }
 
 /// Most requests the public proxy's batch path keeps in flight per client:
@@ -362,7 +385,18 @@ impl ApiClient {
             vendor_outage: Arc::new(AtomicU32::new(0)),
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(PROXY_BATCH_PATH_CONCURRENCY)),
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
+            api_retry: ApiRetry::from_env(),
         }
+    }
+
+    /// Override the JSON calls' 429 / 503 retry policy and clock hooks
+    /// (tests inject a recording sleep and a fixed jitter seed). The client
+    /// and its clones get a fresh wait budget of `policy.run_wait_budget`,
+    /// detached from the process-wide one; [`ApiRetryPolicy::none`] turns
+    /// retries off.
+    pub fn with_api_retry(mut self, policy: ApiRetryPolicy, hooks: RetryHooks) -> Self {
+        self.api_retry = ApiRetry::with_policy(policy, hooks);
+        self
     }
 
     /// Wait for a [`Self::proxy_batch_slots`] slot; held until dropped.
@@ -405,6 +439,73 @@ impl ApiClient {
 
     // ── Internal helpers ──────────────────────────────────────────────
 
+    /// Send one JSON request (`build` makes a fresh builder per attempt),
+    /// retrying 429 / 503 per [`crate::api::retry`]. `label` (`"GET <url>"`)
+    /// names the request in `--debug` lines and keys its jitter.
+    /// `retryable` can veto a retry after seeing the body (the proxy's
+    /// permanent "Patch API is not configured" 503). Transport errors are
+    /// never retried.
+    async fn send_json_request(
+        &self,
+        label: &str,
+        build: impl Fn() -> reqwest::RequestBuilder,
+        retryable: impl Fn(StatusCode, &str) -> bool,
+    ) -> Result<Sent, ApiError> {
+        let retry = &self.api_retry;
+        let max = retry.policy.max_retries;
+        let mut retries = 0u32;
+        loop {
+            let resp = build().send().await.map_err(|e| {
+                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+            })?;
+            let status = resp.status();
+            if !is_retryable_status(status) {
+                return Ok(Sent::Response(resp));
+            }
+            let retry_after = parse_retry_after(resp.headers(), (retry.hooks.now_unix_secs)());
+            let text = resp.text().await.unwrap_or_default();
+            let throttled = |gave_up: Option<String>| {
+                Ok(Sent::Throttled {
+                    status,
+                    text: text.clone(),
+                    gave_up: gave_up.filter(|_| max > 0),
+                })
+            };
+            if !retryable(status, &text) {
+                return throttled(None);
+            }
+            if retries >= max {
+                return throttled(Some(format!(
+                    "gave up after {}",
+                    if retries == 1 {
+                        "1 retry".to_string()
+                    } else {
+                        format!("{retries} retries")
+                    }
+                )));
+            }
+            let next = retries + 1;
+            let delay = retry.policy.delay(
+                next,
+                retry_after,
+                retry_jitter(retry.hooks.jitter_seed, label, next),
+            );
+            if !retry.reserve(delay) {
+                debug_log(&format!(
+                    "{label} returned {}; not retrying: the run's retry wait budget is spent",
+                    status.as_u16()
+                ));
+                return throttled(Some("the run's retry budget is spent".to_string()));
+            }
+            debug_log(&format!(
+                "{label} returned {}; retry {next}/{max} in {delay:?}",
+                status.as_u16()
+            ));
+            (retry.hooks.sleep)(delay).await;
+            retries = next;
+        }
+    }
+
     /// Internal GET that deserialises JSON. Returns `Ok(None)` on 404.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
@@ -413,11 +514,10 @@ impl ApiClient {
         let url = format!("{}{}", self.api_url, path);
         debug_log(&format!("GET {}", url));
 
-        let resp = self.client.get(&url).send().await.map_err(|e| {
-            ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-        })?;
-
-        Self::handle_json_response(resp, self.use_public_proxy).await
+        let sent = self
+            .send_json_request(&format!("GET {url}"), || self.client.get(&url), |_, _| true)
+            .await?;
+        Self::handle_json_response(sent, self.use_public_proxy).await
     }
 
     /// Internal POST that deserialises JSON. Returns `Ok(None)` on 404.
@@ -429,25 +529,34 @@ impl ApiClient {
         let url = format!("{}{}", self.api_url, path);
         debug_log(&format!("POST {}", url));
 
-        let resp = self
-            .client
-            .post(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| {
-                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-            })?;
-
-        Self::handle_json_response(resp, self.use_public_proxy).await
+        let sent = self
+            .send_json_request(
+                &format!("POST {url}"),
+                || {
+                    self.client
+                        .post(&url)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .json(body)
+                },
+                |_, _| true,
+            )
+            .await?;
+        Self::handle_json_response(sent, self.use_public_proxy).await
     }
 
     /// Map an HTTP response to `Ok(Some(T))`, `Ok(None)` (404), or `Err`.
     async fn handle_json_response<T: serde::de::DeserializeOwned>(
-        resp: reqwest::Response,
+        sent: Sent,
         use_public_proxy: bool,
     ) -> Result<Option<T>, ApiError> {
+        let resp = match sent {
+            Sent::Response(resp) => resp,
+            Sent::Throttled {
+                status,
+                text,
+                gave_up,
+            } => return Err(throttled_error(status, &text, use_public_proxy, gave_up)),
+        };
         let status = resp.status();
 
         if status == StatusCode::OK {
@@ -653,7 +762,9 @@ impl ApiClient {
     /// Auth / rate-limit statuses are classified via `classify_auth_error`
     /// exactly like the JSON transport — 401/403 keep feeding
     /// `is_fallback_candidate` and 429 stays visible — and any other
-    /// failure (including over-capacity 503s) surfaces as an error.
+    /// failure (including over-capacity 503s) surfaces as an error. A 429
+    /// or over-capacity 503 is first retried per [`crate::api::retry`];
+    /// the permanent "not configured" 503 degrades at once.
     async fn proxy_batch_post(
         &self,
         purls: &[String],
@@ -665,34 +776,52 @@ impl ApiClient {
         let _slot = self.proxy_batch_slot().await;
         // Logged AFTER the permit, not before: the line announces a request
         // that is about to go out, and a caller queued behind the proxy's
-        // in-flight limit would otherwise print it and then wait.
+        // in-flight limit would otherwise print it and then wait. The slot
+        // stays held through any 429 / 503 retry wait: a throttled proxy
+        // is exactly when the other callers should not pile on.
         debug_log(&format!("POST {}", url));
-        let resp = self
-            .client
-            .post(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
-            })?;
+        let sent = self
+            .send_json_request(
+                &format!("POST {url}"),
+                || {
+                    self.client
+                        .post(&url)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .json(&body)
+                },
+                // "Patch API is not configured" is permanent: degrade to
+                // the per-package path at once instead of retrying it.
+                |status, text| !is_batch_unsupported(status, text),
+            )
+            .await?;
 
-        let status = resp.status();
-
-        if status == StatusCode::OK {
-            let parsed = resp
-                .json::<BatchSearchResponse>()
-                .await
-                .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
-            return Ok(Some(parsed));
-        }
-
-        if let Some(err) = classify_auth_error(status, true) {
-            return Err(err);
-        }
-
-        let text = resp.text().await.unwrap_or_default();
+        let (status, text) = match sent {
+            Sent::Response(resp) => {
+                let status = resp.status();
+                if status == StatusCode::OK {
+                    let parsed = resp
+                        .json::<BatchSearchResponse>()
+                        .await
+                        .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
+                    return Ok(Some(parsed));
+                }
+                if let Some(err) = classify_auth_error(status, true) {
+                    return Err(err);
+                }
+                (status, resp.text().await.unwrap_or_default())
+            }
+            Sent::Throttled {
+                status,
+                text,
+                gave_up,
+            } => {
+                if is_batch_unsupported(status, &text) {
+                    (status, text)
+                } else {
+                    return Err(throttled_error(status, &text, true, gave_up));
+                }
+            }
+        };
         let fallback_reason = if is_batch_unsupported(status, &text) {
             Some("proxy batch endpoint unavailable")
         } else if status == StatusCode::BAD_REQUEST {
@@ -733,12 +862,18 @@ impl ApiClient {
     ) -> Result<BatchSearchResponse, ApiError> {
         // Collect all (purl, response) pairs
         let mut all_results: Vec<(String, Option<SearchResponse>)> = Vec::new();
+        // The first (in input order) package still throttled after its
+        // retries. Its error fails the whole call — a per-package miss is
+        // swallowed for an unresolvable PURL, but swallowing a throttle
+        // would drop the package from the scan without a word.
+        let mut throttled: Option<(usize, ApiError)> = None;
 
-        for chunk in purls.chunks(PROXY_BATCH_PATH_CONCURRENCY) {
+        for (chunk_idx, chunk) in purls.chunks(PROXY_BATCH_PATH_CONCURRENCY).enumerate() {
             // Use tokio::JoinSet for concurrent execution within each chunk
             let mut join_set = tokio::task::JoinSet::new();
 
-            for purl in chunk {
+            for (offset, purl) in chunk.iter().enumerate() {
+                let index = chunk_idx * PROXY_BATCH_PATH_CONCURRENCY + offset;
                 let purl = purl.clone();
                 let client = self.clone();
                 join_set.spawn(async move {
@@ -746,10 +881,11 @@ impl ApiClient {
                     let resp = client.search_patches_by_package(&purl).await;
                     drop(slot);
                     match resp {
-                        Ok(r) => (purl, Some(r)),
+                        Ok(r) => (index, purl, Ok(Some(r))),
+                        Err(e) if is_throttle_error(&e) => (index, purl, Err(e)),
                         Err(e) => {
                             debug_log(&format!("Error fetching patches for {}: {}", purl, e));
-                            (purl, None)
+                            (index, purl, Ok(None))
                         }
                     }
                 });
@@ -757,12 +893,20 @@ impl ApiClient {
 
             while let Some(result) = join_set.join_next().await {
                 match result {
-                    Ok(pair) => all_results.push(pair),
+                    Ok((_, purl, Ok(resp))) => all_results.push((purl, resp)),
+                    Ok((index, _, Err(e))) => {
+                        if throttled.as_ref().is_none_or(|(first, _)| index < *first) {
+                            throttled = Some((index, e));
+                        }
+                    }
                     Err(e) => {
                         debug_log(&format!("Task join error: {}", e));
                     }
                 }
             }
+        }
+        if let Some((_, e)) = throttled {
+            return Err(e);
         }
 
         // Convert the individual SearchResponse results into the batch shape.
@@ -1983,6 +2127,41 @@ fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<Api
             "Rate limit exceeded. Please try again later.".into(),
         )),
         _ => None,
+    }
+}
+
+/// Is `e` a 429 / 503 answer (after the retry loop gave up)? Matches what
+/// [`throttled_error`] and the plain status path produce for those codes.
+fn is_throttle_error(e: &ApiError) -> bool {
+    match e {
+        ApiError::RateLimited(_) => true,
+        ApiError::Other(msg) => msg.starts_with("API request failed with status 503"),
+        _ => false,
+    }
+}
+
+/// The error for a 429 / 503 the retry loop left final: the classification
+/// a first answer always got (429 → [`ApiError::RateLimited`], 503 →
+/// [`ApiError::Other`] with the status and body), naming why the loop
+/// stopped (`gave_up`, e.g. "gave up after 3 retries") when retries were on.
+fn throttled_error(
+    status: StatusCode,
+    text: &str,
+    use_public_proxy: bool,
+    gave_up: Option<String>,
+) -> ApiError {
+    match (classify_auth_error(status, use_public_proxy), gave_up) {
+        (Some(ApiError::RateLimited(_)), Some(why)) => ApiError::RateLimited(format!(
+            "Rate limit exceeded (HTTP 429, {why}). Please try again later."
+        )),
+        (Some(err), _) => err,
+        (None, why) => {
+            let msg = status_error("API request failed with status", status, text);
+            ApiError::Other(match why {
+                Some(why) => format!("{msg} ({why})"),
+                None => msg,
+            })
+        }
     }
 }
 
