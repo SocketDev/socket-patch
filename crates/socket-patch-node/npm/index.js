@@ -24,7 +24,12 @@ const REQUIRED_EXPORTS = [
   'selectHostedScanPathsJson',
   'hostedScanCandidateFiles',
   'engineVersion',
-  'NativeHostedScanSession',
+  'createHostedScanSession',
+  'hostedScanSessionPushChunk',
+  'hostedScanSessionEndFile',
+  'hostedScanSessionMarkPresent',
+  'hostedScanSessionFinish',
+  'hostedScanSessionCancel',
 ]
 
 class SocketPatchAddonUnavailableError extends Error {
@@ -293,6 +298,7 @@ function engineVersion() {
 }
 
 class HostedScanSession {
+  #binding
   #native
 
   constructor(options, provider) {
@@ -302,7 +308,8 @@ class HostedScanSession {
     const native = binding()
     const wrapped = wrapProvider(provider)
     const optionsJson = JSON.stringify(options)
-    this.#native = callNative(() => new native.NativeHostedScanSession(optionsJson, wrapped))
+    this.#binding = native
+    this.#native = callNative(() => native.createHostedScanSession(optionsJson, wrapped))
   }
 
   pushChunk(path, chunk) {
@@ -310,22 +317,22 @@ class HostedScanSession {
     if (!bytes) {
       throw new TypeError('chunk must be a Buffer or Uint8Array')
     }
-    callNative(() => this.#native.pushChunk(requirePath(path), bytes))
+    callNative(() => this.#binding.hostedScanSessionPushChunk(this.#native, requirePath(path), bytes))
   }
 
   endFile(path) {
-    callNative(() => this.#native.endFile(requirePath(path)))
+    callNative(() => this.#binding.hostedScanSessionEndFile(this.#native, requirePath(path)))
   }
 
   markPresent(path, kind) {
     if (typeof kind !== 'string') {
       throw new TypeError('kind must be a string')
     }
-    callNative(() => this.#native.markPresent(requirePath(path), kind))
+    callNative(() => this.#binding.hostedScanSessionMarkPresent(this.#native, requirePath(path), kind))
   }
 
   async finish() {
-    const outcome = await callNative(() => this.#native.finish())
+    const outcome = await callNative(() => this.#binding.hostedScanSessionFinish(this.#native))
     if (!outcome.ok) {
       throw engineError(
         outcome.errorCode ?? 'engine_internal',
@@ -342,7 +349,7 @@ class HostedScanSession {
   }
 
   cancel() {
-    callNative(() => this.#native.cancel())
+    callNative(() => this.#binding.hostedScanSessionCancel(this.#native))
   }
 }
 

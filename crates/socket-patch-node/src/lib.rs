@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use napi::bindgen_prelude::{Buffer, Function, JsObjectValue, Object, PromiseRaw};
+use napi::bindgen_prelude::{Buffer, External, Function, JsObjectValue, Object, PromiseRaw};
 use napi::{Env, Status};
 use napi_derive::napi;
 use socket_patch_cli::hosted_memory::{
@@ -179,7 +179,6 @@ fn ready(outcome: NativeFinishOutcome) -> OutcomeFuture {
     Box::pin(async move { outcome })
 }
 
-#[napi]
 pub struct NativeHostedScanSession {
     state: SessionState,
     provider: Option<ProviderRefs>,
@@ -203,9 +202,7 @@ where
         })
 }
 
-#[napi]
 impl NativeHostedScanSession {
-    #[napi(constructor)]
     pub fn new(options_json: String, provider: Object<'_>) -> napi::Result<Self> {
         let options: HostedScanOptions = serde_json::from_str(&options_json)
             .map_err(|e| invalid_input("invalid_options", format!("session options: {e}")))?;
@@ -262,17 +259,14 @@ impl NativeHostedScanSession {
         }
     }
 
-    #[napi]
     pub fn push_chunk(&mut self, path: String, chunk: Buffer) -> napi::Result<()> {
         self.with_builder(|builder| builder.push_chunk(&path, &chunk))
     }
 
-    #[napi]
     pub fn end_file(&mut self, path: String) -> napi::Result<()> {
         self.with_builder(|builder| builder.end_file(&path))
     }
 
-    #[napi]
     pub fn mark_present(&mut self, path: String, kind: String) -> napi::Result<()> {
         let Some(mark) = PresentKind::parse(&kind) else {
             return Err(invalid_input(
@@ -283,7 +277,6 @@ impl NativeHostedScanSession {
         self.with_builder(|builder| builder.mark_present(&path, mark))
     }
 
-    #[napi]
     pub fn finish<'env>(
         &mut self,
         env: &'env Env,
@@ -317,7 +310,6 @@ impl NativeHostedScanSession {
         env.spawn_future(async move { Ok(outcome.await) })
     }
 
-    #[napi]
     pub fn cancel(&mut self) {
         self.cancel.cancel();
         // Buffered chunks are native memory V8 does not see, so waiting for
@@ -327,4 +319,51 @@ impl NativeHostedScanSession {
         }
         self.provider = None;
     }
+}
+
+#[napi(js_name = "createHostedScanSession")]
+pub fn create_hosted_scan_session(
+    options_json: String,
+    provider: Object<'_>,
+) -> napi::Result<External<NativeHostedScanSession>> {
+    NativeHostedScanSession::new(options_json, provider).map(External::new)
+}
+
+#[napi(js_name = "hostedScanSessionPushChunk")]
+pub fn hosted_scan_session_push_chunk(
+    session: &mut External<NativeHostedScanSession>,
+    path: String,
+    chunk: Buffer,
+) -> napi::Result<()> {
+    session.push_chunk(path, chunk)
+}
+
+#[napi(js_name = "hostedScanSessionEndFile")]
+pub fn hosted_scan_session_end_file(
+    session: &mut External<NativeHostedScanSession>,
+    path: String,
+) -> napi::Result<()> {
+    session.end_file(path)
+}
+
+#[napi(js_name = "hostedScanSessionMarkPresent")]
+pub fn hosted_scan_session_mark_present(
+    session: &mut External<NativeHostedScanSession>,
+    path: String,
+    kind: String,
+) -> napi::Result<()> {
+    session.mark_present(path, kind)
+}
+
+#[napi(js_name = "hostedScanSessionFinish")]
+pub fn hosted_scan_session_finish<'env>(
+    env: &'env Env,
+    session: &mut External<NativeHostedScanSession>,
+) -> napi::Result<PromiseRaw<'env, NativeFinishOutcome>> {
+    session.finish(env)
+}
+
+#[napi(js_name = "hostedScanSessionCancel")]
+pub fn hosted_scan_session_cancel(session: &mut External<NativeHostedScanSession>) {
+    session.cancel();
 }
