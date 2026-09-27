@@ -6548,6 +6548,17 @@ mod tests {
                 ours(11)
             ),
             format!("[dependencies]\nlibc = {{ registry = \"{}\"\n", ours(12)),
+            // Literal strings and quoted keys (#256 reads these as TOML).
+            format!("[dependencies]\nserde = {{ version = '1', registry = '{}' }}\n", ours(13)),
+            format!(
+                "[dependencies.alias]\npackage = 'libc'\nregistry = '{}' # c\n",
+                ours(14)
+            ),
+            format!("[dependencies]\ncc.registry = '{}'\n", ours(15)),
+            format!(
+                "[dependencies]\nx = {{ \"package\" = 'serde', \"registry\" = \"{}\" }}\n",
+                ours(16)
+            ),
         ];
         let crates = [
             "serde", "legacy", "cfg-if", "old", "libc", "cc", "x", "app", "nope",
