@@ -1051,3 +1051,53 @@ async fn cargo_rerun_over_a_drifted_copy_reports_the_deferred_fetch_first() {
     assert_eq!(gets().await, before + 1, "one pristine download");
     assert_eq!(std::fs::read(&copy_lib).unwrap(), PATCHED, "rebuilt");
 }
+
+/// A lockfile-only pnpm package its backend refuses on the lock text alone
+/// (a peer-suffixed snapshot key it cannot rewire) is never fetched: the
+/// pristine download is deferred to the backend, which refuses before it
+/// reads anything, so the run makes no registry request and reports the
+/// real reason. With the registry unreachable, the old eager fetch failed
+/// first (`vendor_fetch_failed`) and hid it.
+#[test]
+fn a_lockfile_only_package_refused_on_lock_text_is_never_fetched() {
+    const UUID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const PURL: &str = "pkg:npm/pkg-b@1.0.0";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "t", "version": "0.0.0", "dependencies": { "pkg-b": "1.0.0" } }"#,
+    )
+    .unwrap();
+    let sri = format!("sha512-{}==", "A".repeat(86));
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  \
+             excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      \
+             pkg-b:\n        specifier: 1.0.0\n        version: 1.0.0(peer-x@1.0.0)\n\n\
+             packages:\n\n  pkg-b@1.0.0:\n    resolution: {{integrity: {sri}}}\n    \
+             peerDependencies:\n      peer-x: '*'\n\nsnapshots:\n\n  \
+             pkg-b@1.0.0(peer-x@1.0.0): {{}}\n"
+        ),
+    )
+    .unwrap();
+    write_manifest(
+        root,
+        PURL,
+        UUID,
+        "package/index.js",
+        b"before\n",
+        b"after\n",
+    );
+    let dead = dead_endpoint();
+
+    let (code, v, stderr) = run_vendor(root, &dead, &[], &[]);
+    assert_eq!(code, 1, "a refused package fails the run: {v:#}\n{stderr}");
+    assert_eq!(
+        purl_events(&v, PURL),
+        vec![("failed", "vendor_lock_entry_unsupported")],
+        "the backend's own refusal, with no fetch before it: {v:#}\n{stderr}"
+    );
+    assert!(!root.join(".socket/vendor").exists(), "nothing vendored");
+}

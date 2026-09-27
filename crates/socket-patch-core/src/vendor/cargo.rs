@@ -812,6 +812,26 @@ async fn cargo_wet_preflight(
     }
 }
 
+/// The cargo backend's locked-version refusal of `record` — `Cargo.lock`
+/// does not resolve the patched version — when it is the first refusal
+/// [`vendor_cargo_crate`] raises (its coordinate and in-tree `vendor/`
+/// checks come first), as `(code, detail)` in the backend's own words. It
+/// reads nothing of the patch, so a vendored run consults it before it
+/// fetches views and pristine sources.
+pub async fn lock_text_refusal(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Option<(&'static str, String)> {
+    match cargo_prelude(purl, project_root, record).await {
+        Err(VendorOutcome::Refused {
+            code: code @ "locked_version_mismatch",
+            detail,
+        }) => Some((code, detail)),
+        _ => None,
+    }
+}
+
 /// Whether [`vendor_cargo_crate`] — a wet run with the service enabled —
 /// asks the patch service for `record`: past every refusal it raises first
 /// ([`cargo_prelude`], [`cargo_wet_preflight`]) and not answered by the
@@ -3683,6 +3703,32 @@ mod tests {
         root.join(format!(
             ".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/src/lib.rs"
         ))
+    }
+
+    /// The locked-version refusal is exactly the backend's own — code and
+    /// words — and only when it is the first refusal the backend raises:
+    /// an in-tree `cargo vendor` copy refuses first, and is not lock text.
+    #[tokio::test]
+    async fn lock_text_refusal_is_the_backends_first_refusal() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        assert_eq!(lock_text_refusal(PURL, root, &record).await, None);
+        for purl in ["pkg:cargo/cfg-if@9.9.9", "pkg:cargo/absent@1.0.0"] {
+            let early = lock_text_refusal(purl, root, &record).await;
+            let VendorOutcome::Refused { code, detail } =
+                run_vendor(purl, root, &blobs, &pristine, &record, false).await
+            else {
+                panic!("the backend must refuse {purl}");
+            };
+            assert_eq!(code, "locked_version_mismatch");
+            assert_eq!(early, Some((code, detail)), "{purl}");
+        }
+        std::fs::create_dir_all(root.join("vendor/cfg-if-9.9.9")).unwrap();
+        assert_eq!(
+            lock_text_refusal("pkg:cargo/cfg-if@9.9.9", root, &record).await,
+            None,
+            "an earlier, non-lock refusal keeps the loop's own path"
+        );
     }
 
     /// The download plan's gate names exactly the crates whose vendor call

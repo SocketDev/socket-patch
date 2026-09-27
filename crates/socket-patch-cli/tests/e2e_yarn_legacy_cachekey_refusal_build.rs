@@ -406,9 +406,12 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
     );
     eprintln!("({tag}) HOSTED REFUSAL OK");
 
-    // 4. VENDORED refusal: per-package failed event, exit 1, partial_failure,
-    //    zero mutations, no vendor artifacts. The download block proves the
-    //    refusal fires at the WIRING step, not by failing discovery.
+    // 4. VENDORED refusal: exit 1, partial_failure, zero mutations, no
+    //    vendor artifacts. The cacheKey gate reads only the lock, so the
+    //    vendored download phase refuses the package BEFORE fetching its
+    //    view (a package that will be refused costs no network): a failed
+    //    download record carrying the backend's code and words, and nothing
+    //    left for the vendor step.
     let vendored_args: Vec<String> = api_args("vendored");
     let vendored_argv: Vec<&str> = vendored_args.iter().map(String::as_str).collect();
     let (code, stdout, stderr) = run_socket(&proj, &vendored_argv);
@@ -422,23 +425,25 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
     });
     assert_eq!(env["status"], "partial_failure", "({tag}) envelope: {env}");
     assert_eq!(
-        env["download"]["downloaded"], 1,
-        "({tag}) the patch must download fine — the refusal is at the wiring step: {env}"
+        (&env["download"]["downloaded"], &env["download"]["failed"]),
+        (&serde_json::json!(0), &serde_json::json!(1)),
+        "({tag}) the lock-text refusal fires before the view fetch: {env}"
     );
-    let events = env["vendor"]["events"]
+    let failed = env["download"]["patches"]
         .as_array()
-        .unwrap_or_else(|| panic!("({tag}) vendor.events must be an array: {env}"));
-    let failed = events
-        .iter()
-        .find(|e| e["action"] == "failed" && e["purl"] == PURL)
-        .unwrap_or_else(|| panic!("({tag}) expected a per-package failed event for {PURL}: {env}"));
+        .and_then(|p| p.iter().find(|r| r["purl"] == PURL))
+        .unwrap_or_else(|| panic!("({tag}) expected a download record for {PURL}: {env}"));
+    assert_eq!(failed["action"], "failed", "({tag}) {failed}");
     assert_eq!(
         failed["errorCode"], "vendor_yarn_berry_cache_unsupported",
         "({tag}) the refusal must be the CODE, not human text: {failed}"
     );
-    assert_eq!(
-        env["vendor"]["summary"]["failed"], 1,
-        "({tag}) vendor summary: {env}"
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("`{expected_cache_key}`")),
+        "({tag}) the refusal detail is the backend's own, naming the cacheKey: {failed}"
     );
     assert_eq!(
         env["vendor"]["summary"]["applied"], 0,

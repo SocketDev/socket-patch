@@ -1866,6 +1866,55 @@ pub(crate) async fn vendor_records_reusing(
                     *rung = MissingRung::Deferred;
                 }
             }
+            // A missing npm or cargo purl its backend refuses on the
+            // project's lock text alone (see `vendor::lock_text_refusals`:
+            // the pnpm / yarn classic / yarn berry gates, cargo's locked
+            // version) is deferred rather than fetched: the backend refuses
+            // it — at its turn, in its own words — before anything reads
+            // the source, so the refusal costs no registry request. A purl
+            // the hosted redirect ledger claims keeps the eager fetch: its
+            // takeover reverts the hosted lock edits first, which rewrites
+            // the text the gates read (and a malformed redirect ledger
+            // defers nothing).
+            let lock_candidates: Vec<(&str, &str)> = missing
+                .iter()
+                .zip(&rungs)
+                .filter(|(_, (_, rung))| matches!(rung, MissingRung::Fetch))
+                .filter_map(|(purl, _)| {
+                    records
+                        .get(purl)
+                        .map(|record| (purl.as_str(), record.uuid.as_str()))
+                })
+                .filter(|(purl, _)| {
+                    matches!(
+                        vendor::ecosystem_dir_for_purl(purl),
+                        Some("npm") | Some("cargo")
+                    )
+                })
+                .collect();
+            if !lock_candidates.is_empty() {
+                let claimed: Option<Vec<String>> =
+                    match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
+                    {
+                        Ok(Some(state)) => {
+                            Some(state.records.keys().map(|k| canonical_purl(k)).collect())
+                        }
+                        Ok(None) => Some(Vec::new()),
+                        Err(_) => None,
+                    };
+                if let Some(claimed) = claimed {
+                    let unclaimed: Vec<(&str, &str)> = lock_candidates
+                        .into_iter()
+                        .filter(|(purl, _)| !claimed.contains(&canonical_purl(purl)))
+                        .collect();
+                    let refused = vendor::lock_text_refusals(&common.cwd, &unclaimed).await;
+                    for (purl, (_, rung)) in missing.iter().zip(rungs.iter_mut()) {
+                        if matches!(rung, MissingRung::Fetch) && refused.contains_key(purl) {
+                            *rung = MissingRung::Deferred;
+                        }
+                    }
+                }
+            }
             // A NOT-INSTALLED gem can only be vendored through the patch
             // service. The bundler path source the gem backend wires needs
             // the eval-able stub gemspec rubygems writes into

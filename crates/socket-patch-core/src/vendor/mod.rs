@@ -926,6 +926,56 @@ pub async fn service_preflight(
     }
 }
 
+/// The lock-text refusals among `candidates` (purls with the uuid of the
+/// patch to vendor): each purl its backend refuses on the project's lock
+/// and manifest text alone, with the backend's `(code, detail)` — the pnpm,
+/// yarn classic and yarn berry gates ([`npm_flavor::lock_text_refusals`])
+/// and cargo's locked-version gate ([`cargo::lock_text_refusal`]). None of
+/// them reads the patch, so the answer needs no view: a vendored run asks
+/// before it fetches views and pristine sources, and a package that will
+/// be refused costs no network.
+pub async fn lock_text_refusals(
+    project_root: &Path,
+    candidates: &[(&str, &str)],
+) -> HashMap<String, (&'static str, String)> {
+    let record = |uuid: &str| crate::manifest::schema::PatchRecord {
+        uuid: uuid.to_string(),
+        exported_at: String::new(),
+        files: HashMap::new(),
+        vulnerabilities: HashMap::new(),
+        description: String::new(),
+        license: String::new(),
+        tier: String::new(),
+    };
+    let mut refusals = HashMap::new();
+    let npm: Vec<(&str, crate::manifest::schema::PatchRecord)> = candidates
+        .iter()
+        .filter(|(purl, _)| ecosystem_dir_for_purl(purl) == Some("npm"))
+        .map(|(purl, uuid)| (*purl, record(uuid)))
+        .collect();
+    if !npm.is_empty() {
+        let packages: Vec<(&str, &crate::manifest::schema::PatchRecord)> =
+            npm.iter().map(|(purl, record)| (*purl, record)).collect();
+        for ((purl, _), refusal) in packages
+            .iter()
+            .zip(npm_flavor::lock_text_refusals(project_root, &packages).await)
+        {
+            if let Some(refusal) = refusal {
+                refusals.insert(purl.to_string(), refusal);
+            }
+        }
+    }
+    for (purl, uuid) in candidates {
+        if ecosystem_dir_for_purl(purl) == Some("cargo") {
+            if let Some(refusal) = cargo::lock_text_refusal(purl, project_root, &record(uuid)).await
+            {
+                refusals.insert(purl.to_string(), refusal);
+            }
+        }
+    }
+    refusals
+}
+
 /// [`VendorState::purl_keys`] over the ledger in `project_root`, loaded
 /// once for callers that match whole purl sets against vendor ownership
 /// (apply / rollback / scan prune). An unreadable ledger degrades to the

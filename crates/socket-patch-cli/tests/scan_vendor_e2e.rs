@@ -2541,8 +2541,10 @@ snapshots:
     /// A package the loop refuses before its first service call costs ZERO
     /// download grants: the plan is built from the backend's own pre-flight,
     /// so `pkg-b` is never asked for, while `pkg-a` and `pkg-c` — which the
-    /// loop does ask for — cost exactly one grant each. The refusal itself
-    /// is still the loop's, reported as it always was.
+    /// loop does ask for — cost exactly one grant each. `pkg-b`'s refusal
+    /// reads only pnpm-lock.yaml, so the download phase raises it before
+    /// fetching its view — the backend's code and words on a failed download
+    /// record — and it costs no request at all.
     #[tokio::test]
     async fn a_package_the_loop_refuses_costs_zero_grants() {
         // The plan is only built when the run may keep more than one
@@ -2566,17 +2568,28 @@ snapshots:
         let v: serde_json::Value = serde_json::from_str(stdout.trim())
             .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"));
         let events = v["vendor"]["events"].as_array().expect("vendor events");
-        let event_for = |name: &str| {
-            events
-                .iter()
-                .find(|e| e["purl"] == purl(name))
-                .unwrap_or_else(|| panic!("no vendor event for {name}: {v}"))
-        };
-        assert_eq!(event_for("pkg-a")["action"], "applied", "{v}");
-        assert_eq!(event_for("pkg-c")["action"], "applied", "{v}");
-        let refused = event_for("pkg-b");
+        let event_for = |name: &str| events.iter().find(|e| e["purl"] == purl(name));
+        assert_eq!(
+            event_for("pkg-a").expect("pkg-a event")["action"],
+            "applied",
+            "{v}"
+        );
+        assert_eq!(
+            event_for("pkg-c").expect("pkg-c event")["action"],
+            "applied",
+            "{v}"
+        );
+        assert!(
+            event_for("pkg-b").is_none(),
+            "refused before the vendor step: {v}"
+        );
+        let refused = v["download"]["patches"]
+            .as_array()
+            .and_then(|p| p.iter().find(|r| r["purl"] == purl("pkg-b")))
+            .unwrap_or_else(|| panic!("no download record for pkg-b: {v}"));
         assert_eq!(refused["action"], "failed", "{v}");
         assert_eq!(refused["errorCode"], "vendor_lock_entry_unsupported", "{v}");
+        assert_eq!(v["download"]["failed"], 1, "{v}");
 
         let mut granted = granted_uuids(&mock).await;
         granted.sort();
@@ -2585,6 +2598,18 @@ snapshots:
             vec![UUID_A.to_string(), UUID_C.to_string()],
             "exactly one grant per package the loop reaches the service for, and none \
              for the package it refuses first"
+        );
+        let viewed: Vec<String> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().contains("/patches/view/"))
+            .map(|r| r.url.path().rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert!(
+            !viewed.contains(&UUID_B.to_string()),
+            "a package refused on lock text alone costs no view: {viewed:?}"
         );
     }
 }

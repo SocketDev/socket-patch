@@ -423,6 +423,71 @@ pub async fn preflight_packages(
     }
 }
 
+/// The lock-text refusals [`vendor_npm_any`] raises for `packages` in a
+/// pnpm, yarn classic or yarn berry project — each package's `(code,
+/// detail)` when its backend refuses it on the project's lock and manifest
+/// text alone, `None` otherwise (and for every package of any other
+/// flavor, or a project the flavor probe refuses).
+///
+/// Those backends evaluate every such gate — the coordinates, the lock and
+/// manifest reads, override conflicts, the entry present and rewritable —
+/// before they first read the package or its patch, dry run or not. So a
+/// package [`preflight_packages`] refuses is refused again here by the
+/// backend itself, dry-run, with no source and no patch content: its code
+/// must be the pre-flight's, and its detail is the backend's own words. A
+/// vendored run consults this before it fetches views and pristine
+/// sources, so a package that will be refused costs no network at all.
+pub async fn lock_text_refusals(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Option<(&'static str, String)>> {
+    let flavor = match detect_npm_lock_flavor(project_root).await {
+        Ok((flavor, _)) => flavor,
+        Err(_) => return vec![None; packages.len()],
+    };
+    if !matches!(
+        flavor,
+        NpmLockFlavor::Pnpm | NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry
+    ) {
+        return vec![None; packages.len()];
+    }
+    let verdicts = preflight_packages(project_root, packages).await;
+    let nowhere = Path::new("");
+    let no_sources = PatchSources {
+        blobs_path: nowhere,
+        packages_path: None,
+        diffs_path: None,
+        mem_blobs: None,
+    };
+    let mut refusals = Vec::with_capacity(packages.len());
+    for ((purl, record), verdict) in packages.iter().zip(verdicts) {
+        let Err(code) = verdict else {
+            refusals.push(None);
+            continue;
+        };
+        let outcome = vendor_npm_any(
+            purl,
+            nowhere,
+            project_root,
+            record,
+            &no_sources,
+            "",
+            true,
+            false,
+            None,
+        )
+        .await;
+        refusals.push(match outcome {
+            VendorOutcome::Refused {
+                code: refused,
+                detail,
+            } if refused == code => Some((refused, detail)),
+            _ => None,
+        });
+    }
+    refusals
+}
+
 /// Is this npm-vendored entry still consumed by its lockfile's dependency
 /// graph?
 ///
@@ -539,6 +604,112 @@ pub async fn revert_npm_any_opts(
             "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
              socket-patch and re-run"
         )),
+    }
+}
+
+#[cfg(test)]
+mod lock_text_refusal_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const UUID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn record() -> PatchRecord {
+        PatchRecord {
+            uuid: UUID.to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    /// A pnpm 9 project: `pkg-a` plain, `pkg-b` behind a peer-suffixed
+    /// snapshot key (which the pnpm backend cannot rewire), nothing else.
+    fn pnpm_project(root: &Path) {
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "t", "version": "0.0.0", "dependencies": { "pkg-a": "1.0.0", "pkg-b": "1.0.0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      pkg-a:\n        specifier: 1.0.0\n        version: 1.0.0\n      pkg-b:\n        specifier: 1.0.0\n        version: 1.0.0(peer-x@1.0.0)\n\npackages:\n\n  pkg-a@1.0.0:\n    resolution: {integrity: sha512-AAAA==}\n\n  pkg-b@1.0.0:\n    resolution: {integrity: sha512-BBBB==}\n    peerDependencies:\n      peer-x: '*'\n\nsnapshots:\n\n  pkg-a@1.0.0: {}\n\n  pkg-b@1.0.0(peer-x@1.0.0): {}\n",
+        )
+        .unwrap();
+    }
+
+    /// Every lock-text refusal is exactly the one the backend's own WET
+    /// call returns — code and words — and a package the backend accepts
+    /// has none.
+    #[tokio::test]
+    async fn pnpm_refusals_are_the_backends_own_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        pnpm_project(root);
+        let rec = record();
+        let purls = [
+            "pkg:npm/pkg-a@1.0.0",
+            "pkg:npm/pkg-b@1.0.0",
+            "pkg:npm/pkg-z@1.0.0",
+        ];
+        let packages: Vec<(&str, &PatchRecord)> = purls.iter().map(|p| (*p, &rec)).collect();
+        let refusals = lock_text_refusals(root, &packages).await;
+        assert_eq!(refusals[0], None, "pkg-a is wireable");
+        let nowhere = root.join("not-installed");
+        let sources = PatchSources {
+            blobs_path: &nowhere,
+            packages_path: None,
+            diffs_path: None,
+            mem_blobs: None,
+        };
+        for (i, code) in [
+            (1, "vendor_lock_entry_unsupported"),
+            (2, "vendor_lock_entry_not_found"),
+        ] {
+            let backend = vendor_npm_any(
+                purls[i],
+                nowhere.as_path(),
+                root,
+                &rec,
+                &sources,
+                "t",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let VendorOutcome::Refused { code: got, detail } = backend else {
+                panic!("the backend must refuse {}", purls[i]);
+            };
+            assert_eq!(got, code);
+            assert_eq!(refusals[i], Some((got, detail)), "{}", purls[i]);
+        }
+    }
+
+    /// Only the pnpm / yarn classic / yarn berry gates answer: a
+    /// package-lock project refuses nothing here, whatever its backend does.
+    #[tokio::test]
+    async fn other_flavors_refuse_nothing_early() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"t","version":"0.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{"name":"t","version":"0.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"t","version":"0.0.0"}}}"#,
+        )
+        .unwrap();
+        let rec = record();
+        assert_eq!(
+            lock_text_refusals(root, &[("pkg:npm/pkg-z@1.0.0", &rec)]).await,
+            vec![None]
+        );
     }
 }
 

@@ -1811,6 +1811,44 @@ impl FetchBatch {
     }
 }
 
+/// Selected purls the vendor backend will refuse on the project's lock
+/// text alone, with the backend's `(code, detail)`.
+type LockRefusals = HashMap<String, (&'static str, String)>;
+
+/// The lock-text refusals of the vendored download phase (see
+/// [`socket_patch_core::vendor::lock_text_refusals`]: the pnpm / yarn
+/// classic / yarn berry gates and cargo's locked-version gate), over the
+/// patches the phase would otherwise fetch a view for — past the Bun
+/// refusal and the ledger's idempotency skip, which take precedence in the
+/// fetch loop. A purl the hosted redirect ledger claims is left to the
+/// vendor loop: its takeover reverts the hosted lock edits first, and the
+/// revert rewrites the very text the gates read. A redirect ledger that
+/// cannot be read leaves every purl to the loop.
+async fn lock_text_refusals_for(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+    ledger: &VendorState,
+    bun_refusal: Option<&BunVendorRefusal>,
+) -> LockRefusals {
+    let claimed: Vec<String> =
+        match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
+            Ok(Some(state)) => state.records.keys().map(|k| canonical_purl(k)).collect(),
+            Ok(None) => Vec::new(),
+            Err(_) => return HashMap::new(),
+        };
+    let candidates: Vec<(&str, &str)> = selected
+        .iter()
+        .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
+        .filter(|sr| {
+            detached_ledger_record(RecordStore::Ledger(&ledger.entries), &sr.purl, &sr.uuid)
+                .is_none()
+        })
+        .filter(|sr| !claimed.contains(&canonical_purl(&sr.purl)))
+        .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
+        .collect();
+    socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await
+}
+
 /// The record a detached ledger entry already carries for `purl` at
 /// exactly `uuid` — the ledger store's idempotency skip (no view fetch).
 /// Always `None` for the manifest store.
@@ -1833,6 +1871,7 @@ fn detached_ledger_record<'a>(
 /// already holds the view), the no-applicable-files guardrail, optional
 /// blob persistence, and every per-patch failure record. Every pinned
 /// stderr line and JSON action lives here once.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_selected_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
@@ -1840,6 +1879,7 @@ async fn fetch_selected_patches(
     store: RecordStore<'_>,
     blobs_dir: Option<&Path>,
     bun_refusal: Option<&BunVendorRefusal>,
+    lock_refusals: &LockRefusals,
     mut prefetched: HashMap<String, PatchResponse>,
 ) -> FetchBatch {
     let quiet = params.quiet();
@@ -1893,6 +1933,7 @@ async fn fetch_selected_patches(
         .filter(|sr| {
             bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none()
                 && detached_ledger_record(store, &sr.purl, &sr.uuid).is_none()
+                && !lock_refusals.contains_key(&sr.purl)
                 && !held.remove(sr.uuid.as_str())
         })
         .map(|sr| sr.uuid.as_str())
@@ -1940,6 +1981,22 @@ async fn fetch_selected_patches(
             }));
             batch.reused.push((purl.to_string(), record));
             batch.skipped += 1;
+            continue;
+        }
+
+        // Lock-text refusal (see `lock_text_refusals_for`): the vendor
+        // backend refuses this package on the project's lock alone, so its
+        // view is never fetched (nor, downstream, its pristine source) —
+        // reported with the backend's code and words, as the Bun refusal is.
+        if let Some((code, detail)) = lock_refusals.get(purl) {
+            batch.fail(
+                params.json,
+                Some(format!("[error] {purl} ({code}): {detail}")),
+                purl,
+                uuid,
+                detail,
+                Some(code),
+            );
             continue;
         }
 
@@ -2178,6 +2235,8 @@ async fn download_patch_records_preflighted(
     bun_refusal: Option<&BunVendorRefusal>,
 ) -> DetachedDownload {
     let vendor_state = vendor_state.unwrap_or_default();
+    let lock_refusals =
+        lock_text_refusals_for(&params.cwd, selected, &vendor_state, bun_refusal).await;
 
     let blobs_dir = params.socket_dir().join("blobs");
     let batch = fetch_selected_patches(
@@ -2187,6 +2246,7 @@ async fn download_patch_records_preflighted(
         RecordStore::Ledger(&vendor_state.entries),
         params.persist_blobs.then_some(blobs_dir.as_path()),
         bun_refusal,
+        &lock_refusals,
         prefetched,
     )
     .await;
@@ -2405,6 +2465,7 @@ pub async fn download_and_apply_patches_with(
         RecordStore::Manifest(&manifest),
         params.persist_blobs.then_some(blobs_dir.as_path()),
         None,
+        &HashMap::new(),
         HashMap::new(),
     )
     .await;

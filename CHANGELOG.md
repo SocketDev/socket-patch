@@ -31,6 +31,33 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed (BREAKING)
 
+- **Vendored runs refuse lock-text failures before downloading them.**
+  `scan --mode vendored` and `get --mode vendored` evaluate the vendor
+  backends' pure lock-text gates — pnpm, yarn classic and yarn berry
+  (coordinates; the lock / manifest reads and their line-ending, version,
+  `cacheKey` and `.yarnrc.yml` gates; override and `resolutions`
+  conflicts; the lock entry present and rewritable) and cargo's
+  `locked_version_mismatch` when it is the crate's first refusal — before
+  fetching patch views and pristine sources, so a package that will be
+  refused costs no network. Such a package is now reported in the download
+  phase: `download.patches[]` records it as `action: "failed"` with the
+  backend's exact `errorCode` and `error`, `download.downloaded` drops and
+  `download.failed` rises by the number of such packages, and the vendor
+  envelope no longer carries their `failed` events (`vendor.summary.failed`
+  drops by the same number) nor, for lockfile-only packages, their
+  `vendor_fetched_missing` events. Exit code and `status` are unchanged.
+  (The interactive human `scan --vendor` arm still fetches the views its
+  pre-prompt baseline check verifies.) Purls the hosted redirect ledger
+  claims keep the vendor loop's refusal.
+  The manifest-driven `vendor` command keeps its `failed` events but no
+  longer fetches the pristine source of a lockfile-only package it refuses
+  this way (no `vendor_fetched_missing` event, no registry request; with an
+  unreachable registry the gate's code replaces `vendor_fetch_failed`).
+  On the polyglot monorepo fixture: 80 of 560 packages (74
+  `vendor_lock_entry_not_found`, 4 `vendor_override_conflict`, 2
+  `vendor_lock_entry_unsupported`) move to the download phase, saving 80
+  view requests and 3 registry tarballs per run.
+
 - **Vendored cargo copies carry a tagged version: `<version>+socket.<uuid>`.**
   The vendored copy's own `Cargo.toml` `[package] version` is rewritten to
   the patch-tagged version (`1.0.4+socket.<uuid>`; a version that already
