@@ -84,10 +84,10 @@ fn run_get_auth(
 /// Multiple FREE patches for one package + JSON mode + no explicit
 /// selection: emits `status: selection_required` with the full
 /// candidate list. Covers the `JsonModeNeedsExplicit` arm of
-/// `select_patches` (commands/get.rs ~481-517).
+/// `select_patches` (commands/get.rs).
 ///
 /// NOTE: `canAccessPaidPatches` MUST be false here. With paid access the
-/// command auto-picks the newest patch and never reaches the
+/// command auto-picks the top-ranked patch (see api::ranking) and never reaches the
 /// selection-required branch — so a `true` here would silently exercise
 /// a completely different (download) path while still "passing" a loose
 /// assertion.
@@ -177,8 +177,8 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
     // instruction must be one the CLI actually accepts. `--id` is a boolean
     // type-tag (see get_id_flag_does_not_accept_a_value below), so selection
     // happens by re-running with the chosen UUID as the positional
-    // identifier; the old "Specify --id <UUID>" wording sent users straight
-    // into a clap usage error.
+    // identifier; a "Specify --id <UUID>" instruction would send users
+    // straight into a clap usage error.
     let err = v["error"].as_str().unwrap_or("");
     assert!(
         !err.contains("--id <"),
@@ -198,10 +198,8 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
 /// This contract is why the `selection_required` wording matters:
 /// selection happens by re-running with the chosen UUID as the positional
 /// identifier (`get <uuid> --id`), never by passing a value to `--id`.
-/// The envelope's error text used to instruct the impossible
-/// "Specify --id <UUID>" form; the selection test above pins the
-/// corrected instruction, and this test locks the boolean CLI contract
-/// it depends on.
+/// The selection test above pins the instruction, and this test locks the
+/// boolean CLI contract it depends on.
 #[tokio::test]
 async fn get_id_flag_does_not_accept_a_value() {
     let mock = MockServer::start().await; // must never be reached

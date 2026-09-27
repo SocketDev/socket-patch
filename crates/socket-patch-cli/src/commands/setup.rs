@@ -467,8 +467,7 @@ fn is_member_excluded(manifest_path: &Path, cwd: &Path, excludes: &[String]) -> 
 
 /// This run's ONE read of `.socket/manifest.json`, shared by the exclude
 /// resolution, the `--exclude` persistence's already-persisted check and
-/// `--check`'s patch-consistency pass (each used to parse the same bytes
-/// again).
+/// `--check`'s patch-consistency pass.
 async fn read_setup_manifest(common: &GlobalArgs) -> io::Result<Option<PatchManifest>> {
     read_manifest(&common.resolved_manifest_path()).await
 }
@@ -1110,7 +1109,7 @@ async fn finalize_gem(common: &GlobalArgs) -> Vec<String> {
 /// Append gem check entries (the Gemfile `plugin` directive + the generated
 /// plugin dir) to the shared `run_check` entries list. Returns whether a
 /// Bundler project was found. Checks the SETUP wiring only — patch consistency
-/// is `apply --check`.
+/// is the shared `append_patch_consistency_entries` pass.
 async fn append_gem_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
@@ -1327,13 +1326,14 @@ fn format_check_footer(hooks: usize, drifted: usize, errors: usize) -> String {
     format!("{}. {}", problems.join(", "), advice.join(" "))
 }
 
-/// Read-only verification that every discovered manifest (npm package.json and
-/// the Python dependency manifest) is configured for socket-patch. Never writes
-/// (so `--dry-run` is a harmless no-op here). Exits 0 only when all are
-/// configured and none failed to parse.
 /// The status line while `setup --check` / `--remove` discover manifests.
 const SEARCHING: &str = "Searching for package.json / Python / Bundler / Composer manifests...";
 
+/// Read-only verification that every discovered install hook (npm
+/// package.json, the Python dependency manifest, the Bundler plugin, the
+/// Composer script) is configured for socket-patch, plus the shared
+/// patch-consistency pass. Never writes (so `--dry-run` is a harmless no-op
+/// here). Exits 0 only when all are configured and none failed to parse.
 async fn run_check(args: &SetupArgs) -> i32 {
     // `--silent` is "errors only" (CLI_CONTRACT.md): suppress the entire
     // human-readable report, mirroring `list`/`repair`/`get`/`remove`/`scan`.
@@ -1527,7 +1527,7 @@ fn render_removed(new: &Option<String>) -> String {
 }
 
 /// Revert the install hooks `setup` added (npm package.json scripts, the
-/// Python `socket-patch-hook` dependency, the gem Bundler plugin wiring and
+/// Python `socket-patch[hook]` dependency, the gem Bundler plugin wiring and
 /// the Composer script). Honors `--dry-run`, `--yes`, `--json`.
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;

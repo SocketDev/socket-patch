@@ -31,8 +31,9 @@
 //!      `vendor --vex`.
 //!
 //! The detached twin (`yarn_classic_detached_scan_vendored_…`) produces the
-//! state with `scan --mode vendored --detached` against a wiremock Socket
-//! API instead — the vendored shape that never has a manifest — and runs the
+//! state with `scan --mode vendored` (plus the kept-for-compat no-op
+//! `--detached`) against a wiremock Socket API instead — the manifest-free
+//! shape every vendored run has — and runs the
 //! same fresh-checkout install + manifest-less VEX matrix (plus the embedded
 //! re-scan).
 //!
@@ -621,8 +622,8 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
 
 // ── detached vendoring from the patch API (the manifest-less shape) ────
 
-/// `scan --mode vendored --detached` against a wiremock Socket API: the
-/// vendored posture that NEVER has a `.socket/manifest.json` (the vendor
+/// `scan --mode vendored` (with the legacy no-op `--detached`) against a
+/// wiremock Socket API: vendored mode NEVER writes `.socket/manifest.json` (the vendor
 /// ledger embeds the record) — the shape a depscan-opened PR commits. The
 /// scan discovers the dep (batch search), the record (with `blobContent`)
 /// comes from the mocked `view/<uuid>` and the tarball is built locally

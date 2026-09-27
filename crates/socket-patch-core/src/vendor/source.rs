@@ -1,16 +1,12 @@
 //! What a vendor backend stages the pristine package from.
 //!
-//! A backend used to be handed a directory that always existed: the
-//! crawler's installed location, or the tree the pristine-source ladder had
-//! already extracted into a private tempdir. Most runs never read it — the
-//! committed-artifact reuse, the in-sync hot path and the vendoring service
-//! all answer from bytes the project already has — so on a lockfile-only
-//! checkout the ladder wrote a whole package tree per purl and deleted it
-//! again at the end of the run.
+//! Most runs never read the pristine tree — the committed-artifact reuse,
+//! the in-sync hot path and the vendoring service all answer from bytes the
+//! project already has — so extracting a whole package tree per purl on a
+//! lockfile-only checkout would be wasted work.
 //!
-//! [`PackageSource`] keeps the fetch, the size caps and the integrity
-//! verification exactly where they were and defers only the writing: the
-//! fetched artifact is validated against the extractor's own rules up front
+//! [`PackageSource`] does the fetch, the size caps and the integrity
+//! verification eagerly and defers only the writing: the fetched artifact is validated against the extractor's own rules up front
 //! (see [`super::registry_fetch::FetchedPackage`]) and materialises on the
 //! first branch that actually reads a file.
 //!
@@ -82,12 +78,11 @@ impl<'a> PackageSource<'a> {
     /// Stage the source freshly at `dst` — the vendor stage the local build
     /// patches and then swaps into the copy dir.
     ///
-    /// An installed tree is copied out of the registry/module cache, as it
-    /// always was. A pending artifact is written STRAIGHT here instead of
-    /// into its tempdir and copied out of it again: the extraction is the
-    /// same walk, so the stage gets the same files with the same bytes and
-    /// the same modes, and `skip_file_name` drops the same entries the copy
-    /// dropped. `dst` is removed and recreated either way.
+    /// An installed tree is copied out of the registry/module cache. A
+    /// pending artifact is written STRAIGHT here instead of into its tempdir
+    /// and copied out of it again: the extraction is the same walk, so the
+    /// stage gets the same files with the same bytes and the same modes, and
+    /// `skip_file_name` drops the same entries the copy drops. `dst` is removed and recreated either way.
     pub async fn stage_into(
         &self,
         dst: &Path,

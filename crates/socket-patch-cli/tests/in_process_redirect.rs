@@ -1789,9 +1789,9 @@ async fn partial_lockfile_write_failure_persists_ledger_originals() {
 // ── Rush monorepo ────────────────────────────────────────────────────────
 
 /// A Rush pnpm lock (v9) resolving the patched package under `packages:`, so
-/// the pnpm redirect rewriter has a `NAME@VERSION` block to repoint. `extra`
-/// lets a subspace lock resolve a DIFFERENT package name so the two locks are
-/// distinguishable in assertions.
+/// the pnpm redirect rewriter has a `NAME@VERSION` block to repoint.
+/// `pkg_name` is the package the lock resolves (both the common and the
+/// subspace lock pass `NAME`).
 fn rush_pnpm_lock(pkg_name: &str) -> String {
     format!(
         "lockfileVersion: '9.0'
@@ -3454,11 +3454,10 @@ async fn corrupt_ledger_dry_run_errors_without_moving_the_file() {
     );
 }
 
-/// D2 regression: hosted mode records patches ONLY in the redirect ledger —
-/// it never writes `.socket/manifest.json` — so `updates[]` (the documented
-/// read-only CI signal) must consult the ledger too. A pure hosted project
-/// whose redirected patch has been superseded used to report `updates: []`
-/// forever.
+/// Hosted mode records patches ONLY in the redirect ledger — it never
+/// writes `.socket/manifest.json` — so `updates[]` (the documented CI
+/// signal) must consult the ledger too, or a pure hosted project whose
+/// redirected patch has been superseded reports `updates: []` forever.
 #[tokio::test]
 #[serial]
 async fn scan_updates_reports_superseding_patch_for_ledger_only_project() {
@@ -3492,7 +3491,7 @@ async fn scan_updates_reports_superseding_patch_for_ledger_only_project() {
     )
     .unwrap();
 
-    // Plain read-only `scan --json` — the nightly CI shape from the finding.
+    // Bare `scan --json` (hosted by default) — the nightly CI shape.
     let out = scrubbed_cli()
         .args([
             "scan",

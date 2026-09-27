@@ -477,11 +477,10 @@ mod tests {
     // state ──
     //
     // The field doc promises `setup` is "omitted from the serialized form when
-    // empty so existing manifests are byte-stable." Before the fix, the skip
-    // predicate was `Option::is_none`, so a `Some` of an empty `SetupConfig`
-    // (which a load of `"setup": {}` produces, and which the also-then-dead
-    // `SetupConfig::is_empty` was written to detect) leaked a spurious
-    // `"setup":{}` key, breaking that contract.
+    // empty so existing manifests are byte-stable." A `Some` of an empty
+    // `SetupConfig` (which a load of `"setup": {}` produces) must not leak a
+    // spurious `"setup":{}` key, so the skip predicate (`setup_is_absent`)
+    // checks emptiness, not just `Option::is_none`.
 
     // A `Some` of an empty config must serialize byte-identically to `None`:
     // no `setup` key at all.

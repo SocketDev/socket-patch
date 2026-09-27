@@ -7,7 +7,7 @@
 //! `Cargo.lock` entry from the registry ([`super::cargo_lock`]) — without the
 //! lock edit, `cargo build --locked` fails closed on the un-relocked `[patch]`
 //! (spike-verified; the whole wiring is proven offline-from-Socket on a fresh
-//! checkout with an empty `CARGO_HOME` — `spikes/PHASE0-FINDINGS.txt`).
+//! checkout with an empty `CARGO_HOME`).
 //!
 //! The copy's own `Cargo.toml` version is TAGGED `<version>+socket.<uuid>`
 //! ([`super::cargo_tag`]) and the detached lock entry carries the same
@@ -233,13 +233,6 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
     }
 }
 
-/// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
-/// from a Socket hosted patch registry, or a manifest — the root or any
-/// workspace member — pins it to a `socket-patch-<uuid>` registry in any
-/// declaration shape (the shapes `scan --mode hosted` writes).
-/// Registry indexes are matched against the config-declared
-/// `[registries.socket-patch-*]` URLs, not a hardcoded host, so test
-/// registries are recognised too. `Some(description)` when residue is found.
 /// The run's parse of the workspace-root `Cargo.toml` for the per-crate
 /// pre-flight, which only reads it: a cargo vendor run asks it about every
 /// patched crate, and on an in-sync re-run the manifest never changes. See
@@ -259,6 +252,13 @@ static MANIFEST_MEMO: ParseMemo<toml_edit::DocumentMut> = ParseMemo::new();
 /// and costs the extraction plus the slot scan and bytes copy.
 static PIN_MEMO: ParseMemo<crate::patch::redirect::CargoRegistryPins, 512> = ParseMemo::new();
 
+/// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
+/// from a Socket hosted patch registry, or a manifest — the root or any
+/// workspace member — pins it to a `socket-patch-<uuid>` registry in any
+/// declaration shape (the shapes `scan --mode hosted` writes).
+/// Registry indexes are matched against the config-declared
+/// `[registries.socket-patch-*]` URLs, not a hardcoded host, so test
+/// registries are recognised too. `Some(description)` when residue is found.
 async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str) -> Option<String> {
     let socket_indexes = cargo_config::socket_registry_indexes(project_root).await;
     if let cargo_lock::LockEntryProbe::Source(src) =
@@ -622,7 +622,7 @@ async fn cargo_prelude(
         ));
     }
     // (b) The lock must resolve this exact version, or the `[patch]` would be
-    // unused and an unlocked build would silently re-lock (spike claim 6).
+    // unused and an unlocked build would silently re-lock.
     if let Some(locked) = cargo_lock::read_locked_versions(project_root).await {
         match locked.get(name) {
             Some(versions) if versions.contains(version) => {}
@@ -2355,14 +2355,9 @@ mod tests {
         out
     }
 
-    /// REGRESSION: cargo before 1.45 resolves every source-less lock entry
-    /// of a crate through ONE `[patch.crates-io]` path (the entry whose key
-    /// sorts last), so a second vendored version of the same crate cannot
-    /// build there — verified on the `rust:1.41-slim` image and cargo
-    /// 1.42/1.43/1.44, where the adversarial key order fails ``patch for
-    /// `cfg-if` … did not resolve to any crates`` even with a populated
-    /// index, while 1.45 and later build either order. The vendor says so
-    /// when the project does not promise a cargo that can take it.
+    /// A second vendored version of one crate cannot build on cargo before
+    /// 1.45 (see [`MULTI_VERSION_CARGO_MINOR`]): the vendor says so when the
+    /// project does not promise a cargo that can take it.
     #[tokio::test]
     async fn a_second_vendored_version_warns_unless_the_project_pins_cargo_1_45() {
         // One version: nothing to warn about.
@@ -2777,7 +2772,7 @@ mod tests {
         let entry = entry.unwrap();
         assert_eq!(entry.lock, None, "nothing was detached");
         assert_eq!(entry.wiring.len(), 1, "only the config wire is recorded");
-        // The copy + config still landed.
+        // The copy + manifest [patch] entry still landed.
         assert!(root.join(copy_rel()).join("src/lib.rs").exists());
         assert!(manifest_path(root).await.is_some());
     }
@@ -2801,7 +2796,7 @@ mod tests {
                 .exists(),
             "half-built copy must be rolled back"
         );
-        // No config entry, lock untouched.
+        // No manifest [patch] entry, lock untouched.
         assert!(manifest_path(root).await.is_none());
         assert_eq!(
             tokio::fs::read_to_string(root.join("Cargo.lock"))
@@ -2917,7 +2912,7 @@ mod tests {
             "error names the lock: {:?}",
             result.error
         );
-        // Unwound: config entry gone (file pruned), copy gone, lock unchanged.
+        // Unwound: manifest [patch] entry gone, copy gone, lock unchanged.
         assert!(manifest_path(root).await.is_none());
         assert!(!root.join(copy_rel()).exists());
         assert_eq!(
@@ -2933,9 +2928,8 @@ mod tests {
     /// formatter), then re-run with the patch content unavailable (empty
     /// blobs dir — the offline shape: a drifted file harvests no blob): the
     /// rebuild fails, but the previous — drifted yet buildable — copy, the
-    /// marker, the config entry, and the detached lock must all be left
-    /// exactly as they were. (Adapted from the audit probe
-    /// `audit_failed_rebuild_deletes_wired_artifact`.)
+    /// marker, the manifest [patch] entry, and the detached lock must all be left
+    /// exactly as they were.
     #[tokio::test]
     async fn test_failed_rebuild_preserves_live_wired_copy() {
         let (dir, blobs, pristine, record) = fixture().await;
@@ -3067,7 +3061,7 @@ mod tests {
     }
 
     /// AUDIT B1 (same destroy class, fresh path): when the pre-existing
-    /// config entry already points at THIS copy (wiring out of sync only
+    /// manifest [patch] entry already points at THIS copy (wiring out of sync only
     /// because the lock went corrupt post-vendor), a detach failure's unwind
     /// restores that entry — so the uuid dir it points at must survive, or
     /// the restored entry dangles and every build breaks.
@@ -3134,7 +3128,7 @@ mod tests {
         );
     }
 
-    /// AUDIT B4 (security_scratch_audit.rs REPRO 3): a user-authored entry
+    /// AUDIT B4: a user-authored entry
     /// whose path merely TRAVERSES a foreign checkout's
     /// `.socket/vendor/cargo/` is user-authored — vendor must refuse up
     /// front, never silently rewrite (or later delete) it.
@@ -3476,7 +3470,7 @@ mod tests {
     /// uuid dir swept afterwards — there is no revert-first). The lock is
     /// already in the detached shape from the first run, so the re-vendor
     /// must accept it as the desired state and succeed — never fail and
-    /// unwind the live config entry (which bricks every build: no `[patch]`
+    /// unwind the live manifest [patch] entry (which bricks every build: no `[patch]`
     /// entry left, source-less lock entry).
     #[tokio::test]
     async fn test_revendor_new_uuid_over_live_wiring_succeeds() {
@@ -3491,7 +3485,7 @@ mod tests {
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record2, false).await);
         assert!(result.success, "re-vendor must succeed: {:?}", result.error);
 
-        // The config entry is repointed at the new uuid's copy.
+        // The manifest [patch] entry is repointed at the new uuid's copy.
         let new_rel = format!(".socket/vendor/cargo/{UUID2}/cfg-if-1.0.4");
         assert_eq!(manifest_path(root).await.as_deref(), Some(new_rel.as_str()));
         // The new copy carries the patched bytes; the old uuid dir is left
@@ -3522,7 +3516,7 @@ mod tests {
 
     /// When the lock-detach step fails mid-re-vendor (here: the lock went
     /// corrupt, which the pre-flight cross-check deliberately skips), the
-    /// unwind must put the PRIOR socket-owned config entry back — dropping
+    /// unwind must put the PRIOR socket-owned manifest [patch] entry back — dropping
     /// it would destroy the first vendor's live wiring.
     #[tokio::test]
     async fn test_detach_failure_unwind_restores_prior_socket_entry() {
@@ -4911,13 +4905,13 @@ mod tests {
             .find(|w| w.code == "lock_restore_skipped")
             .unwrap_or_else(|| panic!("missing skip warning: {:?}", out.warnings));
         assert!(w.detail.contains("no longer exists"), "{}", w.detail);
-        // The rest still reverted: config entry gone, uuid dir gone.
+        // The rest still reverted: manifest [patch] entry gone, uuid dir gone.
         assert!(manifest_path(root).await.is_none());
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
     }
 
-    /// Revert fails CLOSED on a corrupt lock BEFORE touching the config
-    /// entry — a half-revert (entry dropped, lock still path-form) would
+    /// Revert fails CLOSED on a corrupt lock BEFORE touching the manifest
+    /// [patch] entry — a half-revert (entry dropped, lock still path-form) would
     /// break every `--locked` build with no breadcrumb.
     #[tokio::test]
     async fn test_revert_corrupt_lock_fails_closed() {
@@ -4940,7 +4934,7 @@ mod tests {
             "{:?}",
             out.error
         );
-        // Fail-closed: the config entry and the artifact both survive.
+        // Fail-closed: the manifest [patch] entry and the artifact both survive.
         assert_eq!(
             manifest_path(root).await.as_deref(),
             Some(copy_rel().as_str()),
@@ -6862,7 +6856,7 @@ mod tests {
                 ours(11)
             ),
             format!("[dependencies]\nlibc = {{ registry = \"{}\"\n", ours(12)),
-            // Literal strings and quoted keys (#256 reads these as TOML).
+            // Literal strings and quoted keys (the pin scan reads these as TOML).
             format!("[dependencies]\nserde = {{ version = '1', registry = '{}' }}\n", ours(13)),
             format!(
                 "[dependencies.alias]\npackage = 'libc'\nregistry = '{}' # c\n",

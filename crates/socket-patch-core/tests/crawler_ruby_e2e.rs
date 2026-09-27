@@ -347,7 +347,7 @@ async fn get_gem_paths_no_gemfile_returns_empty() {
 /// With a Gemfile present and no vendor/bundle, local mode falls back
 /// to `gem env gemdir` and returns `<gemdir>/gems`. Driven
 /// deterministically with a fake `gem` on PATH so the success arm is
-/// actually asserted (the old test swallowed the result with `let _`).
+/// actually asserted.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -699,8 +699,8 @@ async fn global_gem_discovery_via_home_dotgem_layout() {
 #[path = "common/mod.rs"]
 mod common;
 
-/// `scan_gem_dir` short-circuits when the gem path is unreadable —
-/// drives ruby_crawler.rs:270 read_dir Err arm.
+/// `scan_gem_dir` yields nothing when the gem path is unreadable
+/// (`list_dir_entries` degrades to empty).
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -736,8 +736,8 @@ fn ruby_crawler_default_and_new_construct_cleanly() {
 }
 
 /// With a Gemfile present and `gem` not on PATH, the local-mode
-/// `gem env gemdir` fallback at L56-64 must short-circuit cleanly
-/// (run_gem_env returns None via the `.output().ok()?` arm). The
+/// `gem env gemdir` fallback must short-circuit cleanly
+/// (run_gem_env returns None when the command runner yields no output). The
 /// crawler then exits the if-block and returns an empty Vec.
 #[tokio::test]
 #[serial]

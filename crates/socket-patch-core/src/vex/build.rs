@@ -46,11 +46,11 @@ pub struct BuildOptions {
 /// `VerifyOutcome::vendored`) carry the impact-statement phrasing
 /// "Patched via Socket patch `<uuid>` (vendored)" so the attestation
 /// records that the evidence is the committed `.socket/vendor/`
-/// artifact, not the installed tree. PURLs in `redirected` (pointed at
-/// Socket's hosted vendored patches by `scan --redirect`) carry
-/// "(redirected)" instead. The two sets are disjoint in practice
-/// (`--redirect` conflicts with `--vendor`); if a PURL somehow appears
-/// in both, `vendored` wins. Status and justification are identical
+/// artifact, not the installed tree. PURLs in `redirected` (wired to
+/// Socket's hosted patches by hosted-mode `scan`) carry "(redirected)"
+/// instead. The two sets are disjoint in practice (each PURL is attested
+/// on exactly one basis); if a PURL somehow appears in both, `vendored`
+/// wins. Status and justification are identical
 /// across all three phrasings.
 ///
 /// Returns `None` when no statements can be emitted (no applied
@@ -490,8 +490,7 @@ mod tests {
     }
 
     /// `BuildOptions.tooling = None` → `Document.tooling` is None and
-    /// the JSON output omits the key. Previously only `Some` was
-    /// asserted.
+    /// the JSON output omits the key.
     #[test]
     fn tooling_none_omits_key_in_document() {
         let mut manifest = PatchManifest::new();
@@ -762,7 +761,7 @@ mod tests {
 
     /// If a PURL is defensively present in BOTH the vendored and redirected
     /// sets, the vendored phrasing wins (they are disjoint in practice —
-    /// `--redirect` conflicts with `--vendor`).
+    /// each PURL is attested on one basis).
     #[test]
     fn vendored_takes_precedence_over_redirected() {
         let mut manifest = PatchManifest::new();

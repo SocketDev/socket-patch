@@ -1,4 +1,4 @@
-//! Coverage-gap tests for `commands/vex.rs` (2026-09 coverage audit): the
+//! Coverage-gap tests for `commands/vex.rs`: the
 //! corrupt-ledger/corrupt-manifest hard-error family, the multi-manifest
 //! product auto-detect warning echo, and the four skip guards in the
 //! go-patches `replace` synthesis (including the SECURITY fail-closed
@@ -132,7 +132,7 @@ fn write_ghost_npm_manifest(cwd: &Path, purl: &str) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// corrupt manifest → `manifest_unreadable`, exit 2 (line 682)
+// corrupt manifest → `manifest_unreadable`, exit 2 (read_manifest Err arm)
 //
 // A PRESENT-but-corrupt `.socket/manifest.json` is the hard exit-2 error
 // (`read_manifest` → Err), distinct from the missing-manifest exit-2
@@ -233,7 +233,7 @@ fn corrupt_manifest_json_envelope_carries_code_and_removes_stale_doc() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// corrupt redirect ledger → `redirect_ledger_corrupt`, exit 2 (692-693)
+// corrupt redirect ledger → `redirect_ledger_corrupt`, exit 2 (redirect ledger load)
 //
 // The module doc promises a HARD error for a present-but-malformed
 // `.socket/vendor/redirect-state.json`: attesting with its records
@@ -341,10 +341,8 @@ fn corrupt_redirect_ledger_json_envelope_carries_code_and_preserves_ledger() {
 // ──────────────────────────────────────────────────────────────────────
 // corrupt vendor ledger → `vendor_ledger_corrupt`, exit 2
 //
-// DELIBERATE CHANGE (manifest-less VEX): a present-but-corrupt
-// `.socket/vendor/state.json` used to DEGRADE (stderr warning, vendored
-// purls fell through to the installed tree and were omitted). It is now a
-// hard error mirroring `redirect_ledger_corrupt`: the vendor ledger is an
+// A present-but-corrupt `.socket/vendor/state.json` is a hard error
+// mirroring `redirect_ledger_corrupt`: the vendor ledger is an
 // attestation input in its own right — it carries embedded records and
 // the entries whose wiring liveness gates them — so a run that cannot read
 // it cannot tell which vendored patches it is dropping, and attesting from
@@ -450,7 +448,7 @@ fn corrupt_vendor_ledger_json_envelope_carries_code_and_preserves_ledger() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// multi-manifest auto-detect warning echo (792-794)
+// multi-manifest auto-detect warning echo (resolve_product_id)
 //
 // `detect_product` warns when multiple project manifests coexist (e.g.
 // package.json + Cargo.toml, no .git) and `resolve_product_id` must echo
@@ -604,15 +602,15 @@ fn auto_detect_multi_manifest_warning_suppressed_by_silent() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// go-patches synthesis skip guards (875, 879, 884, 891)
+// go-patches synthesis skip guards
 //
 // `synthesize_go_patches` walks the tamper-able `go.mod` replace set;
 // owner classification is by target-path prefix (`.socket/go-patches/`),
 // so hand-written lines reach every guard:
-//   (a) version-less directory replace          → skipped (875)
-//   (b) go-patches replace with no manifest purl → skipped (879)
-//   (c) explicit (LIVE) vendor entry takes precedence → skipped (884)
-//   (d) SECURITY: unsafe module coordinates      → skipped (891) — the
+//   (a) version-less directory replace          → skipped
+//   (b) go-patches replace with no manifest purl → skipped
+//   (c) explicit (LIVE) vendor entry takes precedence → skipped
+//   (d) SECURITY: unsafe module coordinates      → skipped — the
 //       only end-to-end proof that a tampered go.mod cannot key an
 //       out-of-tree path into VEX verification (the inline unit test only
 //       pins the predicate, not that the synthesis consults it).

@@ -1,6 +1,6 @@
-//! Coverage-gap tests for `commands/scan/vendor_flow.rs` (2026-09 audit).
+//! Coverage-gap tests for `commands/scan/vendor_flow.rs`.
 //!
-//! Pins the audited-but-untested surfaces of `scan --vendor`:
+//! Pins the otherwise-untested surfaces of `scan --vendor`:
 //!
 //! * the `already_vendored` dry-run preview arm (the sibling
 //!   `would_vendor` / `would_revendor` arms are pinned by

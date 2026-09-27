@@ -5,9 +5,9 @@
 //! manifest claims the patch modified must hash (git-blob sha256) to its
 //! `afterHash` inside that artifact — the same standard `vex::verify` applies
 //! to installed trees. Dir-shaped ecosystems are hashed in place; npm
-//! tarballs and pypi wheels are decoded in memory (bounded — the artifacts
-//! are committed and tamper-able, so a crafted archive must not OOM an
-//! audit).
+//! tarballs and zip artifacts (`.whl`/`.nupkg`/`.jar`) are decoded in memory
+//! (bounded — the artifacts are committed and tamper-able, so a crafted
+//! archive must not OOM an audit).
 //!
 //! Fail-closed order (each failure is a stable snake_case routing tag):
 //! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
@@ -167,7 +167,7 @@ async fn verify_dir_members(
     Ok(())
 }
 
-/// A vlt package-dir entry (DESIGN §4.2): npm, flavor `vlt`, not a tarball.
+/// A vlt package-dir entry: npm, flavor `vlt`, not a tarball.
 pub(crate) fn is_vlt_dir_entry(entry: &VendorEntry) -> bool {
     entry.ecosystem == "npm"
         && entry.flavor.as_deref() == Some(super::vlt_lock::FLAVOR)
@@ -281,7 +281,7 @@ pub(crate) async fn vlt_installed_copy_matches(
     true
 }
 
-/// The vlt manifest exemption (DESIGN §4.4): the committed `package.json`
+/// The vlt manifest exemption: the committed `package.json`
 /// is post-transform, so it verifies iff it hashes to the inventory pin and,
 /// when the afterHash blob is in the local blob store, the blob with its
 /// devDependencies stripped hashes to that pin too.
@@ -645,7 +645,8 @@ pub enum ArtifactHealth {
     /// Present but failing verification: rebuildable. `reason` is the
     /// stable routing tag (`vendor_hash_mismatch`, `file_not_found`,
     /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`,
-    /// `vendor_inventory_mismatch`).
+    /// `vendor_inventory_mismatch`, `vendor_workspace_artifact_missing`,
+    /// `vendor_workspace_artifact_corrupt`).
     Corrupt { reason: String },
     /// The ledger/artifact uuid doesn't match the record: a re-vendor is
     /// pending — not repair's job.
@@ -661,7 +662,8 @@ pub enum ArtifactHealth {
 /// Health-check one vendored artifact against its patch record: the
 /// per-file afterHash verification of [`verify_vendored_patch_record`]
 /// (which for dir-shaped artifacts includes the whole-tree fileInventory
-/// cross-check) plus, for file-shaped artifacts (`.tgz`/`.tar.gz`/`.whl`)
+/// cross-check) plus, for file-shaped artifacts
+/// (`.tgz`/`.tar.gz`/`.whl`/`.nupkg`/`.jar`, see [`artifact_is_file_shaped`])
 /// with a recorded ledger sha256, a whole-file hash cross-check — the
 /// rewired lockfile integrity references those exact bytes, so silent
 /// drift breaks the package manager even when the patched members still
@@ -744,7 +746,7 @@ pub async fn file_sha256_hex(path: &Path) -> Option<String> {
 
     // Open, read and hash in ONE blocking hop. The loop below is pure CPU
     // between `read`s, and a wheel or a `.nupkg` is megabytes of it — run on
-    // the async thread it blocked the runtime for the whole digest.
+    // the async thread it would block the runtime for the whole digest.
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let (mut file, meta) = crate::utils::fs::open_regular_file_sync(&path).ok()?;
@@ -1099,7 +1101,7 @@ mod tests {
 
     /// The whole-tree inventory closes the dir-shaped blindspot: with only
     /// afterHashes, a tampered UNPATCHED file (or stub gemspec), a deleted
-    /// file, or a planted extra file were all blessed Healthy. Each arm of
+    /// file, or a planted extra file would all be blessed Healthy. Each arm of
     /// the tamper matrix is hand-pinned; the legacy no-inventory entry keeps
     /// member-only behavior (backward tolerance).
     #[tokio::test]
@@ -1210,7 +1212,7 @@ mod tests {
             .unwrap();
 
         // 5. LEGACY entry (no inventory recorded): the same unpatched-file
-        //    tamper keeps today's member-only Healthy verdict.
+        //    tamper keeps the member-only Healthy verdict.
         tokio::fs::write(dir.join("rack.gemspec"), b"tampered gemspec\n")
             .await
             .unwrap();

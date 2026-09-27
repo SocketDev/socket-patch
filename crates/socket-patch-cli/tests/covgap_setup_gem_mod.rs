@@ -1,4 +1,4 @@
-//! Coverage-gap integration test for `setup/gem/mod.rs` (audit at d5e1815):
+//! Coverage-gap integration test for `setup/gem/mod.rs`:
 //! the binary-level gem `setup` → `setup --remove` round trip that clears
 //! bundler's machine-local plugin registration under `BUNDLE_APP_CONFIG`.
 //!

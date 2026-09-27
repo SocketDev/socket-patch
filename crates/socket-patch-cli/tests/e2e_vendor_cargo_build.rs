@@ -51,8 +51,9 @@
 //! A get-driven twin (`cargo_get_uuid_vendored_fresh_checkout_locked_build`,
 //! v3.6) reaches the same committed state through `get <uuid> --mode
 //! vendored` with the patch record + blob content served from a wiremock
-//! view endpoint instead of a pre-staged `.socket/` — proving the manifest
-//! write, the NO-blobs posture (content stays in memory), and the same
+//! view endpoint instead of a pre-staged `.socket/` — proving the
+//! manifest-free posture (the ledger's detached entry is the record), the
+//! NO-blobs posture (content stays in memory), and the same
 //! fresh-checkout `--locked --offline` build (the revert half is covered by
 //! the capstone: get rides the identical vendor engine).
 //!
@@ -638,10 +639,8 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
-    // NOTE: summary.applied / the event action are asserted in the
-    // `cargo_vendor_reports_applied_event` below — a successful
-    // cargo vendor is currently misreported as skipped/`vendored` (see the
-    // BUG note there). The on-disk + build assertions here are unaffected.
+    // summary.applied / the event action are pinned by
+    // `cargo_vendor_reports_applied_event` below.
 
     // The patched copy, without a `.cargo-checksum.json` (path deps must
     // never carry one).
@@ -896,15 +895,10 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
 /// cargo vendor must surface as an `applied` event with `summary.applied == 1`
 /// (CLI_CONTRACT.md: vendor events are `Applied` (= vendored)).
 ///
-/// Currently it is misreported as `skipped` with errorCode `vendored` and
-/// `summary.applied == 0`: the shared `result_to_event` (apply.rs) routes any
-/// result whose `package_path` contains `.socket/vendor/` to the
-/// Skipped/`vendored` event — that check exists for APPLY's yield-to-vendor
-/// path, but the cargo/golang/composer/gem vendor backends set their
-/// `ApplyResult.package_path` to the vendor copy dir itself, so vendor's own
-/// successes trip it (npm/pypi report `applied` correctly because their
-/// package_path is a stage tempdir / site-packages). Human output says
-/// "Vendored 0 package(s); 1 skipped" and `track_patch_vendored` reports 0.
+/// The cargo/golang/composer/gem vendor backends set
+/// `ApplyResult.package_path` to the `.socket/vendor/` copy dir itself;
+/// `result_to_event` must classify only the exact `VENDOR_OWNED_MARKER`
+/// sentinel as Skipped/`vendored`, never a path under `.socket/vendor/`.
 #[test]
 fn cargo_vendor_reports_applied_event() {
     if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (applied-event)") {
@@ -954,7 +948,7 @@ fn cargo_vendor_reports_applied_event() {
 
 /// get-driven twin (v3.6): `get <uuid> --mode vendored --vendor-source build`
 /// must reach the capstone's committed state through scan's vendored engine —
-/// the manifest record, the patched copy under `.socket/vendor/cargo/<uuid>/`,
+/// no manifest (the ledger records the patch), the patched copy under `.socket/vendor/cargo/<uuid>/`,
 /// the `[patch.crates-io]` wiring + surgical lock detach — with NO
 /// `.socket/blobs` (the download phase holds content in memory; the vendor
 /// step re-fetches `blobContent` from the same view mock). Then the
@@ -980,7 +974,7 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
 
     // The view endpoint serves the record with REAL hashes computed from the
     // ACTUAL extracted registry bytes + inline blobContent — no `.socket/`
-    // pre-staging: `get` writes the manifest itself and the vendor step
+    // pre-staging: `get` writes no manifest (the ledger records the patch) and the vendor step
     // fetches the after-blob into memory from this same mock.
     let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
     assert!(
@@ -1173,8 +1167,8 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
         "the detach must keep the lock format:\n{lock_text}"
     );
 
-    // Manifest-less VEX on the fresh checkout (get wrote a manifest; the
-    // steps delete it).
+    // Manifest-less VEX on the fresh checkout (get wrote no manifest; the
+    // steps' strip is a no-op for it).
     ManifestlessVendored {
         fresh,
         fresh_home,

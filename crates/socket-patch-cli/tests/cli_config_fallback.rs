@@ -50,7 +50,7 @@ fn write_config(data_dir: &Path, json: &serde_json::Value) {
     std::fs::write(dir.join("config.json"), encoded).unwrap();
 }
 
-/// Build a hermetic `socket-patch scan --json -e npm` command: every
+/// Build a hermetic human-mode `socket-patch scan -e npm --cwd <project>` command: every
 /// ambient `SOCKET_*` var is scrubbed (including the inherited
 /// `SOCKET_NO_CONFIG=1` guard — tests re-add exactly what they need), the
 /// data dir points at `data_dir`, and the project dir is an empty npm

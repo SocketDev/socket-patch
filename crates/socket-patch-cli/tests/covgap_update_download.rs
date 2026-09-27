@@ -1,5 +1,5 @@
 //! Coverage-gap e2e for `update::download::fetch_archive`'s non-404 HTTP
-//! failure branch (2026-09 coverage audit): a server error on the asset
+//! failure branch: a server error on the asset
 //! download must surface as `download_failed` — not `asset_not_found`,
 //! which is reserved for 404 ("no prebuilt binary for your target").
 //!

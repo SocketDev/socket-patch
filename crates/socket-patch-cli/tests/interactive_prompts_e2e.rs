@@ -1,7 +1,8 @@
 //! End-to-end tests that drive interactive prompts (`ui::confirm`,
 //! `ui::confirm_or_proceed`) via a pseudo-terminal. These exercise the
-//! stdin-is-a-terminal-gated confirmation paths in `setup`, `remove`, and
-//! `get` that subprocess-with-piped-stdin tests can't reach.
+//! stdin-is-a-terminal-gated confirmation paths in `setup` and `remove`
+//! (plus `apply`'s no-manifest message) that subprocess-with-piped-stdin
+//! tests can't reach.
 //!
 //! PTY support: macOS + Linux. Skipped on Windows.
 
@@ -582,8 +583,8 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
 }
 
 // ---------------------------------------------------------------------------
-// Apply non-JSON without --yes also exercises confirm() flow,
-// even though apply auto-proceeds in non-interactive contexts.
+// `apply` has no prompt; in a real TTY the no-manifest path must still
+// print its friendly message.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -591,10 +592,9 @@ fn apply_in_pty_with_no_manifest_prints_friendly_message() {
     let tmp = tempfile::tempdir().unwrap();
     let (code, output) = run_in_pty(&["apply"], tmp.path(), "", Duration::from_secs(15));
     assert_eq!(code, 0);
-    // Assert the full message, not either half of it. The `||` previously
-    // let a truncated/garbled message ("...nothing to apply...") pass.
-    // v5.0 wording names the missing manifest, not the `.socket/` folder
-    // (hosted/vendored projects have one with nothing for `apply` to do).
+    // Assert the full message, not either half of it. The wording names the
+    // missing manifest, not the `.socket/` folder (hosted/vendored projects
+    // have one with nothing for `apply` to do).
     assert!(
         output.contains("No patch manifest found; nothing to apply."),
         "PTY apply no-manifest must print the friendly message; got: {output}"

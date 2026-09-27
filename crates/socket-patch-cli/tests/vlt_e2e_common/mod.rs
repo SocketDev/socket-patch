@@ -1,4 +1,4 @@
-//! The real-vlt capstone harness (DESIGN §8.3), shared by
+//! The real-vlt capstone harness (docs/testing/vlt-compatibility.md, "The capstone registry harness"), shared by
 //! `e2e_redirect_vlt_build`, `e2e_vendor_vlt_build`, `mode_migration_vlt`,
 //! `e2e_safety_vlt`, `e2e_vlt` and the production suites.
 //!
@@ -300,7 +300,7 @@ pub fn legacy_workspaces_file(v: VltVersion) -> bool {
     v <= VltVersion::zero(12)
 }
 
-/// The lockfile grammar a release writes (DESIGN §1.1).
+/// The lockfile grammar a release writes (docs/testing/vlt-compatibility.md, "Formats").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VltEra {
     A0,
@@ -837,7 +837,7 @@ pub struct VltJson {
     pub no_registry: bool,
 }
 
-/// The vlt.json the §8.3 era table prescribes for registry `r`
+/// The per-era vlt.json (docs/testing/vlt-compatibility.md, "The capstone registry harness") for registry `r`
 /// (`http://127.0.0.1:<port>/`).
 pub fn vlt_json(v: VltVersion, r: &str, opts: &VltJson) -> Value {
     let mut config = serde_json::Map::new();
@@ -1869,7 +1869,7 @@ pub fn lock_bytes(proj: &Path) -> Vec<u8> {
     std::fs::read(proj.join(VLT_LOCK)).expect("vlt-lock.json")
 }
 
-/// vlt's tilde segment decode (DESIGN §1.6).
+/// vlt's tilde segment decode (docs/testing/vlt-compatibility.md, "Formats").
 pub fn tilde_decode(seg: &str) -> String {
     let chars: Vec<char> = seg.chars().collect();
     let mut out = String::new();

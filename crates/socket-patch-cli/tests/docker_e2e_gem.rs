@@ -16,8 +16,6 @@
 //! both apply paths run gated, without `--force`: `scan --sync`'s own
 //! nested apply must patch the file in the same run, and the explicit
 //! `apply` (against restored pristine bytes) must pass the variant gate.
-//! With the old all-zeros placeholder the nested apply failed invisibly
-//! and only the `--force` escape hatch was ever exercised.
 
 #![cfg(feature = "docker-e2e")]
 

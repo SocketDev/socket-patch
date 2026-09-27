@@ -10,9 +10,9 @@
 # delegated to the real `npx`.
 #
 # This is a TEST FIXTURE, not a change to socket-patch behavior. It is the
-# standalone/reference copy; tests/setup_matrix/run-case.sh embeds an
-# identical copy inline so the driver is self-contained when piped into a
-# container. Keep the two in sync.
+# standalone/reference copy; tests/setup_matrix/run-case.sh embeds a
+# functionally equivalent, condensed copy inline so the driver is
+# self-contained when piped into a container. Keep the two in sync.
 set -uo pipefail
 
 sp_bin="${SOCKET_PATCH_BIN:-socket-patch}"

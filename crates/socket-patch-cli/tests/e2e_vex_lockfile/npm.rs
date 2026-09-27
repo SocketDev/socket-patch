@@ -325,7 +325,7 @@ fn vendored_artifact_is_the_evidence_and_a_tampered_member_is_omitted() {
     }
 }
 
-/// REGRESSION (npm 12 dual-lock): npm <= 11 installs from the shrinkwrap,
+/// npm 12 dual-lock: npm <= 11 installs from the shrinkwrap,
 /// npm 12 from the package-lock.json beside it. One lock wired to a Socket
 /// patch while the other still resolves the package from the registry is
 /// patched under some majors only — nothing attests (hosted or vendored, in
@@ -469,9 +469,8 @@ fn warnings_of(envelope: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `--json` keeps WHY a patch was gated (it used to reach only human
-/// stderr as `Note:` lines, leaving the envelope with a bare
-/// `record_unavailable` / `wiring_conflict`): the record-fetch error and
+/// `--json` keeps WHY a patch was gated (not only human stderr `Note:`
+/// lines beside a bare `record_unavailable` / `wiring_conflict`): the record-fetch error and
 /// the wiring conflict's files ride `warnings[]`, standalone and embedded,
 /// and a failed embedded `--vex` lists each omitted patch as `vex_omitted`
 /// (`--silent`: `omitted:` lines under the error).
@@ -700,12 +699,11 @@ fn write_workspace_with_member_alias(project: &Path) {
     .unwrap();
 }
 
-/// REGRESSION (Bugbot): every consumed copy of a hosted npm purl is hashed,
-/// including a workspace member's ALIAS install beside a good root copy.
-/// The alias walk used to start at the root `node_modules` only, and the
-/// identity fallback runs only when no copy was found at all — so with the
-/// root (hoisted) copy patched, a tampered or stale member alias went
-/// unhashed and the document attested from the good root copy.
+/// Every consumed copy of a hosted npm purl is hashed, including a
+/// workspace member's ALIAS install beside a good root copy. The identity
+/// fallback runs only when no copy was found at all, so an alias walk that
+/// started at the root `node_modules` only would leave a tampered or stale
+/// member alias unhashed and attest from the good root copy.
 #[test]
 fn workspace_member_alias_beside_a_patched_root_copy_is_evidence() {
     let api = api_for(UUID, PURL);

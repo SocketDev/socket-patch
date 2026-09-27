@@ -765,8 +765,8 @@ mod tests {
 
     #[test]
     fn test_update_object_scripts_is_string_does_not_panic() {
-        // Regression: a present-but-non-object `scripts` previously panicked
-        // when indexed (`cannot access key "postinstall" in JSON string`).
+        // A present-but-non-object `scripts` must not panic when indexed
+        // (`cannot access key "postinstall" in JSON string`).
         let mut pkg: serde_json::Value = serde_json::json!({
             "name": "test",
             "scripts": "build"
@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_update_object_non_object_root_is_noop() {
-        // Regression: a non-object root previously panicked on `["scripts"] = ...`.
+        // A non-object root must not panic on `["scripts"] = ...`.
         let mut arr: serde_json::Value = serde_json::json!([1, 2, 3]);
         let (modified, _, _) = update_package_json_object(&mut arr, PackageManager::Npm);
         assert!(!modified);
@@ -891,10 +891,9 @@ mod tests {
     #[test]
     fn test_remove_script_empty_segment_no_patch_is_unchanged() {
         // Regression: a patch-free script with a stray empty segment (double
-        // `" && "`) must report `changed == false`. Keying `changed` off
-        // `kept.len() != segments.len()` previously returned `(true, ..)` here,
-        // violating the documented contract — `(true, ..)` means a socket-patch
-        // segment was removed, which did not happen.
+        // `" && "`) must report `changed == false` — `(true, ..)` means a
+        // socket-patch segment was removed, which did not happen, so
+        // `changed` must not be keyed off `kept.len() != segments.len()`.
         let (changed, new) = remove_socket_patch_from_script("echo a &&  && echo b");
         assert!(
             !changed,
@@ -944,8 +943,8 @@ mod tests {
     }
 
     /// A `&&` inside a QUOTED argument of a surviving user command also
-    /// splits at the operator scan, and the old canonical `" && "` rejoin
-    /// rewrote the user's bytes — `grep "a&&b"` became `grep "a && b"`,
+    /// splits at the operator scan, and a canonical `" && "` rejoin would
+    /// rewrite the user's bytes — `grep "a&&b"` becoming `grep "a && b"`,
     /// which greps a different pattern. Survivors must come back verbatim.
     #[test]
     fn test_remove_script_preserves_quoted_ampersands_in_survivors() {

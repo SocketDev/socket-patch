@@ -28,7 +28,7 @@ use socket_patch_cli::{Cli, Commands};
 /// so the process-global mutation can't race a concurrent test.
 ///
 /// Keep this list in sync with `env = "SOCKET_*"` attrs in
-/// `src/args.rs`, `src/commands/scan.rs`, and `src/commands/vex.rs`.
+/// `src/args.rs`, `src/commands/scan/mod.rs`, and `src/commands/vex.rs`.
 const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_ALL_RELEASES",
     "SOCKET_API_TOKEN",
@@ -384,10 +384,11 @@ fn unknown_flag_fails() {
 
 // --- `--apply` flag and JSON shape ----------------------------------------
 //
-// `--apply` opts JSON callers into the full discover → select → apply
-// pipeline (read-only stays the default for backwards compatibility). The
-// subprocess test below also locks in the new `updates` key that bots rely
-// on to summarize what would change.
+// `--apply` (== `--mode agent`) opts callers into the discover → select →
+// apply pipeline; a bare scan defaults to hosted mode, and only
+// `--prune`/global scans without a mode are report-only. The subprocess test
+// below also locks in the `updates` key that bots rely on to summarize what
+// would change.
 
 #[test]
 #[serial_test::serial]
@@ -464,13 +465,11 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // `scan::run`, where the whole result object — including `updates` — is
     // a hardcoded literal. It does NOT cover `detect_updates`, the real
     // function that populates `updates` once packages with patches are
-    // discovered (that path needs live API results and cannot run
-    // hermetically here, and `detect_updates` is `pub(crate)` so it can't
-    // be unit-tested from this integration crate). What this test CAN do is
-    // lock the empty-scan JSON contract *exactly*, so a regression that
-    // drops/renames a key, flips a default count, or leaks an unexpected
-    // `gc`/`apply`/`vex` sub-object onto the read-only default path fails
-    // loudly. See the summary for the uncovered `detect_updates` gap.
+    // discovered; `detect_updates` (pub(super)) is covered by the unit tests
+    // in `src/commands/scan/discovery.rs`). What this test CAN do is lock the
+    // empty-scan JSON contract *exactly*, so a regression that drops/renames
+    // a key, flips a default count, or leaks an unexpected `gc`/`apply`/`vex`
+    // sub-object onto the hosted default path fails loudly.
     let bin = env!("CARGO_BIN_EXE_socket-patch");
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut cmd = std::process::Command::new(bin);
@@ -836,10 +835,8 @@ fn mode_alias_host_folds_to_redirect() {
 #[test]
 #[serial_test::serial]
 fn mode_alias_redirect_folds_to_hosted() {
-    // `redirect` is the legacy FLAG spelling (`--redirect`); pre-fix the
-    // value aliases were asymmetric — `--mode vendor`/`--mode host` parsed
-    // while `--mode redirect` was rejected, even though `--redirect` itself
-    // still folds to hosted.
+    // `redirect` is the legacy FLAG spelling (`--redirect`); the value
+    // aliases stay symmetric with `--mode vendor`/`--mode host`.
     assert_eq!(
         parse_scan(&["--mode", "redirect"]).mode,
         Some(ScanMode::Hosted)

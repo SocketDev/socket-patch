@@ -10,8 +10,8 @@
 //!   same-run `--vex`, re-scanned idempotently and rolled back byte for byte;
 //! * `SOCKET_PIPENV_MAJOR=11` selects the legacy `path` reference shape the
 //!   installer probe would otherwise need a real Pipenv 7–11 on PATH for;
-//! * a stale `Pipfile.lock` that does not pin the package no longer vetoes
-//!   the sibling `requirements.txt` redirect (Bugbot HIGH on #242);
+//! * a stale `Pipfile.lock` that does not pin the package does not veto
+//!   the sibling `requirements.txt` redirect;
 //! * a venv still holding the UPSTREAM release is reported stale and kept
 //!   out of the same-run attestation.
 //!

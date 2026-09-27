@@ -4,8 +4,7 @@
 //! ecosystem dispatch branch", but deno is absent from both its apply and
 //! rollback halves — lcov shows the deno `scan_ecosystem!` invocation has
 //! never executed with a `pkg:jsr/` PURL in any test. These two tests close
-//! that charter gap using the sibling suite's own oracles (adapted copies —
-//! that file is owned by another suite and must not be edited):
+//! that charter gap using the sibling suite's own oracles (adapted copies):
 //!
 //! * **Apply branch** — a manifest holding one `pkg:jsr/` PURL, run under
 //!   `apply --offline --json --ecosystems deno` with nothing installed. The

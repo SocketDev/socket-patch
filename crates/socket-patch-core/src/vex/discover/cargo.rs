@@ -1473,8 +1473,9 @@ mod tests {
 
     // ── vendored ─────────────────────────────────────────────────────
 
-    /// The exact shape `vendor`'s cargo backend writes: the config entry
-    /// plus a detached (sourceless) lock entry.
+    /// The pre-v5 shape `vendor`'s cargo backend wrote (still honored): a
+    /// project-config `[patch]` entry plus an untagged detached (sourceless)
+    /// lock entry.
     #[tokio::test]
     async fn vendored_patch_entry_with_detached_lock_entry() {
         let rel = vendor_path(UUID_A, "cfg-if-1.0.4");

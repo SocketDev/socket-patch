@@ -66,8 +66,7 @@ sha2 = { workspace = true, features = ["asm"] }
 
 # All ecosystems (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
 # Deno) are unconditionally compiled in AND enabled at runtime — there are
-# no ecosystem feature gates and no runtime env gates (the old
-# SOCKET_EXPERIMENTAL_MAVEN/NUGET opt-ins are retired).
+# no ecosystem feature gates and no runtime env gates.
 
 [dev-dependencies]
 tempfile = { workspace = true }

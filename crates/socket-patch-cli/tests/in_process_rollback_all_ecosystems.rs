@@ -5,17 +5,17 @@
 //! `.socket/blobs/`, writes a manifest, then runs in-process
 //! `rollback`. Verifies the file is restored to the original content.
 //!
-//! Exercises `find_packages_for_rollback` for every ecosystem — a
+//! Exercises `find_all_packages_for_rollback` for every ecosystem — a
 //! distinct code path from apply's `find_all_packages_for_purls`.
 //!
 //! That distinction is only *observable* for the release-variant
 //! ecosystems (PyPI / RubyGems / Maven): there the rollback resolver
-//! uses `merge_qualified` while the apply/get resolver uses
-//! `merge_first_wins`, and the two diverge ONLY when the manifest key is
+//! uses `merge_qualified` while apply's resolver is base-keyed
+//! (`merge_variant_copies`), and the two diverge ONLY when the manifest key is
 //! a *qualified* PURL (`?artifact_id=` / `?platform=` / `?classifier=`).
 //! The crawler is queried with the deduped base PURL and returns a
 //! base-keyed result; `merge_qualified` fans that path back out to every
-//! qualified manifest key, whereas `merge_first_wins` would leave only
+//! qualified manifest key, whereas a base-keyed merge would leave only
 //! the base key — so the subsequent `manifest.patches.get(<qualified>)`
 //! returns `None`, the package is skipped, and nothing is restored.
 //!
@@ -23,11 +23,10 @@
 //! manifest PURL: a regression that swapped the rollback resolver back to
 //! a base-keyed `find_all_packages_for_purls` would silently leave the file patched and
 //! the byte-restore assertion below would fail. With a bare PURL both
-//! merge functions behave identically, so the test would prove nothing —
-//! that is the loophole this file used to have.
+//! merge functions behave identically, so the test would prove nothing.
 //!
 //! npm / cargo / golang / composer / nuget are NOT release-variant
-//! ecosystems (they use `merge_first_wins` in both resolvers), so a
+//! ecosystems (their crawlers wire `merge_first_wins` in both resolvers), so a
 //! qualified PURL there is genuinely unsupported and those fixtures keep
 //! bare PURLs.
 
@@ -190,9 +189,8 @@ async fn rollback_pypi_restores_original_content() {
     // create site-packages with a dist-info dir. The layout differs
     // per platform (PEP-405): Unix puts site-packages under
     // `lib/python<MAJOR>.<MINOR>/`, Windows puts it under `Lib/`
-    // with no version subdirectory. The crawler at
-    // crates/socket-patch-core/src/crawlers/python_crawler.rs:182
-    // already branches on cfg!(windows); mirror that here so the
+    // with no version subdirectory. The python crawler
+    // (crates/socket-patch-core/src/crawlers/python_crawler.rs) already branches on cfg!(windows); mirror that here so the
     // crawler actually finds the synthetic package on every runner.
     let site = if cfg!(windows) {
         tmp.path().join(".venv").join("Lib").join("site-packages")
@@ -222,9 +220,9 @@ async fn rollback_pypi_restores_original_content() {
     let socket = tmp.path().join(".socket");
     // QUALIFIED PURL on purpose — see module header. The crawler emits the
     // base `pkg:pypi/rbpypi@1.0.0`; only `merge_qualified` (used by
-    // `find_packages_for_rollback`) fans it back out to this `?artifact_id=`
+    // `find_all_packages_for_rollback`) fans it back out to this `?artifact_id=`
     // key so the manifest lookup hits. A base-keyed `find_all_packages_for_purls`
-    // (`merge_first_wins`) would key it under the bare base, the patch
+    // (`merge_variant_copies`) would key it under the bare base, the patch
     // lookup would miss, and the file below would stay patched.
     write_manifest_with_patch(
         &socket,
@@ -293,9 +291,9 @@ async fn rollback_gem_restores_original_content() {
 
     let socket = tmp.path().join(".socket");
     // QUALIFIED PURL on purpose — RubyGems is a release-variant ecosystem
-    // (`?platform=`). Only `find_packages_for_rollback`'s `merge_qualified`
-    // remaps the crawler's base PURL onto this qualified manifest key; the
-    // `merge_first_wins` resolver would skip the package and leave the file
+    // (`?platform=`). Only `find_all_packages_for_rollback`'s `merge_qualified`
+    // remaps the crawler's base PURL onto this qualified manifest key; a
+    // base-keyed resolver would skip the package and leave the file
     // patched. See module header.
     write_manifest_with_patch(
         &socket,
@@ -453,9 +451,9 @@ async fn rollback_maven_restores_original_content() {
 
     let socket = tmp.path().join(".socket");
     // QUALIFIED PURL on purpose — Maven is a release-variant ecosystem
-    // (`?classifier=&type=`). Only `find_packages_for_rollback`'s
+    // (`?classifier=&type=`). Only `find_all_packages_for_rollback`'s
     // `merge_qualified` remaps the crawler's base PURL onto this qualified
-    // manifest key; `merge_first_wins` would skip the package and leave the
+    // manifest key; a base-keyed resolver would skip the package and leave the
     // file patched. See module header.
     write_manifest_with_patch(
         &socket,

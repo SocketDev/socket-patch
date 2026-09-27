@@ -576,7 +576,7 @@ mod tests {
         }
     }
 
-    /// Only conflicts veto the sibling rewriters (Bugbot HIGH on #242): a
+    /// Only conflicts veto the sibling rewriters: a
     /// Pipfile.lock without the package, an old pipfile-spec, an unparseable
     /// lock or a digest-less patch is SKIPPED with `redirect_pipenv_skipped`
     /// and the requirements.txt / uv.lock rewrite still lands.

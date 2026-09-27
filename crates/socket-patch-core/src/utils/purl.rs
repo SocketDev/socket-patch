@@ -296,6 +296,13 @@ pub(crate) fn build_composer_purl(namespace: &str, name: &str, version: &str) ->
     format!("pkg:composer/{namespace}/{name}@{version}")
 }
 
+/// `((namespace, name), version)` from a namespaced purl, percent-decoded
+/// (jsr `@scope/name`, composer `vendor/name`).
+pub(crate) type NamespacedPurlParts<'a> = ((Cow<'a, str>, Cow<'a, str>), Cow<'a, str>);
+
+/// [`NamespacedPurlParts`] under the JSR crawler's own name.
+pub(crate) type JsrPurlParts<'a> = NamespacedPurlParts<'a>;
+
 /// Parse a JSR PURL to extract scope, name, and version.
 ///
 /// JSR (https://jsr.io) is Deno's package registry. Packages are
@@ -308,13 +315,6 @@ pub(crate) fn build_composer_purl(namespace: &str, name: &str, version: &str) ->
 /// We follow the same shape as `parse_composer_purl` since both
 /// have a `<scope>/<name>` namespace structure. The leading `@` on
 /// the scope is preserved (matching npm's `@scope/name` convention).
-/// `((namespace, name), version)` from a namespaced purl, percent-decoded
-/// (jsr `@scope/name`, composer `vendor/name`).
-pub(crate) type NamespacedPurlParts<'a> = ((Cow<'a, str>, Cow<'a, str>), Cow<'a, str>);
-
-/// [`NamespacedPurlParts`] under the JSR crawler's own name.
-pub(crate) type JsrPurlParts<'a> = NamespacedPurlParts<'a>;
-
 pub(crate) fn parse_jsr_purl(purl: &str) -> Option<JsrPurlParts<'_>> {
     // `parse_namespaced` decodes AFTER splitting on `/`/`@` and BEFORE the
     // shape check below (and the caller's `is_safe_jsr_component` gate) —
@@ -371,8 +371,9 @@ pub fn is_purl(s: &str) -> bool {
 
 /// Does a manifest PURL key match a user-supplied PURL identifier?
 ///
-/// PyPI patches are keyed in the manifest by their fully-qualified PURL
-/// (`pkg:pypi/foo@1.0?artifact_id=...`), one entry per release variant.
+/// Release-variant ecosystems key patches in the manifest by their
+/// fully-qualified PURL — PyPI `?artifact_id=`, RubyGems `?platform=`,
+/// Maven `?classifier=`/`?ext=` — one entry per release variant.
 /// A user removing or rolling back a package usually types the *base*
 /// PURL without a qualifier and expects it to cover every variant. So:
 ///
@@ -381,8 +382,7 @@ pub fn is_purl(s: &str) -> bool {
 /// * a **qualified** identifier (`?artifact_id=...`) matches only the
 ///   exact key, so a single variant can still be targeted precisely.
 ///
-/// Non-PyPI keys never carry a `?`, so for them this reduces to plain
-/// equality.
+/// For keys without a qualifier this reduces to plain equality.
 ///
 /// Comparison is encoding-tolerant (`purl_eq`): manifest keys come from
 /// the API in percent-encoded form (`pkg:npm/%40scope/x@1`) while users

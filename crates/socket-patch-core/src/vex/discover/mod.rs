@@ -1722,10 +1722,11 @@ pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uui
     vendored_wiring_in_files(root, &probe, eco, uuid).await
 }
 
-/// The root files a vendored `eco` artifact can be wired from — every
-/// vendor backend's lockfile / wiring config for that ecosystem (npm: every
+/// The root files a vendored `eco` artifact can be wired from — the vendor
+/// backends' lockfile / wiring config for that ecosystem (npm: every
 /// npm-family lock the `vendor_probe` table flags, `vlt-lock.json`
-/// included; cargo: the `[patch.crates-io]` config; maven /
+/// included; cargo: only the pre-v5 `.cargo/config.toml` / `.cargo/config`
+/// `[patch.crates-io]` spellings, not the v5 root `Cargo.toml`; maven /
 /// nuget: the repository / source that serves the vendored dir). Manifests
 /// such as package.json are deliberately absent: the lock is what the
 /// install consumes.
@@ -2580,7 +2581,8 @@ mod tests {
     /// the patch host is outside the allowlist (no `hosted_claim`); only a
     /// LIVE `source "<patch registry>" do` block declaring rails keeps the
     /// record alive — the uuid in a `#` comment, inside `=begin` … `=end`,
-    /// or in a block for another gem used to (a raw substring scan).
+    /// or in a block for another gem must not (as a raw substring scan
+    /// would).
     #[tokio::test]
     async fn gemfile_liveness_reads_live_source_blocks_only() {
         let index = format!("https://patches.example.com/patch-registry/gem/{TOKEN}/{UUID_A}/");
@@ -2880,8 +2882,8 @@ mod tests {
 
     /// REGRESSION: a redirect ledger naming `deno.lock` (which no hosted
     /// writer edits — Deno has no rewriter) must not stay alive on the
-    /// user's own Socket-url import text there: the fallback used to treat
-    /// every unknown file as a pin, so `vex --no-verify` attested the
+    /// user's own Socket-url import text there: a fallback that treated
+    /// every unknown file as a pin would let `vex --no-verify` attest the
     /// forged record. `deno.json(c)` likewise.
     #[tokio::test]
     async fn hosted_ledger_proof_never_trusts_deno_files() {
@@ -3012,7 +3014,7 @@ mod tests {
             !vendored_wiring_live(root, &["package-lock.json"], "npm", UUID_A).await,
             "an existing recorded wiring file that was reverted is authoritative"
         );
-        // cargo's wiring lives in the config, not Cargo.lock.
+        // Pre-v5 cargo wiring lives in the cargo config, not Cargo.lock.
         let c = Project::new();
         c.write(
             ".cargo/config.toml",

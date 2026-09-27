@@ -244,10 +244,10 @@ fn deno_files_naming_socket_urls_never_attest() {
 /// `--no-verify`:
 /// * a redirect ledger recording the lockfile a hosted rewriter WOULD have
 ///   edited (package-lock.json, absent here) — `redirect_unwired`;
-/// * REGRESSION: a (forged / foreign) redirect ledger naming `deno.lock` /
-///   `deno.json` ITSELF — no writer records those, and the Socket url in
-///   them is the user's own import; the liveness fallback used to read any
-///   unknown file as a pin, so `--no-verify` attested it;
+/// * a (forged / foreign) redirect ledger naming `deno.lock` / `deno.json`
+///   ITSELF — no writer records those, and the Socket url in them is the
+///   user's own import; the liveness fallback must not read an unknown file
+///   as a pin, even under `--no-verify`;
 /// * a vendor ledger entry for a jsr package: there is no jsr backend, so
 ///   no committed artifact can be wired — `vendor_unwired`.
 #[test]

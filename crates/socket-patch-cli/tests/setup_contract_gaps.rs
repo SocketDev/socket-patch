@@ -179,7 +179,7 @@ fn setup_check_detects_unapplied_manifest_patch() {
 // re-materializes it from the artifact; go redirects leave the module cache
 // pristine forever), and a patched-looking installed tree must not launder a
 // tampered artifact. `vex` builds that vendor context
-// (commands/vex.rs::load_vendor_context); `setup --check` must too — without
+// (commands/vex.rs::vendor_context_from); `setup --check` must too — without
 // it a healthy vendored repo false-fails `--check` with `not_applied`, and a
 // tampered artifact passes.
 // ===========================================================================

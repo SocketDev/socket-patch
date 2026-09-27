@@ -194,7 +194,7 @@ async fn pnpm_v9_keys_parse_with_peer_suffix_and_scoped_quoting() {
 
 /// A CRLF checkout of the same lock inventories identically: the
 /// hosted rewriter's pnpm grammar (the one reader) is CRLF-blind, where
-/// an exact `packages:` line match used to see no section at all.
+/// an exact `packages:` line match would see no section at all.
 #[tokio::test]
 async fn pnpm_crlf_lock_inventories_like_its_lf_twin() {
     let tmp = tempfile::tempdir().unwrap();
@@ -280,9 +280,7 @@ async fn pnpm_v5_slash_keys_inventory_with_peer_and_hash_suffixes() {
     write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V5).await;
 
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
-    // The legacy grammars route to the PnpmLegacy wiring flavor now
-    // (they used to reach here through the version-refusal fallback);
-    // the inventory content is identical either way.
+    // The legacy grammars route to the PnpmLegacy wiring flavor.
     assert_eq!(flavor, NpmLockFlavor::PnpmLegacy);
     assert_eq!(
         sorted_pairs(&entries),
@@ -346,9 +344,7 @@ async fn pnpm_v6_leading_slash_keys_inventory_with_peer_parens() {
     write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V6).await;
 
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
-    // The legacy grammars route to the PnpmLegacy wiring flavor now
-    // (they used to reach here through the version-refusal fallback);
-    // the inventory content is identical either way.
+    // The legacy grammars route to the PnpmLegacy wiring flavor.
     assert_eq!(flavor, NpmLockFlavor::PnpmLegacy);
     assert_eq!(
         sorted_pairs(&entries),
@@ -630,9 +626,8 @@ async fn stale_pnpm_lock_beside_empty_live_lock_yields_none() {
 
 // ── shrinkwrap.yaml (pnpm 1/2) ──────────────────────────────────────────
 
-/// The exact grammar the 2026-08-18 legacy matrix captured from a real
-/// pnpm 2 install (shrinkwrapVersion 3): v5-style `/name/version` keys,
-/// BLOCK-mapped `resolution:` (integrity nested on its own line — every
+/// The exact grammar a real pnpm 2 install writes (shrinkwrapVersion 3):
+/// v5-style `/name/version` keys, BLOCK-mapped `resolution:` (integrity nested on its own line — every
 /// pnpm-lock.yaml generation writes the inline `{…}` flow map instead),
 /// quoted top-level `registry:`, and a transitive dep (`minimist`)
 /// listed only under `packages:`.
@@ -1611,8 +1606,7 @@ async fn pipfile_lock_inventory_reads_every_category_with_its_digest_set() {
 /// One hosted pypi url grammar (`hosted_artifact_url`, the one lockfile
 /// discovery reads): a hosted SDIST, an `http://` configured origin and a
 /// path-prefixed origin are Socket references too, so the package stays
-/// discoverable instead of vanishing from the inventory (the old
-/// `https://` + exactly-7-segments + `.whl` rule dropped them).
+/// discoverable instead of vanishing from the inventory.
 #[tokio::test]
 async fn pipfile_lock_inventory_reads_hosted_refs_with_the_shared_url_grammar() {
     let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
@@ -1775,8 +1769,8 @@ async fn pnp_layouts_propagate_the_diagnosis_instead_of_yielding_none() {
     // PnP marker wins over any lockfile — and the diagnosis must
     // PROPAGATE, not collapse into the calm no-lockfile `None`. Under
     // yarn PnP the installed-tree crawl is also structurally empty, so
-    // swallowing this here made `scan` a silent success-0 no-op in
-    // every mode (the P0 this pins).
+    // swallowing this here would make `scan` a silent success-0 no-op in
+    // every mode.
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), ".pnp.cjs", "/* pnp */").await;
     write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
@@ -2341,7 +2335,7 @@ async fn depless_poetry_lock_falls_through_to_requirements() {
 /// requirements.txt pins read with the shared exact-pin rule
 /// (`utils::requirements::exact_pin`, the one lockfile discovery uses): a
 /// wildcard or arbitrary-equality pin is no exact version, so it is not
-/// inventoried as one (it used to emit `pkg:pypi/six@1.*`).
+/// inventoried as one (never `pkg:pypi/six@1.*`).
 #[tokio::test]
 async fn requirements_wildcard_pins_are_not_exact_versions() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2584,9 +2578,9 @@ async fn vlt_lock_wins_the_sibling_order_behind_a_refused_pnpm_lock() {
 ///
 /// The rewriter turns `name==X` into the PEP 508 direct reference
 /// `name @ <patch-server url> --hash=sha256:…`, which the exact-pin rule
-/// does not match — so every redirected line dropped out of the inventory
-/// and a second hosted run over a wet requirements.txt reported ONE package
-/// with patches instead of twelve. uv.lock keeps its `[[package]]`
+/// does not match — without the direct-reference reader every redirected
+/// line would drop out of the inventory and a second hosted run over a wet
+/// requirements.txt would undercount its patched packages. uv.lock keeps its `[[package]]`
 /// name/version through the same rewrite; requirements.txt must too, the
 /// way Pipfile.lock's own reader already keeps a Socket-written reference
 /// (`socket_reference_coords`).
@@ -2698,7 +2692,7 @@ async fn the_hosted_rewriters_own_output_reinventories() {
 /// `./<rel wheel>[ ; marker] --hash=sha256:<hex>  # socket-patch vendor:
 /// <name>==<ver>` (`vendor::pypi_requirements::vendor_line`) — with no
 /// `name @` at all, so the direct-reference reader never sees it and the
-/// package drops out of the inventory exactly the way the hosted lines did.
+/// package would drop out of the inventory just like unread hosted lines.
 /// The `socket-patch vendor:` comment tag is the name/version the writer
 /// left for its readers; cross-check it against the path's own coordinates.
 #[tokio::test]

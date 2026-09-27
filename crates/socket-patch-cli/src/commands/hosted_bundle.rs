@@ -11,7 +11,8 @@
 //! "presentOnly"?: [path], "symlinks"?: [path], "projectRoots"?: [dir],
 //! "pipenvMajor"?: n, "batchSize"?: n}`. Stdout: the engine result
 //! (`HostedScanResult`, binary contents base64), or
-//! `{"status":"error","error":{"code","message"}}` with exit 1.
+//! `{"status":"error","error":{"code","message"}}` with exit 2 for bad
+//! credentials/bundle input, or exit 1 for an engine failure.
 
 use std::collections::BTreeMap;
 use std::io::Read;

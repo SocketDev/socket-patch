@@ -3,9 +3,7 @@
 //!
 //! Twin of the yarn legs in `mode_migration_npm.rs` and the pnpm
 //! `hosted_to_vendor_conversion` module in `in_process_vendor.rs`, for the
-//! one npm-family lock flavor whose hosted→vendored takeover used to be a
-//! hard refusal (`redirect_revert_failed`, "cannot replay yet"): the bun
-//! hosted rewrite REPLACES the registry 4-tuple's `name@version` spec with
+//! bun lock flavor: the bun hosted rewrite REPLACES the registry 4-tuple's `name@version` spec with
 //! a URL 3-tuple, so without the per-purl pre-revert the bun vendor backend
 //! cannot even find the entry. The API is wiremock; no `bun` binary is
 //! needed (the lock grammar is the real bun 1.4.2 lockfileVersion-2 shape
@@ -613,9 +611,9 @@ async fn bun_digestless_hosted_line_is_taken_over_by_scan_vendored_and_reverts_t
     let digestless = drop_digest_in_lock(root, NAME);
     assert!(digestless.contains(HOSTED_URL), "{digestless}");
 
-    // The takeover over the digest-less hosted line: used to refuse
+    // The takeover over the digest-less hosted line must not refuse
     // `redirect_revert_failed` ("has drifted from the recorded hosted
-    // redirect") and vendor nothing.
+    // redirect").
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
     assert_eq!(code, 0, "takeover over a digest-less hosted line: {env:#}");
     assert_eq!(env["status"], "success", "{env:#}");
@@ -825,8 +823,7 @@ async fn bun_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
 /// A hosted-live bun project with TWO redirect records, written exactly as
 /// the hosted flow leaves them (ledger edits = verbatim lines, lock = the
 /// URL 3-tuples). Two records make a scoped unwind of one purl ineligible
-/// for the whole-ledger replay, so it takes the per-purl revert — the path
-/// that used to refuse for bun.
+/// for the whole-ledger replay, so it takes the per-purl revert.
 fn write_two_record_hosted_project(root: &Path) -> String {
     let pristine = pristine_lock_two();
     write_bun_project(root, &pristine, &[(NAME, VERSION), (OTHER_NAME, "1.0.0")]);
@@ -953,8 +950,7 @@ fn bun_scoped_remove_of_one_of_two_hosted_records_unwinds_only_that_purl() {
     let root = tmp.path();
     let pristine = write_two_record_hosted_project(root);
 
-    // `remove <purl>` takes the same per-purl hosted leg; used to exit 1
-    // with `hosted_revert_failed`.
+    // `remove <purl>` takes the same per-purl hosted leg.
     let (code, env) = run_json(
         root,
         &[
@@ -979,13 +975,10 @@ fn bun_scoped_remove_of_one_of_two_hosted_records_unwinds_only_that_purl() {
 // ─────────────────────────────────────────────────────────────────────
 // Hosted mode accepts a lockfileVersion-1 workspace lock (a URL tuple has
 // no path to resolve); the vendored backend refuses every pre-v2 workspace
-// lock (`vendor_bun_workspace_unsupported`). The plain `vendor` command
-// used to run the takeover FIRST — revert the hosted line, persist the
-// redirect-ledger drop — and only then hear the engine's refusal, leaving
-// the project unpatched in BOTH modes while the refusal's remedy pointed
-// at the hosted mode it had just destroyed; its dry run promised the
-// takeover (`vendor_would_revert_redirect`, status success) outright. The
-// Bun preflight now runs inside the engine loop before the takeover block.
+// lock (`vendor_bun_workspace_unsupported`). The Bun preflight runs inside
+// the engine loop before the takeover block, so a refused `vendor` (and its
+// dry run) never reverts the hosted line or drops the redirect-ledger
+// record first — which would leave the project unpatched in BOTH modes.
 
 const WS_CODE: &str = "vendor_bun_workspace_unsupported";
 

@@ -30,9 +30,9 @@
 //! `fsync(2)` stops at the drive's cache — issues ONE `F_FULLFSYNC` per
 //! device to flush that cache for everything before it. Every durable
 //! commit-point write runs the barrier first, so a lockfile or ledger that
-//! names an artifact is never made durable ahead of the artifact itself: the
-//! per-file `F_FULLFSYNC` pair each artifact used to pay collapses into one
-//! plain `fsync` per file plus one cache flush per commit point. (Unix
+//! names an artifact is never made durable ahead of the artifact itself,
+//! at the cost of one plain `fsync` per file plus one cache flush per commit
+//! point rather than a per-file `F_FULLFSYNC` pair. (Unix
 //! only: off Unix the writer fsyncs each file itself and the barrier has
 //! nothing to sync — see [`DEFERS_FILE_SYNC`].)
 //!

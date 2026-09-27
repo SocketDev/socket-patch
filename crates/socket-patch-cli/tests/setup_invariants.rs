@@ -367,9 +367,9 @@ fn setup_yes_json_files_entry_has_expected_keys() {
 // ---------------------------------------------------------------------------
 // Error handling — a malformed package.json must NOT be reported as success.
 //
-// Regression: when nothing was updatable but a file errored (e.g. invalid
-// JSON), `setup` used to emit `status: "already_configured"` with exit 0,
-// masking the failure. A parse error must surface as a non-zero exit.
+// When nothing was updatable but a file errored (e.g. invalid JSON), `setup`
+// must not emit `status: "already_configured"` with exit 0; a parse error
+// must surface as a non-zero exit.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -718,14 +718,11 @@ fn setup_remove_nothing_to_remove_exits_zero() {
     assert_eq!(v["removed"], 0);
 }
 
-// Regression: in human (non-JSON) mode `setup --remove` ends with
+// In human (non-JSON) mode `setup --remove` ends with
 // "Nothing removed; N item(s) could not be processed (see errors above)."
-// when a manifest fails to parse, but `print_remove_preview` printed NO error
-// section at all — so "(see errors above)" pointed at nothing and the user
-// never saw *why* the file could not be processed. The preview must surface the
-// per-file error so the message is truthful. (The companion setup-path check is
-// `setup_malformed_does_not_claim_already_configured_in_human_mode`; this guards
-// the remove path, whose preview previously had no error branch whatsoever.)
+// when a manifest fails to parse, so `print_remove_preview` must surface the
+// per-file error for that message to be truthful. (The companion setup-path
+// check is `setup_malformed_does_not_claim_already_configured_in_human_mode`.)
 #[test]
 fn remove_human_mode_surfaces_unprocessable_file_error() {
     let tmp = tempfile::tempdir().expect("tempdir");

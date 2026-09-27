@@ -14,9 +14,6 @@
 //! 5. `rollback --silent` with a per-package failure (installed file
 //!    modified after patching — hash mismatch) exited 1 with zero output.
 //!
-//! Same bug class previously fixed in `scan` (`embed_vex_human`), `setup`
-//! (all three modes), `apply` (`--silent`/`--check` mutes), and `remove`.
-//!
 //! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client warning:
 //! it's printed by `get_api_client_with_overrides` in core for every ONLINE
 //! command (offline runs suppress it) and is out of scope for `rollback`'s

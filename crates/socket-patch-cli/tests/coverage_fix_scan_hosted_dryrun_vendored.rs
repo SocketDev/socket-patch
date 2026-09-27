@@ -1,16 +1,10 @@
-//! Coverage-audit regression: `scan --mode hosted --dry-run` over a VENDORED
-//! project must preview the WET run's takeover outcome.
-//!
-//! Pre-fix, the takeover pre-revert loop's dry-run branch pushed the
-//! `redirect_would_revert_vendored` warning ("will revert … then redirect")
-//! and `continue`d — skipping the revert but LEAVING the purl in the
-//! candidates/overrides handed to the rewriters. The pnpm/berry rewriters
-//! then previewed against the still-vendored lock, fail-closed refused its
-//! `file:.socket/vendor/…` resolution (`redirect_pnpm_entry_vendored`,
-//! "run `vendor --revert` first"), and the envelope reported `redirected: 0`
-//! with BOTH contradictory prescriptions — while the same command WITHOUT
-//! `--dry-run` reverted first and reported `redirected: 1`. A CI gate keying
-//! on the dry-run count concluded the migration would fail when it succeeds.
+//! `scan --mode hosted --dry-run` over a VENDORED project must preview the
+//! WET run's takeover outcome: the rewriters must not preview against the
+//! still-vendored lock (and fail-closed refuse its `file:.socket/vendor/…`
+//! resolution with `redirect_pnpm_entry_vendored`), or the envelope would
+//! report `redirected: 0` with contradictory prescriptions while the wet
+//! run reports `redirected: 1` — and a CI gate keying on the dry-run count
+//! would conclude the migration fails when it succeeds.
 //!
 //! Fixture: a real offline `vendor` run (the `in_process_vendor.rs` harness
 //! shapes) produces the vendored lock + `.socket/vendor/state.json` entry;
@@ -336,15 +330,15 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
         codes.contains(&"redirect_would_revert_vendored"),
         "the takeover plan must be announced: {doc:#}"
     );
-    // THE BUG: the rewriters previewed against the still-vendored lock and
-    // refused it, contradicting the takeover warning above.
+    // Previewing against the still-vendored lock would refuse it,
+    // contradicting the takeover warning above.
     assert!(
         !codes.contains(&"redirect_pnpm_entry_vendored"),
         "the dry-run must not also tell the user to run `vendor --revert` \
          for a purl this run just promised to revert itself: {doc:#}"
     );
-    // THE BUG: the preview reported `redirected: 0` for a migration the wet
-    // run lands (below) — the CI-gate signal this envelope exists for.
+    // The preview must count the migration the wet run lands (below) — the
+    // CI-gate signal this envelope exists for.
     assert_eq!(
         doc["redirect"]["redirected"], 1,
         "the dry-run must preview the wet outcome: {doc:#}"
@@ -490,7 +484,6 @@ fn scan_hosted_human(cwd: &Path, api_url: &str, dry_run: bool) -> (i32, String, 
     run_cli(cwd, &args)
 }
 
-/// The first line of `stdout` (the summary).
 /// The engine's one-line summary. Human hosted `scan` prints the results
 /// table and discovery summary above it, so find it by its lead words.
 fn summary_line(stdout: &str) -> &str {
@@ -504,8 +497,7 @@ fn summary_line(stdout: &str) -> &str {
 /// the wet run the landed one, each as its own line on stderr, and both
 /// summaries count the same 3 files — the lock and workspace the hosted
 /// rewriter touches plus the package.json `pnpm.overrides` wiring only the
-/// vendored revert touches (the wet count used to omit it: "rewrote 2
-/// files"). The wet run's next steps name `.socket/vendor/` and
+/// vendored revert touches. The wet run's next steps name `.socket/vendor/` and
 /// package.json, so the deleted vendored ledger entry and artifact and the
 /// reverted wiring are committed too.
 #[tokio::test]

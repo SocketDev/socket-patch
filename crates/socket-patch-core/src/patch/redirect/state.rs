@@ -1,9 +1,11 @@
 //! The hosted-mode ledger (`.socket/vendor/redirect-state.json`), written by
-//! `scan --mode hosted` (a.k.a. `scan --redirect`).
+//! hosted-mode `scan` (the default mode; also `--mode hosted` / the legacy
+//! `--redirect`).
 //!
 //! Mirrors the vendor `state.json` shape but records a REMOTE per-dependency
 //! redirect (no local artifact bytes). It carries the recorded [`FileEdit`]s
-//! (for a future `--revert`) plus, per redirected PURL, the manifest
+//! (which `rollback` and the hosted→vendored takeover replay in reverse to
+//! restore the pre-redirect files) plus, per redirected PURL, the manifest
 //! [`PatchRecord`] (file hashes + vulnerability metadata) so a post-install
 //! `socket-patch vex` can attest the redirected patches against the installed
 //! tree exactly as it does for `apply` / `vendor`. VEX folds `records`
@@ -315,11 +317,10 @@ pub async fn save_redirect_state(
 ///   `"name@version"`, pnpm v6 peer-suffixed `"name@version(peer…)"`, or the
 ///   pnpm-v5 respelling `"name@version_peer…"`.
 ///
-/// The old matcher claimed by NAME alone (`key == name`, key ends with
-/// `"/name"`): with two versions of one package hosted, vendoring one
-/// deleted BOTH versions' path-keyed edits, destroying the other version's
-/// revert originals. Name-only matching is gone; version-blind keys with no
-/// artifact anchor are KEPT (fail-closed — they may be the other version's
+/// Never claim by NAME alone (`key == name`, key ends with `"/name"`): with
+/// two versions of one package hosted, vendoring one would delete BOTH
+/// versions' path-keyed edits, destroying the other version's revert
+/// originals. Version-blind keys with no artifact anchor are KEPT (fail-closed — they may be the other version's
 /// only revert data). Consequence for the CLI's takeover-overlap fallback
 /// matcher (which still matches edit keys by bare name, but ONLY when
 /// `records` is empty — the degraded record-fetch-failed ledger): a normal
@@ -695,11 +696,11 @@ mod tests {
     /// TWO versions of one package hosted at once: dropping the vendored one
     /// must not touch the other version's halves. The npm path keys
     /// (`node_modules/…/left-pad`) and legacy `dependencies` bare-name keys
-    /// carry NO version, so the old name-anchored matcher claimed BOTH
+    /// carry NO version, so a name-anchored matcher would claim BOTH
     /// versions' edits here — destroying left-pad@2.0.0's pre-redirect
     /// originals (its only revert data) when left-pad@1.3.0 was vendored.
-    /// The matcher is artifact-anchored now: only edits whose rewritten
-    /// content references the dropped purl's own hosted artifact go.
+    /// Only edits whose rewritten content references the dropped purl's own
+    /// hosted artifact go.
     #[test]
     fn drop_superseded_purl_never_claims_the_other_hosted_versions_edits() {
         const UUID_V2: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0f9e8d7c6b5a";
@@ -1041,7 +1042,7 @@ mod tests {
     /// is at index 0) — is refused outright: nothing is dropped and `false`
     /// is reported. Fail closed — without a `(name, version)` pair the
     /// matcher could only claim by name, the exact over-deletion the
-    /// artifact-anchored rewrite removed.
+    /// artifact anchor exists to prevent.
     #[test]
     fn drop_superseded_purl_unversioned_purl_drops_nothing() {
         for bogus in ["pkg:npm/left-pad", "pkg:npm/@1.0.0"] {
@@ -1164,9 +1165,9 @@ mod tests {
 
     #[tokio::test]
     async fn load_malformed_ledger_is_a_hard_error_naming_the_file() {
-        // A torn/hand-mangled ledger must NOT load as "no ledger": the old
-        // tolerant `None` let the next hosted run start a fresh ledger and
-        // silently overwrite the only copy of the pre-redirect revert data.
+        // A torn/hand-mangled ledger must NOT load as "no ledger": a
+        // tolerant `None` would let the next hosted run start a fresh ledger
+        // and silently overwrite the only copy of the pre-redirect revert data.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".socket/vendor");
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -1492,8 +1493,8 @@ mod tests {
     }
 
     /// Emptying the ledger deletes it AND prunes the now-empty
-    /// `.socket/vendor/` it lived in — the residue a hosted rollback used to
-    /// leave — but never `.socket/` itself (the lock guard owns that level).
+    /// `.socket/vendor/` it lived in — but never `.socket/` itself (the lock
+    /// guard owns that level).
     #[tokio::test]
     async fn persist_empty_state_prunes_the_emptied_vendor_dir() {
         let tmp = tempfile::tempdir().unwrap();

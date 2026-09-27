@@ -1417,11 +1417,10 @@ fn truncated_binary_lock_attests_nothing() {
 /// An aliased install (`"mm": "npm:minimist@1.2.2"`): the map key is the
 /// alias, the spec names the real package, so the purl is minimist's.
 ///
-/// REGRESSION (hosted): bun installs the aliased hosted tarball at
-/// `node_modules/mm`, which the npm crawler's name-keyed lookup never
-/// probes — so the only installed copy read as "not installed" and a
-/// tampered or pristine (not yet reinstalled) alias attested from the lock
-/// pin. The alias copy is consumed evidence and must verify.
+/// Hosted: bun installs the aliased hosted tarball at `node_modules/mm`,
+/// which the npm crawler's name-keyed lookup never probes. The alias copy is
+/// consumed evidence and must verify — a tampered or pristine (not yet
+/// reinstalled) alias must not attest from the lock pin.
 #[test]
 fn aliased_text_entries_attest_the_real_package() {
     for version in [0, 1, 2] {

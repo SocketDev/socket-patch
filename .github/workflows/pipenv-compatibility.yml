@@ -14,7 +14,7 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/pipenv.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_pipenv.rs'
       - 'crates/socket-patch-core/src/vendor/pypi.rs'
-      - 'crates/socket-patch-core/src/vendor/lock_inventory.rs'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory/**'
       - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
       - 'crates/socket-patch-core/src/utils/pipenv.rs'
       - 'crates/socket-patch-cli/src/commands/scan/hosted.rs'

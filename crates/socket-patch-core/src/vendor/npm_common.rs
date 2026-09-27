@@ -1,8 +1,8 @@
 //! Flavor-agnostic npm vendoring pipeline: coordinate guards plus the shared
 //! stage→patch→pack steps.
 //!
-//! Every npm lockfile flavor (package-lock, yarn-classic/berry, pnpm, bun)
-//! vendors the same way up to the wiring: validate the
+//! Every tarball-artifact npm flavor (package-lock, yarn classic/berry, pnpm
+//! incl. legacy, bun) vendors the same way up to the wiring: validate the
 //! coordinates fail-closed, stage a private copy of the installed package in
 //! a tempdir OUTSIDE the project, prune nested `node_modules`, refuse
 //! bundled-deps packages, run the hardened apply pipeline against the stage,
@@ -10,7 +10,8 @@
 //! `.socket/vendor/npm/<uuid>/`. Only the lockfile wiring differs per flavor,
 //! and it always runs LAST — so a refusal or failure in this pipeline leaves
 //! the project byte-untouched (a dry run stops after verification and
-//! creates nothing on disk).
+//! creates nothing on disk). vlt shares the coordinate guards but vendors a
+//! directory artifact instead (see [`super::npm_dir`]).
 
 use std::path::{Path, PathBuf};
 
@@ -213,10 +214,10 @@ pub(super) async fn stage_patch_pack(
     // same members but different bytes), so a service outage or its
     // recovery would re-vendor every package. `--vendor-source` governs
     // acquisition, not reuse; checked before `service_offline_conflict` so
-    // an in-sync `service` + `--offline` re-run succeeds (as cargo and
-    // composer already do). The probe is read-only and offline, so a dry
-    // run runs it too: on a hit it skips the offline refusal (the real run
-    // would not raise it) and keeps previewing the local build.
+    // an in-sync `service` + `--offline` re-run succeeds. The probe is
+    // read-only and offline, so a dry run runs it too: on a hit it skips the
+    // offline refusal (the real run would not raise it) and keeps previewing
+    // the local build.
     let mut reusable = false;
     if let Some(pair) = reuse_committed_pack(purl, project_root, &coords, record).await {
         if !dry_run {
@@ -1029,8 +1030,8 @@ mod tests {
     /// created inside the project — the module contract ("a refusal or
     /// failure in this pipeline leaves the project byte-untouched", and the
     /// `Err` arm's "Nothing inside the project was written") — instead of
-    /// stranding an unledgered, committable husk no `--revert` entry tracks
-    /// (the vendor/cargo.rs failed-vendor-husk class). Reachable shape: the
+    /// stranding an unledgered, committable husk no `--revert` entry tracks.
+    /// Reachable shape: the
     /// patch rewrites package/package.json to content that is not valid
     /// JSON (apply is afterHash-gated only, never a JSON parse), so
     /// `read_staged_package_json` errs after the tarball fully packed.

@@ -338,7 +338,7 @@ pub struct ApplyArgs {
     #[command(flatten)]
     pub vex: VexEmbedArgs,
 
-    /// Set when `get` / `scan --apply/--sync` runs this apply as its last
+    /// Set when `get` / `scan --mode agent` runs this apply as its last
     /// step (`None` for the `apply` command itself). Not a CLI flag.
     #[arg(skip)]
     pub nested: Option<NestedApply>,
@@ -363,8 +363,7 @@ impl ApplyArgs {
 }
 
 // ── local-go redirect helpers ────────────────────────────────────────────────
-// The Go analog of the cargo helpers above: in local mode a `pkg:golang/…` PURL
-// redirects to a project-local patched copy under `.socket/go-patches/` wired via
+// In local mode a `pkg:golang/…` PURL redirects to a project-local patched copy under `.socket/go-patches/` wired via
 // a `go.mod` `replace` directive.
 
 /// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
@@ -738,9 +737,8 @@ fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
 /// Print the yarn-PnP refusal (JSON envelope or human stderr) and return
 /// apply's refusal exit code. Shared by the pre-manifest gate and the
 /// package-manager layout gate below: scan cannot discover PnP packages so
-/// it never writes a manifest, which used to leave the calm `noManifest`
-/// exit as the ONLY thing a PnP user ever saw — the documented loud
-/// `yarn_pnp_unsupported` refusal was unreachable without a manifest.
+/// it never writes a manifest, and the loud `yarn_pnp_unsupported` refusal
+/// must still be reachable without one.
 fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
@@ -909,7 +907,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
 /// package-manager layout gate, the apply loop, embedded VEX, output and
 /// telemetry — over a `lock` the caller already holds and the caller's
 /// `client`. [`run`] takes the lock itself; agent-mode `get` and
-/// `scan --apply/--sync` call this straight after their manifest write, so
+/// `scan --mode agent` call this straight after their manifest write, so
 /// download → manifest write → apply is ONE lock window (a same-process
 /// re-acquire would contend) and the nested apply never builds a second
 /// client. `lock` is released explicitly once every mutation is done
@@ -1353,9 +1351,11 @@ struct ApplyOutcome {
     results: Vec<ApplyResult>,
     /// In-scope manifest purls with no installed package on disk.
     unmatched: Vec<String>,
-    /// Run-level advisories: JSON `warnings[]`, one gated stderr line each
-    /// on the human path (`--silent` = errors only). Today: the gem
-    /// config-root containment skip.
+    /// Run-level advisories: JSON `warnings[]`, and one gated stderr line
+    /// each on the human path (`--silent` = errors only) except the
+    /// sources-unavailable codes (already printed by the stager): the gem
+    /// config-root containment skip and the sources-unavailable reason
+    /// (`run` adds `ownership_not_restored`).
     run_warnings: Vec<RunWarning>,
     /// Gem-env fallback-home copies deliberately left unpatched
     /// (best-effort class): one non-fatal `Skipped` event each in the
@@ -1687,10 +1687,9 @@ async fn apply_patches_inner(
     if partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
         // filtered out by `--ecosystems`). There is genuinely no work to do,
-        // so this is a clean no-op SUCCESS — not a failure. Returning `false`
-        // here used to exit 1 / `partialFailure`, which broke the npm
-        // `postinstall` hook (it runs `apply` on every install, including
-        // fresh projects whose manifest has no matching patches yet). Decided
+        // so this is a clean no-op SUCCESS — not a failure: the npm
+        // `postinstall` hook runs `apply` on every install, including fresh
+        // projects whose manifest has no matching patches yet. Decided
         // BEFORE the ledger read, gem discovery and the crawl — none of which
         // can add work to an empty scope — but AFTER the staging above, which
         // is where `--download-mode` is validated at runtime.
@@ -1787,8 +1786,8 @@ async fn apply_patches_inner(
         let mut unmatched = unmatched;
         unmatched.sort();
         // This diagnostic flips the exit code, so it is an error — and it
-        // prints even under --silent ("errors only", never nothing — the
-        // hooked `apply --silent` used to exit 1 mutely here); `--json`
+        // prints even under --silent ("errors only", never a mute exit 1);
+        // `--json`
         // mutes stderr and the envelope's `package_not_installed` events
         // are the channel.
         if !unmatched.is_empty() && args.prints_errors() {
@@ -2098,7 +2097,7 @@ async fn apply_patches_inner(
             if is_vendored(purl) {
                 continue;
             }
-            // npm PURLs: direct lookup
+            // Non-variant PURLs: direct lookup
             let patch = match manifest.patches.get(purl) {
                 Some(p) => p,
                 None => continue,
@@ -2115,8 +2114,8 @@ async fn apply_patches_inner(
                 // Local go redirects to a project-local patched copy under
                 // `.socket/go-patches/` wired via a `go.mod` `replace` (the
                 // module cache is `go.sum`-verified, so in-place patching
-                // can't build). Everything else — npm/pypi/gem and cargo
-                // (vendored or registry cache) — patches in place via
+                // can't build). Everything else in this branch (npm, cargo,
+                // composer, nuget, …) patches in place via
                 // `apply_package_patch`.
                 let result =
                     match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
@@ -2422,10 +2421,8 @@ mod tests {
     /// Regression: a non-installed release variant whose first patched
     /// file is `NotFound` (e.g. an sdist patching `setup.py` while only a
     /// wheel is on disk) must be treated as NOT installed and skipped —
-    /// exactly like a `HashMismatch`. Before the fix the loop only skipped
-    /// `HashMismatch`, so a `NotFound` variant slipped through to
-    /// `apply_package_patch` and produced a spurious `Failed` event in the
-    /// JSON envelope. This pins the apply-side decision to the same
+    /// exactly like a `HashMismatch`, never reaching `apply_package_patch`
+    /// as a spurious `Failed` event. This pins the apply-side decision to the same
     /// Ready/AlreadyPatched contract as `select_installed_variants`.
     #[test]
     fn variant_matches_only_when_first_file_ready_or_already_patched() {

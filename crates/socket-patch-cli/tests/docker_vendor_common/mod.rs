@@ -153,7 +153,7 @@ git_blob_sha() {
 /// zero network. The optional trailing `<ghsa> <cve>` pair records one
 /// high-severity vulnerability so a generated VEX document has a statement
 /// to emit; omitted, `vulnerabilities` stays empty. Shape mirrors
-/// `e2e_vendor_npm_build.rs::stage_patch` / `stage_patch_with_vuln`.
+/// `e2e_vendor_npm_build.rs::stage_patch_with_vuln`.
 /// Requires [`bash_prelude`] (uses `git_blob_sha`).
 pub fn stage_patch_fn() -> &'static str {
     r#"stage_patch() {

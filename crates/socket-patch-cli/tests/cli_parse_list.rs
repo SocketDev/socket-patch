@@ -368,9 +368,8 @@ fn empty_file_manifest_reports_manifest_invalid_via_binary() {
 fn missing_manifest_under_valid_cwd_reports_manifest_not_found_via_binary() {
     // The common missing-manifest case: cwd exists, but `.socket/manifest.json`
     // does not. `read_manifest` returns `Ok(None)` here, which must surface as
-    // `manifest_not_found` — NOT `manifest_invalid`. (Regression: the `Ok(None)`
-    // arm previously hard-coded `manifest_invalid`, telling consumers a missing
-    // file was corrupt. It was masked by a now-removed metadata pre-check.)
+    // `manifest_not_found` — NOT `manifest_invalid`, which would tell
+    // consumers a missing file was corrupt.
     let tmp = tempfile::tempdir().unwrap();
     let out = run_list_binary(tmp.path(), &["--json"]);
     let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
@@ -398,11 +397,8 @@ fn manifest_path_is_existing_directory_reports_unreadable_via_binary() {
     // path because the latter is `ENOTDIR` on Unix but a NotFound-class error
     // on Windows, where traversing through a file is legitimately "path not
     // found"; a directory yields a non-NotFound error on every platform.)
-    //
-    // Regression: `run()` used to stat the path with `tokio::fs::metadata`
-    // first and treat ANY stat failure as `manifest_not_found`, masking real
-    // I/O errors. Removing that pre-check lets `read_manifest`'s I/O error
-    // classify it correctly.
+    // A stat failure must not be folded into `manifest_not_found`:
+    // `read_manifest`'s I/O error classifies it.
     let tmp = tempfile::tempdir().unwrap();
     let manifest_path = tmp.path().join("manifest-is-a-dir");
     std::fs::create_dir(&manifest_path).unwrap();
@@ -866,10 +862,8 @@ fn absolute_manifest_path_content_wins_over_cwd_via_binary() {
 
 // ---------------------------------------------------------------------------
 // `--silent` contract — CLI_CONTRACT.md defines `--silent` as "Errors only".
-// Regression guard: `run()` gated the human-readable listing on `!json`
-// alone, so `list --silent` still printed the full patch table (and the
-// "No patches found in manifest." line for an empty manifest). Mirrors the
-// `get --silent` / `repair --silent` regressions fixed earlier.
+// `list --silent` must print neither the patch table nor the "No patches
+// found in manifest." line for an empty manifest.
 // ---------------------------------------------------------------------------
 
 /// Like [`run_list_binary`] but with every `GlobalArgs` env var scrubbed,
@@ -1288,10 +1282,10 @@ fn silent_gates_the_malformed_ledger_warning_via_binary() {
 
 // ---------------------------------------------------------------------------
 // `--manifest-path` store scoping — both stores must come from the SAME
-// project. The redirect ledger used to be resolved against cwd
-// unconditionally, so pointing `--manifest-path` at another project's
-// manifest interleaved two projects' patch state (and a LOCAL ledger could
-// suppress the flagged project's manifest_not_found).
+// project. Resolving the redirect ledger against cwd instead would
+// interleave two projects' patch state when `--manifest-path` points at
+// another project's manifest (and a LOCAL ledger could suppress the flagged
+// project's manifest_not_found).
 // ---------------------------------------------------------------------------
 
 #[test]

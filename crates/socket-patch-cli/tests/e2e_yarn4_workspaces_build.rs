@@ -314,7 +314,7 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
     let lock = std::fs::read_to_string(boot.join("yarn.lock")).ok()?;
     // yarn 4.0.x writes the bare hex, 4.1+ `10c0/<hex>`: the API form is the
     // prefixed one. A lock with neither is a harness failure, never a
-    // silent pass (the old `?` here returned before any assertion ran).
+    // silent pass.
     let checksum = yarn_berry_common::yarn_written_checksum(&lock);
     if checksum.is_none() {
         skip!(

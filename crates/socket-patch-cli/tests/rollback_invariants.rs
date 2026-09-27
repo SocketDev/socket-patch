@@ -1,9 +1,8 @@
-//! Integration tests for `rollback` paths that don't require network or
-//! installed packages — same shape as `apply_invariants.rs` for apply.
-//!
-//! The network-dependent paths (downloading missing `beforeHash` blobs)
-//! and the actual disk-mutation paths (rolling back a real installed
-//! package) stay in the `#[ignore]`'d e2e suite.
+//! Integration tests for `rollback` driven through the built binary against
+//! hand-written manifests: error paths, the offline/online before-blob gate,
+//! not-installed entries, the JSON shape, and real restores of fake
+//! installed packages. Nothing reaches a real registry; network cases hit an
+//! unroutable localhost port.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -203,11 +202,11 @@ fn truthy_one_off_env_var_sets_flag() {
     );
 }
 
-/// Regression: an exported-but-empty `SOCKET_ONE_OFF=` — the shell/CI idiom
-/// for blanking a variable without unsetting it — must mean "unset, fall back
-/// to false", not abort the run. (This flag is outside `GLOBAL_ARG_ENV_VARS`,
-/// so `main`'s empty-var scrub never rescues it; the parser itself must
-/// tolerate the empty string.) With one-off correctly off, a manifest-less
+/// An exported-but-empty `SOCKET_ONE_OFF=` — the shell/CI idiom for
+/// blanking a variable without unsetting it — must mean "unset, fall back to
+/// false", not abort the run. (`SOCKET_ONE_OFF` is in `LOCAL_ARG_ENV_VARS`,
+/// so `main`'s empty-var scrub removes it before clap parses;
+/// `parse_bool_flag` also treats an empty string as false.) With one-off correctly off, a manifest-less
 /// rollback reaches the normal "Manifest not found" error.
 #[test]
 fn empty_one_off_env_var_parses_as_false_not_crash() {
@@ -287,11 +286,10 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     // means we won't fetch. Rollback must fail out before touching
     // anything — and the JSON envelope must SAY so. The bail fires before
     // the rollback loop produces any per-package results, so the failures
-    // are synthesized: before the fix the envelope claimed `failed: 0`
-    // with empty `results[]` on an exit-1 run, and `--json` mutes the
-    // stderr explanation, leaving machine consumers zero diagnostic.
-    // (Installing the package matters since the gate reorder: an entry
-    // with no installed package never enters the blob plan — see
+    // are synthesized — `--json` mutes the stderr explanation, so an
+    // envelope claiming `failed: 0` with empty `results[]` would leave
+    // machine consumers zero diagnostic. (The package is installed because
+    // an entry with no installed package never enters the blob plan — see
     // `rollback_only_not_installed_entry_is_never_blob_gated`.)
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_dir(tmp.path());
@@ -775,7 +773,7 @@ fn rollback_json_shape_has_documented_keys() {
     // These keys are documented in CLI_CONTRACT.md as the rollback shape
     // (not yet migrated to the unified envelope). Pin them so a future
     // migration trips this test instead of breaking wrappers silently.
-    // The v4 duality rework added the always-present additive keys from
+    // The v5.0 duality rework added the always-present additive keys from
     // `vendored` onward (vendoredReverted/vendoredPreserved/vendoredKept,
     // hosted, manifest, gc, paths).
     for key in [
@@ -818,10 +816,6 @@ fn rollback_json_shape_has_documented_keys() {
         "warnings must be an array (present even when empty)"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Manifest-path override
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Real rollback against an installed package
@@ -1142,6 +1136,10 @@ fn rollback_dry_run_does_not_modify_file() {
     let content = std::fs::read(pkg_dir.join("index.js")).unwrap();
     assert_eq!(content, after, "dry-run must not modify the installed file");
 }
+
+// ---------------------------------------------------------------------------
+// Manifest-path override
+// ---------------------------------------------------------------------------
 
 #[test]
 fn rollback_honors_manifest_path_override() {

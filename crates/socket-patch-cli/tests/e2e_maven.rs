@@ -4,8 +4,7 @@
 //! Maven local repository layout.  They do **not** require network access or a
 //! real Maven/Java installation: the scan's patch lookup is pinned to an
 //! in-test [`wiremock`] public-proxy stand-in via `--proxy-url`. That pinning
-//! is load-bearing, not cosmetic — since the all-batches-failed fix, an
-//! unreachable API is a hard scan failure (exit 1, `status: "error"`), so an
+//! is load-bearing, not cosmetic — an unreachable API is a hard scan failure (exit 1, `status: "error"`), so an
 //! unpinned scan would phone home to the live proxy on every test run and go
 //! red whenever the network (or an ambient `SOCKET_*` variable) misbehaved.
 //!
@@ -80,11 +79,10 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
     .expect("socket-patch subprocess task panicked")
 }
 
-/// Regression guard for the hermeticity fix: every scan in a test must have
-/// routed its patch lookup through the in-test proxy. Fewer recorded requests
-/// than scans means at least one binary invocation talked to the live API (or
-/// skipped the lookup outright) despite the pinning — exactly the bug this
-/// file used to have.
+/// Hermeticity guard: every scan in a test must have routed its patch lookup
+/// through the in-test proxy. Fewer recorded requests than scans means at
+/// least one binary invocation talked to the live API (or skipped the lookup
+/// outright) despite the pinning.
 async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
@@ -101,7 +99,7 @@ async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
 
 /// Verify that `socket-patch scan` discovers artifacts in a fake Maven local repo.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
+#[ignore = "opt-in maven crawl e2e; run with --ignored"]
 async fn scan_discovers_maven_artifacts() {
     let server = start_proxy().await;
     let proxy_url = server.uri();
@@ -179,8 +177,7 @@ async fn scan_discovers_maven_artifacts() {
         output.status.code()
     );
     // Must NOT have hit the empty-crawl path — that line *also* contains
-    // the word "packages", which is exactly what let the old assertion
-    // pass when discovery was disabled.
+    // the word "packages".
     assert!(
         !combined.contains("No packages found")
             && !combined.contains("No packages found"),
@@ -229,7 +226,7 @@ async fn scan_discovers_maven_artifacts() {
 
 /// Verify that `socket-patch scan` discovers Gradle project artifacts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
+#[ignore = "opt-in maven crawl e2e; run with --ignored"]
 async fn scan_discovers_gradle_project_artifacts() {
     let server = start_proxy().await;
     let proxy_url = server.uri();
@@ -264,9 +261,8 @@ async fn scan_discovers_gradle_project_artifacts() {
 
     // --- JSON run: the `scannedPackages` count is the contract field -----
     // A single artifact lives in the repo. We assert the *value* (1), not
-    // merely the presence of the key — the old `contains("scannedPackages")`
-    // check passed even when the count was 0 (i.e. nothing discovered),
-    // since the field is always emitted.
+    // merely the presence of the key — the field is always emitted, even
+    // when nothing was discovered.
     let output = run(
         &["scan", "--json", "--cwd", project_dir.to_str().unwrap()],
         &project_dir,

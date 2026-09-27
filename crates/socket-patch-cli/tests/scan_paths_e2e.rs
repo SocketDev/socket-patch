@@ -3,7 +3,8 @@
 //!
 //! Spawns the real `socket-patch` binary (same recipe as
 //! `scan_invariants.rs`, with `rollback_invariants.rs`'s SOCKET_* env
-//! scrub) and pins the CONTRACT of path-scoped scans:
+//! scrub) and pins the CONTRACT of path-scoped scans (the scoping bullets
+//! describe agent mode, where PATHS are installed-path globs):
 //!
 //! * scoping narrows the API QUERY (batch-POST body oracle) and the
 //!   envelope counters, echoing the patterns in an always-present `paths`
@@ -14,8 +15,9 @@
 //! * an empty match is a normal empty scan (exit 0, no GC, no API calls);
 //! * lockfile-only supplements are excluded from a scoped scan with the
 //!   `path_scope_excluded_supplements` run-level warning;
-//! * PATHS with `--mode hosted`/`--mode vendored`, and unparseable globs,
-//!   are usage errors (exit 2).
+//! * in hosted/vendored mode (including a bare scan) PATHS are project
+//!   directories: a PATH that is not a directory, more than one directory
+//!   under `--json`, or an unparseable glob is a usage error (exit 2).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -536,7 +538,8 @@ async fn supplements_excluded_with_warning() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Usage errors: PATHS with hosted/vendored modes, and invalid globs.
+// 5. Usage errors: non-directory PATHs in hosted/vendored mode, >1 directory
+//    under --json, and invalid globs.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

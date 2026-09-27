@@ -672,7 +672,7 @@ fn refusal_in_the_middle_leaves_the_prior_rewrite_intact() {
     }
 }
 
-/// Runs the oracle over the Phase 3 benchmark fixtures (real ~1.9 MB uv,
+/// Runs the oracle over the benchmark fixtures (real ~1.9 MB uv,
 /// pylock and PEP 723 locks, too large to commit) when
 /// `SOCKET_PATCH_PY_LOCK_FIXTURES` names their directory; a no-op otherwise.
 #[test]

@@ -576,9 +576,8 @@ pub(crate) async fn rollback_heal(
         .collect()
 }
 
-/// The hosted→vendored heal (DESIGN §4.10 step 4): once a purl is
-/// vendored over its reverted hosted pin, the lock no longer names the
-/// registry DepID, so a store copy still holding the hosted bytes is stale
+/// The hosted→vendored heal: once a purl is vendored over its reverted
+/// hosted pin, the lock no longer names the registry DepID, so a store copy still holding the hosted bytes is stale
 /// against the pristine expectation and is invalidated like a rollback's.
 pub(crate) async fn takeover_heal(
     common: &crate::args::GlobalArgs,

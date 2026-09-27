@@ -14,9 +14,8 @@
 //! metadata as "unknown state, accept the install" rather than
 //! "checksum mismatch, refuse". A signed-package detail tag
 //! (`<name>.<ver>.nupkg.sha512`) — if present — still flags
-//! tampering at the package-archive level; the new typed surface
-//! carries that as an advisory ALONGSIDE the metadata-deleted file
-//! entry (no longer collapsed).
+//! tampering at the package-archive level; that is carried as an
+//! advisory ALONGSIDE the metadata-deleted file entry.
 
 use std::path::Path;
 
@@ -79,8 +78,7 @@ pub(crate) async fn fixup(pkg_path: &Path) -> Result<Option<SidecarPayload>, Sid
 
     // If a `*.nupkg.sha512` sibling exists, the package is signed at
     // the archive level. We can't fix that. Surface a structured
-    // advisory regardless of whether we also deleted metadata — the
-    // old design's lossy collapse hid this when both fired.
+    // advisory regardless of whether we also deleted metadata.
     let advisory = if has_signed_marker(pkg_path).await {
         Some(SidecarAdvisory {
             code: SidecarAdvisoryCode::NugetSignedPackageTampered,
@@ -119,8 +117,7 @@ pub(crate) async fn fixup(pkg_path: &Path) -> Result<Option<SidecarPayload>, Sid
 /// file. The check follows symlinks (`fs::metadata`, not the
 /// non-following `DirEntry::file_type`) so a marker that ships as a
 /// symlink to a real `.sha512` still counts — fail-closed against the
-/// directory false-positive, not fail-open against a symlinked marker
-/// (the symlink-drop trap the npm/cargo crawlers were bitten by).
+/// directory false-positive, not fail-open against a symlinked marker.
 async fn has_signed_marker(pkg_path: &Path) -> bool {
     for entry in list_dir_entries(pkg_path).await {
         if entry
@@ -182,7 +179,7 @@ mod tests {
         assert_eq!(adv.severity, SidecarSeverity::Warning);
     }
 
-    /// Regression (read-only package directory): NuGet caches — like
+    /// Read-only package directory: NuGet caches — like
     /// Cargo's registry and Go's module cache — can live inside a
     /// directory the host marks read-only (`0o555`) for tamper
     /// detection. Removing `.nupkg.metadata` requires *write permission
@@ -233,13 +230,10 @@ mod tests {
         );
     }
 
-    /// Regression (directory false-positive): a *directory* whose name
-    /// ends in `.nupkg.sha512` is NOT a content-signing marker. Before
-    /// the `is_file` guard, `has_signed_marker` matched on name alone
-    /// and emitted a spurious "package may be flagged as tampered"
-    /// advisory for it — misleading an operator into thinking an
-    /// unsigned package was signed. There's no metadata here either, so
-    /// the correct outcome is a clean `None`.
+    /// Directory false-positive: a *directory* whose name ends in
+    /// `.nupkg.sha512` is NOT a content-signing marker and must not emit
+    /// a spurious "package may be flagged as tampered" advisory. There's
+    /// no metadata here either, so the correct outcome is a clean `None`.
     #[tokio::test]
     async fn directory_named_like_marker_is_not_a_signature() {
         let d = tempfile::tempdir().unwrap();
@@ -280,7 +274,7 @@ mod tests {
     /// A marker shipped as a *symlink to a real `.sha512` file* must
     /// still count — the `is_file` guard follows symlinks, so it does
     /// not fail open the way the non-following `DirEntry::file_type`
-    /// would have (the symlink-drop trap the crawlers were bitten by).
+    /// would.
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_marker_still_counts_as_signed() {
@@ -330,9 +324,8 @@ mod tests {
         );
     }
 
-    /// Signed package WITH metadata: the typed payload now carries
-    /// BOTH the file entry and the advisory — the lossy collapse
-    /// from the old design is fixed.
+    /// Signed package WITH metadata: the typed payload carries
+    /// BOTH the file entry and the advisory.
     #[tokio::test]
     async fn signed_with_metadata_carries_files_and_advisory() {
         let d = tempfile::tempdir().unwrap();

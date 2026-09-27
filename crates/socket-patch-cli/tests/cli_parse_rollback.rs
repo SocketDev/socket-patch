@@ -362,7 +362,7 @@ fn all_short_flags_map_to_distinct_fields() {
 /// Bare boolean flags are `SetTrue` (num_args = 0): they must NOT swallow the
 /// following token as a value. If `--one-off` silently became value-taking, a
 /// wrapper invoking `rollback --one-off <purl>` would change meaning (the purl
-/// would be consumed as the flag's value, not the `identifier` positional).
+/// would be consumed as the flag's value, not the `targets` positional).
 #[test]
 fn bare_bool_does_not_consume_next_token() {
     let args = parse_rollback(&["--one-off", "pkg:npm/foo@1"]);

@@ -1136,7 +1136,7 @@ fn golang_hosted_and_vendored_modules_attest_together() {
     );
 }
 
-/// Embedded `scan --vex` (read-only scan) on a manifest-less, ledger-less
+/// Embedded `scan --vex` (a bare scan, which runs hosted mode) on a manifest-less, ledger-less
 /// go project: the scan attests the same patches standalone `vex` does,
 /// and folds the summary into its envelope.
 #[test]

@@ -267,7 +267,8 @@ echo "===FRESH INSTALL VERIFIED==="
 
 # TAMPER PROBE: mutate the vendored jar (leaving its .sha1 stale), purge the
 # target from $M2, and force a cold re-resolve → checksumPolicy=fail must reject
-# it. Restore the pristine jar + re-warm $M2 afterward so stage 3 is clean.
+# it. Restore the pristine jar afterward (stage 3 re-warms $M2 from the clean
+# vendored repo).
 cp "$VJAR" /tmp/vjar.pristine
 printf 'TAMPER' >> "$VJAR"
 rm -rf "$M2/org/apache/commons/commons-text"

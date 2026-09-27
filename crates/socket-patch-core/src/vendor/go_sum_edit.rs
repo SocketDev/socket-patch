@@ -20,11 +20,13 @@
 //!
 //! Everything here is a pure `&str` transform (the hosted rewriters operate on
 //! in-memory file content, mirrored byte-identically by depscan's TS twins).
-//! Unrelated lines are preserved verbatim; insertions keep go's lexicographic
-//! line order so a later `go mod tidy` is a no-op, not a reshuffle. (Whole-line
-//! byte order equals go's `(module, version)` sort because `' '` compares
-//! below every module-path/version character, and the zip line sorts before
-//! its `/go.mod` sibling because `' '` < `'/'`.)
+//! Unrelated lines are preserved verbatim. [`upsert_module_lines`] inserts at
+//! the whole-line byte-order position, which matches go's `(module, semver)`
+//! sort (so a later `go mod tidy` is a no-op) because `' '` compares below
+//! every module-path/version character and `' '` < `'/'` puts the zip line
+//! before its `/go.mod` sibling — except where versions differ in a
+//! multi-digit component (`v1.10.0` vs `v1.9.0`); [`reinsert_lines`] uses the
+//! semver-aware [`go_sum_line_cmp`] instead.
 
 /// The two `go.sum` lines for one module version.
 fn module_lines(module: &str, version: &str, zip_h1: &str, gomod_h1: &str) -> [String; 2] {

@@ -8,7 +8,7 @@
 //! scoping, and the human (non-`--json`) output lines.
 //!
 //! Fixtures and helpers mirror `repair_vendor_e2e.rs` (this suite owns its
-//! own copies; that file is owned by another agent).
+//! own copies).
 //!
 //! A vendored run (`scan --vendor`) is manifest-free: every ledger entry is
 //! `detached` with its record embedded and `.socket/manifest.json` is never
@@ -510,9 +510,10 @@ fn to_standalone_vendor_mode(root: &Path) -> PathBuf {
 
 /// Corrupt `.socket/vendor/state.json` (unparseable JSON) → the vendored
 /// phase surfaces `vendor_state_unreadable` as a partial failure instead of
-/// silently treating the ledger as empty (repair.rs's own earlier load uses
-/// `unwrap_or_default`, so this is the only place the corruption reaches
-/// the user). The artifact is untouched.
+/// silently treating the ledger as empty (repair.rs loads the ledger once
+/// and only its manifest-scoping step degrades a corrupt ledger to "nothing
+/// vendored"; the vendored phase gets the raw result, so this is the only
+/// place the corruption reaches the user). The artifact is untouched.
 #[tokio::test]
 async fn repair_fails_loudly_on_corrupt_vendor_state() {
     let mock = MockServer::start().await;
@@ -1563,12 +1564,10 @@ async fn repair_offline_soft_restore_without_installed_copy() {
 /// the QUALIFIED purl production publishes (`pkg:gem/…?platform=ruby`) —
 /// while the crawler knows only base purls. Repair must resolve the
 /// installed copy through the qualified-aware resolver (the one
-/// `vendor_records` uses): pre-fix the base-keyed lookup never matched a
-/// qualified ledger key, so an INSTALLED package read as absent and an
-/// offline rebuild of a missing artifact failed `vendor_artifact_missing`
-/// instead of rebuilding from the copy on disk (online, it fell through to
-/// the registry-fetch rung — a needless network round-trip that, with no
-/// rubygems route mounted here, fails the repair outright).
+/// `vendor_records` uses): a base-keyed lookup never matches a qualified
+/// ledger key, so an INSTALLED package would read as absent and the rebuild
+/// would fall through to `vendor_artifact_missing` (offline) or the
+/// registry-fetch rung (online; no rubygems route is mounted here).
 #[tokio::test]
 async fn repair_rebuilds_qualified_ledger_key_from_installed_copy() {
     let mock = MockServer::start().await;

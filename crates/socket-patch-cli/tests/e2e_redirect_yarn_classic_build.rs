@@ -107,7 +107,7 @@ fn scrub_socket_env(cmd: &mut Command) {
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
-    // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
+    // Scrub FIRST (it removes SOCKET_* and YARN_CACHE_FOLDER), then
     // set the hermetic flags so they survive.
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
@@ -218,7 +218,7 @@ struct ClassicRedirectFixture {
 }
 
 /// Which CLI front door drives the hosted engine. Both consume the SAME
-/// engine by construction (v3.6): `scan --mode hosted` discovers the dep,
+/// engine by construction (v4.0): `scan --mode hosted` discovers the dep,
 /// while `get <uuid> --mode hosted` names the patch explicitly (the uuid
 /// identifier path is exempt from installed narrowing and needs only the
 /// view + reference mocks, which the fixture mounts anyway). get has no
@@ -686,7 +686,7 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
     tokio::task::block_in_place(|| hosted_dev_resave_vex(&fx));
 }
 
-/// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
+/// get-driven hosted twin (v4.0): `get <uuid> --mode hosted --json --yes`
 /// routes through the SAME hosted engine as `scan --mode hosted`, so the
 /// classic chain must hold unchanged — the fixture's lock pin (hosted URL +
 /// `#sha1` + recomputed integrity) and ledger assertions run against the get

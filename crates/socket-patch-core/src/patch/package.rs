@@ -446,12 +446,8 @@ mod tests {
 
     #[test]
     fn test_read_archive_rejects_double_slash_package_escape() {
-        // Regression: validation must run on the POST-strip path. The raw
-        // entry `package//etc/passwd` passes every pre-strip check (not
-        // absolute, no leading separator, the `//` collapses so no `..`),
-        // but `strip_prefix("package/")` yields the absolute path
-        // `/etc/passwd`. `pkg_path.join("/etc/passwd")` discards the base
-        // and writes to `/etc/passwd` — an out-of-tree arbitrary write.
+        // Validation must run on the POST-strip path: `package//etc/passwd`
+        // strips to the absolute `/etc/passwd` (see `read_archive_from_reader`).
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("arc.tar.gz");
         write_raw_archive(&archive, b"package//etc/passwd", b"evil");
@@ -817,8 +813,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("bomb.tar.gz");
 
-        // Two entries of (max - 1) MiB each = 30 MiB declared, but
-        // gzip compresses zeroes ~1000x so the on-disk archive is small.
+        // Five entries of (MAX_ENTRY_BYTES - 1) bytes each (~16 MiB,
+        // ~80 MiB declared in total), but gzip compresses zeroes ~1000x
+        // so the on-disk archive is small.
         // We don't need to *exceed* 64 MiB — the cap is enforced
         // strictly, so an entry that crosses it will be truncated.
         let chunk = vec![0u8; (MAX_ENTRY_BYTES - 1) as usize];
@@ -826,8 +823,8 @@ mod tests {
         let entry2 = raw_entry(b"b.bin", chunk.len() as u64, &chunk);
         let entry3 = raw_entry(b"c.bin", chunk.len() as u64, &chunk);
         let entry4 = raw_entry(b"d.bin", chunk.len() as u64, &chunk);
-        // 4 * 15 MiB = 60 MiB declared, just under the 64 MiB cap.
-        // Add a fifth to push us over.
+        // Four payloads come to 4 bytes under the 64 MiB cap; a fifth
+        // pushes past it.
         let entry5 = raw_entry(b"e.bin", chunk.len() as u64, &chunk);
         write_raw_tar_gz(&archive, &[entry1, entry2, entry3, entry4, entry5]);
 
@@ -835,7 +832,7 @@ mod tests {
         // Either we get an Io error from truncation or the read
         // succeeds with the first ~4 entries — both prove the cap
         // prevented unbounded growth. Failure mode we want to RULE
-        // OUT: reading all 5 entries (~75 MiB) without error.
+        // OUT: reading all 5 entries (~80 MiB) without error.
         match result {
             Err(_) => { /* defused via Io / truncation */ }
             Ok(map) => {

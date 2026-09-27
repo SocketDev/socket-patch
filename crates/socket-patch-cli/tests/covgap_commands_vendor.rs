@@ -1,4 +1,4 @@
-//! Coverage-gap tests for `commands/vendor.rs` (2026-09 coverage audit):
+//! Coverage-gap tests for `commands/vendor.rs`:
 //! the fail-closed ledger/manifest exit contracts, the fresh-clone
 //! committed-artifact staging error ladder, the redirect-ledger takeover
 //! guard, the human-mode (no `--json`) output surface, and the unix
@@ -741,9 +741,8 @@ fn human_revert_empty_ledger_prints_nothing_to_revert() {
 
 /// Human plain vendor with no manifest at all: the clean no-op message,
 /// exit 0 (same contract as apply). The line names the MANIFEST — the
-/// fixture's `.socket/` (blobs) very much exists, so the old "No .socket
-/// folder found" text was false here and on every hosted-only or
-/// vendored-mode project.
+/// fixture's `.socket/` (blobs) very much exists, as it does on every
+/// hosted-only or vendored-mode project.
 #[test]
 fn human_missing_manifest_prints_nothing_to_vendor() {
     let fx = npm_fixture();
@@ -926,9 +925,9 @@ async fn revert_state_write_failure_reports_failed_after_removal() {
 /// whose ledger save fails AFTER the entry's revert succeeded
 /// (`.socket/vendor` read-only, the artifact dir under `npm/` still
 /// deletable). The purl carries BOTH its `vendor_reconciled` removal and a
-/// `vendor_state_write_failed` failure, and the run exits 1 — pre-fix
-/// `reconcile_dropped` swallowed the error (`let _ = save_state`) and
-/// exited 0 with a ledger still listing the reverted purl.
+/// `vendor_state_write_failed` failure, and the run exits 1 —
+/// `reconcile_dropped` must not swallow the save error and exit 0 with a
+/// ledger still listing the reverted purl.
 #[cfg(unix)]
 #[tokio::test]
 async fn reconcile_state_write_failure_reports_failed_after_removal() {

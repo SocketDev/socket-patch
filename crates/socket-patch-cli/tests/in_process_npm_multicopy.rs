@@ -2,9 +2,9 @@
 //!
 //! When two REAL on-disk copies of the SAME `name@version` exist in a
 //! `node_modules` tree (an npm nested duplicate, a diamond dependency, a
-//! `file:` dup), agent-mode `apply` used to patch only ONE copy and report
-//! `success` with no signal the other copy was left with pristine
-//! (vulnerable) bytes — a false success for a security tool.
+//! `file:` dup), agent-mode `apply` must patch every copy — patching only
+//! ONE and reporting `success` would leave the other with pristine
+//! (vulnerable) bytes, a false success for a security tool.
 //!
 //! These tests build such a tree by hand (no package manager needed, so
 //! they are hermetic and offline), hand-stage a `.socket/` manifest + blob,

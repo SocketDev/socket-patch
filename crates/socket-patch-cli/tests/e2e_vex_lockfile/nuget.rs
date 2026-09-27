@@ -712,8 +712,8 @@ fn nuget_hosted_spoofed_sources_never_attest() {
 /// output for a project without RestorePackagesWithLockFile: the exclusive
 /// exact-id mapping routes every restore of the id to the Socket source,
 /// which serves only the patched version, so the redirect ledger's record
-/// (which supplies the exact version) is live and attests `(redirected)`.
-/// REGRESSION: it used to be `redirect_unwired`.
+/// (which supplies the exact version) is live and attests `(redirected)`,
+/// not `redirect_unwired`.
 #[test]
 fn nuget_hosted_source_without_a_lock_attests_through_its_ledger() {
     let fx = Fx::new();

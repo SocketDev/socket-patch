@@ -46,12 +46,12 @@ mod vex_e2e_common;
 /// real teeth live in [`host_guard`] below.
 #[test]
 #[serial_test::serial]
-// Experimental ecosystem (maven): aspirational setup-matrix cases are a
-// BASELINE GAP today; this passes on CI only because the runners lack `mvn`
-// (cases soft-skip) and fails on any host that has it. Ignore so maven can
-// never block the blocking --all-features jobs; `host_guard` below still pins
-// the real no-op contract. Run with `--features setup-e2e,maven -- --ignored`.
-#[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
+// maven's aspirational setup-matrix cases are a BASELINE GAP (no install
+// hook for setup to wire); this passes on CI only because the runners lack
+// `mvn` (cases soft-skip) and fails on any host that has it. Ignore so maven
+// can never block the blocking --all-features jobs; `host_guard` below still
+// pins the real no-op contract. Run with `--features setup-e2e -- --ignored`.
+#[ignore = "BASELINE GAP (maven): no install hook for setup to wire; not gating CI; run with --ignored"]
 fn mvn() {
     smc::run_pm("maven", "mvn");
 }
@@ -101,9 +101,9 @@ mod host_guard {
     /// runs; a (perfectly valid!) ambient `SOCKET_SETUP_EXCLUDE` stands in for
     /// `setup --exclude`, which a real `setup` run PERSISTS — creating
     /// `.socket/manifest.json` inside the maven fixture and failing
-    /// `assert_pristine`. (Safe to set process-wide: the only other test in
-    /// this binary is the `#[ignore]`d matrix pass, which routes through
-    /// `smc::host_driver_command`'s own `SOCKET_*` prefix scrub.)
+    /// `assert_pristine`. (Safe to set process-wide: every other test in this
+    /// binary is `#[serial]` and spawns through this module's
+    /// prefix-scrubbing `run` / `run_vex` or `smc::host_driver_command`.)
     const HOSTILE_DECOYS: &[(&str, &str)] = &[
         ("SOCKET_STRICT", "banana"),
         ("SOCKET_VENDOR_SOURCE", "bogus-decoy"),

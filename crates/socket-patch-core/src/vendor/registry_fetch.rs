@@ -57,12 +57,11 @@ pub(crate) const MAX_ENTRIES: usize = 60_000;
 /// entry and with the same message. What is deferred is the WRITING — the
 /// committed-artifact reuse, the in-sync hot path and the vendoring service
 /// never read the tree, so an idempotent re-run on a lockfile-only checkout
-/// no longer creates and deletes one.
+/// never creates and deletes one.
 ///
-/// Better still, most of the tree never reaches the tempdir at all: a local
-/// build asks for the vendor stage directly ([`FetchedPackage::stage_into`]),
-/// which the verified bytes write in one pass instead of an extraction and a
-/// whole-tree copy out of it.
+/// A local build asks for the vendor stage directly
+/// ([`FetchedPackage::stage_into`]), which the verified bytes write in one
+/// pass without going through the tempdir.
 ///
 /// The tempdir lives exactly as long as this value — callers must hold it
 /// until the vendor pipeline has finished staging from [`FetchedPackage::dir`].
@@ -77,11 +76,10 @@ pub struct FetchedPackage {
     /// ([`FetchedPackage::stage_into`]).
     ///
     /// Dropped as soon as the tempdir holds the tree: from there on every
-    /// caller copies out of it, so the archive is dead weight and a run
-    /// that materialises its sources holds no more of them than the eager
-    /// fetch did. A source NOTHING reads — the case this deferral exists
-    /// for — keeps its bytes until the holder is dropped, which is the
-    /// trade: the eager fetch spent a whole extracted tree on disk instead.
+    /// caller copies out of it, so the archive is dead weight. A source
+    /// NOTHING reads — the case this deferral exists for — keeps its bytes
+    /// until the holder is dropped instead of a whole extracted tree on
+    /// disk.
     extract: std::sync::Mutex<Option<std::sync::Arc<Extractor>>>,
     /// The tempdir materialisation's outcome, shared by every later caller
     /// so a failure reads the same each time.
@@ -185,16 +183,14 @@ impl FetchedPackage {
     }
 
     /// Write the tree at `dst` instead of the tempdir: the vendor stage the
-    /// local build patches, which a fetched source used to reach by
-    /// extracting into the tempdir and copying the whole tree out of it
-    /// again. `dst` is removed and recreated first, exactly as `fresh_copy`
-    /// does, and `skip_file_name` drops the same entries it dropped.
+    /// local build patches. `dst` is removed and recreated first, exactly as
+    /// `fresh_copy` does, and `skip_file_name` drops the same entries it
+    /// drops.
     pub async fn stage_into(&self, dst: &Path, skip_file_name: Option<&str>) -> Result<(), String> {
         // An earlier branch already wrote the tempdir out (a dry-run
         // preview, or the release-variant probe the vendor loop runs for
         // pypi and gem). Copying it is cheaper than inflating the archive a
-        // second time, and it is what this path did before the fetch went
-        // lazy.
+        // second time.
         if self.extracted.get().is_some_and(Result::is_ok) {
             return crate::patch::copy_tree::fresh_copy(&self.dir, dst, skip_file_name)
                 .await
@@ -457,20 +453,20 @@ struct DestShape {
     /// Two planned entries may land on ONE file, or a name is used as both
     /// a file and a directory. Either way the entries are not independent:
     /// the pool must not spread them and each parent must be created right
-    /// before its own file, which is what the one-pass walk did.
+    /// before its own file, as a sequential in-order extraction does.
     ///
     /// Besides the exact repeats the plan already resolves, two spellings
     /// meet on a case-insensitive volume (`LICENSE` / `license`) or a
     /// normalization-insensitive one (`café` in NFC / NFD). ASCII case is
     /// checked; for anything non-ASCII the walk gives up on deciding and
-    /// takes the one-at-a-time path, which is what it did before.
+    /// takes the one-at-a-time path.
     in_order: bool,
     /// A name is used as both a file and a directory — a refusal the write
     /// walk raises for every such archive, decided by its entries alone.
     file_dir_conflict: bool,
 }
 
-/// What a one-pass walk has put under the destination so far, by the key a
+/// What a sequential walk has put under the destination so far, by the key a
 /// case-insensitive filesystem compares on — enough to answer the one
 /// refusal a write-free pass cannot: a name used as both a file and a
 /// directory ([`DestShape::file_dir_conflict`]), which a sequential archive
@@ -605,12 +601,10 @@ pub(crate) fn validate_zip(
 /// The zip walk, in two passes.
 ///
 /// Pass one reads the central directory alone — no entry is inflated — and
-/// answers everything the one-entry-at-a-time walk decided from headers, in
-/// the same order over the same running total: the traversal guard, the
-/// per-entry and total DECLARED caps, and each entry's destination (with
-/// every parent directory created once, where the old walk re-created them
-/// per entry). It stops at the first refusal, exactly where the single walk
-/// stopped accumulating.
+/// decides everything that comes from headers, in entry order over one
+/// running total: the traversal guard, the per-entry and total DECLARED
+/// caps, and each entry's destination (every parent directory created
+/// once). It stops at the first refusal.
 ///
 /// Pass two inflates the planned entries on a bounded pool of threads, each
 /// with its own reader over the shared bytes. Inflating is the whole cost of
@@ -618,7 +612,7 @@ pub(crate) fn validate_zip(
 /// pass has to serialise is the ANSWER: a repeated name is written by its
 /// last spelling, as an in-order extraction left it, and the refusal
 /// reported is the one at the lowest entry index — which, against pass one's
-/// own index, reproduces the single walk's verdict entry for entry.
+/// own index, reproduces a sequential walk's verdict entry for entry.
 fn walk_zip(
     bytes: &[u8],
     dest: &Path,
@@ -710,8 +704,8 @@ fn plan_zip(
     for i in 0..archive.len() {
         // `by_index`, not the raw reader: an entry the decompressor refuses
         // (an unsupported method, an encrypted member) must be refused HERE,
-        // at the index and with the words the one-pass walk used, rather
-        // than falling through to a later check.
+        // at its index and with the sequential walk's words, rather than
+        // falling through to a later check.
         let file = match archive.by_index(i) {
             Ok(file) => file,
             Err(e) => {
@@ -777,14 +771,13 @@ fn plan_zip(
         return Ok(plan);
     }
 
-    // The destination pass, in entry order — where the one-pass walk did
-    // this work per entry, between its header checks and its inflate.
+    // The destination pass, in entry order.
     let mut out = EntrySink::new(dest, sink).skipping(skip_file_name);
     if plan.in_order {
         // Aliasing destinations: leave the directories to the inflate pass,
         // which creates each one right before its own file, so a name used
-        // as both a file and a directory fails from the syscall it failed
-        // from before, at the entry it failed at.
+        // as both a file and a directory fails from the same syscall at the
+        // same entry as a sequential extraction.
         for entry in &mut plan.entries {
             entry.parent = entry
                 .target
@@ -798,8 +791,8 @@ fn plan_zip(
                 continue;
             };
             if let Err(detail) = out.ensure_parent(&target) {
-                // The one-pass walk stopped here, having written every
-                // entry before this one and nothing after it.
+                // Refuse at this entry: everything before it is written,
+                // nothing after it.
                 let index = plan.entries[at].index;
                 plan.entries.truncate(at);
                 plan.header_refusal = Some((index, detail));
@@ -884,8 +877,8 @@ fn inflate_planned_entries(
             }
         };
         loop {
-            // The verdict is decided; the walk this stands in for had
-            // stopped writing by now, so stop taking work.
+            // The verdict is decided; a sequential walk would have stopped
+            // writing by now, so stop taking work.
             if refused.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
@@ -908,7 +901,7 @@ fn inflate_planned_entries(
         // RLIMIT_NPROC, ENOMEM), and this runs inline on a runtime worker
         // for the fetchers that validate in their async body. Take what the
         // OS gives and let the caller's own thread drain the rest — one
-        // thread is the pre-change walk.
+        // thread is a plain sequential walk.
         for _ in 1..threads {
             if std::thread::Builder::new()
                 .spawn_scoped(scope, worker)
@@ -990,8 +983,8 @@ fn inflate_one<R: std::io::Read + std::io::Seek>(
 
 /// Whether extracting `rel` puts `name` at the root of the destination —
 /// either as the entry itself or as a directory the walk creates for it.
-/// This is exactly what a `metadata(dest.join(name))` probe answered once
-/// the eager extraction had run.
+/// This is exactly what a `metadata(dest.join(name))` probe would answer
+/// after a full extraction.
 fn lands_at_root(rel: &Path, name: &str) -> bool {
     // A leading `./` survives `Path::components` but not `dest.join(rel)`,
     // which is what the probe this replaces ran against.
@@ -1072,13 +1065,10 @@ async fn fetch_gem(
     }))
 }
 
-/// Pure-python wheels recorded by uv.lock (URL + sha256): the unzipped
-/// wheel IS a site-packages layout (package dirs + `.dist-info/RECORD` at
-/// the root), which is exactly the shape the pypi vendor backend stages
-/// from.
 /// PyPI's JSON API base; override with `SOCKET_PYPI_JSON_API` (tests point it
 /// at a mock). Used only to turn a lock's file hash into a download URL for
-/// locks that record hashes without URLs (poetry.lock).
+/// locks that record hashes without URLs (poetry.lock, which records one wheel
+/// hash, and Pipfile.lock, which records every release file's hash).
 pub const DEFAULT_PYPI_JSON_API: &str = "https://pypi.org/pypi";
 
 fn pypi_json_api_base() -> String {
@@ -1179,6 +1169,10 @@ async fn resolve_pypi_url_by_hash(
         })
 }
 
+/// Pure-python wheels recorded by uv.lock (URL + sha256): the unzipped
+/// wheel IS a site-packages layout (package dirs + `.dist-info/RECORD` at
+/// the root), which is exactly the shape the pypi vendor backend stages
+/// from.
 async fn fetch_pypi(
     entry: &LockfileEntry,
     client: &reqwest::Client,
@@ -1367,18 +1361,14 @@ struct ModuleZipWalk {
 /// The dirhash walk, optionally also answering what the extraction walk
 /// would have said about the same entries.
 ///
-/// The golang registry fetch used to inflate every entry twice: once for
-/// the dirhash, once to write the tree. Both walks read the same deflate
-/// streams and both derive everything they check from the entry's name,
-/// its declared size and how many bytes it actually decompresses to — all
-/// of which this walk already has — so the second inflate bought nothing.
+/// One inflate serves both the dirhash and the extraction checks: both
+/// derive everything from the entry's name, its declared size and how many
+/// bytes it actually decompresses to.
 ///
-/// The ORDER the two walks produced is preserved exactly. The dirhash pass
-/// ran to completion first, so its refusal still wins outright and returns
-/// here; the extraction refusal is recorded at the lowest entry index,
-/// where the second walk would have stopped, and handed back for the caller
-/// to raise only after the dirhash has been compared — which is where the
-/// second walk used to start.
+/// Refusal ORDER matches a dirhash-then-extract sequence: a dirhash refusal
+/// wins outright and returns here; the extraction refusal is recorded at
+/// the lowest entry index and handed back for the caller to raise only
+/// after the dirhash has been compared.
 fn walk_module_zip(bytes: &[u8], validate_prefix: Option<&str>) -> Result<ModuleZipWalk, String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -1441,8 +1431,8 @@ fn walk_module_zip(bytes: &[u8], validate_prefix: Option<&str>) -> Result<Module
             ));
         }
         // What `extract_zip_with_prefix` would have made of this entry, in
-        // its own order. Only up to the first refusal: past that the walk it
-        // stands in for had already stopped, totals included.
+        // its own order. Only up to the first refusal: past that the
+        // extraction would already have stopped, totals included.
         if let (Some(prefix), None) = (validate_prefix, extract_refusal.as_ref()) {
             extract_refusal =
                 module_entry_refusal(&name, prefix, declared, entry_bytes, &mut declared_total);
@@ -1667,9 +1657,8 @@ async fn fetch_golang(
             walk.h1
         )));
     }
-    // The tempdir is created BEFORE the extraction refusal is raised, where
-    // the second walk created it: a run that cannot make one reports that,
-    // as it did, rather than the refusal.
+    // The tempdir is created BEFORE the extraction refusal is raised: a run
+    // that cannot make one reports that rather than the refusal.
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("module");
@@ -1910,9 +1899,6 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String
     Ok(bytes)
 }
 
-/// Verify downloaded bytes against the lock-recorded verifier. Runs BEFORE
-/// any disk write. Berry cache-zip checksums and go.sum dirhashes have
-/// dedicated verifiers in their ecosystems' fetchers.
 /// Fetch + stage an npm package from its conventional registry URL WITHOUT
 /// content verification. The download/extract caps still apply.
 ///
@@ -1970,6 +1956,9 @@ pub fn artifact_matches_integrity(
     }
 }
 
+/// Verify downloaded bytes against the lock-recorded verifier. Runs BEFORE
+/// any disk write. Berry cache-zip checksums and go.sum dirhashes have
+/// dedicated verifiers in their ecosystems' fetchers.
 fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), FetchError> {
     match integrity {
         LockIntegrity::Sri(sri) => verify_sri(bytes, sri).map_err(FetchError::Failed),
@@ -2020,8 +2009,8 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
 /// the only integrity npm-era lockfile entries carry (yarn classic writes
 /// `integrity sha1-…` for them), and it is the exact guarantee the package
 /// manager itself enforces for those entries — refusing it would make every
-/// legacy package unvendorable whenever the prebuilt-artifact service misses
-/// (the 2026-07 strapi clean-run regression). The bare-hex twin of this trust
+/// legacy package unvendorable whenever the prebuilt-artifact service misses.
+/// The bare-hex twin of this trust
 /// decision already lives in the `LockIntegrity::Sha1Hex` arm above.
 fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
     let mut best: Option<(u8, &str, &str)> = None;
@@ -2401,8 +2390,7 @@ mod tests {
         use base64::Engine as _;
         let bytes = b"hello";
         let sha1_b64 = base64::engine::general_purpose::STANDARD.encode(Sha1::digest(bytes));
-        // npm-era lockfile entries carry ONLY `sha1-…` (the strapi clean-run
-        // regression: `no usable hash in SRI`); it must verify…
+        // npm-era lockfile entries carry ONLY `sha1-…`; it must verify…
         assert!(
             verify_sri(bytes, &format!("sha1-{sha1_b64}")).is_ok(),
             "sha1-only SRI must be usable"
@@ -2990,8 +2978,7 @@ mod tests {
         assert!(fetched.dir().await.unwrap().join("README.md").is_file());
         // The staged leaf must be the canonical `{name}-{version}`:
         // vendor_gem's platform-suffix guard refuses any other leaf
-        // (`platform_gem_unsupported`), which killed lockfile auto-fetch
-        // when this dir was named `gem`.
+        // (`platform_gem_unsupported`).
         assert_eq!(
             fetched
                 .dir()
@@ -3286,7 +3273,7 @@ mod tests {
     /// instead of wedging the fresh-clone re-vendor forever in an `open(2)`
     /// waiting for a writer — the caller's metadata probe passes for a FIFO,
     /// so this read is the first open. Same `open_regular_file` guard class
-    /// as the vendor lockfile reads (lock_inventory.rs, npm_lock.rs).
+    /// as the vendor lockfile reads (lock_inventory/, npm_lock.rs).
     #[cfg(unix)]
     #[test]
     fn stage_local_artifact_fifo_fails_fast_instead_of_wedging() {
@@ -4305,8 +4292,7 @@ mod tests {
             // And the golang fetch's fused walk, which answers the same
             // question off the dirhash pass's single inflate.
             match walk_module_zip(&bytes, Some(prefix)) {
-                // The dirhash pass guards the caps too and refuses first —
-                // exactly where the pair of walks did.
+                // The dirhash pass guards the caps too and refuses first.
                 Err(dirhash_refusal) => assert!(
                     dirhash_refusal.contains("cap"),
                     "{label}: {dirhash_refusal}"
@@ -4433,8 +4419,7 @@ mod tests {
     }
 
     /// And on a healthy archive: the pass accepts it, writes nothing, and
-    /// answers the root-file probe the fetchers used to run against the
-    /// extracted tree.
+    /// answers the root-file probe without an extracted tree.
     #[test]
     fn validation_pass_accepts_and_answers_the_root_probe() {
         let tgz = make_tgz(&[

@@ -4,7 +4,7 @@
 //! is fully instrumented. Mocks the API via wiremock. Hits every flag
 //! combination that the subprocess-based tests don't explicitly
 //! exercise (non-JSON paths, --apply without --prune, --prune without
-//! --apply, --batch-size variations, --download-mode variations).
+//! --apply, --batch-size variations).
 
 use std::path::Path;
 
@@ -196,7 +196,7 @@ async fn run_scrubbed(args: ScanArgs) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Discovery — read-only --json mode
+// Discovery — default (hosted) --json mode
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -237,7 +237,7 @@ async fn scan_installed_package_discovers_patch() {
     assert_eq!(run_scrubbed(args).await, 0);
     // The installed package must actually be discovered by the crawler and
     // sent to the batch endpoint. Without this, a regression that crawled
-    // nothing would still exit 0 and pass the old test.
+    // nothing would still exit 0.
     let reqs = recorded(&server).await;
     let posts = batch_posts(&reqs);
     assert_eq!(posts.len(), 1, "exactly one batch query expected");
@@ -357,10 +357,10 @@ const UUID_LOW: &str = "22222222-2222-4222-8222-222222222222";
 
 /// A package with two available patches: a freshly-published `low` and an
 /// older `critical`. `paid` toggles `canAccessPaidPatches`, which selects
-/// between `select_patches`' auto-select branch and its interactive one.
+/// between `select_patches`' paid auto-select branch and its free-tier
+/// `--yes` auto-select (scan never prompts).
 ///
-/// This is the exact shape of the reported bug — the old selector took the
-/// most recent patch and left the critical unfixed.
+/// Neither is merged, so severity must beat recency.
 async fn mock_two_patches(server: &MockServer, paid: bool) {
     let low = serde_json::json!({
         "uuid": UUID_LOW, "purl": PURL, "tier": "free",
@@ -377,8 +377,8 @@ async fn mock_two_patches(server: &MockServer, paid: bool) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            // Listed newest-first, i.e. the order the old `.first()` /
-            // date-sort logic would have taken the WRONG patch from.
+            // Listed newest-first, so a `.first()` / date-sort pick would
+            // take the WRONG patch.
             "packages": [{ "purl": PURL, "patches": [low, critical] }],
             "canAccessPaidPatches": paid,
         })))
@@ -458,10 +458,9 @@ async fn scan_apply_picks_critical_over_more_recent_low_for_paid_user() {
     );
 }
 
-/// Same package, but the user has no paid access, so `select_patches`
-/// takes the interactive branch. Tests run headless, so `select_one`
-/// auto-selects option 0 — which means the *presented order* is what
-/// decides, and it must be the ranked order.
+/// Same package, but the user has no paid access. Scan never prompts:
+/// `selection_args` forces `--yes`, so `select_patches` auto-selects the
+/// top-ranked accessible patch, and the ranking alone decides.
 #[tokio::test]
 #[serial]
 async fn scan_apply_picks_critical_for_free_user_via_ranked_prompt_order() {
@@ -927,19 +926,10 @@ async fn scan_non_json_empty_project_friendly_message() {
 // ---------------------------------------------------------------------------
 // API error handling
 //
-// The original `assert!(code == 0 || code == 1)` here was the headline
-// loophole of this file: a disjoint-outcome assertion that passes whether
-// the scan correctly surfaces the failure OR silently swallows it. The
-// implementation used to only emit a telemetry event when every batch
-// errored — returning 0 and printing status="success" with an empty package
-// list — so the assertions below were first committed RED to encode the
-// documented intent ("surface this as a full scan failure rather than
-// silently reporting zero patches").
-//
-// That bug is now FIXED (scan/mod.rs bails with exit 1 when
+// Documented intent: "surface this as a full scan failure rather than
+// silently reporting zero patches" — scan/mod.rs bails with exit 1 when
 // batch_error_count == total_batches, and discover_selected likewise errors
-// when every detail query fails); these tests pass and stay as regression
-// guards for both levels.
+// when every detail query fails. These pin both levels.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1179,8 +1169,7 @@ async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
 async fn scan_prune_keeps_entry_of_uncrawled_ecosystem() {
     // `.socket/manifest.json` is a COMMITTED, shared file. A teammate on a
     // newer CLI can add a patch for an ecosystem this binary has no crawler
-    // for (here `pkg:hex/…`; the runtime-gated maven/nuget crawlers behave
-    // the same way with their gate off). That purl is never looked for, so
+    // for (here `pkg:hex/…`). That purl is never looked for, so
     // its absence from the crawl says nothing about whether it is installed
     // — yet prune treated "not in scanned_purls" as "uninstalled" and
     // deleted both the entry and its blob: silent, cross-machine patch loss.
@@ -1375,9 +1364,7 @@ async fn scan_non_json_dry_run_does_not_mutate() {
 // Maven/NuGet are first-class: every scan mode discovers them.
 // ---------------------------------------------------------------------------
 
-/// Maven and NuGet used to sit behind `SOCKET_EXPERIMENTAL_MAVEN` /
-/// `SOCKET_EXPERIMENTAL_NUGET` runtime gates that silently dropped them
-/// from discovery. The gates are retired: every scan mode (default,
+/// Maven and NuGet have no runtime gate: every scan mode (default,
 /// `--mode hosted`, `--mode vendored`) must crawl both with no opt-in of
 /// any kind. The oracle is the batch POST body — it carries exactly the
 /// purls the crawl discovered, so a resurrected gate shows up as the
@@ -1500,8 +1487,8 @@ async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
     // A manifest whose sole record WOULD attest successfully: vulnerability
     // metadata for the statement, `setup.manual: ["npm"]` to pass the
     // property-7 ecosystem filter, and `--vex-no-verify` below to skip the
-    // on-disk hash check. Under the old behavior the dry run generated the
-    // document for real and wrote it to disk.
+    // on-disk hash check, so only the dry-run gate keeps the document off
+    // disk.
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(

@@ -139,27 +139,16 @@ async fn sync_checksum(
     // `tokio::fs::write`. The checksum file lives inside a Cargo
     // registry/vendor `<crate>-<version>/` tree, which Cargo marks
     // read-only (files `0o444` inside `0o555` dirs) for tamper
-    // detection. A plain in-place truncating write has three defects
-    // there, all of which the rest of the patch engine was hardened
-    // against (see `apply::apply_file_patch_at` and `rollback`):
-    //
-    //   1. **Read-only-hostile.** Opening the existing `0o444` file
-    //      `O_TRUNC` fails `EACCES`, so the fixup errored out exactly
-    //      in the real-registry case it exists to handle — leaving the
-    //      checksum stale-patched and every future `cargo build` of the
-    //      crate refusing the (correctly) patched sources.
-    //   2. **Non-atomic.** A crash / `ENOSPC` mid-write leaves a
-    //      truncated, unparseable `.cargo-checksum.json` — strictly
-    //      worse than a stale hash, because cargo can no longer even
-    //      parse it to report a mismatch; the crate is wedged.
-    //   3. **Copy-on-write-unsafe.** A vendored tree hardlinked into a
-    //      shared store would have its sibling mutated in place.
+    // detection. A plain in-place truncating write would fail `EACCES`
+    // on the `0o444` file, could leave a truncated, unparseable checksum
+    // on a crash / `ENOSPC` (wedging the crate), and would mutate a
+    // hardlinked shared-store sibling in place.
     //
     // `apply_file_patch_at` stages a sibling, fsyncs, and `rename(2)`s
     // atomically (the rename-over is the copy-on-write isolation for a
     // hardlinked sibling — see `utils::fs::atomic_write_bytes`); relaxes
-    // then restores BOTH the file's and the directory's read-only modes;
-    // and verifies the bytes that landed. The `expected_hash` is just the
+    // then restores a read-only parent directory; restores the file's
+    // mode; and verifies the bytes it writes. The `expected_hash` is just the
     // digest of the bytes we hand it (a self-check) — the file already
     // exists, so its original mode is snapshotted and restored
     // bit-for-bit. The post-write ownership warning it may return is
@@ -425,13 +414,11 @@ mod tests {
         assert!(matches!(err, SidecarError::Malformed { .. }));
     }
 
-    /// Regression (read-only checksum file): a real Cargo registry/vendor
-    /// tree marks `.cargo-checksum.json` read-only (`0o444`) for tamper
-    /// detection. The rewrite must still succeed — the hardened
-    /// stage+rename path relaxes the file's mode, swaps a fresh inode in
-    /// atomically, and restores the original `0o444` mode afterward.
-    /// Before the fix the bare in-place `tokio::fs::write` failed `EACCES`
-    /// here, leaving the checksum stale-patched and the crate unbuildable.
+    /// Read-only checksum file: a real Cargo registry/vendor tree marks
+    /// `.cargo-checksum.json` read-only (`0o444`) for tamper detection.
+    /// The rewrite must still succeed — the stage+rename path swaps a
+    /// fresh inode in atomically and restores the original `0o444` mode
+    /// afterward.
     #[cfg(unix)]
     #[tokio::test]
     async fn rewrites_readonly_checksum_file_and_restores_mode() {
@@ -480,12 +467,11 @@ mod tests {
         );
     }
 
-    /// Regression (read-only package directory): Cargo also marks the
+    /// Read-only package directory: Cargo also marks the
     /// crate directory `0o555`. The atomic stage+rename needs write
     /// permission on the *parent dir* to create its sibling stage file,
     /// so the write path must temporarily grant directory write and
-    /// restore the exact `0o555` mode afterward. The bare write could
-    /// not stage inside a read-only directory at all.
+    /// restore the exact `0o555` mode afterward.
     #[cfg(unix)]
     #[tokio::test]
     async fn rewrites_inside_readonly_package_dir() {
@@ -531,12 +517,10 @@ mod tests {
         );
     }
 
-    /// Security regression (path escape via `..`): a poisoned patch
-    /// entry whose key walks out of the package dir must be refused —
-    /// NOT hashed and embedded under an escaping key in the committed
-    /// checksum. Before the guard, `sha256_file` read the out-of-tree
-    /// target and `update_entries` inserted `../secret.txt` into the
-    /// `files` map (info leak + checksum corruption).
+    /// Security (path escape via `..`): a poisoned patch entry whose key
+    /// walks out of the package dir must be refused — NOT hashed and
+    /// embedded under an escaping key in the committed checksum (info
+    /// leak + checksum corruption).
     #[tokio::test]
     async fn refuses_dotdot_escape_path() {
         let d = tempfile::tempdir().unwrap();
@@ -578,7 +562,7 @@ mod tests {
         );
     }
 
-    /// Security regression (absolute-path escape): `Path::join` discards
+    /// Security (absolute-path escape): `Path::join` discards
     /// the base when the key is absolute, so an absolute key would hash
     /// an arbitrary system file. Must be refused exactly like `..`.
     #[tokio::test]
@@ -748,13 +732,11 @@ mod tests {
         );
     }
 
-    /// DoS regression (FIFO checksum file): the checksum file is read
-    /// straight out of the (untrusted) package tree on every cargo
-    /// apply. A FIFO planted at `.cargo-checksum.json` made the plain
-    /// `open(2)` wait for a writer that never comes — wedging apply
-    /// forever *after* the patch bytes were committed. Same DoS class
-    /// already fixed in `file_hash.rs` and `package.rs`: the open must
-    /// be non-blocking and non-regular files must be rejected.
+    /// DoS (FIFO checksum file): the checksum file is read straight out
+    /// of the (untrusted) package tree on every cargo apply. A FIFO
+    /// planted at `.cargo-checksum.json` must not wedge apply on a
+    /// blocking `open(2)`: the open must be non-blocking and non-regular
+    /// files must be rejected (as in `file_hash.rs` and `package.rs`).
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_checksum_file_errors_promptly() {
@@ -782,9 +764,9 @@ mod tests {
         assert!(matches!(result, Err(SidecarError::Io { .. })));
     }
 
-    /// DoS regression (FIFO patched-file target): `update_entries`
-    /// hashes each patched path from disk; a FIFO at that path hung the
-    /// rehash the same way. Must error promptly instead.
+    /// DoS (FIFO patched-file target): `update_entries` hashes each
+    /// patched path from disk; a FIFO at that path must error promptly
+    /// instead of hanging the rehash.
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_patched_file_errors_promptly() {
@@ -825,8 +807,7 @@ mod tests {
     /// Copy-on-write safety: when `.cargo-checksum.json` is hardlinked
     /// into a shared store (a vendored tree shared between projects),
     /// the rewrite must give us a private inode and leave the sibling
-    /// untouched. The atomic rename-over-target achieves this; the old
-    /// in-place write would have mutated the shared inode.
+    /// untouched. The atomic rename-over-target achieves this.
     #[cfg(unix)]
     #[tokio::test]
     async fn rewrite_does_not_mutate_hardlinked_sibling() {

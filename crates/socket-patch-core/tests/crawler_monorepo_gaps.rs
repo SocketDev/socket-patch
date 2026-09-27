@@ -7,7 +7,7 @@
 //! with its own lockfile / installed packages in a subdir — crawling from the
 //! repo root therefore finds none of them.
 //!
-//! Gem is the representative here (the case the request named); python
+//! Gem is the representative here; python
 //! (multiple `.venv`), go (multiple `go.mod`), and composer (multiple
 //! `composer.json`) share the identical cwd-only limitation.
 //!

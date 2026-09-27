@@ -26,9 +26,8 @@ mod tests {
 
     #[test]
     fn user_agent_reports_real_crate_version() {
-        // Regression: USER_AGENT was pinned to "SocketPatchCLI/1.0" while the
-        // crate shipped 3.x, so every API request / telemetry beacon misreported
-        // the version. It must carry the actual compiled crate version.
+        // USER_AGENT must carry the actual compiled crate version, never a
+        // hardcoded one.
         let expected = format!("SocketPatchCLI/{}", env!("CARGO_PKG_VERSION"));
         assert_eq!(USER_AGENT, expected);
         assert!(USER_AGENT.starts_with("SocketPatchCLI/"));

@@ -3,18 +3,18 @@
 //!
 //! The directory-shaped backends (cargo, golang, composer, gem, maven,
 //! nuget) decide "in sync" from the COMMITTED artifact before they ever
-//! consult the patch service. The archive-shaped backends used to acquire
-//! first (service download, else a local deterministic pack) and compare the
-//! lock's digests with those NEW bytes — so a prebuilt ↔ local source flip
-//! between two runs (a service outage, or its recovery) rewrote the lock and
-//! the tarball even though nothing needed vendoring. This module gives them
-//! the same rule: when the ledger vouches for the committed artifact and the
-//! bytes verify, reuse them.
+//! consult the patch service. The archive-shaped backends acquire (service
+//! download, else a local deterministic pack) and compare the lock's digests
+//! with those NEW bytes, so without this a prebuilt ↔ local source flip
+//! between two runs (a service outage, or its recovery) would rewrite the
+//! lock and the tarball even though nothing needed vendoring. This module
+//! gives them the same rule: when the ledger vouches for the committed
+//! artifact and the bytes verify, reuse them.
 //!
 //! Anchor: the vendor ledger entry (`.socket/vendor/state.json`) recorded
 //! the artifact's path + sha256 when it was wired. Reuse requires, fail
 //! closed at every step (any miss falls through to the caller's normal
-//! acquisition, exactly today's behavior):
+//! acquisition):
 //!
 //! 1. a non-empty patch record (nothing to verify ⇒ never reused);
 //! 2. a canonical, uuid-bound artifact path (`checked_artifact_path`) — an
@@ -93,7 +93,7 @@ pub(crate) enum ReuseMiss {
     PlatformLocked,
 }
 
-/// Debug-log a reuse miss (`SOCKET_PATCH_DEBUG`); the caller then acquires.
+/// Debug-log a reuse miss (`SOCKET_DEBUG`); the caller then acquires.
 pub(crate) fn log_miss(purl: &str, miss: &ReuseMiss) {
     if is_debug_enabled() {
         eprintln!("[socket-patch debug] vendor reuse skipped for {purl}: {miss:?}");
@@ -114,7 +114,7 @@ fn norm(path: &str) -> String {
 /// The ledger comes from [`load_state_shared`]: the run asks it once per
 /// npm/pypi package, and on a big monorepo the ledger runs to megabytes,
 /// so re-parsing (or, inside a group commit, deep-cloning) it per package
-/// was the vendored re-run's dominant cost. The shared read still reads
+/// would dominate the vendored re-run. The shared read still reads
 /// the bytes every time and re-parses whenever they changed, answers from
 /// the group commit's captured ledger when there is one, and fails exactly
 /// where [`super::state::load_state`] fails. Only the one matching entry is
@@ -166,7 +166,7 @@ fn select_prior_entry<'a>(
     Ok(first)
 }
 
-/// The pre-SC1 [`prior_entry`], kept as the equivalence oracle: a full
+/// The reloading form of [`prior_entry`], kept as the equivalence oracle: a full
 /// [`super::state::load_state`] per call, entries taken by value.
 #[cfg(test)]
 pub(crate) async fn prior_entry_reloading(
@@ -327,7 +327,7 @@ pub(crate) async fn reusable_committed_artifact(
     verify_committed_artifact(project_root, &entry, record).await
 }
 
-/// DESIGN §4.3 step 2: the committed vlt package dir at `rel_dir`, when
+/// The committed vlt package dir at `rel_dir`, when
 /// the ledger records it for `record.uuid` with an inventory and the tree
 /// still verifies (no link on the path, the structure rule, only links and
 /// `.bin/` scripts under its `node_modules/`, every member and the whole
@@ -664,8 +664,8 @@ mod tests {
     }
 
     /// An UNPATCHED member edited and re-gzipped, with the ledger still
-    /// recording the original sha: the anchor rejects it (today's rebuild
-    /// then heals it).
+    /// recording the original sha: the anchor rejects it (the rebuild then
+    /// heals it).
     #[tokio::test]
     async fn edited_unpatched_member_with_stale_ledger_sha_misses() {
         let (tmp, _) = project(&good_tgz()).await;
@@ -1015,7 +1015,7 @@ mod tests {
         assert!(wheel_reuse(&zip_of(&[("index.js", PATCHED)])).await.is_ok());
     }
 
-    /// SC1: the shared-ledger [`prior_entry`] answers exactly what the
+    /// The shared-ledger [`prior_entry`] answers exactly what the
     /// reloading oracle answers — hits, path filters, twins that agree or
     /// disagree, a missing or corrupt ledger — including after the ledger
     /// changes between two calls (the memo must miss) and inside a group

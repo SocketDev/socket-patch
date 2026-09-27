@@ -199,10 +199,8 @@ fn assert_apply_dispatched(code: i32, env: &Value, ecosystem: &str, expected_pur
 /// `skipped == 0`. This is the load-bearing proof that the filter actually
 /// filters — without it, a `partition_purls` that ignored `allowed_ecosystems`
 /// (a catch-all) would keep every positive test below green while silently
-/// dispatching out-of-scope PURLs. We deliberately do NOT assert the exit
-/// code / status here: an all-out-of-scope (effectively empty) manifest
-/// currently exits 1 / `partialFailure` (a known, separate no-op-success bug);
-/// the dispatch property under test is independent of that.
+/// dispatching out-of-scope PURLs. The exit code / status is not asserted
+/// here; the dispatch property under test is independent of it.
 fn assert_apply_not_dispatched(env: &Value, ecosystem: &str, out_of_scope_purls: &[&str]) {
     assert_eq!(
         env["command"], "apply",
@@ -443,7 +441,8 @@ struct RollbackFixture {
     purl: String,
     /// The on-disk file the rollback must restore to ORIGINAL.
     verify_file: PathBuf,
-    /// Extra env vars the crawler needs (cache locations, experimental gates).
+    /// Extra env vars the crawler needs (cache locations such as GOMODCACHE /
+    /// MAVEN_REPO_LOCAL).
     envs: Vec<(String, String)>,
     /// Run the rollback in `--global` mode. Required for ecosystems whose
     /// project-local backend is a *redirect* (golang): in local mode the
@@ -825,13 +824,11 @@ fn rollback_dispatch_branch_composer() {
 // ---------------------------------------------------------------------------
 // Machine-output purity at dispatch call sites.
 //
-// The scan macro in `ecosystem_dispatch` prints "Using <X> at: <path>" to
-// STDOUT whenever the crawl is global (`--global` / `--global-prefix`) and
-// the caller did not pass `silent = true`. `apply` and `rollback` pass
-// `silent || json`, but the `vex` and `setup --check` call sites passed only
-// `silent`, so in `--json` mode (envelope on stdout) — and in vex's
-// doc-to-stdout mode — the chrome line corrupted the machine stream.
-// `--global-prefix` makes the leak deterministic: the npm crawler returns
+// The scan macro in `ecosystem_dispatch` prints "Using <X> at: <path>" on
+// global crawls (`--global` / `--global-prefix`); it goes to stderr so it
+// can never reach a `--json` envelope or a VEX document on stdout. These
+// tests pin that stdout stays pure at the `vex` and `setup --check` call
+// sites. `--global-prefix` makes the check deterministic: the npm crawler returns
 // the prefix verbatim as a node_modules root, so `paths` is never empty.
 // ---------------------------------------------------------------------------
 

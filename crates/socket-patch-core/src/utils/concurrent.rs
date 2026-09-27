@@ -1,9 +1,9 @@
 //! Ordered, bounded concurrency for independent network requests.
 //!
 //! The CLI's patch-API loops (batch discovery, per-package detail GETs,
-//! hosted record views) used to await one request at a time, so a run
-//! paid one round trip per request. Every consumer here must keep its
-//! output byte-identical to the serial loop, so the only primitive on
+//! hosted record views) run their requests concurrently rather than paying
+//! one round trip per request. Every consumer here must keep its output
+//! byte-identical to a serial loop, so the only primitive on
 //! offer is the ORDERED one: at most `limit` futures run at once, and
 //! results come back in input order no matter which request finishes
 //! first. Callers fold them exactly as the serial loop did (warnings,
@@ -54,8 +54,8 @@ pub const PROXY_API_CONCURRENCY: usize = 4;
 
 /// Operator override for the caps above: the escape hatch for an endpoint
 /// that caps in-flight requests per client (a self-hosted `--api-url`, a
-/// corporate reverse proxy, a WAF or CDN). `1` restores the old strictly
-/// serial loops exactly.
+/// corporate reverse proxy, a WAF or CDN). `1` makes the loops strictly
+/// serial.
 pub const API_CONCURRENCY_ENV: &str = "SOCKET_API_CONCURRENCY";
 
 /// Largest value [`API_CONCURRENCY_ENV`] can ask for — the most in-flight

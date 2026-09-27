@@ -1,7 +1,7 @@
 //! setup-matrix: npm ecosystem (npm / yarn / pnpm / bun / vlt).
 //!
-//! These are the ecosystems `socket-patch setup` actually supports
-//! today (it writes a package.json postinstall hook), so the
+//! `socket-patch setup` supports these package managers (it writes a
+//! package.json postinstall hook), so the
 //! `baseline_with_setup` / `alt_content_patchset` cases are expected to
 //! PASS here. See `setup_matrix_common/mod.rs` for the harness and
 //! `tests/setup_matrix/matrix.json` for the case list.
@@ -80,7 +80,7 @@ fn vlt_workspace() {
 // every `smc::run_pm` / `smc::run_workspace_pm` call above routes through the
 // shared Docker matrix harness, which *soft-skips and silently passes* whenever
 // Docker or the `npm` image is absent (the common case locally and in this
-// eval). So for the one ecosystem `setup` genuinely supports today, the matrix
+// eval). So for npm, the ecosystem family whose `setup` hook the matrix round-trips, the matrix
 // calls can be entirely green having exercised NOTHING — a broken
 // package.json-hook writer would never turn this file red.
 //

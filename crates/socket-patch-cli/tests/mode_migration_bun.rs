@@ -316,7 +316,7 @@ fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
 /// every `BUN_*` var (the harness passes bun's install/cache dirs
 /// explicitly per project), `npm_config_*` (bun reads npm's registry
 /// config; an ambient mirror or auth token would change what the fixture
-/// install resolves against) and `VIRTUAL_ENV` — the scrub the three bun
+/// install resolves against) and `VIRTUAL_ENV` — the scrub the bun
 /// suites share, so none can drift back to a `SOCKET_*`-only scrub.
 fn scrub_env(cmd: &mut Command) {
     cache_env::scrub_ambient_bun_env(cmd);
@@ -1845,8 +1845,7 @@ async fn bun_scoped_rollback_and_remove_unwind_one_of_two_hosted_records() {
     // replay ⇒ pristine.
     assert_unscoped_rollback_restores_pristine(&fx, &by_rollback, "after-scoped-rollback");
 
-    // `remove <purl>` takes the same per-purl hosted leg; used to exit 1
-    // with `hosted_revert_failed`.
+    // `remove <purl>` takes the same per-purl hosted leg.
     let by_remove = fx.dir("two-hosted-copy-remove");
     copy_project(&proj, &by_remove);
     let (code, stdout, stderr) = run_socket(

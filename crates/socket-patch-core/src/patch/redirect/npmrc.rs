@@ -994,8 +994,8 @@ mod tests {
 
     /// Differential corpus: every expectation is what npm's bundled `ini`
     /// (`ini.parse(text)['allow-remote']`) returned for the same text —
-    /// identically under npm 11.19 (ini 6.0.0) and npm 12.1.0 (ini 7.0.0). Pins the review findings: a bare
-    /// `\r` ends a line (`/[\r\n]+/`), and a section header is matched on
+    /// identically under npm 11.19 (ini 6.0.0) and npm 12.1.0 (ini 7.0.0).
+    /// Pins that a bare `\r` ends a line (`/[\r\n]+/`), and a section header is matched on
     /// the UNTRIMMED line (an indented or BOM-prefixed `[sec]` is a plain
     /// top-level key, so the scope does not end there).
     #[test]
@@ -1034,10 +1034,10 @@ mod tests {
         }
     }
 
-    /// Finding: a CR-only `.npmrc` with an explicit `allow-remote=none` was
-    /// read as one `registry` line, planned an Append, and the appended
-    /// `allow-remote=all` silently flipped the user's `none`. Now it is
-    /// respected; a CR-only file WITHOUT the key is never spliced.
+    /// A CR-only `.npmrc` with an explicit `allow-remote=none` must not be
+    /// read as one `registry` line and have an appended `allow-remote=all`
+    /// silently flip the user's `none`: it is respected, and a CR-only file
+    /// WITHOUT the key is never spliced.
     #[test]
     fn plan_never_flips_or_splices_a_cr_only_npmrc() {
         assert_eq!(
@@ -1055,10 +1055,10 @@ mod tests {
         ));
     }
 
-    /// Finding: an indented / BOM-prefixed `[sec]` was treated as a header,
-    /// so the plan wrote `allow-remote=all` above it while npm kept reading
-    /// the user's `none` below it (EALLOWREMOTE, yet the warning claimed
-    /// the write fixed it). npm reads those lines as top-level keys.
+    /// An indented / BOM-prefixed `[sec]` is not a header: npm reads those
+    /// lines as top-level keys, so treating one as a header would write
+    /// `allow-remote=all` above it while npm kept reading the user's `none`
+    /// below it.
     #[test]
     fn plan_respects_values_under_non_headers() {
         for text in [
@@ -1081,11 +1081,11 @@ mod tests {
         assert_eq!(text, "\u{feff}[x]\nallow-remote=all\n[sec]\ny=1\n");
     }
 
-    /// Finding: `[sec]\nallow-remote=all\n` (inert under a section) planned
-    /// a top-level append, and the unwind then counted BOTH copies and
-    /// refused as ambiguous — blocking rollback, remove, the vendored
-    /// takeover and the reconcile over a state our own writer created. The
-    /// unwind now only counts top-level lines, like the plan.
+    /// `[sec]\nallow-remote=all\n` (inert under a section) plans a
+    /// top-level append, so the unwind must count only top-level lines,
+    /// like the plan — counting BOTH copies would refuse as ambiguous and
+    /// block rollback, remove, the vendored takeover and the reconcile over
+    /// a state our own writer created.
     #[test]
     fn unwind_ignores_section_scoped_copies() {
         let before = "[sec]\nallow-remote=all\n";
@@ -1131,11 +1131,11 @@ mod tests {
         }
     }
 
-    /// Finding: only the project `.npmrc` was consulted, so a machine / org
-    /// `allow-remote=none` in `~/.npmrc` or `$PREFIX/etc/npmrc` was
+    /// Outer npm config layers are consulted: a machine / org
+    /// `allow-remote=none` in `~/.npmrc` or `$PREFIX/etc/npmrc` must not be
     /// silently overridden by a committed project `allow-remote=all`, and
     /// an env `npm_config_allow_remote=none` (which beats the project file)
-    /// was ignored while the warning promised `npm ci` needs no flags.
+    /// must not be ignored.
     #[test]
     fn outer_layers_are_located_like_npm_and_respected() {
         use std::collections::HashMap;
@@ -1456,9 +1456,9 @@ mod tests {
         assert!(!npmrc_unwind_due(&edits[..1], &HashSet::new()));
     }
 
-    /// Finding: the per-purl revert learned a symlinked `.npmrc` was
-    /// unwritable only at flush time, after the reverted lock had landed.
-    /// The read used while PLANNING now refuses it.
+    /// The read used while PLANNING refuses a symlinked `.npmrc`, so the
+    /// per-purl revert never learns it is unwritable only at flush time,
+    /// after the reverted lock had landed.
     #[cfg(unix)]
     #[test]
     fn read_project_npmrc_refuses_a_symlink_at_plan_time() {

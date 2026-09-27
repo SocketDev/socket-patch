@@ -166,12 +166,12 @@ pub(crate) fn hosted_artifact_url(url: &str) -> Result<HostedArtifactUrl, String
 // ── registry view ──
 
 /// Inventory the pypi lock the project carries. Fetchable resolution
-/// (URL + sha256 of a pure `py3-none-any` wheel) comes from `uv.lock`;
-/// `poetry.lock` and `--hash`-pinned `requirements.txt` contribute
-/// DISCOVERY-only entries (no recorded URL; platform-independent wheel
-/// choice is not derivable offline). `pdm.lock` contributes discovery-only
-/// entries. Pipfile.lock contributes entries whose integrity is its digest SET
-/// (see `inventory_pipfile_lock`).
+/// (URL + sha256 of a pure `-none-any` wheel) comes from `uv.lock` and
+/// PEP 751 / PEP 723 script locks; `poetry.lock` entries carry the pure
+/// wheel's sha256 when the lock lists one (resolved through PyPI's JSON API
+/// at fetch time), else stay discovery-only; exact `==` `requirements.txt`
+/// pins and `pdm.lock` are discovery-only; Pipfile.lock entries carry its
+/// digest SET (see `inventory_pipfile_lock`).
 #[cfg(test)]
 pub(super) async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     inventory_pypi_locks_in(&ProjectView::Disk(project_root)).await
@@ -220,10 +220,9 @@ pub(super) async fn inventory_pypi_locks_raw_in(
             }
         }
     }
-    // A PARSEABLE uv.lock stays the EXCLUSIVE project inventory (its
-    // precedence over poetry.lock / requirements.txt predates standalone-lock
-    // support). Exclusivity is keyed on parse SUCCESS, not on the file's
-    // presence: an unparseable uv.lock contributed nothing above, so it falls
+    // A PARSEABLE uv.lock is the EXCLUSIVE project inventory, taking
+    // precedence over poetry.lock / requirements.txt. Exclusivity is keyed
+    // on parse SUCCESS, not on the file's presence: an unparseable uv.lock contributed nothing above, so it falls
     // through to poetry.lock / requirements.txt exactly like a package-less
     // poetry.lock does (`depless_poetry_lock_falls_through_to_requirements`).
     // Keying on presence would hide every requirements pin behind a corrupt
@@ -581,7 +580,7 @@ async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>
 ///   `vex::discover::pypi_other` already uses).
 ///
 /// A user's OWN file/url/path reference is not ours to resolve and stays
-/// out, exactly as before.
+/// out.
 async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text("requirements.txt").await.ok()?;
     let mut out = Vec::new();

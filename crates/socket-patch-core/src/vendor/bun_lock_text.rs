@@ -391,7 +391,8 @@ mod tests {
         );
         assert!(!e.trailing_comma);
 
-        // split at the LAST @ (scoped names).
+        // split at the FIRST @ past index 0 (a scoped name's @ is at index 0;
+        // the spec may contain more @s).
         assert_eq!(
             split_name_spec("@scope/pkg@1.0.0"),
             Some(("@scope/pkg", "1.0.0"))
@@ -515,7 +516,7 @@ mod tests {
 
     /// A `"packages"` header spelled any way other than bun's byte-exact
     /// emitted shape must parse as an ERROR (fail closed), never as an empty
-    /// lock — "empty" made the rewriters silently skip locks bun itself
+    /// lock — "empty" would make the rewriters silently skip locks bun itself
     /// parses fine.
     #[test]
     fn noncanonical_packages_header_is_an_error_not_empty() {

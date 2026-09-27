@@ -65,8 +65,8 @@ pub(super) async fn inventory_npm_lock_raw_in(
             // The PnP loaders are a refusal, not an absence: propagate the
             // diagnosis instead of discarding it. Under PnP the
             // installed-tree crawl is ALSO structurally empty, so
-            // swallowing this here made `scan` a silent success-0 no-op in
-            // every mode. Every other probe error keeps the fallbacks below
+            // swallowing this here would make `scan` a silent success-0
+            // no-op in every mode. Every other probe error keeps the fallbacks below
             // and the calm `Ok(None)`.
             if matches!(
                 code,
@@ -144,9 +144,9 @@ pub(super) async fn inventory_npm_lock_raw_in(
     };
     let raw = match flavor {
         NpmLockFlavor::PackageLock => inventory_package_lock_in(view).await,
-        // The pnpm reader is grammar-agnostic (it already served legacy
-        // 5.4/6.0 locks through the refusal fallback below before those
-        // grammars had a wiring backend), so both pnpm flavors share it.
+        // The pnpm reader is grammar-agnostic (it also serves legacy
+        // 5.4/6.0 locks through the version-refusal fallback above), so
+        // both pnpm flavors share it.
         NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy => inventory_pnpm_lock_in(view).await,
         NpmLockFlavor::YarnClassic => inventory_yarn_classic_in(view).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry_in(view).await,

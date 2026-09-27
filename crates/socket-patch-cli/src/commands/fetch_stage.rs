@@ -175,11 +175,6 @@ fn format_fetch_failures(result: &FetchMissingBlobsResult, (one, many): Noun) ->
     lines
 }
 
-/// Announce the per-file blob top-up that follows a diff-mode fetch. It
-/// runs even when every diff archive arrived — a diff cannot patch a file
-/// whose bytes differ from `beforeHash`, and the pipeline then falls back
-/// to the blob — so it is worded as a complement, not a failure, unless
-/// some archives really were unavailable.
 /// The disk stager's status line while it downloads what `.socket/` lacks.
 const DOWNLOADING_ARTIFACTS: &str = "Downloading missing patch artifacts...";
 
@@ -188,6 +183,11 @@ fn format_fetching_content(n: usize) -> String {
     format!("Fetching content for {}...", plural(n, "patch", "patches"))
 }
 
+/// Announce the per-file blob top-up that follows a diff-mode fetch. It
+/// runs even when every diff archive arrived — a diff cannot patch a file
+/// whose bytes differ from `beforeHash`, and the pipeline then falls back
+/// to the blob — so it is worded as a complement, not a failure, unless
+/// some archives really were unavailable.
 fn format_blob_fallback(diff_failed: usize, blobs: usize) -> String {
     let blobs = plural(blobs, "per-file blob", "per-file blobs");
     if diff_failed == 0 {
@@ -311,8 +311,7 @@ pub(crate) async fn stage_patch_sources(
     // locally. We honor `--download-mode` for the primary fetch when there's
     // actually a gap to close. Skip the archive fetch entirely when all file
     // blobs are already present locally — the pipeline will succeed via the
-    // blob path, and the archive endpoints would just 404 (current server
-    // doesn't serve them yet).
+    // blob path, so an archive fetch would be wasted round-trips.
     let download_needed = !common.offline
         && match download_mode {
             DownloadMode::File => !missing_blobs.is_empty(),
@@ -1127,9 +1126,7 @@ mod tests {
     /// A local package archive is a usable source (the pipeline's Strategy 1,
     /// and exactly what the offline gate rules), so an online run whose
     /// downloads all fail must still be Ready when the package archive covers
-    /// every patch. Regression: the failure gate used aggregate fetch
-    /// counters and never consulted package archives, so this cache state was
-    /// Unavailable online while succeeding with --offline.
+    /// every patch, exactly as it succeeds with --offline.
     #[tokio::test]
     async fn stage_online_fetch_failure_accepts_local_package_archive() {
         let tmp = tempfile::tempdir().unwrap();

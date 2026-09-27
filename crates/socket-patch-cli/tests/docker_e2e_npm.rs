@@ -9,16 +9,16 @@
 //! when it fails). NOTE: because the fixture uses a placeholder all-zero
 //! beforeHash and serves no before-blob, an --offline rollback cannot
 //! actually restore the original bytes here — that path is the offline
-//! guard, not a genuine restore. See the summary in the audit notes.
+//! guard, not a genuine restore.
 //!
 //! Run modes:
 //!   - Default (Docker): requires Docker daemon. Pulls `socket-patch-test-
 //!     npm:latest` (built from `tests/docker/Dockerfile.npm` — base built
 //!     from `tests/docker/Dockerfile.base`). If the image isn't present
-//!     the test fails with a clear build-instruction error.
+//!     the test prints a skip notice and passes vacuously.
 //!   - Host mode: set `SOCKET_PATCH_TEST_HOST=1`. Skips Docker; runs npm
-//!     and socket-patch on the host. Requires host-installed npm + a
-//!     debug socket-patch binary at `target/debug/socket-patch`.
+//!     and socket-patch on the host. Requires npm and `socket-patch` on
+//!     PATH.
 //!
 //! Run command:
 //!   `cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_npm`
@@ -166,9 +166,10 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     // bytes, so apply's hash-verify reports HashMismatch.
                     // We pass --force to the apply step to override and
                     // exercise the blob-write path against real on-disk
-                    // content. (`get.rs::download_and_apply_patches`
-                    // requires both hashes to be Some, so we can't send
-                    // null here.)
+                    // content. (A null beforeHash would mark the file as a
+                    // new-file insert — see get.rs `files_for_manifest` —
+                    // so a placeholder hash is needed to exercise the
+                    // overwrite path.)
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
                     "afterHash":  after_hash,
                     "blobContent": blob_b64,
@@ -674,8 +675,8 @@ async fn npm_install_scan_apply_rollback_cycle() {
     );
     assert_vex_agent_attested(&stdout, PURL);
 
-    // Keep the workspace_root reference alive — used by host mode to
-    // resolve the in-tree binary. Without this clippy warns unused.
+    // Keep the workspace_root reference alive; without this clippy warns
+    // unused.
     let _ = workspace_root();
 
     // The mock must have served BOTH the metadata discovery (batch) and

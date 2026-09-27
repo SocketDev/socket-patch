@@ -274,13 +274,12 @@ async fn proxy_batch_429_surfaces_as_rate_limited_without_fallback() {
 
 #[tokio::test]
 async fn proxy_batch_fallback_preserves_requested_purl_order() {
-    // Regression: the per-package fallback runs each chunk's GETs
-    // concurrently and used to collect them in *completion* order, so the
-    // assembled `packages` list was ordered by whichever response came back
-    // first. That order is user-visible — `scan --json` emits `packages`
-    // verbatim and the human table / interactive picker index it — so two
-    // identical scans of an unchanged project could disagree. The order must
-    // follow the requested PURLs, matching what the batch endpoint returns.
+    // The per-package fallback runs each chunk's GETs concurrently; the
+    // assembled `packages` list must not follow *completion* order. That
+    // order is user-visible — `scan --json` emits `packages` verbatim and the
+    // human table indexes it — so two identical scans of an unchanged project
+    // could disagree. The order must follow the requested PURLs, matching
+    // what the batch endpoint returns.
     //
     // The mock makes the race deterministic: the FIRST requested PURL is
     // served with a delay, so completion order is the exact reverse of

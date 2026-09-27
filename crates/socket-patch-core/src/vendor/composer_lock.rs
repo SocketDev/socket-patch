@@ -1,13 +1,15 @@
 //! Composer vendor backend: lock-only `dist` surgery pointing at a committed
 //! patched copy.
 //!
-//! Spike-verified mechanism (composer 2.10 — `spikes/PHASE0-FINDINGS.txt`):
+//! Spike-verified mechanism (composer 2.10):
 //! edit ONLY `composer.lock`. `composer.json` is never touched, and the lock's
 //! `content-hash` covers composer.json alone, so the surgery triggers no
 //! "lock file out of date" warning. The package's lock entry is rewritten to:
 //!
-//! * `dist` → `{"type": "path", "url": "<rel copy dir>", "reference": null}`
-//!   (replaced IN ITS ORIGINAL SLOT so the entry's key order is stable);
+//! * `dist` → `{"type": "path", "url": "<rel copy dir>", "reference": "<patch uuid>"}`
+//!   (replaced IN ITS ORIGINAL SLOT so the entry's key order is stable;
+//!   composer carries the reference into `vendor/composer/installed.json`,
+//!   so the patch stays traceable);
 //! * `source` REMOVED entirely — left in place, `--prefer-source` could
 //!   git-clone the unpatched upstream; with it removed the spike confirmed
 //!   `--prefer-source` falls back to the path dist cleanly;
@@ -414,8 +416,7 @@ pub async fn vendor_composer<'a>(
 
     // ── lock rewrite ─────────────────────────────────────────────────────
     // The memo hands the parse out shared; this is the one branch that
-    // mutates it, so it takes its own copy — exactly the allocation the
-    // parse it replaced would have made.
+    // mutates it, so it takes its own copy.
     let mut lock = (*lock).clone();
     let original_entry = lock[section][idx].clone();
     let Some(original_obj) = original_entry.as_object() else {
@@ -796,7 +797,7 @@ async fn composer_service_copy(
             let stage = stage_dir_for(copy_dir);
             // A tree the download plan already extracted from these bytes
             // (see `prestage`) is moved into the stage instead; otherwise —
-            // or should the move fail — extract here, as always.
+            // or should the move fail — extract here.
             if !claim_prestaged(&mut archive, &stage, copy_dir).await {
                 let _ = remove_tree(&stage).await;
                 if let Err(e) = tokio::fs::create_dir_all(&stage).await {
@@ -824,11 +825,10 @@ async fn composer_service_copy(
             // record names: a zip with an unexpected wrapper dir (the
             // single-level `strip_first` leaves an extra `pkg-<sha>/`
             // segment) or a root-level `src/…` (over-stripped) extracts
-            // "successfully" with every file at the WRONG path. Without
-            // this check the caller synthesized success purely from
-            // `record.files` and shipped a copy missing its patched files
-            // (exit 0, empty copy_dir on disk). Fail closed here and let
-            // the `auto` source fall back to the local build.
+            // "successfully" with every file at the WRONG path, and the
+            // caller would ship a copy missing its patched files. Fail
+            // closed here and let the `auto` source fall back to the local
+            // build.
             if !copy_matches_after_hashes(&stage, &record.files).await {
                 cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return miss(
@@ -2313,7 +2313,7 @@ mod tests {
     /// misplaces the patched file) must NOT be reported as success from
     /// `record.files` alone. Under `service` mode it hard-fails
     /// `vendor_prebuilt_layout_mismatch`; the file is not at the expected
-    /// path. Regression for the exit-0-empty-copy incident (run 29040958337).
+    /// path.
     #[tokio::test]
     async fn service_wrong_layout_service_mode_hard_fails() {
         let lock = lock_value("psr/log", "3.0.2", false);
@@ -2339,8 +2339,8 @@ mod tests {
         .await;
         // Service mode has no fallback, so `miss()` surfaces the uniform
         // `vendor_prebuilt_required` code (same as an integrity mismatch);
-        // the layout diagnosis rides in the detail. The point of the
-        // regression is that it REFUSES rather than synthesizing success —
+        // the layout diagnosis rides in the detail. The point is that it
+        // REFUSES rather than synthesizing success —
         // and the copy dir does not hold the file at its recorded path.
         match outcome {
             VendorOutcome::Refused { code, detail } => {

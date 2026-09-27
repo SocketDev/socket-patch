@@ -45,7 +45,7 @@ use crate::ui::plural;
 /// no install hook set up and is not declared `manual`. Distinct from the
 /// verification tags (`hash_mismatch`, `package_not_found`, …) so a JSON
 /// consumer can tell "not patched" from "patched but not persisted by any
-/// hook" — before this tag existed the drop was machine-invisible.
+/// hook".
 const ECOSYSTEM_NOT_SETUP: &str = "ecosystem_not_setup";
 
 #[derive(Args)]
@@ -85,12 +85,9 @@ pub struct VexArgs {
     /// longer wires, or a lockfile reference whose record is unavailable or
     /// names another package, is omitted either way.
     //
-    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    // clap's default bool parser accepts only the literal strings
-    // `true`/`false` from the env binding, so `SOCKET_VEX_NO_VERIFY=1` (or
-    // an exported-but-empty `SOCKET_VEX_NO_VERIFY=`) aborted the parse.
-    // This var is also outside `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var
-    // scrub never rescues it.
+    // `value_parser = parse_bool_flag`: clap's default bool parser accepts
+    // only `true`/`false` from the env binding, so `SOCKET_VEX_NO_VERIFY=1`
+    // would abort the parse.
     #[arg(
         long = "no-verify",
         env = "SOCKET_VEX_NO_VERIFY",
@@ -115,7 +112,7 @@ pub struct VexArgs {
     pub compact: bool,
 }
 
-/// VEX-generation knobs embedded into `apply` and `scan` via `--vex`.
+/// VEX-generation knobs embedded into `apply`, `vendor` and `scan` via `--vex`.
 ///
 /// `--vex <path>` is the trigger: when set, the host command generates an
 /// OpenVEX document at that path after a successful run. The remaining
@@ -140,10 +137,9 @@ pub struct VexEmbedArgs {
     /// trust the patch records (the lockfile wiring checks still apply). See
     /// `socket-patch vex --no-verify`.
     //
-    // `value_parser = parse_bool_flag`: these embedded flags share their
-    // env vars with the standalone `vex` flags, so without it an ambient
-    // `SOCKET_VEX_NO_VERIFY=1` (or `=`) aborted every host command parse —
-    // including `apply` running from a postinstall hook.
+    // `value_parser = parse_bool_flag`: these share env vars with the
+    // standalone `vex` flags, so an ambient `SOCKET_VEX_NO_VERIFY=1` (or `=`)
+    // must not abort every host command parse (e.g. a postinstall `apply`).
     #[arg(
         long = "vex-no-verify",
         env = "SOCKET_VEX_NO_VERIFY",
@@ -188,7 +184,7 @@ impl VexEmbedArgs {
 }
 
 /// Plain (non-clap) inputs to [`generate_vex`] so the standalone `vex`
-/// command and the embedded `apply`/`scan` paths feed one code path.
+/// command and the embedded `apply`/`vendor`/`scan` paths feed one code path.
 pub(crate) struct VexBuildParams {
     /// Where to write the document. `None` => stdout (standalone `vex`
     /// only); embedded callers always pass `Some(path)`.
@@ -197,7 +193,7 @@ pub(crate) struct VexBuildParams {
     pub no_verify: bool,
     pub doc_id: Option<String>,
     pub compact: bool,
-    /// In-run `scan --redirect --vex` only: the PURLs whose lockfile rewrite
+    /// In-run `scan --mode hosted --vex` only: the PURLs whose lockfile rewrite
     /// THIS RUN confirmed (their hosted-patch URL landed in a project file).
     /// These are exempt from on-disk verification — their bytes are remote
     /// until the next install; the lockfile integrity pins are the evidence —
@@ -219,10 +215,9 @@ pub(crate) struct VexBuildParams {
     /// Embedded hosted `scan --vex` only: scan's npm crawl of the same
     /// tree earlier in this process. The installed-copy lookups take the
     /// npm `node_modules` roots (and, for the identity fallback, the
-    /// crawled packages) from it instead of walking the tree again; each
-    /// root is still searched as before, so copy choice and order are
-    /// unchanged. Ignored when taken with other crawler options. The
-    /// standalone `vex` passes `None` and walks the tree.
+    /// crawled packages) from it instead of walking the tree again; copy
+    /// choice and order are unchanged. Ignored when taken with other crawler
+    /// options. The standalone `vex` passes `None` and walks the tree.
     pub npm_prior: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 }
 
@@ -304,8 +299,7 @@ pub async fn run(args: VexArgs) -> i32 {
     let output = args.output.clone().filter(|p| p.as_os_str() != "-");
 
     // --json without --output would race the envelope and the VEX doc
-    // on the same stdout stream. Bail out with a clear error before
-    // doing any work.
+    // on the same stdout stream.
     if args.common.json && output.is_none() {
         // A usage error, not a generation failure: no telemetry POST and no
         // config read (argument errors never report), just the envelope.
@@ -468,10 +462,11 @@ fn org_looks_like_path(org: Option<&str>) -> Option<String> {
     })
 }
 
-/// Map a `setup.manual` entry to an `Ecosystem`. Accepts the canonical
-/// `cli_name` plus the friendly aliases `setup --exclude`/`--ecosystems` accept
-/// (`go`/`golang`, `python`/`pypi`, `ruby`/`gem`, `php`/`composer`).
-/// Unrecognized names yield `None` and are ignored.
+/// Map a `setup.manual` entry to an `Ecosystem`, case-insensitively.
+/// Accepts the canonical `cli_name`, the aliases `go`, `python`, `ruby`,
+/// `rust`, `php`, `java`, `dotnet` and `jsr`, and the npm-family package
+/// manager names (`yarn`/`pnpm`/`bun`/`vlt`). Unrecognized names yield
+/// `None` and are ignored.
 fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
     match name.to_ascii_lowercase().as_str() {
         "npm" | "yarn" | "pnpm" | "bun" | "vlt" => Some(Ecosystem::Npm),
@@ -490,7 +485,7 @@ fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
 }
 
 /// Core VEX pipeline shared by the standalone `vex` command and the
-/// embedded `apply`/`scan` `--vex` paths: resolve the product, verify the
+/// embedded `apply`/`vendor`/`scan` `--vex` paths: resolve the product, verify the
 /// plan's record view against disk (unless `no_verify`), build the OpenVEX
 /// document, serialize, write (or print to stdout when `output` is `None`),
 /// and fire telemetry. Returns a [`VexWriteSummary`] on success or a
@@ -506,7 +501,6 @@ async fn generate_vex(
 ) -> Result<VexWriteSummary, VexGenError> {
     let manifest = &plan.view;
     let redirected: &[String] = &plan.redirected;
-    // Resolve product.
     let product_id = match resolve_product_id(common, params.product.as_deref(), warnings).await {
         Ok(id) => id,
         Err(reason) => return Err(fail(common, "product_undetected", reason).await),
@@ -645,7 +639,7 @@ async fn generate_vex(
         outcome
     };
 
-    // In-run `scan --redirect --vex`: the bytes of deps THAT RUN confirmed
+    // In-run `scan --mode hosted --vex`: the bytes of deps THAT RUN confirmed
     // redirected live on the patch server until the next install, so their
     // verification against the local tree would spuriously fail
     // (package_not_found / not_applied). Exempt exactly those PURLs —
@@ -657,9 +651,7 @@ async fn generate_vex(
         // The confirmed purls come from the grant reference (unqualified —
         // `pkg:pypi/urllib3@1.26.18`) while the ledger records the API's
         // artifact-qualified purl (`…?artifact_id=py2-py3-none-any-whl`), so
-        // match on the qualifier-stripped form: a lock-only pypi redirect used
-        // to attest nothing and fail the same-run `--vex` with
-        // `no_applicable_patches`.
+        // match on the qualifier-stripped form.
         let exempt: std::collections::HashSet<&str> = params
             .assume_applied
             .iter()
@@ -732,10 +724,8 @@ async fn generate_vex(
     // mechanism, so no install hook exists (or is needed) by construction.
     let vendored_set: std::collections::HashSet<String> =
         outcome.vendored.iter().cloned().collect();
-    // Redirected patches (from `scan --redirect`) bypass the property-7
-    // ecosystem filter for the same reason vendored ones do: the committed
-    // lockfile rewrite IS the persistence mechanism, so no install hook exists
-    // (or is needed) by construction.
+    // Redirected (hosted) patches bypass the filter for the same reason: the
+    // committed lockfile rewrite IS the persistence mechanism.
     let redirected_set: std::collections::HashSet<&str> =
         redirected.iter().map(|s| s.as_str()).collect();
     let mut allowed = crate::commands::setup::configured_ecosystems(common).await;
@@ -761,9 +751,7 @@ async fn generate_vex(
     let any_setup_filtered = !setup_filtered.is_empty();
     // The filter drops join the omission channel (`failed`) with their own
     // routing tag so they surface as per-purl `skipped` events in the
-    // envelope — success and error paths alike. Before this they existed
-    // only as the human-mode note above, leaving `--json` consumers unable
-    // to distinguish "patched but no persistence hook" from "not patched".
+    // envelope — success and error paths alike.
     outcome
         .failed
         .extend(setup_filtered.into_iter().map(|purl| FailedPatch {
@@ -798,12 +786,10 @@ async fn generate_vex(
         }
     }
 
-    // Build the document.
     let opts = BuildOptions {
         product_id,
-        // Same "empty means unset" rule as the product override above: the
-        // document `@id` is a required field with no `skip_serializing_if`,
-        // so `--doc-id "$UNSET_VAR"` emitted a literal `"@id": ""`.
+        // Empty means unset: the document `@id` is a required field, so
+        // `--doc-id "$UNSET_VAR"` must not emit a literal `"@id": ""`.
         doc_id: params
             .doc_id
             .clone()
@@ -845,7 +831,6 @@ async fn generate_vex(
         }
     };
 
-    // Serialize.
     let serialized = match if params.compact {
         serde_json::to_string(&doc)
     } else {
@@ -861,9 +846,7 @@ async fn generate_vex(
         Some(_) if params.dry_run => false,
         Some(path) => {
             if let Err(e) = tokio::fs::write(path, format!("{serialized}\n")).await {
-                // The raw io::Error ("No such file or directory (os error
-                // 2)") names neither the file nor the operation — useless
-                // in a CI log. Say what was being written and where.
+                // The raw io::Error names neither the file nor the operation.
                 return Err(fail(
                     common,
                     "write_failed",
@@ -932,9 +915,9 @@ fn has_iri_scheme(s: &str) -> bool {
 }
 
 /// Read the manifest at `manifest_path`, then [`generate_vex`]. Manifest
-/// read failures are wrapped as [`VexGenError`] so embedded callers
-/// (`apply`/`scan`) get a single error channel. Used by the embedded
-/// `--vex` paths, which always write to a file.
+/// read failures are wrapped as [`VexGenError`] so every caller gets a single
+/// error channel. Used by the standalone `vex` command (file or stdout) and
+/// the embedded `--vex` paths of `apply`/`vendor`/`scan` (always a file).
 ///
 /// Failure contract: a run that ends in error leaves NO OpenVEX document at
 /// the output path — including a stale one from a previous run. Attestation
@@ -1090,7 +1073,7 @@ async fn generate_vex_from_manifest_path_inner(
         Ok(state) => state,
         Err(corrupt) => {
             // Not core's Display: that text ("... so it will not be
-            // overwritten") is written for the `scan --redirect` writer, and
+            // overwritten") is written for the hosted `scan` writer, and
             // `vex` only reads the ledger.
             let message = format!(
                 "The redirect ledger {} is malformed ({}); cannot attest redirected patches. \
@@ -1112,12 +1095,10 @@ async fn generate_vex_from_manifest_path_inner(
             return Err(fail(common, "vendor_ledger_corrupt", message).await);
         }
     };
-    // Rooted where the ledgers are (`--cwd`). It runs under `--global` /
-    // `--global-prefix` too: the redirect and vendor ledgers are still read
-    // from `--cwd`, and discovery is what gates them (core discover rule
-    // 11). Skipping it handed every ledger claim to the raw-text fallbacks,
-    // which must never decide a uuid a lockfile mentions — so a
-    // commented-out or rejected pin attested again under `--global`.
+    // Rooted where the ledgers are (`--cwd`), and run under `--global` /
+    // `--global-prefix` too: discovery is what gates the ledgers (core
+    // discover rule 11); without it the raw-text fallbacks would decide a
+    // uuid a lockfile mentions, attesting a commented-out or rejected pin.
     let discovery = crate::commands::discover_wiring(common, &common.cwd).await;
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
@@ -1185,13 +1166,9 @@ async fn resolve_product_id(
     product: Option<&str>,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<String, String> {
-    // An empty (or whitespace-only) override means "unset" — the semantics
-    // `scrub_empty_env_vars` already gives the `SOCKET_VEX_PRODUCT=` twin and
-    // `api_client_overrides` gives `--api-url ""`. Without the filter,
-    // `--product "$UNSET_VAR"` sailed through to `BuildOptions::product_id`,
-    // and `Product::id` is `skip_serializing_if = "String::is_empty"` — so the
-    // run wrote a spec-invalid document whose statements claim `not_affected`
-    // about a product carrying NO identifier at all, and exited 0.
+    // An empty (or whitespace-only) override means "unset". `Product::id` is
+    // `skip_serializing_if = "String::is_empty"`, so passing it through would
+    // write a spec-invalid document about a product with no identifier.
     if let Some(p) = product.filter(|p| !p.trim().is_empty()) {
         return Ok(p.to_string());
     }
@@ -1274,12 +1251,9 @@ pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Err
 /// instead, so a ledger entry no lockfile wires never routes its
 /// verification.)
 ///
-/// The go-patches synthesis fixes a latent bug: an apply-redirected Go
-/// patch leaves the module cache pristine (the `replace` directive routes
-/// the build at the copy dir), so verifying against the crawler-resolved
-/// cache path reported `not_applied`/`package_not_found` and the patch was
-/// silently omitted from the VEX document. The redirect copy dir holds the
-/// bytes the build actually consumes, so it is what verification must hash.
+/// Go-patches synthesis: an apply-redirected Go patch leaves the module
+/// cache pristine (the `replace` directive routes the build at the copy
+/// dir), so the copy dir is what verification must hash.
 ///
 /// An unreadable/corrupt vendor ledger degrades to "no vendor entries":
 /// vendored PURLs then fall through to the installed tree, fail
@@ -1538,8 +1512,7 @@ mod tests {
     use clap::Parser;
 
     // Property 7: every ecosystem a PURL can classify to must also be
-    // declarable `manual`. Apply-only maven/nuget/deno are the *primary* use of
-    // `manual`; they were missing originally, silently dropping their patches.
+    // declarable `manual` (apply-only maven/nuget/deno are its primary use).
     #[test]
     fn ecosystem_from_manual_name_maps_every_ecosystem() {
         assert_eq!(ecosystem_from_manual_name("npm"), Some(Ecosystem::Npm));
@@ -1559,14 +1532,9 @@ mod tests {
         assert_eq!(ecosystem_from_manual_name("deno"), Some(Ecosystem::Deno));
     }
 
-    // Property 7 completeness, the reverse direction of the test above and
-    // future-proof: every ecosystem the build can classify a PURL for (i.e.
-    // every `Ecosystem::all()` variant) MUST round-trip through its canonical
-    // `cli_name` back to itself via `ecosystem_from_manual_name`. Otherwise a
-    // `manual`-declared patch for that ecosystem would be silently dropped from
-    // the VEX doc by the `retain` in `generate_vex`. Iterating `all()` (rather
-    // than hard-coding names) means adding a new ecosystem without wiring up its
-    // `manual` alias fails this test instead of shipping a silent drop.
+    // Every `Ecosystem::all()` variant must round-trip through its `cli_name`
+    // via `ecosystem_from_manual_name`, or its `manual`-declared patches are
+    // silently dropped by the `retain` in `generate_vex`.
     #[test]
     fn every_compiled_ecosystem_is_declarable_manual_via_cli_name() {
         for &e in Ecosystem::all() {
@@ -1615,10 +1583,8 @@ mod tests {
     }
 
     /// The `--product` advisory keys off [`has_iri_scheme`]: PURLs and
-    /// anything scheme-shaped sail through silently; bare names (what the
-    /// probe fed in) warn. Pin the accept/reject sets so the check can't
-    /// drift into rejecting legal identifiers (a hard reject is explicitly
-    /// out of contract — help text says "PURL/identifier").
+    /// anything scheme-shaped pass silently; bare names warn (never a hard
+    /// reject — help text says "PURL/identifier").
     #[test]
     fn iri_scheme_check_accepts_purls_and_iris_rejects_bare_names() {
         // Accepted (no warning): PURLs, URLs, URNs, exotic-but-legal schemes.
@@ -1845,7 +1811,7 @@ mod tests {
     }
 }
 
-/// H3: embedded hosted `scan --vex` takes the npm roots and crawled
+/// Embedded hosted `scan --vex` takes the npm roots and crawled
 /// packages from scan's crawl instead of walking the tree again; the VEX
 /// document is byte-identical (modulo its per-run timestamps) to the one
 /// the tree walk produces.

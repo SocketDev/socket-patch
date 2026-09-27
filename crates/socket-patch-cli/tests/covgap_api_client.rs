@@ -1,5 +1,5 @@
 //! Coverage-gap e2e for `api::client` env/org-resolution UX paths that need
-//! process-level stderr assertions (2026-09 coverage audit).
+//! process-level stderr assertions.
 //!
 //! The core inline tests (`org_auto_resolution_401_with_hash_shaped_token_hint_arm`)
 //! pin the resulting client *state*; this suite pins the operator-facing

@@ -1,11 +1,8 @@
 //! Integration tests for `repair` / `gc` against pre-populated `.socket/`
-//! fixtures. These run fully offline (`--offline` flag), so they exercise
-//! the cleanup paths — manifest read, orphan-blob detection, archive
-//! cleanup, dry-run preview, JSON envelope output — without needing the
-//! Socket API.
-//!
-//! Network-dependent paths (the fetch arm of `repair` when run without
-//! `--offline`) stay in the `#[ignore]`'d e2e suite.
+//! fixtures. Most tests run fully offline (`--offline`), exercising the
+//! cleanup paths — manifest read, orphan-blob detection, archive cleanup,
+//! dry-run preview, JSON envelope output; the online fetch arm is covered
+//! against a wiremock API (see "Online fetch path" below).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -567,8 +564,7 @@ fn repair_cleanup_failure_is_reported_in_json_and_silent_modes() {
 //
 // Every mutating command's lock guard reclaims a leftover `apply.lock` in
 // place and removes it (plus an otherwise-empty `.socket/`) when it drops;
-// repair — the historical home of the old `unlock --release` fold-in — is
-// where that contract is pinned.
+// that contract is pinned here.
 // ---------------------------------------------------------------------------
 
 /// Take an exclusive flock on the binary's lock file path (the same

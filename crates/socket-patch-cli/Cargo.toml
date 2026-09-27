@@ -45,8 +45,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 [features]
 # Every ecosystem (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
 # Deno) is unconditionally compiled in AND enabled at runtime — there are no
-# ecosystem feature gates and no runtime env gates (the old
-# SOCKET_EXPERIMENTAL_MAVEN/NUGET opt-ins are retired).
+# ecosystem feature gates and no runtime env gates.
 # The only features left gate opt-in test suites:
 #
 # Enables the Docker-driven real-package e2e test suite under

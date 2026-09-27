@@ -38,7 +38,7 @@
 //! decoration.
 //!
 //! A get-driven twin (`cargo_get_uuid_hosted_fresh_checkout_fetch`) drives
-//! the SAME fixture through `get <uuid> --mode hosted` (v3.6) — parity by
+//! the SAME fixture through `get <uuid> --mode hosted` (v4.0) — parity by
 //! construction, since get hands the (purl, uuid) pair to scan's extracted
 //! run_redirect_selected engine — and re-proves the fresh-checkout fetch.
 //! Hosted get writes NO manifest and NO blobs (the redirect ledger is the
@@ -999,7 +999,7 @@ async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies(
         .await;
 }
 
-/// get-driven twin (v3.6): `get <uuid> --mode hosted --json --yes` must land
+/// get-driven twin (v4.0): `get <uuid> --mode hosted --json --yes` must land
 /// the SAME three-file rewrite + ledger as the scan capstone (asserted
 /// inside the shared fixture — parity by construction through
 /// run_redirect_selected, redirected count via the transactional

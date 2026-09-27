@@ -67,7 +67,7 @@ const STAMP_REL: &str = ".socket/gem-plugin-stamp";
 /// every clone.
 const STAMP_IGNORE_LINE: &str = "/gem-plugin-stamp";
 
-/// The generated `plugins.rb` body (the two-trigger idempotent applier).
+/// The generated `plugins.rb` body (the three-trigger idempotent applier).
 const PLUGINS_RB: &str = include_str!("templates/plugins.rb.tmpl");
 /// The generated plugin gemspec.
 const GEMSPEC: &str = include_str!("templates/gemspec.tmpl");

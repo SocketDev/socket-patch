@@ -15,8 +15,7 @@
 //! `go mod verify` keeps passing and other projects are unaffected), and removal
 //! is clean (drop the directive → the build falls back to the cache). A
 //! local-path `replace` target is **not** `go.sum` content-verified, so the
-//! patched bytes build cleanly under the default `-mod=readonly` (validated
-//! empirically — see project memory).
+//! patched bytes build cleanly under the default `-mod=readonly`.
 //!
 //! The copy is produced by **delegating to the hardened
 //! [`apply_package_patch`] pipeline** pointed at the fresh copy, reusing all the

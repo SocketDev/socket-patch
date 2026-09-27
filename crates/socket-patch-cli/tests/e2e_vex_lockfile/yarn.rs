@@ -1249,7 +1249,8 @@ fn assert_embedded_attested(doc: Option<Value>, env: &Value, marker: &str, cell:
     );
 }
 
-/// The in-run VEX of `scan` (agent mode, `--redirect`, `--vendor`) on an
+/// The in-run VEX of `scan` (a bare scan, which runs hosted mode; the legacy
+/// `--redirect`; `--vendor`) on an
 /// already-wired, manifest-less checkout attests the lock's patch like the
 /// standalone command, never rewrites the wiring, never writes a manifest,
 /// and still refuses a tampered installed tree.

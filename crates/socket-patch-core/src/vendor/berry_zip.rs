@@ -3,12 +3,11 @@
 //! yarn berry verifies every install against the sha512 of the *converted
 //! cache zip*, not of the tarball — so a committed vendored lock entry needs
 //! that checksum computed offline, with no yarn on the machine. This module
-//! is a byte-exact Rust port of `spikes/yarn-berry-nm/rebuild_zip.py`, the
-//! spike-proven recipe that reproduces yarn 4.x cache zips bit-for-bit
-//! (verified against yarn 4.12.0 and 4.6.0 output, TZ-insensitive, mode-probe
-//! tarball included — see spike B2 in `spikes/PHASE0-V2-FINDINGS.txt`).
+//! is a byte-exact port of an empirically proven recipe that reproduces
+//! yarn 4.x cache zips bit-for-bit (verified against yarn 4.12.0 and 4.6.0
+//! output, TZ-insensitive, mode-probe tarball included).
 //!
-//! Every constant below is pinned by that spike; the zip writer is
+//! Every constant below is pinned by that verification; the zip writer is
 //! hand-rolled because the recipe's exact field bytes (no extra fields, no
 //! data descriptors, libzip's version-made-by, DOS timestamps rendered as
 //! UTC) are the whole point and must never float with a zip-crate default.
@@ -337,9 +336,9 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
-    /// `spikes/yarn-berry-nm/fixtures/b2-zip-reproducibility/left-pad-1.3.0-patched.tgz`
-    /// (base64) — the spike's patched left-pad tarball, the input yarn 4.12.0
-    /// converted into cache zip `left-pad-file-8dfd6a0c16-10c0.zip`.
+    /// `left-pad-1.3.0-patched.tgz` (base64) — a patched left-pad tarball,
+    /// the input yarn 4.12.0 converted into cache zip
+    /// `left-pad-file-8dfd6a0c16-10c0.zip`.
     const LEFT_PAD_PATCHED_TGZ_B64: &str = concat!(
         "H4sIAJtlKWoAA+1b/XLbNhLv35rpOyDqTSk5EkXqM3HqtIk/rr42tid2Lpd6fDFEQhJjilRJ0Iray/Pcg9yL3W8BkqIcJ7Jd",
         "271rhUxMEthd7C6Axe4CmnDnjA9F44s7LJZl9Todpp5d/UTJnvrD7jTtZrOLf21m2e12r/kF69wlU1lJYskjsDL2zkKf+7NY",
@@ -395,9 +394,8 @@ mod tests {
         "8QVG79b+L+z/+cq7XSdgqf/fsi7s/71ue+X/30v5f/X/swuwI1MfnOlrk9nVxj9ipnZVVmVVVuV2y38BIDHF2gBKAAA=",
     );
 
-    /// `spikes/yarn-berry-nm/fixtures/b2-zip-reproducibility/modeprobe.tgz`
-    /// (base64) — the spike's odd-modes probe tarball (files 0755/0664/0600/
-    /// 0444, dir 0700), pinning yarn's mode normalization.
+    /// `modeprobe.tgz` (base64) — an odd-modes probe tarball (files
+    /// 0755/0664/0600/0444, dir 0700), pinning yarn's mode normalization.
     const MODEPROBE_TGZ_B64: &str = concat!(
         "H4sIAF9mKWoAA+2W3U6EMBCFud6nwHprSltom5j4MICjID8lFBRjfHeLC2aXGPRii4n0u5lACHPg5My0idMifoTAswghRHLu",
         "f1ZxrIa5Hi8oZ5QxEdJQ+oRGkWSez22Kmul1F7dGSpUXqozLVw11ob557iUDKFfec/5RviW1F6eZ/G/7GuvMTo8f/WfsxH9h",
@@ -406,8 +404,8 @@ mod tests {
         "l/R9cXr+e8Dd0FnoMW74aG3/E7bc/yyULv9bMLjAOxwOxy75AJ0RpNkAGAAA",
     );
 
-    /// `spikes/yarn-berry-nm/fixtures/b2-zip-reproducibility/yarn-cache-modeprobe-file-10c0.zip`
-    /// (base64) — yarn 4.12.0's OWN cache zip for modeprobe.tgz, byte-exact.
+    /// `yarn-cache-modeprobe-file-10c0.zip` (base64) — yarn 4.12.0's OWN
+    /// cache zip for modeprobe.tgz, byte-exact.
     const MODEPROBE_YARN_ZIP_B64: &str = concat!(
         "UEsDBBQAAAAAAECu1ggAAAAAAAAAAAAAAAANAAAAbm9kZV9tb2R1bGVzL1BLAwQUAAAAAABArtYIAAAAAAAAAAAAAAAAFwAA",
         "AG5vZGVfbW9kdWxlcy9tb2RlcHJvYmUvUEsDBAoAAAAAAECu1ggvOtrpEgAAABIAAAAdAAAAbm9kZV9tb2R1bGVzL21vZGVw",
@@ -427,8 +425,7 @@ mod tests {
     );
 
     /// Spike-captured lock checksum for the patched left-pad tarball: the
-    /// verbatim `checksum:` value yarn 4.12.0 wrote in
-    /// `spikes/yarn-berry-nm/fixtures/b3-vendored-resolutions/after/yarn.lock`
+    /// verbatim `checksum:` value yarn 4.12.0 wrote in its `yarn.lock`
     /// (== sha512 of `yarn-cache-left-pad-file-8dfd6a0c16-10c0.zip`).
     const LEFT_PAD_SPIKE_CHECKSUM: &str = "10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0cbcbcf00841d42488fddda51265c73eeddd54c5deca87d131e846ff66d27d890ef73f12720b458d7ca3";
 

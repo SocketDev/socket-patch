@@ -738,7 +738,7 @@ impl ApiClient {
     }
 
     /// Resolve hosted-patch references for a set of published-patch UUIDs
-    /// (`scan --redirect`). Uses the authenticated
+    /// (hosted-mode `scan`, the default for a bare `scan`). Uses the authenticated
     /// `POST /v0/orgs/{org}/patches/package` when a token+org are set, else the
     /// public proxy `POST /patch/package` (free patches only). Returns a
     /// UUID → reference map (missing/404 → empty).
@@ -2468,8 +2468,10 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
         severity: highest_severity,
         title,
         // Carry the timestamp through. The batch shape does not require it,
-        // but dropping it here would cost this path the recency tiebreak in
-        // `ranking` — and it is the one path where we definitely have it.
+        // but dropping it here would cost this path its recency ordering in
+        // `ranking` (the sole key among merged patches, the tiebreak after
+        // severity otherwise) — and it is the one path where we definitely
+        // have it.
         published_at: Some(patch.published_at),
     }
 }
@@ -3348,9 +3350,8 @@ mod tests {
 
     #[test]
     fn test_convert_moderate_outranks_low() {
-        // Regression: `moderate` (GHSA medium tier) used to rank below
-        // `low`, so a moderate+low patch reported `low` as its highest
-        // severity.
+        // `moderate` (GHSA medium tier) must outrank `low`, so a
+        // moderate+low patch reports `moderate` as its highest severity.
         let mut vulns = HashMap::new();
         vulns.insert(
             "GHSA-1111".into(),
@@ -3698,9 +3699,8 @@ mod tests {
     #[test]
     fn validate_token_shape_redacts_by_chars_not_bytes() {
         // Regression: the preview tail and the "(N chars)" count must be
-        // measured in *characters*, not bytes. A multi-byte token used to be
-        // sized with `token.len()` (bytes), which over-reported the length
-        // and mis-sliced the "last 4 chars" tail.
+        // measured in *characters*, not bytes: `token.len()` (bytes) would
+        // over-report the length and mis-slice the "last 4 chars" tail.
         //
         // 1 multi-byte char ('é', 2 bytes) + 16 ASCII + "WXYZ" = 21 chars /
         // 22 bytes. Correct redaction keeps the last 4 chars ("WXYZ") and
@@ -3727,11 +3727,10 @@ mod tests {
 
     // ── classify_auth_error: shared 401/403/429 classification ──────────
     //
-    // Regression: `fetch_binary` used to fold *every* non-OK/404 status into
-    // `ApiError::Other`, so an authenticated blob/diff/package fetch that
-    // 401'd/403'd was never recognized by `is_fallback_candidate` and the
-    // auth→proxy fallback silently never fired. Both transport paths now route
-    // through this shared classifier; these pin its contract directly.
+    // Both transport paths (including `fetch_binary`) route through this
+    // shared classifier, so an authenticated blob/diff/package fetch that
+    // 401s/403s is recognized by `is_fallback_candidate` and the auth→proxy
+    // fallback fires. These pin its contract directly.
 
     #[test]
     fn classify_auth_error_maps_401_to_unauthorized() {
@@ -3876,10 +3875,10 @@ mod tests {
 
     // ── binary_url: proxy override must reach blob/diff/package fetches ──
     //
-    // Regression: `fetch_binary` used to re-derive the proxy base from
-    // `SOCKET_PROXY_URL`/default instead of the client's configured
-    // `api_url`, so a `--proxy-url` override (which sets `api_url` but no env
-    // var) was honored for searches yet silently ignored for downloads.
+    // `fetch_binary` must use the client's configured `api_url`, not
+    // re-derive the proxy base from `SOCKET_PROXY_URL`/default, so a
+    // `--proxy-url` override (which sets `api_url` but no env var) reaches
+    // downloads as well as searches.
 
     fn proxy_client(api_url: &str) -> ApiClient {
         ApiClient::new(ApiClientOptions {
@@ -4530,7 +4529,7 @@ mod vendor_package_tests {
         ));
     }
 
-    // ── fetch_registry_references (scan --redirect resolution) ────────
+    // ── fetch_registry_references (hosted-mode scan resolution) ────────
 
     /// `fetch_registry_references` with no UUIDs must return an empty map
     /// with zero I/O — the client points at a closed port, so a regression
@@ -4558,7 +4557,7 @@ mod vendor_package_tests {
         }
     }
 
-    /// The anonymous `scan --redirect` route: `fetch_registry_references`
+    /// The anonymous hosted-mode `scan` route: `fetch_registry_references`
     /// on a public-proxy client POSTs `/patch/package` with no bearer and
     /// no `freeOnly` key, and returns the UUID → reference map.
     #[tokio::test]

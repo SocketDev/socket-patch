@@ -2204,9 +2204,8 @@ mod tests {
         }
     }
 
-    // Captured with vlt 1.2.0 and rc.14 (design probes peerprobe/t2 and
-    // e1c/base): every entry line is inside the grammar and both sections
-    // are in the order the comparators compute.
+    // Captured with vlt 1.2.0 and rc.14: every entry line is inside the
+    // grammar and both sections are in the order the comparators compute.
     const CAPTURED_1_2_0: &str = r#"{
   "lockfileVersion": 1,
   "options": {

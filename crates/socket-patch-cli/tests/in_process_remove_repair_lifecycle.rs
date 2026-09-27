@@ -1,8 +1,8 @@
 //! Full-lifecycle tests for `remove` and `repair`.
 //!
 //! `remove` exercises the rollback → manifest delete → blob cleanup
-//! chain. `repair` exercises blob fetching + GC across all three
-//! download modes (file/diff/package). Both are run in-process so
+//! chain. `repair` exercises blob fetching + GC in both download modes
+//! (file/diff) and checks that the removed `package` mode fails hard. Both are run in-process so
 //! coverage is captured.
 
 use std::path::Path;
@@ -314,7 +314,7 @@ async fn remove_no_manifest_emits_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// repair: download in all three modes (file/diff/package)
+// repair: download in both modes (file/diff); `package` fails hard
 // ---------------------------------------------------------------------------
 
 fn make_repair_args(cwd: &Path, mode: &str) -> RepairArgs {

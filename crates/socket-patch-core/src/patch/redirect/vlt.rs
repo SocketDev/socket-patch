@@ -155,7 +155,7 @@ pub(super) fn default_instances<'a>(lock: &'a HostedLock, dep: &DepOverride) -> 
     partition_instances(nodes, &full_name(dep), &dep.version, lock.parsed.options()).0
 }
 
-/// Does `dep` have a node of socket-patch's vendored vlt shape (§3.4) in a
+/// Does `dep` have a node of socket-patch's vendored vlt shape in a
 /// lock that passed the lock-level parse?
 pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> bool {
     lock.parsed
@@ -163,9 +163,9 @@ pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> boo
         .is_some_and(|nodes| has_vendored_node(nodes, &full_name(dep), &dep.version))
 }
 
-/// The lock-level warnings that say vlt may discard the lock's pins
-/// (§3.9 (c)): neither in-run nor standalone VEX attests a hosted pin of such
-/// a lock from the lock alone.
+/// The lock-level warnings that say vlt may discard the lock's pins:
+/// neither in-run nor standalone VEX attests a hosted pin of such a lock
+/// from the lock alone.
 pub const DISCARDING_LOCK_CODES: [&str; 3] = [
     VERSION_MISSING,
     OLD_LOCKFILE_IGNORED,
@@ -529,8 +529,8 @@ fn rewrite_dep(
     changed
 }
 
-/// The hosted vlt rewrite (DESIGN §3.2–§3.8): lock-level refusal and
-/// advisories, then each npm override's default-registry instances.
+/// The hosted vlt rewrite: lock-level refusal and advisories, then each
+/// npm override's default-registry instances.
 pub(super) fn rewrite_vlt_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],

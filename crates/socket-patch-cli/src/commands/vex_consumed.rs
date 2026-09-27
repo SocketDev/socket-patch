@@ -153,9 +153,9 @@ const ALIAS_WALK_MAX_DIRS: usize = 200_000;
 /// `node_modules/mm`, a dir the crawler's name-keyed lookup never probes
 /// (it matches `node_modules/<name>` by design, so apply cannot patch the
 /// wrong package). For a hosted ref that copy is what the aliased import
-/// loads, so it is consumed evidence like any other: without it an alias
-/// that is the ONLY copy read as "not installed" and a tampered or stale
-/// (pre-reinstall) tree attested from the lock pin alone.
+/// loads, so it is consumed evidence like any other (otherwise an alias
+/// that is the ONLY copy reads as "not installed" and attests from the lock
+/// pin alone).
 ///
 /// Walks EVERY importer `node_modules` tree the crawler resolves the
 /// installed copies from ([`NpmCrawler::get_node_modules_paths`]: the
@@ -163,10 +163,8 @@ const ALIAS_WALK_MAX_DIRS: usize = 200_000;
 /// `--global-prefix`) once, matching each package dir's `package.json`
 /// `(name, version)`; only dirs whose on-disk key DIFFERS from the
 /// package's name are aliases (the crawler already returns the rest).
-/// Walking the root tree alone left a workspace member's alias
-/// (`packages/a/node_modules/lp`) unhashed whenever the root or a hoisted
-/// copy existed — the identity fallback only fills purls with NO copy —
-/// so a stale or tampered member alias attested from the good root copy.
+/// Member trees matter because the identity fallback only fills purls with
+/// NO copy, so a member alias beside a root copy is found only here.
 /// Hidden entries (`.bin`, pnpm's `.pnpm` and vlt's `.vlt` stores — the
 /// crawler probes them) and symlinks (pnpm's and vlt's importer links,
 /// `npm link` targets) are not traversed. Under vlt EVERY importer entry,
@@ -279,12 +277,11 @@ async fn real_subdirs(dir: &Path) -> Vec<(PathBuf, String)> {
 /// (`node_modules/lp`), not its package name, so the targeted resolver —
 /// which probes `node_modules/<name>` — reports it not installed, and the
 /// walk skips symlinked importer entries (yarn's pnpm linker, a global
-/// `--global-prefix` tree). For a hosted purl that is not a harmless miss: "not
-/// installed" is exactly what the lockfile basis excuses, so a stale or
-/// tampered alias install was attested from the lock pin instead of being
-/// hash-verified ("installed evidence wins"). Resolve every npm purl the
-/// targeted lookup missed by the installed `package.json` identity instead
-/// — the same fallback `vendor` uses before declaring a package missing.
+/// `--global-prefix` tree). For a hosted purl "not installed" is exactly what
+/// the lockfile basis excuses, so such a copy must still be hash-verified
+/// ("installed evidence wins"). Resolve every npm purl the targeted lookup
+/// missed by the installed `package.json` identity instead — the same
+/// fallback `vendor` uses before declaring a package missing.
 #[cfg(test)]
 async fn npm_identity_fallback(
     npm: Option<&Vec<String>>,
@@ -622,11 +619,9 @@ mod tests {
         }
     }
 
-    /// REGRESSION: an npm alias install (`node_modules/lp` holding
-    /// left-pad@1.3.0) is a consumed copy of the hosted purl. The targeted
-    /// lookup probes `node_modules/left-pad` only, so it used to come back
-    /// "not installed" — which the lockfile basis excuses — and a tampered or
-    /// stale alias install was attested from the lock pin unverified.
+    /// An npm alias install (`node_modules/lp` holding left-pad@1.3.0) is a
+    /// consumed copy of the hosted purl, though the targeted lookup probes
+    /// only `node_modules/left-pad`.
     #[tokio::test]
     async fn npm_identity_fallback_fills_only_misses() {
         let tmp = tempfile::tempdir().unwrap();
@@ -663,7 +658,7 @@ mod tests {
         assert!(!all.contains_key(&purls[0]), "{all:?}");
     }
 
-    /// H3: the identity fallback answered from the crawl snapshot finds the
+    /// The identity fallback answered from the crawl snapshot finds the
     /// same copies as crawling again — here an alias installed through a
     /// symlink (yarn's pnpm linker, `npm link`), which neither the targeted
     /// lookup nor the alias walk (it skips symlinks) finds, among other
@@ -766,14 +761,10 @@ mod tests {
         assert_eq!(found["pkg:npm/%40scope/pkg@1.0.0"], vec![nm.join("sc")]);
     }
 
-    /// REGRESSION: a workspace member's alias install is a consumed copy
-    /// even when the root holds the package under its own name. The walk
-    /// used to start at the root `node_modules` only, and the identity
-    /// fallback only fills purls with NO copy — so beside a root (or
-    /// hoisted) install the member alias went unhashed and a tampered one
-    /// attested from the good root copy. Every importer tree the crawler
-    /// enumerates is walked; `--global-prefix` walks the prefix; a plain
-    /// `--global` run walks nothing (the fallback covers it).
+    /// A workspace member's alias install is a consumed copy even when the
+    /// root holds the package under its own name. Every importer tree the
+    /// crawler enumerates is walked; `--global-prefix` walks the prefix; a
+    /// plain `--global` run walks nothing (the fallback covers it).
     #[tokio::test]
     async fn npm_alias_copies_walks_every_workspace_members_tree() {
         let tmp = tempfile::tempdir().unwrap();

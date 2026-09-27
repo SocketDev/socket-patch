@@ -547,14 +547,14 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     eprintln!("MANIFEST-LESS VEX OK");
 }
 
-// ── drift-skipped revert keeps artifacts (residual #131, E1 flow) ─────
+// ── drift-skipped revert keeps artifacts (E1 flow) ─────────────────────
 
 /// The strapi E1 flow, end-to-end with real yarn classic: vendored wiring,
 /// then a hosted overlay re-resolves the lock block to a
 /// `patch.socket.dev` URL (any resolution outside our uuid dir fails the
 /// revert's ownership gate the same way), then `vendor --revert`.
 ///
-/// Contract (residual #131 fixed): the revert drift-skips the lock restore
+/// Contract: the revert drift-skips the lock restore
 /// — and must then ALSO keep the vendored artifacts and the ledger entry,
 /// reporting a counted `Skipped` (`vendor_revert_kept`) instead of a
 /// `Removed`. Previously it deleted `.socket/vendor/npm/<uuid>/` and pruned

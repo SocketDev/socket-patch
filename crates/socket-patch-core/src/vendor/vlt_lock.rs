@@ -1,5 +1,5 @@
 //! vlt vendor backend: `vlt-lock.json` + importer `package.json` surgery
-//! for a direct dependency (DESIGN §4.5).
+//! for a direct dependency.
 //!
 //! The target's default-registry node becomes a `file` node naming the
 //! directory artifact ([`super::npm_dir`]), without the peer-context extra
@@ -8,7 +8,7 @@
 //! importers' package.json specs move to `file:<path relative to the
 //! importer>`, and its own outgoing edges are re-keyed to the new DepID.
 //! Every other line of the lock stays byte-identical, and the moved entries
-//! are placed where vlt's own serializer puts them (§4.5.4), so `vlt ci`
+//! are placed where vlt's own serializer puts them, so `vlt ci`
 //! keeps the lock byte-stable.
 //!
 //! Transitive targets are refused: vlt re-resolves a non-importer edge to a
@@ -65,7 +65,7 @@ const NOT_CANONICAL: &str =
 /// A refusal: a stable code and its detail.
 pub type Refusal = (&'static str, String);
 
-/// DESIGN §4.1 lock sniff: a BOM-less JSON object with `lockfileVersion` 0
+/// Lock sniff: a BOM-less JSON object with `lockfileVersion` 0
 /// or 1. The `Err` detail goes with `vendor_lockfile_version_unsupported`.
 pub(crate) fn sniff_vendor_lock(text: &str) -> Result<ParsedLock, String> {
     match sniff_lock(text) {
@@ -297,7 +297,7 @@ impl LockDoc {
     }
 }
 
-// ── placement (§4.5.4) ───────────────────────────────────────────────────
+// ── placement ────────────────────────────────────────────────────────────
 
 fn node_cmp(a: &Entry, b: &Entry) -> Option<Ordering> {
     vlt_collate(&a.key, &b.key)
@@ -350,7 +350,7 @@ fn place(
     list
 }
 
-// ── target analysis (§4.5.1) ─────────────────────────────────────────────
+// ── target analysis ──────────────────────────────────────────────────────
 
 /// An importer edge into the target.
 #[derive(Debug, Clone)]
@@ -585,7 +585,7 @@ fn json_string(s: &str) -> String {
     serde_json::to_string(s).expect("a str serializes to JSON infallibly")
 }
 
-/// DESIGN §4.5.1 declaration checks on the importers' package.json files.
+/// Declaration checks on the importers' package.json files.
 fn check_declarations(
     target: &Target,
     pkgs: &BTreeMap<String, String>,
@@ -705,8 +705,8 @@ async fn analyze(
 /// The read-only vendored-mode refusals vlt can decide before any write:
 /// the lock sniff and layout, the target analysis with its declaration
 /// checks, the installed store copy's `bundleDependencies` and duplicate
-/// `devDependencies`, and a git rule ignoring the would-be uuid dir
-/// (DESIGN §4.6, core part). The dir form matches only directory
+/// `devDependencies`, and a git rule ignoring the would-be uuid dir. The
+/// dir form matches only directory
 /// exclusions: every other rule is overridden by the `!*` the engine
 /// writes into that dir.
 pub async fn vlt_vendor_preflight(
@@ -836,7 +836,7 @@ fn carried(
     }
 }
 
-/// DESIGN §4.5.2–§4.5.4: the records and the new surfaces, or `None` when
+/// The wiring records and the new surfaces, or `None` when
 /// every surface already names `rel`.
 fn plan_wiring(
     analysis: &Analysis,
@@ -1421,7 +1421,7 @@ async fn preflight_package(
 }
 
 /// Rewrite a vlt entry's `<uuid>/.gitignore` and `<uuid>/.gitattributes`
-/// when absent or changed (DESIGN §4.8 health: neither is part of the
+/// when absent or changed (health: neither is part of the
 /// artifact, so repairing them is no rebuild).
 pub async fn restore_vlt_uuid_metadata(
     entry: &VendorEntry,
@@ -1436,7 +1436,7 @@ pub async fn restore_vlt_uuid_metadata(
     super::npm_dir::restore_uuid_metadata(&project_root.join(uuid_dir)).await
 }
 
-/// Whether `text` passes the §4.1 router sniff (a BOM-less JSON object
+/// Whether `text` passes the router sniff (a BOM-less JSON object
 /// with `lockfileVersion` 0 or 1).
 pub fn vlt_lock_sniff_ok(text: &str) -> bool {
     sniff_vendor_lock(text).is_ok()
@@ -1493,7 +1493,7 @@ pub async fn vlt_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Optio
     lock_has_file_node_under(&text, &entry.uuid)
 }
 
-// ── revert (§4.7) ────────────────────────────────────────────────────────
+// ── revert ───────────────────────────────────────────────────────────────
 
 fn drifted(detail: impl Into<String>) -> VendorWarning {
     VendorWarning::new("vendor_lock_entry_drifted", detail.into())
@@ -1730,7 +1730,7 @@ fn revert_pkg(pkgs: &mut BTreeMap<String, String>, rec: &WiringRecord) -> Step {
     }
 }
 
-/// The DESIGN §4.7 cross-grammar drift detail: the user re-created the lock
+/// The cross-grammar drift detail: the user re-created the lock
 /// under the other DepID grammar while package.json still names our dir.
 fn cross_grammar_detail(entry: &VendorEntry, doc: &LockDoc) -> Option<String> {
     let node = entry.wiring.iter().find(|r| r.kind == KIND_LOCK_NODE)?;
@@ -1824,7 +1824,7 @@ async fn revert_reinstall_advisory(
     ))
 }
 
-/// Undo one vlt-vendored package: every record through its §4.5.3 inverse,
+/// Undo one vlt-vendored package: every record through its inverse,
 /// all or nothing, then remove the artifact.
 pub async fn revert_vlt_opts(
     entry: &VendorEntry,
@@ -2035,7 +2035,7 @@ fn drop_unrecorded_file_edges(staged: &mut Staged, entry: &VendorEntry) {
 }
 
 /// A block without its merged entries, the restored ones re-placed
-/// (§4.5.4) in the forward record order.
+/// in the forward record order.
 fn restored_block(
     entries: &[Entry],
     touched: &[usize],

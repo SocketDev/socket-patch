@@ -6,7 +6,7 @@
 //! and the `go.mod` `replace` points at it ([`ReplaceOwner::Vendor`]). A
 //! directory `replace` target bypasses the module cache, sumdb, and `go.sum`
 //! entirely, so a fresh checkout builds the patched module fully offline and
-//! survives `go mod tidy` (spike-verified — `spikes/PHASE0-FINDINGS.txt`).
+//! survives `go mod tidy` (spike-verified).
 //!
 //! ## Takeover of an `apply` redirect
 //! `ensure_replace_entry`'s cross-owner upsert rewrites an existing
@@ -2788,9 +2788,9 @@ mod tests {
 
     /// A FIRST-run service failure (corrupt zip, never previously wired)
     /// must remove the uuid dir but leave go.mod completely untouched — the
-    /// teardown has no directive to drop (`wired=false`), unlike the stale-
-    /// copy rebuild covered by
-    /// `failed_service_rebuild_of_stale_copy_drops_dangling_directive`.
+    /// teardown has no directive to drop (`wired=false`), unlike the wired
+    /// rebuild of a MISSING copy covered by
+    /// `failed_service_rebuild_of_missing_copy_drops_dangling_directive`.
     #[tokio::test]
     async fn first_run_service_extract_failure_leaves_gomod_untouched() {
         let (dir, blobs, pristine, record) = fixture().await;

@@ -45,11 +45,11 @@ import type { FileCtx } from "./study-crates.ts";
 
 export const model = "claude-opus-5";
 
-// Every ecosystem is compiled in unconditionally — the old per-ecosystem
-// feature gates (`cargo`, `golang`, `maven`, …) no longer exist, and naming
-// them makes cargo abort with "none of the selected packages contains these
-// features". The default feature set is already exactly what we want here:
-// all nine ecosystems, minus the cfg-gated `docker-e2e`/`setup-e2e` suites
+// Every ecosystem is compiled in unconditionally — there are no per-ecosystem
+// feature gates, and naming one (`cargo`, `golang`, `maven`, …) makes cargo
+// abort with "none of the selected packages contains these features". The
+// default feature set is already exactly what we want here: all nine
+// ecosystems, minus the cfg-gated `docker-e2e`/`setup-e2e` suites
 // that `--all-features` would drag in.
 const FEATURES = "";
 

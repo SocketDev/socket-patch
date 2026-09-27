@@ -8,9 +8,10 @@
 //! socket-patch and no Socket API access. `--revert` restores the recorded
 //! original lockfile fragments and removes the artifacts.
 //!
-//! The rest of the CLI is vendor-aware: `apply`/`rollback` yield ownership of
-//! ledger-recorded purls, `remove` reverts vendoring as part of removing a
-//! patch, `scan --prune` exempts vendored entries, and `scan`/`get --mode
+//! The rest of the CLI is vendor-aware: `apply` yields ownership of
+//! ledger-recorded purls, `rollback` skips them in its in-place leg and then
+//! reverts them through its vendored leg, `remove` reverts vendoring as part
+//! of removing a patch, `scan --prune` exempts vendored entries, and `scan`/`get --mode
 //! vendored` drive this module's [`vendor_records`] engine directly in
 //! DETACHED mode: every entry they write carries its patch record embedded
 //! in the ledger and no `.socket/manifest.json` is ever written — this
@@ -118,25 +119,19 @@ pub(crate) async fn dispatch_vendor_one(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
-    // The patch.socket.dev vendoring-service config. `None` = build-only (the
-    // pre-service behavior). `vendor` and `scan`/`get --mode vendored` pass
-    // `Some(_)` (honoring `--vendor-source`); repair passes `None` — it
-    // rebuilds locally from the recorded patch.
+    // The patch.socket.dev vendoring-service config. `None` = build-only;
+    // `vendor` and `scan`/`get --mode vendored` pass `Some(_)` (honoring
+    // `--vendor-source`); repair passes `None` — it rebuilds locally from
+    // the recorded patch.
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &vendor::pypi::InstalledSiteListings,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
 
-    // Prebuilt service downloads now cover every vendorable ecosystem: npm,
-    // pypi, cargo, golang, composer, gem, nuget, and maven. Gem's `.gem`
-    // archive doesn't carry the eval-able stub gemspec a bundler path source
-    // wants, so the converter generates it and serves it as a
-    // `gem-stub-gemspec` second artifact alongside the `.gem` (the gem backend
-    // downloads + verifies both).
-    // Under fail-closed `service` mode, refuse any not-covered ecosystem with a
-    // clear message rather than silently building (which would violate the
-    // contract). Under `auto`/`build` they fall through to the local build.
+    // Ecosystems with prebuilt service downloads. Under fail-closed `service`
+    // mode any other ecosystem is refused rather than silently built; under
+    // `auto`/`build` it falls through to the local build.
     const SERVICE_ECOSYSTEMS: &[&str] = &[
         "npm", "pypi", "cargo", "golang", "composer", "gem", "nuget", "maven",
     ];
@@ -153,8 +148,7 @@ pub(crate) async fn dispatch_vendor_one(
             });
         }
     }
-    // Every backend takes the identical 9-argument tuple; the macro keeps
-    // the per-arm #[cfg] while collapsing the eight-way repetition.
+    // Every backend takes the identical 9-argument tuple.
     macro_rules! vend {
         ($backend:path) => {
             $backend(
@@ -258,17 +252,14 @@ pub(crate) async fn dispatch_revert_one_opts(
 
 /// Is this vendored entry still consumed by its project's lockfile
 /// dependency graph? `None` = cannot determine — callers must keep the
-/// entry (fail-safe): non-npm ecosystems have no in-use probe yet, and a
-/// missing/unreadable lockfile proves nothing.
+/// entry (fail-safe): ecosystems other than npm and cargo have no in-use
+/// probe yet, and a missing/unreadable lockfile proves nothing.
 async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         // Cargo probes the lock entry's shape: detached + `[patch]` pointing
         // at this entry's copy = in use; a registry source (crates.io
-        // re-resolve or a hosted takeover) or a missing entry = reclaimable
-        // (the revert restores / keeps the registry resolution and drops the
-        // dead wiring). Without this, a vendored entry displaced by a hosted
-        // takeover survives every `scan --prune` forever.
+        // re-resolve or a hosted takeover) or a missing entry = reclaimable.
         "cargo" => vendor::cargo::vendored_entry_in_use(entry, project_root).await,
         _ => None,
     }
@@ -366,12 +357,8 @@ pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
 ///
 /// The event is therefore pushed DIRECTLY onto `events` rather than through
 /// [`Envelope::record`], so it stays visible to JSON consumers but does NOT
-/// bump `summary.skipped`. That counter must report packages that were
-/// genuinely skipped, not the number of advisory events — routing every
-/// warning through `record` made a single SUCCESSFUL service vendor report
-/// `applied:1 skipped:1`, let a 1-package project print "2 skipped", and
-/// counted "1 skipped" on a refresh that skipped nothing. `Skipped` never
-/// flips the run status, so pushing it directly loses no status signal.
+/// bump `summary.skipped`, which counts genuinely skipped packages.
+/// `Skipped` never flips the run status, so no status signal is lost.
 pub(crate) fn record_warning(
     env: &mut Envelope,
     purl: &str,
@@ -437,9 +424,6 @@ fn format_vendor_failure(purl: &str, detail: &str) -> String {
     format!("Error: Cannot vendor {}: {detail}", normalize_purl(purl))
 }
 
-/// Report one package that failed to vendor. An error, so it prints even
-/// under `--silent` ("errors only", never nothing); `--json` carries it
-/// in the envelope instead.
 /// The status line while one package's vendor engine call runs.
 fn format_vendor_progress(dry_run: bool, purl: &str, n: usize, total: usize) -> String {
     let verb = if dry_run { "Checking" } else { "Vendoring" };
@@ -450,6 +434,9 @@ fn format_vendor_progress(dry_run: bool, purl: &str, n: usize, total: usize) -> 
     }
 }
 
+/// Report one package that failed to vendor. An error, so it prints even
+/// under `--silent` ("errors only", never nothing); `--json` carries it
+/// in the envelope instead.
 fn report_vendor_failure(common: &GlobalArgs, purl: &str, detail: &str) {
     if !common.json {
         eprintln!("{}", format_vendor_failure(purl, detail));
@@ -665,20 +652,14 @@ pub async fn run(args: VendorArgs) -> i32 {
     // `--revert` derives everything from state.json + the vendor tree; it
     // must work after the manifest was deleted. Plain vendor needs the
     // manifest and exits clean without one (same contract as apply). This
-    // is a MANIFEST check, not a `.socket/` check: it also fires on
-    // hosted-only projects and on every `scan`/`get --mode vendored`
-    // project (those never write a manifest — the vendor ledger owns their
-    // entries and `repair` is what verifies them), where `.socket/` exists.
-    // Nothing is locked or written on this path.
+    // is a MANIFEST check, not a `.socket/` check: `scan`/`get --mode
+    // vendored` projects have `.socket/` but never a manifest. Nothing is
+    // locked or written on this path.
     if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
-        // Nothing to vendor, but a requested `--vex` still attests what the
-        // `.socket/vendor` ledgers and lockfiles already wire (e.g. a
-        // `scan`/`get --mode vendored` checkout, which has no manifest by
-        // design). Same contract as `apply --vex` with no manifest: nothing
-        // referenced anywhere keeps the calm exit 0; any other VEX failure
-        // flips the exit; a dry run skips generation. The host line prints
-        // first: the VEX run's own stderr warnings follow what the command
-        // did.
+        // A requested `--vex` still attests what the `.socket/vendor`
+        // ledgers and lockfiles already wire. Same contract as `apply --vex`
+        // with no manifest: nothing referenced anywhere keeps exit 0; any
+        // other VEX failure flips the exit; a dry run skips generation.
         if !args.common.json && !args.common.silent {
             // An unreadable ledger is not "no entries": say so (stderr)
             // instead of the calm nothing-to-vendor line.
@@ -752,16 +733,10 @@ pub async fn run(args: VendorArgs) -> i32 {
         return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
     }
 
-    // The API client and the vendoring-service config exist for the
-    // vendoring arm alone — `--revert` never talks to the API (no service
-    // downloads, no telemetry) — so they are built after the no-manifest
-    // no-op and only when this run vendors. Built BEFORE the lock, like
-    // apply/rollback: the client's org-resolve round-trip must not run
-    // while other commands wait on `apply.lock`. `vendor_source` was
-    // validated by clap, so the parse cannot fail; fall back to the `auto`
-    // default defensively. The client moves into the config and is reused
-    // for the package-reference request (no second auth round-trip); the
-    // telemetry ids ride alongside for the post-run report.
+    // The API client and vendoring-service config exist for the vendoring
+    // arm alone (`--revert` never talks to the API). Built BEFORE the lock,
+    // like apply/rollback: the client's org-resolve round-trip must not run
+    // while other commands wait on `apply.lock`.
     let vendor_service = if args.revert {
         None
     } else {
@@ -778,14 +753,9 @@ pub async fn run(args: VendorArgs) -> i32 {
     // Same lock as apply/rollback: vendor mutates the same lockfiles and
     // `.socket/` tree, so a separate lock would allow an apply↔vendor race.
     //
-    // `--revert` skipped the manifest check above, so it is the one path
-    // that can reach here with no `.socket/` dir at all — the documented
-    // clean no-op ("a missing ledger is an empty ledger"). `acquire` would
-    // create `.socket/` for its lock file and the guard's drop would prune
-    // it again, but a no-op revert must never be the thing that creates a
-    // `.socket/` dir, even transiently: with no `.socket/` there is no
-    // ledger to read and nothing to write, hence nothing to serialize
-    // against. Skip the lock.
+    // `--revert` with no `.socket/` dir is a clean no-op ("a missing ledger
+    // is an empty ledger") and must never create `.socket/`, even
+    // transiently for the lock file — so skip the lock.
     let lock = if args.revert && tokio::fs::metadata(&socket_dir).await.is_err() {
         None
     } else {
@@ -811,10 +781,7 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     // Embedded VEX: same contract as `apply --vex` — only on success, and a
     // requested-but-failed VEX flips the exit code. A dry run vendors
-    // nothing, so there is no vendored state to attest: generating here
-    // would verify the deliberately untouched tree, spuriously fail the
-    // whole command with `no_applicable_patches`, and write an attestation
-    // file during --dry-run. Skip instead.
+    // nothing, so there is nothing to attest: skip.
     if exit == 0 && !args.revert {
         if let Some(vex_path) = args.vex.vex.as_ref() {
             if args.common.dry_run {
@@ -857,18 +824,12 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     note_classic_migration_risk(&mut env, &args.common.cwd, &args.common);
     // Same cross-mode takeover advisory the scan-driven vendored flow emits:
-    // the standalone `vendor` command is the PRIMARY hosted→vendored
-    // migration entry point, so it must surface a redirect ledger that this
-    // run (or an earlier one) superseded — silence here left the stale
-    // ledger feeding VEX indefinitely.
+    // surface a redirect ledger that this run (or an earlier one) superseded.
     super::scan::note_vendor_supersedes_redirect(&mut env, &args.common.cwd, &args.common).await;
 
     // That advisory may persist the redirect ledger, so it ran under the
-    // lock; everything below is output and telemetry — nothing touches
-    // `.socket/` or the lockfiles — so release the lock first (the drop also
-    // unlinks `apply.lock` and prunes an emptied `.socket/`) rather than
-    // holding it across a network round-trip while competitors see
-    // `lock_held`.
+    // lock; everything below is output and telemetry, so release the lock
+    // before the telemetry round-trip.
     drop(lock);
 
     if args.common.json {
@@ -889,11 +850,6 @@ pub async fn run(args: VendorArgs) -> i32 {
     exit
 }
 
-/// The human no-op line for a plain `vendor` with no manifest. Names the
-/// MANIFEST (the thing actually missing), and — when the vendor ledger
-/// tracks entries, i.e. a `scan`/`get --mode vendored` project — says so
-/// instead of implying nothing is vendored: their refresh path is `scan
-/// --mode vendored`, and `repair` is what re-verifies the ledger.
 /// The no-manifest warning when the vendor ledger cannot be read either.
 fn no_manifest_ledger_unreadable(err: &str) -> String {
     format!(
@@ -902,6 +858,11 @@ fn no_manifest_ledger_unreadable(err: &str) -> String {
     )
 }
 
+/// The human no-op line for a plain `vendor` with no manifest. Names the
+/// MANIFEST (the thing actually missing), and — when the vendor ledger
+/// tracks entries, i.e. a `scan`/`get --mode vendored` project — says so
+/// instead of implying nothing is vendored: their refresh path is `scan
+/// --mode vendored`, and `repair` is what re-verifies the ledger.
 fn no_manifest_message(tracked_entries: usize) -> String {
     match tracked_entries {
         0 => "No manifest found, nothing to vendor.".to_string(),
@@ -916,7 +877,7 @@ fn no_manifest_message(tracked_entries: usize) -> String {
 }
 
 /// Telemetry for a vendor run's success/failure split, shared by
-/// [`run`] and the scan-driven vendor step (`scan --vendor`).
+/// [`run`] and the scan-driven vendor step (`scan --mode vendored`).
 pub(crate) async fn track_outcomes_for_vendor(
     has_errors: bool,
     env: &Envelope,
@@ -953,8 +914,7 @@ async fn run_vendor(
     // Reconcile first (mirrors apply's placement): entries vendored by a
     // previous run whose patches were dropped from the manifest are reverted
     // even when zero in-scope patches remain. Its post-reconcile ledger
-    // feeds the staging harvest below and then the engine (one load, not
-    // three).
+    // feeds the staging harvest below and then the engine.
     let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
@@ -1007,12 +967,9 @@ async fn run_vendor(
 
     if has_errors {
         // A run where EVERY event failed still reads as "partialFailure":
-        // the envelope has no "completed with zero successes" status, and
-        // status=error is reserved for pre-event failures (it implies a
-        // top-level error payload and empty events[] — see json_envelope.rs).
-        // Escalating here without an envelope-level API broke that contract,
-        // and scan --vendor / vendor --revert report the same outcome as
-        // partialFailure, so this stays aligned with them.
+        // status=error is reserved for pre-event failures (a top-level error
+        // payload and empty events[] — see json_envelope.rs), matching
+        // `scan --mode vendored` and `vendor --revert`.
         env.mark_partial_failure();
         1
     } else {
@@ -1039,7 +996,7 @@ pub(crate) async fn persist_vendor_entry(
     let (has_errors, stale) =
         record_vendor_entry(common, env, &mut shared, candidate, entry, detached, record).await;
     // A group commit keeps its own reference to the ledger it captured, so
-    // this copies — once per save, as the by-value save always did.
+    // this may copy once per save.
     *state = std::sync::Arc::try_unwrap(shared).unwrap_or_else(|held| (*held).clone());
     if let Some(stale) = stale {
         sweep_stale_artifact(common, env, state, stale).await;
@@ -1071,25 +1028,17 @@ async fn record_vendor_entry(
 ) -> (bool, Option<StaleArtifact>) {
     let candidate = candidate.to_string();
     entry.detached = detached;
-    // EVERY entry embeds its patch record, not only detached (vendored-mode)
-    // ones: the ledger is committed next to the artifacts, so a checkout of
-    // a project the manifest-driven standalone `vendor` wired, whose
-    // manifest is gone or was never committed, can still verify and attest
-    // the vendored patch offline — manifest-less `vex` reads it. `detached`
-    // stays the "no manifest owner" flag: for a non-detached entry the
-    // manifest record remains authoritative wherever both exist (repair,
-    // vex), and the embedded copy is the fallback.
+    // EVERY entry embeds its patch record, not only detached ones, so a
+    // checkout whose manifest is gone or was never committed can still
+    // verify and attest the vendored patch offline. For a non-detached
+    // entry the manifest record stays authoritative wherever both exist;
+    // the embedded copy is the fallback.
     entry.record = Some(record.clone());
-    // A re-vendor run re-derives the entry from current disk state, where
-    // the takeover / earlier wiring already happened. Reconcile the fresh
-    // entry with the one it replaces so `--revert` still knows how to undo
-    // every surface any earlier vendoring touched: carry forward the true
-    // pre-vendor originals (a re-vendor records `original: None` for its own
-    // stale `.socket/vendor/` pointer), the wiring records for surfaces this
-    // run left in sync (e.g. package.json + pnpm-lock.yaml when only the new
-    // pnpm-workspace.yaml override was added on a pnpm >= 11 upgrade), the
-    // pnpm created-surface bookkeeping, the cargo lock originals, and the
-    // takeover flag. See [`vendor::carry_forward_wiring`].
+    // A re-vendor re-derives the entry from disk state where the earlier
+    // wiring already happened, so carry forward the true pre-vendor
+    // originals and wiring records from the entry it replaces — `--revert`
+    // must still undo every surface any earlier vendoring touched. See
+    // [`vendor::carry_forward_wiring`].
     let prev = state.entries.get(&candidate).cloned();
     if let Some(prev) = &prev {
         vendor::carry_forward_wiring(prev, &mut entry);
@@ -1097,9 +1046,7 @@ async fn record_vendor_entry(
     let new_uuid = entry.uuid.clone();
     // Persist per-package so a crash mid-run leaves a ledger that matches
     // what's already wired (under a group commit this lands in the run's
-    // captured state, committed with the wiring it describes — the group
-    // holds this very ledger, so the insert is made in place rather than
-    // on a per-package copy of the whole ledger).
+    // captured state, committed with the wiring it describes).
     let key = candidate.clone();
     if let Err(e) = save_state_shared(&common.cwd, state, move |s| {
         s.entries.insert(key, entry);
@@ -1223,12 +1170,8 @@ pub(crate) async fn fetch_pristine_package(
 /// download: the lock's own entry when it carries an integrity, else the
 /// pre-vendor resolution the ledger recovers. A cargo crate from a git,
 /// path or custom-registry source has neither, so its fetch refuses
-/// `vendor_fetch_unverifiable` and the purl is not vendored; deferring that
-/// fetch behind the patch service would instead vendor the crates.io patch
-/// over it. A purl with neither is also one the ladder has no source for
-/// at all (`package_not_installed` when nothing is installed), which is
-/// why the early lock-text refusals ([`lock_refusals_reaching_backend`])
-/// stay off it.
+/// `vendor_fetch_unverifiable`; deferring that fetch behind the patch
+/// service would instead vendor the crates.io patch over it.
 pub(crate) async fn pristine_fetch_is_verifiable(
     project_root: &Path,
     inventory: &[lock_inventory::LockfileEntry],
@@ -1387,10 +1330,10 @@ impl MissingRung {
 /// the ledger (a vlt directory artifact against its file inventory) —
 /// offline-safe, no registry traffic — and `--offline` stops before the
 /// registry. Only at the record's own uuid: an older patch's artifact holds
-/// that patch's bytes, never a pristine source for a superseding one. Also returns the committed artifact's path when it
-/// is missing (the caller's `vendor_artifact_missing` warning; the purl
-/// then falls through to the registry ladder, which recovers the
-/// pre-vendor resolution from the ledger and rebuilds).
+/// that patch's bytes, never a pristine source for a superseding one. Also
+/// returns the committed artifact's path when it is missing (the caller's
+/// `vendor_artifact_missing` warning; the purl then falls through to the
+/// registry ladder).
 async fn missing_local_rung(
     common: &GlobalArgs,
     ledger_entry: Option<&VendorEntry>,
@@ -1443,10 +1386,7 @@ async fn missing_local_rung(
 /// which is what lets its download be deferred. Some in-sync checks look
 /// only for the artifact's presence (pypi's), so a file artifact that no
 /// longer hashes to its ledger pin is not covered: it keeps the eager
-/// ladder, and a run that cannot reach the registry says so as it always
-/// did. A copy DIR's integrity stays the backend's own question — a
-/// drifted one is rebuilt, and a rebuild that needs the pristine tree
-/// fetches it then.
+/// ladder. A copy DIR's integrity stays the backend's own question.
 async fn ledger_covers(cwd: &Path, entry: Option<&VendorEntry>, record: &PatchRecord) -> bool {
     match entry {
         Some(entry) if entry.uuid == record.uuid => entry.committed_artifact_intact(cwd).await,
@@ -1734,7 +1674,8 @@ pub(crate) async fn vendor_records(
     force: bool,
     env: &mut Envelope,
     // Vendoring-service config (`None` = build-only). Both the `vendor`
-    // command and `scan --vendor` pass `Some(_)`, honoring `--vendor-source`.
+    // command and `scan --mode vendored` pass `Some(_)`, honoring
+    // `--vendor-source`.
     service: Option<&VendorServiceConfig>,
     ledger: std::io::Result<VendorState>,
 ) -> bool {
@@ -1749,7 +1690,7 @@ pub(crate) async fn vendor_records(
 /// nothing has touched since (`scan`'s own crawl) — instead of walking
 /// `node_modules` again: its roots feed the targeted lookup and its
 /// packages the alias identity fallback. `None` (or a snapshot taken with
-/// other options) crawls as before.
+/// other options) crawls afresh.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor_records_reusing(
     common: &GlobalArgs,
@@ -1809,14 +1750,10 @@ pub(crate) async fn vendor_records_reusing(
         })
         .collect();
 
-    // The vendor ledger, loaded ONCE per run by the caller (under its lock,
-    // for its staging harvest) and handed over here: the artifact-staging
-    // path below, the Bun preflight and every per-package persist read or
-    // mutate this copy. An unreadable ledger is the hard error it is —
-    // failing here, before the crawler walk and any registry traffic, is
-    // what keeps a corrupt state.json from running the whole fetch ladder
-    // first (and pushing its warnings into the envelope) only to fail the
-    // run afterwards.
+    // The vendor ledger, loaded ONCE per run by the caller (under its lock)
+    // and handed over here; every read and per-package persist below uses
+    // this copy. An unreadable ledger fails here, before the crawler walk
+    // and any registry traffic.
     let mut state = match ledger {
         Ok(s) => std::sync::Arc::new(s),
         Err(e) => {
@@ -1837,14 +1774,10 @@ pub(crate) async fn vendor_records_reusing(
     // Resolve installed packages with the qualified-purl-aware resolver, never
     // a base-keyed one: the manifest keys release-variant ecosystems (gem
     // `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
-    // *qualified* purls, but the crawler only knows the *base* purl. A
-    // base-keyed result map would make the `missing`/`contains_key` check
-    // below miss every installed
-    // qualified-purl package and falsely classify it "not installed" —
-    // triggering a spurious `vendor_fetched_missing`, a redundant per-run
-    // registry download, and (for gem) a HashMap-order platform coin-flip.
-    // The rollback variant fans each base path back out to every qualified
-    // manifest purl (same invariant as `find_manifest_package_paths`).
+    // *qualified* purls, but the crawler only knows the *base* purl, so a
+    // base-keyed map would misclassify every installed qualified purl as
+    // "not installed". The rollback variant fans each base path back out to
+    // every qualified manifest purl.
     let mut all_packages: HashMap<String, StagedSource> = find_packages_for_rollback_reusing(
         &vendorable_partition,
         &crawler_options,
@@ -1913,13 +1846,11 @@ pub(crate) async fn vendor_records_reusing(
             let client = registry_fetch::build_registry_client();
             // Two passes over `missing`, so the registry fetches can run
             // concurrently while every event, warning and stderr line still
-            // lands in `missing` order, exactly as the one-purl-at-a-time
-            // loop emitted them. Pass 1 decides each purl's local rungs (the
-            // committed-artifact staging and the offline stop: local and
-            // read-only, so deciding them early changes nothing) without
-            // emitting anything; the purls left for the registry are then
-            // fetched at most `registry_concurrency` at a time, in order, and
-            // pass 2 emits every purl's outcome in turn.
+            // lands in `missing` order. Pass 1 decides each purl's local
+            // rungs (local and read-only) without emitting anything; the
+            // purls left for the registry are then fetched at most
+            // `registry_concurrency` at a time, in order, and pass 2 emits
+            // every purl's outcome in turn.
             let mut rungs: Vec<(Option<String>, MissingRung)> = {
                 let mut rungs = Vec::with_capacity(missing.len());
                 for purl in &missing {
@@ -1937,20 +1868,17 @@ pub(crate) async fn vendor_records_reusing(
             // Downloads nothing may need, deferred to the backend branch
             // that reads the pristine tree (see `DeferredPackage`):
             //
-            //  * a purl the ledger already covers — its entry records this
-            //    record's patch uuid and the committed artifact is on disk —
-            //    is what the backend's in-sync hot path answers from those
-            //    committed bytes alone, so a re-run makes no registry request
-            //    (and succeeds with no network at all). `--force` may
+            //  * a purl the ledger already covers (see `ledger_covers`): the
+            //    backend's in-sync hot path answers it from the committed
+            //    bytes alone, so a re-run needs no network. `--force` may
             //    rebuild anyway, so it keeps the eager fetch.
             //  * a cargo crate the patch service can serve: the backend reads
-            //    the pristine tree only once `cargo_service_copy` falls back
-            //    to the local build. Only a crate the registry ladder COULD
-            //    fetch (see `pristine_fetch_is_verifiable`) — a git, path or
+            //    the pristine tree only if it falls back to the local build.
+            //    Only a crate the registry ladder COULD fetch (see
+            //    `pristine_fetch_is_verifiable`) — a git, path or
             //    custom-registry crate keeps the eager rung, whose
-            //    `vendor_fetch_unverifiable` refusal is what keeps a
-            //    crates.io patch off a crate that does not come from
-            //    crates.io.
+            //    `vendor_fetch_unverifiable` refusal keeps a crates.io patch
+            //    off it.
             //
             // A backend that does reach its pristine tree fetches it then,
             // through the same ladder, and the loop reports the fetch as the
@@ -2045,32 +1973,19 @@ pub(crate) async fn vendor_records_reusing(
                 }
             }
             // A NOT-INSTALLED gem can only be vendored through the patch
-            // service. The bundler path source the gem backend wires needs
-            // the eval-able stub gemspec rubygems writes into
-            // `<gem home>/specifications/` at INSTALL time; a fetched `.gem`
-            // carries its gemspec only as YAML in `metadata.gz`, which is
-            // exactly why the service serves a converted `gem-stub-gemspec`
-            // second artifact. With the service off (`--vendor-source build`,
-            // or no config at all) the fetched copy is unusable, so the
-            // backend refused `gem_spec_missing` — AFTER paying for the
-            // download, on every run. Refuse before the download instead,
-            // with the same code and a detail that names the real remedy.
-            // The backend keeps its own refusal as the backstop for every
-            // other route into it.
+            // service: the bundler path source needs the eval-able stub
+            // gemspec rubygems writes at INSTALL time, which a fetched `.gem`
+            // lacks (the service serves a converted `gem-stub-gemspec`).
+            // With the service off, refuse `gem_spec_missing` before the
+            // download rather than after it; the backend keeps its own
+            // refusal as the backstop.
             //
             // Scoped to the purls a DOWNLOAD would actually happen for,
-            // mirroring `fetch_pristine_package`'s own `fetchable` filter: a
-            // gem the lock cannot VERIFY (no `CHECKSUMS` section) is never
-            // fetched and keeps its `vendor_fetch_unverifiable` warning plus
-            // the calm `package_not_installed` skip; a gem the ledger already
-            // holds is the already-vendored fresh-clone case the backend's
-            // hot path confirms without a stub gemspec; a gem that resolves
-            // from nowhere keeps the calm skip. Refusing first also means a
-            // refusal the backend would have reached earlier on the fetched
-            // copy (an uneditable Gemfile declaration, say) now reports as
-            // `gem_spec_missing` instead; either way the package fails.
-            // A dry run never refused: the backend's verify-only preview
-            // runs on the fetched copy, so it keeps the eager fetch.
+            // mirroring `fetch_pristine_package`'s `fetchable` filter: a gem
+            // the lock cannot VERIFY, one the ledger already holds, or one
+            // that resolves from nowhere keeps its existing outcome. A dry
+            // run keeps the eager fetch: its verify-only preview runs on the
+            // fetched copy.
             if !service_enabled
                 && !common.dry_run
                 && missing
@@ -2092,8 +2007,7 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 }
             }
-            // Parsed only when some purl reaches the registry rung (the
-            // serial loop's lazy first use).
+            // Parsed only when some purl reaches the registry rung.
             let inv: &[lock_inventory::LockfileEntry] =
                 if rungs.iter().any(|(_, r)| r.needs_registry()) {
                     inventory
@@ -2247,24 +2161,12 @@ pub(crate) async fn vendor_records_reusing(
     let vendored_at = now_rfc3339();
 
     // Bun vendored preflight (see `crate::commands::bun_preflight`), run
-    // ONCE per run over the in-scope npm records and consulted per
-    // candidate in the dispatch loop BEFORE the hosted→vendored takeover.
-    // The bun engine refuses a pre-v2 text `workspace:` lock (and a malformed /
-    // unreadable / unsupported-version project) before its own writes —
-    // but the takeover below reverts a hosted purl's lockfile edits and
-    // persists the redirect-ledger drop FIRST, so without this gate a
-    // `vendor` over a hosted-wired v1 workspace lock stripped the live
-    // hosted redirect, then failed `vendor_bun_workspace_unsupported`:
-    // unpatched in both modes, with the refusal telling the user to use
-    // the hosted mode it had just destroyed. `scan`/`get --mode vendored`
-    // already run this preflight at download time; here it is the ONLY
-    // gate the plain `vendor` command has, and its dry-run arm previews the
-    // same refusal instead of the takeover advisory. A purl the vendor
-    // ledger wires at the record's uuid, or whose lock instances are all
-    // already ours, is exempt (the engine handles in-sync re-runs and
-    // superseding-uuid re-vendors itself) — the ledger loaded above is the
-    // one it consults. Pairs are the in-scope vendorable records, so an
-    // `--ecosystems` filter that excludes npm never reads the lock.
+    // ONCE per run over the in-scope records and consulted per candidate
+    // BEFORE the hosted→vendored takeover: the takeover reverts a hosted
+    // purl's lockfile edits first, so a bun refusal the engine would raise
+    // afterwards (pre-v2 text `workspace:` lock, unsupported project) must
+    // be raised before it, or the purl ends up unpatched in both modes.
+    // A purl the ledger wires at the record's uuid is exempt.
     let bun_pairs: Vec<(&str, &str)> = vendorable
         .iter()
         .filter_map(|p| records.get(p).map(|r| (p.as_str(), r.uuid.as_str())))
@@ -2294,14 +2196,11 @@ pub(crate) async fn vendor_records_reusing(
     let mut handled_bases: HashSet<String> = HashSet::new();
 
     // The hosted redirect ledger, for cross-mode takeovers: vendoring a purl
-    // it still claims must revert the hosted edits FIRST (see the hook in the
-    // dispatch loop below). Loaded once; mutated + persisted per reverted
-    // purl. A MALFORMED ledger is held as the hard error it is: this loop
-    // WRITES the ledger for takeovers, and with its records unreadable a
-    // claimed purl is indistinguishable from an unclaimed one — so every
-    // purl of a takeover-capable ecosystem (cargo, npm) fails closed with
-    // the corruption surfaced (other purls never touch the redirect ledger
-    // here and proceed).
+    // it still claims must revert the hosted edits FIRST (see the dispatch
+    // loop below). Loaded once; mutated + persisted per reverted purl. With
+    // a MALFORMED ledger a claimed purl is indistinguishable from an
+    // unclaimed one, so every takeover-capable purl fails closed; other
+    // purls proceed.
     let (mut redirect_ledger, redirect_ledger_corrupt) =
         match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
             Ok(state) => (state, None),
@@ -2313,14 +2212,13 @@ pub(crate) async fn vendor_records_reusing(
     // backend's project-level refusals (mixed line endings in yarn.lock or
     // package.json, cacheKey, `.yarnrc.yml` compressionLevel), computed at
     // most once per run and only when a hosted-claimed npm purl reaches the
-    // takeover below — which must refuse such a purl BEFORE reverting its
-    // hosted edits: a hosted revert keeps a mixed lock mixed, so the backend
-    // then refused it with the redirect already gone.
+    // takeover below, which must refuse such a purl BEFORE reverting its
+    // hosted edits.
     let berry_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
         tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
     // The vlt store entries each hosted→vendored takeover unpinned, healed
-    // once the purl is vendored (DESIGN §4.10).
+    // once the purl is vendored.
     let mut vlt_takeover_targets: HashMap<
         String,
         Vec<socket_patch_core::patch::redirect::vlt_heal::LedgerTarget>,
@@ -2328,8 +2226,6 @@ pub(crate) async fn vendor_records_reusing(
     let installed_sites = vendor::pypi::InstalledSiteListings::default();
     let mut dry_in_sync: u32 = 0;
     // Sorted, so per-package lines print in the same order every run.
-    // Purls are unique keys, so ordering on the purl alone is the order the
-    // `(purl, path)` sort produced.
     let mut all_packages: Vec<(String, StagedSource)> = all_packages.into_iter().collect();
     all_packages.sort_by(|a, b| a.0.cmp(&b.0));
     // Progress over the per-package engine calls (download, pack, lockfile
@@ -2338,20 +2234,12 @@ pub(crate) async fn vendor_records_reusing(
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
     // Service downloads, fetched ahead of this serial loop (the wiring and
-    // every write stay here, in order). The plan is EXACT — the records the
-    // loop will ask the service for, in loop order, across every ecosystem:
-    // past the variant probe, the Bun refusal and the takeover gate below,
-    // and past every refusal the backend raises before its first service
-    // call (evaluated here with the backend's own gates — npm's
-    // `preflight_packages`, the others' `service_preflight`), and not
-    // answered by a backend's in-sync hot path or a committed-artifact
-    // reuse (those never ask the service). A download grant can start a
-    // server-side build and counts against quota, so a package the loop
-    // refuses is never granted on its behalf. The plan stays advisory —
-    // the breaker and every outcome are still decided at the loop's own
-    // call (see `VendorPrefetch`). Asking `wants_prefetch` first keeps the
-    // walk off the runs that would drop the plan anyway (`--vendor-source
-    // build`, `--offline`, one request at a time).
+    // every write stay here, in order). The plan is EXACT — only the
+    // records the loop will ask the service for (see
+    // `plan_service_downloads`): a download grant can start a server-side
+    // build and counts against quota, so a package the loop refuses is
+    // never granted on its behalf. The plan stays advisory — every outcome
+    // is still decided at the loop's own call (see `VendorPrefetch`).
     let service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
         Some(cfg) => {
             let takeover_blocked = |purl: &str| {
@@ -2434,13 +2322,9 @@ pub(crate) async fn vendor_records_reusing(
             // Variant probe: only the installed distribution's variant is
             // vendored (mirrors apply / select_installed_variants). It hashes a
             // representative patch-target file against the installed package
-            // dir, so it only works when those files are EXTRACTED on disk
-            // (pypi wheels / gem gems). Maven is a release-variant ecosystem
-            // too, but its patch targets live INSIDE the un-extracted
-            // `<a>-<v>.jar` — the version dir holds only the jar/pom, so the
-            // probe would always read NotFound and drop the package. Maven
-            // vendor takes the single main jar regardless (no on-disk variant
-            // to select), so the probe is inapplicable and is skipped for it.
+            // dir, so it only works when those files are EXTRACTED on disk.
+            // Maven's patch targets live INSIDE the un-extracted jar and its
+            // vendor takes the single main jar regardless, so it is skipped.
             let probe_applicable = is_variant_eco
                 && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
             // A deferred source was deferred because the ledger covers the
@@ -2474,15 +2358,9 @@ pub(crate) async fn vendor_records_reusing(
                             break;
                         }
                         // Not a variant verdict: the tree could not be
-                        // WRITTEN at all — a full or unwritable `$TMPDIR`,
-                        // no file descriptors. The eager fetch hit that
-                        // while fetching and reported it; reading it as a
-                        // variant that does not match would file the purl
-                        // under `package_not_installed` ("no installed
-                        // package found on disk") and lose the cause.
-                        // One failure for the SOURCE, keyed on the purl the
-                        // fetch was issued for — the eager fetch raised it
-                        // once, before the variants were ever fanned out.
+                        // WRITTEN at all (full `$TMPDIR`, no fds). Report one
+                        // failure for the SOURCE purl rather than filing it
+                        // under `package_not_installed` and losing the cause.
                         Err(detail) => {
                             env.record(
                                 PatchEvent::new(PatchAction::Failed, purl.clone())
@@ -2502,13 +2380,9 @@ pub(crate) async fn vendor_records_reusing(
             }
             matched.insert(candidate.clone());
 
-            // The Bun preflight verdict (computed once above): the engine
-            // would refuse this project for this purl, so refuse HERE — the
-            // same `failed` event, code and detail the engine would have
-            // produced, in the dry run and the wet run alike — before the
-            // takeover block below can revert a live hosted redirect on its
-            // behalf. Hosted wiring, redirect ledger and lockfile stay
-            // byte-untouched for a refused purl.
+            // The Bun/vlt preflight verdicts (computed once above): refuse
+            // HERE, with the engine's own code and detail, before the
+            // takeover block below can revert a live hosted redirect.
             if let Some(refusal) = bun_refusal.as_ref().filter(|r| r.applies_to(candidate)) {
                 has_errors = true;
                 env.record(
@@ -2531,23 +2405,14 @@ pub(crate) async fn vendor_records_reusing(
             // Cross-mode takeover: vendoring over a LIVE hosted redirect
             // must first revert the hosted edits from the redirect ledger.
             // Cargo: `[patch.crates-io]` only patches crates-io-sourced
-            // deps, so vendoring on top of the `registry = "socket-patch-…"`
-            // pin leaves the project unbuildable in BOTH modes while this
-            // run reports success. npm family: the vendor rewire happens to
-            // succeed either way, but without the pre-revert the vendor
-            // ledger records the grant-tokenized HOSTED lock fragment as its
-            // unrecoverable pre-vendor original (so `vendor --revert` lands
-            // back on an expiring hosted URL with no CLI path to registry
-            // state) and the superseded redirect records/edits survive
-            // forever as a stale-ledger replay hazard. In every ecosystem
-            // the pre-revert hands the vendor detach the PRISTINE registry
-            // lock fragment to record as the ledger's originals. A purl
-            // whose hosted edits cannot be cleanly reverted is REFUSED; the
-            // cargo backend's own fail-closed guard (`hosted_redirect_live`)
-            // backstops states with no usable ledger at all. A purl whose
-            // bun project the vendor engine would refuse outright never
-            // reaches this block (the Bun preflight `continue`d above), so
-            // a refusal can no longer land AFTER the revert was persisted.
+            // deps, so vendoring on top of the hosted registry pin leaves the
+            // project unbuildable. npm family: without the pre-revert the
+            // vendor ledger records the grant-tokenized HOSTED lock fragment
+            // as its pre-vendor original. In every ecosystem the pre-revert
+            // hands the vendor detach the PRISTINE registry fragment to
+            // record. A purl whose hosted edits cannot be cleanly reverted is
+            // REFUSED; the cargo backend's `hosted_redirect_live` guard
+            // backstops states with no usable ledger.
             if socket_patch_core::patch::redirect::redirect_revert_supported(candidate) {
                 if let Some(corrupt) = &redirect_ledger_corrupt {
                     has_errors = true;
@@ -2589,13 +2454,9 @@ pub(crate) async fn vendor_records_reusing(
                     }
                 }
                 if claimed && common.dry_run {
-                    // Probe the takeover exactly as the wet run would — the
-                    // per-purl revert's dry run resolves every inverse and
-                    // drift check, flushes nothing, and mutates only this
-                    // throwaway clone — so the preview never promises a
-                    // takeover the wet run then refuses (a drifted lock, a
-                    // corrupt edit): those surface here with the SAME
-                    // `redirect_revert_failed` code and detail.
+                    // Probe the takeover exactly as the wet run would (a dry
+                    // revert on a throwaway clone), so the preview never
+                    // promises a takeover the wet run then refuses.
                     let mut probe = redirect_ledger.clone().expect("claimed implies Some");
                     match socket_patch_core::patch::redirect::revert_redirect_purl(
                         &common.cwd,
@@ -2621,22 +2482,12 @@ pub(crate) async fn vendor_records_reusing(
                                 common,
                             );
                             // The backend preview below reads the lock from
-                            // disk, where the hosted wiring is still live. A
-                            // flavor whose hosted rewrite keeps the entry's
-                            // `name@version` identity (yarn, pnpm, package-lock)
-                            // previews fine over it; bun's hosted rewrite
-                            // REPLACES that spec, so the backend would refuse a
-                            // `vendor_lock_entry_not_found` the wet run never
-                            // sees. When the revert would rewrite a lock this
-                            // backend reads, the advisory already states the
-                            // whole plan (revert, then vendor) and the preview
-                            // stops here — the hosted dry run makes the same
-                            // choice after `redirect_would_revert_vendored`.
-                            // The project-level refusals the engine WOULD
-                            // raise after the revert (workspace gate, lock
-                            // version) were already previewed by the Bun
-                            // preflight above, so stopping here promises
-                            // nothing the wet run then refuses.
+                            // disk, where the hosted wiring is still live.
+                            // Bun's hosted rewrite REPLACES the entry's
+                            // `name@version` spec, so the backend would refuse
+                            // a `vendor_lock_entry_not_found` the wet run never
+                            // sees: the advisory already states the plan, so
+                            // the preview stops here.
                             if revert
                                 .reverted_files
                                 .iter()
@@ -2961,7 +2812,7 @@ pub(crate) async fn vendor_records_reusing(
             }
             // The reverted hosted pin is gone either way: a vendored purl
             // is healed against its new wiring, a failed one against the
-            // restored registry pin (DESIGN §4.10 step 4).
+            // restored registry pin.
             if let Some(targets) = vlt_takeover_targets.remove(candidate) {
                 let detail = if vendored {
                     crate::commands::scan::vlt_takeover_heal(common, &targets).await
@@ -3184,7 +3035,7 @@ pub(crate) async fn vendor_records_reusing(
     has_errors
 }
 
-/// The committable-files hint of a vlt-wired run (DESIGN §4.9).
+/// The committable-files hint of a vlt-wired run.
 const VLT_COMMIT_HINT: &str = "Commit package.json (and workspace package.json files), \
      vlt-lock.json and .socket/vendor/ (the .gitignore there re-includes the payload and keeps \
      vlt's node_modules links out of git); CI: `vlt ci`.";
@@ -3192,9 +3043,9 @@ const VLT_COMMIT_HINT: &str = "Commit package.json (and workspace package.json f
 /// The install command that re-materializes the project tree from the wired
 /// lockfile, per npm-family flavor. Vendoring edits ONLY the lockfile/config
 /// wiring — the already-installed node_modules keeps its pre-vendor bytes
-/// until the package manager reinstalls from the rewired lock (verified
-/// against real pnpm installs) — so a successful vendor must say how to
-/// update it. `None` for flavors whose consuming step is not an install.
+/// until the package manager reinstalls from the rewired lock — so a
+/// successful vendor must say how to update it. `None` for flavors whose
+/// consuming step is not an install.
 fn flavor_install_command(flavor: &str) -> Option<&'static str> {
     match flavor {
         "package-lock" => Some("npm install"),
@@ -3263,8 +3114,8 @@ fn drop_vendored_installs_by<V>(
 /// deleting its artifact) as a cross-ecosystem side effect. Detached
 /// entries — every `scan`/`get --mode vendored` entry — are never
 /// manifest-tracked, so "absent from the manifest" is their normal state,
-/// not a drop — only `vendor --revert`, `remove`, or the lockfile-driven
-/// half of [`run_vendor_gc`] may undo them.
+/// not a drop — only `vendor --revert`, `remove`, `rollback` (its vendored
+/// leg), or the lockfile-driven half of [`run_vendor_gc`] may undo them.
 fn manifest_dropped_purls(
     state: &VendorState,
     manifest: &PatchManifest,
@@ -3306,10 +3157,10 @@ pub(crate) async fn reconcile_dropped(
         }
         if outcome.success {
             if outcome.kept_artifact {
-                // Drift-skip keep (residual #131): the backend left the
-                // drifted lock alone and kept the artifacts, so the ledger
-                // entry must survive too — and the genuine outcome is a
-                // COUNTED skip, not a removal.
+                // Drift-skip keep: the backend left the drifted lock alone
+                // and kept the artifacts, so the ledger entry must survive
+                // too — and the genuine outcome is a COUNTED skip, not a
+                // removal.
                 env.record(
                     PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                         "vendor_revert_kept",
@@ -3329,10 +3180,8 @@ pub(crate) async fn reconcile_dropped(
             if !common.dry_run {
                 state.entries.remove(&purl);
                 // Per-purl save, exactly like `--revert`: crash-consistent
-                // with the wiring just restored, no write at all on the
-                // (normal) run that reverted nothing, and a failed write is
-                // the failure it is — the reverted purl would otherwise
-                // linger in the ledger with exit 0 and no event.
+                // with the wiring just restored, and a failed write fails
+                // the purl rather than leaving it in the ledger silently.
                 if let Err(e) = save_state(&common.cwd, &state).await {
                     had_error = true;
                     env.record(
@@ -3400,12 +3249,11 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                         .with_error("revert_failed", why),
                 );
             }
-            // Drift-skip keep (residual #131): the backend left the
-            // drifted lock alone and kept the artifacts, so the ledger
-            // entry must survive too — and the genuine outcome is a
-            // COUNTED skip, not a removal. (`record_warning` above
-            // already surfaced the per-record details as uncounted
-            // advisory events.)
+            // Drift-skip keep: the backend left the drifted lock alone and
+            // kept the artifacts, so the ledger entry must survive too — and
+            // the genuine outcome is a COUNTED skip, not a removal.
+            // (`record_warning` above already surfaced the per-record
+            // details as uncounted advisory events.)
             VendorRevertStep::Kept => env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_revert_kept",
@@ -3546,11 +3394,9 @@ pub(crate) struct VendorGcSummary {
 /// A drift-skipped revert ([`RevertOutcome::kept_artifact`]) keeps the
 /// ledger entry — and, in (b), the purl's manifest records — exactly like
 /// every other `dispatch_revert_one` caller; the kept purl is reported in
-/// [`VendorGcSummary::kept`] so `scan --prune` can explain the entry it
-/// did not reclaim instead of silently no-oping on what its own preview
-/// listed as revertable. Wet-only: a dry [`dispatch_revert_one`] returns
-/// before the wiring replay that detects drift, so the dry lists still
-/// carry such an entry as revertable.
+/// [`VendorGcSummary::kept`] so `scan --prune` can explain it. Wet-only: a
+/// dry [`dispatch_revert_one`] returns before the wiring replay that
+/// detects drift.
 ///
 /// Detached entries — every `scan`/`get --mode vendored` entry — are exempt
 /// from (a) alone: they are never manifest-tracked, so "absent from the
@@ -3561,15 +3407,12 @@ pub(crate) struct VendorGcSummary {
 /// manifest skips (a) only (a prune must not mass-revert on a deleted
 /// manifest — that is `vendor --revert`'s explicit contract).
 ///
-/// Lock-free: the caller holds the apply lock for a wet pass (`scan
-/// --prune`'s `run_apply_gc` takes ONE lock for the vendored half and the
-/// manifest prune — flock is per open file description, so a nested acquire
-/// here would read as a live holder and silently skip every revert); a dry
-/// run needs none (read-only, list-only). Re-reads the ledger itself — under
-/// the caller's lock it is the authoritative copy. The ledger and manifest
-/// are rewritten only when a pass removed something; a failed rewrite is
-/// recorded in [`VendorGcSummary::write_failures`] (the reverts themselves
-/// already happened on disk).
+/// Lock-free: the caller holds the apply lock for a wet pass (flock is per
+/// open file description, so a nested acquire here would read as a live
+/// holder and skip every revert); a dry run needs none. Re-reads the ledger
+/// itself — under the caller's lock it is the authoritative copy. The
+/// ledger and manifest are rewritten only when a pass removed something; a
+/// failed rewrite is recorded in [`VendorGcSummary::write_failures`].
 pub(crate) async fn run_vendor_gc(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -3584,10 +3427,8 @@ pub(crate) async fn run_vendor_gc(
     };
 
     // (a) manifest-dropped entries. Everything (a) touches is excluded from
-    // (b): in a dry run the ledger keeps the entry, and after a wet revert
-    // failure it does too — either way (b) would list/fail the same purl a
-    // second time, which the wet success path (entry removed before (b)'s
-    // candidate scan) never does.
+    // (b), which would otherwise list/fail the same purl a second time on a
+    // dry run or after a wet revert failure.
     let mut handled_by_a: HashSet<String> = HashSet::new();
     // Set at the two `state.entries.remove` sites: the ledger is rewritten
     // only when a pass reclaimed something (the common `scan --prune` with
@@ -3606,12 +3447,9 @@ pub(crate) async fn run_vendor_gc(
             if !outcome.success {
                 out.failed.push(purl);
             } else if outcome.kept_artifact {
-                // Drift-skip keep (residual #131): the backend left the
-                // drifted lock alone and kept the artifacts, so the ledger
-                // entry must survive too (the RevertOutcome contract every
-                // other caller honors) — which also shields the uuid dir
-                // from the (c) orphan sweep. Nothing was reclaimed, so the
-                // purl is reported as kept, never as reverted.
+                // Drift-skip keep: the ledger entry must survive too (which
+                // also shields the uuid dir from the (c) orphan sweep), and
+                // the purl is reported as kept, never as reverted.
                 out.kept.push(purl);
             } else {
                 state.entries.remove(&purl);
@@ -3647,10 +3485,10 @@ pub(crate) async fn run_vendor_gc(
             continue;
         }
         if outcome.kept_artifact {
-            // Drift-skip keep (residual #131), same gate as (a) — and the
-            // purl's manifest records must survive too: pruning them would
-            // make the next `vendor` reconcile re-revert an entry whose
-            // backing record is gone (the `remove` caller's rationale).
+            // Drift-skip keep, same gate as (a) — and the purl's manifest
+            // records must survive too: pruning them would make the next
+            // `vendor` reconcile re-revert an entry whose backing record is
+            // gone.
             out.kept.push(purl);
             continue;
         }
@@ -3675,8 +3513,7 @@ pub(crate) async fn run_vendor_gc(
     if !dry_run {
         // The reverts above already restored the wiring and removed the
         // artifacts; a failed ledger/manifest rewrite leaves records for
-        // state that is gone, which must not pass silently (the sibling
-        // callers all report `vendor_state_write_failed`).
+        // state that is gone, which must not pass silently.
         if ledger_dirty {
             if let Err(e) = save_state(&common.cwd, &state).await {
                 let detail = format!(
@@ -3728,9 +3565,7 @@ mod dispatch_tests {
     /// Fail-closed `--vendor-source=service` must not refuse maven at the
     /// dispatch gate: the maven backend has a full service path (prebuilt
     /// jar download + registry pom), and its own errors advise exactly
-    /// that flag. Regression: PR #117 shipped the backend and added nuget
-    /// to `SERVICE_ECOSYSTEMS` but left maven off the list, so the gate
-    /// dead-ended the flag the backend recommends.
+    /// that flag.
     #[tokio::test]
     async fn service_mode_gate_admits_maven() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3892,10 +3727,7 @@ mod warning_counting_tests {
     /// A vendor advisory (e.g. a SUCCESSFUL `vendor_prebuilt_downloaded`
     /// service fetch) must NOT inflate `summary.skipped`: that counter counts
     /// packages that were genuinely skipped, not the number of advisory
-    /// events. Regression: every warning was routed through
-    /// `Envelope::record` as a `Skipped` event, so a single service vendor
-    /// reported `applied:1 skipped:1` and a 1-package project could print
-    /// "2 skipped". The advisory must still remain visible in `events[]`.
+    /// events. The advisory must still remain visible in `events[]`.
     #[test]
     fn advisory_warning_does_not_bump_skipped_summary() {
         let common = quiet_common();
@@ -3933,8 +3765,7 @@ mod warning_counting_tests {
     }
 
     /// Two advisories on a single 1-package vendor must still leave
-    /// `summary.skipped` at zero — directly reproduces the "2 skipped" report
-    /// the sweep observed for a one-package project.
+    /// `summary.skipped` at zero.
     #[test]
     fn multiple_advisories_do_not_accumulate_skips() {
         let common = quiet_common();
@@ -3962,8 +3793,7 @@ mod warning_counting_tests {
 
     /// A genuinely-skipped PACKAGE (recorded via `Envelope::record`, e.g.
     /// `already_vendored` or `package_not_installed`) must still bump
-    /// `summary.skipped` — the fix narrows the counter to real skips, it does
-    /// not zero it out.
+    /// `summary.skipped`.
     #[test]
     fn genuine_package_skip_still_counts() {
         let mut env = Envelope::new(Command::Vendor);
@@ -4022,12 +3852,10 @@ mod variant_probe_tests {
     /// Fixture: an installed wheel of `foo@1.0.0` (its `foo/__init__.py`
     /// matches the wheel variant's `beforeHash`) plus a manifest sdist
     /// variant that is NOT installed — it patches `setup.py` (absent from
-    /// the wheel install → `NotFound`) and adds one new file. With the
-    /// representative taken from `HashMap::iter().next()` the sdist's new
-    /// file comes up first roughly half the time, `Ready` admits the
-    /// not-installed variant, and `vendor` attempts to vendor it — the
-    /// same nondeterminism that was fixed in core's
-    /// `select_installed_variants` and in `apply`'s variant loop.
+    /// the wheel install → `NotFound`) and adds one new file. A
+    /// representative taken from `HashMap::iter().next()` would pick the
+    /// sdist's new file roughly half the time and admit the not-installed
+    /// variant.
     #[tokio::test]
     async fn variant_probe_never_picks_a_new_file_as_representative() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4436,9 +4264,7 @@ mod gc_tests {
     /// writes — is exempt from (a) alone (never manifest-tracked, so its
     /// absence from the manifest is not a drop) but NOT from (b): it is
     /// wired into the lock like any other entry, so once the dependency
-    /// leaves the lock graph the GC reclaims it. Pre-fix (b) skipped
-    /// detached entries as "lockfile-invisible", which made the unused GC
-    /// dead for every vendored-mode project.
+    /// leaves the lock graph the GC reclaims it.
     #[tokio::test]
     async fn vendor_gc_keeps_undeterminable_entries_and_reclaims_unused_detached() {
         // Lock removed entirely: probe says None → keep.
@@ -4528,10 +4354,9 @@ mod gc_tests {
     }
 
     /// A vendored CARGO entry displaced by a hosted takeover (its lock entry
-    /// re-sourced to a socket-patch sparse index) is reclaimable by the GC:
-    /// pre-fix, `dispatch_in_use_one` had no cargo probe (`None` = keep), so
-    /// the stale ledger entry, the committed tree, and the build-breaking
-    /// `[patch.crates-io]` entry survived every `scan --prune` forever.
+    /// re-sourced to a socket-patch sparse index) is reclaimable by the GC
+    /// through `dispatch_in_use_one`'s cargo probe, which drops the
+    /// build-breaking `[patch.crates-io]` entry.
     #[tokio::test]
     async fn vendor_gc_reclaims_cargo_entry_displaced_by_hosted_takeover() {
         const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
@@ -4687,14 +4512,12 @@ mod gc_tests {
         })
     }
 
-    /// (a) + drift-keep (residual #131): the patch left the manifest, but
+    /// (a) + drift-keep: the patch left the manifest, but
     /// the lock entry drifted since vendoring, so the revert leaves the
     /// lock alone and returns success with `kept_artifact`. Per the
     /// [`RevertOutcome::kept_artifact`] contract the GC must keep the
     /// ledger entry — which also shields the uuid dir from the (c) orphan
-    /// sweep — and must NOT report the purl as cleanly reverted. Pre-fix
-    /// it pruned the entry, counted it `dropped_reverted`, and the sweep
-    /// then destroyed the kept artifacts.
+    /// sweep — and must NOT report the purl as cleanly reverted.
     #[tokio::test]
     async fn vendor_gc_keeps_drift_skipped_manifest_dropped_entry() {
         let (tmp, common, manifest_path) = wired_gc_fixture(fork_fragment()).await;
@@ -4746,8 +4569,7 @@ mod gc_tests {
     /// artifact — because the lock entry drifted to a third-party fork.
     /// Same keep contract as (a), plus the purl's manifest records must
     /// survive (pruning them would make the next `vendor` reconcile
-    /// re-revert an entry whose backing record is gone — the `remove`
-    /// caller's rationale).
+    /// re-revert an entry whose backing record is gone).
     #[tokio::test]
     async fn vendor_gc_keeps_drift_skipped_unused_entry_and_manifest_record() {
         let (tmp, common, manifest_path) = wired_gc_fixture(fork_fragment()).await;
@@ -4837,10 +4659,10 @@ mod gc_tests {
 
     /// The orphan sweep keeps every un-ledgered dir a project file still
     /// points at. A vendored requirements pin may live ONLY in a `-r`
-    /// include (the planner writes it where the original pin was), and
-    /// the sweep used to consult the root requirements.txt alone — so
-    /// after a state.json loss it deleted the include-referenced wheel as
-    /// `vendor_orphan_removed` and bricked the next `pip install`.
+    /// include (the planner writes it where the original pin was), so the
+    /// sweep must follow includes, not just the root requirements.txt —
+    /// deleting the include-referenced wheel would brick the next
+    /// `pip install`.
     #[tokio::test]
     async fn orphan_sweep_keeps_include_referenced_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5108,11 +4930,6 @@ mod scope_and_hint_tests {
         assert_eq!(flavor_install_command(""), None);
     }
 
-    /// The no-manifest no-op names the MANIFEST (the thing missing) and,
-    /// on a ledger-tracked project (`scan`/`get --mode vendored` never
-    /// write a manifest), says what IS vendored instead of "nothing" —
-    /// the old "No .socket folder found" text was false on every such
-    /// project (`.socket/vendor/` exists).
     #[test]
     fn no_manifest_with_unreadable_ledger_warns() {
         assert_eq!(
@@ -5123,6 +4940,9 @@ mod scope_and_hint_tests {
         );
     }
 
+    /// The no-manifest no-op names the MANIFEST (the thing missing) and,
+    /// on a ledger-tracked project (`scan`/`get --mode vendored` never
+    /// write a manifest), says what IS vendored instead of "nothing".
     #[test]
     fn no_manifest_message_names_the_manifest_and_tracked_entries() {
         assert_eq!(

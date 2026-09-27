@@ -2,12 +2,11 @@
 //! `get::download_and_apply_patches_with` (driven through this file's
 //! `download_and_apply_patches` shim, which supplies the run's client).
 //!
-//! Regression guard: the manifest-update count used to be tallied from a
-//! pre-fetch scan of the manifest (`existing.uuid != search_result.uuid`),
-//! so a patch whose detail fetch subsequently FAILED was still reported as
-//! `updated`, and the misleading `[update] … (replacing …)` line printed
-//! for a replacement that never happened. The count must now reflect only
-//! patches whose record was actually replaced in the manifest.
+//! The manifest-update count must reflect only patches whose record was
+//! actually replaced in the manifest — not a pre-fetch scan of the manifest
+//! (`existing.uuid != search_result.uuid`), which would report a patch whose
+//! detail fetch FAILED as `updated` and print a misleading `[update] …
+//! (replacing …)` line for a replacement that never happened.
 
 use std::path::Path;
 

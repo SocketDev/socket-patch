@@ -1,18 +1,16 @@
 //! Real-yarn mode-migration e2e: hosted ⇄ vendored takeovers on the npm
 //! family must leave the project FULLY in the new mode — or refuse.
 //!
-//! Twin of `mode_migration_cargo.rs` (the file that pins the C1–C7 cargo
-//! takeover bug class from #196) for the yarn classic + berry lock flavors.
-//! Pre-fix, the vendor dispatch loop's cross-mode pre-revert was hard-gated
-//! `candidate.starts_with("pkg:cargo/")`, so vendoring an npm purl over a
-//! LIVE hosted redirect:
-//!   (a) recorded the HOSTED patch.socket.dev lock fragment as the vendor
+//! Twin of `mode_migration_cargo.rs` for the yarn classic + berry lock
+//! flavors. Vendoring an npm purl over a LIVE hosted redirect must run the
+//! cross-mode pre-revert, or it would:
+//!   (a) record the HOSTED patch.socket.dev lock fragment as the vendor
 //!       ledger's unrecoverable pre-vendor "original" (not the pristine
 //!       registry fragment),
-//!   (b) left the redirect ledger's records + edits in place forever, so the
+//!   (b) leave the redirect ledger's records + edits in place forever, so the
 //!       `vendor_supersedes_redirect` warning's promised auto-reconcile never
-//!       converged, and
-//!   (c) made `vendor --revert` land back on the (grant-tokenized, expiring)
+//!       converges, and
+//!   (c) make `vendor --revert` land back on the (grant-tokenized, expiring)
 //!       hosted wiring with no CLI path back to registry state.
 //!
 //! Each scenario drives the REAL binary against a real `corepack yarn`

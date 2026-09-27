@@ -185,9 +185,7 @@ pub enum SelectError {
 ///   `Ok(0)` would hand callers an out-of-bounds index.
 /// - stdin not a terminal: the first option, with
 ///   [`NON_INTERACTIVE_SELECT_FIRST`] unless `--silent` or the process is
-///   quiet ([`super::quiet`]; a caller that must never get
-///   `JsonModeNeedsExplicit`, like `scan`, passes its flags with `json`
-///   off, but a `--json` run still keeps the note off stderr).
+///   quiet ([`super::quiet`]).
 /// - Interactive: Esc/q/Ctrl-C cancel; the cursor is always restored.
 pub fn select_one(
     prompt: &str,
@@ -418,7 +416,7 @@ mod tests {
 
     #[test]
     fn eof_declines_even_when_default_is_yes() {
-        // Ctrl-D at "[Y/n]" used to mean yes and mutate the project.
+        // Ctrl-D at "[Y/n]" must not mean yes and mutate the project.
         let (answer, out) = run(b"", at_tty(true));
         assert!(!answer);
         assert_eq!(

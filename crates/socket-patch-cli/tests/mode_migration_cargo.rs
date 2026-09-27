@@ -5,14 +5,13 @@
 //! `.cargo/config.toml` registry block — so both directions edit Cargo.toml
 //! and each must leave none of the other mode's lines behind.
 //!
-//! Adapted from the audit probes that empirically proved findings C1–C7 (the
-//! cargo mode-takeover bug class): both directions used to exit 0 while
-//! leaving the project unbuildable under `--locked` (leftover
+//! Pins the cargo mode-takeover failure class: neither direction may exit 0
+//! while leaving the project unbuildable under `--locked` (a leftover
 //! `[patch.crates-io]` after a hosted takeover; a surviving
 //! `registry = "socket-patch-…"` Cargo.toml pin after a vendored takeover), a
-//! double takeover destroyed the unrecoverable crates.io lock originals in
-//! the vendored ledger, and the takeover classifier then emitted an INVERTED
-//! warning telling the user to delete the live ledger.
+//! double takeover must keep the unrecoverable crates.io lock originals in
+//! the vendored ledger, and the takeover classifier must never tell the user
+//! to delete the live ledger.
 //!
 //! Each scenario drives the REAL binary against real cargo (network used for
 //! the crates.io fixture build only; the hosted registry is wiremock) and

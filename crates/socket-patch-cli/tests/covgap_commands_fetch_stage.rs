@@ -3,9 +3,9 @@
 //!
 //!   - the non-quiet offline "no local source" report: the count header,
 //!     the 5-PURL cap, the "... and N more" continuation, and the
-//!     re-run-online hint (`report_offline_missing`);
-//!   - the non-quiet online staging progress: the download announcement
-//!     and the diff→per-file-blob fallback messages;
+//!     the `repair` remedy hint (`report_offline_missing`);
+//!   - the online staging result lines (progress is transient) and the
+//!     diff→per-file-blob fallback;
 //!   - the vendor mem-stager's per-file failure arms for malformed patch
 //!     view responses (missing `blobContent`, invalid `afterHash`,
 //!     undecodable base64) and the non-quiet "could not fetch patch
@@ -160,11 +160,11 @@ fn apply_offline_nonquiet_lists_capped_missing_purls_and_repair_hint() {
 
 /// A human-mode (no `--json`/`--silent`) online apply in the default
 /// `diff` download mode, where the server has no diff archive but serves
-/// the per-file blob: the run announces the primary download (with the
-/// mode tag), announces the per-file blob fallback in place of the
-/// unavailable diff archive (whose 404 is not reported: the blobs cover
-/// it), reports its success — and applies. `.socket/` stays
-/// untouched (downloads land in the overlay tempdir).
+/// the per-file blob: the download and fallback progress are transient
+/// status lines (nothing permanent on a non-terminal stderr), the diff
+/// archive's 404 is not reported (the blobs cover it), and only the
+/// "Downloaded 1 blob" result line persists before the apply. `.socket/`
+/// stays untouched (downloads land in the overlay tempdir).
 #[tokio::test]
 async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
     let before_hash = git_sha256(BEFORE);
@@ -223,7 +223,8 @@ async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
     )
     .unwrap();
 
-    // apply rejects --api-url/--api-token/--org flags — env is its channel.
+    // Point apply at the mock via env (SOCKET_API_URL/TOKEN/ORG_SLUG); the
+    // equivalent --api-url/--api-token/--org flags work too.
     let mock_uri = mock.uri();
     let (code, stdout, stderr) = run_cli_env(
         tmp.path(),

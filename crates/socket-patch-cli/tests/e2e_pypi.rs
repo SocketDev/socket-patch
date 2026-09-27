@@ -62,7 +62,7 @@ fn git_sha256_file(path: &Path) -> String {
 }
 
 /// The three legacy `SOCKET_PATCH_*` names still honored at runtime via
-/// `socket_patch_core::env_compat` — not in the clap-bound lists, so they
+/// `socket_patch_core::utils::env_compat` — not in the clap-bound lists, so they
 /// need scrubbing separately.
 const LEGACY_ENV_VARS: &[&str] = &[
     "SOCKET_PATCH_PROXY_URL",

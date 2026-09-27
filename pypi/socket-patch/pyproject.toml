@@ -25,8 +25,9 @@ classifiers = [
 # `pip install socket-patch[hook]` additionally installs the
 # package-manager-agnostic .pth startup hook that re-applies patches after
 # install. Unpinned so the hook updates independently of the CLI. `setup`
-# itself commits a bare `socket-patch-hook` dependency (the hook needs no
-# specific CLI version — it runs whatever `socket-patch` is on PATH).
+# commits `socket-patch[hook]` (this extra), which pulls in both the CLI and the
+# hook wheel. The hook runs the binary bundled in the installed `socket_patch`
+# package and falls back to PATH only when that package is absent.
 hook = ["socket-patch-hook"]
 
 [project.urls]

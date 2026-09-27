@@ -1,8 +1,8 @@
 //! Shared steps for manifest-less VEX end-to-end tests (hosted + vendored
 //! patches, one suite per package manager).
 //!
-//! A hosted (`scan --mode hosted`) or vendored (`scan --vendor`,
-//! `vendor --detached`, a depscan-opened PR) checkout has NO
+//! A hosted (`scan --mode hosted`) or vendored (`scan --mode vendored`,
+//! `get --mode vendored`, a depscan-opened PR) checkout has NO
 //! `.socket/manifest.json`: the patches live in the lockfiles/configs, the
 //! committed `.socket/vendor/` artifacts and (optionally) the two ledgers.
 //! These helpers take a project a real package manager produced, strip it

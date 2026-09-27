@@ -1,15 +1,13 @@
 //! Subprocess regression test: agent-mode `get <search-id> --json` must
 //! print exactly ONE JSON document when the download engine hits a HARD
 //! error (here: an unreadable manifest). The engine's fail-closed paths
-//! in `download_and_apply_patches` print the `{status: "error"}`
+//! in `download_and_apply_patches_with` print the `{status: "error"}`
 //! envelope themselves via `report_error` and return it; `run()`'s agent
-//! path then pretty-printed the SAME envelope again, putting two JSON
-//! documents on stdout — violating get's one-document `--json` contract
-//! (the vendored search path already guards this with its
-//! `result["status"] == "error"` early return).
+//! path must not pretty-print the SAME envelope again (get's `--json`
+//! contract is one document on stdout).
 //!
-//! Subprocess (not in-process) because the defect is precisely what the
-//! spawned binary PRINTS. Same harness recipe as `get_modes_e2e.rs`.
+//! Subprocess (not in-process) because the contract is what the spawned
+//! binary PRINTS. Same harness recipe as `get_modes_e2e.rs`.
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

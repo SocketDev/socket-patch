@@ -10,7 +10,7 @@
 # real `pnpm install` / `pnpm add` — is delegated unchanged to the real
 # pnpm.
 #
-# TEST FIXTURE only. Reference copy; run-case.sh embeds an identical copy.
+# TEST FIXTURE only. Reference copy; run-case.sh embeds an equivalent copy.
 set -uo pipefail
 
 sp_bin="${SOCKET_PATCH_BIN:-socket-patch}"

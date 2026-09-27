@@ -18,8 +18,7 @@ fn names(entries: &[LockfileEntry]) -> Vec<(String, String)> {
 }
 
 /// A script lock is scoped to its script: it must ADD to the project's
-/// requirements.txt / poetry.lock pins, not replace them (the base only
-/// ever let uv.lock short-circuit the fallbacks).
+/// requirements.txt / poetry.lock pins, not replace them.
 #[tokio::test]
 async fn script_lock_supplements_project_pins() {
     let tmp = tempfile::tempdir().unwrap();
@@ -60,9 +59,9 @@ async fn uv_lock_still_hides_requirements_pins() {
 }
 
 /// Without a uv.lock, poetry.lock is the project's tool lock: it hides
-/// requirements.txt (the base's poetry → requirements ordering) while a
-/// script lock still UNIONS with it — the standalone lock supplements
-/// whichever tool lock the project has, never just uv.lock.
+/// requirements.txt while a script lock still UNIONS with it — the
+/// standalone lock supplements whichever tool lock the project has, never
+/// just uv.lock.
 #[tokio::test]
 async fn poetry_lock_unions_with_script_lock_and_hides_requirements() {
     let tmp = tempfile::tempdir().unwrap();

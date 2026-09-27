@@ -28,10 +28,9 @@ pub struct RepairArgs {
     //
     // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
     // clap's default bool parser accepts only the literal strings
-    // `true`/`false` from the env binding, so `SOCKET_DOWNLOAD_ONLY=1` (or
-    // an exported-but-empty `SOCKET_DOWNLOAD_ONLY=`) aborted every `repair`
-    // invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
-    // `main`'s empty-var scrub never rescues it.
+    // `true`/`false` from the env binding, so `SOCKET_DOWNLOAD_ONLY=1` would
+    // abort every `repair` invocation. (`main`'s empty-var scrub covers an
+    // exported-but-empty value via `LOCAL_ARG_ENV_VARS`.)
     #[arg(
         long = "download-only",
         env = "SOCKET_DOWNLOAD_ONLY",
@@ -401,7 +400,7 @@ async fn repair_inner(
 
     // Step 1: Check for and download missing artifacts in the requested
     // mode. Counts below refer to whatever kind of artifact was requested
-    // (file blobs, diff archives, or package archives).
+    // (file blobs or diff archives).
     //
     // VENDORED-in-sync manifest entries are excluded: vendor flows keep
     // patch content in memory and the committed artifact IS the patch, so
@@ -785,9 +784,8 @@ mod tests {
 
     /// Regression for the offline + dry-run leak: with `--offline` set, the
     /// download phase is skipped entirely, so even in dry-run mode a missing
-    /// artifact must NOT produce a "would-download" (verified) event. Before
-    /// the fix the event was recorded unconditionally on `dry_run &&
-    /// missing > 0`, contradicting the human-readable path (which only warns).
+    /// artifact must NOT produce a "would-download" (verified) event,
+    /// matching the human-readable path (which only warns).
     #[tokio::test]
     async fn offline_dry_run_does_not_record_download_event() {
         let tmp = tempfile::tempdir().unwrap();

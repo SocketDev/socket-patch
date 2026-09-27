@@ -157,11 +157,12 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
         patterns: Vec::new(),
     };
 
-    // Check for pnpm workspaces first — pnpm projects may also have
-    // "workspaces" in package.json for compatibility, but pnpm-workspace.yaml
-    // is the definitive signal. It lives next to package.json and does not
-    // depend on package.json being present or even valid JSON, so it must be
-    // checked *before* parsing package.json — otherwise a malformed (e.g.
+    // Check vlt's workspace config (vlt.json / vlt-workspaces.json) and then
+    // pnpm-workspace.yaml first — pnpm projects may also have "workspaces" in
+    // package.json for compatibility, but these files are the definitive
+    // signal. They live next to package.json and do not depend on it being
+    // present or even valid JSON, so they must be checked *before* parsing
+    // package.json — otherwise a malformed (e.g.
     // JSONC, or simply broken) root manifest would wrongly demote a real pnpm
     // workspace to "no workspace".
     let dir = package_json_path.parent().unwrap_or(Path::new("."));
@@ -535,7 +536,7 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
     for entry in list_dir_entries(dir).await {
         let path = entry.path();
         // A single-level `dir/*` glob follows a symlinked direct member, the
-        // way npm/pnpm (and our cargo `glob_dir`) resolve a workspace member
+        // way npm/pnpm resolve a workspace member
         // that is itself a symlink. `entry.file_type()` reports the *link's*
         // own type — `is_dir() == false` — so it would silently drop such a
         // member; stat the path instead so the link is followed. (The
@@ -646,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_parse_pnpm_indented_key() {
-        // The parser uses `trimmed == "packages:"` so leading spaces should match
+        // The header is matched on the trimmed line, so leading spaces still match
         let yaml = "  packages:\n  - packages/*";
         assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
     }
@@ -731,7 +732,7 @@ mod tests {
     #[test]
     fn test_parse_pnpm_flow_sequence_on_line_after_header() {
         // The flow sequence may equally sit indented on its own line below the
-        // header (`packages:` then `  ['a']`). The next-section check used to
+        // header (`packages:` then `  ['a']`); the next-section check must not
         // break on the `[` line and drop every pattern.
         assert_eq!(
             parse_pnpm_workspace_patterns("packages:\n  ['packages/*', apps/*]"),
@@ -852,8 +853,7 @@ mod tests {
     #[tokio::test]
     async fn test_detect_workspaces_pnpm_with_malformed_package_json() {
         // Regression: pnpm-workspace.yaml is the definitive signal and must be
-        // honored even when the root package.json is not valid JSON. Previously
-        // the JSON parse error short-circuited before the pnpm check.
+        // honored even when the root package.json is not valid JSON.
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");
         // JSONC-style comment — valid for some tooling, invalid for serde_json.
@@ -1339,8 +1339,8 @@ mod tests {
     #[test]
     fn test_parse_pnpm_comment_only_list_item_skipped() {
         // A `- # comment` item is a YAML null (the value is just a comment) and
-        // must NOT become a literal `"# comment"` workspace pattern. Previously
-        // the inline-comment scan started at index 1, so a leading `#` survived.
+        // must NOT become a literal `"# comment"` workspace pattern (the
+        // inline-comment scan must consider index 0).
         let yaml = "packages:\n  - # only a comment\n  - real/*";
         assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["real/*"]);
     }
@@ -1494,11 +1494,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_find_star_glob_follows_symlinked_member() {
-        // Regression: a single-level `packages/*` glob must follow a workspace
-        // member that is itself a symlink (npm/pnpm and our cargo `glob_dir`
-        // both resolve such members). `entry.file_type()` reports the link as a
-        // non-directory, so the old gate silently dropped it and `setup` never
-        // patched the package.
+        // A single-level `packages/*` glob must follow a workspace member that
+        // is itself a symlink (npm/pnpm resolve such members).
+        // `entry.file_type()` reports the link as a non-directory, so gating on
+        // it would drop the member and `setup` would never patch the package.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -1671,10 +1670,9 @@ mod tests {
     async fn test_find_workspace_negation_excludes_member() {
         // npm (`@npmcli/map-workspaces`), yarn, and pnpm all support
         // `!`-prefixed exclusion patterns: a member matched by an earlier
-        // pattern and then negated is NOT a workspace member. Previously the
-        // `!pattern` was treated as a literal directory named `!packages`, so
-        // the exclusion was silently ignored and `setup` edited a package.json
-        // the user had explicitly excluded.
+        // pattern and then negated is NOT a workspace member. `!pattern` must
+        // not be treated as a literal directory named `!packages`, or `setup`
+        // edits a package.json the user explicitly excluded.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -1738,8 +1736,7 @@ mod tests {
         // Globstar matches zero segments: npm/pnpm resolve members by globbing
         // `apps/**/package.json`, which matches `apps/package.json` itself. A
         // package living at the pattern's prefix directory is a workspace
-        // member too, not just its descendants — previously it was silently
-        // skipped and never configured.
+        // member too, not just its descendants.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),

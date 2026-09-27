@@ -1030,11 +1030,10 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
 /// 1. The wired lock entry VANISHED (an uninstall is one drift flavor —
 ///    the live lock no longer matches anything the wiring recorded), so
 ///    the backend revert keeps the artifacts (`RevertOutcome::
-///    kept_artifact`, residual #131) and the GC must keep the ledger entry
-///    too — pre-fix it pruned the ledger, reported the purl in
-///    `revertedVendoredEntries`, and the orphan sweep then destroyed the
-///    kept artifacts (with the recorded pre-vendor originals, the state a
-///    later `git checkout` of the vendored lock still points at).
+///    kept_artifact`) and the GC must keep the ledger entry too — pruning
+///    it would let the orphan sweep destroy the kept artifacts (with the
+///    recorded pre-vendor originals, the state a later `git checkout` of
+///    the vendored lock still points at).
 /// 2. Undoing the drift (restoring the pre-vendor registry lock — the
 ///    keep warning's documented remediation) converges every recorded
 ///    fragment, and the same prune then reverts fully: ledger entry
@@ -1176,8 +1175,8 @@ async fn scan_prune_reverts_unused_vendored_entry() {
 }
 
 /// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:
-/// installed content matching NEITHER hash is annotated BEFORE the
-/// confirm prompt, and the run still vendors (auto-force) with the
+/// installed content matching NEITHER hash is annotated before vendoring
+/// starts, and the run still vendors (auto-force) with the
 /// `vendor_content_mismatch_overwritten` warning on stderr.
 #[tokio::test]
 async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
@@ -1558,8 +1557,8 @@ async fn scan_vendor_works_on_a_completely_fresh_clone() {
     assert_socket_dir_lean(tmp.path());
 }
 
-/// Read-only discovery flags lockfile-only packages in JSON and the human
-/// table.
+/// A bare (hosted-mode) scan flags lockfile-only packages in JSON and the
+/// human table.
 #[tokio::test]
 async fn scan_discovers_lockfile_only_packages_with_warning() {
     let mock = MockServer::start().await;
@@ -1888,9 +1887,8 @@ async fn scan_vendored_bun_v1_workspace_refuses_in_download_phase() {
     );
 }
 
-/// The `--detached` twin refuses BEFORE any fetch too (it used to fetch the
-/// view and only fail in the vendor step): same record, zero downloads,
-/// and — detached — no manifest at all.
+/// The `--detached` (no-op) twin refuses BEFORE any fetch too: same record,
+/// zero downloads, and no manifest at all.
 #[tokio::test]
 async fn scan_vendored_bun_detached_refuses_before_fetch() {
     let mock = MockServer::start().await;
@@ -2287,8 +2285,7 @@ mod exact_download_plan {
     /// A pnpm 9 project with three installed, patched packages. `pkg-b`'s
     /// snapshot key carries a peer suffix (`1.0.0(peer-x@1.0.0)`), which
     /// the pnpm backend refuses as `vendor_lock_entry_unsupported` before
-    /// staging anything — the shape behind two of the three speculative
-    /// grants the plan used to issue on depscan.
+    /// staging anything, so the plan must not issue it a speculative grant.
     fn write_pnpm_fixture(root: &Path) {
         std::fs::write(
             root.join("package.json"),

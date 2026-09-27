@@ -1058,8 +1058,7 @@ async fn unscoped_replays_unsupported_ecosystems() {
 // ---------------------------------------------------------------------------
 
 /// A hosted-only project (redirect ledger + wired lock, NO manifest) rolls
-/// back fine — a missing manifest is no longer fatal when a ledger holds
-/// work. A TRULY empty directory keeps the legacy "Manifest not found"
+/// back fine — a missing manifest is not fatal when a ledger holds work. A TRULY empty directory keeps the legacy "Manifest not found"
 /// exit-1 error.
 #[tokio::test]
 #[serial]

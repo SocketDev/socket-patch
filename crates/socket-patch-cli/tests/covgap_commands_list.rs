@@ -1,7 +1,8 @@
-//! Coverage-gap tests for `commands/list.rs` (audit of 2026-09, commit
-//! d5e1815): the `--debug` provenance echoes for config-sourced telemetry
-//! credentials (`telemetry_credentials`'s two `inspect` closures ran under
-//! the config-fallback tests, but never with `--debug`), and the
+//! Coverage-gap tests for `commands/list.rs`: the `--debug` provenance
+//! echoes for config-sourced telemetry credentials (the two `inspect`
+//! closures in core api/client.rs's credential resolution, reached via
+//! `GlobalArgs::telemetry_credentials` -> `resolve_ambient_credentials`),
+//! and the
 //! human-readable listing's sparse-record branches — a vulnerability with
 //! no CVE ids (GHSA-only advisories are a real production shape), and a
 //! record with zero vulnerabilities / zero files, whose section headers
@@ -27,7 +28,7 @@ mod vlt_hosted_common;
 mod vlt_vendored;
 
 // ---------------------------------------------------------------------------
-// `--debug` provenance echoes (list.rs telemetry_credentials, config layer)
+// `--debug` provenance echoes (GlobalArgs::telemetry_credentials, config layer)
 // ---------------------------------------------------------------------------
 
 const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");

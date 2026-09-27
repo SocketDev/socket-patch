@@ -50,7 +50,7 @@ on:
   # (rust-cache keys on Cargo.lock, so Cargo.lock belongs here) and re-runs
   # the matrix post-merge on the code paths it exercises: the vendored engine
   # (`vendor/**` — bun_lock.rs, bun_lock_text.rs's shared version gate,
-  # npm_flavor.rs, lock_inventory.rs), the hosted rewriter + unwinds, and the
+  # npm_flavor.rs, lock_inventory/), the hosted rewriter + unwinds, and the
   # CLI drivers (`scan/**` — hosted.rs, vendor_flow.rs, mod.rs — plus the
   # vendor / repair / remove commands the matrix runs).
   push:

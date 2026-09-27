@@ -531,12 +531,9 @@ fn env_vars_populate_global_args() {
     }
 }
 
-/// Regression: bool env vars accept "1"/"yes" (the conventional truthy
-/// strings), not just clap's strict "true"/"false". Before
-/// BoolishValueParser was wired onto every bool with env, setting
-/// SOCKET_OFFLINE=1 (or SOCKET_DEBUG=1) crashed clap with
-/// `error: invalid value '1' for '--offline'`, taking down every
-/// downstream CLI run that follows the conventional shell idiom.
+/// Bool env vars accept "1"/"yes" (the conventional truthy strings), not
+/// just clap's strict "true"/"false": `SOCKET_OFFLINE=1` (or
+/// `SOCKET_DEBUG=1`) must not fail with `invalid value '1' for '--offline'`.
 ///
 /// `#[serial]` because env-var state is process-global; without it
 /// these tests race each other (and the existing
@@ -654,14 +651,11 @@ fn bool_env_vars_reject_zero_and_falsey() {
 
 /// An **empty** boolean env var resolves to `false` — it must NOT crash.
 ///
-/// FIXED (2026-06-05): `SOCKET_OFFLINE=` (the conventional shell idiom for
-/// blanking a variable without unsetting it) previously made clap fail with a
-/// `ValueValidation` error via the stock `BoolishValueParser`, which rejects
-/// `""`. That took down *every* CLI invocation, on *every* subcommand, for
-/// *every* boolean global — an operator who blanked the var to disable airgap
-/// mode got a hard crash instead. `args::parse_bool_flag` now maps an empty
-/// (or whitespace-only) value to `false`. This test pins the fixed behavior:
-/// every boolean global parses cleanly to `false` when its env var is empty.
+/// `SOCKET_OFFLINE=` (the conventional shell idiom for blanking a variable
+/// without unsetting it) must not fail validation the way the stock
+/// `BoolishValueParser` does on `""`: `args::parse_bool_flag` maps an empty
+/// (or whitespace-only) value to `false`, so every boolean global parses
+/// cleanly to `false` when its env var is empty.
 #[test]
 #[serial_test::serial]
 fn empty_bool_env_var_resolves_to_false_not_crash() {
@@ -708,10 +702,8 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
 
 /// Every `SOCKET_*` env var that `GlobalArgs` binds, so tests that need a
 /// clean slate can save/clear/restore them in one place. This is the
-/// production list itself — a private copy already went stale once
-/// (`SOCKET_STRICT` + the vendor knobs were missing, so ambient values
-/// survived the "clean slate" and could taint every parse in this file);
-/// `save_and_clear_covers_every_bound_global_env_var` above pins the fix.
+/// production list itself, so it cannot drift from the bound flags;
+/// `save_and_clear_covers_every_bound_global_env_var` below pins that.
 use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS as GLOBAL_ENV_VARS;
 
 /// An exported-but-**empty** non-bool env var must mean "unset", not crash.

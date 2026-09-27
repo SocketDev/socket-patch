@@ -158,7 +158,7 @@ fn truthy_vex_compact_env_sets_flag_on_vex() {
 /// `VexEmbedArgs` shares the env var names with the standalone flags, so an
 /// ambient `SOCKET_VEX_NO_VERIFY=1` must also parse (and set
 /// `--vex-no-verify`) on `apply` — this is the postinstall-hook blast
-/// radius: before the fix the env var aborted every `apply` run.
+/// radius: a parse failure here would abort every `apply` run.
 #[test]
 #[serial_test::serial]
 fn truthy_vex_no_verify_env_sets_embedded_flag_on_apply() {

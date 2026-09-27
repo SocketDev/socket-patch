@@ -1,7 +1,6 @@
 //! Leaf helpers shared by the vendor backends (and [`crate::patch::redirect::golang_local`]).
 //!
-//! Each backend used to carry a private, byte-identical copy of these; they
-//! are hoisted here so the shapes stay in lockstep.
+//! Kept in one place so every backend's shapes stay in lockstep.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -798,7 +797,7 @@ impl MemoryRepack {
 /// A private stage directory whose (recursive) deletion can be handed to the
 /// blocking pool: [`tempfile::TempDir`]'s own `Drop` unlinks the whole tree
 /// synchronously, which on the build paths ran on the runtime thread. Dropping
-/// a `Stage` without [`Stage::dispose`] still deletes it the old way, so every
+/// a `Stage` without [`Stage::dispose`] still deletes it synchronously, so every
 /// early return stays correct.
 pub(crate) struct Stage(Option<tempfile::TempDir>);
 
@@ -1859,8 +1858,7 @@ mod tests {
     }
 
     /// The lock file is user-owned: reverting the splice must not reset its
-    /// permission bits (the `package_json/update.rs` mode-reset bug, same
-    /// class — see `atomic_write_bytes_preserving_mode`).
+    /// permission bits (see `atomic_write_bytes_preserving_mode`).
     #[cfg(unix)]
     #[tokio::test]
     async fn revert_lock_fragment_splice_preserves_lock_mode() {
@@ -1974,8 +1972,9 @@ mod tests {
     /// When the final atomic write fails (read-only parent dir — the
     /// documented 'atomic write needs writable parent' class), the revert
     /// must fail with `cannot write <lock>`, keep `kept_artifact == false`
-    /// (the mod.rs contract), and — the reason lines 462-467 hand-build the
-    /// outcome instead of calling `RevertOutcome::failed` — carry the drift
+    /// (the mod.rs contract), and — the reason `revert_lock_fragment_splice_inner`
+    /// hand-builds the write-failure outcome instead of calling
+    /// `RevertOutcome::failed` — carry the drift
     /// warnings accumulated before the write into the failed outcome.
     #[cfg(unix)]
     #[tokio::test]
@@ -2071,7 +2070,7 @@ mod tests {
         );
     }
 
-    // ── in-memory repack equivalence (X10) ──────────────────────────────────
+    // ── in-memory repack equivalence ────────────────────────────────────────
 
     /// A zip built entry by entry, so the oracle fixtures can carry the
     /// spellings `write_zip_entries` never emits: repeated names, STORED
@@ -2118,7 +2117,7 @@ mod tests {
             .collect()
     }
 
-    /// The pre-X10 repack, kept verbatim as the oracle: extract every member
+    /// The extract-to-disk repack, kept as the oracle: extract every member
     /// to a stage, let the caller stand in for the apply pipeline, then walk
     /// the stage back into a deterministic zip.
     async fn on_disk_repack(
@@ -2132,7 +2131,7 @@ mod tests {
         rebuild_zip(stage.path(), skip_entry)
     }
 
-    /// The X10 repack: members stay in memory, only the patch targets (plus
+    /// The in-memory repack: members stay in memory, only the patch targets (plus
     /// `extra`) are materialised, and the same stand-in apply runs over them.
     /// `None` means the name gate sent the rebuild back to the on-disk path.
     async fn in_memory_repack(
@@ -2289,7 +2288,7 @@ mod tests {
 
     /// A patch key that names a DIRECTORY of the archive must find one in the
     /// stage, exactly as a full extraction leaves one there — otherwise the
-    /// verify reports "File not found" where it used to report a hash
+    /// verify reports "File not found" where a full extraction reports a hash
     /// failure, and `--force` would silently skip the key.
     #[tokio::test]
     // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is

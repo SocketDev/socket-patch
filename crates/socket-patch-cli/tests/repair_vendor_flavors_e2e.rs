@@ -69,8 +69,7 @@ enum Flavor {
 /// gate refuses a FRESH vendor into a pre-v2 workspace lock, while `repair`
 /// (and in-sync re-runs) on a lock that ALREADY carries the vendored tuple
 /// must keep working — a project vendored before it grew a workspace member
-/// used to be refused every maintenance verb, with `repair` leaving the lock
-/// pointing at a tarball it declined to rebuild.
+/// must not be refused every maintenance verb.
 #[derive(Clone, Copy)]
 struct BunLock {
     version: u64,
@@ -849,11 +848,9 @@ async fn repair_reconstructs_pnpm_ledger_from_lockfile() {
 // Empirically confirmed brick (real pnpm@10.34.5 project, 2026-08-18): after
 // `repair` reconstructs a ledger-gone vendored entry from the lockfile, the
 // entry carries EMPTY wiring (npm-family pre-vendor lock fragments are not
-// offline-recoverable). A subsequent `vendor --revert` used to exit 0 with a
-// bare {"action":"removed"} event — zero warnings — while DELETING the
-// vendored tarball pnpm-lock.yaml still resolves through in several places;
-// every later `pnpm install` then fails ENOENT on the missing file: tarball.
-// The npm-family backends now fail closed
+// offline-recoverable). Deleting the vendored tarball pnpm-lock.yaml still
+// resolves through would make every later `pnpm install` fail ENOENT, so a
+// subsequent `vendor --revert` on the npm-family backends fails closed
 // (`vendor_wiring_unknown_revert_blocked`) when there is nothing to replay
 // and the lock still references the artifact, and still remove genuinely
 // orphaned artifacts once the lock no longer does. `repair`'s reconstruction

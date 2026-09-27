@@ -5,22 +5,18 @@
 //! `bundle install` (digest-gated load-time + per-gem `after-install`
 //! triggers, forced `after-install-all` re-apply).
 //!
-//! The two structural reasons the with-setup Docker cases
-//! (`baseline_with_setup`, `alt_content_patchset`) used to be a
-//! [BASELINE GAP] are both fixed (2026-08-13): (a) the bootstrap deadlock —
-//! installing the plugin evaluates `plugins.rb` BEFORE any project gems land,
-//! and the old load-time `SocketPatch.apply!` treated apply's exit 1 ("No
-//! packages found") as fatal (`Bundler::BundlerError`), killing the FIRST
-//! `bundle install` of every fresh checkout — is gone: the generated plugin
-//! now warns-and-continues on apply failures (`SOCKET_PATCH_STRICT=1`
-//! restores the raise), pinned by [`plugin_runtime`] below; (b) the fixture's
-//! synthetic all-zeros beforeHash — which hash-gated gem apply (no npm-style
-//! mismatch-warn-and-apply path) always rejected — is replaced by the real
+//! The with-setup Docker cases (`baseline_with_setup`, `alt_content_patchset`)
+//! depend on two things: (a) installing the plugin evaluates `plugins.rb`
+//! BEFORE any project gems land, so the generated plugin warns-and-continues
+//! on apply failures (`SOCKET_PATCH_STRICT=1` restores the raise) instead of
+//! killing the FIRST `bundle install` of every fresh checkout — pinned by
+//! [`plugin_runtime`] below; (b) hash-gated gem apply has no npm-style
+//! mismatch-warn-and-apply path, so the fixture's beforeHash is the real
 //! git-blob hash probed from the published .gem (`resolve_before_hash` in
 //! `run-case.sh`, mirroring docker_e2e_gem). NOTE: in Docker mode the matrix
-//! runs the binary BAKED INTO the local image; an image built before this fix
-//! generates the old raising plugin and still red-flags these cases — rebuild
-//! the image (or run with `SOCKET_PATCH_TEST_HOST=1`) to see them pass.
+//! runs the binary BAKED INTO the local image; a stale image generates a
+//! raising plugin and red-flags these cases — rebuild the image (or run with
+//! `SOCKET_PATCH_TEST_HOST=1`).
 //!
 //! IMPORTANT — why this file carries a real assertion of its own:
 //! `smc::run_pm("gem", "bundler")` routes gem through the shared Docker
@@ -1019,8 +1015,7 @@ mod plugin_runtime {
             "the warning must mention the strict escape hatch:\n{err}"
         );
 
-        // A retry is not poisoned either (the old failure mode repeated
-        // identically forever because plugin registration never completed).
+        // A retry is not poisoned either (plugin registration completed).
         let (code, out, err) = bundle_install(root, &fake, &[]);
         assert_eq!(
             code, 0,
@@ -1545,7 +1540,7 @@ mod plugin_runtime {
         out
     }
 
-    /// MANIFEST-LESS vendored checkout (the depscan / `vendor --detached`
+    /// MANIFEST-LESS vendored checkout (the depscan / `scan --mode vendored`
     /// shape: a committed `.socket/vendor/gem/<uuid>/` artifact wired by a
     /// Gemfile `path:`, NO `.socket/manifest.json`) with the setup plugin
     /// wired, driven with the REAL binary as the plugin's apply under

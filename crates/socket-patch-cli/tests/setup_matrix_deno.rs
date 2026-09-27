@@ -50,10 +50,11 @@ mod vex_e2e_common;
 #[test]
 #[serial_test::serial]
 // Experimental ecosystem (deno): the setup-matrix aspirational cases are a
-// BASELINE GAP (setup does not wire deno's install hook yet). This passes on CI
+// BASELINE GAP (setup wires the package.json postinstall, but `deno install`
+// is not known to run it). This passes on CI
 // only because the runners lack the `deno` toolchain (the cases soft-skip); on
 // any host that HAS deno it fails. Ignore it so deno can never block the
-// blocking --all-features jobs. The non-skippable no-op contract is still
+// blocking --all-features jobs. The non-skippable setup round-trip is still
 // guarded by `host_guard` below. Run with `--features setup-e2e -- --ignored`.
 #[ignore = "experimental ecosystem (deno): not gating CI until the deno backend is implemented; run with --ignored"]
 fn deno() {

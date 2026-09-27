@@ -219,8 +219,8 @@ fn vendored_purl_attested_with_no_installed_tree() {
     let rel = write_vendored_dir(cwd, patched);
     write_vendor_state(cwd, purl, &rel);
 
-    // No Cargo.toml, no target/, no registry copy — the vendored artifact
-    // is the ONLY evidence on disk.
+    // No installed tree (no target/, no registry copy) — only the wiring
+    // Cargo.toml and the vendored artifact are on disk.
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
         purl.to_string(),
@@ -792,7 +792,7 @@ fn write_member_tgz(dest: &Path, member: &str, bytes: &[u8]) -> Vec<u8> {
 
 /// Minimal STORED-entry (no compression) zip writer — local headers +
 /// central directory + EOCD — and returns the bytes for the ledger sha256.
-/// The production reader (`verify_wheel_members`' bounded `zip::ZipArchive`,
+/// The production reader (`vendor::verify`'s bounded `read_zip_to_map` over `zip::ZipArchive`,
 /// which handles `.whl`/`.nupkg`/`.jar` alike) is the code under test;
 /// hand-rolling the writer keeps this test crate off a zip-writer dependency
 /// while still producing honest zip-family artifacts.
@@ -1990,11 +1990,10 @@ fn lockfile_vendored_ref_whose_record_names_another_package_is_a_mismatch() {
     );
 }
 
-/// REGRESSION: `repair`'s ledger reconstruction writes entries with
+/// `repair`'s ledger reconstruction writes entries with
 /// `wiring: []` (every ecosystem but gem) and says VEX attests them. With
 /// no recorded wiring file, liveness must probe the ecosystem's root locks
-/// — here a pnpm lock (a format lockfile discovery does not read yet) that
-/// still wires the committed tarball — instead of calling the entry
+/// — here a pnpm lock that still wires the committed tarball — instead of calling the entry
 /// `vendor_unwired`. Once that lock is reverted, the entry is unwired.
 #[test]
 fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
@@ -2086,10 +2085,10 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 9. REGRESSION (core discover rule 11): a vendor ledger entry whose
-// artifact the lockfiles still MENTION, but only in a shape the package
-// manager does not consume, is dead — the ledger fallback no longer
-// re-derives "live" from the raw text the extractor already rejected.
+// 9. Core discover rule 11: a vendor ledger entry whose artifact the
+// lockfiles still MENTION, but only in a shape the package manager does not
+// consume, is dead — the ledger fallback never re-derives "live" from the
+// raw text the extractor already rejected.
 // ──────────────────────────────────────────────────────────────────────
 
 /// A detached ledger entry (embedded record) for `purl` → `rel`, recording

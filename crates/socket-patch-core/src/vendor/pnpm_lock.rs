@@ -5,7 +5,7 @@
 //! lockfile's own `overrides:` section, so a lock-only edit is unsound:
 //! `--frozen-lockfile` fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` and a
 //! plain `pnpm install` silently strips the section and reinstalls the
-//! unpatched registry bytes (spike P3, `spikes/PHASE0-V2-FINDINGS.txt`).
+//! unpatched registry bytes (spike P3).
 //!
 //! WHERE pnpm reads overrides moved between majors: pnpm <= 10 reads
 //! package.json `pnpm.overrides`; pnpm >= 11 no longer reads the package.json
@@ -18,11 +18,10 @@
 //! has no `pnpm-workspace.yaml`, one is created carrying a root-only
 //! `packages:` list (pnpm 9 refuses a workspace file with no `packages`
 //! field) plus the `overrides:` block; `vendor --revert` deletes it again.
-//! The lock still gets the four fragments pnpm itself would emit. The surgery
-//! is a faithful port of
-//! `spikes/pnpm/edit_lock.py`, whose output was verified byte-identical to
-//! pnpm's own lock on BOTH supported majors (9.15.9 / 10.34.1 — they emit
-//! byte-identical `lockfileVersion: '9.0'` locks; fixtures in `spikes/pnpm/`):
+//! The lock still gets the four fragments pnpm itself would emit; the
+//! surgery's output was verified byte-identical to pnpm's own lock on BOTH
+//! supported majors (9.15.9 / 10.34.1 — they emit byte-identical
+//! `lockfileVersion: '9.0'` locks):
 //!
 //! 1. `overrides:` section — inserted before `importers:` or extended;
 //! 2. every importer's dep entry — `specifier:` AND `version:` rewritten to
@@ -612,9 +611,9 @@ fn pnpm_entry_in_use_scan(uuid: &str, lines: &[String]) -> bool {
 /// restored entry carries empty wiring). Revert has nothing to replay for
 /// them — it cannot un-wire the lock — so removing the artifact while
 /// `pnpm-lock.yaml` still resolves through it bricks every subsequent
-/// install (ENOENT on the missing `file:` tarball), and used to do so
-/// silently. `in_use` is the calling backend's own lock probe result
-/// ([`pnpm_entry_in_use`] / its legacy twin): `Some(true)` refuses;
+/// install (ENOENT on the missing `file:` tarball). `in_use` is the calling
+/// backend's own lock probe result ([`pnpm_entry_in_use`] / its legacy
+/// twin): `Some(true)` refuses;
 /// `Some(false)` (provably orphaned) returns `None` and the caller's
 /// removal proceeds unchanged; undeterminable (`None`) refuses too UNLESS
 /// the lock is absent altogether — a missing lock cannot reference the
@@ -877,11 +876,11 @@ pub async fn revert_pnpm_opts(
         }
     }
 
-    // LOSSINESS GUARD (residual #131): when any wiring record was left
-    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
-    // what the lock — or the redirect ledger's recorded originals — still
-    // points at. Keep it (and let the CLI keep the ledger entry) instead of
-    // deleting evidence out from under a lock we just refused to touch.
+    // LOSSINESS GUARD: when any wiring record was left alone ("drifted;
+    // left alone"), the uuid dir may hold the only copy of what the lock —
+    // or the redirect ledger's recorded originals — still points at. Keep
+    // it (and let the CLI keep the ledger entry) instead of deleting evidence
+    // out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
         return outcome;
@@ -2293,7 +2292,7 @@ fn matching_blocks<L: EditLines>(
 /// The run's `pnpm-lock.yaml` split. A vendored run reads the lock once per
 /// patched npm package — and a monorepo lock runs to megabytes, so the
 /// split into lines and the whole-section scans the pre-flight and the
-/// edits make were paid per package. See [`ParseMemo`]: the read still
+/// edits make would be paid per package. See [`ParseMemo`]: the read still
 /// happens every time, and a lock whose bytes changed between two packages
 /// is split afresh. The backend re-seeds the slot with the lock it wrote.
 static LOCK_MEMO: ParseMemo<LockDoc> = ParseMemo::new();
@@ -3329,10 +3328,9 @@ pub(super) fn indent_of(line: &str) -> usize {
 /// (keys themselves contain `:` in `file:` specs).
 ///
 /// All three are slices of `line`. Every scan below runs this over whole
-/// `packages:` / `snapshots:` sections once per vendored package, so on a
-/// multi-megabyte lock the owning copies it used to hand back dominated
-/// the surgery's CPU. A caller that keeps a piece past the next edit to
-/// `lines` copies it itself.
+/// `packages:` / `snapshots:` sections once per vendored package, so owning
+/// copies would dominate the surgery's CPU on a multi-megabyte lock. A
+/// caller that keeps a piece past the next edit to `lines` copies it itself.
 pub(super) fn parse_key_line(line: &str, indent: usize) -> Option<(&str, &str, &str)> {
     if line.len() <= indent || !line.as_bytes()[..indent].iter().all(|&b| b == b' ') {
         return None;
@@ -3433,7 +3431,7 @@ mod tests {
         "sha512-VR8nCbFxvOcFX5Rxku2psjaj0+xzKdzFkcuqZJSHf597bMVomG100t6+cJkMBFRLhyVdSVwufbCwVzlCzZkUwg==";
 
     // ── tool-generated byte-exact oracles ─────────────────────────────────
-    // Provenance: spikes/pnpm/p1-multi-dep/{before,after}/ — generated by
+    // Provenance: spike P1 (multi-dep) before/after — generated by
     // pnpm 9.15.9 AND 10.34.1 (byte-identical on both majors), spike P1/P2.
     const P1_BEFORE_PKG: &str = r#"{
   "name": "vendor-spike",
@@ -3552,7 +3550,7 @@ snapshots:
   left-pad@file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz: {}
 ";
 
-    // Provenance: spikes/pnpm/p7-workspace/{before,after}/ (spike P7) — the
+    // Provenance: spike P7 (workspace) before/after — the
     // per-importer re-relativized specifier vs root-relative version.
     const P7_BEFORE_PKG: &str = r#"{
   "name": "ws-root",
@@ -4031,11 +4029,9 @@ snapshots:
         (fx, entry)
     }
 
-    /// P1 regression (empirically confirmed vs a real pnpm@10.34.5 project,
-    /// 2026-08-18): a `repair`-reconstructed entry carries no wiring
-    /// records; revert used to remove the artifact dir unconditionally,
-    /// leaving the lock resolving through a deleted tarball — every later
-    /// install failed ENOENT, and nothing said so. With nothing to replay,
+    /// A `repair`-reconstructed entry carries no wiring records; removing
+    /// the artifact dir would leave the lock resolving through a deleted
+    /// tarball (every later install fails ENOENT). With nothing to replay,
     /// revert must refuse (fail-closed) while the lock still resolves
     /// through the artifact.
     #[tokio::test]
@@ -4442,12 +4438,11 @@ snapshots:
     /// Two VERSIONS of the same package vendored in sequence: each edit
     /// must bind to its own version's entries — a name-only "ours" match
     /// would let the second vendor clobber/rekey the first one's blocks
-    /// (live-debugged on Flowise: identical duplicated mapping keys).
-    /// 1.2.0 is reachable through a transitive dependent's snapshot ref
-    /// (the Flowise shape) — the P1 `npm:` ALIAS shape now refuses
-    /// fail-closed instead (see
+    /// (identical duplicated mapping keys). 1.2.0 is reachable through a
+    /// transitive dependent's snapshot ref — the P1 `npm:` ALIAS shape
+    /// refuses fail-closed instead (see
     /// `aliased_same_version_reference_refuses_fail_closed`; the surgery
-    /// cannot rewrite alias dep paths and used to strand them dangling).
+    /// cannot rewrite alias dep paths).
     #[tokio::test]
     async fn multi_version_vendor_does_not_clobber_sibling_entries() {
         // P1 with the `left-pad-old` alias swapped for a `dep-two`
@@ -5184,8 +5179,8 @@ snapshots:
         );
         // Non-drifted fragments still restored.
         assert!(after.contains("  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVN"));
-        // Residual #131: a drift-skip keeps the artifact dir (the drifted
-        // fragment's recorded original may still be needed later) and says so.
+        // A drift-skip keeps the artifact dir (the drifted fragment's
+        // recorded original may still be needed later) and says so.
         assert!(
             fx.root()
                 .join(format!(".socket/vendor/npm/{UUID}"))
@@ -5947,7 +5942,8 @@ snapshots:
     /// pnpm-workspace.yaml are the FIRST opens in the vendor flow (flavor
     /// detection reads only the lock), and revert's lock/package.json reads
     /// are the first opens of theirs. Same `open_regular_file` guard class
-    /// as the vendor siblings (npm_lock.rs, npm_flavor.rs, lock_inventory.rs).
+    /// as the vendor siblings (npm_lock.rs, npm_flavor.rs, the
+    /// lock_inventory/ readers).
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_pair_files_fail_fast_instead_of_wedging_vendor_and_revert() {

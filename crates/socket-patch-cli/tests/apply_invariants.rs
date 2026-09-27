@@ -230,11 +230,8 @@ fn write_mixed_scope_project(root: &Path) {
 /// THIS run. A patch filtered out by `--ecosystems` — or belonging to an
 /// ecosystem this build can't apply at all — will never be applied, so
 /// its missing `.socket/` sources must not fail a run whose in-scope
-/// patches are all locally applicable.
-///
-/// Before the fix, the guard scanned the WHOLE manifest: here the
-/// out-of-scope pypi patch (no blob on disk) tripped the offline bail and
-/// the fully-applicable npm patch was never applied (exit 1, no events).
+/// patches are all locally applicable: here the out-of-scope pypi patch
+/// (no blob on disk) must not trip the offline bail for the npm patch.
 #[test]
 fn offline_ecosystems_filter_ignores_out_of_scope_missing_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -274,7 +271,7 @@ fn offline_ecosystems_filter_ignores_out_of_scope_missing_source() {
 
     // CONTROL: the same fixture WITHOUT the `--ecosystems` filter puts the
     // sourceless pypi patch in scope, so the documented offline bail must
-    // still fire — the fix scopes the guard, it does not disable it.
+    // still fire — the guard is scoped, not disabled.
     let tmp2 = tempfile::tempdir().expect("tempdir");
     write_mixed_scope_project(tmp2.path());
     let (code2, stdout2) = run_apply(tmp2.path(), &["--offline", "--silent"]);
@@ -509,9 +506,9 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
 /// Regression: only a genuine NotFound means "no `.socket/` set up". Any
 /// other stat error — an unreadable `.socket/` (root-owned directory,
 /// restrictive ACL), a plain file where `.socket/` should be, a symlink
-/// loop — used to take the very same `status: noManifest` / exit-0 path.
-/// A project whose patches were never even read then reported "nothing to
-/// apply", which the install hook and CI both read as success. Fail closed.
+/// loop — must NOT take the `status: noManifest` / exit-0 path: a project
+/// whose patches were never even read would report "nothing to apply",
+/// which the install hook and CI both read as success. Fail closed.
 #[cfg(unix)]
 #[test]
 #[ignore = "RED: apply's manifest probe is `tokio::fs::metadata(..).is_err()`, so \

@@ -1,6 +1,6 @@
 //! Gem (Bundler) vendor backend: the Gemfile + Gemfile.lock pair edit.
 //!
-//! Spike-verified mechanism (bundler 2.5 — `spikes/PHASE0-FINDINGS.txt`):
+//! Empirically verified mechanism (bundler 2.5):
 //! BOTH files must be edited. A lock-only edit is a silent unpatch on the next
 //! plain `bundle install` (bundler re-resolves from the Gemfile and rewrites
 //! the lock back to a registry GEM source; frozen/CI mode errors with exit 16
@@ -26,9 +26,9 @@
 //!   byte-preserved;
 //! * bundler ≥ 2.6 with `lockfile_checksums` adds a CHECKSUMS section whose
 //!   registry entries read `  <name> (<version>) sha256=<hex>`; a path-sourced
-//!   gem keeps a BARE `  <name> (<version>)` entry (bundler 2.7.2 spike —
-//!   `spikes/PHASE0-V2-FINDINGS.txt` gemChecksums G2/G3). The registry token
-//!   MUST be stripped on vendor — bundler never repairs it itself (G4: a stale
+//!   gem keeps a BARE `  <name> (<version>)` entry (verified on bundler
+//!   2.7.2). The registry token
+//!   MUST be stripped on vendor — bundler never repairs it itself (a stale
 //!   token is silently preserved, i.e. permanent lock-vs-regen churn) — and
 //!   restored verbatim on revert: a bare entry on a registry-sourced gem
 //!   hard-fails `BUNDLE_FROZEN=true bundle install` (exit 16).
@@ -204,13 +204,9 @@ async fn gem_prelude(
     //      suffix to the base purl, so a `?platform=ruby` lookup can still land
     //      on a native install dir).
     //
-    // The old gate tested only `dir_name != leaf`, which spuriously refused
-    // EVERY pure-ruby gem fetched via the registry auto-fetch ladder: that
-    // path stages the pristine `.gem` into a private tempdir named literally
-    // `gem` (see registry_fetch::fetch_gem), so `dir_name` was `gem`, never
-    // `<name>-<version>`. Gating on the platform (not the staging dir name)
-    // lets `?platform=ruby` and bare purls vendor while still refusing true
-    // native builds by either signal.
+    // Gating on the platform (not only the staging dir name) lets
+    // `?platform=ruby` and bare purls vendor whatever the staging dir is
+    // called, while still refusing true native builds by either signal.
     if let Some(platform) = purl_qualifier(purl, "platform") {
         if !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby") {
             return Err(refused(
@@ -225,9 +221,10 @@ async fn gem_prelude(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // Fail closed: only two dir names are legitimate here — the installed
-    // gem's own `<name>-<version>` leaf, and the literal `gem` staging dir
-    // created by the registry auto-fetch ladder (registry_fetch::fetch_gem).
+    // Fail closed: only two dir names are legitimate here — the gem's own
+    // `<name>-<version>` leaf (installed, or staged by
+    // registry_fetch::fetch_gem), and a literal `gem` staging dir, still
+    // admitted for compatibility though fetch_gem no longer produces it.
     // Everything else is refused, including a `<name>-<version>-<platform>`
     // precompiled build; an allowlist (not a suffix match) means an unexpected
     // install dir name can never slip through into a vendored copy.
@@ -333,9 +330,9 @@ async fn gem_prelude(
     if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
             // Probe the copy only once the lock is known to be wired (the
-            // common fresh vendor has no copy to hash). D4 heal: a project
-            // vendored before the invalid-stub hardening carries the
-            // defective SERVED stub on disk, so EXISTS is not enough — an
+            // common fresh vendor has no copy to hash). Invalid-stub heal: a
+            // project vendored before the stub check carries a defective
+            // SERVED stub on disk, so EXISTS is not enough — an
             // on-disk stub that fails the required-attribute bar routes into
             // the artifact rebuild (which re-materialises a valid stub)
             // instead of the silent `already_vendored` no-op. The stub read
@@ -399,8 +396,7 @@ fn gem_edits(
     };
     // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
     // A lock-shape failure therefore costs no download / copy / patch and no
-    // Gemfile write — the same failed `Done` outcome the unwind path used to
-    // produce, minus the unwind.
+    // Gemfile write.
     let lock_edit = match edit_lock(&prelude.lock_text, name, version, &prelude.copy_rel) {
         Ok(edit) => edit,
         Err(e) => {
@@ -908,8 +904,8 @@ enum GemServiceCopy {
     /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
     HardFail(Box<VendorOutcome>),
     /// Fall back to copying the installed gem + local stub and patching it.
-    /// When the service DID serve a stub but it failed validation (the D4
-    /// defect), the payload carries the defect reason so a stub-less local
+    /// When the service DID serve a stub but it failed validation, the
+    /// payload carries the defect reason so a stub-less local
     /// fallback can refuse truthfully — naming the served defect and the
     /// install-the-gem remedy — instead of `gem_spec_missing`'s circular
     /// "use --vendor-source=service" advice (a `Refused` outcome carries no
@@ -930,7 +926,7 @@ enum GemServiceCopy {
 /// patch built before the stub rollout (the invalidation migration rebuilds
 /// those). The downloaded stub is re-checked for native extensions as defense
 /// in depth, and an INVALID stub — one missing the rubygems-required
-/// `summary`/`authors` assignments, the D4 served-artifact defect — follows
+/// `summary`/`authors` assignments — follows
 /// the same miss policy under its own `vendor_prebuilt_stub_invalid` code
 /// (always loud, even under `auto`).
 async fn gem_service_copy(
@@ -1071,9 +1067,9 @@ async fn gem_service_copy(
         );
     }
 
-    // Defense in depth (D4, gem live matrix 2026-08-19): production's stub
-    // generator omitted the rubygems-required `summary`/`authors`, and every
-    // bundler major validates path-source gemspecs — writing such a stub
+    // Defense in depth: a served stub may omit the rubygems-required
+    // `summary`/`authors`, and every bundler major validates path-source
+    // gemspecs — writing such a stub
     // verbatim makes every later `bundle install` exit 1 (`missing value for
     // attribute summary`). An INVALID stub follows the MISSING-stub policy
     // (fall back under `auto`, refuse under `service`) but under its own
@@ -1231,7 +1227,7 @@ async fn materialise_patched_copy(
             // gem, whose only route is the service path.
             let Some((spec_path, spec_text)) = local_stub else {
                 return Err(Box::new(match served_stub_defect {
-                    // The service DID serve a stub — a defective one (D4). Say
+                    // The service DID serve a stub — a defective one. Say
                     // so: the generic advice below would send the user in a
                     // circle (`--vendor-source=service` refuses on the same
                     // defect), and a `Refused` outcome carries no warnings, so
@@ -1385,7 +1381,7 @@ pub async fn revert_gem_opts(
     // the removed dir and the next `bundle install` hard-fails. Refuse
     // loudly with the manual cleanup steps instead. (Every entry
     // `vendor_gem` records carries at least the Gemfile + lock records.)
-    // NOT skipped under `keep_artifact` (PR #231 review hardening): a
+    // NOT skipped under `keep_artifact`: a
     // preserve-state revert that cannot restore the wiring must not report
     // the system restored while the pair edit still wires the vendored dir
     // in — the patch would silently stay applied.
@@ -2862,8 +2858,7 @@ fn authors_rhs_collapses_empty(rhs: &str) -> bool {
 /// The rubygems-REQUIRED attributes a stub gemspec must assign for bundler to
 /// accept it as a path source, returned as the list it is missing (empty =
 /// valid). Every bundler major validates path-source gemspecs, so a stub
-/// missing these bricks every later `bundle install` — the D4 defect the
-/// 2026-08-19 gem live matrix found in ALL served stubs.
+/// missing these bricks every later `bundle install`.
 ///
 /// The bar is EMPIRICAL, verified against rubygems 3.3 / 3.5 / 3.6
 /// (`Gem::Specification#validate`, both packaging modes, in the bundler
@@ -3302,7 +3297,7 @@ mod tests {
     /// tolerates must always pass, whatever its spelling.
     #[test]
     fn required_attrs_heuristic() {
-        // The D4 production shape: no summary, no authors.
+        // The defective served shape: no summary, no authors.
         assert_eq!(
             gemspec_missing_required_attrs(
                 "Gem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n"
@@ -3426,16 +3421,15 @@ mod tests {
         assert!(!root.join(".socket").exists());
     }
 
-    /// Fail-closed allowlist regression: an install dir whose name is neither
-    /// the `<name>-<version>` leaf nor the `gem` auto-fetch staging dir is
-    /// refused — even though it is NOT a `<leaf>-<platform>` suffix, so the old
-    /// suffix-only check (`dir_name.starts_with("{leaf}-")`) would have ADMITTED
-    /// it. Only the two legitimate dir names may pass.
+    /// Fail-closed allowlist: an install dir whose name is neither the
+    /// `<name>-<version>` leaf nor the legacy `gem` staging dir is refused —
+    /// even though it is NOT a `<leaf>-<platform>` suffix, so a suffix-only
+    /// check would admit it. Only the two legitimate dir names may pass.
     #[tokio::test]
     async fn test_refuses_unexpected_install_dir_name() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         // A wholly-unexpected dir name: not `rack-3.2.6`, not `gem`, and not a
-        // `rack-3.2.6-<suffix>` platform build (which the old suffix check caught).
+        // `rack-3.2.6-<suffix>` platform build.
         let odd_dir = installed.parent().unwrap().join("random-unrelated");
         tokio::fs::rename(&installed, &odd_dir).await.unwrap();
 
@@ -3463,18 +3457,16 @@ mod tests {
         assert!(!root.join(".socket").exists(), "refusal must write nothing");
     }
 
-    /// Regression: a pure-ruby gem fetched via the registry auto-fetch ladder
-    /// is staged into a private tempdir named literally `gem` (NOT
-    /// `<name>-<version>`). The old gate refused every such gem with
-    /// `platform_gem_unsupported` because `dir_name != leaf`. With the purl's
-    /// `?platform=ruby` (the portable default) the vendor must now SUCCEED —
-    /// the staging dir name is not a platform signal.
+    /// A pure-ruby gem in the legacy `gem` staging dir (still admitted, though
+    /// registry_fetch::fetch_gem now stages at `<name>-<version>`) vendors
+    /// with the purl's `?platform=ruby` (the portable default) — the staging
+    /// dir name is not a platform signal.
     #[tokio::test]
     async fn test_platform_ruby_gem_from_autofetch_staging_dir_vendors() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        // Rename the install dir to `gem`, mirroring registry_fetch::fetch_gem's
-        // staging leaf. The sibling `specifications/rack-3.2.6.gemspec` (needed
-        // by the local build) is derived from installed_dir.parent().parent(),
+        // Rename the install dir to the legacy `gem` staging leaf. The
+        // sibling `specifications/rack-3.2.6.gemspec` (needed by the local
+        // build) is derived from installed_dir.parent().parent(),
         // so keeping the dir under the same gem_home preserves it.
         let staged = installed.parent().unwrap().join("gem");
         tokio::fs::rename(&installed, &staged).await.unwrap();
@@ -3847,10 +3839,9 @@ mod tests {
         b"module Rack\n  SOCKET_PATCHED = true\n  VERSION = \"3.1.8\"\nend\n";
     const GEMSPEC_318: &str = "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.version = \"3.1.8\"\n  s.summary = \"a modular Ruby web server interface\"\n  s.authors = [\"Rack maintainers\"]\n  s.require_paths = [\"lib\"]\nend\n";
 
-    // Embedded VERBATIM from the spike pair
-    // `spikes/gem-checksums/path-with-checksums/{before,after}/` (bundler
+    // Embedded VERBATIM from a captured before/after pair (bundler
     // 2.7.2, ruby 3.3.11, aarch64-linux; the `after` lock was written by
-    // bundler itself via `bundle lock`, never by hand). G3 pinned exactly this
+    // bundler itself via `bundle lock`, never by hand), verified exactly this
     // pair byte-stable under `bundle install`, `BUNDLE_FROZEN=true bundle
     // install` and a from-scratch `bundle lock`.
     const SPIKE_GEMFILE_CHECKSUMS: &str =
@@ -4267,7 +4258,7 @@ mod tests {
 
     #[test]
     fn test_no_checksums_lock_records_no_checksum_wiring() {
-        // Regression: a lock WITHOUT a CHECKSUMS section must keep producing
+        // A lock WITHOUT a CHECKSUMS section must keep producing
         // the exact pre-CHECKSUMS output and no checksum record.
         let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
         assert!(edit.checksum_rewrite.is_none());
@@ -4733,8 +4724,7 @@ mod tests {
 
     /// Trailing options on the declaration (`require: false`, `group: :test`,
     /// …) must survive the rewrite: dropping `require: false` auto-requires
-    /// the gem at boot, changing app behavior while vendored (the redirect
-    /// backend's `gem_line_trailing_options` twin, FIXED there 2026-07-06).
+    /// the gem at boot, changing app behavior while vendored.
     #[tokio::test]
     async fn test_rewrite_preserves_trailing_options() {
         let gemfile =
@@ -4874,8 +4864,7 @@ mod tests {
     const SERVICE_STUB: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.summary = \"a modular Ruby web server interface\".freeze\n  s.authors = [\"Rack maintainers\".freeze]\n  s.licenses = [\"MIT\".freeze]\n  s.require_paths = [\"lib\".freeze]\nend\n";
     /// A stub that declares native extensions (must be refused).
     const SERVICE_STUB_NATIVE: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.extensions = [\"ext/rack/extconf.rb\"]\nend\n";
-    /// The DEFECTIVE stub shape production served as of 2026-08-19 (gem
-    /// live-matrix defect D4): it never assigns the rubygems-required
+    /// A DEFECTIVE stub shape: it never assigns the rubygems-required
     /// `summary` / `authors` (nor `licenses`), so bundler's path-source
     /// validation rejects it and every post-vendor `bundle install` exits 1.
     const SERVICE_STUB_INVALID: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n";
@@ -5211,7 +5200,7 @@ mod tests {
         );
     }
 
-    /// D4 (gem live-matrix 2026-08-19): explicit `service` mode + a served stub
+    /// Explicit `service` mode + a served stub
     /// that never assigns the rubygems-required `summary`/`authors` refuses
     /// with its own `vendor_prebuilt_stub_invalid` code, naming the missing
     /// attributes — writing it verbatim would make every later `bundle install`
@@ -5259,7 +5248,7 @@ mod tests {
         );
     }
 
-    /// D4 under the default `auto`: an INVALID served stub is treated exactly
+    /// Under the default `auto`: an INVALID served stub is treated exactly
     /// like a MISSING one — fall back to the LOCAL build (installed gem +
     /// locally derived stub) — but with a LOUD `vendor_prebuilt_stub_invalid`
     /// warning naming the served-stub defect. The vendored copy must carry the
@@ -5308,7 +5297,7 @@ mod tests {
         );
     }
 
-    /// D4 + `auto` + the gem NOT installed (a `missing_install` staging-style
+    /// Invalid served stub + `auto` + the gem NOT installed (a `missing_install` staging-style
     /// dir): the local-build fallback has no stub to derive, and the refusal
     /// must be TRUTHFUL — it carries the served-stub defect (a `Refused`
     /// outcome has no warnings channel, so the detail is the diagnostic's
@@ -5354,7 +5343,7 @@ mod tests {
         assert!(!root.join(".socket").exists());
     }
 
-    /// D4 + explicit `service` + the gem NOT installed: the hard refusal is
+    /// Invalid served stub + explicit `service` + the gem NOT installed: the hard refusal is
     /// the same as the installed case — installation is irrelevant to
     /// `service` mode, which never falls back.
     #[tokio::test]
@@ -5473,8 +5462,8 @@ mod tests {
         );
     }
 
-    /// D4 heal: a project vendored PRE-hardening carries the invalid served
-    /// stub on disk. The idempotent hot path must not re-bless it as
+    /// Invalid-stub heal: a project vendored before the stub check carries
+    /// the invalid served stub on disk. The idempotent hot path must not re-bless it as
     /// `already_vendored`: the on-disk stub fails the required-attribute bar,
     /// routing into the artifact-only rebuild, which rewrites a valid stub
     /// with the pair edit and the ledger entry untouched.
@@ -5527,7 +5516,7 @@ mod tests {
         );
     }
 
-    /// AUDIT B1 (cargo twin, PR #194): a failed hot-path artifact rebuild must
+    /// A failed hot-path artifact rebuild must
     /// never destroy the live-wired vendored copy. Drift the committed copy
     /// (bad merge / hand edit — still buildable: the path source exists and
     /// the stub is valid), then re-run with the patch content unavailable
@@ -6014,8 +6003,7 @@ mod tests {
     }
 
     /// The empty-wiring refusal applies under `keep_artifact`
-    /// (`--preserve-state`) TOO — PR #231's review hardening (5ceba4a3)
-    /// deliberately removed the `&& !keep_artifact` gate: a preserve-state
+    /// (`--preserve-state`) TOO: a preserve-state
     /// rollback that cannot restore the wiring must not report the system
     /// restored while the pair edit still wires the vendored dir in (the
     /// patch would silently stay applied). Pins that decision.
@@ -6250,10 +6238,10 @@ mod tests {
         );
     }
 
-    // ── coverage-gap additions (2026-09 audit): refusal / failure legs ────
+    // ── refusal / failure legs ────
 
     /// [`run_vendor`] with an explicit service config (the service tests
-    /// above inline this shape; the coverage additions share it).
+    /// above inline this shape; the tests below share it).
     async fn run_vendor_service(
         root: &Path,
         blobs: &Path,
@@ -7027,8 +7015,8 @@ mod tests {
     }
 
     /// An invalid served stub that DOES assign `licenses` must not carry the
-    /// "also omits `licenses`" advisory — the empty-note branch of the D4
-    /// refusal detail.
+    /// "also omits `licenses`" advisory — the empty-note branch of the
+    /// invalid-stub refusal detail.
     #[tokio::test]
     async fn invalid_stub_with_licenses_omits_licenses_advisory() {
         const STUB_INVALID_WITH_LICENSE: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.licenses = [\"MIT\".freeze]\n  s.require_paths = [\"lib\".freeze]\nend\n";
@@ -7057,7 +7045,7 @@ mod tests {
         assert!(!root.join(".socket").exists());
     }
 
-    /// D4 + `auto` + a CORRUPTED local stub: the local-build write choke
+    /// Invalid served stub + `auto` + a CORRUPTED local stub: the local-build write choke
     /// point refuses `gem_spec_invalid`, and the detail honestly notes the
     /// service cannot supply a stub either (its served stub is defective) —
     /// never circular "use --vendor-source=service" advice.
@@ -7996,7 +7984,7 @@ mod tests {
         );
     }
 
-    // ── coverage mop-up 2026-09: swap / prune / grammar / unwind edges ───────
+    // ── swap / prune / grammar / unwind edges ───────
 
     /// A parentless `copy_dir` (e.g. the filesystem root) has no directory to
     /// place a same-dir sibling in; the fallback nests the suffix under the
@@ -8118,7 +8106,9 @@ mod tests {
     }
 
     /// An unreadable (present but non-regular) Gemfile fails a `gemfile_line`
-    /// revert loudly — unlike a MISSING one, which is drift and left alone.
+    /// revert loudly — unlike a MISSING one, which is reported as
+    /// `vendor_lockfile_missing` (`FileMissing`, not drift) and does not
+    /// block artifact removal.
     #[tokio::test]
     async fn revert_gemfile_record_unreadable_gemfile_is_an_error() {
         // The tempdir itself squats the Gemfile path: a directory is
@@ -8143,7 +8133,7 @@ mod tests {
     }
 
     /// A `gemfile_lock_spec` record whose `new` is not a string array is
-    /// drift (`Ok(false)`), decided BEFORE the lock is read — proven with a
+    /// drift (`Ok(RecordRevert::Drifted)`), decided BEFORE the lock is read — proven with a
     /// lock path that would error loudly (a directory) if it were read.
     #[tokio::test]
     async fn revert_lock_record_non_array_new_is_drift_before_reading() {
@@ -8361,7 +8351,7 @@ mod tests {
         );
     }
 
-    // ── source-flip regression: the hot path decides "in sync" from the
+    // ── source flip: the hot path decides "in sync" from the
     //    COMMITTED copy before any service call, so a service ↔ local flip
     //    between runs is a byte-identical no-op with no request. ──
 

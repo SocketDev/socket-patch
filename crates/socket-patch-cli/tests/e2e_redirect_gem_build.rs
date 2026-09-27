@@ -44,7 +44,7 @@
 //! `gems.rb`/`gems.locked` spelling (which bundler prefers over `Gemfile`
 //! when both exist — this pins the candidate-list + rewriter support).
 //!
-//! The `get <uuid> --mode hosted` twin (v3.6) drives the SAME fixture
+//! The `get <uuid> --mode hosted` twin (v4.0) drives the SAME fixture
 //! through get's per-advisory selector instead of scan — same hosted engine
 //! by construction (CLI_CONTRACT.md "get --mode and installed narrowing"):
 //! identical Gemfile/lock rewrite + ledger, get's envelope (nested
@@ -392,7 +392,7 @@ enum Driver {
     /// recipe with the in-run (unverified) attestation.
     ScanVex,
     /// `get <uuid> --mode hosted --json --yes` — get's per-advisory
-    /// selector (v3.6). No `--vex` (get has none); the uuid path needs only
+    /// selector (v4.0). No `--vex` (get has none); the uuid path needs only
     /// the view + reference mocks and is exempt from installed narrowing.
     GetUuid,
 }
@@ -484,8 +484,9 @@ fn run_hosted_scan(proj: &Path, api: &str) -> (i32, String, String) {
 /// and assert the redirect envelope + Gemfile rewrite. `checksums_lock` opts
 /// the fixture lock into a CHECKSUMS section (`bundle lock --add-checksums`);
 /// `registry_declares_deps` toggles the patch registry's `/info` between the
-/// CORRECT contract (runtime deps declared) and today's production-like
-/// deps-less answer. `rotated_token` = Some(token B) arms a grant-rotation
+/// CORRECT contract (runtime deps declared) and production's HISTORICAL
+/// deps-less answer (fixed by the 2026-08-18 republish). `rotated_token` =
+/// Some(token B) arms a grant-rotation
 /// plan: the `TOKEN` grant answers the first two reference calls, token B
 /// (same uuid) every later one, and the patch registry serves both token
 /// paths (production keeps a grant alive until it expires). `None` = skip
@@ -977,8 +978,9 @@ fn assert_patched_install(fx: &RedirectFixture, fresh: &Path) {
     );
     // The deps contract: `tiny-dep` reaches the install ONLY through the
     // patch registry's `/info` declaring it (the fresh resolution re-derives
-    // vuln-gem's dependencies from that answer — production's deps-less
-    // answer drops it, see the red-arm twin).
+    // vuln-gem's dependencies from that answer — a deps-less answer
+    // (production's historical defect, reproduced by the red-arm twin) drops
+    // it).
     assert!(
         fresh_installed_lib(fresh, &format!("{TRANSITIVE}-1.0.0"), "tiny_dep.rb").is_file(),
         "the runtime dependency must install alongside the patched gem"
@@ -1154,7 +1156,8 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
 /// `git checkout`): the Gemfile still carries the patch-registry source
 /// block, the lock resolves the gem from upstream. Bundler re-resolves from
 /// the Gemfile — proven here with the REAL bundler — so the ledger keeps the
-/// patch live (vex_sources `redirect_record_live` step 0), while a
+/// patch live (`Discovery::redirect_record_live` step 0 in socket-patch-core
+/// vex/discover), while a
 /// ledger-less checkout has nothing discovery reads until that install
 /// re-converges the lock, after which it attests from the lock alone.
 async fn lock_only_revert_reconverges(fx: &RedirectFixture) {
@@ -1287,7 +1290,7 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
     lock_only_revert_reconverges(&fx).await;
 }
 
-/// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v3.6,
+/// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v4.0,
 /// the per-advisory selector) must leave the same committable redirect
 /// state as `scan --mode hosted` — same Gemfile source block, same ledger,
 /// NO manifest, NO blobs — proven the same way against the REAL bundler: a
@@ -1547,8 +1550,8 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
     // rewrite): discovery reads it AND its CHECKSUMS pin.
     manifestless_vex_matrix(&fx, &frozen).await;
 
-    // UNFROZEN fresh checkout: the previously-pinned exit 37 "mismatched
-    // checksums" refusal is gone too.
+    // UNFROZEN fresh checkout: no exit 37 "mismatched checksums" refusal
+    // either.
     let (fresh, install) = fresh_checkout_bundle_install(&fx);
     assert!(
         install.status.success(),
@@ -1567,10 +1570,9 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
 /// grant, (2) refresh the source block's URL IN PLACE under a rotated grant —
 /// exactly one Socket source block, a `redirect_gemfile_source_url` ledger
 /// edit, no stale token anywhere — and (3) leave a pair a fresh checkout
-/// installs the patched bytes from. Before the fix, the rotated re-scan
-/// wrapped the old block's indented gem line in a new NESTED source block
-/// (+1 nesting per re-scan), kept the stale token URL live, and still
-/// reported success.
+/// installs the patched bytes from — never wrap the old block's indented
+/// gem line in a new NESTED source block (+1 nesting per re-scan) with the
+/// stale token URL still live.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]

@@ -191,11 +191,10 @@ fn rollback_cmd(cwd: &Path) -> Command {
     cmd
 }
 
-/// THE regression: an online rollback must download a before-blob that only
-/// a NESTED duplicate copy needs. The gate used to verify the root copy
-/// alone — already original, so "no blob needed" — skip the download, and
-/// the loop then failed the nested copy with `MissingBlob` while it stayed
-/// patched. Retrying could never succeed.
+/// An online rollback must download a before-blob that only a NESTED
+/// duplicate copy needs. A gate that verified the root copy alone (already
+/// original, so "no blob needed") would skip the download and fail the
+/// nested copy with `MissingBlob` while it stayed patched, forever.
 #[test]
 fn rollback_downloads_blob_needed_only_by_nested_duplicate_copy() {
     let tmp = tempfile::tempdir().unwrap();

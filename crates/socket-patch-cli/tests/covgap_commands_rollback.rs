@@ -1,21 +1,21 @@
-//! Coverage-gap tests for `commands/rollback.rs` (2026-09 audit).
+//! Coverage-gap tests for `commands/rollback.rs`. Sections:
 //!
-//! Five themes the existing rollback suites never exercised:
-//!
-//!   1. HUMAN-mode output — nearly every prior rollback test runs `--json`
-//!      or `--silent`, so the dry-run summary, wet-run messages, verbose
-//!      per-file details, preserve-state closing message, and the
-//!      error-class stderr notices had never rendered;
-//!   2. failure legs of the vendored and hosted rollback (unknown-backend
-//!      revert failure, ledger save/persist failure, replay refusal,
-//!      per-purl revert I/O failure, corrupt ledgers);
-//!   3. scope plumbing gaps (path globs selecting vendored/hosted entries,
-//!      `--ecosystems` narrowing both non-manifest legs, the multi-copy
-//!      out-of-scope warning);
-//!   4. the interactive confirm DECLINE (PTY-driven, like
-//!      `interactive_prompts_e2e.rs`);
-//!   5. boundary error envelopes (corrupt manifest, blobs-path-is-a-file
-//!      legacy error shape, lock contention).
+//! 1. HUMAN-mode output — the dry-run summary, wet-run messages, verbose
+//!    per-file details, preserve-state closing message, and the
+//!    error-class stderr notices (other suites run `--json`/`--silent`);
+//! 2. failure legs of the vendored and hosted rollback (unknown-backend
+//!    revert failure, ledger save/persist failure, replay refusal,
+//!    per-purl revert I/O failure, corrupt ledgers);
+//! 3. GC-failure warnings (unix permissions);
+//! 4. manifest-write failure (macOS immutable flag);
+//! 5. the interactive confirm DECLINE (PTY-driven, like
+//!    `interactive_prompts_e2e.rs`);
+//! 6. mop-up arms: boundary error envelopes (corrupt manifest,
+//!    blobs-path-is-a-file legacy error shape, lock contention), scope
+//!    isolation (path globs, `--ecosystems` narrowing both non-manifest
+//!    legs, the multi-copy out-of-scope warning), variant + redirect
+//!    routing;
+//! 7. the hosted vlt heal.
 //!
 //! Binary-driven throughout (the `rollback_duality_invariants.rs` shape):
 //! `SOCKET_*`-scrubbed child processes via `common::run`, hand-written
@@ -372,7 +372,7 @@ fn human_wet_reports_already_original_and_not_installed() {
 
 /// `--verbose` per-file details on a hash-mismatch failure: the humanized
 /// `[hash mismatch]` label plus the `message:` and `expected:` lines
-/// (populated exactly on this status) — and the wet "Failed to rollback:"
+/// (populated exactly on this status) — and the wet "Failed to roll back:"
 /// section with exit 1.
 #[test]
 fn human_verbose_hash_mismatch_details() {

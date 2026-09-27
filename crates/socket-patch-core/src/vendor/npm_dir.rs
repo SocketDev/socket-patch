@@ -1,4 +1,4 @@
-//! Directory artifacts for the vlt backend (DESIGN §4.2–§4.4).
+//! Directory artifacts for the vlt backend.
 //!
 //! vlt installs a `file:` directory dependency by linking it, so the vendored
 //! artifact is the patched package directory itself, laid out as
@@ -15,7 +15,7 @@
 //! packages publish) while keeping vlt's links out, and `<uuid>/.gitattributes`
 //! stops EOL conversion from rewriting the payload on a Windows checkout.
 //!
-//! Two deterministic transforms run on every tree, service-built or local:
+//! One deterministic transform runs on every tree, service-built or local:
 //! the top-level `devDependencies` member is cut out of `package.json` (vlt
 //! installs a `file` node's devDependencies), and nothing else changes. The
 //! verifiers then apply the vlt manifest exemption ([`super::verify`]).
@@ -206,7 +206,7 @@ pub(crate) enum SpanError {
     NotString,
 }
 
-/// DESIGN §4.4: `package.json` with its top-level `devDependencies` member
+/// `package.json` with its top-level `devDependencies` member
 /// cut out as a byte span (key, colon, value and the whitespace between
 /// them, plus the following comma and the run up to the next token, else
 /// the preceding comma). `Ok(None)` when the member is absent.
@@ -270,8 +270,8 @@ pub(crate) fn replace_dependency_token(
     Ok(format!("{}{raw}{}", &text[..start], &text[end..]))
 }
 
-/// The §4.4 transform on a staged tree's `package.json`. A refusal is the
-/// ready outcome.
+/// The `devDependencies` strip on a staged tree's `package.json`. A
+/// refusal is the ready outcome.
 async fn apply_transforms(
     stage: &Path,
     name: &str,
@@ -302,7 +302,7 @@ async fn apply_transforms(
 
 // ── tree checks ──────────────────────────────────────────────────────────
 
-/// DESIGN §4.2 structure rule: `<uuid>/<leaf>/node_modules/` holds exactly
+/// The structure rule: `<uuid>/<leaf>/node_modules/` holds exactly
 /// the package dir (for a scoped name, exactly `@scope/` holding exactly
 /// `<bare>`). `rel_abs` is the package dir.
 pub(crate) async fn structure_rule_holds(rel_abs: &Path, name: &str) -> bool {
@@ -430,7 +430,7 @@ async fn git_output(
     ))
 }
 
-/// DESIGN §4.2 probe: `git check-ignore -v --no-index` over `paths`
+/// `git check-ignore -v --no-index` over `paths`
 /// (project-relative). `Some(rules)` names what ignores them; `None` when
 /// nothing is ignored, git is absent or the root is not a work tree, and
 /// also when git could not answer (see [`gitignore_probe`] for the
@@ -528,7 +528,7 @@ pub(crate) fn gitignored_detail(rel: &str, rules: &str) -> String {
 
 // ── pipeline ─────────────────────────────────────────────────────────────
 
-/// DESIGN §4.3: reuse the committed dir, else build it from the patch
+/// Reuse the committed dir, else build it from the patch
 /// service or the installed copy, then write it into place. Same result
 /// shape as [`super::npm_common::stage_patch_pack`]: `Err` is a refusal or
 /// a failure with the project untouched, `Ok((None, _))` a failed patch or
@@ -726,7 +726,7 @@ pub(super) async fn stage_patch_dir(
     ))
 }
 
-/// DESIGN §4.3 step 5 on any staged tree: prune its `node_modules/` and
+/// On any staged tree: prune its `node_modules/` and
 /// refuse a package that bundles dependencies.
 async fn prune_staged_node_modules(
     purl: &str,

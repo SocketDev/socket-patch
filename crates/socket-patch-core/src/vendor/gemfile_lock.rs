@@ -243,8 +243,9 @@ pub(crate) fn parse(text: &str) -> GemfileLock<'_> {
 
 /// The plain gem-token charset (letters, digits, `.`, `_`, `-`). The vendor
 /// backend applies it before embedding coordinates into Ruby source and lock
-/// line grammar (see the SECURITY note on [`crate::vendor::gem::vendor_gem`]),
-/// so it is deliberately stricter than the path-level segment guard.
+/// line grammar (see the SECURITY note in `crate::vendor::gem`'s
+/// `gem_prelude`, which [`crate::vendor::gem::vendor_gem`] runs first), so it
+/// is deliberately stricter than the path-level segment guard.
 pub(crate) fn is_plain_gem_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars()

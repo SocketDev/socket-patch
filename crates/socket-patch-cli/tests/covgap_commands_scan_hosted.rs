@@ -1,6 +1,6 @@
-//! Coverage-gap tests for `commands/scan/hosted.rs` (coverage audit 2026-09).
+//! Coverage-gap tests for `commands/scan/hosted.rs`.
 //!
-//! Targets the audited never-executed branches of `run_redirect_selected`:
+//! Targets otherwise-untested branches of `run_redirect_selected`:
 //! the `bad_purl` / `no_url` reference skips, the WET takeover refusal
 //! (vendored revert fails closed) and its refused-purl cleanup, the cargo
 //! socket-owned-wiring-without-ledger refusal, the bun.lockb dry-run /
@@ -388,7 +388,7 @@ fn warning_detail<'a>(doc: &'a Value, code: &str) -> &'a str {
         .unwrap_or_else(|| panic!("expected a `{code}` warning: {doc:#}"))
 }
 
-// ───────────────────── reference-skip reasons (835-844) ─────────────────────
+// ───────────────────── reference-skip reasons ─────────────────────
 
 /// A granted reference whose purl fails `parse_purl_simple` is skipped with
 /// reason `bad_purl` — never redirected, never recorded — and the project is
@@ -883,7 +883,8 @@ async fn zero_grant_wet_run_reports_a_malformed_ledger_without_moving_it() {
     assert_eq!(std::fs::read(&ledger).unwrap(), TORN);
 }
 
-/// The hosted `lock_io` envelope (contract §123/§138): a regular file
+/// The hosted `lock_io` envelope (CLI_CONTRACT.md "Lock lifecycle (v5.0)" and
+/// the hosted-mode "Lock (v5.0)" clause): a regular file
 /// squatting on `.socket/` makes the wet run's lock acquire fail with an I/O
 /// fault, not contention — top-level `errorCode: "lock_io"`, a string
 /// `error` naming the squatting path, `redirect: {mode: "hosted"}` retained,
@@ -946,8 +947,8 @@ async fn hosted_lock_io_when_a_file_squats_on_socket_dir() {
 /// `scan --mode hosted --yes` (human) and `scan --mode hosted --json`, each
 /// on a fresh project, `.socket/` holds exactly `vendor/` (the redirect
 /// ledger's home) — no `apply.lock` outlives the run, nothing else is
-/// created. The `--yes` human run also never prints the `Non-interactive
-/// mode detected` auto-accept line: the prompt is skipped, not answered.
+/// created. The human run also never prints the `Non-interactive mode
+/// detected` auto-accept line: scan never prompts.
 #[tokio::test]
 async fn successful_wet_hosted_run_leaves_only_vendor_under_socket() {
     let server = MockServer::start().await;
@@ -964,7 +965,7 @@ async fn successful_wet_hosted_run_leaves_only_vendor_under_socket() {
         names
     };
 
-    // Human `--yes` arm.
+    // Human arm.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_npm_project(root, NAME);
@@ -1125,7 +1126,7 @@ async fn hosted_human_paid_only_discovery_stops_with_the_paid_hint() {
     server.verify().await;
 }
 
-// ───────────── cargo wiring-without-ledger refusal (1104-1114) ─────────────
+// ───────────── cargo wiring-without-ledger refusal ─────────────
 
 /// A cargo purl with SOCKET-OWNED `[patch.crates-io]` wiring — pre-v5 in
 /// .cargo/config.toml, or v5 in the root Cargo.toml — but NO vendored ledger
@@ -1769,7 +1770,7 @@ async fn malformed_bun_lockb_beside_pnpm_lock_is_not_confirmed() {
     );
 }
 
-// ───────────── live unreadable pnpm-workspace.yaml fallback (1450) ─────────────
+// ───────────── live unreadable pnpm-workspace.yaml fallback ─────────────
 
 /// Production wiring of the present-but-unreadable pnpm-workspace.yaml arm
 /// (the exact seam where a Create once overwrote the user's workspace file):
@@ -1833,7 +1834,7 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
     );
 }
 
-// ──────────── redirect_supersedes_vendored (1723-1726 + human) ────────────
+// ──────────── redirect_supersedes_vendored (+ human) ────────────
 
 /// The hosted-direction takeover warning: a LIVE lock routing package X to
 /// its hosted artifact while BOTH ledgers still claim X (redirect records +
@@ -2164,7 +2165,7 @@ async fn human_rush_run_prints_the_repo_state_stale_warning_line() {
     );
 }
 
-// ───────── ledger save failure after a successful revert (1065-1079) ─────────
+// ───────── ledger save failure after a successful revert ─────────
 
 /// save_state failure AFTER a successful takeover revert: the wiring is gone
 /// but the vendored ledger still claims it, so the purl must fail CLOSED —
@@ -2287,7 +2288,7 @@ async fn human_reference_failure_prints_an_error_line_and_exits_1() {
 }
 
 /// A malformed redirect ledger aborts with an `Error: The redirect ledger
-/// ...` line (it used to print a bare lowercase sentence).
+/// ...` line.
 #[tokio::test]
 async fn human_malformed_ledger_prints_an_error_prefix() {
     let server = MockServer::start().await;
@@ -2386,8 +2387,8 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
 }
 
 /// A granted patch whose package has no lock entry is listed by purl on
-/// stderr (it used to vanish: only a raw rewriter warning hinted at it),
-/// under a `No patches could be redirected:` headline when nothing was.
+/// stderr (not just hinted at by a raw rewriter warning), under a
+/// `No patches could be redirected:` headline when nothing was.
 #[tokio::test]
 async fn human_unconfirmed_purl_is_listed_with_a_headline() {
     let server = MockServer::start().await;

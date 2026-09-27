@@ -531,8 +531,8 @@ impl RubyCrawler {
     /// caller that swaps `PATH` or `GEM_HOME` still asks afresh. Only a
     /// complete answer is kept: a failed ask (spawn error under fd pressure,
     /// a non-zero exit from a racing shim, empty output) is asked again by
-    /// the next caller, as every caller used to ask — and so is an answer
-    /// the environment changed under, which the key would misfile.
+    /// the next caller — and so is an answer the environment changed under,
+    /// which the key would misfile.
     async fn gem_env_homes() -> GemEnvHomes {
         static MEMO: once_cell::sync::Lazy<GemEnvMemo> =
             once_cell::sync::Lazy::new(Default::default);
@@ -1232,16 +1232,15 @@ mod tests {
         assert_eq!(found, HashSet::from([ruby_gems, jruby_gems, truffle_gems]));
     }
 
-    // ── bundler-1 flat BUNDLE_PATH layout (gem live-matrix D1) ─────
+    // ── bundler-1 flat BUNDLE_PATH layout ─────
 
     /// Bundler 1 with `BUNDLE_PATH` set via the ENVIRONMENT installs
     /// GEM_HOME-style into the flat `<BUNDLE_PATH>/gems/` — no
     /// `<engine>/<abi>` scope segment, sibling `specifications/` dir
-    /// present (bundler >= 2 appends the scope even for env installs).
-    /// The crawler only enumerated the scoped layout, so such projects
-    /// scanned as `notInstalled` and `get` downloaded 1 / applied 0
-    /// (live-verified 2026-08-19: activestorage@6.0.3 under bundler
-    /// 1.17.3 at `vendor/bundle/gems/activestorage-6.0.3`).
+    /// present (bundler >= 2 appends the scope even for env installs),
+    /// e.g. activestorage@6.0.3 under bundler 1.17.3 at
+    /// `vendor/bundle/gems/activestorage-6.0.3`. Enumerating only the
+    /// scoped layout would scan such projects as `notInstalled`.
     #[tokio::test]
     async fn get_vendor_bundle_paths_flat_bundler1_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1582,8 +1581,7 @@ mod tests {
     /// `.bundle/config` `BUNDLE_PATH:` first, then the `BUNDLE_PATH`
     /// environment variable, then the implicit `vendor/bundle` default —
     /// so the stores come back highest-precedence first and first-wins
-    /// consumers pick the copy bundler actually loads. The pre-fix order
-    /// (default → env → config) was bundler's precedence inverted.
+    /// consumers pick the copy bundler actually loads.
     #[tokio::test]
     async fn bundle_roots_probe_in_bundler_precedence_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -1889,8 +1887,8 @@ mod tests {
     // ── env BUNDLE_PATH `~` expansion + normalization ──────────────
 
     /// A leading `~/` in the env `BUNDLE_PATH` expands against HOME
-    /// (bundler `File.expand_path`s the value); it used to resolve as a
-    /// literal `<cwd>/~/...` relative path and discover nothing.
+    /// (bundler `File.expand_path`s the value), not as a literal
+    /// `<cwd>/~/...` relative path.
     #[tokio::test]
     async fn bundle_path_env_tilde_expands_against_home() {
         let dir = tempfile::tempdir().unwrap();

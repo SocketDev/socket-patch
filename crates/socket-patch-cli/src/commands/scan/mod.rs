@@ -69,8 +69,8 @@ use self::vendor_flow::{
 const DEFAULT_BATCH_SIZE: usize = 500;
 
 /// Packages per batch request on the public proxy when `--batch-size` is
-/// not given. The proxy is shared and unauthenticated, so it keeps the
-/// historical size.
+/// not given. The proxy is shared and unauthenticated, so it keeps a
+/// smaller size.
 const DEFAULT_PROXY_BATCH_SIZE: usize = 100;
 
 /// Upper bound on one batch request's JSON body. A chunk whose purls would
@@ -147,11 +147,9 @@ pub enum ScanMode {
     /// Rewrite lockfiles so only patched dependencies resolve to Socket's
     /// hosted patch server: no artifact bytes land in the repo, but
     /// installs must reach the patch server
-    // Equivalent to the hidden `--redirect` boolean. Hidden value aliases
-    // mirror the legacy flag spellings symmetrically: `host` matches the
-    // old mode name, `redirect` matches the `--redirect` boolean (vendored
-    // accepts `vendor` for the same reason; `apply` is NOT an alias of
-    // agent — applying is not a scan mode name anywhere else).
+    // Equivalent to the hidden `--redirect` boolean. The hidden value
+    // aliases mirror legacy spellings (`apply` is deliberately NOT an alias
+    // of agent).
     #[value(alias = "host", alias = "redirect")]
     Hosted,
     /// Commit patched artifacts to `.socket/vendor/`: hermetic,
@@ -196,9 +194,8 @@ impl ScanMode {
 ///   Hosted mode runs no GC, so `--mode hosted --prune` stays accepted but
 ///   emits an explicit `redirect_prune_ignored` warning in `run` rather
 ///   than silently dropping the flag.
-/// * `--detached` requires vendored mode in either spelling. The former
-///   clap-level `requires = "vendor"` couldn't see `--mode vendored`, so
-///   the requirement moved here too.
+/// * `--detached` requires vendored mode in either spelling (clap's
+///   `requires = "vendor"` cannot see `--mode vendored`).
 ///
 /// Public (not `pub(crate)`) so the CLI-contract tests can exercise the
 /// fold without driving a full `run()`.
@@ -289,11 +286,8 @@ pub struct ScanArgs {
     #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE")]
     pub batch_size: Option<usize>,
 
-    /// Deprecated spelling of `--mode agent`. With `--json`, download and
-    /// apply the selected patches without prompting (without a mode,
-    /// `scan --json` only reports). Without `--json` it asks first on a
-    /// terminal and proceeds otherwise, whereas a scan with no mode and no
-    /// `--yes` only reports when stdin is not a terminal
+    /// Deprecated spelling of `--mode agent`: download the selected patches
+    /// and apply them in place
     #[arg(long, default_value_t = false)]
     pub apply: bool,
 
@@ -307,8 +301,8 @@ pub struct ScanArgs {
     pub prune: bool,
 
     /// Shorthand for `--mode agent --prune`: a cron job or CI workflow can
-    /// run `socket-patch scan --json --sync --yes` to end up fully
-    /// reconciled in one invocation
+    /// run `socket-patch scan --json --sync` to end up fully reconciled in
+    /// one invocation
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
@@ -331,22 +325,13 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false, hide = true)]
     pub detached: bool,
 
-    /// Redirect every patched dependency to Socket's HOSTED vendored patches
-    /// by rewriting lockfiles/registry configs so ONLY the patched dependency
-    /// points at the patch-server (`--patch-server-url`), instead of applying
-    /// patches in place or ejecting local artifacts. This is the remote
-    /// counterpart of `--vendor`: no artifact bytes land in the repo — the
-    /// lockfile pins the hosted URL + integrity (npm/pypi/composer) or a
-    /// per-dependency registry override (cargo/nuget/gem/…). Conflicts with
-    /// `--apply`/`--sync`/`--vendor`. Hidden from help: the flag is
-    /// unreleased and `--mode hosted` is the documented spelling.
+    // Hidden legacy spelling of `--mode hosted`.
     #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync", "vendor"])]
     pub redirect: bool,
 
-    /// How discovered patches are consumed. Without a mode, an interactive
-    /// scan offers to apply them in place and `scan --json` only reports.
-    /// `--vendor` and `--apply` are older spellings of `--mode vendored`
-    /// and `--mode agent`
+    /// How discovered patches are consumed [default: hosted]. A `--prune`
+    /// or `--global` scan with no mode only reports. `--vendor` and
+    /// `--apply` are older spellings of `--mode vendored` and `--mode agent`
     // Each mode is equivalent to one boolean flag (hosted == the hidden
     // `--redirect`, vendored == `--vendor`, agent == `--apply`/`--sync`).
     // Combining `--mode` with a boolean from a DIFFERENT mode is rejected in
@@ -552,24 +537,18 @@ async fn embed_vex_human(
 
 /// The per-package discovery + selection step shared by the apply, vendor,
 /// and redirect flows: search each patched package's full patch list, then
-/// resolve the newest accessible patch per PURL. Per-package search errors
-/// are skipped — but when EVERY query errors the step produced no
-/// trustworthy patch data at all, and reporting the empty set would be
-/// indistinguishable from a genuine "no patches" result (the same masking
-/// the batch loop in `run` guards against), so that surfaces as `Err(1)`
-/// with the failure on stderr. Selects with [`selection_args`]:
-/// scan-driven workflows have no "specify --id" option, so non-TTY runs
-/// auto-select the newest patch rather than erroring with
-/// `selection_required`. `Err` carries the exit code AND the message: the
-/// JSON callers must fold it into their envelope (every `--json`
-/// invocation emits exactly one JSON object — see CLI_CONTRACT.md), so
-/// the stderr line alone is not enough. `show_progress` / `warn` are the
-/// human-only output knobs of [`fetch_patch_details`] (the JSON callers pass
-/// `false, false`; the hosted human arm passes the same values as the agent
-/// human arm, so the two print the same progress counter and per-package
-/// warnings). `json_warnings` is the JSON callers' envelope: a partial
-/// failure (some queries failed, not all) adds one
-/// [`PATCH_DETAILS_FAILED`] run-level warning per failed package to it.
+/// resolve the top-ranked accessible patch per PURL. Per-package search
+/// errors are skipped, but when EVERY query errors the empty set would be
+/// indistinguishable from a genuine "no patches" result, so that surfaces
+/// as `Err(1)` with the failure on stderr. Selects with [`selection_args`]:
+/// scan never prompts, so every run auto-selects the top-ranked patch (see
+/// `api::ranking`) rather than erroring with `selection_required`. `Err`
+/// carries the exit code AND the message, since JSON callers must fold it
+/// into their single envelope (CLI_CONTRACT.md). `show_progress` / `warn`
+/// are the human-only knobs of [`fetch_patch_details`] (JSON callers pass
+/// `false, false`). `json_warnings` is the JSON callers' envelope: a
+/// partial failure adds one [`PATCH_DETAILS_FAILED`] warning per failed
+/// package to it.
 #[allow(clippy::too_many_arguments)]
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
@@ -584,8 +563,8 @@ async fn discover_selected(
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
     // The scan event's send overlapped the detail fetches; every caller's
-    // next output (the error line below, a `--json` envelope, a prompt)
-    // must find it delivered.
+    // next output (the error line below, a `--json` envelope) must find it
+    // delivered.
     telemetry.flush().await;
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
@@ -613,11 +592,8 @@ async fn discover_selected(
         return Ok(Vec::new());
     }
     if common.json {
-        // A `--json` run must never open the interactive menu (it would
-        // pop up over a machine-read stream on a TTY): pick the top-ranked
-        // accessible patch per PURL, exactly what a non-TTY run does.
-        // `select_patches` takes the top-ranked patch without prompting
-        // when every candidate is accessible, so pre-filter to those.
+        // Pre-filter to accessible patches so `select_patches` takes the
+        // top-ranked one per PURL.
         let accessible: Vec<PatchSearchResult> = all_search_results
             .into_iter()
             .filter(|p| can_access_paid_patches || p.tier == "free")
@@ -714,7 +690,7 @@ async fn fetch_patch_details(
 /// The human hosted arm's stand-in for the lenient loader's advisory: a
 /// malformed redirect ledger the engine would report as a hard error, on a
 /// run that returned BEFORE the engine (empty discovery, nothing
-/// downloadable, a detail-fetch failure, a declined confirm). Read-only —
+/// downloadable, a detail-fetch failure). Read-only —
 /// the file is never moved; `--silent` mutes it like every advisory.
 fn warn_unreported_corrupt_ledger(common: &crate::args::GlobalArgs, corrupt: Option<&str>) {
     if let Some(corrupt) = corrupt {
@@ -791,10 +767,6 @@ fn partition_agent_selection(
     }
 }
 
-/// The `DownloadParams` every scan-driven download shares. Only the output
-/// shape (`json`/`silent`) and `save_only` differ per flow; vendored mode
-/// never persists blobs (its records stay in memory and the vendor step
-/// consumes the staged sources).
 /// The ecosystems a scan crawls (`None`: every one). `--ecosystems`
 /// narrows everything the run counts, queries and shows to the named
 /// ecosystems, so without a GC the other crawlers' output would only be
@@ -810,6 +782,10 @@ fn crawl_scope(prune: bool, ecosystems: Option<&[String]>) -> Option<&[String]> 
     }
 }
 
+/// The `DownloadParams` every scan-driven download shares. Only the output
+/// shape (`json`/`silent`) and `save_only` differ per flow; vendored mode
+/// never persists blobs (its records stay in memory and the vendor step
+/// consumes the staged sources).
 fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
@@ -845,26 +821,19 @@ fn download_run<'a>(args: &ScanArgs, api_client: &'a ApiClient) -> DownloadRun<'
 //
 // Hosted mode writes `.socket/vendor/redirect-state.json`; vendored mode
 // writes `.socket/vendor/state.json` (+ committed tarballs). Switching a
-// project's mode rewires the lockfile to the NEW mode but leaves the OLD
-// mode's ledger on disk asserting wiring that is no longer live (and, for
-// vendored→hosted, the orphaned tarball behind). Anything auditing a ledger
-// as "what is live" (including `vex`) is then misled. Detect the overlap so
-// each flow can warn. Reconciliation is per direction: the VENDORED flows
-// clean the superseded redirect-ledger halves themselves (cargo via
-// `revert_cargo_redirect_purl` before vendoring, npm-family via
-// `note_vendor_supersedes_redirect` after — always announced by the
-// takeover warning, never silent); the HOSTED direction stays warn-only
-// (removing a vendored ledger entry means deleting committed artifacts —
-// `remove <purl>`'s job, on the operator's say-so).
+// project's mode rewires the lockfile but leaves the OLD mode's ledger on
+// disk asserting wiring that is no longer live, which misleads anything
+// auditing a ledger (including `vex`). Detect the overlap so each flow can
+// warn. The VENDORED flows clean the superseded redirect-ledger halves
+// themselves (always announced); the HOSTED direction stays warn-only
+// (removing a vendored entry deletes committed artifacts — `remove
+// <purl>`'s job).
 //
-// The overlap alone only proves BOTH ledgers name the same package(s) — NOT
-// which one won. The takeover DIRECTION is decided by the ACTUAL current
-// lockfile wiring for each overlapping package (see `classify_overlap_takeover`),
-// never by which command happens to be running: a hosted dry-run/no-op over a
-// lock that still points at the vendored files must not tell the user to delete
-// the live vendored ledger (and vice-versa). Remediation always points at the
-// ledger that does NOT match the live lock; a package the lock proves neither
-// way stays silent.
+// The overlap only proves BOTH ledgers name the package, not which won. The
+// takeover DIRECTION comes from the current lockfile wiring per package
+// (`classify_overlap_takeover`), never from which command is running;
+// remediation points at the ledger that does NOT match the live lock, and a
+// package the lock proves neither way stays silent.
 
 /// Warning code emitted by the HOSTED flow when it just redirected package(s)
 /// a committed vendored ledger still claims (its tarballs are now orphaned).
@@ -875,12 +844,10 @@ pub(super) const REDIRECT_SUPERSEDES_VENDORED: &str = "redirect_supersedes_vendo
 pub(super) const VENDOR_SUPERSEDES_REDIRECT: &str = "vendor_supersedes_redirect";
 
 /// Warning code + detail emitted when `--prune` is combined with
-/// `--mode hosted`: both hosted terminals return before the GC blocks, so
-/// the flag would otherwise be silently dropped — a bot migrating its sync
-/// job from `--mode agent --prune` to `--mode hosted --prune` would stop
-/// pruning forever with exit 0 and no signal. `--prune` stays accepted
-/// (CLI_CONTRACT.md: an orthogonal GC knob, never a usage error), but the
-/// no-op must be explicit in both the JSON `warnings[]` and stderr.
+/// `--mode hosted`: the hosted flow runs no GC, so the flag would otherwise
+/// be silently dropped. `--prune` stays accepted (CLI_CONTRACT.md: an
+/// orthogonal GC knob, never a usage error), but the no-op is explicit in
+/// both the JSON `warnings[]` and stderr.
 pub(super) const REDIRECT_PRUNE_IGNORED: &str = "redirect_prune_ignored";
 pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
     "--prune has no effect with --mode hosted: the hosted flow rewrites lockfiles only and \
@@ -889,15 +856,10 @@ pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
 
 /// The PURLs claimed by BOTH the hosted redirect ledger
 /// (`.socket/vendor/redirect-state.json`) and the vendored state ledger
-/// (`.socket/vendor/state.json`), sorted, over ALREADY-LOADED ledgers —
-/// loads nothing, so a flow holding both in memory (the hosted engine,
-/// post-merge) shares its copies instead of re-reading them. A non-empty
-/// result means one mode has taken the lockfile over from the other for
-/// these package(s) while the displaced mode's ledger stayed on disk —
-/// exactly one of the two ledgers is stale for each PURL (a package's
-/// lockfile entry can point only one way). `None` / an empty vendor ledger
-/// yield the empty overlap; disjoint ledgers (a legitimate split: some
-/// redirected, others vendored) too — so there are no false positives.
+/// (`.socket/vendor/state.json`), sorted, over already-loaded ledgers. A
+/// non-empty result means exactly one of the two ledgers is stale for each
+/// PURL (a lockfile entry can point only one way). `None`, an empty vendor
+/// ledger, or disjoint ledgers (a legitimate split) yield no overlap.
 fn overlap_from_states(
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: &VendorState,
@@ -926,17 +888,13 @@ fn overlap_from_states(
             .collect();
     }
     // The records map can be EMPTY while the ledger still asserts stale lock
-    // wiring: a run where every per-uuid record fetch failed persists its
-    // edits with no records (`record_fetch_failed`). Deriving the redirect
-    // side of the overlap from record keys alone would leave the takeover
-    // machinery blind to exactly that degraded ledger, so fall back to
-    // matching the vendored purls against the recorded edit keys — npm
-    // `node_modules/<name>` (possibly nested), pnpm/yarn/cargo/uv
-    // `<name>@<version>` (vlt `<name>@<version>~<extra>` for a peer or
-    // modifier variant), bun `<prefix>/<name>`, gem/composer/pypi bare
-    // `<name>`. Name-level matching can over-claim across versions, but the
-    // direction gate in `classify_overlap_takeover` still requires the live
-    // lock to prove one side before anything is reported.
+    // wiring (every per-uuid record fetch failed: `record_fetch_failed`), so
+    // fall back to matching the vendored purls against the recorded edit
+    // keys — npm `node_modules/<name>` (possibly nested), pnpm/yarn/cargo/uv
+    // `<name>@<version>` (vlt `<name>@<version>~<extra>`), bun
+    // `<prefix>/<name>`, gem/composer/pypi bare `<name>`. Name-level matching
+    // can over-claim across versions, but `classify_overlap_takeover` still
+    // requires the live lock to prove one side before anything is reported.
     if redirect.edits.is_empty() {
         return Vec::new();
     }
@@ -965,23 +923,15 @@ fn overlap_from_states(
 ///
 /// Both directions are proved by lockfile discovery with the same liveness
 /// rules `vex` gates attestations on (core `Discovery::redirect_record_live`
-/// / `Discovery::vendor_entry_live` — every package manager's lock read
-/// through its extractor, cargo's `Cargo.lock` + `[patch]` shapes included,
-/// with the ledger's recorded files as the fallback for a uuid no read file
-/// mentions). `redirect` holds the overlap PURLs the lock currently routes
-/// to the hosted patch server: hosted genuinely won the lockfile, so the
-/// vendored ledger entry (and its now-orphaned tarball) is the stale one and
-/// `redirect_supersedes_vendored` is truthful. `vendored` holds the PURLs the
-/// lock currently routes to a committed `.socket/vendor/<eco>/<uuid>` artifact:
-/// vendored won, the redirect ledger record is stale, and
-/// `vendor_supersedes_redirect` is truthful.
+/// / `Discovery::vendor_entry_live`). `redirect` holds the overlap PURLs the
+/// lock routes to the hosted patch server (the vendored ledger entry is
+/// stale); `vendored` holds those it routes to a committed
+/// `.socket/vendor/<eco>/<uuid>` artifact (the redirect record is stale).
 ///
 /// A PURL the lock proves NEITHER way — a dry-run/no-op that did not rewire it,
 /// a half-migrated lock naming both, or an ecosystem whose live spec we cannot
-/// read — lands in neither bucket, so the caller stays SILENT instead of
-/// guessing the direction from which command happened to run (the
-/// takeover-direction bug: a hosted no-op pointing cleanup at the live vendored
-/// ledger).
+/// read — lands in neither bucket, so the caller stays SILENT rather than
+/// guessing the direction from which command happened to run.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct OverlapTakeover {
     /// Overlap PURLs whose vendored ledger is stale (lock points hosted).
@@ -1003,12 +953,10 @@ pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -
     classify_overlap_takeover_with(common, cwd, redirect.as_ref(), vendor.as_ref()).await
 }
 
-/// [`classify_overlap_takeover`] over ALREADY-LOADED ledgers: loads neither
-/// (the hosted engine holds both in memory — its post-merge redirect ledger
-/// and the post-takeover vendor ledger — and must classify against those,
-/// never a pre-takeover snapshot) but still reads the LIVE lockfiles in
-/// `cwd`, the truth source for direction. `None` for either ledger yields
-/// no overlap.
+/// [`classify_overlap_takeover`] over already-loaded ledgers (the hosted
+/// engine must classify against its in-memory post-merge / post-takeover
+/// copies, never a pre-takeover snapshot); still reads the LIVE lockfiles
+/// in `cwd`. `None` for either ledger yields no overlap.
 pub(super) async fn classify_overlap_takeover_with(
     common: &GlobalArgs,
     cwd: &Path,
@@ -1078,28 +1026,20 @@ pub(super) async fn classify_overlap_takeover_with(
 /// hosted redirect displaced a vendored ledger, `false` when a vendored run
 /// displaced a hosted redirect ledger.
 ///
-/// The warning fires PER PACKAGE (the direction is proved per purl by the
-/// live lockfile), so the remediation must be per-package and non-destructive
-/// too. It must never tell the user to delete a whole ledger file or a whole
-/// `.socket/vendor/<eco>/` tree: both may still carry LIVE data for packages
-/// this takeover did not touch — the redirect ledger holds other packages'
-/// records (VEX reads them) plus the recorded pre-redirect lockfile originals
-/// (the only revert data), and the `<eco>/` tree holds every vendored uuid
-/// dir, including packages the hosted run skipped.
+/// The warning fires PER PACKAGE, so the remediation is per-package and
+/// non-destructive: never delete a whole ledger file or a whole
+/// `.socket/vendor/<eco>/` tree, which may still carry LIVE data for
+/// packages this takeover did not touch (other records VEX reads, the
+/// pre-redirect originals that are the only revert data, other vendored
+/// uuid dirs).
 ///
-/// Per package also has to mean COMPLETE per package, or the remediation does
-/// not converge:
+/// It must also be COMPLETE per package, or it does not converge:
 ///
 /// * The vendored direction names the package's `edits` entry alongside its
-///   `records` entry. `overlap_from_states` falls back to matching edit
-///   KEYS once `records` is empty (the degraded-ledger blind spot), so a
-///   records-only cleanup that happened to delete the last record left the
-///   package still matching and this warning firing on every later run —
-///   repeating advice the operator had already carried out.
-/// * The hosted direction describes `socket-patch remove`'s full blast radius.
-///   It deletes the package's `.socket/manifest.json` entry too, not just the
-///   vendor ledger entry and artifact dir, and a reader who budgeted for a
-///   ledger-only edit needs to know that before running it with `--yes`.
+///   `records` entry: `overlap_from_states` falls back to edit KEYS once
+///   `records` is empty, so a records-only cleanup keeps this warning firing.
+/// * The hosted direction states `socket-patch remove`'s full blast radius,
+///   including the package's `.socket/manifest.json` entry.
 pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: bool) -> String {
     let list = superseded.join(", ");
     if current_is_hosted {
@@ -1131,9 +1071,7 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
     } else {
         // NEVER advise deleting the redirect ledger by hand: it may hold the
         // only revert data (FileEdit originals) and VEX records for OTHER
-        // packages that are still hosted-redirected. The vendored flows
-        // reconcile per package — reverting the stale hosted edits and
-        // dropping exactly the superseded ledger records.
+        // packages that are still hosted-redirected.
         format!(
             "vendored artifacts superseded the hosted redirect ledger for: {list}. \
              `.socket/vendor/redirect-state.json` still records a hosted redirect for \
@@ -1161,21 +1099,17 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
 }
 
 /// Detail for the vendored-direction takeover warning on the run that
-/// RECONCILED the ledger in place (non-dry-run, npm-family): past tense —
-/// it states what was dropped and where the revert data now lives, so the
-/// operator is told the takeover happened without being handed remediation
-/// that is already done. The warning code stays `vendor_supersedes_redirect`
-/// (envelope contract: codes are additive and stable; only the free-text
-/// detail differs), and it fires exactly once — the reconciled ledger no
-/// longer overlaps, so re-runs stay silent.
+/// RECONCILED the ledger in place (non-dry-run, npm-family): past tense,
+/// stating what was dropped and where the revert data now lives. The code
+/// stays `vendor_supersedes_redirect` (codes are stable; only the detail
+/// differs), and it fires once — the reconciled ledger no longer overlaps.
 pub(super) fn mode_takeover_reconciled_detail(
     reconciled: &[String],
     npmrc_unwound: bool,
 ) -> String {
     let list = reconciled.join(", ");
-    // The `.npmrc` sentence is conditional: only a run that actually
-    // unwound the hosted npm allow-remote auto-config says so, and then the
-    // "restores the hosted wiring" claim gains its npm >= 12 caveat.
+    // Only a run that actually unwound the hosted npm allow-remote
+    // auto-config says so (with its npm >= 12 caveat).
     let npmrc = if npmrc_unwound {
         " The hosted redirect's `.npmrc` `allow-remote=all` auto-config was \
          unwound too (a redirect-created file deleted, an appended line \
@@ -1202,20 +1136,15 @@ pub(super) fn mode_takeover_reconciled_detail(
 }
 
 /// Drop the superseded purls' `records` + `edits` from the redirect ledger
-/// and persist it (atomic write; an emptied ledger is deleted — the same
-/// delete-when-empty contract every other persist follows). Called ONLY with
-/// purls [`classify_overlap_takeover`] proved vendored-live AND hosted-dead
-/// against the LIVE lockfile: the gate that makes the warning truthful is
-/// the one that makes the drop lossless (the vendor ledger's wiring
-/// `original` embeds the hosted-spliced fragment, so `vendor --revert` needs
-/// nothing from these records). `Ok(Some(npmrc))` — reconciled, with the
-/// outcome of the `.npmrc` allow-remote unwind (whether the file changed,
-/// and its advisories for the caller to surface); `Ok(None)` when nothing
-/// matched (degenerate — the caller falls back to the manual advisory
-/// rather than claiming a reconciliation that did not happen); `Err` when
-/// the ledger could not be read back or persisted (fail closed: the atomic
-/// writer leaves the on-disk ledger either untouched or fully pre-drop, and
-/// the caller surfaces the failure inside the warning).
+/// and persist it (atomic write; an emptied ledger is deleted). Called ONLY
+/// with purls [`classify_overlap_takeover`] proved vendored-live AND
+/// hosted-dead: that gate makes the drop lossless (the vendor ledger's
+/// wiring `original` embeds the hosted-spliced fragment, so `vendor
+/// --revert` needs nothing from these records). `Ok(Some(npmrc))`:
+/// reconciled, with the `.npmrc` allow-remote unwind outcome; `Ok(None)`:
+/// nothing matched (caller falls back to the manual advisory); `Err`: the
+/// ledger could not be read or persisted (fail closed: on-disk ledger
+/// untouched or fully pre-drop).
 async fn reconcile_superseded_redirect(
     cwd: &Path,
     purls: &[String],
@@ -1232,14 +1161,10 @@ async fn reconcile_superseded_redirect(
     if !dropped {
         return Ok(None);
     }
-    // The dropped npm purls may have been the last package-lock entries the
-    // hosted `.npmrc` `allow-remote=all` auto-config served: unwind it
-    // (created file deleted / appended line removed) before persisting, so
-    // a hosted→vendored migration leaves no loosened install policy behind.
-    // Vendored `file:` specs never needed it (npm gates them by
-    // `allow-file`, default `all`).
-    // Its outcome (and advisories such as
-    // `redirect_npmrc_allow_remote_modified`) goes back to the caller.
+    // The dropped npm purls may have been the last entries the hosted
+    // `.npmrc` `allow-remote=all` auto-config served: unwind it before
+    // persisting, so a hosted→vendored migration leaves no loosened install
+    // policy behind (vendored `file:` specs are gated by `allow-file`).
     let npmrc =
         socket_patch_core::patch::redirect::npmrc::unwind_unneeded_npmrc(cwd, &mut state, false)
             .await?;
@@ -1273,36 +1198,25 @@ pub(super) fn push_run_warning(
 /// ledger both claim package(s) AND the live lockfile proves vendored won,
 /// the redirect ledger records for those package(s) are stale. Warn once at
 /// the envelope level (JSON `warnings[]` and stderr) — and, for npm-family
-/// package(s) on a non-dry run, reconcile the ledger in place at the same
-/// time (mirroring the cargo branch in `vendor.rs`, which reverts + drops
-/// BEFORE vendoring because `[patch.crates-io]` cannot stack on the hosted
-/// registry pin; npm-family needs no on-disk revert — vendoring already
-/// overwrote the hosted splice and recorded it as the wiring `original`).
-/// Without the drop, the stale records fed VEX/updates forever and this
-/// warning re-fired on every subsequent run (`already_vendored` no-ops drop
-/// nothing). The reverse direction (`redirect_supersedes_vendored`) is
-/// deliberately untouched.
+/// package(s) on a non-dry run, reconcile the ledger in place (cargo
+/// reverts + drops BEFORE vendoring in `vendor.rs`; npm-family needs no
+/// on-disk revert, since vendoring already overwrote the hosted splice and
+/// recorded it as the wiring `original`). The reverse direction
+/// (`redirect_supersedes_vendored`) is deliberately untouched.
 pub(super) async fn note_vendor_supersedes_redirect(
     env: &mut crate::json_envelope::Envelope,
     cwd: &Path,
     common: &GlobalArgs,
 ) {
-    // Only warn for the package(s) the LIVE lockfile actually routes to the
-    // committed `.socket/vendor/` files — the direction the lock proves, not
-    // the fact that this happens to be a vendored flow. A dry-run / no-op
-    // over a lock that still points at the hosted patch server stays silent
-    // instead of pointing cleanup at the live redirect ledger.
+    // Only the package(s) the LIVE lockfile routes to `.socket/vendor/`.
     let superseded = classify_overlap_takeover(common, cwd).await.vendored;
     if superseded.is_empty() {
         return;
     }
-    // Reconciliation is gated three ways, each fail-closed to the manual
-    // advisory: never under --dry-run (this advisory runs even on preview
-    // flows, and a dry run must not mutate the ledger); only npm-family
-    // purls (cargo goes through `revert_cargo_redirect_purl`'s on-disk
-    // revert in vendor.rs, and other ecosystems' vendor wiring has not been
-    // verified to embed the hosted originals); and only purls the live-lock
-    // classification above already proved no longer resolve the hosted URL.
+    // Reconciliation is gated, each fail-closed to the manual advisory:
+    // never under --dry-run; only npm-family purls (cargo reverts in
+    // vendor.rs, and other ecosystems' vendor wiring is not verified to
+    // embed the hosted originals); only purls classified above.
     let (reconcilable, manual): (Vec<String>, Vec<String>) = if common.dry_run {
         (Vec::new(), superseded)
     } else {
@@ -1329,9 +1243,6 @@ pub(super) async fn note_vendor_supersedes_redirect(
                 VENDOR_SUPERSEDES_REDIRECT,
                 mode_takeover_reconciled_detail(&reconcilable, npmrc.file_changed),
             );
-            // The `.npmrc` unwind's own advisories (a redirect-created file
-            // the user has since added to: kept, only our line removed) —
-            // surfaced like rollback / vendor surface them.
             for (code, detail) in npmrc.warnings {
                 push_run_warning(env, common, &code, detail);
             }
@@ -1374,25 +1285,17 @@ fn layout_refusal_json(refusals: &[(String, String)]) -> serde_json::Value {
 // Agent-flow cross-mode visibility (hosted / vendored state left in place)
 // ---------------------------------------------------------------------------
 //
-// The takeover machinery above covers hosted ⇄ vendored — the two modes that
-// COMPETE for lockfile wiring. The agent flow competes with neither (it
-// patches installed trees in place), so running `scan --mode agent` over
-// another mode's live state is not a takeover: nothing goes stale, nothing
-// is mutated. But it IS a mode conversion that silently did not complete,
-// and the envelope said nothing:
+// The agent flow patches installed trees in place, so `scan --mode agent`
+// over another mode's live state is not a takeover, but it IS a mode
+// conversion that did not complete:
 //
-// * over live HOSTED wiring, the agent apply succeeds against the already-
-//   patched bytes while the lockfile keeps resolving to the hosted patch
-//   server and the redirect ledger stays live — and no npm/yarn hosted
-//   revert exists, so the "conversion" can never complete without another
-//   mode run;
-// * over VENDORED ownership, the apply partitions the vendor-owned purls
-//   into `apply.patches[]` skip records (`skipped`/`vendored`) that a
-//   `--json` consumer only finds by digging into the per-patch array.
+// * over live HOSTED wiring, the lockfile keeps resolving to the hosted
+//   patch server and the redirect ledger stays live;
+// * over VENDORED ownership, the vendor-owned purls become `apply.patches[]`
+//   skip records (`skipped`/`vendored`).
 //
-// Both get one additive run-level warning (top-level `warnings[]` on the
-// scan `--json` envelope + stderr when not silent). NEVER a status or
-// exit-code change — hosted refusals set that precedent (exit 0 + warning).
+// Both get one additive run-level warning (top-level `warnings[]` + stderr
+// when not silent). NEVER a status or exit-code change.
 
 /// Warning code: agent-mode scan ran over package(s) whose hosted redirect
 /// wiring is still LIVE (ledger record present AND the lock provably still
@@ -1426,20 +1329,14 @@ pub(super) const PATCH_DETAILS_FAILED: &str = "patch_details_failed";
 /// redirect-ledger attestations on.
 ///
 /// Deliberately NOT routed through [`classify_overlap_takeover`]: that
-/// classifier keys on purls present in BOTH ledgers (hosted ∩ vendored),
-/// so hosted-only wiring — the exact hosted→agent conversion state — can
-/// structurally never trigger it (pinned by
-/// `hosted_only_wiring_is_invisible_to_the_overlap_classifier`).
+/// classifier keys on purls present in BOTH ledgers, so hosted-only wiring
+/// can never trigger it (pinned by
+/// `hosted_only_wiring_fires_agent_probe_not_the_overlap_classifier`).
 ///
-/// Silent-by-construction cases (each pinned by a test):
-/// * ledger absent/malformed or `records` empty — a hosted→vendored
-///   pre-revert that retired the records must retire this warning with
-///   them, even while the append-only `edits` (revert originals) remain;
-/// * purl not scanned this run — the warning only ever names packages the
-///   scan actually covered;
-/// * the live lock does not prove hosted wiring (registry-clean lock, an
-///   ecosystem whose lock we cannot read) — never guess from ledger
-///   presence alone.
+/// Silent cases (each pinned by a test): ledger absent/malformed or
+/// `records` empty (even while `edits` remain); purl not scanned this run;
+/// the live lock does not prove hosted wiring — never guess from ledger
+/// presence alone.
 pub(super) async fn hosted_wiring_retained_purls(
     common: &GlobalArgs,
     redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
@@ -1456,9 +1353,8 @@ pub(super) async fn hosted_wiring_retained_purls(
         .into_iter()
         .map(|p| canon(p.as_ref()))
         .collect();
-    // Cheap no-I/O gate: only ledger records naming a scanned purl can ever
-    // prove live wiring, so when none do (a zero/filtered discovery, or a
-    // ledger about other packages) skip the lockfile proofs below entirely.
+    // Cheap no-I/O gate: skip the lockfile proofs when no record names a
+    // scanned purl.
     let candidates: Vec<(String, &str)> = redirect
         .records
         .iter()
@@ -1537,32 +1433,18 @@ pub(super) fn vendored_ownership_retained_detail(purls: &[String]) -> String {
 /// block rather than a warning — plus the scanned purls whose hosted
 /// lockfile wiring the live lock still proves.
 ///
-/// Before this block, a hosted-wired project's report-only `scan --json`
-/// was byte-identical to a never-touched project's (verified against
-/// production on bundler 1.17/2.7/4.0): [`HOSTED_WIRING_RETAINED`] rides
-/// only the agent-mode envelope, and the `redirect` sub-object only a
-/// hosted-mode run's. `None` (key omitted, additive contract) when the
-/// ledger is absent or its `records` are empty — an edits-only ledger
-/// (post-takeover / degraded) asserts no patches, mirroring the warning's
-/// records gate. This emptiness check is the block's ONE presence
-/// decision; the caller precomputes `wiring_live` (see below) whose own
-/// probe guards its inputs independently for its other callers.
+/// `None` (key omitted, additive contract) when the ledger is absent or its
+/// `records` are empty — an edits-only ledger asserts no patches.
 ///
 /// Shape: `{ mode, ledger, records: [{purl, ledgerKey, uuid}], wiringLive:
-/// [purl] }`. `mode` is the constant [`crate::commands::HOSTED_MODE_LABEL`]
-/// — never the ledger's own opaque `mode` string (pre-rename ledgers carry
-/// `"redirect"`; consumers dispatching on this key must not need that
-/// history). Each record's `purl` is CANONICALIZED (qualifiers stripped,
-/// percent-decoded) to the same spelling `wiringLive` carries, so the
-/// records↔proof join is a plain string compare; `ledgerKey` is the
-/// ledger's verbatim key (percent-encoded scoped names, `?platform=`
-/// qualifiers) for consumers that need to address the ledger itself.
-/// `wiring_live` is the caller's [`hosted_wiring_retained_purls`] result —
-/// computed ONCE per run (it parses the project's lockfiles) and shared
-/// with the agent-flow warning. Records are the ledger's word, wiringLive
-/// the live lock's proof: a record with no proof means the wiring was
-/// unwound, the lock is unreadable, or the purl was not crawled/queried
-/// this run — never "still live".
+/// [purl] }`. `mode` is the constant [`crate::commands::HOSTED_MODE_LABEL`],
+/// never the ledger's own `mode` string (older ledgers carry `"redirect"`).
+/// Each record's `purl` is canonicalized (qualifiers stripped,
+/// percent-decoded) to the spelling `wiringLive` carries; `ledgerKey` is the
+/// ledger's verbatim key. `wiring_live` is the caller's
+/// [`hosted_wiring_retained_purls`] result, computed once per run. A record
+/// with no proof means the wiring was unwound, the lock is unreadable, or
+/// the purl was not crawled this run — never "still live".
 pub(super) fn redirect_state_json(
     redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
     wiring_live: &[String],
@@ -1630,8 +1512,8 @@ fn print_zero_error_envelope(err: &str, paths: &[String]) {
 pub async fn run(args: ScanArgs) -> i32 {
     // Scan's telemetry sends run off the critical path: each is spawned
     // where its event fires and flushed before the first stdout write that
-    // follows it (so a closed pipe's SIGPIPE, or a Ctrl-C at a prompt, still
-    // finds it delivered, as with an inline send). The flush here is the
+    // follows it (so a closed pipe's SIGPIPE or a Ctrl-C still finds it
+    // delivered, as with an inline send). The flush here is the
     // backstop that keeps every event ahead of the process exit.
     let mut telemetry = PendingTelemetry::new();
     let code = Box::pin(run_scan(args, &mut telemetry)).await;
@@ -1700,15 +1582,10 @@ async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i
 async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     apply_env_toggles(&args.common);
 
-    // Fold the legacy mode booleans into `args.mode` before anything reads
-    // it, so every branch below keeps a single source of truth (the enum;
-    // the booleans are never consulted past this point). Cross-mode
-    // combinations get a usage-style error (exit 2, matching clap's
-    // conflict exit code) — see `resolve_mode_flags` for why clap itself
-    // can't express them.
-    // Usage errors (exit 2) print no JSON envelope, even under --json:
-    // they behave like clap's own usage errors, which cannot print one
-    // either (pinned by scan_paths_e2e::paths_with_hosted_or_vendored_mode_exit_2).
+    // Fold the legacy mode booleans into `args.mode` (see
+    // `resolve_mode_flags`). Cross-mode combinations are usage errors
+    // (exit 2), which print no JSON envelope even under --json, like
+    // clap's own.
     if let Err(message) = resolve_mode_flags(&mut args) {
         eprintln!("Error: {message}");
         return 2;
@@ -1732,13 +1609,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
     };
 
-    // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
-    // network; operations that need remote data fail loudly). Scan's
-    // patch discovery IS remote data — proceeding would POST the crawled
-    // package inventory to the batch endpoint — so refuse up front,
-    // before the crawl and before the API client is built (org
-    // auto-resolve is itself a network call). No telemetry fires here:
-    // offline gates `is_telemetry_disabled` too.
+    // Strict airgap (CLI_CONTRACT.md `--offline`): scan's patch discovery
+    // is remote data, so refuse before the crawl and before the API client
+    // is built (org auto-resolve is itself a network call).
     if args.common.offline {
         let err = "scan requires network access to query the patch API and cannot run with \
                    --offline/SOCKET_OFFLINE (strict airgap)";
@@ -1752,20 +1625,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return 1;
     }
 
-    // `--sync` is sugar for `--mode agent --prune`. Derive locals once and
-    // use them everywhere downstream so the flag interactions are
-    // expressed in one place. `--apply --prune --sync` is redundant
-    // but legal.
+    // `--sync` is sugar for `--mode agent --prune`.
     let apply = args.mode == Some(ScanMode::Agent);
     let vendor = args.mode == Some(ScanMode::Vendored);
     let hosted = args.mode == Some(ScanMode::Hosted);
     let prune = args.prune || args.sync;
 
-    // Hosted mode runs no GC (both hosted terminals return before the GC
-    // blocks): say so ONCE up front on the human path instead of silently
-    // dropping the flag. The `--json` path carries the same warning in the
-    // `redirect.warnings[]` array (see `run_redirect` and the zero-discovery
-    // envelope below).
+    // Hosted mode runs no GC: say so once up front on the human path. The
+    // `--json` path carries it in `redirect.warnings[]`.
     if hosted && prune && !args.common.json && !args.common.silent {
         eprintln!("Warning ({REDIRECT_PRUNE_IGNORED}): {REDIRECT_PRUNE_IGNORED_DETAIL}");
     }
@@ -1779,18 +1646,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
         get_api_client_with_overrides(overrides.clone()).await;
-    // Sized for the endpoint the run starts on (see `effective_batch_size`;
-    // a zero `--batch-size` is floored to 1 there rather than crash the
-    // chunking below). A mid-run downgrade to the proxy keeps these chunk
-    // boundaries: the failed chunk is retried as-is, and every chunk is
-    // within the proxy's body cap by construction (`BATCH_BODY_BYTE_CAP`).
+    // Sized for the endpoint the run starts on. A mid-run downgrade to the
+    // proxy keeps these chunk boundaries: every chunk is within the proxy's
+    // body cap by construction (`BATCH_BODY_BYTE_CAP`).
     let batch_size = effective_batch_size(args.batch_size, use_public_proxy);
     let telemetry_token = api_client.api_token().cloned();
     let telemetry_org = api_client.org_slug().cloned();
-    // Tracks whether scan was downgraded from the authenticated
-    // endpoint to the public proxy mid-run after a 401/403. Surfaces
-    // in the final `patch_scanned` telemetry event so we can measure
-    // how often stale-token fallbacks fire in the wild.
+    // Whether scan downgraded to the public proxy mid-run after a 401/403
+    // (reported in the `patch_scanned` telemetry event).
     let mut fallback_to_proxy = false;
 
     let crawler_options = args.common.crawler_options();
@@ -1801,11 +1664,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         "packages"
     };
 
-    // `--silent` is "errors only" (CLI_CONTRACT.md): progress, the crawl
-    // summary, the results table, and the per-patch listing are all
-    // suppressed below, mirroring `list`/`get`/`repair`/`remove`. Errors
-    // and the JSON envelope are unaffected.
-    // Live only on a terminal; its result lines print whenever `human`.
+    // `--silent` is "errors only" (CLI_CONTRACT.md): progress, summary,
+    // table and per-patch listing are suppressed; errors and the JSON
+    // envelope are unaffected.
     let human = !args.common.json && !args.common.silent;
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
     status.set(format!("Scanning {scan_target}..."));
@@ -1813,12 +1674,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Which ecosystems to crawl (see `crawl_scope`).
     let crawl_scope = crawl_scope(prune, args.common.ecosystems.as_deref());
 
-    // Crawl packages. Vendored mode keeps the npm half: its engine
-    // resolves the same untouched tree and reuses this crawl instead of
-    // walking `node_modules` again (no snapshot when npm was not crawled).
-    // Hosted mode keeps it only for an embedded `--vex` (skipped under
-    // `--dry-run`), whose installed-copy lookup reuses the npm roots. No
-    // other run reads the snapshot, so no other run pays for copying it.
+    // Crawl packages. Vendored mode keeps the npm half for its engine to
+    // reuse; hosted mode keeps it only for an embedded `--vex` (skipped
+    // under `--dry-run`). No other run pays for copying the snapshot.
     let keep_npm = vendor || (hosted && args.vex.vex.is_some() && !args.common.dry_run);
     let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if keep_npm {
         crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
@@ -1829,26 +1687,15 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 
     // Lockfile supplement: dependencies the project's lockfile resolves
     // that have NO installed copy (fresh clone, partial install). They join
-    // discovery — counts, API lookup, table, the prune "scanned" set — and
-    // are flagged "not yet installed" everywhere a user could act on them.
-    // Scoped to the crawled ecosystems: a skipped ecosystem's lockfile
-    // entries have no crawl to be measured against, and `--ecosystems`
-    // filters them out of this run anyway.
+    // discovery and are flagged "not yet installed". Scoped to the crawled
+    // ecosystems.
     let lockfile_only = lockfile_supplement(&args.common, &all_crawled, crawl_scope).await;
-    // Discovery diagnoses unsupported installation layouts and malformed
-    // binary Bun locks. Preserve these on empty scans too: an unreadable
-    // graph is not evidence that a fresh checkout has no dependencies.
-    // Surface them as run-level JSON warnings and human stderr messages.
+    // Unsupported layouts and malformed binary Bun locks, kept on empty
+    // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
-    // Config-sourced gem bundle root refused by the crawler's containment
-    // guard (a committed `.bundle/config` whose BUNDLE_PATH resolves
-    // outside the project — untrusted input that would otherwise become a
-    // scan/apply WRITE-target root). The crawl above consulted and
-    // silently skipped it, handing the skip back (local mode only); surface
-    // it on the SAME run-level channel as the layout refusals (JSON
-    // `warnings[]` on both the zero-package and ≥1-package envelopes; a
-    // gated stderr line on the human path) unless `--ecosystems` filtered
-    // gem out of this run.
+    // A committed `.bundle/config` whose BUNDLE_PATH resolves outside the
+    // project, refused by the crawler's containment guard: surface it on
+    // the same run-level channel as the layout refusals.
     if let Some(value) = skipped_bundle_config_path {
         if args.common.ecosystem_selected(Ecosystem::Gem) {
             let (code, detail) = config_path_ignored_warning(&value);
@@ -1869,12 +1716,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
         all_crawled.extend(lockfile_only.packages.iter().cloned());
     }
-    // The vendor ledger, loaded ONCE and shared by the supplement here, the
-    // prune-exemption / vendored-skip key set below, and update detection —
-    // three read-only consumers of the same bytes. Their failure policies
-    // stay distinct on purpose: the supplement falls back to the committed
-    // artifacts (fail-closed for the prune), the key set degrades to empty
-    // (fail-open, its documented contract).
+    // The vendor ledger, loaded ONCE for the supplement, the key set below,
+    // and update detection. Failure policies differ on purpose: the
+    // supplement falls back to the committed artifacts (fail-closed for the
+    // prune), the key set degrades to empty (fail-open).
     let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd).await;
     let ledger_supplement =
         vendored_ledger_supplement(&args.common, &all_crawled, &vendor_state).await;
@@ -1886,26 +1731,16 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     }
     all_crawled.extend(ledger_supplement);
 
-    // Every PURL the crawl found, captured BEFORE the `--ecosystems`
-    // display/query filter is applied. Prunable detection (manifest
-    // entries whose PURL is not installed) must reference the full
-    // installed set: `--ecosystems npm` narrows what we *query and
-    // show*, but packages of other ecosystems are still installed. If
-    // prune used the filtered set instead, `scan --ecosystems npm --prune`
-    // would treat every cargo/go/pypi/gem manifest entry as "uninstalled"
-    // and delete it (plus its blobs) — silent cross-ecosystem data loss.
-    // Lockfile-only purls are deliberately included: a dependency the
-    // lockfile still resolves must not be pruned just because node_modules
-    // is wiped or partially installed. (This is why a GC run never scopes
-    // the crawl — see `crawl_scope`; a scoped run reads this set nowhere.)
+    // Every PURL the crawl found, captured BEFORE the `--ecosystems` /
+    // `--package` / PATH filters: prune must judge manifest entries against
+    // the full installed set, or `scan --ecosystems npm --prune` would
+    // delete every other ecosystem's entries. Lockfile-only purls are
+    // included so a wiped node_modules does not prune them.
     let scanned_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
-    // Vendor-ledger purl keys (from the single load above), shared by the
-    // prune exemption (a vendored package is consumed from the committed
-    // artifact, so "absent from the crawl" is its normal state, not
-    // grounds for pruning) and the vendored-skip in the apply path. A
-    // corrupt ledger degrades to the EMPTY set — fail-open by the key set's
-    // documented contract (the supplement above is the fail-closed half).
+    // Vendor-ledger purl keys, shared by the prune exemption (a vendored
+    // package's normal state is absent from the crawl) and the
+    // vendored-skip in the apply path. A corrupt ledger yields the empty set.
     let vendored_purls: HashSet<String> = vendor_state
         .as_ref()
         .map(VendorState::purl_keys)
@@ -1930,11 +1765,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             .collect()
     };
 
-    // PATH scoping — applied strictly AFTER the `scanned_purls` capture
-    // above (the prune universe stays full-crawl: `scan PATHS --prune`
-    // must never treat out-of-scope packages as uninstalled) and after the
-    // `--ecosystems` filter. A purl is in scope when ANY genuinely-crawled
-    // copy of it sits under a matching path.
+    // PATH scoping, strictly AFTER the `scanned_purls` capture. A purl is
+    // in scope when ANY genuinely-crawled copy of it sits under a matching
+    // path.
     let filtered_crawled: Vec<_> = if path_scope.is_empty() {
         filtered_crawled
     } else {
@@ -1982,9 +1815,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             for (code, detail) in &layout_refusals {
                 eprintln!("Warning ({code}): {detail}");
             }
-            // The JSON path skips the GC here too (see below); the human
-            // path says so instead of silently dropping `--prune`. Hosted
-            // mode already printed its own prune-ignored warning.
+            // Hosted mode already printed its own prune-ignored warning.
             if prune && !hosted {
                 eprintln!("{}", render::PRUNE_SKIPPED_EMPTY);
             }
@@ -2008,11 +1839,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         // The result prints right away: nothing to overlap the send with.
         telemetry.flush().await;
         if args.common.json {
-            // When the crawler finds nothing, GC is intentionally skipped
-            // — pruning every manifest entry on the assumption that the
-            // user "uninstalled everything" is too destructive. Bots
-            // that need full cleanup can call `repair` explicitly. No
-            // `gc` field emitted because the user didn't request one.
+            // GC is intentionally skipped when the crawl finds nothing:
+            // pruning every manifest entry is too destructive (`repair`
+            // does full cleanup explicitly).
             let mut result = serde_json::json!({
                 "status": "success",
                 "scannedPackages": 0,
@@ -2026,19 +1855,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 "updates": [],
                 "paths": path_scope.raw(),
             });
-            // PnP layout refusals: additive top-level `warnings` (omitted
-            // when empty — run-level warnings precedent) so a JSON consumer
-            // can tell "structurally unscannable project" apart from a
-            // genuinely-empty one. This is the loud half of the fix for the
-            // yarn-PnP silent success-0 no-op.
+            // Layout refusals: additive top-level `warnings` (omitted when
+            // empty) so a consumer can tell an unscannable project from an
+            // empty one.
             if !layout_refusals.is_empty() {
                 result["warnings"] = layout_refusal_json(&layout_refusals);
             }
-            // Hosted mode: keep the `--json` envelope schema-consistent with
-            // the ≥1-package path by including a (no-op) nested `redirect`
-            // block — nothing was discovered, so nothing is redirected. The
-            // prune-ignored warning still rides along: hosted runs no GC even
-            // when the crawl is empty.
+            // Hosted mode: a no-op `redirect` block keeps the envelope
+            // schema-consistent with the ≥1-package path.
             if hosted {
                 let mut warnings: Vec<serde_json::Value> = Vec::new();
                 if prune {
@@ -2052,19 +1876,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     args.common.dry_run,
                 );
             } else if !vendor {
-                // The `redirectState` block rides the empty-discovery
-                // envelope too (same rule as the ≥1-package path below:
-                // every non-hosted-mode, non-vendored-mode `--json` envelope
-                // carries it when the ledger holds records) — an
-                // `--ecosystems` filter or a wiped tree must not blind a
-                // state-probing consumer. The vendored gate mirrors the
-                // main path's: vendored runs may reconcile ledger records
-                // mid-run, so they never carry a pre-run snapshot. The
-                // ledger is loaded here (leniently, --silent-gated) because
-                // the main-path load sits after this early return.
-                // `wiringLive` is empty by construction: this run counted
-                // zero packages, and the block's contract scopes the proof
-                // to packages the run actually covered.
+                // `redirectState` rides the empty-discovery envelope too
+                // (same rule as the ≥1-package path). `wiringLive` is empty
+                // by construction: this run covered zero packages.
                 let redirect_state = crate::commands::load_redirect_state_lenient(
                     &args.common.cwd,
                     args.common.silent,
@@ -2079,8 +1893,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             print_json(&result);
             return code;
         } else if !args.common.silent {
-            // Errors only under --silent: the empty-scan hint is
-            // informational.
             println!(
                 "{}",
                 render::no_packages_message(
@@ -2092,9 +1904,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
-
-    // Keep discovery format errors on non-empty scans in every mode as
-    // well: installed packages do not make an unreadable lockfile safe.
 
     // Build ecosystem summary
     let mut eco_parts = Vec::new();
@@ -2126,9 +1935,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         if !lockfile_only.purls.is_empty() {
             eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
         }
-        // Polyglot PnP repos (e.g. a PnP frontend + a python venv) reach
-        // this non-empty path: the refusal still prints so the invisible
-        // npm half is never silently blessed by the other ecosystems' scan.
         for (code, detail) in &layout_refusals {
             eprintln!("Warning ({code}): {detail}");
         }
@@ -2146,10 +1952,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // succeeded (all failing is the error envelope below).
     let mut failed_batches: Vec<(usize, String)> = Vec::new();
 
-    // Fold one batch outcome, in chunk order. Every caller below consumes
-    // outcomes strictly by chunk index, so the per-batch warnings,
-    // `batch_error_count` and `last_batch_error` come out exactly as the
-    // serial loop produced them.
+    // Fold one batch outcome; callers consume outcomes strictly in chunk
+    // order.
     let mut fold = |batch_idx: usize,
                     result: Result<BatchSearchResponse, ApiError>,
                     status: &mut StatusLine<_>| match result {
@@ -2184,23 +1988,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     //
     // - On the authenticated client the first chunk goes alone, so a stale
     //   token costs the authenticated API one request before the
-    //   downgrade, as it always did. Already on the proxy there is no
-    //   downgrade left to cap (the fallback arm below is authenticated-
-    //   only), so a token-less run opens the full window at chunk 0.
-    // - Fallback: a 401/403 against the authenticated endpoint can mean a
-    //   stale/revoked token. At the first consumed chunk `k` whose error is
-    //   a fallback candidate (any index, not just the first), the window is
-    //   dropped — in-flight requests for chunks past `k` are cancelled and
-    //   any responses already received for them are discarded, never
-    //   folded — then chunk `k` is retried against the public proxy (free
-    //   patches only) and the rest continues on the downgraded client.
-    //   That is exactly the serial loop's sequence; on the proxy no further
-    //   fallback applies. A token revoked mid-run does cost the auth
-    //   endpoint the requests the window had already dispatched past `k`
-    //   (up to the in-flight cap, instead of one). Their answers are
-    //   discarded, and so are their `--debug` lines: each chunk's are held
-    //   back until it is folded, so a chunk the window drops announces
-    //   nothing the serial loop would not have announced.
+    //   downgrade. Already on the proxy, the full window opens at chunk 0.
+    // - Fallback: at the first consumed chunk `k` whose error is a 401/403
+    //   fallback candidate, the window is dropped (in-flight requests past
+    //   `k` cancelled, received responses and their held-back `--debug`
+    //   lines discarded), chunk `k` is retried against the public proxy
+    //   (free patches only), and the rest continues on the downgraded
+    //   client. No further fallback applies on the proxy.
     let mut next = 0usize;
     'windows: while next < total_batches {
         let end = if next == 0 && !use_public_proxy {
@@ -2221,11 +2015,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     "Querying API for patches... (batch {}/{total_batches})",
                     next + 1
                 ));
-                // `ordered_concurrent` yields exactly one item per chunk,
-                // so the window never runs dry early. Should a future
-                // variant make it, stop the scan here: re-entering the
-                // outer loop with `next` unchanged would rebuild the very
-                // same window and re-POST every chunk in it, forever.
+                // `ordered_concurrent` yields one item per chunk. Should it
+                // ever run dry early, stop: re-entering the outer loop with
+                // `next` unchanged would re-POST the same window forever.
                 let Some(result) = results.next().await else {
                     debug_assert!(false, "batch window yields one result per chunk");
                     break 'windows;
@@ -2258,16 +2050,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
     }
 
-    // The client returns each batch's packages PURL-sorted, but the batches
-    // themselves are concatenated in chunk order, so the assembled list is
-    // only sorted *within* each chunk. Sort globally: this list drives the
-    // human table, the `--json` `packages` array, and the apply order, all
-    // of which operators diff across runs.
+    // Batches are only sorted within each chunk. Sort globally: this list
+    // drives the table, the `--json` `packages` array and the apply order,
+    // which operators diff across runs.
     all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
 
-    // If every batch errored, surface this as a full scan failure rather
-    // than silently reporting zero patches (which historically looked
-    // identical to "no patches for these packages").
+    // If every batch errored, surface a full scan failure rather than
+    // silently reporting zero patches.
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
@@ -2280,12 +2069,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         );
         // The failure prints right away: nothing to overlap the send with.
         telemetry.flush().await;
-
-        // A scan in which *every* batch failed produced no trustworthy
-        // patch data. Surfacing `status: "success"` / exit 0 here would be
-        // indistinguishable from a genuine "no patches" result and would
-        // mask a total API outage. Report the failure explicitly and bail
-        // before writing any manifest or attempting apply/prune.
         if args.common.json {
             let result = serde_json::json!({
                 "status": "error",
@@ -2339,10 +2122,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     }
     let total_patches = free_patches + paid_patches;
 
-    // Telemetry: record the scan outcome once we have the canonical
-    // per-tier counts. `fallback_to_proxy` is `true` iff the batch
-    // loop downgraded from the authenticated endpoint to the public
-    // proxy after a 401/403.
+    // Telemetry: record the scan outcome with the per-tier counts.
     spawn_patch_scanned(
         telemetry,
         package_count,
@@ -2359,39 +2139,24 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         telemetry_org.as_deref(),
     );
 
-    // Read existing manifest once for update detection. Used by both the
-    // JSON-mode emission (always includes an `updates` array) and the
-    // non-JSON table-print path (counts `updates_available`).
-    // (`manifest_path`/`socket_dir` are resolved at the top of `run`.)
+    // Read existing manifest once for update detection.
     let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
-    // Hosted and vendored modes record their patches ONLY in their ledgers
-    // (neither writes the manifest), so fold both ledgers' purl→uuid records
-    // into the view update detection sees — otherwise a pure hosted or
-    // vendored project's `updates[]` (the documented CI signal) stays
-    // structurally empty and a superseding patch is never reported. The
-    // envelope schema is unchanged. A malformed redirect ledger is only
-    // warned about here (and muted by --silent — the warning is advisory)
-    // — this is a read-only consult; a malformed vendor ledger contributes
-    // nothing (the supplement above already recovered its purls from the
-    // committed artifacts). A HOSTED run does not warn here: its engine
-    // loads the same ledger strictly, under the apply lock when it holds
-    // one, and reports the corruption ONCE as the hard error it is, so the
-    // advisory here would only duplicate that message. But the human hosted
-    // arm has returns BEFORE the engine (empty discovery, nothing
-    // downloadable, a detail-fetch failure, a declined confirm) where nobody
-    // would report it — so the corruption text is kept and printed at those
-    // returns (`warn_unreported_corrupt_ledger`), never quarantined (a
-    // read-only consult; quarantine is the engine's under-lock job).
+    // Hosted and vendored modes record their patches ONLY in their ledgers,
+    // so both ledgers' purl→uuid records are folded into update detection
+    // (otherwise their `updates[]` would stay empty). A malformed redirect
+    // ledger is only warned about here (--silent mutes it). A HOSTED run
+    // does not warn: its engine loads the ledger strictly and reports the
+    // corruption once as a hard error; the human hosted arm's returns
+    // BEFORE the engine (empty discovery, nothing downloadable, a
+    // detail-fetch failure) print it via `warn_unreported_corrupt_ledger`.
     let (redirect_state, hosted_corrupt_ledger) = if hosted {
         match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
             Ok(state) => (state, None),
             Err(corrupt) => (None, Some(corrupt.to_string())),
         }
     } else {
-        // `load_redirect_state_lenient`, with the scan event's send flushed
-        // before its warning: that line can be this run's first write since
-        // the event fired, and a closed stderr's SIGPIPE must find the event
-        // delivered, as the inline send it replaced was.
+        // `load_redirect_state_lenient`, with the scan event flushed before
+        // its warning (possibly this run's first write since the event).
         match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
             Ok(state) => (state, None),
             Err(corrupt) => {
@@ -2425,13 +2190,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     );
     let updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
 
-    // The hosted-wiring probes below (`wiringLive`, the agent-flow
-    // `hosted_wiring_retained` warning) take `all_purls` — the POST-filter
-    // scanned set: they only ever name packages this run actually
-    // counted/queried (an `--ecosystems` filter narrows both — a
-    // filtered-out purl reads as "not covered this run", never as "wiring
-    // unwound"). Distinct from `scanned_purls` above, which deliberately
-    // stays PRE-filter for the GC prune (see its comment).
+    // The hosted-wiring probes below take `all_purls` (POST-filter: only
+    // packages this run covered), unlike the PRE-filter `scanned_purls`
+    // the GC prune uses.
 
     if args.common.json {
         let mut result = serde_json::json!({
@@ -2451,26 +2212,20 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 "newUuid": u.new_uuid,
             })).collect::<Vec<_>>(),
         });
-        // PnP layout refusals ride the non-empty envelope too (polyglot
-        // repos: the OTHER ecosystems' discovery being non-empty must not
-        // silently bless the structurally-invisible npm half). Additive,
-        // omitted when empty.
+        // Layout refusals ride the non-empty envelope too (additive,
+        // omitted when empty).
         if !layout_refusals.is_empty() {
             result["warnings"] = layout_refusal_json(&layout_refusals);
         }
-        // A batch that failed while others succeeded left its packages
-        // unchecked; the human run warns on stderr, the envelope carries
-        // the same line per batch (additive, status and exit unchanged).
+        // One warning per failed batch (status and exit unchanged).
         for (batch, err) in &failed_batches {
             let line = render::batch_failed_warning(*batch, total_batches, err);
             let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
             push_scan_json_warning(&mut result, API_BATCH_FAILED, detail);
         }
-        // Flag lockfile-only packages so JSON consumers can tell "patch
-        // available but not installed" from the installed case. Additive
-        // field; absent means installed. Matching bridges the API's
-        // percent-encoded purl spelling to the supplement's literal form
-        // via `normalize_purl`, like the apply-path skip partitions.
+        // Flag lockfile-only packages (additive; absent means installed).
+        // `normalize_purl` bridges the API's percent-encoded spelling to the
+        // supplement's literal form.
         if let Some(packages) = result["packages"].as_array_mut() {
             for pkg in packages {
                 let is_lockfile_only = pkg["purl"].as_str().is_some_and(|p| {
@@ -2484,12 +2239,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             }
         }
 
-        // Hosted mode: NEST the redirect result under `redirect` in the classic
-        // scan object just built above (mirrors vendored mode's nested `vendor`
-        // block), so the hosted `--json` envelope carries the same top-level
-        // scan keys and `packages` enumeration as every other scan plus the
-        // redirect summary. Returns before the apply/vendor/prune branches,
-        // which are mutually exclusive with hosted mode.
+        // Hosted mode: NEST the redirect result under `redirect` in the scan
+        // object above (like vendored mode's `vendor` block).
         if hosted {
             return run_redirect(
                 &args,
@@ -2503,19 +2254,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             .await;
         }
 
-        // Cross-mode visibility, read-only half (companion to the run-level
-        // warnings below): the hosted redirect ledger's records ride every
-        // report-only and agent `--json` envelope as the additive
-        // `redirectState` block. Hosted mode is excluded above (its nested
-        // `redirect` block reports this run's own result, and `run_redirect`
-        // re-persists the ledger mid-run, so a pre-run snapshot would go
-        // stale); the vendored path below is excluded for the same staleness
-        // reason (its takeover reconciliation may retire ledger records
-        // mid-run — the `vendor_supersedes_redirect` warning covers it).
-        //
-        // The live-wiring probe (lockfile discovery, behind its cheap
-        // no-I/O gate) runs ONCE here and is shared with the agent-flow
-        // warning in the apply branch below.
+        // The additive `redirectState` block rides every report-only and
+        // agent `--json` envelope. Hosted and vendored runs are excluded:
+        // both may rewrite the ledger mid-run, so a pre-run snapshot would
+        // go stale. The live-wiring probe runs ONCE here and is shared with
+        // the agent-flow warning below.
         let hosted_retained = if vendor {
             Vec::new()
         } else {
@@ -2527,10 +2270,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             }
         }
 
-        // `apply` and `prune` are computed once at the top of run()
-        // (factoring in --sync, which implies both). They're independent
-        // here: a bot can `--apply` without `--prune`, or `--prune`
-        // without `--apply` (just GC-sweep), or both (full sync).
         let dry = args.common.dry_run;
         let mut apply_code = 0i32;
 
@@ -2556,9 +2295,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             };
 
             // Vendor-owned and lockfile-only purls leave the selection as
-            // calm skip records BEFORE download (see `partition_agent_
-            // selection`); the vendored purls alone feed the run-level
-            // `vendored_ownership_retained` warning emitted after apply.
+            // skip records BEFORE download (see `partition_agent_selection`).
             let AgentSelection {
                 kept: selected,
                 skip_records: vendored_records,
@@ -2568,8 +2305,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 
             if dry {
                 // Synthesize the per-patch outcome without touching disk.
-                // `decide_patch_action` consults the existing manifest,
-                // so it accurately reports what `--apply` *would* do.
                 let empty_manifest = PatchManifest::new();
                 let manifest_for_preview = existing_manifest.as_ref().unwrap_or(&empty_manifest);
                 let mut patches: Vec<serde_json::Value> = selected
@@ -2609,10 +2344,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     "dryRun": true,
                 });
             } else if selected.is_empty() {
-                // No patches left to download (e.g. all paid for a free
-                // user, no packages had patches, or everything selected is
-                // vendor-owned). Emit a stable-shape `apply` carrying any
-                // vendored skips, then fall through to GC if requested.
+                // Nothing left to download: a stable-shape `apply` carrying
+                // any skips, then fall through to GC if requested.
                 result["apply"] = serde_json::json!({
                     "found": vendored_records.len(),
                     "downloaded": 0,
@@ -2639,15 +2372,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 }
             }
 
-            // Cross-mode visibility (additive run-level warnings; never a
-            // status or exit-code change — see the constants' docs):
-            //
-            // * vendor-owned purls were partitioned out above — surface
-            //   them at the envelope level instead of only deep inside
-            //   `apply.patches[]`;
-            // * hosted redirect wiring the live lock still proves — the
-            //   agent run cannot unwind it, so silence here reads as a
-            //   completed conversion that never happened.
+            // Cross-mode visibility: additive run-level warnings, never a
+            // status or exit-code change.
             if !vendored_skip_purls.is_empty() {
                 let detail = vendored_ownership_retained_detail(&vendored_skip_purls);
                 if !args.common.silent {
@@ -2655,9 +2381,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 }
                 push_scan_json_warning(&mut result, VENDORED_OWNERSHIP_RETAINED, &detail);
             }
-            // `hosted_retained` was computed once above (shared with the
-            // `redirectState` block) — same probe, same post-filter scanned
-            // set, no second lockfile-inventory parse.
             if !hosted_retained.is_empty() {
                 let detail = hosted_wiring_retained_detail(&hosted_retained);
                 if !args.common.silent {
@@ -2667,12 +2390,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             }
         // --- Vendor path (if requested; conflicts with --apply/--sync) ---
         } else if vendor {
-            // Extracted into its own boxed fn — and it must STAY extracted:
-            // this branch's temporaries (json! trees, DownloadParams, the
-            // engine dispatch) live in the enclosing poll frame in debug
-            // builds even when the branch is never taken, and that frame
-            // has to fit Windows' 1 MiB main-thread stack (regression-
-            // pinned by `scan_run_fits_windows_main_thread_stack`).
+            // Must STAY a boxed fn: this branch's temporaries would otherwise
+            // live in the enclosing poll frame in debug builds, which has to
+            // fit Windows' 1 MiB main-thread stack.
             return boxed_vendor_json_path(
                 &args,
                 &api_client,
@@ -2731,10 +2451,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let silent = args.common.silent;
 
     // Every human-path exit that did not fail: the `--prune` GC first
-    // (agent mode only: the vendored step runs its own GC and hosted mode
-    // runs none), then the embedded VEX. The JSON path runs the GC whether
-    // or not anything was applied, and so does this one: an early "nothing
-    // to apply" exit must not silently drop `--prune`.
+    // (not vendored, which runs its own, nor hosted, which runs none), then
+    // the embedded VEX. An early "nothing to apply" exit still runs the GC.
     let (args_ref, manifest_ref, socket_ref) = (&args, &manifest_path, &socket_dir);
     let (scanned_ref, vendored_ref) = (&scanned_purls, &vendored_purls);
     let finish_human = move |code: i32| async move {
@@ -2751,11 +2469,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         embed_vex_human(&args_ref.common, &args_ref.vex, manifest_ref, code).await
     };
 
-    // Every mode stops on an empty discovery — vendored mode included: scan
-    // vendors what THIS discovery selects (a fresh clone or wiped
-    // `.socket/vendor/` is `repair`'s job, from the committed ledger), so
-    // there is nothing for its vendor step to do and reaching it would only
-    // take the apply lock for a no-op.
+    // Every mode stops on an empty discovery, vendored included (restoring
+    // a wiped `.socket/vendor/` is `repair`'s job).
     if all_packages_with_patches.is_empty() {
         if !silent {
             println!("\nNo patches available for installed packages.");
@@ -2764,19 +2479,12 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return finish_human(0).await;
     }
 
-    // The whole table + summary section is presentational only (nothing
-    // computed inside is consumed downstream), so `--silent` skips it
-    // wholesale.
+    // Presentational only, so `--silent` skips it wholesale.
     if !silent {
         let mut updates_available = 0usize;
 
-        // Canonical set of PURLs with a newer patch available, computed once via
-        // `detect_updates` (the same source the JSON `updates` array uses). The
-        // table path MUST agree with the JSON path, so reuse that result rather
-        // than re-deriving it: comparing against *any* batch patch (instead of the
-        // first/candidate one `select_patches` would resolve to) over-reports
-        // updates whenever the manifest already holds the newest patch but older
-        // patches also appear in the batch.
+        // PURLs with a newer patch, from the same `detect_updates` result the
+        // JSON `updates` array uses, so the table and JSON never disagree.
         let update_purls: HashSet<&str> = updates.iter().map(|u| u.purl.as_str()).collect();
 
         // Human display only: the decoded PURL (`%40scope` → `@scope`), like
@@ -2817,13 +2525,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 .min_by_key(|s| severity_order(s))
                 .unwrap_or("unknown");
 
-            // Collect vuln IDs (deterministic: deduped, CVEs then GHSAs,
-            // each group sorted, aliases not counted — see collect_vuln_ids).
+            // Collect vuln IDs (deterministic; see collect_vuln_ids).
             let vuln_str = render::vuln_cell(&collect_vuln_ids(pkg), verbose);
 
-            // Check for updates — consult the canonical `detect_updates` result
-            // (mirrored into `update_purls`) so the human table and JSON `updates`
-            // array never disagree.
             let has_update = update_purls.contains(pkg.purl.as_str());
             if has_update {
                 updates_available += 1;
@@ -2834,11 +2538,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             } else {
                 String::new()
             };
-            // Lockfile-only packages can be patched by `scan --mode vendored`
-            // (which fetches them pristine) but not applied in place.
-            // `normalize_purl` bridges the API's percent-encoded spelling
-            // to the supplement's literal form, like the JSON flag and the
-            // apply-path skip partitions.
+            // Lockfile-only packages can be vendored (fetched pristine) but
+            // not applied in place.
             let not_installed_marker = if lockfile_only_contains(&lockfile_only.purls, &pkg.purl) {
                 ui::paint(" [NOT INSTALLED]", "33", use_color)
             } else {
@@ -2901,19 +2602,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
     }
 
-    // Registry-redirect (hosted) mode is a distinct, self-contained flow
-    // (rewrite lockfiles → hosted vendored patches). It reuses the
-    // discovery, table and update detection above, confirms, then hands
-    // the selection to the redirect engine — it must NOT fall through to
-    // the apply/vendor branches. Same discovery/selection as `run_redirect`
-    // (the `--json` arm, which returned above with the redirect result
-    // NESTED in its envelope) and the same engine entry as `get --mode
-    // hosted`.
-    // Count downloadable patches. Shared by the hosted arm below and the
-    // agent/vendored arms: a free-tier org whose every offer is paid-tier has
-    // nothing any mode could select, so every human arm stops here with the
-    // same paid-subscription line instead of entering its engine for a
-    // no-op (hosted would otherwise print `Redirected 0 packages`).
+    // Count downloadable patches: a free-tier org whose every offer is
+    // paid-tier has nothing any mode could select, so every human arm stops
+    // here with the same paid-subscription line.
     let downloadable_count = if can_access_paid_patches {
         all_packages_with_patches.len()
     } else {
@@ -2931,6 +2622,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return finish_human(0).await;
     }
 
+    // Hosted mode is a self-contained flow: it reuses the discovery, table
+    // and update detection above, then hands the selection to the redirect
+    // engine (the same entry as `get --mode hosted`) — it must NOT fall
+    // through to the apply/vendor branches.
     if hosted {
         let selected = match discover_selected(
             &api_client,
@@ -2978,17 +2673,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return 1;
     }
 
-    // Scan never prompts. A scan left without a mode (path-scoped,
-    // `--prune` or global; see `resolve_mode_flags`) only reports, plus the
-    // `--prune` GC.
+    // A scan left without a mode (`--prune` or global; see
+    // `resolve_mode_flags`) only reports, plus the `--prune` GC.
     let report_only = args.mode.is_none();
 
-    // Smart selection. A report-only run picks without the non-interactive
-    // note: it never downloads, so there is no pick to announce.
+    // Scan always takes the top-ranked patch (see `selection_args`).
     let mut select_common = selection_args(&args.common);
     select_common.silent |= report_only;
-    // A menu or the non-interactive note opens its own paragraph under the
-    // table's Summary (stderr, like the prompt).
+    // Never true for scan: `selection_args` sets `yes`.
     if !select_common.silent
         && super::get::selection_has_choice(
             &all_search_results,
@@ -3009,10 +2701,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let mut skip_paragraph = false;
 
     // Agent flow (mirrors the JSON arm): vendor-owned and lockfile-only
-    // purls leave the selection as calm skips. In vendored mode nothing is
-    // partitioned — re-vendoring a stale uuid is exactly what the mode is
-    // for, and the vendor engine fetches lockfile-resolved packages
-    // pristine.
+    // purls leave the selection as skips. Vendored mode partitions nothing.
     let selected = if vendor {
         selected
     } else {
@@ -3030,9 +2719,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         split.kept
     };
 
-    // A selection the manifest already records at the same uuid would be
-    // downloaded only to be skipped ("already in manifest") — don't offer
-    // it. Agent mode only: vendored mode never reads the manifest.
+    // Drop selections the manifest already records at the same uuid.
+    // Agent mode only: vendored mode never reads the manifest.
     let recorded = |p: &PatchSearchResult| {
         existing_manifest
             .as_ref()
@@ -3066,8 +2754,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return finish_human(0).await;
     }
 
-    // Display detailed summary of selected patches before confirming
-    // (presentational only — skipped wholesale under --silent).
+    // Display detailed summary of selected patches (skipped under --silent).
     if !silent {
         if vendor {
             println!("\nPatches to vendor:\n");
@@ -3111,27 +2798,21 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
     }
 
-    // What the prompt / dry-run line offers.
+    // What the dry-run line offers.
     let plan = if vendor {
         render::Plan::Vendor(selected.len())
     } else {
         render::Plan::Apply(selected.len())
     };
 
-    // `--dry-run` is a non-mutating preview (see the global flag's doc and
-    // the JSON path's `dryRun` envelope). The interactive path must honor it
-    // too: stop here, having printed the table and the per-patch plan above,
-    // before the confirm prompt, the download/apply, and the prune GC — all
-    // of which mutate the manifest and `.socket/` on disk (the GC runs as a
-    // read-only preview instead).
+    // `--dry-run` is a non-mutating preview: stop here, having printed the
+    // table and the per-patch plan above, before the download/apply and the
+    // prune GC (which runs as a read-only preview instead).
     if args.common.dry_run {
         if !silent {
-            // Vendored preview: the same ledger classification the JSON arm
-            // nests under `vendor`, rendered as `[would-refuse]` lines so a
-            // human preview never advertises vendoring the wet run's Bun
-            // preflight is known to refuse (the `get --mode vendored
-            // --dry-run` arms print the identical lines). The headline
-            // counts them too.
+            // Vendored preview: the JSON arm's ledger classification,
+            // rendered as `[would-refuse]` lines so a preview never
+            // advertises vendoring the wet run would refuse.
             let preview = if vendor {
                 Some(preview_vendor_json(&args.common.cwd, &selected).await)
             } else {
@@ -3172,10 +2853,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     }
 
     // Vendor mode: pre-verify baselines so a content mismatch is reported
-    // before vendoring starts (vendoring still proceeds for these — the
-    // stage force-applies the verified patched content). Runs after the
-    // dry-run return above so a preview fetches no views; the views it
-    // does fetch seed the download phase, which never fetches them again.
+    // before vendoring starts (vendoring still proceeds — the stage
+    // force-applies the verified patched content). The fetched views seed
+    // the download phase.
     let prefetched = if vendor && !silent {
         let (mismatched, views) = preverify_vendor_baselines(
             &api_client,
@@ -3209,8 +2889,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     );
 
     let code = if vendor {
-        // Extracted + boxed for the same Windows-1-MiB-frame reason as the
-        // JSON path (see `run_vendor_json_path`).
+        // Boxed for the same Windows 1 MiB frame reason as the JSON path.
         boxed_vendor_interactive_path(
             &args,
             &api_client,
@@ -3235,12 +2914,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         code
     };
 
-    // Cross-mode visibility, mirroring the JSON apply path: after an
-    // in-place apply, warn when the hosted redirect wiring is still live
-    // for scanned package(s) — the apply cannot unwind it, and silence
-    // reads as a completed hosted→agent conversion that never happened.
-    // (The vendored-ownership counterpart is already printed per package
-    // by the `[skip] … (vendored …)` lines above.)
+    // Cross-mode visibility, mirroring the JSON apply path: warn when the
+    // hosted redirect wiring is still live for scanned package(s). (The
+    // vendored-ownership counterpart is the `[skip]` lines above.)
     if !vendor && !silent {
         let hosted_retained =
             hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await;
@@ -3252,11 +2928,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
     }
 
-    // Post-apply GC: only runs when the user opted in via `--prune` or
-    // `--sync`. Default `scan --yes` no longer touches the manifest
-    // beyond what `--apply` added — users wanting to clean up should
-    // run `socket-patch gc` (or `repair`) explicitly. (Vendor mode runs
-    // its own GC after the vendor step, inside `vendor_flow`.)
+    // Post-apply GC: only with `--prune` or `--sync`; otherwise an agent
+    // apply leaves every other manifest entry alone (`socket-patch repair`
+    // cleans up explicitly). Vendor mode runs its own GC in `vendor_flow`.
     if prune && !vendor {
         gc::run_human_gc(
             &args.common,
@@ -3492,10 +3166,6 @@ mod tests {
     }
 
     // ---- cross-mode ledger takeover (hosted ⇄ vendored) --------------------
-    // Switching a project's patch mode rewires the lockfile to the new mode
-    // but leaves the OLD mode's ledger on disk asserting stale wiring. These
-    // pin the detection + warning that flags it (the sweep's
-    // stale-ledger-on-mode-takeover finding).
 
     const TAKEOVER_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
@@ -3619,9 +3289,7 @@ mod tests {
         let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];
 
         // Vendored displaced a hosted redirect: name the stale ledger, but
-        // NEVER advise deleting it by hand — it may hold the only revert data
-        // and VEX records for OTHER still-live redirects. The safe sequence
-        // is re-running the vendored flow, which reconciles per package.
+        // NEVER advise deleting it by hand.
         let vendored = mode_takeover_detail(&purls, /*current_is_hosted=*/ false);
         assert!(vendored.contains("pkg:npm/minimist@1.2.2"));
         assert!(vendored.contains("redirect-state.json"));
@@ -3634,10 +3302,11 @@ mod tests {
             "must warn against hand-deleting the ledger: {vendored}"
         );
 
-        // Hosted displaced a vendored ledger: `vendor --revert` is the ONLY
-        // offered remediation. Deleting the `.socket/vendor/<eco>/` tree by
-        // hand hard-breaks cargo resolution while `[patch.crates-io]` still
-        // references it.
+        // Hosted displaced a vendored ledger: per-package `remove <purl>` is
+        // the offered remediation; `vendor --revert` is named only as
+        // something NOT to run (it mass-reverts). Deleting the
+        // `.socket/vendor/<eco>/` tree by hand hard-breaks cargo resolution
+        // while `[patch.crates-io]` still references it.
         let hosted = mode_takeover_detail(&purls, /*current_is_hosted=*/ true);
         assert!(hosted.contains("pkg:npm/minimist@1.2.2"));
         assert!(hosted.contains("state.json"));
@@ -3654,12 +3323,6 @@ mod tests {
     }
 
     // ---- agent-flow hosted-wiring retention (hosted → agent conversion) ----
-    // The overlap classifier keys on purls present in BOTH ledgers, so
-    // hosted-ONLY wiring (the exact hosted→agent conversion state: redirect
-    // ledger live, no vendor state.json) can structurally never trigger it.
-    // The agent flow probes the redirect ledger + live lock directly and
-    // emits `hosted_wiring_retained`. These pin the trigger, every
-    // non-trigger, and the remediation wording.
 
     /// Redirect ledger with one record per PURL AND a recorded `yarn.lock`
     /// edit — the shape a real hosted run leaves behind (the edit is what
@@ -3748,11 +3411,9 @@ mod tests {
         let purl = "pkg:npm/minimist@1.2.2";
         let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
 
-        // (a) Records retired — the lane-B (hosted→vendored pre-revert)
-        // world: the pre-revert drops the ledger RECORDS while the
-        // append-only `edits` (revert originals) legitimately remain. The
-        // warning keys on records still live at scan time, so it must stay
-        // silent even with the uuid still present in the lock text.
+        // (a) Records retired (a hosted→vendored pre-revert drops RECORDS
+        // while the `edits` remain): silent even with the uuid still in the
+        // lock text.
         let tmp = tempfile::tempdir().unwrap();
         write_redirect_ledger_with_edit(tmp.path(), &[]).await;
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
@@ -3858,10 +3519,8 @@ mod tests {
     fn agent_retention_details_name_packages_and_safe_remediation() {
         let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];
 
-        // hosted_wiring_retained: names the purl and both real options
-        // (stay hosted / migrate via vendored), never a hosted→agent
-        // unwind (none exists) and never hand-deleting the ledger (the
-        // only store of the pre-redirect revert originals).
+        // hosted_wiring_retained: names the purl and the real options,
+        // never hand-deleting the ledger.
         let hosted = hosted_wiring_retained_detail(&purls);
         assert!(hosted.contains("pkg:npm/minimist@1.2.2"));
         assert!(hosted.contains("scan --mode hosted"));
@@ -3946,12 +3605,8 @@ mod tests {
 
     /// The records↔wiringLive join is a plain string compare: each record's
     /// `purl` is canonicalized to exactly the spelling the probe emits, with
-    /// the ledger's raw key preserved as `ledgerKey`. Pinned on the two key
-    /// shapes real ledgers carry — a percent-encoded scoped npm name (the
-    /// API spelling, the `drop_superseded_purl` fixture shape) and a
-    /// `?platform=`-qualified gem purl. Pre-fix, `records[].purl` kept the
-    /// verbatim key while `wiringLive` was canonical, so a LIVE redirect
-    /// read as "wiring unwound" to any consumer doing the documented join.
+    /// the ledger's raw key preserved as `ledgerKey`. Pinned on a
+    /// percent-encoded scoped npm name and a `?platform=`-qualified gem purl.
     #[tokio::test]
     async fn redirect_state_records_canonicalize_to_the_wiring_live_spelling() {
         use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
@@ -4040,8 +3695,8 @@ mod tests {
     }
 
     /// The block's `mode` is the constant label, not the ledger's opaque
-    /// `mode` string: a pre-rename ledger carrying `"redirect"` still labels
-    /// as `"hosted"`, so consumers dispatching on the key need no history.
+    /// `mode` string: a ledger carrying `"redirect"` still labels as
+    /// `"hosted"`.
     #[tokio::test]
     async fn redirect_state_mode_is_the_constant_label_for_legacy_ledgers() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4055,11 +3710,8 @@ mod tests {
 
     // ---- cargo takeover direction (lock-shape probe) ------------------------
     // The scan inventory records `resolved: None` for every cargo entry, so
-    // the generic patch.socket.dev check can never prove hosted for cargo —
-    // pre-fix, a genuine vendored→hosted cargo takeover classified as
-    // (hosted=false, vendored=true) and the warning INVERTED: the vendored
-    // flow told the user to delete the LIVE redirect ledger. These pin the
-    // cargo-specific lock-shape classifier.
+    // the generic patch.socket.dev check can never prove hosted for cargo;
+    // these pin the cargo-specific lock-shape classifier.
 
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
     /// A self-hosted patch server's sparse index (the probe must not depend
@@ -4116,7 +3768,7 @@ mod tests {
         .unwrap();
     }
 
-    /// The mixed state a pre-fix vendored→hosted cargo takeover left behind:
+    /// The mixed state a vendored→hosted cargo takeover can leave behind:
     /// the lock rewired to the hosted sparse index (declared as a
     /// socket-patch registry in the config), while the vendored
     /// `[patch.crates-io]` entry ALSO survives in the config.
@@ -4150,7 +3802,7 @@ mod tests {
         // (a localhost URL — the probe must not depend on the
         // patch.socket.dev host). Hosted won; the vendored ledger is stale —
         // even though the leftover [patch.crates-io] marker would satisfy the
-        // generic wiring scan (the pre-fix inversion).
+        // generic wiring scan.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_redirect_ledger(root, &[CARGO_PURL]).await;
@@ -4231,10 +3883,6 @@ mod tests {
     }
 
     // ---- takeover DIRECTION follows the live lock, not the command ---------
-    // The overlap alone only proves both ledgers name the same package; it does
-    // NOT prove which mode won. `classify_overlap_takeover` decides direction
-    // from the ACTUAL current lockfile wiring, so a dry-run/no-op can never emit
-    // the wrong `*_supersedes_*` warning and point cleanup at the LIVE ledger.
 
     /// Like [`write_vendor_ledger`] but each entry records wiring the
     /// `package-lock.json` — the file the direction check reads to see whether
@@ -4336,7 +3984,7 @@ mod tests {
         // Both ledgers claim minimist, but the LIVE lockfile still resolves it
         // to the committed `.socket/vendor/` artifact — vendored is live. A
         // hosted dry-run/no-op must NOT emit `redirect_supersedes_vendored`,
-        // which would point cleanup at the LIVE vendored ledger (the bug).
+        // which would point cleanup at the LIVE vendored ledger.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_redirect_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
@@ -4355,8 +4003,7 @@ mod tests {
             takeover.vendored,
             vec!["pkg:npm/minimist@1.2.2".to_string()]
         );
-        // Pre-fix the hosted flow keyed off the raw overlap, which is non-empty
-        // — it WOULD have wrongly told the user to delete the live ledger.
+        // The raw overlap is non-empty: only the direction gate keeps it quiet.
         assert!(!overlapping_ledger_purls(root).await.is_empty());
     }
 
@@ -4409,12 +4056,9 @@ mod tests {
 
     #[test]
     fn takeover_detail_remediation_is_per_package_and_non_destructive() {
-        // Regression: the remediation used to instruct whole-ledger /
-        // whole-tree deletion, destroying live data for packages the takeover
-        // did not touch — the redirect ledger holds OTHER packages' records
-        // (VEX reads them) plus the only recorded pre-redirect originals, and
-        // the `.socket/vendor/<eco>/` tree holds EVERY vendored uuid dir.
-        // Cleanup must be scoped per named package.
+        // Cleanup must be scoped per named package: whole-ledger / whole-tree
+        // deletion would destroy live data for packages the takeover did not
+        // touch.
         let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];
 
         let hosted = mode_takeover_detail(&purls, /*current_is_hosted=*/ true);
@@ -4456,11 +4100,8 @@ mod tests {
 
     #[test]
     fn hosted_remediation_states_removes_full_blast_radius() {
-        // Regression: the hosted text said `socket-patch remove <purl>` "drops
-        // only that entry and its own `.socket/vendor/<eco>/<uuid>/` artifact
-        // directory". It also deletes the package's `.socket/manifest.json`
-        // entry, so a reader budgeting for a ledger-scoped edit — a bot passing
-        // `--yes`, especially — was mis-told what the command does.
+        // `socket-patch remove <purl>` also deletes the package's
+        // `.socket/manifest.json` entry; the hosted text must say so.
         let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];
         let hosted = mode_takeover_detail(&purls, /*current_is_hosted=*/ true);
 
@@ -4522,8 +4163,7 @@ mod tests {
         // A hosted run where every per-uuid record fetch failed persists a
         // ledger with edits but an EMPTY records map (`record_fetch_failed`).
         // That ledger still asserts stale lock wiring, so a vendored takeover
-        // of the same package must still be flagged — deriving the overlap
-        // from record keys alone was blind to exactly this ledger.
+        // of the same package must still be flagged.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_redirect_ledger_with_edits(
@@ -4576,14 +4216,10 @@ mod tests {
 
     #[tokio::test]
     async fn following_the_vendored_remediation_clears_the_warning() {
-        // Regression (sticky warning): the vendored remediation used to name
-        // only the `records` entries. When the takeover cleared the LAST
-        // record, the leftover `edits` still matched the package through the
-        // degraded-ledger fallback above, so the identical warning fired on
-        // every later run — and repeated advice that could no longer be
-        // followed, since `records` was already empty. The remediation now
-        // names the matching `edits` entries too; carrying it out in full has
-        // to leave nothing to warn about.
+        // The vendored remediation names the matching `edits` entries as
+        // well as `records` (leftover edits keep matching through the
+        // degraded-ledger fallback); carrying it out in full must leave
+        // nothing to warn about.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_redirect_ledger_with_edits(
@@ -4822,9 +4458,8 @@ mod tests {
     // ---- hostile-ledger tamper guards (path traversal) ----------------------
     // The ledgers are committed files an attacker can edit: a recorded
     // lockfile name must never make the wiring probes READ outside the
-    // project root. The probes are core discovery's ledger-liveness rules
-    // (the ones `vex` gates on); with nothing discovered they fall back to
-    // the ledger's recorded files, which is the path under test.
+    // project root. With nothing discovered the probes fall back to the
+    // ledger's recorded files, which is the path under test.
 
     #[tokio::test]
     async fn hosted_wiring_text_proof_never_reads_outside_the_project() {
@@ -4933,9 +4568,6 @@ mod tests {
     }
 
     // ---- note_vendor_supersedes_redirect: warning + npm auto-reconcile ------
-    // The vendored flows' takeover advisory. Detection is pinned above;
-    // these pin the post-detection body: the reconciled/manual/dry-run
-    // partitions, the ledger mutation, and the fires-once contract.
 
     const NPM_TAKEOVER_PURL: &str = "pkg:npm/minimist@1.2.2";
 
@@ -5010,12 +4642,9 @@ mod tests {
         );
     }
 
-    /// Finding: the reconcile unwound the hosted `.npmrc` auto-config but
-    /// threw away the unwind's warnings (a user-edited redirect-created
-    /// `.npmrc` was rewritten with no `redirect_npmrc_allow_remote_modified`)
-    /// and its detail never mentioned `.npmrc` while still promising
-    /// `vendor --revert` restores the hosted wiring (npm 12 then refuses it
-    /// without the line). Both are now surfaced.
+    /// The reconcile's `.npmrc` unwind surfaces its own warnings
+    /// (`redirect_npmrc_allow_remote_modified`), and the detail mentions
+    /// `.npmrc` with the npm 12 EALLOWREMOTE caveat.
     #[tokio::test]
     async fn vendored_takeover_reconcile_surfaces_the_npmrc_unwind() {
         let tmp = tempfile::tempdir().unwrap();

@@ -11,8 +11,7 @@
 //!   * exit 0 but unparseable stdout → the probe fails OPEN, setup wires;
 //!   * nonzero exit → the probe fails OPEN, setup wires.
 //!
-//! Sibling host-run gem tests live in setup_invariants.rs; this file is
-//! additive (coverage-audit file-ownership rules). Shims are sh scripts, so
+//! Sibling host-run gem tests live in setup_invariants.rs. Shims are sh scripts, so
 //! the whole file is unix-only — matching every other PATH-shim suite.
 #![cfg(unix)]
 

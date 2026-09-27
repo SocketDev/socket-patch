@@ -598,7 +598,7 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
 /// `view/{uuid}` endpoint — the before/after git-blob hashes `stage_patch`
 /// would compute from the actually-installed bytes, plus the after bytes
 /// inline as base64 `blobContent` — and must land the identical committed
-/// state: manifest record, deterministic artifact, vendor ledger, `file:`
+/// state: a detached vendor-ledger entry (NO manifest), deterministic artifact, vendor ledger, `file:`
 /// lock wiring with a recomputed sha512, and NO `.socket/blobs` (scan
 /// parity: the download phase holds patch content in memory). The
 /// fresh-checkout `npm ci` proof is the capstone's, verbatim.

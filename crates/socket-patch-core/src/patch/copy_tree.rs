@@ -19,7 +19,8 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 /// mirroring the cache's read-only modes, so the copy can be patched and later
 /// removed without a chmod dance. File *contents* are copied via
 /// `std::fs::copy`, which also carries the source's mode bits (often `0o444` in
-/// the cache); the downstream apply pipeline grants write as needed, and
+/// the cache); the downstream apply pipeline replaces files via stage +
+/// rename (no write grant needed), and
 /// [`remove_tree`] relaxes perms on cleanup. Symlinks / specials are skipped —
 /// crates.io registry and Go module-cache sources contain none, and copying a
 /// dangling link would be unsafe.

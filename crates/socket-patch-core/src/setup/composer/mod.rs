@@ -6,8 +6,8 @@
 //! `composer update` finish populating `vendor/`. `setup` appends
 //! `socket-patch apply --offline --silent --ecosystems composer` to both so the
 //! committed `.socket/` patches are re-applied on every install/update (the
-//! socket-patch CLI must be on `PATH`, the same requirement as the cargo build
-//! guard / gem Bundler plugin / Go guard).
+//! socket-patch CLI must be on `PATH`, the same requirement as the gem Bundler
+//! plugin).
 //!
 //! `composer.json` is JSON, so — like the npm `package_json` backend — edits go
 //! through `serde_json` (with the workspace's `preserve_order` feature, so the
@@ -56,8 +56,8 @@ pub struct ComposerEditResult {
 }
 
 /// Find the composer project rooted at `cwd`: the path to a `composer.json`
-/// directly in `cwd`. cwd-only, matching the other single-project backends
-/// (gem/pypi/go).
+/// directly in `cwd`. cwd-only, like the pypi backend (gem discovery walks up
+/// to the nearest Gemfile/gems.rb).
 pub async fn discover_composer_project(cwd: &Path) -> Option<PathBuf> {
     let composer_json = cwd.join("composer.json");
     fs::metadata(&composer_json)

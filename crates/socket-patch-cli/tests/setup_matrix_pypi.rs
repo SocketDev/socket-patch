@@ -83,10 +83,11 @@ fn hatch() {
 //
 // A pip project carries a `requirements.txt`, which `setup` DOES support:
 // it commits the `socket-patch[hook]` dependency (the `.pth` post-install
-// carrier). Unlike gem/go/deno (no-op `no_files` ecosystems), pypi has a
+// carrier). Unlike the no-op `no_files` ecosystems (go, maven, nuget,
+// cargo), pypi has a
 // positive contract, so this guard asserts the full configure round-trip
 // rather than a no-op. It runs with no Docker, no network, and (for pip,
-// whose `lock_command` is `None`) no external toolchain.
+// whose `lock_commands()` is `None`) no external toolchain.
 // ─────────────────────────────────────────────────────────────────────────
 mod host_guard {
     use std::path::Path;

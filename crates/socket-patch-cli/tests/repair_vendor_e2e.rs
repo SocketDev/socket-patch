@@ -1675,8 +1675,8 @@ async fn revert_of_empty_wiring_gem_entry_fails_loudly() {
 ///     LEDGERED gem entry whose wiring is empty (pre-reconstruction repairs
 ///     persisted exactly these) gets full revert-capable wiring backfilled
 ///     from the live pair while the artifact is healthy — byte-identical to
-///     the original ledger for the exact-pin fixture — and the revert that
-///     used to refuse (G2) byte-restores both files. RED without the pass-1
+///     the original ledger for the exact-pin fixture — and the revert
+///     byte-restores both files. RED without the pass-1
 ///     backfill: repair exits 0 leaving `"wiring": []`, no wiringRestored
 ///     event, and the revert fails.
 #[tokio::test]

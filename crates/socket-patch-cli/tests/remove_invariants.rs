@@ -1,9 +1,9 @@
 //! Integration tests for `remove` against pre-populated manifests.
 //!
 //! `remove` runs rollback internally before deleting from the manifest.
-//! These tests pass `--skip-rollback` so they don't try to walk
-//! node_modules — every code path here is testable without network or
-//! installed packages.
+//! Most tests use the `run_remove` helper, which passes `--skip-rollback`;
+//! the rest drive the real rollback path offline against installed
+//! fixtures.
 
 use std::path::{Path, PathBuf};
 
@@ -163,9 +163,8 @@ fn remove_with_invalid_manifest_emits_error() {
     // A manifest that EXISTS but cannot be parsed is `manifest_invalid` per
     // the CLI_CONTRACT.md error-code table — distinct from both
     // `manifest_not_found` (missing file) and `manifest_unreadable` (genuine
-    // I/O error). Regression: remove labeled every read error
-    // `manifest_unreadable`, telling consumers a corrupt file was a
-    // transient I/O failure (list shares the split and was fixed first).
+    // I/O error) — a corrupt file must not read as a transient I/O failure
+    // (list shares the split).
     assert_eq!(
         v["error"]["code"], "manifest_invalid",
         "unparseable manifest must be manifest_invalid; envelope: {v}"
@@ -321,7 +320,7 @@ fn remove_event_has_required_envelope_fields() {
 // Real rollback path (no --skip-rollback)
 // ---------------------------------------------------------------------------
 
-/// Every other test passes `--skip-rollback`, which bypasses the
+/// The `run_remove` helper passes `--skip-rollback`, which bypasses the
 /// rollback-before-remove step that `remove` runs by default. That makes the
 /// suite blind to the actual contract: if the internal rollback fails, the
 /// manifest entry must NOT be deleted (fail-closed — never drop a patch from
@@ -402,7 +401,7 @@ fn remove_without_skip_rollback_fails_closed_and_keeps_manifest() {
 /// `details.rolledBack`. That carrier is metadata — NOT a removed manifest
 /// entry — so it must never bump `summary.removed`.
 ///
-/// Every other test passes `--skip-rollback` against a manifest whose afterHash
+/// The `run_remove` helper passes `--skip-rollback` against a manifest whose afterHash
 /// blobs aren't present on disk, so the cleanup phase sweeps nothing and the
 /// carrier never fires — leaving this path completely uncovered. Here we stage
 /// both patches' afterHash blobs in `.socket/blobs`, remove A, and force a
@@ -985,9 +984,8 @@ fn remove_skip_rollback_sweep_semantics_unchanged() {
 }
 
 /// The full-path preview (no --skip-rollback) must not create `.socket/blobs`
-/// either: rollback's preview previously `create_dir_all`'d it (and, online,
-/// downloaded before-blobs into it) — leaving new files a wet remove's sweep
-/// would have deleted. Offline keeps this hermetic: the preview reports the
+/// either (nor, online, download before-blobs into it) — that would leave
+/// new files a wet remove's sweep would have deleted. Offline keeps this hermetic: the preview reports the
 /// missing-blob failure (accurate — a wet offline run fails the same way)
 /// without inventing directories.
 ///

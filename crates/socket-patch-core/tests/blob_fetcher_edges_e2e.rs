@@ -262,7 +262,7 @@ fn download_mode_as_tag_round_trips_with_parse() {
 /// `fetch_blobs_by_hash` with a hash whose blob is already on disk
 /// short-circuits the network call and reports `skipped: 1`, leaving the
 /// existing file byte-for-byte untouched. Covers the `skip if already on
-/// disk` branch (~L184-206).
+/// disk` branch.
 #[tokio::test]
 async fn fetch_blobs_by_hash_skips_existing_blobs() {
     let tmp = tempfile::tempdir().unwrap();

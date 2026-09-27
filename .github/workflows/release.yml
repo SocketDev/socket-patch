@@ -31,8 +31,7 @@ name: Release
 #      registration per package covers everything, on every registry.
 #   2. GitHub suppresses events caused by this workflow's own GITHUB_TOKEN —
 #      a `release: published` (or `push: tags:`) trigger in another file
-#      would never fire, which is why the old design kept every publish job
-#      in this file — but workflow_dispatch (and repository_dispatch) events
+#      would never fire — but workflow_dispatch (and repository_dispatch) events
 #      are documented exceptions, so `gh workflow run` with GITHUB_TOKEN
 #      works without a PAT/GitHub App token.
 #

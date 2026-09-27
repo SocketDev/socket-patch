@@ -13,7 +13,7 @@
 //! legacy name and prints a one-shot deprecation warning to stderr. The
 //! warning fires **unconditionally** — even under `--silent` / `--json` — so
 //! users see the transition signal in scripts and CI logs. The legacy names
-//! will be removed in the next major release.
+//! will be removed in a future major release.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
