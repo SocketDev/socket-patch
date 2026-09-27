@@ -55,6 +55,7 @@ use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
 use socket_patch_core::formats::registry;
+use socket_patch_core::formats::yarn::{sniff_grammar, YarnLockGrammar};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::utils::fs::read_regular_to_string;
@@ -289,20 +290,11 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     }
     if let Some(text) = read("yarn.lock").await {
         if text.contains(&needle) {
-            // Same head sniff as core's `sniff_yarn_lock` (BOM skipped,
-            // CRLF-tolerant); berry wins.
-            let head: Vec<&str> = text
-                .strip_prefix('\u{feff}')
-                .unwrap_or(&text)
-                .lines()
-                .take(30)
-                .collect();
-            return if head.iter().any(|l| l.starts_with("__metadata:")) {
-                Some("yarn-berry".to_string())
-            } else if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
-                Some("yarn-classic".to_string())
-            } else {
-                None
+            // The format model's head sniff; berry wins.
+            return match sniff_grammar(&text) {
+                Some(YarnLockGrammar::Berry) => Some("yarn-berry".to_string()),
+                Some(YarnLockGrammar::Classic) => Some("yarn-classic".to_string()),
+                None => None,
             };
         }
     }

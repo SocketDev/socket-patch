@@ -27,7 +27,9 @@ pub mod cargo;
 pub mod composer;
 pub mod gem;
 pub mod pnpm;
+pub(crate) mod bun;
 pub mod registry;
+pub mod yarn;
 
 pub use registry::registry;
 

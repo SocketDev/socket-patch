@@ -26,6 +26,7 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
 use crate::formats::pnpm::PnpmLockGrammar;
+use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
@@ -90,11 +91,6 @@ impl NpmLockFlavor {
 use crate::constants::npm_family::{
     BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
 };
-
-/// How many head lines the yarn content sniff reads (the v1 header sits in
-/// the leading comment block; berry's `__metadata:` is the first top-level
-/// key after it).
-const YARN_SNIFF_HEAD_LINES: usize = 30;
 
 /// Every lockfile name the probe knows, grouped into wiring families: the
 /// flavor that owns a family wires (or supersedes) every file in it, so only
@@ -322,29 +318,19 @@ async fn read_lock(project_root: &Path, name: &str) -> Result<String, (&'static 
 /// mistaken for classic.
 async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static str, String)> {
     let text = read_lock(project_root, "yarn.lock").await?;
-    // CRLF lines split like LF ones; a leading BOM is not key text.
-    let head: Vec<&str> = text
-        .strip_prefix('\u{feff}')
-        .unwrap_or(&text)
-        .lines()
-        .take(YARN_SNIFF_HEAD_LINES)
-        .collect();
     // Berry wins the check (it must never be mistaken for classic). The
     // node-modules linker keeps packages on disk for staging, and berry's
     // cache-zip checksum is reproducible from our tarball (berry_zip), so the
     // backend can wire it; PnP (caught earlier by the `.pnp.*` markers) is the
     // only berry layout vendor refuses.
-    if head.iter().any(|l| l.starts_with("__metadata:")) {
-        return Ok(NpmLockFlavor::YarnBerry);
-    }
-    if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
-        return Ok(NpmLockFlavor::YarnClassic);
+    match sniff_grammar(&text) {
+        Some(YarnLockGrammar::Berry) => return Ok(NpmLockFlavor::YarnBerry),
+        Some(YarnLockGrammar::Classic) => return Ok(NpmLockFlavor::YarnClassic),
+        None => {}
     }
     Err((
         "vendor_lockfile_version_unsupported",
-        "yarn.lock carries neither the `# yarn lockfile v1` header nor a berry \
-         `__metadata:` key; cannot identify the lockfile version"
-            .to_string(),
+        UNIDENTIFIED_DETAIL.to_string(),
     ))
 }
 

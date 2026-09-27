@@ -51,6 +51,7 @@ use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::converge_gem_lock_source;
+pub(crate) use crate::formats::yarn::is_berry_lock;
 use crate::formats::cargo::hosted::{self as cargo_lock, plan_cargo_lock, CargoLockPlan};
 pub(crate) use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
@@ -3154,20 +3155,6 @@ pub(crate) fn yarn_lock_fragment_kind(kind: &str) -> bool {
     )
 }
 
-/// A yarn.lock is berry (v2+) when it carries the `__metadata:` header block;
-/// anything else is a classic v1 lock. Shared by both yarn rewriters and
-/// lockfile discovery (`vex::discover::yarn`) so the grammar split cannot
-/// drift. A leading BOM is encoding, not key text (yarn's YAML parser drops
-/// it), so a header-less lock opening with `\u{feff}__metadata:` is berry
-/// too.
-pub(crate) fn is_berry_lock(content: &str) -> bool {
-    content
-        .strip_prefix('\u{feff}')
-        .unwrap_or(content)
-        .lines()
-        .any(|line| line.starts_with("__metadata:"))
-}
-
 /// The `cacheKey:` value from the `__metadata` block (berry writes it unquoted:
 /// `  cacheKey: 10c0`), mirroring the vendored backend's `berry_field`.
 fn berry_cache_key(content: &str) -> Option<String> {
@@ -3539,24 +3526,21 @@ pub fn preflight_bun_hosted(content: &str) -> Result<(), RewriteWarning> {
 fn parse_bun_hosted_lock(
     content: &str,
 ) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
-    use crate::vendor::bun_lock_text::{
-        check_lock_version, has_workspace_packages, lock_version, parse_packages_section,
-    };
+    use crate::vendor::bun_lock_text::{has_workspace_packages, lock_version};
 
     // The shared gate's `Err` text IS the detail: hosted and vendored refuse
     // an unsupported head with one message (and one remedy per arm — a
     // future version means "update socket-patch", a missing integer means
     // "re-lock"), so the two modes cannot drift apart.
-    if let Err(detail) = check_lock_version(content) {
-        return Err(RewriteWarning {
-            code: "redirect_bun_lock_unsupported".into(),
-            detail,
-        });
-    }
-    let lines: Vec<String> = content.split('\n').map(str::to_string).collect();
-    let entries = match parse_packages_section(&lines) {
-        Ok(entries) => entries,
-        Err(_) => {
+    let (lines, entries) = match crate::formats::bun::BunTextLock::parse(content) {
+        Ok(lock) => (lock.lines, lock.entries),
+        Err(crate::formats::bun::BunTextError::Version(detail)) => {
+            return Err(RewriteWarning {
+                code: "redirect_bun_lock_unsupported".into(),
+                detail,
+            });
+        }
+        Err(crate::formats::bun::BunTextError::Packages(_)) => {
             // Fail-closed: never line-splice a lock whose packages section
             // deviates from bun's emitted single-line grammar.
             return Err(RewriteWarning {
