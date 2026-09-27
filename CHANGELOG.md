@@ -39,7 +39,12 @@ into the new version's section — see docs/releasing.md.
   conflicts; the lock entry present and rewritable) and cargo's
   `locked_version_mismatch` when it is the crate's first refusal — before
   fetching patch views and pristine sources, so a package that will be
-  refused costs no network. Such a package is now reported in the download
+  refused costs no network. This applies only to a package the vendor loop
+  would hand to its backend — one installed on disk, or one the lockfile
+  resolves to a verifiable registry source (the pristine fetch would
+  happen); a package absent from the lock and not installed keeps its
+  `skipped` / `package_not_installed` vendor event and its download
+  record, exactly as before. Such a package is now reported in the download
   phase: `download.patches[]` records it as `action: "failed"` with the
   backend's exact `errorCode` and `error`, `download.downloaded` drops and
   `download.failed` rises by the number of such packages, and the vendor
@@ -48,11 +53,17 @@ into the new version's section — see docs/releasing.md.
   `vendor_fetched_missing` events. Exit code and `status` are unchanged.
   (The interactive human `scan --vendor` arm still fetches the views its
   pre-prompt baseline check verifies.) Purls the hosted redirect ledger
-  claims keep the vendor loop's refusal.
+  claims keep the vendor loop's refusal. Because no view is fetched, the
+  lock-text refusal now takes precedence over every outcome that came
+  from the view: a package that would also have hit a paid-access 403, a
+  failed view fetch or the no-applicable-files guardrail reports the lock
+  refusal instead.
   The manifest-driven `vendor` command keeps its `failed` events but no
   longer fetches the pristine source of a lockfile-only package it refuses
   this way (no `vendor_fetched_missing` event, no registry request; with an
-  unreachable registry the gate's code replaces `vendor_fetch_failed`).
+  unreachable registry the gate's code replaces `vendor_fetch_failed`) —
+  again only when the lockfile resolves it to a verifiable source; one the
+  lock does not resolve keeps its `package_not_installed` skip.
   On the polyglot monorepo fixture: 80 of 560 packages (74
   `vendor_lock_entry_not_found`, 4 `vendor_override_conflict`, 2
   `vendor_lock_entry_unsupported`) move to the download phase, saving 80

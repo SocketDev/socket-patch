@@ -1824,12 +1824,22 @@ type LockRefusals = HashMap<String, (&'static str, String)>;
 /// vendor loop: its takeover reverts the hosted lock edits first, and the
 /// revert rewrites the very text the gates read. A redirect ledger that
 /// cannot be read leaves every purl to the loop.
+///
+/// Only a package the vendor loop would hand to its backend is refused
+/// here (see [`crate::commands::vendor::lock_refusals_reaching_backend`]):
+/// one installed on disk, or one the lockfile resolves to a verifiable
+/// registry source. A package with neither — absent from the lock and not
+/// installed — never reaches its backend: the loop reports it `skipped` /
+/// `package_not_installed`, and so it still does. `prior` is scan's npm
+/// crawl, when the caller has it (the installed-copy lookup reuses it).
 async fn lock_text_refusals_for(
-    cwd: &Path,
+    params: &DownloadParams,
     selected: &[PatchSearchResult],
     ledger: &VendorState,
     bun_refusal: Option<&BunVendorRefusal>,
+    prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> LockRefusals {
+    let cwd = params.cwd.as_path();
     let claimed: Vec<String> =
         match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
             Ok(Some(state)) => state.records.keys().map(|k| canonical_purl(k)).collect(),
@@ -1846,7 +1856,21 @@ async fn lock_text_refusals_for(
         .filter(|sr| !claimed.contains(&canonical_purl(&sr.purl)))
         .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
         .collect();
-    socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await
+    let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
+    let options = CrawlerOptions {
+        cwd: params.cwd.clone(),
+        global: params.global,
+        global_prefix: params.global_prefix.clone(),
+    };
+    crate::commands::vendor::lock_refusals_reaching_backend(
+        cwd,
+        refused,
+        &ledger.entries,
+        |purls| async move {
+            crate::commands::vendor::installed_purls(&options, &purls, prior).await
+        },
+    )
+    .await
 }
 
 /// The record a detached ledger entry already carries for `purl` at
@@ -2190,6 +2214,18 @@ pub(crate) async fn download_patch_records_with(
     api_client: &ApiClient,
     prefetched: HashMap<String, PatchResponse>,
 ) -> DetachedDownload {
+    download_patch_records_reusing(selected, params, api_client, prefetched, None).await
+}
+
+/// [`download_patch_records_with`], handing `prior` (scan's npm crawl of
+/// the untouched tree) to the lock-text refusals' installed-copy lookup.
+pub(crate) async fn download_patch_records_reusing(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+    api_client: &ApiClient,
+    prefetched: HashMap<String, PatchResponse>,
+    prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+) -> DetachedDownload {
     // The ledger load outcome is handed to the preflight AS a result: an
     // unreadable ledger must surface as `vendor_state_unreadable` from the
     // one refusal this phase emits (fail closed, nothing exempt), not be
@@ -2217,6 +2253,7 @@ pub(crate) async fn download_patch_records_with(
         prefetched,
         vendor_state,
         bun_refusal.as_ref(),
+        prior,
     )
     .await
 }
@@ -2233,10 +2270,11 @@ async fn download_patch_records_preflighted(
     prefetched: HashMap<String, PatchResponse>,
     vendor_state: std::io::Result<VendorState>,
     bun_refusal: Option<&BunVendorRefusal>,
+    prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> DetachedDownload {
     let vendor_state = vendor_state.unwrap_or_default();
     let lock_refusals =
-        lock_text_refusals_for(&params.cwd, selected, &vendor_state, bun_refusal).await;
+        lock_text_refusals_for(params, selected, &vendor_state, bun_refusal, prior).await;
 
     let blobs_dir = params.socket_dir().join("blobs");
     let batch = fetch_selected_patches(
@@ -3767,6 +3805,7 @@ async fn run_get_vendored(
             prefetched_views,
             vendor_state,
             bun_refusal.as_ref(),
+            None,
         ))
         .await
     } else {

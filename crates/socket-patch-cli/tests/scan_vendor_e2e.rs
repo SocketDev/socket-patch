@@ -2612,4 +2612,389 @@ snapshots:
             "a package refused on lock text alone costs no view: {viewed:?}"
         );
     }
+
+    // ── Which packages the lock-text refusal reaches ────────────────────
+    //
+    // The download phase refuses, before the view, only a package the
+    // vendor loop would hand to its backend: one installed on disk, or one
+    // the lockfile resolves to a verifiable registry source. A package with
+    // neither never reached its backend — the loop skips it
+    // `package_not_installed` — and keeps that outcome.
+
+    const UUID_Y: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const UUID_Z: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+    /// A pnpm 9 project: `pkg-a` installed and locked (wireable); `pkg-b`
+    /// locked behind a peer-suffixed snapshot key (refused), NOT installed;
+    /// `pkg-y` installed but absent from the lock (refused); `pkg-z`
+    /// neither installed nor locked.
+    fn write_pnpm_scope_fixture(root: &Path) {
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "scope-test", "version": "0.0.0", "dependencies": { "pkg-a": "1.0.0", "pkg-b": "1.0.0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      pkg-a:
+        specifier: 1.0.0
+        version: 1.0.0
+      pkg-b:
+        specifier: 1.0.0
+        version: 1.0.0(peer-x@1.0.0)
+
+packages:
+
+  pkg-a@1.0.0:
+    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}
+
+  pkg-b@1.0.0:
+    resolution: {integrity: sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==}
+    peerDependencies:
+      peer-x: '*'
+
+snapshots:
+
+  pkg-a@1.0.0: {}
+
+  pkg-b@1.0.0(peer-x@1.0.0): {}
+",
+        )
+        .unwrap();
+        for name in ["pkg-a", "pkg-y"] {
+            let pkg = root.join("node_modules").join(name);
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+        }
+    }
+
+    const PNPM_SCOPE: [(&str, &str); 4] = [
+        ("pkg:npm/pkg-a@1.0.0", UUID_A),
+        ("pkg:npm/pkg-b@1.0.0", UUID_B),
+        ("pkg:npm/pkg-y@1.0.0", UUID_Y),
+        ("pkg:npm/pkg-z@1.0.0", UUID_Z),
+    ];
+
+    /// Every uuid whose view the run fetched.
+    async fn viewed_uuids(mock: &MockServer) -> Vec<String> {
+        let mut viewed: Vec<String> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().contains("/patches/view/"))
+            .map(|r| r.url.path().rsplit('/').next().unwrap().to_string())
+            .collect();
+        viewed.sort();
+        viewed
+    }
+
+    /// No request reached the (mock) registry.
+    async fn assert_no_registry_request(mock: &MockServer) {
+        let registry: Vec<String> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.starts_with("/registry/"))
+            .collect();
+        assert!(registry.is_empty(), "no pristine fetch: {registry:?}");
+    }
+
+    fn record_for<'a>(records: &'a serde_json::Value, purl: &str) -> &'a serde_json::Value {
+        records
+            .as_array()
+            .and_then(|p| p.iter().find(|r| r["purl"] == purl))
+            .unwrap_or_else(|| panic!("no record for {purl}: {records}"))
+    }
+
+    fn events_for<'a>(v: &'a serde_json::Value, purl: &str) -> Vec<(&'a str, &'a str)> {
+        v["vendor"]["events"]
+            .as_array()
+            .expect("vendor events")
+            .iter()
+            .filter(|e| e["purl"] == purl)
+            .map(|e| {
+                (
+                    e["action"].as_str().unwrap_or_default(),
+                    e["errorCode"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn run_json(root: &Path, argv: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
+        let (_code, stdout, stderr) = run_cli_env(root, argv, env);
+        serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("valid JSON: {e}\nstdout={stdout}\nstderr={stderr}"))
+    }
+
+    fn api_argv<'a>(mock_uri: &'a str, head: &[&'a str]) -> Vec<&'a str> {
+        let mut argv = head.to_vec();
+        argv.extend_from_slice(&[
+            "--json",
+            "--yes",
+            "--api-url",
+            mock_uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ]);
+        argv
+    }
+
+    /// `scan --mode vendored` over the pnpm scope fixture: the installed
+    /// (`pkg-y`) and the lock-resolved (`pkg-b`) refused packages fail in
+    /// the download phase with no view and no pristine fetch; `pkg-z`,
+    /// which the lock does not resolve and nothing installed, is fetched
+    /// and skipped `package_not_installed` by the loop exactly as before.
+    #[tokio::test]
+    async fn scan_refuses_early_only_what_reaches_the_pnpm_backend() {
+        let mock = MockServer::start().await;
+        mount_patch_api(&mock, &PNPM_SCOPE, "package/index.js").await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_scope_fixture(tmp.path());
+        let registry = format!("{}/registry", mock.uri());
+        let uri = mock.uri();
+        let v = run_json(
+            tmp.path(),
+            &api_argv(&uri, &["scan", "--mode", "vendored"]),
+            &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+        );
+        let dl = &v["download"]["patches"];
+        let b = record_for(dl, "pkg:npm/pkg-b@1.0.0");
+        assert_eq!(
+            (&b["action"], &b["errorCode"]),
+            (
+                &serde_json::json!("failed"),
+                &serde_json::json!("vendor_lock_entry_unsupported")
+            ),
+            "{v}"
+        );
+        let y = record_for(dl, "pkg:npm/pkg-y@1.0.0");
+        assert_eq!(
+            (&y["action"], &y["errorCode"]),
+            (
+                &serde_json::json!("failed"),
+                &serde_json::json!("vendor_lock_entry_not_found")
+            ),
+            "{v}"
+        );
+        assert_eq!(
+            record_for(dl, "pkg:npm/pkg-z@1.0.0")["action"],
+            "downloaded",
+            "not refused early: {v}"
+        );
+        assert_eq!(
+            (&v["download"]["downloaded"], &v["download"]["failed"]),
+            (&serde_json::json!(2), &serde_json::json!(2)),
+            "{v}"
+        );
+        assert_eq!(
+            events_for(&v, "pkg:npm/pkg-z@1.0.0"),
+            vec![("skipped", "package_not_installed")],
+            "{v}"
+        );
+        assert!(events_for(&v, "pkg:npm/pkg-b@1.0.0").is_empty(), "{v}");
+        assert!(events_for(&v, "pkg:npm/pkg-y@1.0.0").is_empty(), "{v}");
+        assert_eq!(
+            events_for(&v, "pkg:npm/pkg-a@1.0.0"),
+            vec![("applied", "")],
+            "{v}"
+        );
+        assert_eq!(
+            viewed_uuids(&mock).await,
+            vec![UUID_A.to_string(), UUID_Z.to_string()]
+        );
+        assert_no_registry_request(&mock).await;
+    }
+
+    /// `get <exact purl> --mode vendored` (exact-versioned purls skip the
+    /// installed-version narrowing): a package neither installed nor locked
+    /// keeps the loop's `package_not_installed` skip; a lock-resolved one
+    /// the backend refuses fails before its view.
+    #[tokio::test]
+    async fn exact_purl_get_refuses_early_only_what_reaches_the_pnpm_backend() {
+        let mock = MockServer::start().await;
+        mount_patch_api(&mock, &PNPM_SCOPE, "package/index.js").await;
+        let registry = format!("{}/registry", mock.uri());
+        let uri = mock.uri();
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_scope_fixture(tmp.path());
+        let v = run_json(
+            tmp.path(),
+            &api_argv(&uri, &["get", "pkg:npm/pkg-z@1.0.0", "--mode", "vendored"]),
+            &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+        );
+        assert_eq!(
+            record_for(&v["patches"], "pkg:npm/pkg-z@1.0.0")["action"],
+            "downloaded",
+            "{v}"
+        );
+        assert_eq!(v["failed"], 0, "{v}");
+        assert_eq!(
+            events_for(&v, "pkg:npm/pkg-z@1.0.0"),
+            vec![("skipped", "package_not_installed")],
+            "{v}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_scope_fixture(tmp.path());
+        let v = run_json(
+            tmp.path(),
+            &api_argv(&uri, &["get", "pkg:npm/pkg-b@1.0.0", "--mode", "vendored"]),
+            &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+        );
+        let b = record_for(&v["patches"], "pkg:npm/pkg-b@1.0.0");
+        assert_eq!(
+            (&b["action"], &b["errorCode"]),
+            (
+                &serde_json::json!("failed"),
+                &serde_json::json!("vendor_lock_entry_unsupported")
+            ),
+            "{v}"
+        );
+        assert!(events_for(&v, "pkg:npm/pkg-b@1.0.0").is_empty(), "{v}");
+        assert_eq!(viewed_uuids(&mock).await, vec![UUID_Z.to_string()]);
+        assert_no_registry_request(&mock).await;
+    }
+
+    const CARGO_SCOPE: [(&str, &str); 2] = [
+        ("pkg:cargo/cfg-if@9.9.9", UUID_Y),
+        ("pkg:cargo/absent-crate@1.0.0", UUID_Z),
+    ];
+
+    /// A cargo project locking `cfg-if 1.0.4`, with `cfg-if 9.9.9` in the
+    /// (private) registry cache — installed at a version the lock does not
+    /// resolve — and `absent-crate` nowhere. Returns the `CARGO_HOME`.
+    fn write_cargo_scope_fixture(tmp: &Path) -> (PathBuf, String) {
+        let root = tmp.join("proj");
+        let cargo_home = tmp.join("cargo-home");
+        let krate = cargo_home.join("registry/src/index.crates.io-6f17d22bba15001f/cfg-if-9.9.9");
+        std::fs::create_dir_all(krate.join("src")).unwrap();
+        std::fs::write(krate.join("src/lib.rs"), BEFORE).unwrap();
+        std::fs::write(
+            krate.join("Cargo.toml"),
+            "[package]\nname = \"cfg-if\"\nversion = \"9.9.9\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"cfg-if\",\n]\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{}\"\n",
+                "9".repeat(64)
+            ),
+        )
+        .unwrap();
+        (root, cargo_home.to_string_lossy().into_owned())
+    }
+
+    /// cargo's `locked_version_mismatch` is refused before the view only
+    /// for a crate installed at the unlocked version (the loop hands it to
+    /// the backend); a crate the lock does not resolve and nothing
+    /// installed keeps the loop's `package_not_installed` skip — on
+    /// `scan --mode vendored` and on exact-purl `get --mode vendored`.
+    #[tokio::test]
+    async fn cargo_refuses_early_only_an_installed_crate() {
+        let mock = MockServer::start().await;
+        mount_patch_api(&mock, &CARGO_SCOPE, "package/src/lib.rs").await;
+        let registry = format!("{}/registry", mock.uri());
+        let uri = mock.uri();
+        let env_for = |home: &str| {
+            vec![
+                ("CARGO_HOME".to_string(), home.to_string()),
+                ("SOCKET_CRATES_REGISTRY".to_string(), registry.clone()),
+            ]
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, home) = write_cargo_scope_fixture(tmp.path());
+        let env = env_for(&home);
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let v = run_json(
+            &root,
+            &api_argv(&uri, &["scan", "--mode", "vendored"]),
+            &env,
+        );
+        let dl = &v["download"]["patches"];
+        let installed = record_for(dl, CARGO_SCOPE[0].0);
+        assert_eq!(
+            (&installed["action"], &installed["errorCode"]),
+            (
+                &serde_json::json!("failed"),
+                &serde_json::json!("locked_version_mismatch")
+            ),
+            "{v}"
+        );
+        assert!(events_for(&v, CARGO_SCOPE[0].0).is_empty(), "{v}");
+        assert_eq!(record_for(dl, CARGO_SCOPE[1].0)["action"], "downloaded", "{v}");
+        assert_eq!(
+            events_for(&v, CARGO_SCOPE[1].0),
+            vec![("skipped", "package_not_installed")],
+            "{v}"
+        );
+        assert_eq!(viewed_uuids(&mock).await, vec![UUID_Z.to_string()]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, home) = write_cargo_scope_fixture(tmp.path());
+        let env = env_for(&home);
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let v = run_json(
+            &root,
+            &api_argv(&uri, &["get", CARGO_SCOPE[1].0, "--mode", "vendored"]),
+            &env,
+        );
+        assert_eq!(
+            record_for(&v["patches"], CARGO_SCOPE[1].0)["action"],
+            "downloaded",
+            "{v}"
+        );
+        assert_eq!(
+            events_for(&v, CARGO_SCOPE[1].0),
+            vec![("skipped", "package_not_installed")],
+            "{v}"
+        );
+        let v = run_json(
+            &root,
+            &api_argv(&uri, &["get", CARGO_SCOPE[0].0, "--mode", "vendored"]),
+            &env,
+        );
+        let installed = record_for(&v["patches"], CARGO_SCOPE[0].0);
+        assert_eq!(installed["errorCode"], "locked_version_mismatch", "{v}");
+        assert_eq!(
+            viewed_uuids(&mock).await,
+            vec![UUID_Z.to_string(), UUID_Z.to_string()],
+            "the installed crate's view is never fetched"
+        );
+        assert_no_registry_request(&mock).await;
+    }
 }

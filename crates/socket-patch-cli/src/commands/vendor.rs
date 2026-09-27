@@ -1215,8 +1215,11 @@ pub(crate) async fn fetch_pristine_package(
 /// path or custom-registry source has neither, so its fetch refuses
 /// `vendor_fetch_unverifiable` and the purl is not vendored; deferring that
 /// fetch behind the patch service would instead vendor the crates.io patch
-/// over it.
-async fn cargo_fetch_is_verifiable(
+/// over it. A purl with neither is also one the ladder has no source for
+/// at all (`package_not_installed` when nothing is installed), which is
+/// why the early lock-text refusals ([`lock_refusals_reaching_backend`])
+/// stay off it.
+pub(crate) async fn pristine_fetch_is_verifiable(
     project_root: &Path,
     inventory: &[lock_inventory::LockfileEntry],
     purl: &str,
@@ -1233,6 +1236,82 @@ async fn cargo_fetch_is_verifiable(
             .is_ok_and(|e| verifiable(&e)),
         None => false,
     }
+}
+
+/// The purls among `purls` with an installed copy, found exactly as the
+/// vendor loop finds them: the qualified-aware resolver
+/// ([`find_packages_for_rollback_reusing`]), then the npm `package.json`
+/// identity lookup for an npm purl it missed (an alias install). `prior`
+/// is the loop's own reusable npm crawl, when the caller has it.
+pub(crate) async fn installed_purls(
+    options: &CrawlerOptions,
+    purls: &[String],
+    prior: Option<&NpmCrawlSnapshot>,
+) -> HashSet<String> {
+    if purls.is_empty() {
+        return HashSet::new();
+    }
+    let partition = partition_purls(purls, None);
+    let mut installed: HashSet<String> =
+        find_packages_for_rollback_reusing(&partition, options, true, prior)
+            .await
+            .into_keys()
+            .collect();
+    let missing_npm: Vec<&String> = partition
+        .get(&Ecosystem::Npm)
+        .into_iter()
+        .flatten()
+        .filter(|p| !installed.contains(*p))
+        .collect();
+    let by_identity = match prior.and_then(|p| p.packages_for(options)) {
+        Some(crawled) => npm_paths_by_identity_in(crawled, &missing_npm),
+        None => npm_paths_by_identity(options, &missing_npm).await,
+    };
+    installed.extend(by_identity.into_keys());
+    installed
+}
+
+/// Narrows `refused` (the lock-text refusals of
+/// [`vendor::lock_text_refusals`]) to the packages the vendor loop would
+/// actually hand to their backend — and so see refused, in these very
+/// words — once it has a source for them: an installed copy (`installed`
+/// answers, for the purls with no verifiable registry resolution), or a
+/// verifiable registry resolution the pristine-source ladder fetches
+/// ([`pristine_fetch_is_verifiable`]). A package with neither never
+/// reaches its backend: the loop reports it `package_not_installed` (a
+/// calm skip), with no pristine fetch, so it is left to the loop and keeps
+/// that outcome. The check reads only local files.
+pub(crate) async fn lock_refusals_reaching_backend<F, Fut>(
+    cwd: &Path,
+    mut refused: HashMap<String, (&'static str, String)>,
+    ledger: &HashMap<String, VendorEntry>,
+    installed: F,
+) -> HashMap<String, (&'static str, String)>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = HashSet<String>>,
+{
+    if refused.is_empty() {
+        return refused;
+    }
+    let inventory = lock_inventory::inventory_project(cwd).await;
+    let mut unresolved: Vec<String> = Vec::new();
+    for purl in refused.keys() {
+        if !pristine_fetch_is_verifiable(cwd, &inventory, purl, lookup_entry(ledger, purl)).await {
+            unresolved.push(purl.clone());
+        }
+    }
+    if unresolved.is_empty() {
+        return refused;
+    }
+    unresolved.sort();
+    let installed = installed(unresolved.clone()).await;
+    for purl in unresolved {
+        if !installed.contains(&purl) {
+            refused.remove(&purl);
+        }
+    }
+    refused
 }
 
 /// One purl's pristine source while the vendor loop is being assembled.
@@ -1828,7 +1907,7 @@ pub(crate) async fn vendor_records_reusing(
             //  * a cargo crate the patch service can serve: the backend reads
             //    the pristine tree only once `cargo_service_copy` falls back
             //    to the local build. Only a crate the registry ladder COULD
-            //    fetch (see `cargo_fetch_is_verifiable`) — a git, path or
+            //    fetch (see `pristine_fetch_is_verifiable`) — a git, path or
             //    custom-registry crate keeps the eager rung, whose
             //    `vendor_fetch_unverifiable` refusal is what keeps a
             //    crates.io patch off a crate that does not come from
@@ -1853,7 +1932,7 @@ pub(crate) async fn vendor_records_reusing(
                 let cargo_via_service = service_enabled
                     && matches!(rung, MissingRung::Fetch)
                     && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
-                    && cargo_fetch_is_verifiable(
+                    && pristine_fetch_is_verifiable(
                         &common.cwd,
                         inventory
                             .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
@@ -1907,7 +1986,18 @@ pub(crate) async fn vendor_records_reusing(
                         .into_iter()
                         .filter(|(purl, _)| !claimed.contains(&canonical_purl(purl)))
                         .collect();
-                    let refused = vendor::lock_text_refusals(&common.cwd, &unclaimed).await;
+                    // Only a purl the ladder would really fetch (a
+                    // verifiable registry resolution): one with no source
+                    // at all keeps the loop's `package_not_installed` skip.
+                    // These purls have no installed copy, so none is
+                    // looked for.
+                    let refused = lock_refusals_reaching_backend(
+                        &common.cwd,
+                        vendor::lock_text_refusals(&common.cwd, &unclaimed).await,
+                        &state.entries,
+                        |_| async { HashSet::new() },
+                    )
+                    .await;
                     for (purl, (_, rung)) in missing.iter().zip(rungs.iter_mut()) {
                         if matches!(rung, MissingRung::Fetch) && refused.contains_key(purl) {
                             *rung = MissingRung::Deferred;

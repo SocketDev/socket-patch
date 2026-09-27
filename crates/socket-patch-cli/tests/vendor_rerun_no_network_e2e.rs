@@ -1101,3 +1101,86 @@ fn a_lockfile_only_package_refused_on_lock_text_is_never_fetched() {
     );
     assert!(!root.join(".socket/vendor").exists(), "nothing vendored");
 }
+
+/// The early deferral above is only for a package the pristine-source
+/// ladder would really fetch (a verifiable lock resolution). A package the
+/// lock does not resolve and nothing installed has no source at all: the
+/// loop skips it `package_not_installed`, as it always did — never the
+/// backend's lock refusal. pnpm (absent from the lock) and cargo (a crate
+/// absent from Cargo.lock, and one at a version it does not lock).
+#[test]
+fn a_package_absent_from_the_lock_keeps_the_not_installed_skip() {
+    const UUID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let dead = dead_endpoint();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "t", "version": "0.0.0", "dependencies": {} }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  \
+         excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {}\n",
+    )
+    .unwrap();
+    const NPM_PURL: &str = "pkg:npm/pkg-z@1.0.0";
+    write_manifest(
+        root,
+        NPM_PURL,
+        UUID,
+        "package/index.js",
+        b"before\n",
+        b"after\n",
+    );
+    let (_code, v, stderr) = run_vendor(root, &dead, &[], &[]);
+    assert_eq!(
+        purl_events(&v, NPM_PURL),
+        vec![("skipped", "package_not_installed")],
+        "{v:#}\n{stderr}"
+    );
+
+    for purl in ["pkg:cargo/absent-crate@1.0.0", "pkg:cargo/cfg-if@9.9.9"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let cargo_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(cargo_home.join("registry/src")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"cfg-if\",\n]\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{}\"\n",
+                "9".repeat(64)
+            ),
+        )
+        .unwrap();
+        write_manifest(
+            &root,
+            purl,
+            UUID,
+            "package/src/lib.rs",
+            b"before\n",
+            b"after\n",
+        );
+        let home = cargo_home.to_string_lossy().into_owned();
+        let (_code, v, stderr) =
+            run_vendor(&root, &dead, &[], &[("CARGO_HOME", home.as_str())]);
+        assert_eq!(
+            purl_events(&v, purl),
+            vec![("skipped", "package_not_installed")],
+            "{purl}: {v:#}\n{stderr}"
+        );
+    }
+}

@@ -5,7 +5,7 @@
 //! out of `run`'s poll frame (Windows 1 MiB main-thread stack).
 //!
 //! Vendored mode is manifest-free: the download phase fetches the patch
-//! records in memory ([`download_patch_records_with`]), the vendor engine
+//! records in memory ([`download_patch_records_reusing`]), the vendor engine
 //! embeds each record in its ledger entry (`detached: true`), and
 //! `.socket/manifest.json` is never written — a project vendored by an
 //! older, manifest-mode CLI is migrated on its next vendored run (see
@@ -32,7 +32,7 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
-use crate::commands::get::{download_patch_records_with, DetachedDownload, DownloadParams};
+use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, track_outcomes_for_vendor, vendor_records_reusing,
@@ -146,7 +146,7 @@ pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
 /// The vendor step shared by `scan --vendor`'s JSON and interactive arms
 /// (and, through [`boxed_scan_vendor_step`], `get --mode vendored`):
 /// acquire the apply lock, stage the in-memory `records` (from
-/// [`download_patch_records_with`], whose blob `seed` spares the stager a
+/// [`download_patch_records_reusing`], whose blob `seed` spares the stager a
 /// second view fetch), drive [`vendor_records`] detached — every ledger
 /// entry embeds its record; `.socket/manifest.json` is never a record
 /// source — over the run's `client`, then migrate any legacy manifest
@@ -528,7 +528,7 @@ async fn run_vendor_json_path(
         args, /*save_only=*/ true, /*json=*/ true, /*silent=*/ true,
     );
     let (dl_code, dl_json, records, blobs) =
-        boxed_download_patch_records(&selected, &params, api_client, HashMap::new()).await;
+        boxed_download_patch_records(&selected, &params, api_client, HashMap::new(), prior).await;
     let mut has_errors = dl_code != 0;
     result["download"] = dl_json;
 
@@ -649,7 +649,7 @@ async fn run_vendor_interactive_path(
         );
     }
     let (dl_code, dl_json, records, blobs) =
-        boxed_download_patch_records(selected, params, api_client, prefetched).await;
+        boxed_download_patch_records(selected, params, api_client, prefetched, prior).await;
     let mut has_errors = dl_code != 0;
     // Patches the download phase could not get (it reported each one).
     let download_failed = dl_json["failed"].as_u64().unwrap_or(0);
@@ -972,9 +972,10 @@ fn boxed_download_patch_records<'a>(
     params: &'a DownloadParams,
     api_client: &'a ApiClient,
     prefetched: HashMap<String, PatchResponse>,
+    prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DetachedDownload> + 'a>> {
-    Box::pin(download_patch_records_with(
-        selected, params, api_client, prefetched,
+    Box::pin(download_patch_records_reusing(
+        selected, params, api_client, prefetched, prior,
     ))
 }
 
