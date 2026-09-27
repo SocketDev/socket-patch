@@ -3526,7 +3526,7 @@ mod tests {
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
-    use socket_patch_core::patch::redirect::{DepOverride, FileEdit};
+    use socket_patch_core::patch::redirect::DepOverride;
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
 
     /// The wheel window is a patch-API window, so the documented escape

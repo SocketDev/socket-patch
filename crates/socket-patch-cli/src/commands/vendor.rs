@@ -934,7 +934,6 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             )),
         }
     }
-    drop(views);
     for (purl, detail) in &fetch_failures {
         report_vendor_failure(common, purl, detail);
     }
@@ -2653,7 +2652,7 @@ pub(crate) async fn vendor_records_reusing(
                     continue;
                 }
                 for (code, detail) in &restore.warnings {
-                    record_warning(env, candidate, &VendorWarning::new(*code, detail.clone()), common);
+                    record_warning(env, candidate, &VendorWarning::new(code, detail.clone()), common);
                 }
                 if common.dry_run {
                     record_warning(
