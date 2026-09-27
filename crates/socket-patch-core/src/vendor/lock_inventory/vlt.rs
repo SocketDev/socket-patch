@@ -1,12 +1,13 @@
 //! `vlt-lock.json`: the entry model lockfile discovery shares
 //! ([`vlt_lock_nodes`]) and the registry view (DESIGN §4.8).
 
+#[cfg(test)]
 use std::path::Path;
 
 use serde_json::{Map, Value};
 
 use crate::constants::npm_family::VLT_LOCK;
-use crate::utils::fs::read_regular_to_string;
+use super::view::ProjectView;
 use crate::vendor::vlt_lock_text::{
     is_default_registry, sniff_lock, split_dep_id, DepId, DepIdKind, LockSniff,
 };
@@ -152,7 +153,13 @@ pub(crate) fn vlt_registry_entries(lock: &VltLock) -> Vec<LockfileEntry> {
 
 /// Inventory the root `vlt-lock.json`. Vendored `file` nodes are not
 /// registry nodes and never appear; hosted pins stay (pnpm parity).
+#[cfg(test)]
 pub(super) async fn inventory_vlt(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&root.join(VLT_LOCK)).await.ok()?;
+    inventory_vlt_in(&ProjectView::Disk(root)).await
+}
+
+/// [`inventory_vlt`] over a [`ProjectView`].
+pub(super) async fn inventory_vlt_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text(VLT_LOCK).await.ok()?;
     vlt_lock_nodes(&text).map(|lock| vlt_registry_entries(&lock))
 }

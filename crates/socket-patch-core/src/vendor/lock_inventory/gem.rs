@@ -7,6 +7,7 @@ use crate::utils::fs::read_regular_to_string;
 use crate::utils::purl::simple_purl;
 use crate::vendor::gemfile_lock::{self, Section};
 
+use super::view::ProjectView;
 use super::{dedup_prefer_integrity, http_url, LockIntegrity, LockfileEntry, SourceKind};
 
 // ── registry view ──
@@ -26,18 +27,26 @@ use super::{dedup_prefer_integrity, http_url, LockIntegrity, LockfileEntry, Sour
 /// distinct `remote:` lines is a legacy bundler 1.x multisource lock whose
 /// per-spec origin is genuinely ambiguous: its specs stay discovery-only
 /// (no resolved URL — the fetch layer then refuses), fail-closed.
+#[cfg(test)]
 pub(super) async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    inventory_gemfile_lock_raw(project_root)
+    inventory_gemfile_lock_in(&ProjectView::Disk(project_root)).await
+}
+
+/// [`inventory_gemfile_lock`] over a [`ProjectView`].
+pub(super) async fn inventory_gemfile_lock_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
+    inventory_gemfile_lock_raw_in(view)
         .await
         .map(dedup_prefer_integrity)
 }
 
 /// [`inventory_gemfile_lock`] before its collapse: every instance
 /// ([`super::inventory_project_every_lock`]).
-pub(super) async fn inventory_gemfile_lock_raw(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&project_root.join("Gemfile.lock"))
-        .await
-        .ok()?;
+pub(super) async fn inventory_gemfile_lock_raw_in(
+    view: &ProjectView<'_>,
+) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text("Gemfile.lock").await.ok()?;
     // The shared lock model (lockfile discovery reads it too); what bundler
     // would refuse (`problems`) still inventories whatever parsed — this is
     // read-only discovery.

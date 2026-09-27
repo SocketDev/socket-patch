@@ -38,18 +38,18 @@ pub(super) fn install_state_present(cwd: &Path) -> bool {
 }
 
 /// What the artifact preflight decided for this run's npm candidates.
-#[derive(Default)]
-pub(super) struct Preflight {
+#[derive(Debug, Default)]
+pub(crate) struct Preflight {
     /// Failed while vlt drives, or for a vlt-vendored takeover: withheld
     /// from every rewriter.
-    pub(super) withheld_everywhere: BTreeMap<String, String>,
+    pub(crate) withheld_everywhere: BTreeMap<String, String>,
     /// Failed while another npm-family lock may drive: kept out of the vlt
     /// rewrite only.
-    pub(super) withheld_from_vlt: BTreeSet<String>,
-    pub(super) passed: BTreeSet<String>,
+    pub(crate) withheld_from_vlt: BTreeSet<String>,
+    pub(crate) passed: BTreeSet<String>,
     /// Artifact bytes by URL, for the heal's no-record comparison.
-    pub(super) artifacts: BTreeMap<String, Vec<u8>>,
-    pub(super) warnings: Vec<serde_json::Value>,
+    pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
+    pub(crate) warnings: Vec<serde_json::Value>,
 }
 
 /// The files `vlt_drives` and the preflight scope read: `vlt-lock.json`
@@ -122,16 +122,15 @@ pub(super) async fn artifact_preflight(
     api_client: &socket_patch_core::api::client::ApiClient,
     deps: &[(&str, &DepOverride)],
 ) -> Preflight {
-    let mut out = Preflight::default();
     let files = vlt_inputs(&common.cwd).await;
     if files.is_empty() {
-        return out;
+        return Preflight::default();
     }
     let overrides: Vec<DepOverride> = deps.iter().map(|(_, dep)| (*dep).clone()).collect();
     let vendored = vlt_vendored_uuids(&common.cwd, deps).await;
     let scope = vlt_preflight::preflight_scope(&files, &overrides, &vendored);
     if scope.is_empty() {
-        return out;
+        return Preflight::default();
     }
     let drives = vlt::vlt_drives(&files, common.cwd.join(BUN_LOCKB).exists());
     let urls: BTreeSet<String> = scope.iter().map(|d| d.artifact_url.clone()).collect();
@@ -140,8 +139,42 @@ pub(super) async fn artifact_preflight(
     } else {
         vlt_preflight::probe_artifacts(api_client, &urls).await
     };
+    judge_preflight(&scope, deps, drives, probes)
+}
+
+/// [`artifact_preflight`] for a host with no network (the in-memory hosted
+/// engine): every in-scope artifact is judged as `--offline` judges it, so
+/// the dep is withheld (`redirect_vlt_artifact_unverifiable`, "offline")
+/// rather than pinned in a lock vlt may not be able to install. `files`
+/// are the [`vlt_inputs`] entries built from the host's file set.
+pub(crate) fn offline_preflight(
+    files: &BTreeMap<String, String>,
+    deps: &[(&str, &DepOverride)],
+    bun_lockb_present: bool,
+) -> Preflight {
+    if files.is_empty() {
+        return Preflight::default();
+    }
+    let overrides: Vec<DepOverride> = deps.iter().map(|(_, dep)| (*dep).clone()).collect();
+    let scope = vlt_preflight::preflight_scope(files, &overrides, &BTreeSet::new());
+    if scope.is_empty() {
+        return Preflight::default();
+    }
+    let drives = vlt::vlt_drives(files, bun_lockb_present);
+    judge_preflight(&scope, deps, drives, BTreeMap::new())
+}
+
+/// The preflight's verdicts for `scope` given the `probes` fetched for it
+/// (none for a URL that was not fetched: judged offline).
+fn judge_preflight(
+    scope: &[vlt_preflight::PreflightDep],
+    deps: &[(&str, &DepOverride)],
+    drives: bool,
+    probes: BTreeMap<String, vlt_preflight::ArtifactProbe>,
+) -> Preflight {
+    let mut out = Preflight::default();
     let mut passed_urls: BTreeSet<&str> = BTreeSet::new();
-    for dep in &scope {
+    for dep in scope {
         let reason = match probes.get(&dep.artifact_url) {
             None => Some(OFFLINE_REASON.to_string()),
             Some(probe) => probe.failure(&dep.sha512),
@@ -187,7 +220,7 @@ pub(super) async fn artifact_preflight(
 }
 
 /// The skip `reason` of a dep the preflight withheld from every rewriter.
-pub(super) const WITHHELD_REASON: &str = ARTIFACT_UNVERIFIABLE;
+pub(crate) const WITHHELD_REASON: &str = ARTIFACT_UNVERIFIABLE;
 
 fn patch_server_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
     common

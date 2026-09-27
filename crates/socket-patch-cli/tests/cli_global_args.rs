@@ -42,6 +42,8 @@ const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
     // Hidden parse target of the root `--update` flag; its VERSION
     // positional is optional, so the no-positional variant covers it.
     "self-update",
+    // Hidden internal harness for the in-memory hosted engine.
+    "hosted-bundle",
 ];
 
 /// Subcommands that require a positional identifier.
@@ -140,6 +142,7 @@ fn common_of(cli: &Cli) -> &GlobalArgs {
         Vendor(a) => &a.common,
         Vex(a) => &a.common,
         SelfUpdate(a) => &a.common,
+        HostedBundle(a) => &a.common,
     }
 }
 

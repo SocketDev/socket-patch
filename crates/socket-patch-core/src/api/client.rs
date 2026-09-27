@@ -180,7 +180,7 @@ pub struct ApiClientOptions {
 /// Supports both the authenticated Socket API (`api.socket.dev`) and the
 /// public proxy (`patches-api.socket.dev`) which serves free patches
 /// without authentication.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiClient {
     client: reqwest::Client,
     /// Header-free twin of `client` (User-Agent only, never Authorization)
@@ -2482,7 +2482,7 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
 /// reaches a caller. `scan` renders `packages[].patches` straight to the
 /// operator and treats the leading entry as the patch apply will install;
 /// both only hold because of this.
-fn sort_batch_response(response: &mut BatchSearchResponse) {
+pub fn sort_batch_response(response: &mut BatchSearchResponse) {
     for pkg in &mut response.packages {
         pkg.patches.sort_by(cmp_batch_infos);
     }
@@ -2568,6 +2568,302 @@ pub enum ApiError {
 
     #[error("{0}")]
     Other(String),
+}
+
+// ── Patch API seam ────────────────────────────────────────────────────
+
+/// A boxed, `Send` future returned by [`PatchApi`] methods.
+pub type ApiFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ApiError>> + Send + 'a>>;
+
+/// The patch-data calls the hosted flow makes, as an object-safe trait so an
+/// embedding host (the in-memory engine, a napi addon) can serve them
+/// in-process. [`ApiClient`] implements it by forwarding to its inherent
+/// methods, so existing callers are unaffected.
+pub trait PatchApi: Send + Sync {
+    /// Whether calls go to the public patch proxy (free patches only).
+    fn uses_public_proxy(&self) -> bool;
+
+    /// `POST …/patches/batch` for up to 500 purls, normalized through
+    /// [`sort_batch_response`].
+    fn search_patches_batch<'a>(
+        &'a self,
+        purls: &'a [String],
+    ) -> ApiFuture<'a, BatchSearchResponse>;
+
+    /// `GET …/patches/by-package/<purl>`, results best-first.
+    fn search_patches_by_package<'a>(&'a self, purl: &'a str) -> ApiFuture<'a, SearchResponse>;
+
+    /// `POST …/patches/package` (hosted reference grants), keyed by uuid.
+    fn fetch_registry_references<'a>(
+        &'a self,
+        uuids: &'a [String],
+    ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>>;
+
+    /// `GET …/patches/view/<uuid>`; `None` when not found.
+    fn fetch_patch<'a>(&'a self, uuid: &'a str) -> ApiFuture<'a, Option<PatchResponse>>;
+
+    /// Download a grant-tokenized artifact URL, refusing bodies over
+    /// `max_bytes`.
+    fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>>;
+}
+
+impl PatchApi for ApiClient {
+    fn uses_public_proxy(&self) -> bool {
+        self.use_public_proxy
+    }
+
+    fn search_patches_batch<'a>(
+        &'a self,
+        purls: &'a [String],
+    ) -> ApiFuture<'a, BatchSearchResponse> {
+        Box::pin(ApiClient::search_patches_batch(self, purls))
+    }
+
+    fn search_patches_by_package<'a>(&'a self, purl: &'a str) -> ApiFuture<'a, SearchResponse> {
+        Box::pin(ApiClient::search_patches_by_package(self, purl))
+    }
+
+    fn fetch_registry_references<'a>(
+        &'a self,
+        uuids: &'a [String],
+    ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
+        Box::pin(ApiClient::fetch_registry_references(self, uuids))
+    }
+
+    fn fetch_patch<'a>(&'a self, uuid: &'a str) -> ApiFuture<'a, Option<PatchResponse>> {
+        Box::pin(ApiClient::fetch_patch(self, uuid))
+    }
+
+    fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>> {
+        Box::pin(self.download_artifact_capped(url, max_bytes))
+    }
+}
+
+/// Outcome of one capped artifact GET, and `Some(retry-after)` iff a
+/// failure is retryable.
+type CappedAttempt = (Result<Vec<u8>, ApiError>, Option<Option<Duration>>);
+
+impl ApiClient {
+    /// [`ApiClient::download_artifact`] with the caller's byte cap applied
+    /// while streaming (a declared `Content-Length` over it is refused
+    /// before the body is read), retrying transient failures on the vendor
+    /// retry policy.
+    async fn download_artifact_capped(
+        &self,
+        url: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ApiError> {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(ApiError::Other(format!(
+                "refusing non-http(s) artifact URL `{url}`"
+            )));
+        }
+        let attempts = self.vendor_retry.attempts.max(1);
+        let mut attempt = 1;
+        loop {
+            match self.download_artifact_capped_once(url, max_bytes).await {
+                (Err(_), Some(retry_after)) if attempt < attempts => {
+                    self.vendor_backoff(attempt, retry_after).await;
+                    attempt += 1;
+                }
+                (outcome, _) => return outcome,
+            }
+        }
+    }
+
+    async fn download_artifact_capped_once(&self, url: &str, max_bytes: u64) -> CappedAttempt {
+        use crate::utils::http::{read_capped_typed, ReadCappedError};
+        let sent = tokio::time::timeout(
+            self.vendor_retry.attempt_timeout,
+            self.plain
+                .get(url)
+                .header(header::ACCEPT, "application/octet-stream")
+                .send(),
+        )
+        .await;
+        let resp = match sent {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return (
+                    Err(ApiError::Network(format!(
+                        "Network error fetching artifact: {}",
+                        network_error_detail(&e)
+                    ))),
+                    Some(None),
+                )
+            }
+            Err(_) => {
+                return (
+                    Err(ApiError::Network(format!(
+                        "Network error fetching artifact: no response within {:?}",
+                        self.vendor_retry.attempt_timeout
+                    ))),
+                    Some(None),
+                )
+            }
+        };
+        let status = resp.status();
+        match status {
+            StatusCode::OK => {}
+            StatusCode::NOT_FOUND | StatusCode::GONE => {
+                return (
+                    Err(ApiError::Other(format!("artifact not found: {url}"))),
+                    None,
+                )
+            }
+            StatusCode::REQUEST_TIMEOUT => {
+                return (
+                    Err(ApiError::Other(format!("artifact still building: {url}"))),
+                    None,
+                )
+            }
+            _ => {
+                let hint =
+                    vendor_status_retryable(status).then(|| retry_after_secs(resp.headers()));
+                let err = classify_auth_error(status, true).unwrap_or_else(|| {
+                    ApiError::Other(format!(
+                        "artifact download failed with status {}",
+                        status.as_u16()
+                    ))
+                });
+                return (Err(err), hint);
+            }
+        }
+        let body = tokio::time::timeout(
+            self.vendor_retry.body_timeout,
+            read_capped_typed(resp, max_bytes, "artifact"),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ReadCappedError::Truncated(format!(
+                "artifact body not received within {:?}",
+                self.vendor_retry.body_timeout
+            )))
+        });
+        match body {
+            Ok(bytes) => (Ok(bytes), None),
+            Err(ReadCappedError::Truncated(e)) => (Err(ApiError::Network(e)), Some(None)),
+            Err(ReadCappedError::CapExceeded(_)) => (
+                Err(ApiError::Other(format!(
+                    "artifact exceeds the {max_bytes}-byte limit"
+                ))),
+                None,
+            ),
+        }
+    }
+}
+
+/// Never prints the bearer token: an `ApiClient` can end up in a panic
+/// message or an error's `{:?}`.
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("api_url", &self.api_url)
+            .field("api_token", &self.api_token.as_ref().map(|_| "<redacted>"))
+            .field("use_public_proxy", &self.use_public_proxy)
+            .field("org_slug", &self.org_slug)
+            .field("vendor_retry", &self.vendor_retry)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod patch_api_seam_tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_token() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.example".into(),
+            api_token: Some("sktsec_secret_value_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("org".into()),
+        });
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("sktsec_secret_value_api"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn trait_reports_the_proxy_flag() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.example".into(),
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        });
+        let api: &dyn PatchApi = &client;
+        assert!(api.uses_public_proxy());
+    }
+
+    #[tokio::test]
+    async fn trait_forwards_to_the_inherent_batch_search() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/org/patches/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": [
+                    {"purl": "pkg:npm/b@1", "patches": []},
+                    {"purl": "pkg:npm/a@1", "patches": []}
+                ],
+                "canAccessPaidPatches": true
+            })))
+            .mount(&server)
+            .await;
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: Some("t".into()),
+            use_public_proxy: false,
+            org_slug: Some("org".into()),
+        });
+        let api: &dyn PatchApi = &client;
+        let purls = vec!["pkg:npm/a@1".to_string(), "pkg:npm/b@1".to_string()];
+        let response = api.search_patches_batch(&purls).await.unwrap();
+        assert!(response.can_access_paid_patches);
+        let order: Vec<&str> = response.packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(order, vec!["pkg:npm/a@1", "pkg:npm/b@1"]);
+    }
+
+    #[tokio::test]
+    async fn trait_download_enforces_the_callers_byte_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a.whl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 64]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/gone.whl"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: Some("t".into()),
+            use_public_proxy: false,
+            org_slug: Some("org".into()),
+        });
+        let api: &dyn PatchApi = &client;
+        let url = format!("{}/a.whl", server.uri());
+        assert_eq!(
+            api.download_artifact(&url, 64).await.unwrap(),
+            vec![7u8; 64]
+        );
+        let err = api.download_artifact(&url, 63).await.unwrap_err();
+        assert!(err.to_string().contains("63-byte limit"), "{err}");
+        let gone = format!("{}/gone.whl", server.uri());
+        let err = api.download_artifact(&gone, 64).await.unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert!(api
+            .download_artifact("file:///etc/passwd", 64)
+            .await
+            .is_err());
+    }
 }
 
 #[cfg(test)]

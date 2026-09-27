@@ -2570,9 +2570,11 @@ async fn vlt_lock_wins_the_sibling_order_behind_a_refused_pnpm_lock() {
     let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
     assert_eq!(flavor, NpmLockFlavor::Vlt);
     assert_eq!(entries.len(), 1);
-    let (flavor, entries) = super::npm_family::inventory_live_sibling_lock(tmp.path())
-        .await
-        .unwrap();
+    let (flavor, entries) = super::npm_family::inventory_live_sibling_lock_in(
+        &super::view::ProjectView::Disk(tmp.path()),
+    )
+    .await
+    .unwrap();
     assert_eq!(flavor, NpmLockFlavor::Vlt);
     assert_eq!(entries.len(), 1);
 }

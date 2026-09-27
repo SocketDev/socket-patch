@@ -175,11 +175,11 @@ jobs:
 
       - name: Build (cargo)
         if: matrix.build-tool == 'cargo'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release -p socket-patch-cli --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.build-tool == 'cross'
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release -p socket-patch-cli --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'

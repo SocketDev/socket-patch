@@ -66,23 +66,31 @@ pub(crate) mod pnpm;
 pub(crate) mod pypi;
 pub(crate) mod recover;
 pub(crate) mod vlt;
+pub mod view;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
 pub(crate) use self::composer::{composer_lock_packages, ComposerLockPackage};
 pub(crate) use self::npm::{npm_lock_nodes, NpmLockNode};
+#[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pnpm::pnpm_registry_key;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
+pub use self::view::{MemoryEntry, MemoryProject, ProjectView};
 pub use self::wired::wired_vendor_integrity;
 
 // The per-format views `inventory_project_diagnosed` unions (and the test
 // modules reach through `super::*`).
+#[cfg(test)]
 use self::cargo::inventory_cargo_lock;
+#[cfg(test)]
 use self::composer::inventory_composer_lock;
+#[cfg(test)]
 use self::gem::inventory_gemfile_lock;
+#[cfg(test)]
 use self::golang::inventory_go_sum;
+#[cfg(test)]
 use self::pypi::inventory_pypi_locks;
 #[cfg(test)]
 use self::{
@@ -262,18 +270,33 @@ enum Instances {
     Every,
 }
 
+/// [`inventory_project_diagnosed`] over a [`ProjectView`]: the same views,
+/// precedence and guards, reading from disk or from an in-memory project.
+pub async fn inventory_project_diagnosed_in(
+    view: &ProjectView<'_>,
+) -> (Vec<LockfileEntry>, Vec<UnsupportedNpmLayout>) {
+    union_views_in(view, Instances::Collapsed).await
+}
+
 /// The union of the per-format views, in the one precedence order.
 async fn union_views(
     project_root: &Path,
+    instances: Instances,
+) -> (Vec<LockfileEntry>, Vec<UnsupportedNpmLayout>) {
+    union_views_in(&ProjectView::Disk(project_root), instances).await
+}
+
+async fn union_views_in(
+    view: &ProjectView<'_>,
     instances: Instances,
 ) -> (Vec<LockfileEntry>, Vec<UnsupportedNpmLayout>) {
     let every = instances == Instances::Every;
     let mut out: Vec<LockfileEntry> = Vec::new();
     let mut unsupported: Vec<UnsupportedNpmLayout> = Vec::new();
     let npm = if every {
-        npm_family::inventory_npm_lock_raw(project_root).await
+        npm_family::inventory_npm_lock_raw_in(view).await
     } else {
-        inventory_npm_lock(project_root).await
+        npm_family::inventory_npm_lock_in(view).await
     };
     match npm {
         Ok(Some((_, entries))) => out.extend(entries),
@@ -282,29 +305,29 @@ async fn union_views(
     }
     let views = [
         if every {
-            cargo::inventory_cargo_lock_raw(project_root).await
+            cargo::inventory_cargo_lock_raw_in(view).await
         } else {
-            inventory_cargo_lock(project_root).await
+            cargo::inventory_cargo_lock_in(view).await
         },
         if every {
-            golang::inventory_go_sum_raw(project_root).await
+            golang::inventory_go_sum_raw_in(view).await
         } else {
-            inventory_go_sum(project_root).await
+            golang::inventory_go_sum_in(view).await
         },
         if every {
-            composer::inventory_composer_lock_raw(project_root).await
+            composer::inventory_composer_lock_raw_in(view).await
         } else {
-            inventory_composer_lock(project_root).await
+            composer::inventory_composer_lock_in(view).await
         },
         if every {
-            gem::inventory_gemfile_lock_raw(project_root).await
+            gem::inventory_gemfile_lock_raw_in(view).await
         } else {
-            inventory_gemfile_lock(project_root).await
+            gem::inventory_gemfile_lock_in(view).await
         },
         if every {
-            pypi::inventory_pypi_locks_raw(project_root).await
+            pypi::inventory_pypi_locks_raw_in(view).await
         } else {
-            inventory_pypi_locks(project_root).await
+            pypi::inventory_pypi_locks_in(view).await
         },
     ];
     out.extend(views.into_iter().flatten().flatten());

@@ -21,7 +21,7 @@ use crate::commands::vex::generate_vex_from_manifest_path;
 use super::{discover_selected, ScanArgs};
 
 mod python;
-mod vlt;
+pub(crate) mod vlt;
 
 pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
 pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
@@ -31,13 +31,13 @@ pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
 /// Fragment-edit kinds whose lockfile the package manager re-lays in place
 /// (keeping the Socket source) — a re-scan REBASES their ledger edits instead
 /// of appending; see the ledger merge below.
-const REBASE_KINDS: &[&str] = &[
+pub(crate) const REBASE_KINDS: &[&str] = &[
     "redirect_poetry_lock_package",
     "redirect_pdm_lock_package",
     socket_patch_core::patch::redirect::vlt::KIND,
 ];
 
-const REDIRECT_CANDIDATE_FILES: &[&str] = &[
+pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
@@ -133,7 +133,7 @@ fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
 /// dependency (reqwest is dev-only here); per RFC 3986 a raw `@` in the
 /// authority can ONLY be the userinfo terminator (it is percent-encoded
 /// everywhere else), so the tail after the LAST `@` is exactly host[:port].
-fn url_host(url: &str) -> Option<&str> {
+pub(crate) fn url_host(url: &str) -> Option<&str> {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
@@ -143,7 +143,7 @@ fn url_host(url: &str) -> Option<&str> {
 /// Repo-relative path of the pnpm workspace manifest the trustLockfile
 /// auto-config edits (the same file the vendor backend's override surface
 /// uses).
-const PNPM_WORKSPACE_REL: &str = "pnpm-workspace.yaml";
+pub(crate) const PNPM_WORKSPACE_REL: &str = "pnpm-workspace.yaml";
 
 /// `FileEdit.kind` recorded when the hosted flow ensures `trustLockfile:
 /// true` in pnpm-workspace.yaml. `action: "created"` — the workspace file
@@ -151,14 +151,14 @@ const PNPM_WORKSPACE_REL: &str = "pnpm-workspace.yaml";
 /// `trustLockfile: true` line was appended to an existing file (a revert
 /// removes exactly that line). Additive ledger vocabulary: older ledgers
 /// without it load unchanged (kind is an opaque string to the loader).
-const REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND: &str = "redirect_pnpm_workspace_trust";
+pub(crate) const REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND: &str = "redirect_pnpm_workspace_trust";
 
 /// The honest-tradeoff + don't-rebuild tail shared by every trustLockfile
 /// warning variant. The tradeoff sentence is a security disclosure, not
 /// prose garnish: `trustLockfile: true` disables pnpm's lockfile
 /// re-verification for the WHOLE lock, so it must be stated wherever the
 /// setting is written or recommended.
-const PNPM_TRUST_TRADEOFF_AND_CAUTION: &str =
+pub(crate) const PNPM_TRUST_TRADEOFF_AND_CAUTION: &str =
     "Note: trustLockfile makes pnpm skip its lockfile re-verification \
      (minimumReleaseAge / trustPolicy re-checks) for ALL lockfile entries, \
      not just the patched ones — the per-entry sha512 integrity pins are \
@@ -169,7 +169,7 @@ const PNPM_TRUST_TRADEOFF_AND_CAUTION: &str =
 
 /// The policy preamble shared by every trustLockfile warning variant:
 /// what was repointed, and how pnpm >=11 fails without trust.
-fn pnpm_trust_policy_preamble(server: &str) -> String {
+pub(crate) fn pnpm_trust_policy_preamble(server: &str) -> String {
     format!(
         "pnpm-lock.yaml was repointed at {server}; pnpm >=11 rejects the \
          rewritten lock (pnpm 11: ERR_PNPM_TARBALL_URL_MISMATCH, pnpm 12: \
@@ -180,7 +180,7 @@ fn pnpm_trust_policy_preamble(server: &str) -> String {
 /// The pre-auto-config guidance, kept verbatim for the runs where the
 /// auto-config does not apply (legacy 5.x/6.0 locks, Rush nested locks,
 /// `--no-trust-lockfile-config`): both verified recoveries, spelled exactly.
-fn pnpm_trust_manual_guidance(server: &str) -> String {
+pub(crate) fn pnpm_trust_manual_guidance(server: &str) -> String {
     format!(
         "{}. Install with `pnpm install --trust-lockfile`, or commit \
          `trustLockfile: true` in pnpm-workspace.yaml so every install \
@@ -198,7 +198,7 @@ fn pnpm_trust_manual_guidance(server: &str) -> String {
 /// no trust step exists or is needed. Deliberately NEVER mentions
 /// `pnpm install --trust-lockfile`: pnpm 7/8 reject the flag as an unknown
 /// option, so headlining it here would hand users a command that errors.
-fn pnpm_trust_legacy_detail(server: &str) -> String {
+pub(crate) fn pnpm_trust_legacy_detail(server: &str) -> String {
     format!(
         "The pnpm lockfile was repointed at {server}. This is a legacy \
          lock read by pnpm 1–8, which have no \
@@ -216,7 +216,7 @@ fn pnpm_trust_legacy_detail(server: &str) -> String {
 /// here would OVERWRITE the user's file with the root-only scaffold —
 /// destroying their `packages:` globs — so the auto-config stands down and
 /// the warning names the file, the error, and both manual recoveries.
-fn pnpm_trust_workspace_unreadable_detail(server: &str, err: &std::io::Error) -> String {
+pub(crate) fn pnpm_trust_workspace_unreadable_detail(server: &str, err: &std::io::Error) -> String {
     format!(
         "{}. {PNPM_WORKSPACE_REL} exists but could not be read ({err}); it \
          was left untouched — auto-configuring trust would risk overwriting \
@@ -291,7 +291,7 @@ fn npm_lock_url_needles(artifact_url: &str) -> Vec<String> {
 /// block engages anyway. Legacy (<9) and unparseable-version locks stay
 /// `None` (fail closed: never write config for a lock era we can't read),
 /// as does a root lock this run DID splice (the splice path covers it).
-fn pnpm_heal_root<'a>(
+pub(crate) fn pnpm_heal_root<'a>(
     root_spliced: bool,
     disk_root: Option<&'a String>,
     overrides: &[socket_patch_core::patch::redirect::DepOverride],
@@ -307,7 +307,7 @@ fn pnpm_heal_root<'a>(
 
 /// The auto-config variant: trust was (or, on `--dry-run`, would be)
 /// configured in pnpm-workspace.yaml, so installs need no flags.
-fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) -> String {
+pub(crate) fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) -> String {
     let how = match (created, dry_run) {
         (true, false) => "`trustLockfile: true` was written to a new",
         (false, false) => "`trustLockfile: true` was merged into the existing",
@@ -327,7 +327,7 @@ fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) -> S
 /// `'6.0'`, pnpm 7 an unquoted `5.4`. `None` when no parseable version line
 /// exists — callers treat that as "not trust-policy era" and stay
 /// hands-off (fail closed: never write config for a lock we can't read).
-fn pnpm_lock_version_major(lock_text: &str) -> Option<u32> {
+pub(crate) fn pnpm_lock_version_major(lock_text: &str) -> Option<u32> {
     lock_text.lines().find_map(|line| {
         let rest = line.strip_prefix("lockfileVersion:")?;
         let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
@@ -339,7 +339,7 @@ fn pnpm_lock_version_major(lock_text: &str) -> Option<u32> {
 /// `--store` (pnpm 1–3 can silently ignore `--store-dir`; early pnpm 4
 /// rejects it): a `shrinkwrapVersion` lock (pnpm 1–2) or lockfileVersion
 /// 5.0–5.2 (pnpm 3–5). Later locks never get the `--store` note.
-fn pnpm_lock_may_need_store_flag(lock_text: &str) -> bool {
+pub(crate) fn pnpm_lock_may_need_store_flag(lock_text: &str) -> bool {
     lock_text.lines().any(|line| {
         if line.starts_with("shrinkwrapVersion:") {
             return true;
@@ -359,7 +359,7 @@ fn pnpm_lock_may_need_store_flag(lock_text: &str) -> bool {
 }
 
 /// The planned pnpm-workspace.yaml `trustLockfile: true` edit.
-enum TrustPlan {
+pub(crate) enum TrustPlan {
     /// No workspace file: create it (root-only `packages` scaffold — pnpm 9
     /// refuses a workspace file with no `packages` field — plus the trust
     /// key; the same scaffold shape the vendor backend creates).
@@ -379,7 +379,7 @@ enum TrustPlan {
 /// Line splices only (never a YAML library), mirroring the vendor backend's
 /// workspace surgery: untouched lines stay byte-identical, so a revert can
 /// remove exactly what was added.
-fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
+pub(crate) fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
     let Some(text) = existing else {
         return TrustPlan::Create("packages:\n  - '.'\ntrustLockfile: true\n".to_string());
     };
@@ -409,7 +409,7 @@ fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
 /// The root npm locks the hosted rewriter edits (`rewrite_npm_lock` rewrites
 /// every one present — npm 12 installs from package-lock.json beside a
 /// committed shrinkwrap).
-const NPM_LOCKS: [&str; 2] = ["npm-shrinkwrap.json", "package-lock.json"];
+pub(crate) const NPM_LOCKS: [&str; 2] = ["npm-shrinkwrap.json", "package-lock.json"];
 
 /// The honest-tradeoff + opt-out tail shared by every `allow-remote`
 /// warning variant. The tradeoff sentence is a security disclosure, not
@@ -436,7 +436,11 @@ fn npm_allow_remote_preamble(hosts: &[&str]) -> String {
 
 /// The auto-config variant: `allow-remote=all` was (or, on `--dry-run`,
 /// would be) written to the project `.npmrc`, so installs need no flags.
-fn npm_allow_remote_configured_detail(hosts: &[&str], created: bool, dry_run: bool) -> String {
+pub(crate) fn npm_allow_remote_configured_detail(
+    hosts: &[&str],
+    created: bool,
+    dry_run: bool,
+) -> String {
     let how = match (created, dry_run) {
         (true, false) => "`allow-remote=all` was written to a new",
         (false, false) => "`allow-remote=all` was appended to the existing",
@@ -453,7 +457,7 @@ fn npm_allow_remote_configured_detail(hosts: &[&str], created: bool, dry_run: bo
 }
 
 /// The project `.npmrc` already resolves to `allow-remote=all`.
-fn npm_allow_remote_already_detail(hosts: &[&str]) -> String {
+pub(crate) fn npm_allow_remote_already_detail(hosts: &[&str]) -> String {
     format!(
         "{}, and the project .npmrc already sets `allow-remote=all` — keep it committed \
          alongside the lock; `npm ci` needs no extra flags. {NPM_ALLOW_REMOTE_TRADEOFF}",
@@ -464,7 +468,7 @@ fn npm_allow_remote_already_detail(hosts: &[&str]) -> String {
 /// The user explicitly set another value: respected, never flipped (the
 /// pnpm `trustLockfile: false` precedent) — the warning names the manual
 /// recoveries instead.
-fn npm_allow_remote_user_set_detail(hosts: &[&str], value: &str) -> String {
+pub(crate) fn npm_allow_remote_user_set_detail(hosts: &[&str], value: &str) -> String {
     format!(
         "{}. The project .npmrc explicitly sets `allow-remote={value}`, which was respected \
          and left untouched — set `allow-remote=all` there yourself (or install with \
@@ -477,7 +481,7 @@ fn npm_allow_remote_user_set_detail(hosts: &[&str], value: &str) -> String {
 /// An `npm_config_allow_remote` environment variable sets another value.
 /// npm's env layer beats every `.npmrc`, so a project write could not take
 /// effect in this environment — and an explicit setting is respected.
-fn npm_allow_remote_env_set_detail(hosts: &[&str], var: &str, value: &str) -> String {
+pub(crate) fn npm_allow_remote_env_set_detail(hosts: &[&str], var: &str, value: &str) -> String {
     format!(
         "{}. The environment variable {var}={value} explicitly sets `allow-remote`, which \
          was respected: npm's environment layer overrides every .npmrc, so a project \
@@ -492,7 +496,7 @@ fn npm_allow_remote_env_set_detail(hosts: &[&str], var: &str, value: &str) -> St
 /// another value. A committed project `allow-remote=all` would silently
 /// override that machine / org policy on every checkout, so it is
 /// respected like a project value and the override is left to the user.
-fn npm_allow_remote_outer_set_detail(
+pub(crate) fn npm_allow_remote_outer_set_detail(
     hosts: &[&str],
     layer: &str,
     path: &std::path::Path,
@@ -512,7 +516,7 @@ fn npm_allow_remote_outer_set_detail(
 
 /// The opt-out (`--no-npm-allow-remote-config`) variant: nothing written,
 /// both manual recoveries spelled out.
-fn npm_allow_remote_manual_detail(hosts: &[&str]) -> String {
+pub(crate) fn npm_allow_remote_manual_detail(hosts: &[&str]) -> String {
     format!(
         "{}. Commit `allow-remote=all` in the project .npmrc (or install with \
          `npm ci --allow-remote=all`) so npm >=12 installs the patched artifacts. \
@@ -525,7 +529,7 @@ fn npm_allow_remote_manual_detail(hosts: &[&str]) -> String {
 /// be read, or is a symlink / non-regular file the atomic writer would
 /// replace. Planning a Create here would OVERWRITE the user's registry /
 /// auth config, so the auto-config stands down and names the problem.
-fn npm_allow_remote_unreadable_detail(hosts: &[&str], why: &str) -> String {
+pub(crate) fn npm_allow_remote_unreadable_detail(hosts: &[&str], why: &str) -> String {
     format!(
         "{}. The project .npmrc exists but {why}; it was left untouched. Add \
          `allow-remote=all` to it yourself (or install with `npm ci --allow-remote=all`) \
@@ -615,7 +619,7 @@ fn build_redirect_json_envelope(
 /// `mode` is `"hosted"` (the final mode name for `--redirect`): an additive
 /// key so consumers dispatch on the mode without inferring it from which
 /// sub-object is present.
-pub(super) fn redirect_json_block(
+pub(crate) fn redirect_json_block(
     redirected: usize,
     rewritten: Vec<String>,
     skipped: Vec<serde_json::Value>,
@@ -3782,7 +3786,7 @@ fn format_next_steps(
 /// context). A replacing edit keeps the recorded pristine slots when vlt
 /// carried the pin ([`carried_pin_original`]). Returns, per fresh edit,
 /// whether it was merged (anything else is appended as usual).
-fn rebase_vlt_edits(
+pub(crate) fn rebase_vlt_edits(
     ledger: &mut Vec<socket_patch_core::patch::redirect::FileEdit>,
     fresh: &[socket_patch_core::patch::redirect::FileEdit],
     before_lock: Option<&str>,
