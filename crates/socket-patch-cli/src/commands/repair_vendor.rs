@@ -53,7 +53,6 @@ use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::constants::SOCKET_DIR;
-use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::utils::fs::read_regular_to_string;
@@ -1360,11 +1359,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     // ── Pristine package sources ─────────────────────────────────────────
     let purls: Vec<String> = candidates.iter().map(|c| c.purl.clone()).collect();
     let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
-    let crawler_options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-    };
+    let crawler_options = common.crawler_options();
     // Ledger keys are the manifest spelling — QUALIFIED for release-variant
     // ecosystems (gem `?platform=`, pypi `?artifact_id=`, maven
     // `?classifier=&ext=`) — while the crawler knows only base purls. A

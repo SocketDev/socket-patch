@@ -14,7 +14,7 @@ use socket_patch_core::api::client::{
 };
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
-use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
@@ -261,7 +261,7 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         ));
     }
     if args.mode == Some(ScanMode::Hosted)
-        && (args.common.global || args.common.global_prefix.is_some())
+        && args.common.is_global()
     {
         // Global installs have no project lockfile to repoint: the hosted
         // flow would "redirect 0 packages" and exit 0, a silent no-op.
@@ -1744,13 +1744,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // how often stale-token fallbacks fire in the wild.
     let mut fallback_to_proxy = false;
 
-    let crawler_options = CrawlerOptions {
-        cwd: args.common.cwd.clone(),
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-    };
+    let crawler_options = args.common.crawler_options();
 
-    let scan_target = if args.common.global || args.common.global_prefix.is_some() {
+    let scan_target = if args.common.is_global() {
         "global packages"
     } else {
         "packages"
@@ -1805,12 +1801,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // gated stderr line on the human path) unless `--ecosystems` filtered
     // gem out of this run.
     if let Some(value) = skipped_bundle_config_path {
-        if args
-            .common
-            .ecosystems
-            .as_ref()
-            .is_none_or(|list| list.iter().any(|e| e == Ecosystem::Gem.cli_name()))
-        {
+        if args.common.ecosystem_selected(Ecosystem::Gem) {
             let (code, detail) = config_path_ignored_warning(&value);
             layout_refusals.push((code.to_string(), detail));
         }
@@ -1872,20 +1863,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         .unwrap_or_default();
 
     // Filter by --ecosystems if provided
-    let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
-        all_crawled
-            .into_iter()
-            .filter(|pkg| {
-                if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
-                    allowed.iter().any(|a| a == eco.cli_name())
-                } else {
-                    false
-                }
-            })
-            .collect()
-    } else {
-        all_crawled
-    };
+    let filtered_crawled: Vec<_> = all_crawled
+        .into_iter()
+        .filter(|pkg| args.common.purl_ecosystem_selected(&pkg.purl))
+        .collect();
 
     let filtered_crawled: Vec<_> = if args.packages.is_empty() {
         filtered_crawled
@@ -2054,7 +2035,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             println!(
                 "{}",
                 render::no_packages_message(
-                    args.common.global || args.common.global_prefix.is_some(),
+                    args.common.is_global(),
                     args.common.ecosystems.as_deref(),
                     &args.paths,
                 )
@@ -2376,7 +2357,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // The hosted pins the lockfiles wire count too: the lockfile is the
     // record of a hosted redirect even where no ledger was committed.
     let hosted_pins: Vec<(String, String)> =
-        if args.common.global || args.common.global_prefix.is_some() {
+        if args.common.is_global() {
             Vec::new()
         } else {
             crate::commands::discover_wiring(&args.common, &args.common.cwd)

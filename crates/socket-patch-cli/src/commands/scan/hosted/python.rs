@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use socket_patch_core::crawlers::{types::CrawlerOptions, PythonCrawler};
+use socket_patch_core::crawlers::PythonCrawler;
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vex::verify::judge_installed_record;
@@ -44,13 +44,9 @@ pub(super) async fn stale_install_warnings(
     // copy of the release (a tool venv on PATH) and warn about a venv the
     // project's installer never touches — a false positive that also fails
     // the same-run --vex. --global / --global-prefix keep their meaning.
-    let paths = if common.global || common.global_prefix.is_some() {
+    let paths = if common.is_global() {
         crawler
-            .get_site_packages_paths(&CrawlerOptions {
-                cwd: common.cwd.clone(),
-                global: common.global,
-                global_prefix: common.global_prefix.clone(),
-            })
+            .get_site_packages_paths(&common.crawler_options())
             .await
             .unwrap_or_default()
     } else {

@@ -346,11 +346,12 @@ fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
 
 /// Does `eco` fall inside this run's `--ecosystems` scope?
 pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
-    match common.ecosystems.as_deref() {
-        None => true,
-        Some(list) => list.iter().any(|e| {
-            e.eq_ignore_ascii_case(eco) || (eco == "golang" && e.eq_ignore_ascii_case("go"))
-        }),
+    match socket_patch_core::crawlers::Ecosystem::all()
+        .iter()
+        .find(|e| e.cli_name() == eco)
+    {
+        Some(eco) => common.ecosystem_selected(*eco),
+        None => common.ecosystems.as_ref().is_none_or(Vec::is_empty),
     }
 }
 
@@ -1832,11 +1833,7 @@ pub(crate) async fn vendor_records_reusing(
         vendor::prestage::sweep_stale(&common.cwd).await;
     }
 
-    let crawler_options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-    };
+    let crawler_options = common.crawler_options();
     // Resolve installed packages with the qualified-purl-aware resolver, never
     // a base-keyed one: the manifest keys release-variant ecosystems (gem
     // `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
@@ -5158,11 +5155,11 @@ mod scope_and_hint_tests {
         }
     }
 
-    /// The `Some(list)` branch of [`ecosystem_in_scope`]: exact match,
-    /// case-insensitivity, and the `go` → `golang` alias; `None` means
-    /// everything is in scope.
+    /// [`ecosystem_in_scope`] is `--ecosystems`' exact-name match (clap
+    /// validates the names, so no case or alias variant reaches it); `None`
+    /// means everything is in scope.
     #[test]
-    fn ecosystem_in_scope_honors_list_alias_and_case() {
+    fn ecosystem_in_scope_is_an_exact_name_match() {
         let unscoped = with_scope(None);
         assert!(ecosystem_in_scope(&unscoped, "npm"));
         assert!(ecosystem_in_scope(&unscoped, "cargo"));
@@ -5172,18 +5169,8 @@ mod scope_and_hint_tests {
         assert!(!ecosystem_in_scope(&npm_only, "cargo"));
         assert!(!ecosystem_in_scope(&npm_only, "golang"));
 
-        let upper = with_scope(Some(&["NPM"]));
-        assert!(
-            ecosystem_in_scope(&upper, "npm"),
-            "scope matching is case-insensitive"
-        );
-
-        let go_alias = with_scope(Some(&["go"]));
-        assert!(
-            ecosystem_in_scope(&go_alias, "golang"),
-            "`go` must alias the golang ecosystem"
-        );
-        assert!(!ecosystem_in_scope(&go_alias, "npm"));
+        let golang = with_scope(Some(&["golang"]));
+        assert!(ecosystem_in_scope(&golang, "golang"));
     }
 }
 

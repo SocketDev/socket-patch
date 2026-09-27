@@ -1265,14 +1265,6 @@ pub struct DownloadRun<'a> {
     pub verbose: bool,
 }
 
-fn crawler_options_for(common: &GlobalArgs) -> CrawlerOptions {
-    CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-    }
-}
-
 /// Narrow a selection of patches down to the release variant(s) present
 /// in each locally-installed distribution.
 ///
@@ -1615,7 +1607,7 @@ async fn filter_to_installed_purls(
             .collect()
     };
     let partitioned = partition_purls(&bases, None);
-    let found = find_packages_for_rollback(&partitioned, &crawler_options_for(common), true).await;
+    let found = find_packages_for_rollback(&partitioned, &common.crawler_options(), true).await;
     let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
 
     // Manifest membership counts as presence (read-only probe: a corrupt
@@ -1901,11 +1893,7 @@ async fn lock_text_refusals_for(
         .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
         .collect();
     let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
-    let options = CrawlerOptions {
-        cwd: params.cwd.clone(),
-        global: params.global,
-        global_prefix: params.global_prefix.clone(),
-    };
+    let options = params.crawler_options();
     crate::commands::vendor::lock_refusals_reaching_backend(
         cwd,
         refused,
@@ -2956,7 +2944,7 @@ pub async fn run(args: GetArgs) -> i32 {
         IdentifierType::Package => {
             status.set("Enumerating packages...");
             let (all_packages, _, _) =
-                crawl_all_ecosystems(&crawler_options_for(&args.common)).await;
+                crawl_all_ecosystems(&args.common.crawler_options()).await;
 
             if all_packages.is_empty() {
                 status.finish();
@@ -3198,7 +3186,7 @@ pub async fn run(args: GetArgs) -> i32 {
         let (selected, variant_warnings, _views) = filter_to_installed_releases(
             &selected,
             args.all_releases,
-            &crawler_options_for(&args.common),
+            &args.common.crawler_options(),
             quiet,
             &api_client,
         )
@@ -3237,7 +3225,7 @@ pub async fn run(args: GetArgs) -> i32 {
             let (selected, variant_warnings, _views) = filter_to_installed_releases(
                 &selected,
                 args.all_releases,
-                &crawler_options_for(&args.common),
+                &args.common.crawler_options(),
                 quiet,
                 &api_client,
             )

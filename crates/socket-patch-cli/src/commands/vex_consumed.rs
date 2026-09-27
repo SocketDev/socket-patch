@@ -76,11 +76,7 @@ pub(crate) async fn hosted_consumed_copies(
     if hosted.is_empty() {
         return out;
     }
-    let options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-    };
+    let options = common.crawler_options();
     let purls: Vec<String> = hosted.keys().cloned().collect();
     let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
 

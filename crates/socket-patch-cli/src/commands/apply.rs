@@ -3,7 +3,7 @@ use socket_patch_core::api::blob_fetcher::get_missing_blobs;
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::{
-    detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager, RubyCrawler,
+    detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
 };
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
@@ -386,13 +386,7 @@ pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
 /// `.yarn/cache/*.zip`, so a run that never crawls the checkout's
 /// `node_modules` must not be refused by its layout).
 fn eco_in_local_scope(common: &GlobalArgs, eco: Ecosystem) -> bool {
-    if common.global || common.global_prefix.is_some() {
-        return false;
-    }
-    match &common.ecosystems {
-        None => true,
-        Some(list) => list.iter().any(|e| e == eco.cli_name()),
-    }
+    !common.is_global() && common.ecosystem_selected(eco)
 }
 
 /// Materialise a local-go redirect for `purl`, or `None` if `purl` isn't a
@@ -1727,11 +1721,7 @@ async fn apply_patches_inner(
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
 
-    let crawler_options = CrawlerOptions {
-        cwd: args.common.cwd.clone(),
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-    };
+    let crawler_options = args.common.crawler_options();
 
     // Gem bundle-store discovery, re-run cheaply (filesystem probes only,
     // no `gem env` shell-out) against the same ambient environment the

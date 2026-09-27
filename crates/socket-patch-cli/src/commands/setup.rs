@@ -417,11 +417,7 @@ fn pathdiff(path: &str, base: &Path) -> String {
 /// value parser admits no alias or case variant — and it is the same rule
 /// `partition_purls` applies, so setup's scope never diverges from apply's.
 fn eco_in_scope(common: &GlobalArgs, eco: Ecosystem) -> bool {
-    match &common.ecosystems {
-        None => true,
-        Some(list) if list.is_empty() => true,
-        Some(list) => list.iter().any(|e| e == eco.cli_name()),
-    }
+    common.ecosystem_selected(eco)
 }
 
 /// Normalize a workspace-member / exclude path for comparison: trimmed,

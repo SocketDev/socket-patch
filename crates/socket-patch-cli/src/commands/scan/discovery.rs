@@ -102,7 +102,7 @@ pub(super) async fn lockfile_supplement(
     use socket_patch_core::vendor::lock_inventory;
 
     let mut out = LockfileSupplement::default();
-    if common.global || common.global_prefix.is_some() {
+    if common.is_global() {
         return out;
     }
     let (entries, unsupported) = lock_inventory::inventory_project_diagnosed(&common.cwd).await;
@@ -175,7 +175,7 @@ pub(super) async fn vendored_ledger_supplement(
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     state: &std::io::Result<VendorState>,
 ) -> Vec<socket_patch_core::crawlers::types::CrawledPackage> {
-    if common.global || common.global_prefix.is_some() {
+    if common.is_global() {
         return Vec::new();
     }
     let base_purls: Vec<String> = match state {

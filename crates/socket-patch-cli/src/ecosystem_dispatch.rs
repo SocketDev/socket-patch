@@ -632,11 +632,7 @@ pub async fn find_manifest_package_copies_reusing(
     prior: Option<&NpmCrawlSnapshot>,
 ) -> HashMap<String, Vec<PathBuf>> {
     let partitioned = partition_purls(purls, common.ecosystems.as_deref());
-    let crawler_options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-    };
+    let crawler_options = common.crawler_options();
     let npm_roots = prior.and_then(|p| p.roots_for(&crawler_options));
     dispatch_find(
         &partitioned,

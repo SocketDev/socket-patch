@@ -382,6 +382,40 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
+    /// The crawler options this run's `--cwd` / `--global` /
+    /// `--global-prefix` select.
+    pub(crate) fn crawler_options(&self) -> socket_patch_core::crawlers::CrawlerOptions {
+        socket_patch_core::crawlers::CrawlerOptions {
+            cwd: self.cwd.clone(),
+            global: self.global,
+            global_prefix: self.global_prefix.clone(),
+        }
+    }
+
+    /// Whether this run targets globally installed packages (`--global` or
+    /// `--global-prefix`) rather than the project at `--cwd`.
+    pub(crate) fn is_global(&self) -> bool {
+        self.global || self.global_prefix.is_some()
+    }
+
+    /// Whether `--ecosystems` selects `eco` (every ecosystem when unset or
+    /// empty). The names are validated at parse time, so this is an exact
+    /// match.
+    pub(crate) fn ecosystem_selected(&self, eco: Ecosystem) -> bool {
+        self.ecosystems.as_ref().is_none_or(|list| {
+            list.is_empty() || list.iter().any(|name| name == eco.cli_name())
+        })
+    }
+
+    /// [`Self::ecosystem_selected`] for the ecosystem of `purl`; a purl of
+    /// no known ecosystem is selected only when `--ecosystems` is unset.
+    pub(crate) fn purl_ecosystem_selected(&self, purl: &str) -> bool {
+        match Ecosystem::from_purl(purl) {
+            Some(eco) => self.ecosystem_selected(eco),
+            None => self.ecosystems.as_ref().is_none_or(Vec::is_empty),
+        }
+    }
+
     /// Resolve `manifest_path` against `cwd`: absolute paths are returned
     /// as-is, relative paths are joined to `cwd`.
     pub(crate) fn resolved_manifest_path(&self) -> PathBuf {

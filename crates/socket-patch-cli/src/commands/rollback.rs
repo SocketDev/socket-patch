@@ -2348,11 +2348,7 @@ pub(crate) async fn rollback_patches_inner(
         .patches
         .retain(|purl, _| in_scope.contains(purl));
 
-    let crawler_options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-    };
+    let crawler_options = common.crawler_options();
 
     // Multi-copy aware: npm nests genuine duplicates of one `name@version`,
     // so the resolver returns EVERY physical copy per PURL. Restoring only
