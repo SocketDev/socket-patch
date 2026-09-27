@@ -41,6 +41,30 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed (BREAKING)
 
+- **`repair` no longer rebuilds the vendor ledger from lockfiles.** A
+  lockfile that references `.socket/vendor/<eco>/<uuid>/` with no entry in
+  `.socket/vendor/state.json` now fails with `vendor_ledger_missing` (an
+  artifact-level `failed` event with `uuid` and `details.{ecosystem,path}`;
+  exit 1) instead of re-synthesizing the entry (`details.ledgerRestored` is
+  gone). The rewired lockfile cannot supply the pre-vendor originals a
+  revert needs, so the remedy is restoring `state.json` from version
+  control (or `git checkout -- <lockfile>` and re-vendoring). The unverified
+  npm "rebuild from the wired integrity" rung and the gem Gemfile wiring
+  reconstruction went with it; `rollback`'s missing-ledger error now asks
+  for `state.json` to be restored instead of naming `repair`.
+- **`repair` re-vendors broken artifacts the way `vendor` does.** Missing
+  or corrupt vendored artifacts go through the same vendored backend as
+  `vendor` / `scan --mode vendored` / `get --mode vendored`, so under the
+  default `--vendor-source auto` the patch service's prebuilt artifact is
+  downloaded again, with a local build as the fallback (and the only
+  source under `--offline` / `--vendor-source build`). The result is still
+  verified against the ledger fingerprint before it counts as `rebuilt`.
+  Failure details are now `vendor`'s own (for example "no installed
+  package found on disk"), and a drifted installed copy of a gem or pypi
+  release variant is no longer force-overwritten by repair — it fails the
+  same installed-variant check `vendor` applies. Internally, `vendor`, `scan`/`get --mode vendored`, `vendor --revert`,
+  `rollback`'s vendored leg, `remove` and `repair` now share one
+  `VendoredBackend { apply, revert, repair }`.
 - **Vendored runs refuse lock-text failures before downloading them.**
   `scan --mode vendored` and `get --mode vendored` evaluate the vendor
   backends' pure lock-text gates — pnpm, yarn classic and yarn berry

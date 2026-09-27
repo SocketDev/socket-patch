@@ -736,21 +736,29 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     assert_eq!(repaired["summary"]["rebuilt"], 1, "repair: {repaired}");
     fixture.frozen("repaired", &fixture.patched, "minimist");
 
-    // Recovery also discovers native binary wiring when the local ledger was
-    // lost. Save the original ledger only to continue the unrelated takeover
-    // and exact-rollback assertions after this recovery proof.
+    // A lost ledger is reported, not re-synthesized — and the reference is
+    // still discovered from the native binary lock. Save the original
+    // ledger to continue the takeover and exact-rollback assertions.
     let state_path = project.join(".socket/vendor/state.json");
     let saved_state = std::fs::read(&state_path).unwrap();
     std::fs::remove_file(&state_path).unwrap();
-    std::fs::remove_dir_all(project.join(".socket/vendor/npm")).unwrap();
-    let recovered = cli(project, &["repair", "--offline", "--yes"]);
-    assert_eq!(
-        recovered["summary"]["rebuilt"], 1,
+    let output = command(env!("CARGO_BIN_EXE_socket-patch"), project)
+        .args(["repair", "--offline", "--yes", "--cwd"])
+        .arg(project)
+        .args(["--json", "--no-telemetry"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "ledgerless repair must fail");
+    let recovered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        recovered["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["errorCode"] == "vendor_ledger_missing"),
         "ledgerless repair: {recovered}"
     );
-    let state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    assert_eq!(state["entries"][PURL]["flavor"], "bun");
-    fixture.frozen("ledgerless-repair", &fixture.patched, "minimist");
+    assert!(!state_path.exists(), "no ledger is synthesized");
     std::fs::write(&state_path, saved_state).unwrap();
 
     let before = snapshot(project);

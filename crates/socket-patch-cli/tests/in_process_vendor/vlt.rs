@@ -900,7 +900,7 @@ fn link_vendored_dir(root: &Path, uuid: &str) {
 }
 
 #[test]
-fn vendor_vlt_linked_install_without_a_ledger_entry_points_at_repair() {
+fn vendor_vlt_linked_install_without_a_ledger_entry_points_at_state_json() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     direct_project(root);
@@ -923,7 +923,7 @@ fn vendor_vlt_linked_install_without_a_ledger_entry_points_at_repair() {
         detail,
         format!(
             "installed from the vendored artifact .socket/vendor/npm/{UUID}/, but the vendor \
-             ledger has no entry for it; run `socket-patch repair` to restore the entry"
+             ledger has no entry for it; restore .socket/vendor/state.json from version control"
         )
     );
     assert!(
@@ -932,41 +932,17 @@ fn vendor_vlt_linked_install_without_a_ledger_entry_points_at_repair() {
     );
     assert_eq!(read(root, VLT_LOCK), lock);
 
+    // Repair reports the lost ledger rather than re-synthesizing it.
     let cwd = root.to_str().unwrap().to_string();
     let (code, env, _) = socket(root, &["repair", "--json", "--offline", "--cwd", &cwd], &[]);
-    assert_eq!(code, 0, "{env:#}");
-    let unverified = events(&env)
-        .into_iter()
-        .find(|e| e["errorCode"] == "vendor_inventory_unverified")
-        .unwrap_or_else(|| panic!("{env:#}"));
-    assert!(
-        unverified["reason"].as_str().unwrap().ends_with(
-            "restore the registry version spec in the package.json files that name the \
-             vendored dir, run `vlt install`, then run `socket-patch vendor` to re-vendor and \
-             record one"
-        ),
-        "{unverified:#}"
-    );
-    let entry = ledger_entry(root, PURL);
-    assert_eq!(entry["flavor"], "vlt", "{env:#}");
-    assert_eq!(entry["uuid"], UUID, "{env:#}");
-    // The reconstructed entry has no inventory: the rerun says so instead
-    // of claiming nothing is installed.
-    assert!(entry["artifact"]["fileInventory"].is_null(), "{entry:#}");
-    let (code, env, _) = vendor(root, &[]);
     assert_eq!(code, 1, "{env:#}");
-    let skip = events(&env)
-        .into_iter()
-        .find(|e| e["errorCode"] == "package_not_installed")
-        .unwrap_or_else(|| panic!("{env:#}"));
-    assert_eq!(
-        skip["reason"],
-        format!(
-            "the only installed copy is the vendored artifact .socket/vendor/npm/{UUID}/, which \
-             is not a pristine source, and its ledger entry records no file inventory to stage \
-             the committed artifact against"
-        )
+    assert!(
+        events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_ledger_missing" && e["uuid"] == UUID),
+        "{env:#}"
     );
+    assert!(!root.join(".socket/vendor/state.json").exists(), "{env:#}");
     assert_eq!(read(root, VLT_LOCK), lock);
 }
 
