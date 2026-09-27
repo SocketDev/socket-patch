@@ -6,7 +6,9 @@
 //!
 //! Two defaults are especially load-bearing and explicitly asserted:
 //!
-//! * `--batch-size` defaults to `100`. Downstream API batching assumes this.
+//! * `--batch-size` has no parse-time default: unset, `scan` picks it per
+//!   endpoint at run time (500 on the authenticated API, 100 on the public
+//!   proxy), so an explicit value must stay distinguishable from none.
 //! * `--download-mode` defaults to `"diff"`. This diverges from `repair`'s
 //!   default and is a silent-regression risk if flipped.
 
@@ -110,7 +112,10 @@ fn defaults_match_contract() {
     let args = parse_scan(&[]);
 
     // Critical load-bearing defaults.
-    assert_eq!(args.batch_size, 100, "--batch-size default is 100");
+    assert_eq!(
+        args.batch_size, None,
+        "--batch-size has no parse-time default (resolved per endpoint at run time)"
+    );
     assert_eq!(
         args.common.download_mode, "diff",
         "--download-mode default is \"diff\""
@@ -264,14 +269,14 @@ fn api_token_flag() {
 #[serial_test::serial]
 fn batch_size_500() {
     let args = parse_scan(&["--batch-size", "500"]);
-    assert_eq!(args.batch_size, 500);
+    assert_eq!(args.batch_size, Some(500));
 }
 
 #[test]
 #[serial_test::serial]
 fn batch_size_1() {
     let args = parse_scan(&["--batch-size", "1"]);
-    assert_eq!(args.batch_size, 1);
+    assert_eq!(args.batch_size, Some(1));
 }
 
 #[test]
@@ -281,7 +286,7 @@ fn batch_size_0_parses() {
     // a command-level concern, not a parser concern. Lock in that the parser
     // itself does not reject it.
     let args = parse_scan(&["--batch-size", "0"]);
-    assert_eq!(args.batch_size, 0);
+    assert_eq!(args.batch_size, Some(0));
 }
 
 #[test]
@@ -707,7 +712,7 @@ fn legacy_mode_spellings_still_parse() {
 /// `Debug` derive) are formatted individually.
 fn snap(a: &ScanArgs) -> String {
     format!(
-        "{:?} paths={:?} batch_size={} apply={} prune={} sync={} vendor={} detached={} \
+        "{:?} paths={:?} batch_size={:?} apply={} prune={} sync={} vendor={} detached={} \
          redirect={} mode={:?} all_releases={} vex={:?} vex_product={:?} \
          vex_no_verify={} vex_doc_id={:?} vex_compact={}",
         a.common,

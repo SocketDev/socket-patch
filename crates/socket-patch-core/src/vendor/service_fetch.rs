@@ -8,6 +8,8 @@
 //! per-ecosystem backends own the placement (Tier A: write the archive; Tier B:
 //! extract it into the vendor directory) and the build-vs-service policy.
 
+use sha2::Digest as _;
+
 use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
 use crate::manifest::schema::PatchRecord;
 use crate::vendor::lock_inventory::LockIntegrity;
@@ -23,6 +25,8 @@ use crate::vendor::{
 /// Deliberately minimal: every consumer recomputes the hashes it needs from
 /// `bytes` (so a service-downloaded artifact describes itself byte-identically
 /// to a local build), so the service-reported sha1/md5/size are not re-carried.
+/// The one exception is [`Self::sha256_hex`], which is OUR digest of the same
+/// bytes, taken where they are already being walked.
 #[derive(Debug)]
 pub(crate) struct VerifiedArchive {
     /// The verified archive bytes (npm `.tgz`, pypi `.whl`/sdist, cargo
@@ -31,12 +35,30 @@ pub(crate) struct VerifiedArchive {
     /// Normalized sha512 SRI (`sha512-<b64>`) of the bytes — what npm/pypi/etc.
     /// lockfiles that key on sha512 embed verbatim.
     pub integrity_sri: String,
+    /// Hex sha256 of the same bytes — the pin a pypi lock records for the
+    /// vendored wheel. Taken on FIRST READ: pypi is the only backend that
+    /// asks for it, and the other seven download through this same path, so
+    /// digesting every archive here would charge them all for a walk none of
+    /// them makes.
+    sha256_hex: std::sync::OnceLock<String>,
     /// The (possibly host-rewritten) URL the bytes came from — for logging.
     pub source_url: String,
     /// The OTHER served artifacts (e.g. gem's path-source stub gemspec), still
     /// unverified — a backend that needs one calls [`fetch_verified_secondary`]
     /// to download + integrity-verify it on demand.
     pub secondary: Vec<SecondaryArtifact>,
+    /// What the vendor prefetch plan already did with these bytes ahead of
+    /// the backend: an extracted tree to claim, an afterHash verdict (see
+    /// [`crate::vendor::prestage`]).
+    pub prestaged: crate::vendor::prestage::Prestaged,
+}
+
+impl VerifiedArchive {
+    /// Hex sha256 of [`Self::bytes`], digested once on first ask.
+    pub(crate) fn sha256_hex(&self) -> &str {
+        self.sha256_hex
+            .get_or_init(|| hex::encode(sha2::Sha256::digest(&self.bytes)))
+    }
 }
 
 /// Result of attempting a service download for one patch UUID.
@@ -108,9 +130,26 @@ pub(crate) async fn fetch_verified_archive(
     ServiceArtifact::Ready(VerifiedArchive {
         bytes: pkg.tarball,
         integrity_sri: pkg.integrity_sri,
+        sha256_hex: std::sync::OnceLock::new(),
         source_url: pkg.source_url,
         secondary: pkg.secondary_artifacts,
+        prestaged: pkg.prestaged,
     })
+}
+
+/// Move the tree the download plan pre-staged from `archive`'s bytes (see
+/// [`crate::vendor::prestage`]) into `stage`, the backend's stage for
+/// `copy_dir`, where the backend would otherwise extract them. `false` —
+/// nothing pre-staged, or the move failed — and the backend extracts live.
+pub(crate) async fn claim_prestaged(
+    archive: &mut VerifiedArchive,
+    stage: &std::path::Path,
+    copy_dir: &std::path::Path,
+) -> bool {
+    match archive.prestaged.tree.take() {
+        Some(tree) => tree.claim_into(stage, copy_dir).await,
+        None => false,
+    }
 }
 
 /// Outcome of attempting to materialise a single-file artifact from the patch
@@ -168,7 +207,10 @@ pub(crate) async fn service_archive_copy(
         // Tier-B backends' extracted-tree check). Fail closed → `auto`
         // falls back to the local rebuild.
         ServiceArtifact::Ready(archive)
-            if !zip_bytes_match_after_hashes(&archive.bytes, &record.files) =>
+            if !archive
+                .prestaged
+                .zip_verdict(&record.files)
+                .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files)) =>
         {
             miss(
                 warnings,
@@ -255,7 +297,13 @@ pub(crate) async fn fetch_verified_secondary(
         return SecondaryArtifactResult::Absent;
     };
 
-    let bytes = match client.download_artifact(&artifact.url).await {
+    // A download the vendor prefetch plan already made stands in for the
+    // live request (its debug lines print here, where this call's would).
+    let downloaded = match artifact.prefetched.as_ref().and_then(|p| p.take()) {
+        Some(held) => held.release(),
+        None => client.download_artifact(&artifact.url).await,
+    };
+    let bytes = match downloaded {
         Ok(bytes) => bytes,
         Err(e) => return SecondaryArtifactResult::Failed(e.to_string()),
     };
@@ -751,12 +799,15 @@ mod tests {
         let archive = VerifiedArchive {
             bytes: Vec::new(),
             integrity_sri: String::new(),
+            sha256_hex: std::sync::OnceLock::new(),
             source_url: String::new(),
             secondary: vec![SecondaryArtifact {
+                prefetched: None,
                 kind: "gem-stub-gemspec".into(),
                 url: format!("{}/stub", server.uri()),
                 integrity_sri: PackedTarball::from_bytes(b"x").integrity,
             }],
+            prestaged: Default::default(),
         };
         match fetch_verified_secondary(&cfg_for(&server), &archive, "gem-stub-gemspec").await {
             SecondaryArtifactResult::Failed(reason) => {

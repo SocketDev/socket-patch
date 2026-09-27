@@ -7,15 +7,20 @@
 //! small helpers shared across the submodules.
 
 use clap::Args;
+use futures_util::StreamExt;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
+    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
+    is_fallback_candidate, ApiClient, ApiError,
 };
-use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
+use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
+use socket_patch_core::telemetry::{
+    spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
+};
+use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
@@ -25,7 +30,7 @@ use std::path::Path;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::crawl_all_ecosystems;
+use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use super::get::{download_and_apply_patches_with, select_patches, DownloadParams, DownloadRun};
@@ -57,7 +62,78 @@ use self::vendor_flow::{
     partition_skipped_selected,
 };
 
-const DEFAULT_BATCH_SIZE: usize = 100;
+/// Packages per batch request on the authenticated API when `--batch-size`
+/// is not given: the server's own per-request maximum
+/// (`MAX_PURLS_PER_BATCH` on `POST /v0/orgs/{org}/patches/batch`).
+const DEFAULT_BATCH_SIZE: usize = 500;
+
+/// Packages per batch request on the public proxy when `--batch-size` is
+/// not given. The proxy is shared and unauthenticated, so it keeps the
+/// historical size.
+const DEFAULT_PROXY_BATCH_SIZE: usize = 100;
+
+/// Upper bound on one batch request's JSON body. A chunk whose purls would
+/// serialize past it is split, deterministically, into consecutive smaller
+/// chunks. The value is the public proxy's own body cap
+/// (`MAX_PATCH_PROXY_BODY_BYTES`, answered with a 413 past it) — the
+/// tightest limit any batch route has (the authenticated API accepts
+/// 16 MiB). A batch the fallback re-sends to the proxy therefore always
+/// fits, whichever endpoint the chunks were sized for.
+const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
+
+/// The chunk size in effect: `--batch-size` / `SOCKET_BATCH_SIZE` when
+/// given (on either endpoint), else [`DEFAULT_BATCH_SIZE`] on the
+/// authenticated API and [`DEFAULT_PROXY_BATCH_SIZE`] on the public proxy.
+/// Floored at 1: `--batch-size 0` is otherwise unvalidated and would make
+/// the chunking below panic, so it degrades to one-package batches.
+fn effective_batch_size(requested: Option<usize>, use_public_proxy: bool) -> usize {
+    requested
+        .unwrap_or(if use_public_proxy {
+            DEFAULT_PROXY_BATCH_SIZE
+        } else {
+            DEFAULT_BATCH_SIZE
+        })
+        .max(1)
+}
+
+/// Serialized length of one `{"purl":…}` component of the batch body,
+/// exactly as `serde_json` writes it (quotes and escapes included).
+fn batch_component_bytes(purl: &str) -> usize {
+    // `{"purl":` + the JSON string + `}`.
+    8 + serde_json::to_string(purl).map_or(purl.len() + 2, |s| s.len()) + 1
+}
+
+/// Split `purls` into consecutive batch chunks of at most `batch_size`
+/// purls whose request body (`{"components":[{"purl":…},…]}`) stays within
+/// `max_body_bytes`. A chunk closes at `batch_size` purls or when the next
+/// purl would push its body past the cap, so the boundaries depend only on
+/// the purls, their order and the two limits. A single purl too long for
+/// the cap on its own still goes, alone (the server judges it); nothing is
+/// ever dropped or reordered. With a cap no chunk reaches, this is exactly
+/// `purls.chunks(batch_size)`.
+fn batch_chunks(purls: &[String], batch_size: usize, max_body_bytes: usize) -> Vec<&[String]> {
+    // `{"components":[` + `]}`.
+    const ENVELOPE: usize = 15 + 2;
+    let batch_size = batch_size.max(1);
+    let mut chunks = Vec::with_capacity(purls.len().div_ceil(batch_size));
+    let mut start = 0usize;
+    let mut body = ENVELOPE;
+    for (i, purl) in purls.iter().enumerate() {
+        let count = i - start;
+        let item = batch_component_bytes(purl) + usize::from(count > 0);
+        if count > 0 && (count == batch_size || body + item > max_body_bytes) {
+            chunks.push(&purls[start..i]);
+            start = i;
+            body = ENVELOPE + batch_component_bytes(purl);
+        } else {
+            body += item;
+        }
+    }
+    if start < purls.len() {
+        chunks.push(&purls[start..]);
+    }
+    chunks
+}
 
 /// The three patch-application modes `scan` can drive, selectable via
 /// `--mode` (the documented spelling). Each variant is equivalent to one
@@ -211,9 +287,11 @@ pub struct ScanArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Number of packages to query per API request.
-    #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE", default_value_t = DEFAULT_BATCH_SIZE)]
-    pub batch_size: usize,
+    /// Number of packages to query per API request [default: 500 on the
+    /// authenticated API, 100 on the public proxy]. A batch whose request
+    /// body would exceed 256 KiB is split into smaller consecutive batches
+    #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE")]
+    pub batch_size: Option<usize>,
 
     /// Deprecated spelling of `--mode agent`. With `--json`, download and
     /// apply the selected patches without prompting (without a mode,
@@ -441,7 +519,10 @@ async fn embed_vex_human(
 /// human-only output knobs of [`fetch_patch_details`] (the JSON callers pass
 /// `false, false`; the hosted human arm passes the same values as the agent
 /// human arm, so the two print the same progress counter and per-package
-/// warnings).
+/// warnings). `json_warnings` is the JSON callers' envelope: a partial
+/// failure (some queries failed, not all) adds one
+/// [`PATCH_DETAILS_FAILED`] run-level warning per failed package to it.
+#[allow(clippy::too_many_arguments)]
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
@@ -449,9 +530,15 @@ async fn discover_selected(
     common: &GlobalArgs,
     show_progress: bool,
     warn: bool,
+    telemetry: &mut PendingTelemetry,
+    json_warnings: Option<&mut serde_json::Value>,
 ) -> Result<Vec<PatchSearchResult>, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
+    // The scan event's send overlapped the detail fetches; every caller's
+    // next output (the error line below, a `--json` envelope, a prompt)
+    // must find it delivered.
+    telemetry.flush().await;
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
         let err = failures
@@ -461,6 +548,18 @@ async fn discover_selected(
         let message = format!("all {error_count} patch-detail queries failed: {err}");
         eprintln!("Error: {message}");
         return Err((1, message));
+    }
+    // Some queries failed, some succeeded: a `--json` run has no stderr
+    // warning (`warn` is human-only), so each failed package becomes a
+    // run-level `warnings[]` entry — never a silent drop from the envelope.
+    if let Some(result) = json_warnings {
+        for (purl, e) in &failures {
+            push_scan_json_warning(
+                result,
+                PATCH_DETAILS_FAILED,
+                &format!("could not fetch details for {purl}: {e}"),
+            );
+        }
     }
     if all_search_results.is_empty() {
         return Ok(Vec::new());
@@ -530,13 +629,31 @@ async fn fetch_patch_details(
     // `show_progress` off reads as `--json` to the status line: never
     // drawn. On, it is live only on a terminal; it never prints a result.
     let mut status = StatusLine::stderr(!show_progress, false);
-    for (i, pkg) in packages.iter().enumerate() {
+    // The queries run concurrently but come back in `packages` order, so
+    // `results` and `failures` fold exactly as the serial loop's did. The
+    // counter names the next result awaited, and each query's `--debug`
+    // lines are held back and printed at its fold, where the serial loop
+    // would have made the request.
+    let mut responses = std::pin::pin!(ordered_concurrent(
+        packages,
+        api_concurrency_for(api_client.uses_public_proxy(), packages.len()),
+        |pkg| async move {
+            (
+                pkg,
+                hold_back_debug(api_client.search_patches_by_package(&pkg.purl)).await,
+            )
+        },
+    ));
+    for i in 0..packages.len() {
         status.set(format!(
             "Fetching patch details... ({}/{})",
             i + 1,
             packages.len()
         ));
-        match api_client.search_patches_by_package(&pkg.purl).await {
+        let Some((pkg, response)) = responses.next().await else {
+            break;
+        };
+        match response.release() {
             Ok(response) => results.extend(response.patches),
             Err(e) => failures.push((pkg.purl.clone(), e.to_string())),
         }
@@ -634,6 +751,21 @@ fn partition_agent_selection(
 /// shape (`json`/`silent`) and `save_only` differ per flow; vendored mode
 /// never persists blobs (its records stay in memory and the vendor step
 /// consumes the staged sources).
+/// The ecosystems a scan crawls (`None`: every one). `--ecosystems`
+/// narrows everything the run counts, queries and shows to the named
+/// ecosystems, so without a GC the other crawlers' output would only be
+/// filtered away: they are not run at all. A GC run (`--prune` / `--sync`)
+/// still crawls everything — the GC judges every manifest entry against the
+/// FULL installed set (see `scanned_purls` in `run_scan`), and a skipped
+/// ecosystem would read as uninstalled.
+fn crawl_scope(prune: bool, ecosystems: Option<&[String]>) -> Option<&[String]> {
+    if prune {
+        None
+    } else {
+        ecosystems
+    }
+}
+
 fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
@@ -1226,6 +1358,21 @@ pub(super) const HOSTED_WIRING_RETAINED: &str = "hosted_wiring_retained";
 /// package(s) did NOT convert to agent mode.
 pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retained";
 
+/// Run-level `--json` warning: one API batch query failed (after the
+/// client's bounded 429 / 503 retry) while others succeeded, so the
+/// packages in that batch were not checked for patches. The detail is the
+/// human `Warning: API batch <n> of <total> failed: <error>` line without
+/// its prefix. (Every batch failing is the all-batches-failed error
+/// envelope instead.)
+pub(super) const API_BATCH_FAILED: &str = "api_batch_failed";
+
+/// Run-level `--json` warning: one package's patch-detail query failed
+/// (after the client's bounded 429 / 503 retry) while others succeeded, so
+/// its patch was left out of the selection. The detail is the human
+/// `Warning: could not fetch details for <purl>: <error>` line without its
+/// prefix. (Every query failing is the discovery error envelope instead.)
+pub(super) const PATCH_DETAILS_FAILED: &str = "patch_details_failed";
+
 /// The scanned purls whose HOSTED redirect wiring is still live: the
 /// redirect ledger records the purl AND lockfile discovery proves the
 /// current lockfile still routes it to that hosted patch — core
@@ -1434,7 +1581,19 @@ fn print_zero_error_envelope(err: &str, paths: &[String]) {
     print_json(&result);
 }
 
-pub async fn run(mut args: ScanArgs) -> i32 {
+pub async fn run(args: ScanArgs) -> i32 {
+    // Scan's telemetry sends run off the critical path: each is spawned
+    // where its event fires and flushed before the first stdout write that
+    // follows it (so a closed pipe's SIGPIPE, or a Ctrl-C at a prompt, still
+    // finds it delivered, as with an inline send). The flush here is the
+    // backstop that keeps every event ahead of the process exit.
+    let mut telemetry = PendingTelemetry::new();
+    let code = Box::pin(run_scan(args, &mut telemetry)).await;
+    telemetry.flush().await;
+    code
+}
+
+async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     apply_env_toggles(&args.common);
 
     // Fold the legacy mode booleans into `args.mode` before anything reads
@@ -1499,13 +1658,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         eprintln!("Warning ({REDIRECT_PRUNE_IGNORED}): {REDIRECT_PRUNE_IGNORED_DETAIL}");
     }
 
-    // A zero batch size would panic the API-query loop below: both
-    // `all_purls.len().div_ceil(batch_size)` and `all_purls.chunks(batch_size)`
-    // abort the process on a divisor/chunk-size of 0. `--batch-size 0`
-    // (or `SOCKET_BATCH_SIZE=0`) is otherwise unvalidated, so clamp to a
-    // floor of 1 — degrade to one-package batches rather than crash.
-    let batch_size = args.batch_size.max(1);
-
     // Resolved up-front (rather than at the GC site) because the embedded
     // `--vex` side-effect reads the manifest at several terminal returns,
     // including the early "no packages" exit before the GC block.
@@ -1515,6 +1667,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
         get_api_client_with_overrides(overrides.clone()).await;
+    // Sized for the endpoint the run starts on (see `effective_batch_size`;
+    // a zero `--batch-size` is floored to 1 there rather than crash the
+    // chunking below). A mid-run downgrade to the proxy keeps these chunk
+    // boundaries: the failed chunk is retried as-is, and every chunk is
+    // within the proxy's body cap by construction (`BATCH_BODY_BYTE_CAP`).
+    let batch_size = effective_batch_size(args.batch_size, use_public_proxy);
     let telemetry_token = api_client.api_token().cloned();
     let telemetry_org = api_client.org_slug().cloned();
     // Tracks whether scan was downgraded from the authenticated
@@ -1544,15 +1702,31 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
     status.set(format!("Scanning {scan_target}..."));
 
-    // Crawl packages
-    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path) =
-        crawl_all_ecosystems(&crawler_options).await;
+    // Which ecosystems to crawl (see `crawl_scope`).
+    let crawl_scope = crawl_scope(prune, args.common.ecosystems.as_deref());
+
+    // Crawl packages. Vendored mode keeps the npm half: its engine
+    // resolves the same untouched tree and reuses this crawl instead of
+    // walking `node_modules` again (no snapshot when npm was not crawled).
+    // Hosted mode keeps it only for an embedded `--vex` (skipped under
+    // `--dry-run`), whose installed-copy lookup reuses the npm roots. No
+    // other run reads the snapshot, so no other run pays for copying it.
+    let keep_npm = vendor || (hosted && args.vex.vex.is_some() && !args.common.dry_run);
+    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if keep_npm {
+        crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
+    } else {
+        let (packages, counts, skipped) = crawl_ecosystems(&crawler_options, crawl_scope).await;
+        (packages, counts, skipped, None)
+    };
 
     // Lockfile supplement: dependencies the project's lockfile resolves
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery — counts, API lookup, table, the prune "scanned" set — and
     // are flagged "not yet installed" everywhere a user could act on them.
-    let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
+    // Scoped to the crawled ecosystems: a skipped ecosystem's lockfile
+    // entries have no crawl to be measured against, and `--ecosystems`
+    // filters them out of this run anyway.
+    let lockfile_only = lockfile_supplement(&args.common, &all_crawled, crawl_scope).await;
     // Discovery diagnoses unsupported installation layouts and malformed
     // binary Bun locks. Preserve these on empty scans too: an unreadable
     // graph is not evidence that a fresh checkout has no dependencies.
@@ -1619,7 +1793,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // and delete it (plus its blobs) — silent cross-ecosystem data loss.
     // Lockfile-only purls are deliberately included: a dependency the
     // lockfile still resolves must not be pruned just because node_modules
-    // is wiped or partially installed.
+    // is wiped or partially installed. (This is why a GC run never scopes
+    // the crawl — see `crawl_scope`; a scoped run reads this set nowhere.)
     let scanned_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
     // Vendor-ledger purl keys (from the single load above), shared by the
@@ -1705,7 +1880,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
-        track_patch_scanned(
+        spawn_patch_scanned(
+            telemetry,
             0,
             0,
             0,
@@ -1718,8 +1894,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             false,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-        )
-        .await;
+        );
+        // The result prints right away: nothing to overlap the send with.
+        telemetry.flush().await;
         if args.common.json {
             // When the crawler finds nothing, GC is intentionally skipped
             // — pruning every manifest entry on the assumption that the
@@ -1850,67 +2027,124 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
-    let total_batches = all_purls.len().div_ceil(batch_size);
+    let chunks: Vec<&[String]> = batch_chunks(&all_purls, batch_size, BATCH_BODY_BYTE_CAP);
+    let total_batches = chunks.len();
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
+    // `--json` twin of the per-batch stderr warnings: `(batch, error)` in
+    // chunk order, surfaced as run-level `warnings[]` when some batch
+    // succeeded (all failing is the error envelope below).
+    let mut failed_batches: Vec<(usize, String)> = Vec::new();
 
-    for (batch_idx, chunk) in all_purls.chunks(batch_size).enumerate() {
-        status.set(format!(
-            "Querying API for patches... (batch {}/{total_batches})",
-            batch_idx + 1
-        ));
-
-        let mut result = api_client.search_patches_batch(chunk).await;
-
-        // Fallback: a 401/403 against the authenticated endpoint can
-        // mean a stale/revoked token. Retry against the public proxy
-        // (free patches only) once, then continue the rest of the
-        // loop with the downgraded client. Only triggers on the
-        // first authenticated batch; subsequent iterations are
-        // already on the proxy.
-        if !use_public_proxy {
-            if let Err(ref e) = result {
-                if is_fallback_candidate(e) {
-                    // Errors-only under --silent; --json keeps it on stderr
-                    // (the envelope has no slot for a mid-run downgrade).
-                    if !args.common.silent {
-                        status.println(format!(
-                            "Warning: authenticated API returned {e}; \
-                             falling back to public patch API proxy (free patches only)."
-                        ));
-                    }
-                    api_client = build_proxy_fallback_client(&overrides);
-                    use_public_proxy = true;
-                    fallback_to_proxy = true;
-                    result = api_client.search_patches_batch(chunk).await;
+    // Fold one batch outcome, in chunk order. Every caller below consumes
+    // outcomes strictly by chunk index, so the per-batch warnings,
+    // `batch_error_count` and `last_batch_error` come out exactly as the
+    // serial loop produced them.
+    let mut fold = |batch_idx: usize,
+                    result: Result<BatchSearchResponse, ApiError>,
+                    status: &mut StatusLine<_>| match result {
+        Ok(response) => {
+            if response.can_access_paid_patches {
+                can_access_paid_patches = true;
+            }
+            for pkg in response.packages {
+                if !pkg.patches.is_empty() {
+                    all_packages_with_patches.push(pkg);
                 }
             }
         }
+        Err(e) => {
+            batch_error_count += 1;
+            last_batch_error = Some(e.to_string());
+            failed_batches.push((batch_idx + 1, e.to_string()));
+            // Not fatal by itself: the scan goes on with the other
+            // batches. A one-batch scan says it once, below.
+            if !args.common.json && !args.common.silent && total_batches > 1 {
+                status.println(render::batch_failed_warning(
+                    batch_idx + 1,
+                    total_batches,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
 
-        match result {
-            Ok(response) => {
-                if response.can_access_paid_patches {
-                    can_access_paid_patches = true;
-                }
-                for pkg in response.packages {
-                    if !pkg.patches.is_empty() {
-                        all_packages_with_patches.push(pkg);
+    // The batches run concurrently (at most `api_concurrency` in flight)
+    // but are CONSUMED in chunk order, one window at a time:
+    //
+    // - On the authenticated client the first chunk goes alone, so a stale
+    //   token costs the authenticated API one request before the
+    //   downgrade, as it always did. Already on the proxy there is no
+    //   downgrade left to cap (the fallback arm below is authenticated-
+    //   only), so a token-less run opens the full window at chunk 0.
+    // - Fallback: a 401/403 against the authenticated endpoint can mean a
+    //   stale/revoked token. At the first consumed chunk `k` whose error is
+    //   a fallback candidate (any index, not just the first), the window is
+    //   dropped — in-flight requests for chunks past `k` are cancelled and
+    //   any responses already received for them are discarded, never
+    //   folded — then chunk `k` is retried against the public proxy (free
+    //   patches only) and the rest continues on the downgraded client.
+    //   That is exactly the serial loop's sequence; on the proxy no further
+    //   fallback applies. A token revoked mid-run does cost the auth
+    //   endpoint the requests the window had already dispatched past `k`
+    //   (up to the in-flight cap, instead of one). Their answers are
+    //   discarded, and so are their `--debug` lines: each chunk's are held
+    //   back until it is folded, so a chunk the window drops announces
+    //   nothing the serial loop would not have announced.
+    let mut next = 0usize;
+    'windows: while next < total_batches {
+        let end = if next == 0 && !use_public_proxy {
+            1
+        } else {
+            total_batches
+        };
+        let mut fallback_error = None;
+        {
+            let client = &api_client;
+            let mut results = std::pin::pin!(ordered_concurrent(
+                &chunks[next..end],
+                api_concurrency_for(use_public_proxy, end - next),
+                |chunk| hold_back_debug(client.search_patches_batch(chunk)),
+            ));
+            while next < end {
+                status.set(format!(
+                    "Querying API for patches... (batch {}/{total_batches})",
+                    next + 1
+                ));
+                // `ordered_concurrent` yields exactly one item per chunk,
+                // so the window never runs dry early. Should a future
+                // variant make it, stop the scan here: re-entering the
+                // outer loop with `next` unchanged would rebuild the very
+                // same window and re-POST every chunk in it, forever.
+                let Some(result) = results.next().await else {
+                    debug_assert!(false, "batch window yields one result per chunk");
+                    break 'windows;
+                };
+                match result.release() {
+                    Err(e) if !use_public_proxy && is_fallback_candidate(&e) => {
+                        fallback_error = Some(e);
+                        break;
                     }
+                    result => fold(next, result, &mut status),
                 }
+                next += 1;
             }
-            Err(e) => {
-                batch_error_count += 1;
-                last_batch_error = Some(e.to_string());
-                // Not fatal by itself: the scan goes on with the other
-                // batches. A one-batch scan says it once, below.
-                if !args.common.json && !args.common.silent && total_batches > 1 {
-                    status.println(render::batch_failed_warning(
-                        batch_idx + 1,
-                        total_batches,
-                        &e.to_string(),
-                    ));
-                }
+        }
+        if let Some(e) = fallback_error {
+            // Errors-only under --silent; --json keeps it on stderr
+            // (the envelope has no slot for a mid-run downgrade).
+            if !args.common.silent {
+                status.println(format!(
+                    "Warning: authenticated API returned {e}; \
+                     falling back to public patch API proxy (free patches only)."
+                ));
             }
+            api_client = build_proxy_fallback_client(&overrides);
+            use_public_proxy = true;
+            fallback_to_proxy = true;
+            let result = api_client.search_patches_batch(chunks[next]).await;
+            fold(next, result, &mut status);
+            next += 1;
         }
     }
 
@@ -1927,13 +2161,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        track_patch_scan_failed(
+        spawn_patch_scan_failed(
+            telemetry,
             &err,
             fallback_to_proxy,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-        )
-        .await;
+        );
+        // The failure prints right away: nothing to overlap the send with.
+        telemetry.flush().await;
 
         // A scan in which *every* batch failed produced no trustworthy
         // patch data. Surfacing `status: "success"` / exit 0 here would be
@@ -1997,7 +2233,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // per-tier counts. `fallback_to_proxy` is `true` iff the batch
     // loop downgraded from the authenticated endpoint to the public
     // proxy after a 401/403.
-    track_patch_scanned(
+    spawn_patch_scanned(
+        telemetry,
         package_count,
         free_patches,
         paid_patches,
@@ -2010,8 +2247,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         fallback_to_proxy,
         telemetry_token.as_deref(),
         telemetry_org.as_deref(),
-    )
-    .await;
+    );
 
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
@@ -2042,11 +2278,20 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             Err(corrupt) => (None, Some(corrupt.to_string())),
         }
     } else {
-        (
-            crate::commands::load_redirect_state_lenient(&args.common.cwd, args.common.silent)
-                .await,
-            None,
-        )
+        // `load_redirect_state_lenient`, with the scan event's send flushed
+        // before its warning: that line can be this run's first write since
+        // the event fired, and a closed stderr's SIGPIPE must find the event
+        // delivered, as the inline send it replaced was.
+        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+            Ok(state) => (state, None),
+            Err(corrupt) => {
+                if !args.common.silent {
+                    telemetry.flush().await;
+                    eprintln!("Warning: {corrupt}");
+                }
+                (None, None)
+            }
+        }
     };
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
@@ -2088,6 +2333,14 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         if !layout_refusals.is_empty() {
             result["warnings"] = layout_refusal_json(&layout_refusals);
         }
+        // A batch that failed while others succeeded left its packages
+        // unchecked; the human run warns on stderr, the envelope carries
+        // the same line per batch (additive, status and exit unchanged).
+        for (batch, err) in &failed_batches {
+            let line = render::batch_failed_warning(*batch, total_batches, err);
+            let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
+            push_scan_json_warning(&mut result, API_BATCH_FAILED, detail);
+        }
         // Flag lockfile-only packages so JSON consumers can tell "patch
         // available but not installed" from the installed case. Additive
         // field; absent means installed. Matching bridges the API's
@@ -2119,6 +2372,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 Some(result),
+                telemetry,
+                npm_crawl.as_ref(),
             )
             .await;
         }
@@ -2163,6 +2418,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 &args.common,
                 false,
                 false,
+                telemetry,
+                Some(&mut result),
             )
             .await
             {
@@ -2305,9 +2562,16 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 prune,
                 telemetry_token.as_deref(),
                 telemetry_org.as_deref(),
+                telemetry,
+                npm_crawl.as_ref(),
             )
             .await;
         }
+
+        // The GC and the VEX build below can write to stderr; the report-
+        // only arm has not flushed the scan event yet (the `--apply` arm
+        // did, in `discover_selected`).
+        telemetry.flush().await;
 
         // --- GC (post-apply, or standalone --prune GC-sweep) -------------
         if prune {
@@ -2333,6 +2597,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         print_json(&result);
         return final_code;
     }
+
+    // Every human exit below prints first; the scan event goes out before.
+    telemetry.flush().await;
 
     let use_color = ui::stdout_color();
     let verbose = args.common.verbose;
@@ -2549,6 +2816,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             &args.common,
             human,
             !silent,
+            telemetry,
+            None,
         )
         .await
         {
@@ -2563,7 +2832,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         // so only a wet run with work confirms. `--mode hosted` is explicit
         // intent, so a non-TTY run auto-proceeds like every other mode —
         // only the mode-less scan below is report-only.
-        if !selected.is_empty() && !args.common.dry_run {
+        let prompts = !selected.is_empty() && !args.common.dry_run;
+        // Whether that prompt waits on a person: the tree may change while it
+        // does, so the embedded VEX then walks node_modules afresh instead of
+        // reusing the pre-prompt crawl (as the vendor path below does).
+        let prompt_waits = prompts && ui::confirm_waits(&args.common);
+        if prompts {
             let prompt = render::hosted_confirm_prompt(selected.len());
             // The prompt (or the non-TTY note) opens its own paragraph
             // under the table's Summary, on the prompt's stream.
@@ -2592,6 +2866,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             &api_client,
             &pairs,
             None,
+            npm_crawl.as_ref().filter(|_| !prompt_waits),
         )
         .await;
     }
@@ -2825,6 +3100,10 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         HashMap::new()
     };
 
+    // Whether the prompt below waits on a person: the tree may change while
+    // it does, so the vendor step then crawls afresh instead of reusing the
+    // pre-prompt crawl (`--yes` / `--json` / non-terminal answer at once).
+    let prompt_waits = ui::confirm_waits(&args.common);
     if !ui::confirm(&render::confirm_prompt(plan), true, &args.common) {
         if !silent {
             println!();
@@ -2864,6 +3143,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             prune,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
+            npm_crawl.as_ref().filter(|_| !prompt_waits),
         )
         .await
     } else {
@@ -2949,6 +3229,136 @@ mod tests {
             );
         }
         m
+    }
+
+    /// The request body `search_patches_batch` sends for `chunk`, as
+    /// `serde_json` writes it (the client's `BatchSearchBody`).
+    fn batch_body(chunk: &[String]) -> String {
+        let components: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|p| serde_json::json!({ "purl": p }))
+            .collect();
+        serde_json::json!({ "components": components }).to_string()
+    }
+
+    fn purls(n: usize, len: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let head = format!("pkg:npm/p{i}-");
+                let pad = len.saturating_sub(head.len() + 6);
+                format!("{head}{}@1.0.0", "x".repeat(pad))
+            })
+            .collect()
+    }
+
+    /// Unset, the batch size follows the endpoint: the server's 500-purl
+    /// maximum on the authenticated API, 100 on the public proxy. A given
+    /// size wins on both, and 0 is floored to 1.
+    #[test]
+    fn batch_size_defaults_per_endpoint_and_honors_an_explicit_value() {
+        assert_eq!(effective_batch_size(None, false), 500);
+        assert_eq!(effective_batch_size(None, true), 100);
+        assert_eq!(effective_batch_size(Some(7), false), 7);
+        assert_eq!(effective_batch_size(Some(7), true), 7);
+        assert_eq!(effective_batch_size(Some(0), false), 1);
+        assert_eq!(effective_batch_size(Some(0), true), 1);
+    }
+
+    /// The byte arithmetic matches `serde_json`'s output exactly, escapes
+    /// and non-ASCII included, so the cap is judged on the real body.
+    #[test]
+    fn batch_component_bytes_match_the_serialized_body() {
+        for purl in [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:npm/%40scope/name@1.0.0",
+            "pkg:pypi/we\"ird@1.0?x=\\y",
+            "pkg:cargo/caf\u{e9}@0.1.0",
+            "pkg:npm/ctl\u{1}@1.0.0",
+        ] {
+            let one = vec![purl.to_string()];
+            assert_eq!(
+                17 + batch_component_bytes(purl),
+                batch_body(&one).len(),
+                "{purl}"
+            );
+        }
+        let many = purls(9, 40);
+        let sum: usize = many.iter().map(|p| batch_component_bytes(p)).sum();
+        assert_eq!(17 + sum + (many.len() - 1), batch_body(&many).len());
+    }
+
+    /// With a cap no chunk reaches, the chunks are exactly
+    /// `purls.chunks(batch_size)`: same boundaries, same order.
+    #[test]
+    fn batch_chunks_without_cap_pressure_match_plain_chunking() {
+        for n in [0usize, 1, 99, 100, 101, 499, 500, 501, 1000, 1234] {
+            let list = purls(n, 30);
+            for size in [1usize, 3, 100, 500] {
+                let want: Vec<&[String]> = list.chunks(size).collect();
+                assert_eq!(
+                    batch_chunks(&list, size, BATCH_BODY_BYTE_CAP),
+                    want,
+                    "n={n} size={size}"
+                );
+            }
+        }
+    }
+
+    /// An oversize chunk is split greedily at the byte cap: every body fits,
+    /// every chunk is maximal (its successor's first purl would not have
+    /// fitted), nothing is dropped or reordered, and the split is the same
+    /// on every call.
+    #[test]
+    fn batch_chunks_split_an_oversize_chunk_at_the_byte_cap() {
+        let list = purls(1400, 220);
+        let chunks = batch_chunks(&list, 5000, BATCH_BODY_BYTE_CAP);
+        assert!(chunks.len() > 1, "1400 x 220-byte purls exceed 256 KiB");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(batch_body(chunk).len() <= BATCH_BODY_BYTE_CAP, "chunk {i}");
+            if let Some(next) = chunks.get(i + 1) {
+                let mut grown = chunk.to_vec();
+                grown.push(next[0].clone());
+                assert!(batch_body(&grown).len() > BATCH_BODY_BYTE_CAP, "chunk {i}");
+            }
+        }
+        assert_eq!(chunks.concat(), list);
+        assert_eq!(chunks, batch_chunks(&list, 5000, BATCH_BODY_BYTE_CAP));
+
+        // The count limit still applies inside the byte limit, and a body
+        // exactly at the cap is kept whole.
+        let small = batch_chunks(&list, 500, BATCH_BODY_BYTE_CAP);
+        assert!(small.iter().all(|c| c.len() <= 500));
+        let exact = batch_body(&list[..10]).len();
+        assert_eq!(batch_chunks(&list[..11], 500, exact)[0].len(), 10);
+    }
+
+    /// A purl too long for the cap on its own still goes, alone, between
+    /// its neighbours' chunks.
+    #[test]
+    fn batch_chunks_send_an_oversize_purl_alone() {
+        let mut list = purls(4, 30);
+        list.insert(2, format!("pkg:npm/{}@1.0.0", "y".repeat(400)));
+        let chunks = batch_chunks(&list, 100, 200);
+        assert_eq!(chunks.concat(), list);
+        let alone: Vec<&[String]> = chunks
+            .iter()
+            .copied()
+            .filter(|c| c.contains(&list[2]))
+            .collect();
+        assert_eq!(alone, vec![&list[2..3]]);
+        assert!(chunks.iter().all(|c| !c.is_empty()));
+    }
+
+    /// MVN-4: only a non-GC `--ecosystems` run narrows the crawl. A GC run
+    /// crawls every ecosystem whatever `--ecosystems` says (its prune reads
+    /// the full installed set), and no `--ecosystems` crawls every one.
+    #[test]
+    fn crawl_scope_narrows_only_a_non_gc_filtered_run() {
+        let npm = vec!["npm".to_string()];
+        assert_eq!(crawl_scope(false, Some(&npm)), Some(&npm[..]));
+        assert_eq!(crawl_scope(true, Some(&npm)), None);
+        assert_eq!(crawl_scope(false, None), None);
+        assert_eq!(crawl_scope(true, None), None);
     }
 
     // ---- cross-mode ledger takeover (hosted ⇄ vendored) --------------------

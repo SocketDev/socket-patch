@@ -129,7 +129,7 @@ fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         apply: false,
         prune: false,
         sync: false,

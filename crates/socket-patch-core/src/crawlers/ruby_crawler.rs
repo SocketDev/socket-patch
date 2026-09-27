@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{entry_is_dir, home_dir, is_dir, list_dir_entries, normalize_lexically};
+use crate::utils::fs::{
+    entry_is_dir, home_dir, is_dir, list_dir_entries, normalize_lexically, run_blocking,
+};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
@@ -230,11 +232,18 @@ impl RubyCrawler {
     /// `gempath` (`GEM_PATH`) entry. Non-existent homes and duplicates are
     /// dropped, so the result is the deduped set of installed-gem roots in
     /// RubyGems' own precedence order.
+    ///
+    /// The two `gem env` subprocesses run concurrently (each is one
+    /// ruby boot), once per process ([`Self::gem_env_homes`]); their
+    /// answers are consumed in the fixed order above. The directory probes
+    /// are re-run on every call.
     async fn gem_env_gems_dirs() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
 
-        if let Some(gemdir) = Self::run_gem_env("gemdir").await {
+        let (gemdir, gempath) = Self::gem_env_homes().await;
+
+        if let Some(gemdir) = gemdir {
             let gems_path = PathBuf::from(gemdir).join("gems");
             if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
                 paths.push(gems_path);
@@ -246,7 +255,7 @@ impl RubyCrawler {
         // `:` shreds Windows drive-letter paths (`C:\Ruby\...;D:\...`) into
         // `["C", "\Ruby\...;D", "\..."]`, so defer to `split_paths`, which
         // honors the platform separator — same as the Go crawler's GOPATH.
-        if let Some(gempath) = Self::run_gem_env("gempath").await {
+        if let Some(gempath) = gempath {
             for gems_path in gem_homes_to_gems_dirs(&gempath) {
                 if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
                     paths.push(gems_path);
@@ -513,10 +522,38 @@ impl RubyCrawler {
         paths
     }
 
-    /// Run `gem env <key>` and return the trimmed stdout.
-    async fn run_gem_env(key: &str) -> Option<String> {
-        let stdout = SystemCommandRunner.run("gem", &["env", key]);
-        parse_gem_env_output(stdout.as_deref().unwrap_or(""))
+    /// `gem env gemdir` and `gem env gempath`, asked once per process
+    /// environment: a scan asks from the project fallback, the global
+    /// paths, the hosted stale probe and rollback lookup — two ruby boots
+    /// (100-400 ms) each time — and the answers are RubyGems configuration
+    /// that nothing in a run changes. The memo is keyed on everything the
+    /// subprocess inherits (the environment and working directory), so a
+    /// caller that swaps `PATH` or `GEM_HOME` still asks afresh. Only a
+    /// complete answer is kept: a failed ask (spawn error under fd pressure,
+    /// a non-zero exit from a racing shim, empty output) is asked again by
+    /// the next caller, as every caller used to ask — and so is an answer
+    /// the environment changed under, which the key would misfile.
+    async fn gem_env_homes() -> GemEnvHomes {
+        static MEMO: once_cell::sync::Lazy<GemEnvMemo> =
+            once_cell::sync::Lazy::new(Default::default);
+        let key = gem_env_key();
+        let cell = gem_env_cell(&MEMO, key.clone());
+        memoize_gem_env_homes(&cell, || async move {
+            let homes = tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"));
+            let env_unchanged = gem_env_key() == key;
+            (homes, env_unchanged)
+        })
+        .await
+    }
+
+    /// Run `gem env <key>` (on the blocking pool — it waits on a
+    /// subprocess) and return the trimmed stdout.
+    async fn run_gem_env(key: &'static str) -> Option<String> {
+        run_blocking(move || {
+            let stdout = SystemCommandRunner.run("gem", &["env", key]);
+            parse_gem_env_output(stdout.as_deref().unwrap_or(""))
+        })
+        .await
     }
 
     /// Scan a gem directory and return all valid gem packages found.
@@ -670,6 +707,90 @@ impl Default for RubyCrawler {
     }
 }
 
+impl RubyCrawler {
+    /// [`Self::find_by_purls`] for each of `purls` ON ITS OWN — element `i`
+    /// is what `find_by_purls(gem_path, &[purls[i]])` returns for that PURL
+    /// — as one blocking-pool task that lists `gem_path` at most once for
+    /// the platform-suffix fallback (instead of once per PURL whose exact
+    /// `<name>-<version>` dir does not verify).
+    pub async fn find_each_by_purl(
+        &self,
+        gem_path: &Path,
+        purls: &[String],
+    ) -> Vec<Option<CrawledPackage>> {
+        let gem_path = gem_path.to_path_buf();
+        let purls = purls.to_vec();
+        crate::utils::fs::run_blocking(move || {
+            // `gem_path`'s entry names (lossy, readdir order), listed on
+            // the first PURL that needs the prefix scan — and only kept
+            // when the listing is the whole directory (`names_memoized`).
+            let mut names: Option<Vec<String>> = None;
+            purls
+                .iter()
+                .map(|purl| {
+                    let (name, version) = crate::utils::purl::parse_gem_purl(purl)?;
+                    let (name, version) = (name.as_ref(), version.as_ref());
+                    if !is_safe_gem_coordinate(name, version) {
+                        return None;
+                    }
+                    let gem_dir = locate_gem_dir_sync(&gem_path, name, version, &mut names)?;
+                    Some(CrawledPackage {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        namespace: None,
+                        purl: purl.clone(),
+                        path: gem_dir,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+}
+
+/// Blocking twin of `RubyCrawler::locate_gem_dir` over a lazily listed,
+/// reused `gem_path` listing.
+fn locate_gem_dir_sync(
+    gem_path: &Path,
+    name: &str,
+    version: &str,
+    names: &mut Option<Vec<String>>,
+) -> Option<PathBuf> {
+    let exact = gem_path.join(format!("{name}-{version}"));
+    if verify_gem_at_path_sync(&exact) {
+        return Some(exact);
+    }
+    let prefix = format!("{name}-{version}-");
+    let names = super::listing::names_memoized(gem_path, names);
+    for dir_name in names.iter() {
+        if dir_name.starts_with(&prefix) {
+            let dir = gem_path.join(dir_name);
+            if verify_gem_at_path_sync(&dir) {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Blocking twin of `RubyCrawler::verify_gem_at_path`: a directory holding
+/// `lib/` or a `.gemspec`.
+fn verify_gem_at_path_sync(path: &Path) -> bool {
+    use crate::utils::fs::is_dir_sync;
+    if !is_dir_sync(path) {
+        return false;
+    }
+    if is_dir_sync(&path.join("lib")) {
+        return true;
+    }
+    super::listing::list_dir_sync(path).iter().any(|entry| {
+        entry
+            .name
+            .to_str()
+            .is_some_and(|name| name.ends_with(".gemspec"))
+    })
+}
+
 /// Result of probing the Bundler install roots.
 ///
 /// Public so CLI consumers (apply's store-class split, scan/apply's
@@ -735,6 +856,67 @@ pub fn parse_gem_env_output(stdout: &str) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+/// `(gemdir, gempath)` as [`parse_gem_env_output`] reads each `gem env` answer.
+type GemEnvHomes = (Option<String>, Option<String>);
+
+/// What a `gem env` subprocess inherits: the (sorted) environment and the
+/// working directory.
+type GemEnvKey = (
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    Option<PathBuf>,
+);
+
+type GemEnvMemo =
+    std::sync::Mutex<HashMap<GemEnvKey, std::sync::Arc<tokio::sync::OnceCell<GemEnvHomes>>>>;
+
+fn gem_env_key() -> GemEnvKey {
+    let mut vars: Vec<_> = std::env::vars_os().collect();
+    vars.sort();
+    (vars, std::env::current_dir().ok())
+}
+
+/// The memo cell for `key`, created empty on first sight.
+fn gem_env_cell(
+    memo: &GemEnvMemo,
+    key: GemEnvKey,
+) -> std::sync::Arc<tokio::sync::OnceCell<GemEnvHomes>> {
+    let mut memo = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::sync::Arc::clone(memo.entry(key).or_default())
+}
+
+/// The first caller runs `ask`; concurrent callers wait for its answer and
+/// later ones reuse it — once it is complete (both homes answered) and
+/// `ask` vouches it is keepable. Otherwise the asker gets its own answer and
+/// the cell stays empty, so the next caller asks again. Split from
+/// [`RubyCrawler::gem_env_homes`] so tests can count the asks against a cell
+/// of their own.
+async fn memoize_gem_env_homes<F, Fut>(
+    cell: &tokio::sync::OnceCell<GemEnvHomes>,
+    ask: F,
+) -> GemEnvHomes
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (GemEnvHomes, bool)>,
+{
+    let mut unkept = None;
+    let slot = &mut unkept;
+    let kept = cell
+        .get_or_try_init(|| async move {
+            let (homes, keepable) = ask().await;
+            if keepable && homes.0.is_some() && homes.1.is_some() {
+                Ok(homes)
+            } else {
+                *slot = Some(homes);
+                Err(())
+            }
+        })
+        .await;
+    match kept {
+        Ok(homes) => homes.clone(),
+        Err(()) => unkept.expect("a refused ask leaves its answer"),
     }
 }
 
@@ -2030,6 +2212,102 @@ mod tests {
         assert_eq!(result.get("pkg:gem/rails@7.1.0").unwrap().path, exact);
     }
 
+    // ── gem env memo ──────────────────────────────────────────────
+
+    /// Every caller gets the first answer, however many ask at once, and
+    /// the subprocess pair runs exactly once.
+    #[tokio::test]
+    async fn gem_env_homes_are_asked_once_per_cell() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        let asks = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let (cell, asks) = (Arc::clone(&cell), Arc::clone(&asks));
+            tasks.push(tokio::spawn(async move {
+                memoize_gem_env_homes(&cell, || async {
+                    let n = asks.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    (
+                        (Some(format!("/gems/home-{n}")), Some("/gems/path".into())),
+                        true,
+                    )
+                })
+                .await
+            }));
+        }
+        let first = (
+            Some("/gems/home-0".to_string()),
+            Some("/gems/path".to_string()),
+        );
+        for task in tasks {
+            assert_eq!(task.await.expect("memo task"), first);
+        }
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        let later =
+            memoize_gem_env_homes(&cell, || async { ((None, Some("x".into())), true) }).await;
+        assert_eq!(later, first);
+    }
+
+    /// A failed or partial ask is not kept: the asker gets its own answer
+    /// and the next caller asks again, as every caller did before the memo.
+    /// So is an answer the environment changed under.
+    #[tokio::test]
+    async fn gem_env_homes_failures_are_asked_again() {
+        let cell = tokio::sync::OnceCell::new();
+        let good = (
+            Some("/gems/home".to_string()),
+            Some("/gems/path".to_string()),
+        );
+        for unkept in [
+            ((None, None), true),
+            ((Some("/gems/home".to_string()), None), true),
+            ((None, Some("/gems/path".to_string())), true),
+            (good.clone(), false),
+        ] {
+            let want = unkept.0.clone();
+            assert_eq!(
+                memoize_gem_env_homes(&cell, || async { unkept }).await,
+                want
+            );
+            assert!(cell.get().is_none(), "{want:?} must not be kept");
+        }
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let ask = || async {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (good.clone(), true)
+        };
+        assert_eq!(memoize_gem_env_homes(&cell, ask).await, good);
+        assert_eq!(
+            memoize_gem_env_homes(&cell, || async { ((None, None), true) }).await,
+            good
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// One cell per inherited environment: the same key shares a cell, a
+    /// swapped `PATH` gets its own.
+    #[test]
+    fn gem_env_cells_are_keyed_on_the_inherited_environment() {
+        let memo = GemEnvMemo::default();
+        let key = |path: &str| -> GemEnvKey {
+            (
+                vec![("PATH".into(), path.into())],
+                Some(PathBuf::from("/work")),
+            )
+        };
+        let a = gem_env_cell(&memo, key("/usr/bin"));
+        let again = gem_env_cell(&memo, key("/usr/bin"));
+        let swapped = gem_env_cell(&memo, key("/tmp/fake-bin"));
+        assert!(std::sync::Arc::ptr_eq(&a, &again));
+        assert!(!std::sync::Arc::ptr_eq(&a, &swapped));
+        let (vars, cwd) = gem_env_key();
+        assert!(vars.windows(2).all(|w| w[0] <= w[1]), "sorted env snapshot");
+        assert_eq!(cwd, std::env::current_dir().ok());
+    }
+
     // ── gem env gempath splitting (OS path separator) ─────────────
 
     /// `gem env gempath` lists several gem homes joined by the OS path
@@ -2520,5 +2798,78 @@ mod tests {
         // Bare `~` → home itself (PathBuf equality is components-based,
         // tolerating join("")'s trailing-separator artifact).
         assert_eq!(expand_tilde(Path::new("~"), Some(home)), home.to_path_buf());
+    }
+
+    // ── find_each_by_purl ≡ per-PURL find_by_purls ─────────────────────
+
+    #[tokio::test]
+    async fn find_each_by_purl_matches_per_purl_find_by_purls() {
+        use crate::crawlers::oracle_support::{mkdir, symlink, write, PermGuard, Rng};
+
+        const GEMS: &[&str] = &["rails", "nokogiri", "rack", "rails-html"];
+        const VERSIONS: &[&str] = &["7.1.0", "1.16.5", "3.0.0"];
+        const SUFFIXES: &[&str] = &["", "-x86_64-linux", "-arm64-darwin", "-java"];
+        let mut found = 0;
+        for seed in 0..48u64 {
+            let mut rng = Rng::new(seed);
+            let tmp = tempfile::tempdir().unwrap();
+            let mut perms = PermGuard::default();
+            let root = tmp.path().join("gems");
+            mkdir(&root);
+            for i in 0..rng.below(16) {
+                let dir = root.join(format!(
+                    "{}-{}{}",
+                    rng.pick(GEMS),
+                    rng.pick(VERSIONS),
+                    rng.pick(SUFFIXES)
+                ));
+                match rng.below(8) {
+                    0 => write(&dir, "file"),
+                    1 => write(&dir.join("x.gemspec"), ""),
+                    2 => mkdir(&dir.join("x.gemspec")),
+                    3 => {
+                        let target = tmp.path().join(format!("t{i}"));
+                        if rng.chance(70) {
+                            mkdir(&target.join("lib"));
+                        }
+                        symlink(&target, &dir);
+                    }
+                    4 => {
+                        mkdir(&dir.join("lib"));
+                        perms.plan(&dir, 0o000);
+                    }
+                    5 => mkdir(&dir),
+                    _ => mkdir(&dir.join("lib")),
+                }
+            }
+            perms.apply();
+            let mut purls: Vec<String> = Vec::new();
+            for gem in GEMS {
+                for version in VERSIONS {
+                    purls.push(format!("pkg:gem/{gem}@{version}"));
+                }
+            }
+            purls.push("pkg:gem/..@1.0.0".to_string());
+            purls.push("pkg:npm/rails@7.1.0".to_string());
+
+            let crawler = RubyCrawler::new();
+            let each = crawler.find_each_by_purl(&root, &purls).await;
+            assert_eq!(each.len(), purls.len());
+            for (purl, got) in purls.iter().zip(each) {
+                let single = crawler
+                    .find_by_purls(&root, std::slice::from_ref(purl))
+                    .await
+                    .unwrap();
+                let want = single.get(purl);
+                assert_eq!(
+                    got.as_ref()
+                        .map(|p| (&p.name, &p.version, &p.namespace, &p.purl, &p.path)),
+                    want.map(|p| (&p.name, &p.version, &p.namespace, &p.purl, &p.path)),
+                    "seed {seed}: {purl}"
+                );
+                found += usize::from(got.is_some());
+            }
+        }
+        assert!(found > 50, "vacuous fixtures: {found}");
     }
 }

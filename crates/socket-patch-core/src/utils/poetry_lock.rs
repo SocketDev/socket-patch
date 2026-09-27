@@ -47,6 +47,12 @@ pub(crate) fn metadata_files<'d>(lock: &'d DocumentMut, name: &str) -> Vec<&'d d
 /// vendored loader already accepts newer minors with an advisory; the hosted
 /// path must not refuse what the vendored path accepts).
 pub fn lock_version(lock: &DocumentMut) -> Result<&str, String> {
+    lock_version_of(lock)
+}
+
+/// [`lock_version`] of a parsed lock's root table (a `DocumentMut` or a
+/// spanned `Document`).
+fn lock_version_of(lock: &Table) -> Result<&str, String> {
     let metadata = lock
         .get("metadata")
         .filter(|item| item.is_table_like())
@@ -130,6 +136,100 @@ pub fn rewrite_poetry_lock(
     filename: &str,
     sha256: &str,
 ) -> Result<Option<String>, String> {
+    Ok(rewrite_poetry_lock_with_edits(
+        text,
+        name,
+        version,
+        source_type,
+        source_url,
+        filename,
+        sha256,
+    )?
+    .map(|rewrite| rewrite.text))
+}
+
+/// A successful [`rewrite_poetry_lock_with_edits`].
+pub struct PoetryLockRewrite<'a> {
+    /// The rewritten lock text.
+    pub text: String,
+    original: &'a str,
+    name: &'a str,
+    /// The original's fragments, already taken to build `text`.
+    before: Vec<String>,
+    /// The fragment edits, when `text` is byte-identical to the serialized
+    /// document they were derived against (the common case: toml_edit
+    /// round-trips the untouched bytes) — then they are also the edits
+    /// against `text`.
+    known_edits: Option<Vec<(String, String)>>,
+}
+
+impl PoetryLockRewrite<'_> {
+    /// Exactly `poetry_lock_edits(original, &self.text, name)`, without
+    /// re-deriving what the rewrite already did.
+    pub fn edits(&self) -> Result<Vec<(String, String)>, String> {
+        if let Some(edits) = &self.known_edits {
+            return Ok(edits.clone());
+        }
+        let after = poetry_lock_fragments(&self.text, self.name)?;
+        pair_poetry_lock_fragments(self.original, &self.before, &self.text, after)
+    }
+}
+
+/// [`rewrite_poetry_lock`], also handing back what the caller needs to
+/// record the rewrite's fragment edits ([`PoetryLockRewrite::edits`]).
+pub fn rewrite_poetry_lock_with_edits<'a>(
+    text: &'a str,
+    name: &'a str,
+    version: &str,
+    source_type: &str,
+    source_url: &str,
+    filename: &str,
+    sha256: &str,
+) -> Result<Option<PoetryLockRewrite<'a>>, String> {
+    rewrite_poetry_lock_in(
+        &mut PoetryLockParse::default(),
+        text,
+        name,
+        version,
+        source_type,
+        source_url,
+        filename,
+        sha256,
+    )
+}
+
+/// The parse of the lock text a [`rewrite_poetry_lock_in`] call last saw or
+/// produced, handed to the next call so a caller rewriting one lock dep by
+/// dep parses each state once: a rewrite parses its own output anyway (to
+/// take the output's fragments), and when the splice reproduces that output
+/// byte for byte — the common case — it is the next dep's input. Reused only
+/// for byte-identical text, and `DocumentMut`'s own parser is exactly
+/// `Document::parse(..).into_mut()`, so every result is the fresh parse's.
+#[derive(Default)]
+pub struct PoetryLockParse {
+    doc: Option<toml_edit::Document<String>>,
+}
+
+/// Where [`rewrite_poetry_lock_in`] rewrites, settled before it mutates.
+struct PoetryLockPlan {
+    format: String,
+    effective_url: String,
+    index: usize,
+    package_name: String,
+}
+
+/// [`rewrite_poetry_lock_with_edits`], reusing (and refreshing) `parse`.
+#[allow(clippy::too_many_arguments)]
+pub fn rewrite_poetry_lock_in<'a>(
+    parse: &mut PoetryLockParse,
+    text: &'a str,
+    name: &'a str,
+    version: &str,
+    source_type: &str,
+    source_url: &str,
+    filename: &str,
+    sha256: &str,
+) -> Result<Option<PoetryLockRewrite<'a>>, String> {
     if !matches!(source_type, "file" | "url")
         || sha256.len() != 64
         || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -149,71 +249,34 @@ pub fn rewrite_poetry_lock(
     {
         return Err("Poetry patch wheel does not match the locked package".into());
     }
-    let mut lock: DocumentMut = text
-        .parse()
-        .map_err(|e| format!("invalid Poetry lock: {e}"))?;
-    let format = lock_version(&lock)?.to_string();
-    if format == "0" && source_type == "url" {
-        return Err("Poetry 0.x ignores URL sources; hosted patches require Poetry >= 1.0".into());
-    }
-    let effective_url = if format == "1.0" && source_type == "url" {
-        // Poetry 1.0 hands pip `<url>#egg=<name>` unconditionally; the trailing
-        // `&` keeps `sha256=<hex>` a complete fragment parameter when `#egg=`
-        // is appended (pip >= 22 would otherwise read `<hex>#egg=<name>` as the
-        // digest and hard-fail the install).
-        format!("{source_url}#sha256={sha256}&")
-    } else {
-        source_url.to_string()
+    let doc = match parse.doc.take() {
+        Some(doc) if doc.raw() == text => doc,
+        _ => toml_edit::Document::parse(text.to_owned())
+            .map_err(|e| format!("invalid Poetry lock: {e}"))?,
     };
-    let packages = lock
+    let plan = match plan_poetry_rewrite(&doc, name, version, source_type, source_url, &sha256) {
+        Ok(Some(plan)) => plan,
+        verdict => {
+            // Nothing was mutated: the parse still describes `text`.
+            parse.doc = Some(doc);
+            return verdict.map(|_| None);
+        }
+    };
+    let PoetryLockPlan {
+        format,
+        effective_url,
+        index,
+        package_name,
+    } = plan;
+    // The original's fragments come from the same parse; an error surfaces
+    // where the fresh parse used to raise it, after the rewrite.
+    let before = poetry_lock_fragments_in(&doc, text, name);
+    let mut lock = doc.into_mut();
+    let package = lock
         .get_mut("package")
         .and_then(Item::as_array_of_tables_mut)
-        .ok_or("missing Poetry packages")?;
-    let indices: Vec<_> = packages
-        .iter()
-        .enumerate()
-        .filter(|(_, package)| {
-            package
-                .get("name")
-                .and_then(Item::as_str)
-                .is_some_and(|candidate| {
-                    canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
-                })
-        })
-        .map(|(index, _)| index)
-        .collect();
-    if indices.is_empty() {
-        return Ok(None);
-    }
-    if indices.len() != 1 {
-        return Err("forked Poetry package requires an unambiguous source".into());
-    }
-    let package = packages
-        .get_mut(indices[0])
+        .and_then(|packages| packages.get_mut(index))
         .ok_or("missing Poetry package")?;
-    if package.get("version").and_then(Item::as_str) != Some(version) {
-        return Ok(None);
-    }
-    let package_name = package
-        .get("name")
-        .and_then(Item::as_str)
-        .unwrap_or(name)
-        .to_string();
-    if let Some(source) = package.get("source") {
-        let existing_type = source.get("type").and_then(Item::as_str);
-        let existing_url = source.get("url").and_then(Item::as_str).unwrap_or("");
-        let same_target = existing_type == Some(source_type) && existing_url == effective_url;
-        let prior_hosted = source_type == "url"
-            && existing_type == Some("url")
-            && is_prior_hosted_url(existing_url, &effective_url);
-        if !same_target && !prior_hosted {
-            return Err(format!(
-                "refusing to replace an existing Poetry source ({} {}) for {package_name}",
-                existing_type.unwrap_or("unknown"),
-                existing_url
-            ));
-        }
-    }
     let mut entry = InlineTable::new();
     entry.insert("file", Value::from(filename));
     entry.insert("hash", Value::from(format!("sha256:{sha256}")));
@@ -262,12 +325,105 @@ pub fn rewrite_poetry_lock(
     if text.contains("\r\n") {
         rewritten = rewritten.replace("\r\n", "\n").replace('\n', "\r\n");
     }
-    let edits = poetry_lock_edits(text, &rewritten, name)?;
+    let before = before?;
+    let after_doc = toml_edit::Document::parse(rewritten).map_err(|e| e.to_string())?;
+    let rewritten = after_doc.raw();
+    let after = poetry_lock_fragments_in(&after_doc, rewritten, name)?;
+    let edits = pair_poetry_lock_fragments(text, &before, rewritten, after)?;
     let mut result = text.to_string();
-    for (original, replacement) in edits {
-        result = result.replacen(&original, &replacement, 1);
+    for (original, replacement) in &edits {
+        result = result.replacen(original, replacement, 1);
     }
-    Ok(Some(result))
+    let known_edits = (result == rewritten).then_some(edits);
+    if known_edits.is_some() {
+        // The output IS the rendered text just parsed: the next dep's input.
+        parse.doc = Some(after_doc);
+    }
+    Ok(Some(PoetryLockRewrite {
+        text: result,
+        original: text,
+        name,
+        before,
+        known_edits,
+    }))
+}
+
+/// Every refusal and not-applicable verdict of [`rewrite_poetry_lock_in`]
+/// that precedes its first mutation, read from the parsed lock.
+fn plan_poetry_rewrite(
+    lock: &Table,
+    name: &str,
+    version: &str,
+    source_type: &str,
+    source_url: &str,
+    sha256: &str,
+) -> Result<Option<PoetryLockPlan>, String> {
+    let format = lock_version_of(lock)?.to_string();
+    if format == "0" && source_type == "url" {
+        return Err("Poetry 0.x ignores URL sources; hosted patches require Poetry >= 1.0".into());
+    }
+    let effective_url = if format == "1.0" && source_type == "url" {
+        // Poetry 1.0 hands pip `<url>#egg=<name>` unconditionally; the trailing
+        // `&` keeps `sha256=<hex>` a complete fragment parameter when `#egg=`
+        // is appended (pip >= 22 would otherwise read `<hex>#egg=<name>` as the
+        // digest and hard-fail the install).
+        format!("{source_url}#sha256={sha256}&")
+    } else {
+        source_url.to_string()
+    };
+    let packages = lock
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .ok_or("missing Poetry packages")?;
+    let indices: Vec<_> = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| {
+            package
+                .get("name")
+                .and_then(Item::as_str)
+                .is_some_and(|candidate| {
+                    canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
+                })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    if indices.len() != 1 {
+        return Err("forked Poetry package requires an unambiguous source".into());
+    }
+    let package = packages.get(indices[0]).ok_or("missing Poetry package")?;
+    if package.get("version").and_then(Item::as_str) != Some(version) {
+        return Ok(None);
+    }
+    let package_name = package
+        .get("name")
+        .and_then(Item::as_str)
+        .unwrap_or(name)
+        .to_string();
+    if let Some(source) = package.get("source") {
+        let existing_type = source.get("type").and_then(Item::as_str);
+        let existing_url = source.get("url").and_then(Item::as_str).unwrap_or("");
+        let same_target = existing_type == Some(source_type) && existing_url == effective_url;
+        let prior_hosted = source_type == "url"
+            && existing_type == Some("url")
+            && is_prior_hosted_url(existing_url, &effective_url);
+        if !same_target && !prior_hosted {
+            return Err(format!(
+                "refusing to replace an existing Poetry source ({} {}) for {package_name}",
+                existing_type.unwrap_or("unknown"),
+                existing_url
+            ));
+        }
+    }
+    Ok(Some(PoetryLockPlan {
+        format,
+        effective_url,
+        index: indices[0],
+        package_name,
+    }))
 }
 
 /// End (exclusive, before its line break) of the first top-level TOML header
@@ -303,101 +459,123 @@ pub fn poetry_lock_edits(
     rewritten: &str,
     name: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    fn fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
-        let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
-        let package = lock
-            .get("package")
-            .and_then(Item::as_array_of_tables)
-            .and_then(|packages| {
-                packages.iter().find(|package| {
-                    package
-                        .get("name")
-                        .and_then(Item::as_str)
-                        .is_some_and(|value| {
-                            canonicalize_pypi_name(value) == canonicalize_pypi_name(name)
-                        })
-                })
+    let before = poetry_lock_fragments(original, name)?;
+    let after = poetry_lock_fragments(rewritten, name)?;
+    pair_poetry_lock_fragments(original, &before, rewritten, after)
+}
+
+/// The fragments of `text` for `name` that [`poetry_lock_edits`] pairs up:
+/// the `[[package]]` unit and, for legacy formats, the integrity entry.
+fn poetry_lock_fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
+    let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
+    poetry_lock_fragments_in(&lock, text, name)
+}
+
+/// [`poetry_lock_fragments`] of `text` from its (spanned) parse `lock`.
+fn poetry_lock_fragments_in<S>(
+    lock: &toml_edit::Document<S>,
+    text: &str,
+    name: &str,
+) -> Result<Vec<String>, String> {
+    let package = lock
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .and_then(|packages| {
+            packages.iter().find(|package| {
+                package
+                    .get("name")
+                    .and_then(Item::as_str)
+                    .is_some_and(|value| {
+                        canonicalize_pypi_name(value) == canonicalize_pypi_name(name)
+                    })
             })
-            .ok_or("missing Poetry package")?;
-        fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
-            if let Some(own) = table.span() {
+        })
+        .ok_or("missing Poetry package")?;
+    fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
+        if let Some(own) = table.span() {
+            span.start = span.start.min(own.start);
+            span.end = span.end.max(own.end);
+        }
+        for (_, item) in table.iter() {
+            if let Some(own) = item.span() {
                 span.start = span.start.min(own.start);
                 span.end = span.end.max(own.end);
             }
-            for (_, item) in table.iter() {
-                if let Some(own) = item.span() {
-                    span.start = span.start.min(own.start);
-                    span.end = span.end.max(own.end);
-                }
-                if let Some(child) = item.as_table() {
-                    extend_span(child, span);
-                }
+            if let Some(child) = item.as_table() {
+                extend_span(child, span);
             }
         }
-        let mut span = package.span().ok_or("missing Poetry package span")?;
-        extend_span(package, &mut span);
-        span.end += text[span.end..]
-            .find(['\r', '\n'])
-            .unwrap_or(text.len() - span.end);
-        // Carry the unit's BOUNDARY: the blank line(s) after it plus the next
-        // top-level header (`[[package]]`, `[metadata]`, `[extras]`, …) or
-        // EOF. The rewrite APPENDS `[package.source]` to the unit, so without
-        // the boundary the pristine fragment would be a strict prefix of every
-        // rewritten (or later relocked) unit: rollback's "already converged"
-        // check could never fire for lock 1.0, and a relock that dropped the
-        // inserted `files` line but kept the source block would match the
-        // pristine prefix and report a successful rollback while the lock
-        // still redirected. With the header included, the pristine fragment
-        // matches only a unit that really ends where it ended.
-        span.end = next_header_end(text, span.end);
-        let mut result = vec![text[span].to_string()];
-        let metadata = lock
-            .get("metadata")
-            .filter(|item| item.is_table_like())
-            .ok_or("missing Poetry metadata")?;
-        let format = metadata
-            .get("lock-version")
-            .and_then(Item::as_str)
-            .unwrap_or("0");
-        if !format.starts_with('2') {
-            let field = if format == "0" { "hashes" } else { "files" };
-            let table = metadata
-                .get(field)
-                .and_then(Item::as_table)
-                .ok_or_else(|| format!("missing Poetry integrity table [metadata.{field}]"))?;
-            let package_name = package
-                .get("name")
-                .and_then(Item::as_str)
-                .ok_or("missing package name")?;
-            let key_start = table
-                .key(package_name)
-                .and_then(|key| key.span())
-                .ok_or("missing Poetry integrity key")?
-                .start;
-            // Anchor the fragment at the preceding line break so a
-            // suffix-named sibling entry (`pyurllib3 = […]` vs `urllib3 = […]`)
-            // holding the same value can never contain it.
-            let start = text[..key_start].rfind('\n').unwrap_or(key_start);
-            let end = table
-                .get(package_name)
-                .and_then(Item::span)
-                .ok_or("missing Poetry integrity span")?
-                .end;
-            result.push(text[start..end].to_string());
-        }
-        Ok(result)
     }
-    let before = fragments(original, name)?;
-    let after = fragments(rewritten, name)?;
+    let mut span = package.span().ok_or("missing Poetry package span")?;
+    extend_span(package, &mut span);
+    span.end += text[span.end..]
+        .find(['\r', '\n'])
+        .unwrap_or(text.len() - span.end);
+    // Carry the unit's BOUNDARY: the blank line(s) after it plus the next
+    // top-level header (`[[package]]`, `[metadata]`, `[extras]`, …) or
+    // EOF. The rewrite APPENDS `[package.source]` to the unit, so without
+    // the boundary the pristine fragment would be a strict prefix of every
+    // rewritten (or later relocked) unit: rollback's "already converged"
+    // check could never fire for lock 1.0, and a relock that dropped the
+    // inserted `files` line but kept the source block would match the
+    // pristine prefix and report a successful rollback while the lock
+    // still redirected. With the header included, the pristine fragment
+    // matches only a unit that really ends where it ended.
+    span.end = next_header_end(text, span.end);
+    let mut result = vec![text[span].to_string()];
+    let metadata = lock
+        .get("metadata")
+        .filter(|item| item.is_table_like())
+        .ok_or("missing Poetry metadata")?;
+    let format = metadata
+        .get("lock-version")
+        .and_then(Item::as_str)
+        .unwrap_or("0");
+    if !format.starts_with('2') {
+        let field = if format == "0" { "hashes" } else { "files" };
+        let table = metadata
+            .get(field)
+            .and_then(Item::as_table)
+            .ok_or_else(|| format!("missing Poetry integrity table [metadata.{field}]"))?;
+        let package_name = package
+            .get("name")
+            .and_then(Item::as_str)
+            .ok_or("missing package name")?;
+        let key_start = table
+            .key(package_name)
+            .and_then(|key| key.span())
+            .ok_or("missing Poetry integrity key")?
+            .start;
+        // Anchor the fragment at the preceding line break so a
+        // suffix-named sibling entry (`pyurllib3 = […]` vs `urllib3 = […]`)
+        // holding the same value can never contain it.
+        let start = text[..key_start].rfind('\n').unwrap_or(key_start);
+        let end = table
+            .get(package_name)
+            .and_then(Item::span)
+            .ok_or("missing Poetry integrity span")?
+            .end;
+        result.push(text[start..end].to_string());
+    }
+    Ok(result)
+}
+
+/// [`poetry_lock_edits`] over fragments already taken from both sides.
+fn pair_poetry_lock_fragments(
+    original: &str,
+    before: &[String],
+    rewritten: &str,
+    after: Vec<String>,
+) -> Result<Vec<(String, String)>, String> {
     let mut edits = Vec::new();
-    for (old, new) in before.into_iter().zip(after) {
-        if old == new {
+    for (old, new) in before.iter().zip(after) {
+        if *old == new {
             continue;
         }
-        if original.matches(&old).count() != 1 || rewritten.matches(&new).count() != 1 {
+        if original.matches(old.as_str()).count() != 1 || rewritten.matches(&new).count() != 1 {
             return Err("ambiguous Poetry rollback fragment".into());
         }
-        edits.push((old, new));
+        edits.push((old.clone(), new));
     }
     Ok(edits)
 }
@@ -601,5 +779,407 @@ mod tests {
         assert_eq!(generated_by_version(&fixture("2.4.3")), Some((2, 4)));
         assert_eq!(generated_by_version(&fixture("1.3.2")), None);
         assert_eq!(generated_by_version(&fixture("1.2.2")), None);
+    }
+
+    /// The edits a rewrite hands back are exactly `poetry_lock_edits` of its
+    /// input and output — whether reused from the rewrite or re-derived.
+    #[test]
+    fn rewrite_edits_equal_poetry_lock_edits() {
+        for version in [
+            "0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.8.5", "2.0.1", "2.4.3",
+        ] {
+            for crlf in [false, true] {
+                let mut text = fixture(version);
+                if crlf {
+                    text = text.replace('\n', "\r\n");
+                }
+                let rewrite = rewrite_poetry_lock_with_edits(
+                    &text,
+                    "urllib3",
+                    "1.26.18",
+                    "file",
+                    ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+                    WHEEL,
+                    &sha(),
+                )
+                .unwrap()
+                .unwrap();
+                let want = poetry_lock_edits(&text, &rewrite.text, "urllib3");
+                assert_eq!(rewrite.edits(), want, "{version} crlf={crlf}");
+                let rederived = PoetryLockRewrite {
+                    known_edits: None,
+                    ..rewrite
+                };
+                assert_eq!(rederived.edits(), want, "{version} crlf={crlf} re-derived");
+            }
+        }
+    }
+
+    /// When the splice does not reproduce the serialized document (a mixed
+    /// line-ending lock: the serializer rewrites every line to CRLF, the
+    /// splice leaves the untouched LF lines alone), the rewrite's own edits
+    /// are not kept and `edits()` re-derives them against the output.
+    #[test]
+    fn rewrite_edits_are_rederived_when_the_splice_differs_from_the_document() {
+        for version in ["0.12.17", "1.0.10", "1.2.2", "2.4.3"] {
+            let crlf = fixture(version).replace('\n', "\r\n");
+            // `[metadata] content-hash` is in no fragment of the package.
+            let hash = crlf.find("content-hash").unwrap();
+            let eol = hash + crlf[hash..].find("\r\n").unwrap();
+            let text = format!("{}\n{}", &crlf[..eol], &crlf[eol + 2..]);
+            let rewrite = rewrite_poetry_lock_with_edits(
+                &text,
+                "urllib3",
+                "1.26.18",
+                "file",
+                ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+                WHEEL,
+                &sha(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                rewrite.known_edits.is_none(),
+                "{version}: splice must differ"
+            );
+            assert_eq!(
+                rewrite.edits(),
+                poetry_lock_edits(&text, &rewrite.text, "urllib3"),
+                "{version}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod parse_reuse_equivalence_tests {
+    //! The single-parse rewrite ([`rewrite_poetry_lock_in`], reusing the
+    //! previous rewrite's parsed output) against the previous
+    //! [`rewrite_poetry_lock_with_edits`], kept verbatim: identical verdicts,
+    //! texts and edits at every step of a dep sequence, on every lock
+    //! generation, LF and CRLF, with refusals and re-runs in between.
+    use super::*;
+
+    fn rewrite_poetry_lock_with_edits_oracle<'a>(
+        text: &'a str,
+        name: &'a str,
+        version: &str,
+        source_type: &str,
+        source_url: &str,
+        filename: &str,
+        sha256: &str,
+    ) -> Result<Option<PoetryLockRewrite<'a>>, String> {
+        if !matches!(source_type, "file" | "url")
+            || sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid Poetry artifact source or SHA-256".into());
+        }
+        // Poetry compares the lock's `sha256:<hex>` against `hashlib`'s lowercase
+        // hexdigest as strings, so an uppercase digest would fail every install.
+        let sha256 = sha256.to_ascii_lowercase();
+        if filename.contains(['/', '\\']) || !filename.ends_with(".whl") {
+            return Err("Poetry patch wheel does not match the locked package".into());
+        }
+        let parts: Vec<_> = filename.split('-').collect();
+        if !matches!(parts.len(), 5 | 6)
+            || canonicalize_pypi_name(parts[0]) != canonicalize_pypi_name(name)
+            || parts[1] != version
+        {
+            return Err("Poetry patch wheel does not match the locked package".into());
+        }
+        let mut lock: DocumentMut = text
+            .parse()
+            .map_err(|e| format!("invalid Poetry lock: {e}"))?;
+        let format = lock_version(&lock)?.to_string();
+        if format == "0" && source_type == "url" {
+            return Err(
+                "Poetry 0.x ignores URL sources; hosted patches require Poetry >= 1.0".into(),
+            );
+        }
+        let effective_url = if format == "1.0" && source_type == "url" {
+            // Poetry 1.0 hands pip `<url>#egg=<name>` unconditionally; the trailing
+            // `&` keeps `sha256=<hex>` a complete fragment parameter when `#egg=`
+            // is appended (pip >= 22 would otherwise read `<hex>#egg=<name>` as the
+            // digest and hard-fail the install).
+            format!("{source_url}#sha256={sha256}&")
+        } else {
+            source_url.to_string()
+        };
+        let packages = lock
+            .get_mut("package")
+            .and_then(Item::as_array_of_tables_mut)
+            .ok_or("missing Poetry packages")?;
+        let indices: Vec<_> = packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| {
+                package
+                    .get("name")
+                    .and_then(Item::as_str)
+                    .is_some_and(|candidate| {
+                        canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        if indices.len() != 1 {
+            return Err("forked Poetry package requires an unambiguous source".into());
+        }
+        let package = packages
+            .get_mut(indices[0])
+            .ok_or("missing Poetry package")?;
+        if package.get("version").and_then(Item::as_str) != Some(version) {
+            return Ok(None);
+        }
+        let package_name = package
+            .get("name")
+            .and_then(Item::as_str)
+            .unwrap_or(name)
+            .to_string();
+        if let Some(source) = package.get("source") {
+            let existing_type = source.get("type").and_then(Item::as_str);
+            let existing_url = source.get("url").and_then(Item::as_str).unwrap_or("");
+            let same_target = existing_type == Some(source_type) && existing_url == effective_url;
+            let prior_hosted = source_type == "url"
+                && existing_type == Some("url")
+                && is_prior_hosted_url(existing_url, &effective_url);
+            if !same_target && !prior_hosted {
+                return Err(format!(
+                    "refusing to replace an existing Poetry source ({} {}) for {package_name}",
+                    existing_type.unwrap_or("unknown"),
+                    existing_url
+                ));
+            }
+        }
+        let mut entry = InlineTable::new();
+        entry.insert("file", Value::from(filename));
+        entry.insert("hash", Value::from(format!("sha256:{sha256}")));
+        let mut files = Array::new();
+        files.push(entry);
+        let mut source = Table::new();
+        source.insert("type", value(source_type));
+        source.insert("url", value(effective_url));
+        if matches!(format.as_str(), "0" | "1.0") {
+            // Poetry 0.12 / 1.0 read `source.reference` unconditionally (KeyError
+            // without it), even for archive sources.
+            source.insert("reference", value(""));
+        }
+        package.insert("source", Item::Table(source));
+        if matches!(format.as_str(), "1.0" | "1.1") && source_type == "url" {
+            // Poetry >= 1.2 verifies url sources against the package's own
+            // `files` (it never reads `metadata.files` hashes for them), Poetry
+            // 1.0/1.1 against `metadata.files` — write both so whichever installer
+            // consumes this legacy lock enforces the patched hash. Poetry 1.0/1.1
+            // ignore the extra package key (measured on 1.0.10; 1.2.2 rejects a
+            // tampered package `files` hash on a lock-1.0 file only when it is
+            // present).
+            package.insert("files", value(files.clone()));
+        }
+        if format.starts_with('2') {
+            package.insert("files", value(files));
+        } else {
+            let field = if format == "0" { "hashes" } else { "files" };
+            let table = lock
+                .get_mut("metadata")
+                .and_then(Item::as_table_like_mut)
+                .ok_or("missing Poetry lock metadata")?
+                .get_mut(field)
+                .ok_or_else(|| format!("missing Poetry integrity table [metadata.{field}]"))?
+                .as_table_like_mut()
+                .ok_or_else(|| format!("[metadata.{field}] is not a table"))?;
+            if format == "0" {
+                let mut hashes = Array::new();
+                hashes.push(sha256.as_str());
+                table.insert(&package_name, value(hashes));
+            } else {
+                table.insert(&package_name, value(files));
+            }
+        }
+        let mut rewritten = lock.to_string();
+        if text.contains("\r\n") {
+            rewritten = rewritten.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+        let before = poetry_lock_fragments(text, name)?;
+        let after = poetry_lock_fragments(&rewritten, name)?;
+        let edits = pair_poetry_lock_fragments(text, &before, &rewritten, after)?;
+        let mut result = text.to_string();
+        for (original, replacement) in &edits {
+            result = result.replacen(original, replacement, 1);
+        }
+        let known_edits = (result == rewritten).then_some(edits);
+        Ok(Some(PoetryLockRewrite {
+            text: result,
+            original: text,
+            name,
+            before,
+            known_edits,
+        }))
+    }
+
+    const VERSIONS: &[&str] = &[
+        "0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.5.1", "1.6.1", "1.7.1",
+        "1.8.5", "2.0.1", "2.1.4", "2.2.1", "2.3.4", "2.4.3",
+    ];
+    const SHA: &str = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
+
+    /// The native fixture grown to `extra` more packages (clones of its
+    /// urllib3 unit, with their legacy integrity entries), one of them
+    /// forked into two versions.
+    fn grown(version: &str, extra: usize) -> String {
+        let lock = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/poetry/{version}/poetry.lock",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("\r\n", "\n");
+        let meta = lock.find("\n[metadata]").unwrap();
+        let first = lock.find("[[package]]").unwrap();
+        let unit = &lock[first..meta];
+        let mut out = lock[..meta].to_string();
+        for i in 0..extra {
+            out.push('\n');
+            out.push_str(&unit.replace("name = \"urllib3\"", &format!("name = \"pkg{i}\"")));
+        }
+        out.push('\n');
+        out.push_str(&unit.replace("name = \"urllib3\"", "name = \"forked\""));
+        out.push('\n');
+        out.push_str(
+            &unit
+                .replace("name = \"urllib3\"", "name = \"forked\"")
+                .replace("version = \"1.26.18\"", "version = \"2.0.0\""),
+        );
+        let mut tail = lock[meta..].to_string();
+        let entries: String = (0..extra).map(|i| format!("\npkg{i} = []")).collect();
+        tail = tail.replacen("\nurllib3 = []", &format!("\nurllib3 = []{entries}"), 1);
+        out + &tail
+    }
+
+    type Step<'a> = (&'a str, &'a str, &'a str, String);
+
+    fn steps(extra: usize) -> Vec<Step<'static>> {
+        let url = |name: &str, tag: &str| {
+            format!("https://patch.socket.dev/patch/pypi/{name}/{tag}/{name}-1.26.18-py2.py3-none-any.whl")
+        };
+        let mut out: Vec<Step> = vec![("urllib3", "1.26.18", "url", url("urllib3", "a"))];
+        let names: &[&'static str] = &["pkg0", "pkg1", "pkg2", "pkg3"];
+        for name in names.iter().take(extra) {
+            out.push((name, "1.26.18", "url", url(name, "a")));
+        }
+        out.push(("absent", "1.26.18", "url", url("absent", "a"))); // not found
+        out.push(("forked", "1.26.18", "url", url("forked", "a"))); // refused
+        out.push(("urllib3", "9.9.9", "url", url("urllib3", "a"))); // wheel mismatch
+        out.push(("urllib3", "1.26.18", "url", url("urllib3", "a"))); // re-run
+        out.push(("urllib3", "1.26.18", "url", url("urllib3", "rotated"))); // superseded
+        out.push((
+            "urllib3",
+            "1.26.18",
+            "file",
+            ".socket/vendor/x/urllib3-1.26.18-py2.py3-none-any.whl".into(),
+        )); // foreign source
+        if extra > 0 {
+            out.push((
+                "pkg0",
+                "1.26.18",
+                "file",
+                ".socket/vendor/y/pkg0-1.26.18-py2.py3-none-any.whl".into(),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn reused_parse_matches_the_fresh_parse_rewrite() {
+        let mut landed = 0;
+        for version in VERSIONS {
+            for extra in [0, 2, 4] {
+                for crlf in [false, true] {
+                    let mut lock = grown(version, extra);
+                    if crlf {
+                        lock = lock.replace('\n', "\r\n");
+                    }
+                    let (mut want_text, mut got_text) = (lock.clone(), lock);
+                    let mut parse = PoetryLockParse::default();
+                    for (i, (name, version, source_type, url)) in steps(extra).iter().enumerate() {
+                        let what = format!("{version} extra={extra} crlf={crlf} step {i}");
+                        let filename = url.rsplit('/').next().unwrap();
+                        let want = rewrite_poetry_lock_with_edits_oracle(
+                            &want_text,
+                            name,
+                            version,
+                            source_type,
+                            url,
+                            filename,
+                            SHA,
+                        );
+                        let got = rewrite_poetry_lock_in(
+                            &mut parse,
+                            &got_text,
+                            name,
+                            version,
+                            source_type,
+                            url,
+                            filename,
+                            SHA,
+                        );
+                        match (want, got) {
+                            (Err(w), Err(g)) => assert_eq!(g, w, "{what}"),
+                            (Ok(None), Ok(None)) => {}
+                            (Ok(Some(w)), Ok(Some(g))) => {
+                                assert_eq!(g.text, w.text, "{what}: text");
+                                assert_eq!(g.edits(), w.edits(), "{what}: edits");
+                                landed += 1;
+                                want_text = w.text;
+                                got_text = g.text;
+                            }
+                            (w, g) => panic!(
+                                "{what}: verdicts differ: {:?} vs {:?}",
+                                w.map(|r| r.map(|r| r.text)),
+                                g.map(|r| r.map(|r| r.text))
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(landed > 200, "only {landed} rewrites landed");
+    }
+
+    /// A parse is reused only for byte-identical text: an external edit
+    /// between two calls is parsed afresh.
+    #[test]
+    fn reused_parse_misses_on_changed_text() {
+        let lock = grown("2.4.3", 2);
+        let url = "https://patch.socket.dev/patch/pypi/pkg0/a/pkg0-1.26.18-py2.py3-none-any.whl";
+        let mut parse = PoetryLockParse::default();
+        let first = rewrite_poetry_lock_in(
+            &mut parse,
+            &lock,
+            "pkg0",
+            "1.26.18",
+            "url",
+            url,
+            "pkg0-1.26.18-py2.py3-none-any.whl",
+            SHA,
+        )
+        .unwrap()
+        .unwrap();
+        // pkg1 dropped from the lock behind the parse's back.
+        let edited = first.text.replace("name = \"pkg1\"", "name = \"gone\"");
+        let url1 = "https://patch.socket.dev/patch/pypi/pkg1/a/pkg1-1.26.18-py2.py3-none-any.whl";
+        let got = rewrite_poetry_lock_in(
+            &mut parse,
+            &edited,
+            "pkg1",
+            "1.26.18",
+            "url",
+            url1,
+            "pkg1-1.26.18-py2.py3-none-any.whl",
+            SHA,
+        );
+        assert!(matches!(got, Ok(None)), "the stale parse was reused");
     }
 }

@@ -44,7 +44,7 @@ pub(super) async fn load(
         return Err(("pypi_hatch_unsupported", "vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into()));
     }
     let prefix = format!("{{root:uri}}/.socket/vendor/pypi/{uuid}/");
-    let state = super::state::load_state(root)
+    let state = super::state::load_state_shared(root)
         .await
         .map_err(|error| ("pypi_hatch_ledger_invalid", error.to_string()))?;
     let entry = state
@@ -184,7 +184,7 @@ pub(super) async fn wire(
     let mut permission_record = None;
     if let Some(permission) = plan.permission {
         originals.insert(permission.file.clone(), permission.new.clone());
-        let state = super::state::load_state(root)
+        let state = super::state::load_state_shared(root)
             .await
             .map_err(|error| ("pypi_hatch_ledger_invalid", error.to_string()))?;
         permission_record = Some(

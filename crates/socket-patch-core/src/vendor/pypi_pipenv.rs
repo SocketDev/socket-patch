@@ -3,6 +3,7 @@
 //! portable relative wheel paths with integrity hashes.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -10,6 +11,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 use super::common::{ensure_unchanged, refuse_symlinked, serialize_json};
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::state::{PipenvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
@@ -37,7 +39,8 @@ const NON_REGISTRY_KEYS: [&str; 6] = ["path", "git", "hg", "svn", "bzr", "editab
 #[derive(Debug)]
 pub(super) struct PipenvProject {
     /// Parsed lock (the edit substrate — re-serialized canonically).
-    pub lock: Value,
+    /// Shared: the wire step takes its own copy before mutating.
+    pub lock: Arc<Value>,
     /// Verbatim lock text the parse came from: the wire step re-reads the
     /// file and refuses when it no longer matches (a `pipenv lock` landed
     /// during the wheel build).
@@ -51,6 +54,14 @@ pub(super) struct PipenvProject {
     /// hashes on file-ref entries) — the orchestrator must surface these.
     pub warnings: Vec<VendorWarning>,
 }
+
+/// The run's Pipfile.lock parse. `load_pipenv_project` runs once per patched
+/// package and re-parsed the whole lock each time; an idempotent re-run
+/// parses bytes nothing has changed. Not re-seeded after a write: the wire
+/// step re-serializes with the lock's own line endings restored, so the
+/// document in hand is not the one those bytes parse to — the next package
+/// pays one parse, as before. See [`ParseMemo`].
+static LOCK_MEMO: ParseMemo<Value> = ParseMemo::new();
 
 /// What the target entries already look like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,12 +97,16 @@ pub(super) async fn load_pipenv_project(
             ))
         }
     };
-    let lock: Value = serde_json::from_str(&lock_text).map_err(|e| {
-        (
-            "pypi_pipenv_lock_parse_failed",
-            format!("{LOCK_FILE} is not parseable JSON: {e}"),
-        )
-    })?;
+    let lock = LOCK_MEMO
+        .parse(lock_text.as_bytes(), || {
+            serde_json::from_str::<Value>(&lock_text)
+        })
+        .map_err(|e| {
+            (
+                "pypi_pipenv_lock_parse_failed",
+                format!("{LOCK_FILE} is not parseable JSON: {e}"),
+            )
+        })?;
     if !lock.is_object() {
         return Err((
             "pypi_pipenv_lock_parse_failed",
@@ -291,7 +306,7 @@ pub(super) async fn wire_pipenv(
         PipenvTarget::Fresh => {}
     }
 
-    let mut lock = p.lock.clone();
+    let mut lock = (*p.lock).clone();
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut sections: Vec<String> = Vec::new();
     for section in category_names(&lock) {
@@ -367,6 +382,8 @@ pub(super) async fn wire_pipenv(
     // The edit was computed from the pre-flight snapshot; a `pipenv lock` /
     // editor save that landed during the wheel build must not be clobbered.
     ensure_unchanged(root, LOCK_FILE, &p.lock_text, "pypi_pipenv_changed").await?;
+    // Dropped before the write, so a torn one leaves nothing behind either.
+    LOCK_MEMO.invalidate();
     atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_text.as_bytes())
         .await
         .map_err(|e| {
@@ -549,6 +566,7 @@ pub(super) async fn revert_pipenv(
     // churn a lock whose formatting we did not produce.
     if changed && !dry_run {
         let new_text = with_line_ending(to_canonical_json(&lock), lock_text.contains("\r\n"));
+        LOCK_MEMO.invalidate();
         if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
             return RevertOutcome {
                 kept_artifact: false,

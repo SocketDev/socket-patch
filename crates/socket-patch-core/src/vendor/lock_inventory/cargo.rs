@@ -41,14 +41,16 @@ pub(super) async fn inventory_cargo_lock_in(view: &ProjectView<'_>) -> Option<Ve
 pub(super) async fn inventory_cargo_lock_raw_in(
     view: &ProjectView<'_>,
 ) -> Option<Vec<LockfileEntry>> {
-    let doc: toml_edit::DocumentMut = match view {
+    let doc: std::sync::Arc<toml_edit::DocumentMut> = match view {
         ProjectView::Disk(project_root) => {
             crate::vendor::cargo_lock::read_lock(project_root)
                 .await
                 .ok()?
                 .1
         }
-        ProjectView::Memory(_) => view.read_text("Cargo.lock").await.ok()?.parse().ok()?,
+        ProjectView::Memory(_) => {
+            std::sync::Arc::new(view.read_text("Cargo.lock").await.ok()?.parse().ok()?)
+        }
     };
     let mut out = Vec::new();
     for pkg in crate::vendor::cargo_lock::locked_packages(&doc) {
