@@ -26,15 +26,6 @@ pub(crate) mod vlt;
 pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
 pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
 
-/// Fragment-edit kinds whose lockfile the package manager re-lays in place
-/// (keeping the Socket source) — a re-scan REBASES their ledger edits instead
-/// of appending; see the ledger merge below.
-pub(crate) const REBASE_KINDS: &[&str] = &[
-    "redirect_poetry_lock_package",
-    "redirect_pdm_lock_package",
-    socket_patch_core::patch::redirect::vlt::KIND,
-];
-
 /// Candidate lockfiles / registry configs the redirect rewriters may touch —
 /// read from the project when present and handed to `rewrite_registry_redirect`.
 pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
@@ -1213,7 +1204,7 @@ pub(crate) async fn run_redirect_selected(
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect_withholding_vlt, RedirectState,
+        rewrite_registry_redirect_withholding_vlt,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -1425,11 +1416,9 @@ pub(crate) async fn run_redirect_selected(
 
     // v5 hosted mode keeps no ledger: the lockfiles are the only record of
     // a redirect (vex, list, vendor and rollback read the hosted pins from
-    // them). This run's edits and records still collect here in memory,
-    // for the edit rebasing below, the stale-install probes and the
-    // takeover classification. A pre-v5 ledger on disk is left untouched:
-    // it only goes stale, and replaying a stale edit fails closed.
-    let mut ledger = RedirectState::new();
+    // them). This run's patch records (fetched below) feed only the
+    // stale-install probes and the in-run VEX attestation. A pre-v5 ledger
+    // on disk is left untouched: it is read only for migration.
     // The vendored ledger, loaded ONCE per run (under the same lock, so no
     // other writer can move the on-disk file under it): the takeover below
     // mutates it in place per reverted purl (saving after each), and the
@@ -2781,8 +2770,8 @@ pub(crate) async fn run_redirect_selected(
                         "code": "record_fetch_failed",
                         "detail": format!(
                             "{purl} redirected, but its patch record could not be fetched; \
-                             it will be missing from VEX until `socket-patch scan --mode \
-                             hosted` is re-run"
+                             this run's VEX attestation omits it (`socket-patch vex` \
+                             fetches it again once the API answers)"
                         ),
                     }));
                 }
@@ -2792,109 +2781,6 @@ pub(crate) async fn run_redirect_selected(
     }
 
     if !common.dry_run {
-        // Fold this run's edits and records into the in-memory ledger.
-        // New edits append, skipping byte-identical re-plans; records are
-        // keyed by purl, newest wins.
-        if !rewrite.edits.is_empty() || !records.is_empty() {
-            // Older ledgers carry `"mode": "redirect"`; normalize on rewrite
-            // (the loader accepts either).
-            ledger.mode = "hosted".to_string();
-            // REBASE instead of append for fragment kinds whose file the
-            // package manager itself rewrites in place: when the ledger already
-            // holds edits for the same (path, kind, key) and the file no longer
-            // carried their `new` fragments before this run (Poetry 1.1/1.2
-            // `poetry lock --no-update` keeps the Socket source but re-lays the
-            // unit and drops the inserted `files` line), appending this run's
-            // edits — recorded against the RELOCKED text — would build a chain
-            // whose older links match nothing, so rollback and remove refuse
-            // forever. Keeping the oldest `original` (the pristine
-            // fragment) and adopting the fresh `new` keeps the chain a single
-            // invertible link: replay swaps the fragment this run wrote back to
-            // the fragment the very first run found.
-            let vlt_merged = rebase_vlt_edits(
-                &mut ledger.edits,
-                &rewrite.edits,
-                files
-                    .get(socket_patch_core::constants::npm_family::VLT_LOCK)
-                    .map(String::as_str),
-            );
-            let mut rebased: Vec<usize> = Vec::new();
-            for edit in rewrite.edits.iter().filter(|e| {
-                REBASE_KINDS.contains(&e.kind.as_str())
-                    && e.kind != socket_patch_core::patch::redirect::vlt::KIND
-            }) {
-                let siblings: Vec<usize> = ledger
-                    .edits
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, old)| {
-                        old.path == edit.path && old.kind == edit.kind && old.key == edit.key
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                let before = files.get(&edit.path).map(String::as_str).unwrap_or("");
-                let drifted = !siblings.is_empty()
-                    && siblings.iter().all(|&i| {
-                        ledger.edits[i]
-                            .new
-                            .as_ref()
-                            .and_then(serde_json::Value::as_str)
-                            .is_none_or(|new| !before.contains(new))
-                    });
-                if !drifted {
-                    continue;
-                }
-                // Positional pairing: the rewriter emits a key's fragments in a
-                // fixed order (package unit, then the legacy integrity entry).
-                let nth = rewrite
-                    .edits
-                    .iter()
-                    .filter(|e| e.path == edit.path && e.kind == edit.kind && e.key == edit.key)
-                    .position(|e| std::ptr::eq(e, edit))
-                    .unwrap_or(0);
-                if let Some(&target) = siblings.get(nth) {
-                    if !rebased.contains(&target) {
-                        // `pdm lock` fully un-patches the lock (registry source
-                        // restored) and may reflow line endings (CRLF → LF), so
-                        // the fresh run's `original` IS the correct
-                        // relocked-registry rollback target and the stale
-                        // recorded one would restore a mismatched fragment.
-                        // Poetry's relock instead KEEPS the Socket source (it
-                        // only drops the inserted `files` line), so its oldest
-                        // `original` — the true pre-patch fragment — must
-                        // survive; only its `new` is refreshed.
-                        if edit.kind == "redirect_pdm_lock_package" {
-                            ledger.edits[target].original = edit.original.clone();
-                        }
-                        ledger.edits[target].new = edit.new.clone();
-                        ledger.edits[target].action = edit.action.clone();
-                        rebased.push(target);
-                    }
-                }
-            }
-            // Dedup against the ledger as this run found it, never within
-            // this run: one run legitimately records identical edits (a
-            // Cargo.toml declaring the crate with the same line in two
-            // sections), and each one reverts one occurrence.
-            let recorded = ledger.edits.len();
-            for (i, edit) in rewrite.edits.iter().enumerate() {
-                if vlt_merged[i] {
-                    continue;
-                }
-                let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
-                    && rebased.iter().any(|&t| {
-                        let old = &ledger.edits[t];
-                        old.path == edit.path
-                            && old.kind == edit.kind
-                            && old.key == edit.key
-                            && old.new == edit.new
-                    });
-                if !is_rebased && !ledger.edits[..recorded].contains(edit) {
-                    ledger.edits.push(edit.clone());
-                }
-            }
-            ledger.records.extend(records);
-        }
         for (rel, content) in rewrite
             .files
             .iter()
@@ -2951,7 +2837,7 @@ pub(crate) async fn run_redirect_selected(
             common.global,
             common.global_prefix.clone(),
             &confirmed,
-            &ledger.records,
+            &records,
             &gem_artifact_shas,
         )
         .await
@@ -2963,7 +2849,7 @@ pub(crate) async fn run_redirect_selected(
             common,
             &confirmed,
             &rewrite.confirmed_pipenv_uuids,
-            &ledger.records,
+            &records,
         )
         .await
     };
@@ -2985,7 +2871,7 @@ pub(crate) async fn run_redirect_selected(
                     .or_else(|| files.get(lock_key))
                     .map(String::as_str),
                 preflight: &vlt_preflight,
-                records: &ledger.records,
+                records: &records,
                 confirmed: &confirmed,
                 confirmed_vlt: &rewrite.confirmed_vlt_uuids,
                 foreign: &rewrite.vlt_foreign_uuids,
@@ -3594,91 +3480,6 @@ fn format_next_steps(files: &[String], vendored_removed: bool) -> Vec<String> {
     steps
 }
 
-/// Merge this run's vlt node edits into the recorded ones. A fresh edit
-/// for the same `key` and DepID keeps the oldest recorded `original` (the
-/// pristine registry entry), takes the fresh `new` and drops the chain's
-/// later links (a server-written ledger appends one per hosted PR). One
-/// whose recorded same-key edits all name DepIDs the pre-run lock no longer
-/// holds (a re-lock, or a new id grammar after a vlt upgrade) replaces
-/// them. So does one for another key of the same `name@version` whose
-/// vanished recorded edit's pin vlt carried to the fresh DepID (a new peer
-/// context). A replacing edit keeps the recorded pristine slots when vlt
-/// carried the pin ([`carried_pin_original`]). Returns, per fresh edit,
-/// whether it was merged (anything else is appended as usual).
-pub(crate) fn rebase_vlt_edits(
-    ledger: &mut Vec<socket_patch_core::patch::redirect::FileEdit>,
-    fresh: &[socket_patch_core::patch::redirect::FileEdit],
-    before_lock: Option<&str>,
-) -> Vec<bool> {
-    use socket_patch_core::patch::redirect::vlt::{
-        carried_pin_original, edit_dep_id, lock_node_ids, KIND,
-    };
-    use socket_patch_core::patch::redirect::FileEdit;
-    fn superseding(edit: &FileEdit, old: &FileEdit) -> FileEdit {
-        let mut next = edit.clone();
-        if let Some(original) = carried_pin_original(edit, old) {
-            next.original = Some(original);
-        }
-        next
-    }
-    fn key_base(key: &Option<String>) -> Option<&str> {
-        key.as_deref()
-            .map(|k| k.split_once('~').map_or(k, |(base, _)| base))
-    }
-    let live = before_lock.and_then(lock_node_ids).unwrap_or_default();
-    let mut merged = vec![false; fresh.len()];
-    for (i, edit) in fresh.iter().enumerate() {
-        if edit.kind != KIND {
-            continue;
-        }
-        let id = edit_dep_id(edit);
-        let same_key: Vec<usize> = ledger
-            .iter()
-            .enumerate()
-            .filter(|(_, old)| old.kind == KIND && old.path == edit.path && old.key == edit.key)
-            .map(|(j, _)| j)
-            .collect();
-        let same_dep: Vec<usize> = same_key
-            .iter()
-            .copied()
-            .filter(|&j| id.is_some() && edit_dep_id(&ledger[j]) == id)
-            .collect();
-        if let Some((&first, rest)) = same_dep.split_first() {
-            ledger[first].new = edit.new.clone();
-            ledger[first].action = edit.action.clone();
-            for &j in rest.iter().rev() {
-                ledger.remove(j);
-            }
-            merged[i] = true;
-            continue;
-        }
-        let vanished = |j: &usize| edit_dep_id(&ledger[*j]).is_none_or(|old| !live.contains(&old));
-        let gone: Vec<usize> = same_key.into_iter().filter(vanished).collect();
-        if let Some((&first, rest)) = gone.split_first() {
-            ledger[first] = superseding(edit, &ledger[first]);
-            for &j in rest.iter().rev() {
-                ledger.remove(j);
-            }
-            merged[i] = true;
-            continue;
-        }
-        let rekeyed = (0..ledger.len()).find(|j| {
-            let old = &ledger[*j];
-            old.kind == KIND
-                && old.path == edit.path
-                && old.key != edit.key
-                && key_base(&old.key) == key_base(&edit.key)
-                && vanished(j)
-                && carried_pin_original(edit, old).is_some()
-        });
-        if let Some(j) = rekeyed {
-            ledger[j] = superseding(edit, &ledger[j]);
-            merged[i] = true;
-        }
-    }
-    merged
-}
-
 /// Transient-frame boxed constructor for [`run_redirect_selected`] — the
 /// future embeds the whole hosted engine, and callers outside scan (`get
 /// --mode hosted`) must not materialize it in their own poll frame (Windows
@@ -3723,7 +3524,6 @@ mod tests {
         pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
-    use super::{rebase_vlt_edits, REBASE_KINDS};
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::{DepOverride, FileEdit};
@@ -5350,175 +5150,6 @@ mod tests {
                 .iter()
                 .any(|s| s.starts_with("vlt:"))
         );
-    }
-
-    fn vlt_edit(key: &str, id: &str, slot2: &str, slot3: &str) -> FileEdit {
-        FileEdit {
-            path: "vlt-lock.json".into(),
-            kind: socket_patch_core::patch::redirect::vlt::KIND.into(),
-            action: "rewritten".into(),
-            key: Some(key.into()),
-            original: Some(serde_json::Value::String(format!(
-                "\"{id}\": [0,\"x\",\"sha512-reg\",null]"
-            ))),
-            new: Some(serde_json::Value::String(format!(
-                "\"{id}\": [0,\"x\",\"{slot2}\",\"{slot3}\"]"
-            ))),
-        }
-    }
-
-    fn vlt_lock_with(ids: &[&str]) -> String {
-        let nodes: Vec<String> = ids
-            .iter()
-            .map(|id| format!("    \"{id}\": [0,\"x\"]"))
-            .collect();
-        format!(
-            "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n{}\n  }},\n  \"edges\": {{}}\n}}\n",
-            nodes.join(",\n")
-        )
-    }
-
-    #[test]
-    fn vlt_rerun_keeps_the_pristine_original_for_the_same_dep_id() {
-        assert!(REBASE_KINDS.contains(&socket_patch_core::patch::redirect::vlt::KIND));
-        let mut ledger = vec![vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p1", "u1")];
-        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p2", "u2");
-        fresh.original = ledger[0].new.clone();
-        let merged = rebase_vlt_edits(
-            &mut ledger,
-            std::slice::from_ref(&fresh),
-            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
-        );
-        assert_eq!(merged, [true]);
-        assert_eq!(ledger.len(), 1);
-        assert_eq!(
-            ledger[0].original,
-            vlt_edit("x@1.0.0", "~npm~x@1.0.0", "", "").original
-        );
-        assert_eq!(ledger[0].new, fresh.new);
-    }
-
-    #[test]
-    fn vlt_relocked_dep_id_supersedes_the_recorded_edits() {
-        let mut ledger = vec![
-            vlt_edit("x@1.0.0", "··x@1.0.0", "sha512-p", "u"),
-            vlt_edit("x@1.0.0", "·npm·x@1.0.0", "sha512-p", "u"),
-            vlt_edit("y@1.0.0", "·npm·y@1.0.0", "sha512-p", "u"),
-        ];
-        let fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p", "u");
-        let merged = rebase_vlt_edits(
-            &mut ledger,
-            std::slice::from_ref(&fresh),
-            Some(&vlt_lock_with(&["~npm~x@1.0.0", "·npm·y@1.0.0"])),
-        );
-        assert_eq!(merged, [true]);
-        assert_eq!(
-            ledger,
-            [fresh, vlt_edit("y@1.0.0", "·npm·y@1.0.0", "sha512-p", "u")]
-        );
-    }
-
-    fn vlt_pinned_at(edit: &FileEdit, id: &str) -> Option<serde_json::Value> {
-        let new = edit.new.as_ref()?.as_str()?;
-        let (_, tuple) = new.split_once(": ")?;
-        Some(serde_json::Value::String(format!("\"{id}\": {tuple}")))
-    }
-
-    #[test]
-    fn vlt_rerun_collapses_a_server_appended_chain_into_one_link() {
-        let first = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pa", "ua");
-        let mut second = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pb", "ub");
-        second.original = first.new.clone();
-        let mut ledger = vec![first, second.clone()];
-        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pc", "uc");
-        fresh.original = second.new.clone();
-        let merged = rebase_vlt_edits(
-            &mut ledger,
-            std::slice::from_ref(&fresh),
-            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
-        );
-        assert_eq!(merged, [true]);
-        assert_eq!(
-            ledger,
-            [FileEdit {
-                original: vlt_edit("x@1.0.0", "~npm~x@1.0.0", "", "").original,
-                ..fresh
-            }]
-        );
-    }
-
-    #[test]
-    fn vlt_rerun_after_a_peer_context_rekey_keeps_the_pristine_slots() {
-        let old_id = "~npm~x@1.0.0~peer.0df72515a50372ba";
-        let new_id = "~npm~x@1.0.0~peer.32643a3290c32d5d";
-        let recorded = vlt_edit("x@1.0.0~peer.0df72515a50372ba", old_id, "sha512-p1", "u1");
-        let mut ledger = vec![
-            vlt_edit("y@1.0.0", "~npm~y@1.0.0", "sha512-p", "u"),
-            recorded.clone(),
-        ];
-        let mut fresh = vlt_edit("x@1.0.0~peer.32643a3290c32d5d", new_id, "sha512-p2", "u2");
-        fresh.original = vlt_pinned_at(&recorded, new_id);
-        let merged = rebase_vlt_edits(
-            &mut ledger,
-            std::slice::from_ref(&fresh),
-            Some(&vlt_lock_with(&[new_id, "~npm~y@1.0.0"])),
-        );
-        assert_eq!(merged, [true]);
-        assert_eq!(ledger.len(), 2);
-        assert_eq!(ledger[1].key, fresh.key);
-        assert_eq!(ledger[1].new, fresh.new);
-        assert_eq!(
-            ledger[1].original,
-            Some(serde_json::Value::String(format!(
-                "\"{new_id}\": [0,\"x\",\"sha512-reg\"]"
-            )))
-        );
-
-        let mut pristine = vec![recorded.clone()];
-        let relocked = vlt_edit("x@1.0.0~peer.32643a3290c32d5d", new_id, "sha512-p2", "u2");
-        let merged = rebase_vlt_edits(
-            &mut pristine,
-            std::slice::from_ref(&relocked),
-            Some(&vlt_lock_with(&[new_id])),
-        );
-        assert_eq!(merged, [false], "a re-lock that dropped the pin appends");
-        assert_eq!(pristine, [recorded]);
-    }
-
-    #[test]
-    fn vlt_relocked_dep_id_that_kept_the_pin_keeps_the_pristine_slots() {
-        let recorded = vlt_edit("x@1.0.0", "·npm·x@1.0.0", "sha512-p1", "u1");
-        let mut ledger = vec![recorded.clone()];
-        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p2", "u2");
-        fresh.original = vlt_pinned_at(&recorded, "~npm~x@1.0.0");
-        let merged = rebase_vlt_edits(
-            &mut ledger,
-            std::slice::from_ref(&fresh),
-            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
-        );
-        assert_eq!(merged, [true]);
-        assert_eq!(
-            ledger,
-            [FileEdit {
-                original: Some(serde_json::Value::String(
-                    "\"~npm~x@1.0.0\": [0,\"x\",\"sha512-reg\"]".into()
-                )),
-                ..fresh
-            }]
-        );
-    }
-
-    #[test]
-    fn vlt_edit_of_a_live_sibling_dep_id_is_appended() {
-        let mut ledger = vec![vlt_edit("x@1.0.0", "··x@1.0.0", "sha512-p", "u")];
-        let fresh = vlt_edit("x@1.0.0", "·npm·x@1.0.0", "sha512-p", "u");
-        let merged = rebase_vlt_edits(
-            &mut ledger,
-            std::slice::from_ref(&fresh),
-            Some(&vlt_lock_with(&["··x@1.0.0", "·npm·x@1.0.0"])),
-        );
-        assert_eq!(merged, [false]);
-        assert_eq!(ledger.len(), 1);
     }
 
     #[test]
