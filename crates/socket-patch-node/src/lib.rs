@@ -1,5 +1,5 @@
 //! Node addon for the in-memory hosted redirect engine
-//! (`socket_patch_cli::hosted_memory`).
+//! (`socket_patch_core::hosted::memory`).
 //!
 //! This is the private native half of `@socketsecurity/socket-patch-node`;
 //! npm/index.js is the public surface (npm/index.d.ts). Options, tree
@@ -15,8 +15,8 @@ use std::sync::Arc;
 use napi::bindgen_prelude::{Buffer, External, Function, JsObjectValue, Object, PromiseRaw};
 use napi::{Env, Status};
 use napi_derive::napi;
-use socket_patch_cli::hosted_memory::{
-    self, EngineError, HostedScanOptions, HostedScanOutput, PresentKind, SelectOptions,
+use socket_patch_core::hosted::memory::{
+    self as hosted_memory, EngineError, HostedScanOptions, HostedScanOutput, PresentKind, SelectOptions,
     SessionBuilder, TreeEntryInput,
 };
 use socket_patch_core::api::client::PatchApi;

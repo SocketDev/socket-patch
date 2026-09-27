@@ -149,7 +149,10 @@ struct PatchedFixture {
     purl: &'static str,
     before: &'static [u8],
     after: &'static [u8],
+    // Read only by the macOS-only test below.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     before_hash: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     after_hash: String,
 }
 
