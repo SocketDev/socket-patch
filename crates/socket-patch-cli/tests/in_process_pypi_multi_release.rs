@@ -292,6 +292,7 @@ async fn mount_view(
 fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
     ScanArgs {
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.to_path_buf(),
             org: Some(ORG.to_string()),

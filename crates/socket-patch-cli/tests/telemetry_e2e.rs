@@ -983,7 +983,7 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
     const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
     let cases: [(&str, &[&str]); 2] = [
-        ("plain envelope", &[]),
+        ("agent preview", &["--mode", "agent", "--dry-run"]),
         ("vendored", &["--mode", "vendored", "--dry-run"]),
     ];
     for (label, extra_args) in cases {

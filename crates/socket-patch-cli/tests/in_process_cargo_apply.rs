@@ -221,6 +221,7 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
 
     let args = ScanArgs {
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().join("proj"),
             org: Some(ORG.to_string()),
@@ -337,6 +338,7 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
 
     let args = ScanArgs {
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().join("proj"),
             org: Some(ORG.to_string()),
@@ -439,6 +441,7 @@ async fn cargo_crawler_finds_real_fetched_crate() {
     std::env::set_var("CARGO_HOME", &cargo_home);
     let args = ScanArgs {
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().join("proj"),
             org: Some(ORG.to_string()),

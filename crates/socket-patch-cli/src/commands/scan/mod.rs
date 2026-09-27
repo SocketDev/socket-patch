@@ -239,6 +239,14 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         args.mode = Some(ScanMode::Vendored);
     } else if args.apply || args.sync {
         args.mode = Some(ScanMode::Agent);
+    } else if args.paths.is_empty()
+        && !args.prune
+        && !args.common.global
+        && args.common.global_prefix.is_none()
+    {
+        // v5: hosted is the default. A path-scoped, `--prune` or global scan
+        // with no mode stays report-only (none of them can rewire lockfiles).
+        args.mode = Some(ScanMode::Hosted);
     }
     if !args.paths.is_empty()
         && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
@@ -377,6 +385,17 @@ pub struct ScanArgs {
     )]
     pub all_releases: bool,
 
+    /// Only scan these packages: a name (`lodash`, `@scope/pkg`,
+    /// `requests`), or a purl with or without its version
+    /// (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`). Repeat the flag or
+    /// separate with commas
+    #[arg(
+        long = "package",
+        env = "SOCKET_SCAN_PACKAGES",
+        value_delimiter = ','
+    )]
+    pub packages: Vec<String>,
+
     /// On a successful scan, also generate an OpenVEX 0.2.0 document.
     /// `--vex <path>` is the trigger; the `--vex-*` knobs mirror the
     /// standalone `vex` command. The document is built from the manifest
@@ -385,6 +404,44 @@ pub struct ScanArgs {
     /// VEX makes the command exit non-zero.
     #[command(flatten)]
     pub vex: VexEmbedArgs,
+}
+
+/// Whether a `--package` spec names the package at `purl`: a purl spec
+/// matches the same purl, or any version of it when it carries none; a
+/// bare spec matches the package's full name (`@scope/pkg`, `group/name`)
+/// or its last segment. Qualifiers are ignored and names compare
+/// case-insensitively (PyPI, NuGet and Composer names are case-insensitive;
+/// npm forbids uppercase).
+pub(crate) fn package_spec_matches(spec: &str, purl: &str) -> bool {
+    let decoded = normalize_purl(strip_purl_qualifiers(purl)).to_lowercase();
+    let spec = spec.trim().to_lowercase();
+    if spec.is_empty() {
+        return false;
+    }
+    let Some(rest) = decoded.strip_prefix("pkg:") else {
+        return false;
+    };
+    let Some((_eco, name_version)) = rest.split_once('/') else {
+        return false;
+    };
+    let name = match name_version.rfind('@').filter(|&i| i > 0) {
+        Some(at) => &name_version[..at],
+        None => name_version,
+    };
+    if let Some(spec_rest) = spec.strip_prefix("pkg:") {
+        let spec_purl = normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase();
+        let spec_rest = &spec_purl[4..];
+        let has_version = spec_rest
+            .split_once('/')
+            .is_some_and(|(_, nv)| nv.rfind('@').is_some_and(|i| i > 0));
+        return if has_version {
+            decoded == spec_purl
+        } else {
+            decoded.strip_prefix(&spec_purl).is_some_and(|tail| tail.starts_with('@'))
+        };
+    }
+    let spec = spec.replace(':', "/");
+    name == spec || name.rsplit('/').next() == Some(spec.as_str())
 }
 
 /// Embedded-VEX side-effect for `scan`'s JSON terminal returns. When
@@ -593,17 +650,13 @@ async fn discover_selected(
     .map_err(|code| (code, "patch selection failed".to_string()))
 }
 
-/// `common` with `json` off, for `select_patches`: scan has no "re-run
-/// with the chosen UUID" path, so it must never get `selection_required`.
-/// A `--json` run also counts as `--yes`: it must never stop at the
-/// interactive patch menu (on a TTY that menu would block a machine
-/// consumer), so it takes the menu's default, the top-ranked patch.
-/// (It still keeps the non-interactive note off stderr: the process-wide
-/// quiet switch mutes it.)
+/// `common` for `select_patches`: scan never prompts, so it always takes
+/// the top-ranked patch, and with `json` off it never gets
+/// `selection_required` (scan has no "re-run with the chosen UUID" path).
 fn selection_args(common: &GlobalArgs) -> GlobalArgs {
     GlobalArgs {
         json: false,
-        yes: common.yes || common.json,
+        yes: true,
         ..common.clone()
     }
 }
@@ -1834,6 +1887,19 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         all_crawled
     };
 
+    let filtered_crawled: Vec<_> = if args.packages.is_empty() {
+        filtered_crawled
+    } else {
+        filtered_crawled
+            .into_iter()
+            .filter(|pkg| {
+                args.packages
+                    .iter()
+                    .any(|spec| package_spec_matches(spec, &pkg.purl))
+            })
+            .collect()
+    };
+
     // PATH scoping — applied strictly AFTER the `scanned_purls` capture
     // above (the prune universe stays full-crawl: `scan PATHS --prune`
     // must never treat out-of-scope packages as uninstalled) and after the
@@ -2840,33 +2906,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 return code;
             }
         };
-        // The engine honors `--dry-run` itself (a preview mutates nothing),
-        // so only a wet run with work confirms. `--mode hosted` is explicit
-        // intent, so a non-TTY run auto-proceeds like every other mode —
-        // only the mode-less scan below is report-only.
-        let prompts = !selected.is_empty() && !args.common.dry_run;
-        // Whether that prompt waits on a person: the tree may change while it
-        // does, so the embedded VEX then walks node_modules afresh instead of
-        // reusing the pre-prompt crawl (as the vendor path below does).
-        let prompt_waits = prompts && ui::confirm_waits(&args.common);
-        if prompts {
-            let prompt = render::hosted_confirm_prompt(selected.len());
-            // The prompt (or the non-TTY note) opens its own paragraph
-            // under the table's Summary, on the prompt's stream.
-            if !silent && !args.common.yes {
-                eprintln!();
-            }
-            if !ui::confirm(&prompt, true, &args.common) {
-                if !silent {
-                    println!();
-                    for line in render::hosted_decline_hint() {
-                        println!("{line}");
-                    }
-                }
-                warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
-                return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
-            }
-        }
         let pairs: Vec<(String, String)> = selected
             .iter()
             .map(|s| (s.purl.clone(), s.uuid.clone()))
@@ -2878,7 +2917,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &api_client,
             &pairs,
             None,
-            npm_crawl.as_ref().filter(|_| !prompt_waits),
+            npm_crawl.as_ref(),
         )
         .await;
     }
@@ -2894,14 +2933,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return 1;
     }
 
-    // Prompt to download. A MODE-LESS human scan (no `--mode`/`--apply`/
-    // `--sync`/`--vendor`/`--redirect` and no `--prune`) with a non-TTY
-    // stdin and no `--yes` is report-only: it stops before the prompt with
-    // exit 0 and a hint, never downloads, never creates `.socket/`. This is
-    // a scan-side pre-check — `confirm()` itself keeps its non-TTY
-    // auto-accept, so every explicit-intent flag (and every other command's
-    // prompt) still proceeds unattended, and a TTY always prompts.
-    let report_only = args.mode.is_none() && !args.prune && !args.common.yes && !ui::stdin_is_tty();
+    // Scan never prompts. A scan left without a mode (path-scoped,
+    // `--prune` or global; see `resolve_mode_flags`) only reports, plus the
+    // `--prune` GC.
+    let report_only = args.mode.is_none();
 
     // Smart selection. A report-only run picks without the non-interactive
     // note: it never downloads, so there is no pick to announce.
@@ -3071,19 +3106,28 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return finish_human(0).await;
     }
 
-    // Report-only (see `report_only` above): stop before the prompt.
     if report_only {
         // The "Patches to apply:" listing already ends with a blank line.
         if !silent {
-            for line in render::decline_hint(false) {
+            for line in render::report_only_hint() {
                 println!("{line}");
             }
+        }
+        if prune {
+            gc::run_human_gc(
+                &args.common,
+                &manifest_path,
+                &socket_dir,
+                &scanned_purls,
+                &vendored_purls,
+            )
+            .await;
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
-    // Vendor mode: pre-verify baselines so a content mismatch surfaces
-    // BEFORE the confirm prompt (vendoring still proceeds for these — the
+    // Vendor mode: pre-verify baselines so a content mismatch is reported
+    // before vendoring starts (vendoring still proceeds for these — the
     // stage force-applies the verified patched content). Runs after the
     // dry-run return above so a preview fetches no views; the views it
     // does fetch seed the download phase, which never fetches them again.
@@ -3105,7 +3149,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             );
             any_mismatch = true;
         }
-        // Keep the prompt its own paragraph, as in the other flows.
         if any_mismatch {
             println!();
         }
@@ -3113,23 +3156,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     } else {
         HashMap::new()
     };
-
-    // Whether the prompt below waits on a person: the tree may change while
-    // it does, so the vendor step then crawls afresh instead of reusing the
-    // pre-prompt crawl (`--yes` / `--json` / non-terminal answer at once).
-    let prompt_waits = ui::confirm_waits(&args.common);
-    if !ui::confirm(&render::confirm_prompt(plan), true, &args.common) {
-        if !silent {
-            println!();
-            for line in render::decline_hint(vendor) {
-                println!("{line}");
-            }
-            if prune {
-                eprintln!("{}", render::PRUNE_SKIPPED_DECLINED);
-            }
-        }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
-    }
 
     // Download, then apply in place — or vendor (vendored mode, where the
     // download only saves and the vendor step below does the rest).
@@ -3154,7 +3180,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             prune,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-            npm_crawl.as_ref().filter(|_| !prompt_waits),
+            npm_crawl.as_ref(),
         )
         .await
     } else {
@@ -3203,6 +3229,28 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_specs_match_names_and_purls() {
+        let lodash = "pkg:npm/lodash@4.17.20";
+        let scoped = "pkg:npm/%40babel/core@7.0.0";
+        let maven = "pkg:maven/org.apache/commons-text@1.9";
+        assert!(package_spec_matches("lodash", lodash));
+        assert!(package_spec_matches("LoDash", lodash));
+        assert!(package_spec_matches("pkg:npm/lodash", lodash));
+        assert!(package_spec_matches("pkg:npm/lodash@4.17.20", lodash));
+        assert!(!package_spec_matches("pkg:npm/lodash@4.17.21", lodash));
+        assert!(!package_spec_matches("pkg:pypi/lodash", lodash));
+        assert!(!package_spec_matches("lodash-es", lodash));
+        assert!(!package_spec_matches("pkg:npm/lodash-es", lodash));
+        assert!(package_spec_matches("@babel/core", scoped));
+        assert!(package_spec_matches("core", scoped));
+        assert!(package_spec_matches("pkg:npm/@babel/core", scoped));
+        assert!(package_spec_matches("pkg:npm/%40babel/core", scoped));
+        assert!(package_spec_matches("org.apache:commons-text", maven));
+        assert!(package_spec_matches("commons-text", maven));
+        assert!(!package_spec_matches("", lodash));
+    }
 
     /// The load-then-derive form of [`overlap_from_states`]: the unit
     /// tests' entry point (production classifies over ledgers it already
@@ -3482,19 +3530,17 @@ mod tests {
     }
 
     #[test]
-    fn selection_args_never_leaves_json_at_the_patch_menu() {
-        let json = selection_args(&GlobalArgs {
-            json: true,
-            ..GlobalArgs::default()
-        });
-        assert!(!json.json && json.yes, "--json selects like --yes");
-        let human = selection_args(&GlobalArgs::default());
-        assert!(!human.json && !human.yes, "a human run keeps its menu");
-        let yes = selection_args(&GlobalArgs {
-            yes: true,
-            ..GlobalArgs::default()
-        });
-        assert!(yes.yes);
+    fn selection_args_never_prompts() {
+        for common in [
+            GlobalArgs::default(),
+            GlobalArgs {
+                json: true,
+                ..GlobalArgs::default()
+            },
+        ] {
+            let picked = selection_args(&common);
+            assert!(!picked.json && picked.yes, "scan always takes the top patch");
+        }
     }
 
     #[test]

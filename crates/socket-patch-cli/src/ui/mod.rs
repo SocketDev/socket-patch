@@ -21,7 +21,7 @@ use std::io::IsTerminal;
 
 use crate::args::GlobalArgs;
 
-pub(crate) use prompt::{confirm, confirm_or_proceed, confirm_waits};
+pub(crate) use prompt::{confirm, confirm_or_proceed};
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{plural, truncate};
@@ -46,11 +46,6 @@ pub(crate) fn print_json(v: &serde_json::Value) {
         "{}",
         serde_json::to_string_pretty(v).expect("serializing an in-memory JSON value cannot fail")
     );
-}
-
-/// Whether stdin is a terminal a person can answer prompts on.
-pub(crate) fn stdin_is_tty() -> bool {
-    std::io::stdin().is_terminal()
 }
 
 /// Whether `--silent`/`--json` is in effect for this process (see [`init`]).

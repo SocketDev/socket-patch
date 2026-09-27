@@ -20,6 +20,7 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 fn default_args(cwd: &Path) -> ScanArgs {
     ScanArgs {
         paths: Vec::new(),
+        packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
@@ -877,6 +878,7 @@ async fn scan_non_json_with_patches_prints_table() {
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
     args.common.json = false;
+    args.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
 
     let code = run_scrubbed(args).await;
     // Non-JSON path: discovery → batch query → render table → fetch

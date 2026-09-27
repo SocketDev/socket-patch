@@ -3131,6 +3131,7 @@ snapshots:
     fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
         ScanArgs {
             paths: Vec::new(),
+            packages: Vec::new(),
             common: GlobalArgs {
                 cwd: cwd.to_path_buf(),
                 org: Some(ORG.to_string()),

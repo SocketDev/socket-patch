@@ -225,6 +225,8 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
     let (code, stdout, stderr) = run_scan(
         tmp.path(),
         &[
+            "--mode",
+            "agent",
             "--silent",
             "--yes",
             "--api-url",
@@ -274,6 +276,8 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
     let (loud_code, loud_stdout, loud_stderr) = run_scan(
         tmp2.path(),
         &[
+            "--mode",
+            "agent",
             "--yes",
             "--api-url",
             &mock.uri(),

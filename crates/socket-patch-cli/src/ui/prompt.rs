@@ -42,11 +42,7 @@ pub(crate) fn confirm(prompt: &str, default_yes: bool, common: &GlobalArgs) -> b
     )
 }
 
-/// Whether [`confirm`] would stop and wait for a person to answer — a
-/// caller's clue that the world may change while it does (`scan` reuses a
-/// crawl across the prompt only when it does not wait). Derived from
-/// `confirm` itself rather than hand-copied at the call site: the drift
-/// that matters is the unsafe direction, a wait nobody accounted for.
+/// Whether [`confirm`] would stop and wait for a person to answer.
 pub(crate) fn confirm_waits(common: &GlobalArgs) -> bool {
     !(common.yes || common.json) && io::stdin().is_terminal()
 }
@@ -543,8 +539,8 @@ mod tests {
         ));
     }
 
-    /// `confirm_waits` is what `scan` plans its crawl reuse around, so it
-    /// must never say "no wait" for a case `confirm` would stop on. Over
+    /// `confirm_waits` must never say "no wait" for a case `confirm` would
+    /// stop on. Over
     /// the whole `{yes, json}` cube with this process's stdin (a pipe
     /// under the test harness, so never a terminal), it says no wait —
     /// and `confirm` indeed answers from its default without reading a

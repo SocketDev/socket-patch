@@ -518,6 +518,15 @@ fn scan_json_empty_cwd_emits_updates_key() {
         // v4 duality rework: the positional PATH globs are echoed on every
         // scan envelope, always present (empty when no scoping was given).
         "paths": [],
+        // v5: a bare scan runs hosted mode, so its result nests here.
+        "redirect": {
+            "mode": "hosted",
+            "redirected": 0,
+            "rewrittenFiles": [],
+            "skipped": [],
+            "warnings": [],
+            "dryRun": false
+        },
     });
     assert_eq!(
         v,
@@ -611,9 +620,14 @@ fn mode_agent_is_the_source_of_truth() {
         "--sync == --mode agent --prune"
     );
     assert!(folded.sync, "the prune half of --sync stays readable");
-    // No mode selected at all: scan stays read-only.
+    // v5: no mode selected means hosted...
     let folded = parse_and_resolve(&[]).expect("fold ok");
-    assert_eq!(folded.mode, None, "modeless scan is read-only");
+    assert_eq!(folded.mode, Some(ScanMode::Hosted), "a bare scan is hosted");
+    // ...except where no lockfile can be rewired: those stay report-only.
+    for argv in [&["--prune"][..], &["packages/foo"], &["--global"]] {
+        let folded = parse_and_resolve(argv).expect("fold ok");
+        assert_eq!(folded.mode, None, "{argv:?} stays report-only");
+    }
 }
 
 #[test]
