@@ -48,7 +48,7 @@
 pub mod path;
 pub mod state;
 
-mod berry_zip;
+pub(crate) mod berry_zip;
 mod bun_binary;
 pub mod bun_lock;
 pub(crate) mod bun_lock_text;

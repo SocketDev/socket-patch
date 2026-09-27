@@ -60,6 +60,7 @@ mod rewrite_oracle_support;
 mod staged;
 mod state;
 mod takeover;
+pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
