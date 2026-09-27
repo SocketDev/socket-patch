@@ -1,0 +1,29 @@
+lockfileVersion: '9.0'
+
+overrides:
+  alpha@1.0.0: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz
+  beta@1.0.0: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz
+
+importers:
+  .:
+    dependencies:
+      alpha:
+        specifier: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz
+        version: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz
+      beta:
+        specifier: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz
+        version: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz
+
+packages:
+  alpha@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz:
+    resolution: {integrity: sha512-kmYLZ8QKvcFKA3NQaxXFnIwOjKLrsfUVj5XeSUIOlaYzy5VKZ+ZbIaRpwvt7crrAd5x6llAVcTVLvWt+QAdZnA==, tarball: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz}
+    version: 1.0.0
+
+  beta@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz:
+    resolution: {integrity: sha512-qdpYNuREio4Ne2pCoWYKEfqDrKR7gNVvJEi6UhkognzwSBA9PvcgPrVhGDFWlMeerfGwZzVfmHd8p6zabtkO2A==, tarball: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz}
+    version: 1.0.0
+
+snapshots:
+  alpha@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz: {}
+
+  beta@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz: {}

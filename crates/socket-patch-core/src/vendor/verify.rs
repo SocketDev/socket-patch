@@ -516,22 +516,31 @@ pub async fn check_vendored_artifact(
 /// can never wedge the health check in `open(2)`.
 pub async fn file_sha256_hex(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
-    use tokio::io::AsyncReadExt;
+    use std::io::Read as _;
 
-    let (mut file, meta) = crate::utils::fs::open_regular_file(path).await.ok()?;
-    if meta.len() > MAX_HEALTH_HASH_BYTES {
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).await.ok()?;
-        if n == 0 {
-            break;
+    // Open, read and hash in ONE blocking hop. The loop below is pure CPU
+    // between `read`s, and a wheel or a `.nupkg` is megabytes of it — run on
+    // the async thread it blocked the runtime for the whole digest.
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (mut file, meta) = crate::utils::fs::open_regular_file_sync(&path).ok()?;
+        if meta.len() > MAX_HEALTH_HASH_BYTES {
+            return None;
         }
-        hasher.update(&buf[..n]);
-    }
-    Some(hex::encode(hasher.finalize()))
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Some(hex::encode(hasher.finalize()))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 pub(crate) fn verify_member_map(

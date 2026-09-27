@@ -6,9 +6,14 @@
 use std::path::Path;
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
+use socket_patch_core::utils::concurrent::{
+    api_concurrency, api_concurrency_for, ordered_concurrent,
+};
 use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
@@ -83,6 +88,25 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // redirect rewriter edits its integrity entries today — recording the
     // decision here so the omission reads as deliberate, not forgotten.
 ];
+
+/// Most hosted wheel-metadata downloads in flight at once, below the patch
+/// API's own in-flight cap: each one buffers a whole wheel (up to
+/// `MAX_VENDOR_PACKAGE_BYTES`) where the serial loop held one, so the
+/// window is bounded by what it costs as well as by what it saves.
+const WHEEL_METADATA_CONCURRENCY: usize = 4;
+
+/// The in-flight cap for the hosted wheel-metadata window.
+///
+/// These GETs go to the patch server, so they are paced by the same knob as
+/// every other patch-API window ([`api_concurrency`], and with it
+/// `SOCKET_API_CONCURRENCY`) — an operator who caps in-flight requests per
+/// client must be able to cap this one too, or a `uv.lock` project's wheels
+/// land in `skipped` as `python_metadata_unavailable`. `api_concurrency`
+/// already returns 1 under a tight descriptor limit, which is what the
+/// serial loop's one-socket-at-a-time profile needs.
+fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
+    api_concurrency(use_public_proxy).min(WHEEL_METADATA_CONCURRENCY)
+}
 
 /// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
 /// For user-facing messages that name where a lockfile now points — the
@@ -224,11 +248,27 @@ fn pnpm_lock_carries_hosted_redirect(
     lock_text: &str,
     overrides: &[socket_patch_core::patch::redirect::DepOverride],
 ) -> bool {
-    overrides.iter().filter(|o| o.ecosystem == "npm").any(|o| {
-        let encoded = socket_patch_core::utils::uri::encode_uri_component(&o.artifact_url);
-        socket_patch_core::patch::redirect::artifact_url_present(lock_text, &o.artifact_url)
-            || lock_text.contains(encoded.as_str())
-    })
+    let groups: Vec<Vec<String>> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "npm")
+        .map(|o| npm_lock_url_needles(&o.artifact_url))
+        .collect();
+    socket_patch_core::patch::redirect::presence::groups_present(&[lock_text], &groups)
+        .into_iter()
+        .any(|present| present)
+}
+
+/// The spellings of an npm artifact URL a pnpm lock may carry — raw or
+/// `\/`-escaped ([`artifact_url_spellings`](socket_patch_core::patch::redirect::artifact_url_spellings),
+/// the `artifact_url_present` pair) plus the percent-encoded form — searched
+/// in one multi-needle pass ([`groups_present`](socket_patch_core::patch::redirect::presence::groups_present)).
+fn npm_lock_url_needles(artifact_url: &str) -> Vec<String> {
+    let mut needles: Vec<String> =
+        socket_patch_core::patch::redirect::artifact_url_spellings(artifact_url).into();
+    needles.push(socket_patch_core::utils::uri::encode_uri_component(
+        artifact_url,
+    ));
+    needles
 }
 
 /// The HEAL-ON-RERUN gate: when this run spliced no root pnpm-lock.yaml
@@ -749,22 +789,18 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
 /// already-patched install must not produce a delete prescription.
 /// (`current_hash` is `Some` only when the bytes were really hashed, which
 /// also excludes the absent-new-file `Ready`.)
+///
+/// The probes take this from the same one-pass
+/// [`socket_patch_core::vex::verify::judge_installed_record`] that decides
+/// PATCHED (`stale_evidence`); this view of it is what the unit tests pin.
+#[cfg(test)]
 async fn installed_stale_positive_evidence(
     package_dir: &Path,
     record: &socket_patch_core::manifest::schema::PatchRecord,
 ) -> bool {
-    use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
-    for (file_name, info) in &record.files {
-        let result = verify_file_patch(package_dir, file_name, info).await;
-        if matches!(
-            result.status,
-            VerifyStatus::Ready | VerifyStatus::HashMismatch
-        ) && result.current_hash.is_some()
-        {
-            return true;
-        }
-    }
-    false
+    socket_patch_core::vex::verify::judge_installed_record(package_dir, record)
+        .await
+        .stale_evidence
 }
 
 /// Post-rewrite stale-materialization probe for gem redirects — the guard
@@ -785,12 +821,14 @@ async fn installed_stale_positive_evidence(
 ///   itself). Record availability is part of the candidate filter, and the
 ///   probe returns before any crawler work (or `gem env` subprocess spawn)
 ///   when no judgment is possible.
-/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle.
+/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle
+///   (decided, with STALE, by one pass of
+///   [`socket_patch_core::vex::verify::judge_installed_record`]).
 ///   Judgments are grouped BY INSTALLED DIR: platform-variant purls of one
 ///   gem resolve to the same dir, and if ANY variant's record proves the
 ///   dir patched, the dir is patched — never warned.
-/// * STALE requires [`installed_stale_positive_evidence`] — never inferred from
-///   missing/unreadable files.
+/// * STALE requires positive evidence (the `installed_stale_positive_evidence`
+///   rule) — never inferred from missing/unreadable files.
 /// * A committed `vendor/cache/<leaf>.gem` whose sha256 differs from the
 ///   patched artifact's is stale too (bundler installs from it first, fresh
 ///   checkouts included): folded into a project-local install warning's
@@ -815,7 +853,7 @@ async fn gem_stale_install_warnings(
     use socket_patch_core::crawlers::RubyCrawler;
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::vendor::file_sha256_hex;
-    use socket_patch_core::vex::verify::verify_patch_record;
+    use socket_patch_core::vex::verify::judge_installed_record;
 
     let mut out = StaleInstallOutcome::default();
     let find_record =
@@ -849,16 +887,22 @@ async fn gem_stale_install_warnings(
         global_prefix,
     };
     let gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
+    // Every candidate's installed dir in every gem home, one blocking pass
+    // (and at most one listing) per home — the per-candidate lookups the
+    // loop below consumes, in the same (candidate, home) order.
+    let stripped: Vec<String> = candidates
+        .iter()
+        .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
+        .collect();
+    let mut found_per_home = Vec::with_capacity(gem_paths.len());
+    for gems_dir in &gem_paths {
+        found_per_home.push(crawler.find_each_by_purl(gems_dir, &stripped).await);
+    }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
-    for (purl, record) in &candidates {
-        let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string();
-        for gems_dir in &gem_paths {
-            let found = crawler
-                .find_by_purls(gems_dir, std::slice::from_ref(&stripped))
-                .await
-                .unwrap_or_default();
-            let Some(pkg) = found.get(&stripped) else {
+    for (index, (purl, record)) in candidates.iter().enumerate() {
+        for found in &found_per_home {
+            let Some(pkg) = &found[index] else {
                 continue;
             };
             // A dir whose leaf isn't clean UTF-8 cannot be a real crawler
@@ -875,10 +919,10 @@ async fn gem_stale_install_warnings(
                     patched: false,
                     positive: false,
                 });
-            if verify_patch_record(&pkg.path, record).await.is_ok() {
+            let judged = judge_installed_record(&pkg.path, record).await;
+            if judged.patched {
                 entry.patched = true;
-            } else if !entry.positive && installed_stale_positive_evidence(&pkg.path, record).await
-            {
+            } else if !entry.positive && judged.stale_evidence {
                 entry.positive = true;
                 entry.purl = (*purl).to_string();
             }
@@ -966,6 +1010,31 @@ async fn gem_stale_install_warnings(
     out
 }
 
+/// Whether the hosted flow's Pipenv probe is CERTAIN to run: the candidates
+/// that no wheel-metadata failure can drop (none shares a fetched wheel's
+/// artifact URL) already target an entry of Pipfile.lock, so
+/// `pipenv_lock_targets` over the post-fetch overrides — a superset of
+/// them — is true whatever the fetch returns.
+fn pipenv_probe_certain<'a>(
+    files: &std::collections::BTreeMap<String, String>,
+    candidates: impl Iterator<Item = &'a DepOverride>,
+    fetched_wheel_urls: impl Iterator<Item = &'a str>,
+) -> bool {
+    // `pipenv_lock_targets` answers false on its first line when there is
+    // no Pipfile.lock, and EVERY hosted redirect run reaches this — an
+    // npm-only one with hundreds of candidates included. Ask that question
+    // before building the list to ask it with.
+    if !files.contains_key("Pipfile.lock") {
+        return false;
+    }
+    let droppable: std::collections::BTreeSet<&str> = fetched_wheel_urls.collect();
+    let kept: Vec<DepOverride> = candidates
+        .filter(|dep| !droppable.contains(dep.artifact_url.as_str()))
+        .cloned()
+        .collect();
+    socket_patch_core::patch::redirect::pipenv_lock_targets(files, &kept)
+}
+
 /// The `(name, version)` key the gem artifact-sha map uses — derived from
 /// the purl so overrides (which carry no purl) and confirmed purls meet on
 /// neutral ground.
@@ -989,6 +1058,13 @@ pub(super) async fn run_redirect(
     // it so the hosted `--json` envelope stays schema-consistent with every
     // other scan; `.take()` at each terminal (error or success) folds it in.
     mut scan_result: Option<serde_json::Value>,
+    // Scan's pending telemetry, flushed by `discover_selected` before
+    // anything below writes to stdout.
+    telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
+    // Scan's npm crawl (`Some` only when an embedded `--vex` will run),
+    // handed to the VEX step so it does not walk the tree for the npm
+    // roots again.
+    npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
     let selected = match discover_selected(
@@ -998,6 +1074,8 @@ pub(super) async fn run_redirect(
         &args.common,
         false,
         false,
+        telemetry,
+        scan_result.as_mut(),
     )
     .await
     {
@@ -1033,8 +1111,73 @@ pub(super) async fn run_redirect(
         api_client,
         &pairs,
         scan_result,
+        npm_prior,
     )
     .await
+}
+
+/// How the confirmation probe in [`run_redirect_selected`] settles one
+/// candidate: a non-substring rule (a transactional rewriter's own report, a
+/// refusal) decides it outright, otherwise it is confirmed iff any of its
+/// needles occurs in a final text.
+enum ProbeStep {
+    Decided(bool),
+    Needles(Vec<String>),
+}
+
+/// The substrings whose presence in a final text confirms `dep`'s redirect —
+/// the override's own targets: artifact URL; per-dependency registry index
+/// URL; fail-closed maven's globally-unique `-socket.<hex8>` suffixed version
+/// (never the `.pom` URL).
+///
+/// - The artifact URL in the rewriters' own spellings
+///   ([`artifact_url_spellings`](socket_patch_core::patch::redirect::artifact_url_spellings),
+///   raw or the `\/`-escaped slashes an old composer.lock spells them with),
+///   so a writer's spelling can never be one this probe misses. It was: the
+///   composer rewriter emitted `\/`-escaped urls this probe never looked for,
+///   so a fully successful composer redirect reported `redirected: 0`, fetched
+///   no patch record into the ledger, and left the patch unattestable by
+///   `vex`.
+/// - The percent-encoded URL: the berry rewriter writes it into the lock's
+///   `::__archiveUrl=` binding, so the raw form is absent.
+/// - The registry index URL and the maven suffixed version, when present.
+fn candidate_presence_needles(
+    dep: &socket_patch_core::patch::redirect::DepOverride,
+) -> Vec<String> {
+    let artifact_url = dep.artifact_url.as_str();
+    let registry = dep.registry_override.as_ref();
+    let mut needles: Vec<String> =
+        socket_patch_core::patch::redirect::artifact_url_spellings(artifact_url).into();
+    needles.push(socket_patch_core::utils::uri::encode_uri_component(
+        artifact_url,
+    ));
+    if let Some(o) = registry {
+        needles.push(o.index_url.clone());
+        if let Some(sv) = o.identifiers.maven_suffixed_version.as_deref() {
+            needles.push(sv.to_string());
+        }
+    }
+    needles
+}
+
+/// The per-candidate probe [`candidate_presence_needles`] +
+/// `groups_present` replaced, kept as the equivalence oracle.
+#[cfg(test)]
+fn candidate_present_oracle(
+    final_texts: &[&String],
+    dep: &socket_patch_core::patch::redirect::DepOverride,
+) -> bool {
+    let artifact_url = dep.artifact_url.as_str();
+    let registry = dep.registry_override.as_ref();
+    let index_url = registry.map(|o| o.index_url.as_str());
+    let suffixed_version = registry.and_then(|o| o.identifiers.maven_suffixed_version.as_deref());
+    let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
+    final_texts.iter().any(|text| {
+        socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
+            || text.contains(encoded.as_str())
+            || index_url.is_some_and(|iu| text.contains(iu))
+            || suffixed_version.is_some_and(|sv| text.contains(sv))
+    })
 }
 
 /// The hosted-redirect engine over an ALREADY-SELECTED `(purl, uuid)` set:
@@ -1066,6 +1209,7 @@ pub(crate) async fn run_redirect_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[(String, String)],
     mut scan_result: Option<serde_json::Value>,
+    npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
@@ -1773,66 +1917,147 @@ pub(crate) async fn run_redirect_selected(
     // it rides the same atomic-write / ledger-first machinery as the locks.
     let mut python_metadata = std::collections::BTreeMap::new();
     let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
-    for dep in candidates
-        .iter()
-        .map(|c| &c.dep)
-        .filter(|dep| dep.ecosystem == "pypi")
+    // `pipenv --version` (see `pipenv_major` below), started before the
+    // wheel metadata fetch when that probe is certain to be needed.
+    let mut pipenv_probe: Option<tokio::task::JoinHandle<Option<u32>>> = None;
     {
-        let Some(sha256) = dep.integrity.sha256.as_deref() else {
-            continue;
-        };
-        if !dep
-            .artifact_url
-            .split(['?', '#'])
-            .next()
-            .is_some_and(|path| path.ends_with(".whl"))
-        {
-            continue;
-        }
-        let native_target = files
+        use socket_patch_core::utils::python_lock::{ArtifactSource, PythonLockProbe};
+        // Each native Python lock is parsed once, on the first dep that
+        // needs the probe, rather than rewritten per dep just to learn
+        // whether it would be.
+        let mut probes: Option<Vec<PythonLockProbe>> = None;
+        let mut wheel_deps: Vec<(&DepOverride, &str)> = Vec::new();
+        for dep in candidates
             .iter()
-            .filter(|(path, _)| {
-                *path == "uv.lock"
-                    || socket_patch_core::utils::python_lock::is_script_lock_name(path)
-            })
-            .any(|(_, text)| {
-                socket_patch_core::utils::python_lock::rewrite_python_lock(
-                    text,
-                    &dep.name,
-                    &dep.version,
-                    socket_patch_core::utils::python_lock::ArtifactSource::Url(&dep.artifact_url),
-                    sha256,
-                )
-                .ok()
-                .flatten()
-                .is_some()
-            });
-        if !native_target {
-            continue;
-        }
-        status.set(format!(
-            "Fetching hosted wheel metadata for {}...",
-            dep.name
-        ));
-        match socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
-            api_client,
-            &dep.artifact_url,
-            sha256,
-        )
-        .await
+            .map(|c| &c.dep)
+            .filter(|dep| dep.ecosystem == "pypi")
         {
-            Ok(Some(metadata)) => {
-                python_metadata.insert(dep.artifact_url.clone(), metadata);
+            let Some(sha256) = dep.integrity.sha256.as_deref() else {
+                continue;
+            };
+            if !dep
+                .artifact_url
+                .split(['?', '#'])
+                .next()
+                .is_some_and(|path| path.ends_with(".whl"))
+            {
+                continue;
             }
-            Ok(None) => {}
-            Err(detail) => {
-                unavailable_python_artifacts.insert(dep.artifact_url.clone());
-                skipped.push(serde_json::json!({
-                    "purl": format!("pkg:pypi/{}@{}", dep.name, dep.version),
-                    "uuid": dep.patch_uuid,
-                    "reason": "python_metadata_unavailable",
-                    "detail": detail.replace(&dep.artifact_url, "<hosted artifact>"),
-                }));
+            let native_target = probes
+                .get_or_insert_with(|| {
+                    files
+                        .iter()
+                        .filter(|(path, _)| {
+                            *path == "uv.lock"
+                                || socket_patch_core::utils::python_lock::is_script_lock_name(path)
+                        })
+                        .map(|(_, text)| PythonLockProbe::new(text))
+                        .collect()
+                })
+                .iter()
+                .any(|probe| {
+                    probe.rewrites(
+                        &dep.name,
+                        &dep.version,
+                        ArtifactSource::Url(&dep.artifact_url),
+                    )
+                });
+            if native_target {
+                wheel_deps.push((dep, sha256));
+            }
+        }
+        // The only candidates the metadata fetch can still drop are those
+        // sharing a fetched wheel's artifact URL. If the rest already
+        // target an entry of Pipfile.lock, the Pipenv probe below is certain
+        // to run: start it now so it overlaps the fetch. Otherwise it runs
+        // (or not) exactly where it always did.
+        if pipenv_probe_certain(
+            &files,
+            candidates.iter().map(|c| &c.dep),
+            wheel_deps.iter().map(|(dep, _)| dep.artifact_url.as_str()),
+        ) {
+            let root = common.cwd.clone();
+            pipenv_probe = Some(tokio::spawn(async move {
+                socket_patch_core::utils::pipenv::installed_major(&root).await
+            }));
+        }
+        // The wheels' FIRST attempts run concurrently and are folded in dep
+        // order, so `python_metadata`, `unavailable_python_artifacts` and
+        // `skipped` come out exactly as the serial loop's did; each attempt's
+        // opt-in debug lines are held back and printed at its fold, so they
+        // keep the serial order too.
+        //
+        // An attempt the client would RETRY (a 429 / 5xx / transport
+        // failure) is never settled concurrently. At the first one no
+        // further attempt is started, the ones already in flight are awaited
+        // (so the host is idle again, as the serial loop would find it), and
+        // that dep plus every later one are finished one at a time. A
+        // deferred attempt is RESUMED, not restarted: `Retry-After` is
+        // waited out and only the budget it left is spent, so each wheel
+        // costs the host exactly the requests the serial loop's would have.
+        // What stays different is only their overlap: a host that answers a
+        // burst differently than it answers the same requests one at a time
+        // (a sliding-window limiter, a bot challenge) can still hand back a
+        // status the serial loop would not have seen. The first such answer
+        // is what closes the window.
+        //
+        // Kept small on purpose, and paced by `SOCKET_API_CONCURRENCY` like
+        // every other patch-API window — see `wheel_metadata_concurrency`.
+        let wheel_metadata_concurrency = wheel_metadata_concurrency(api_client.uses_public_proxy());
+        use futures_util::StreamExt as _;
+        use socket_patch_core::vendor::pypi::{
+            finish_hosted_wheel_metadata, try_fetch_hosted_wheel_metadata_once,
+        };
+        // Lazily built: a dep's attempt starts only once it is pulled here.
+        let mut unstarted = wheel_deps.iter().map(|&(dep, sha256)| {
+            try_fetch_hosted_wheel_metadata_once(api_client, &dep.artifact_url, sha256)
+        });
+        let mut in_flight: futures_util::stream::FuturesOrdered<_> = unstarted
+            .by_ref()
+            .take(wheel_metadata_concurrency)
+            .collect();
+        // Once serial: the attempts that were in flight when a dep needed a
+        // retry, in dep order (the deps after them were never started).
+        let mut drained: Option<std::collections::VecDeque<_>> = None;
+        for &(dep, sha256) in &wheel_deps {
+            status.set(format!(
+                "Fetching hosted wheel metadata for {}...",
+                dep.name
+            ));
+            let attempt = match drained.as_mut() {
+                Some(drained) => drained.pop_front(),
+                None => match in_flight.next().await {
+                    Some(attempt) if !attempt.needs_retry() => {
+                        in_flight.extend(unstarted.next());
+                        Some(attempt)
+                    }
+                    // A retryable failure (or nothing left in flight): let
+                    // the host go idle, then finish one at a time from here.
+                    struggling => {
+                        let mut rest = std::collections::VecDeque::new();
+                        while let Some(later) = in_flight.next().await {
+                            rest.push_back(later);
+                        }
+                        drained = Some(rest);
+                        struggling
+                    }
+                },
+            };
+            match finish_hosted_wheel_metadata(api_client, &dep.artifact_url, sha256, attempt).await
+            {
+                Ok(Some(metadata)) => {
+                    python_metadata.insert(dep.artifact_url.clone(), metadata);
+                }
+                Ok(None) => {}
+                Err(detail) => {
+                    unavailable_python_artifacts.insert(dep.artifact_url.clone());
+                    skipped.push(serde_json::json!({
+                        "purl": format!("pkg:pypi/{}@{}", dep.name, dep.version),
+                        "uuid": dep.patch_uuid,
+                        "reason": "python_metadata_unavailable",
+                        "detail": detail.replace(&dep.artifact_url, "<hosted artifact>"),
+                    }));
+                }
             }
         }
     }
@@ -1849,10 +2074,19 @@ pub(crate) async fn run_redirect_selected(
     // run must neither spawn Pipenv nor warn about its absence.
     let targets_pipenv_lock =
         socket_patch_core::patch::redirect::pipenv_lock_targets(&files, &overrides);
-    let pipenv_major = if targets_pipenv_lock {
-        socket_patch_core::utils::pipenv::installed_major(&common.cwd).await
-    } else {
-        None
+    let pipenv_major = match (targets_pipenv_lock, pipenv_probe) {
+        (true, Some(probe)) => match probe.await {
+            Ok(major) => major,
+            Err(err) => std::panic::resume_unwind(err.into_panic()),
+        },
+        (true, None) => socket_patch_core::utils::pipenv::installed_major(&common.cwd).await,
+        // Unreachable (the early start implies the target), but never leave
+        // a probe running: aborting drops it, which reaps the child.
+        (false, Some(probe)) => {
+            probe.abort();
+            None
+        }
+        (false, None) => None,
     };
     let binary_content = if binary_bun && overrides.iter().any(|o| o.ecosystem == "npm") {
         Some(
@@ -1876,12 +2110,23 @@ pub(crate) async fn run_redirect_selected(
         .filter(|o| !(binary_content.as_ref().is_some_and(Result::is_err) && o.ecosystem == "npm"))
         .cloned()
         .collect();
-    let mut rewrite = rewrite_registry_redirect_with_pipenv_version(
-        &files,
-        &rewrite_overrides,
-        &python_metadata,
-        pipenv_major,
-    );
+    // Pure CPU over every lock text (the independent rewriter groups run
+    // concurrently inside), so it runs on the blocking pool rather than on a
+    // runtime worker; `files` comes back for the confirmation probe below.
+    let (files, mut rewrite) = tokio::task::spawn_blocking(move || {
+        let rewrite = rewrite_registry_redirect_with_pipenv_version(
+            &files,
+            &rewrite_overrides,
+            &python_metadata,
+            pipenv_major,
+        );
+        (files, rewrite)
+    })
+    .await
+    .unwrap_or_else(|e| match e.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(e) => panic!("hosted rewrite task failed: {e}"),
+    });
     if let Some(content) = binary_content {
         rewrite
             .warnings
@@ -2040,20 +2285,20 @@ pub(crate) async fn run_redirect_selected(
             // `\/`-escaped via artifact_url_present, plus the percent-encoded
             // spelling) so a writer's spelling can never be one this filter
             // misses.
-            let mut hosts: Vec<&str> = overrides
+            let npm_overrides: Vec<_> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+            let groups: Vec<Vec<String>> = npm_overrides
                 .iter()
-                .filter(|o| o.ecosystem == "npm")
-                .filter(|o| {
-                    let encoded =
-                        socket_patch_core::utils::uri::encode_uri_component(&o.artifact_url);
-                    pnpm_lock_texts.iter().any(|text| {
-                        socket_patch_core::patch::redirect::artifact_url_present(
-                            text,
-                            &o.artifact_url,
-                        ) || text.contains(encoded.as_str())
-                    })
-                })
-                .filter_map(|o| url_host(&o.artifact_url))
+                .map(|o| npm_lock_url_needles(&o.artifact_url))
+                .collect();
+            let present = socket_patch_core::patch::redirect::presence::groups_present(
+                &pnpm_lock_texts,
+                &groups,
+            );
+            let mut hosts: Vec<&str> = npm_overrides
+                .iter()
+                .zip(present)
+                .filter(|(_, present)| *present)
+                .filter_map(|(o, _)| url_host(&o.artifact_url))
                 // Dry-run takeover purls land in the root lock on the wet run.
                 .chain(takeover_pnpm_urls.iter().filter_map(|url| url_host(url)))
                 .collect();
@@ -2204,24 +2449,26 @@ pub(crate) async fn run_redirect_selected(
         None;
     {
         let npm_hosts: Vec<&str> = {
-            let mut hosts: Vec<&str> = overrides
+            let npm_lock_texts: Vec<&String> = NPM_LOCKS
                 .iter()
-                .filter(|o| o.ecosystem == "npm")
-                .filter(|o| {
-                    NPM_LOCKS.iter().any(|lock| {
-                        rewrite
-                            .files
-                            .get(*lock)
-                            .or_else(|| files.get(*lock))
-                            .is_some_and(|text| {
-                                socket_patch_core::patch::redirect::artifact_url_present(
-                                    text,
-                                    &o.artifact_url,
-                                )
-                            })
-                    })
+                .filter_map(|lock| rewrite.files.get(*lock).or_else(|| files.get(*lock)))
+                .collect();
+            let npm_overrides: Vec<_> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+            let groups: Vec<[String; 2]> = npm_overrides
+                .iter()
+                .map(|o| {
+                    socket_patch_core::patch::redirect::artifact_url_spellings(&o.artifact_url)
                 })
-                .filter_map(|o| url_host(&o.artifact_url))
+                .collect();
+            let present = socket_patch_core::patch::redirect::presence::groups_present(
+                &npm_lock_texts,
+                &groups,
+            );
+            let mut hosts: Vec<&str> = npm_overrides
+                .iter()
+                .zip(present)
+                .filter(|(_, present)| *present)
+                .filter_map(|(o, _)| url_host(&o.artifact_url))
                 // A dry-run vendored→hosted takeover: the wet run reverts
                 // the vendored wiring in a root npm lock and splices the
                 // hosted URL there, so preview the `.npmrc` write too.
@@ -2345,16 +2592,22 @@ pub(crate) async fn run_redirect_selected(
                 .map(|(_, content)| content),
         )
         .collect();
-    let confirmed: Vec<(String, String)> = candidates
+    // Every non-substring rule decides a candidate outright; the rest are
+    // confirmed by substring presence of their needles in the final texts.
+    // All needle groups are answered in ONE multi-needle pass per text
+    // (`groups_present`), which is the per-candidate `any()` exactly —
+    // presence does not depend on search order, and `confirmed` keeps
+    // candidate order. See `confirm_candidates_oracle` for the old form.
+    let steps: Vec<ProbeStep> = candidates
         .iter()
-        .filter(|c| {
+        .map(|c| {
             let purl = c.purl.as_str();
             let uuid = c.dep.patch_uuid.as_str();
             if binary_bun && purl.starts_with("pkg:npm/") {
-                return rewrite.confirmed_bun_binary_uuids.contains(uuid);
+                return ProbeStep::Decided(rewrite.confirmed_bun_binary_uuids.contains(uuid));
             }
             if rewrite.refused_pipenv_uuids.contains(uuid) {
-                return false;
+                return ProbeStep::Decided(false);
             }
             // pdm is transactional like cargo: a refused uuid is never
             // confirmed, and when `pdm.lock` is the PyPI install driver
@@ -2367,28 +2620,32 @@ pub(crate) async fn run_redirect_selected(
             // backend, which registers every pypi uuid as hatch-owned while
             // the lock's presence keeps hatch from confirming any of them.
             if rewrite.refused_pdm_uuids.contains(uuid) {
-                return false;
+                return ProbeStep::Decided(false);
             }
             if purl.starts_with("pkg:pypi/")
                 && socket_patch_core::patch::redirect::pdm_drives(&files)
             {
-                return rewrite.confirmed_pdm_uuids.contains(uuid);
+                return ProbeStep::Decided(rewrite.confirmed_pdm_uuids.contains(uuid));
             }
             if rewrite.python_lock_uuids.contains(uuid) {
-                return rewrite.confirmed_python_lock_uuids.contains(uuid)
-                    && !rewrite.refused_python_lock_uuids.contains(uuid);
+                return ProbeStep::Decided(
+                    rewrite.confirmed_python_lock_uuids.contains(uuid)
+                        && !rewrite.refused_python_lock_uuids.contains(uuid),
+                );
             }
             if rewrite.hatch_uuids.contains(uuid) {
-                return rewrite.confirmed_hatch_uuids.contains(uuid);
+                return ProbeStep::Decided(rewrite.confirmed_hatch_uuids.contains(uuid));
             }
             // A Pipfile.lock rewrite confirms its own uuids (the sibling
             // requirements.txt rewriter may have had nothing to do).
             if purl.starts_with("pkg:pypi/") {
-                return rewrite.confirmed_pipenv_uuids.contains(uuid)
-                    || rewrite.confirmed_requirements_uuids.contains(uuid);
+                return ProbeStep::Decided(
+                    rewrite.confirmed_pipenv_uuids.contains(uuid)
+                        || rewrite.confirmed_requirements_uuids.contains(uuid),
+                );
             }
             if rewrite.refused_pnpm_uuids.contains(uuid) {
-                return false;
+                return ProbeStep::Decided(false);
             }
             // Cargo is transactional: the rewriter reports exactly which
             // patch uuids FULLY landed (manifest pin + lock + registry
@@ -2397,40 +2654,37 @@ pub(crate) async fn run_redirect_selected(
             // pinning nothing, so a config-block-only rewrite would be
             // attested with zero enforcement in any build.
             if purl.starts_with("pkg:cargo/") {
-                return rewrite.confirmed_cargo_uuids.contains(uuid);
+                return ProbeStep::Decided(rewrite.confirmed_cargo_uuids.contains(uuid));
             }
             // Golang likewise: the goproxy `indexUrl` is the bare
             // patch-server origin (present in any other hosted lock), and
             // the socket module's go.sum lines outlive a removed replace.
             if purl.starts_with("pkg:golang/") {
-                return rewrite.confirmed_golang_uuids.contains(uuid);
+                return ProbeStep::Decided(rewrite.confirmed_golang_uuids.contains(uuid));
             }
-            // The override's own targets: artifact URL; per-dependency
-            // registry index URL; fail-closed maven's globally-unique
-            // `-socket.<hex8>` suffixed version (never the `.pom` URL).
-            let artifact_url = c.dep.artifact_url.as_str();
-            let registry = c.dep.registry_override.as_ref();
-            let index_url = registry.map(|o| o.index_url.as_str());
-            let suffixed_version =
-                registry.and_then(|o| o.identifiers.maven_suffixed_version.as_deref());
-            let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
-            final_texts.iter().any(|text| {
-                // The rewriters' own predicate — raw, or the `\/`-escaped
-                // slashes an old composer.lock spells them with — so a
-                // writer's spelling can never be one this probe misses. It
-                // was: the composer rewriter emitted `\/`-escaped urls this
-                // probe never looked for, so a fully successful composer
-                // redirect reported `redirected: 0`, fetched no patch record
-                // into the ledger, and left the patch unattestable by `vex`.
-                socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
-                    // The berry rewriter writes the URL percent-encoded into the
-                    // lock's `::__archiveUrl=` binding, so the raw form is absent.
-                    || text.contains(encoded.as_str())
-                    || index_url.is_some_and(|iu| text.contains(iu))
-                    || suffixed_version.is_some_and(|sv| text.contains(sv))
-            })
+            ProbeStep::Needles(candidate_presence_needles(&c.dep))
         })
-        .map(|c| (c.purl.clone(), c.dep.patch_uuid.clone()))
+        .collect();
+    let groups: Vec<&[String]> = steps
+        .iter()
+        .filter_map(|step| match step {
+            ProbeStep::Needles(needles) => Some(needles.as_slice()),
+            ProbeStep::Decided(_) => None,
+        })
+        .collect();
+    let mut present =
+        socket_patch_core::patch::redirect::presence::groups_present(&final_texts, &groups)
+            .into_iter();
+    let confirmed: Vec<(String, String)> = candidates
+        .iter()
+        .zip(&steps)
+        .filter(|(_, step)| match step {
+            ProbeStep::Decided(keep) => *keep,
+            ProbeStep::Needles(_) => present
+                .next()
+                .expect("one presence answer per needle group"),
+        })
+        .map(|(c, _)| (c.purl.clone(), c.dep.patch_uuid.clone()))
         .collect();
     // Dry-run mode-takeover previews were withheld from the rewriters (their
     // lock fragments still carry the vendored wiring the wet run reverts
@@ -2476,12 +2730,34 @@ pub(crate) async fn run_redirect_selected(
 
     if !common.dry_run {
         let total = confirmed.len();
-        for (i, (purl, uuid)) in confirmed.iter().enumerate() {
+        // The views are fetched concurrently but consumed in `confirmed`
+        // order, so `records` (newest wins) and `record_warnings` fold
+        // exactly as the serial loop's did. Each response is reduced to
+        // its record inside the window: a view carries every file's
+        // `blobContent`, so buffering whole responses would hold the cap's
+        // worth of patch payloads in memory at once, where the loop only
+        // ever needed the hashes. `record_from_patch_response` is pure, so
+        // folding it early changes nothing downstream. Each fetch's
+        // `--debug` lines are held back and printed at its fold, where the
+        // serial loop would have made the request.
+        let mut views = std::pin::pin!(ordered_concurrent(
+            confirmed.iter(),
+            api_concurrency_for(api_client.uses_public_proxy(), confirmed.len()),
+            |(_, uuid)| {
+                hold_back_debug(async move {
+                    api_client.fetch_patch(uuid).await.map(|resp| {
+                        resp.map(|resp| crate::commands::get::record_from_patch_response(&resp))
+                    })
+                })
+            },
+        ));
+        for (i, (purl, _)) in confirmed.iter().enumerate() {
             status.set(format!("Fetching patch records... ({}/{total})", i + 1));
-            match api_client.fetch_patch(uuid).await {
-                Ok(Some(resp)) => {
-                    let (rec_purl, record) =
-                        crate::commands::get::record_from_patch_response(&resp);
+            let Some(view) = views.next().await else {
+                break;
+            };
+            match view.release() {
+                Ok(Some((rec_purl, record))) => {
                     records.insert(rec_purl, record);
                 }
                 Ok(None) | Err(_) => {
@@ -2763,6 +3039,13 @@ pub(crate) async fn run_redirect_selected(
     let mut vex_code = 0;
     if vex.vex.is_some() && !common.dry_run {
         let mut params = vex.to_build_params();
+        // Hosted mode wrote only lockfiles and config files since scan's
+        // crawl, never a directory the npm root walk descends into, so its
+        // roots and packages still describe the tree (the snapshot checks
+        // it was taken with these crawler options). The interactive scan
+        // hands none in when its confirm prompt waited on a person — the
+        // tree may have changed while it did.
+        params.npm_prior = npm_prior.cloned();
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
@@ -3306,6 +3589,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
     api_client: &'a socket_patch_core::api::client::ApiClient,
     selected: &'a [(String, String)],
     scan_result: Option<serde_json::Value>,
+    npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_redirect_selected(
         common,
@@ -3314,6 +3598,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         api_client,
         selected,
         scan_result,
+        npm_prior,
     ))
 }
 
@@ -3337,8 +3622,50 @@ mod tests {
         pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
+    use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;
+    use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+
+    /// The wheel window is a patch-API window, so the documented escape
+    /// hatch has to reach it: an operator behind something that caps
+    /// in-flight requests per client sets `SOCKET_API_CONCURRENCY=1` and
+    /// gets one artifact GET at a time here too — otherwise the capping
+    /// endpoint rejects the extras and those deps land in `skipped` as
+    /// `python_metadata_unavailable`. Serial: `SOCKET_*` is process-global.
+    #[test]
+    #[serial_test::serial]
+    fn socket_api_concurrency_paces_the_wheel_metadata_window() {
+        let orig = std::env::var(API_CONCURRENCY_ENV).ok();
+        std::env::remove_var(API_CONCURRENCY_ENV);
+        // The window's own ceiling still binds: the authenticated cap is 32,
+        // but a whole wheel per in-flight request is what sizes this one.
+        assert_eq!(
+            wheel_metadata_concurrency(false),
+            WHEEL_METADATA_CONCURRENCY
+        );
+        assert_eq!(wheel_metadata_concurrency(true), WHEEL_METADATA_CONCURRENCY);
+
+        std::env::set_var(API_CONCURRENCY_ENV, "1");
+        assert_eq!(wheel_metadata_concurrency(false), 1);
+        assert_eq!(wheel_metadata_concurrency(true), 1);
+
+        // A value between 1 and the ceiling lowers the window to it.
+        std::env::set_var(API_CONCURRENCY_ENV, "2");
+        assert_eq!(wheel_metadata_concurrency(false), 2);
+
+        // Raising the API cap never raises this one past its own ceiling.
+        std::env::set_var(API_CONCURRENCY_ENV, "32");
+        assert_eq!(
+            wheel_metadata_concurrency(false),
+            WHEEL_METADATA_CONCURRENCY
+        );
+
+        match orig {
+            Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+            None => std::env::remove_var(API_CONCURRENCY_ENV),
+        }
+    }
 
     /// Lock-head version sniff against the byte-real heads the 2026-08-18
     /// matrix captured from pnpm 7/8/9-12: quoted `'9.0'` and `'6.0'`,
@@ -3588,6 +3915,101 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
+    }
+
+    /// The early Pipenv probe start is exact: whenever it fires, the
+    /// post-fetch gate is true for EVERY outcome of the wheel metadata
+    /// fetch (any subset of the fetched wheels' URLs dropped).
+    #[test]
+    fn pipenv_probe_certain_implies_the_post_fetch_gate() {
+        use super::pipenv_probe_certain;
+        use socket_patch_core::patch::redirect::pipenv_lock_targets;
+
+        let lock = serde_json::json!({
+            "_meta": {"pipfile-spec": 6, "hash": {"sha256": "x"}},
+            "default": {"urllib3": {"version": "==1.26.18"}, "six": {"version": "==1.16.0"}},
+            "develop": {},
+        });
+        let files = std::collections::BTreeMap::from([(
+            "Pipfile.lock".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        )]);
+        let names = ["urllib3", "Six", "requests", "idna"];
+        let urls = ["u0", "u1", "u2", "u3"];
+        let (mut fired, mut held) = (0, 0);
+        for seed in 0..4096u64 {
+            // Deterministic spread over names, ecosystems, URLs and the
+            // fetched-URL set.
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |n: u64| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n) as usize
+            };
+            let candidates: Vec<DepOverride> = (0..next(4))
+                .map(|_| {
+                    let mut dep = npm_override(urls[next(4)]);
+                    dep.name = names[next(4)].to_string();
+                    if next(4) != 0 {
+                        dep.ecosystem = "pypi".to_string();
+                    }
+                    dep
+                })
+                .collect();
+            let fetched: Vec<&str> = urls.iter().copied().filter(|_| next(2) == 0).collect();
+            if !pipenv_probe_certain(&files, candidates.iter(), fetched.iter().copied()) {
+                held += 1;
+                continue;
+            }
+            fired += 1;
+            for mask in 0..(1u32 << fetched.len()) {
+                let dropped: Vec<&str> = fetched
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, url)| *url)
+                    .collect();
+                let kept: Vec<DepOverride> = candidates
+                    .iter()
+                    .filter(|dep| !dropped.contains(&dep.artifact_url.as_str()))
+                    .cloned()
+                    .collect();
+                assert!(
+                    pipenv_lock_targets(&files, &kept),
+                    "seed {seed} mask {mask}"
+                );
+            }
+        }
+        assert!(fired > 100 && held > 100, "{fired}/{held}");
+    }
+
+    /// Without a Pipfile.lock the gate is false whatever the candidates
+    /// are, exactly as `pipenv_lock_targets` answers it — so the early
+    /// return skips only the list the question would have been asked with.
+    #[test]
+    fn pipenv_probe_certain_is_false_without_a_pipfile_lock() {
+        use super::pipenv_probe_certain;
+        use socket_patch_core::patch::redirect::pipenv_lock_targets;
+
+        let files =
+            std::collections::BTreeMap::from([("package-lock.json".to_string(), "{}".to_string())]);
+        let mut pypi = npm_override("u1");
+        pypi.ecosystem = "pypi".to_string();
+        pypi.name = "urllib3".to_string();
+        let candidates = [npm_override("u0"), pypi];
+
+        assert!(!pipenv_probe_certain(
+            &files,
+            candidates.iter(),
+            std::iter::empty()
+        ));
+        assert!(!pipenv_lock_targets(&files, &candidates));
+        assert!(!pipenv_probe_certain(
+            &std::collections::BTreeMap::new(),
+            candidates.iter(),
+            std::iter::empty()
+        ));
     }
 
     fn npm_override(artifact_url: &str) -> DepOverride {
@@ -4965,6 +5387,174 @@ mod tests {
             assert!(read_npmrc_for_allow_remote(&path)
                 .unwrap_err()
                 .contains("symbolic link"));
+        }
+    }
+}
+
+/// H1 equivalence: the one-pass multi-needle confirmation probe answers
+/// exactly what the per-candidate `any()` it replaced answered.
+#[cfg(test)]
+mod probe_equivalence_tests {
+    use super::{candidate_presence_needles, candidate_present_oracle, npm_lock_url_needles};
+    use socket_patch_core::patch::redirect::presence::groups_present;
+    use socket_patch_core::patch::redirect::{
+        artifact_url_present, artifact_url_spellings, rewrite_registry_redirect, DepOverride,
+    };
+    use socket_patch_core::utils::uri::encode_uri_component;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn golden_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../socket-patch-core/tests/fixtures/redirect")
+    }
+
+    fn cases(dir: &Path, out: &mut Vec<PathBuf>) {
+        if dir.join("input").is_dir() && dir.join("overrides.json").is_file() {
+            out.push(dir.to_path_buf());
+            return;
+        }
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                cases(&p, out);
+            }
+        }
+    }
+
+    fn read_tree(base: &Path) -> BTreeMap<String, String> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else if let Ok(text) = std::fs::read_to_string(&p) {
+                    let rel = p.strip_prefix(base).unwrap().to_string_lossy();
+                    out.insert(rel.replace('\\', "/"), text);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        if base.is_dir() {
+            walk(base, base, &mut out);
+        }
+        out
+    }
+
+    /// Every golden fixture (composer `\/`, berry percent-encoded, maven
+    /// suffixed version, go module path, cargo index url, …): each case's
+    /// final texts — input overlaid with this CLI's own rewrite, as the probe
+    /// sees them — plus its authored `expected/` files, probed with EVERY
+    /// fixture's overrides so hits and misses are both well exercised.
+    #[test]
+    fn multi_needle_probe_matches_per_candidate_any_on_golden_fixtures() {
+        let mut dirs = Vec::new();
+        cases(&golden_root(), &mut dirs);
+        dirs.sort();
+        assert!(dirs.len() > 50, "golden fixtures not found: {}", dirs.len());
+
+        let mut all_overrides: Vec<DepOverride> = Vec::new();
+        let mut text_sets: Vec<Vec<String>> = Vec::new();
+        for case in &dirs {
+            let overrides: Vec<DepOverride> = match serde_json::from_str(
+                &std::fs::read_to_string(case.join("overrides.json")).unwrap(),
+            ) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            let input = read_tree(&case.join("input"));
+            let rewrite = rewrite_registry_redirect(&input, &overrides);
+            let finals: Vec<String> = input
+                .iter()
+                .map(|(name, text)| rewrite.files.get(name).unwrap_or(text).clone())
+                .chain(
+                    rewrite
+                        .files
+                        .iter()
+                        .filter(|(name, _)| !input.contains_key(*name))
+                        .map(|(_, t)| t.clone()),
+                )
+                .collect();
+            text_sets.push(finals);
+            text_sets.push(read_tree(&case.join("expected")).into_values().collect());
+            text_sets.push(input.into_values().collect());
+            all_overrides.extend(overrides);
+        }
+        text_sets.push(Vec::new());
+        // Texts that carry ONE needle kind and nothing else — no golden
+        // fixture has the maven suffixed version or the registry index URL
+        // without the artifact URL beside it, so a needle dropped from
+        // `candidate_presence_needles` would otherwise go unnoticed.
+        let mut lone_suffixed: Vec<usize> = Vec::new();
+        for o in all_overrides
+            .iter()
+            .filter_map(|d| d.registry_override.as_ref())
+        {
+            text_sets.push(vec![format!("<url>{}</url>\n", o.index_url)]);
+            if let Some(sv) = o.identifiers.maven_suffixed_version.as_deref() {
+                lone_suffixed.push(text_sets.len());
+                text_sets.push(vec![format!("<version>{sv}</version>\n")]);
+            }
+        }
+        assert!(
+            !lone_suffixed.is_empty(),
+            "no maven suffixed-version override"
+        );
+
+        let groups: Vec<Vec<String>> = all_overrides
+            .iter()
+            .map(candidate_presence_needles)
+            .collect();
+        let (mut hits, mut misses) = (0usize, 0usize);
+        for (set, texts) in text_sets.iter().enumerate() {
+            let refs: Vec<&String> = texts.iter().collect();
+            let fast = groups_present(&refs, &groups);
+            if lone_suffixed.contains(&set) {
+                assert!(
+                    fast.iter().any(|hit| *hit),
+                    "a lone suffixed version confirms its maven override"
+                );
+            }
+            for (dep, got) in all_overrides.iter().zip(&fast) {
+                let want = candidate_present_oracle(&refs, dep);
+                assert_eq!(
+                    *got, want,
+                    "{}/{} / {}",
+                    dep.ecosystem, dep.name, dep.artifact_url
+                );
+                if want {
+                    hits += 1;
+                } else {
+                    misses += 1;
+                }
+            }
+        }
+        assert!(hits > 100 && misses > 100, "hits={hits} misses={misses}");
+
+        // The pnpm / npm host filters and the heal probe: the npm lock
+        // spellings, and the bare `artifact_url_present` pair.
+        let npm: Vec<&DepOverride> = all_overrides.iter().collect();
+        let lock_groups: Vec<Vec<String>> = npm
+            .iter()
+            .map(|o| npm_lock_url_needles(&o.artifact_url))
+            .collect();
+        let pair_groups: Vec<[String; 2]> = npm
+            .iter()
+            .map(|o| artifact_url_spellings(&o.artifact_url))
+            .collect();
+        for texts in &text_sets {
+            let lock_fast = groups_present(texts, &lock_groups);
+            let pair_fast = groups_present(texts, &pair_groups);
+            for (i, o) in npm.iter().enumerate() {
+                let encoded = encode_uri_component(&o.artifact_url);
+                let pair = texts
+                    .iter()
+                    .any(|t| artifact_url_present(t, &o.artifact_url));
+                let lock = texts.iter().any(|t| {
+                    artifact_url_present(t, &o.artifact_url) || t.contains(encoded.as_str())
+                });
+                assert_eq!(pair_fast[i], pair, "{}", o.artifact_url);
+                assert_eq!(lock_fast[i], lock, "{}", o.artifact_url);
+            }
         }
     }
 }

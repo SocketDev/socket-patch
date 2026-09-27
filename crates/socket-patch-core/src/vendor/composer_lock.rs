@@ -28,7 +28,8 @@
 //! (matching `JSON_UNESCAPED_SLASHES`).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
@@ -36,7 +37,7 @@ use crate::constants::SOCKET_DIR;
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
@@ -48,9 +49,11 @@ use super::common::{
     swap_stage_into_place, synthesized_result,
 };
 use super::lock_inventory::{composer_lock_packages, ComposerLockPackage};
+use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
-use super::registry_fetch::extract_zip;
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -59,6 +62,11 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
 
+/// The run's composer.lock parse. Every entry point below re-reads the lock
+/// (the read is the TOCTOU guarantee) and reuses this parse whenever the
+/// bytes it read are the ones the parse came from; see [`ParseMemo`].
+static LOCK_MEMO: ParseMemo<Value> = ParseMemo::new();
+
 /// Wiring-record discriminator. The record's `key` is
 /// `"<section>:<vendor>/<name>"` where `<section>` is `packages` or
 /// `packages-dev` (the lock array holding the entry) and `<vendor>/<name>` is
@@ -66,31 +74,44 @@ const COMPOSER_LOCK: &str = "composer.lock";
 /// package name, so the encoding is unambiguous.
 const WIRING_KIND: &str = "composer_lock_package";
 
-/// Vendor a composer package: materialize a patched copy under
-/// `.socket/vendor/composer/<uuid>/<vendor>/<name>@<version>` and rewire the
-/// matching `composer.lock` entry at it (see the module doc for the surgery).
-///
-/// `installed_dir` is the crawler's package dir (`vendor/<v>/<n>` — the same
-/// root `apply` patches, so the manifest file keys resolve relative to it).
-/// The lock edit runs LAST: any copy/patch failure removes the copy and
-/// leaves the lock untouched.
-#[allow(clippy::too_many_arguments)]
-pub async fn vendor_composer(
+/// Everything [`vendor_composer`] decides before it can first ask the patch
+/// service: the coordinate guards, the no-op of an empty patch, the lock's
+/// presence and entry, and whether that entry already wires an intact copy.
+/// The download plan evaluates the same function ahead of the vendor loop
+/// ([`service_preflight`]), so a package this refuses is never granted.
+struct ComposerPrelude {
+    vendor: String,
+    name: String,
+    pkg: String,
+    version: String,
+    copy_rel: String,
+    uuid_dir: PathBuf,
+    copy_dir: PathBuf,
+    lock_path: PathBuf,
+    lock: Arc<Value>,
+    section: &'static str,
+    idx: usize,
+    /// The lock entry already points at this uuid's copy.
+    wired: bool,
+    /// ...and the committed copy carries every afterHash (the in-sync hot
+    /// path, which never asks the service).
+    in_sync: bool,
+}
+
+async fn composer_prelude(
     purl: &str,
-    installed_dir: &Path,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    vendored_at: &str,
-    dry_run: bool,
-    force: bool,
-    service: Option<&VendorServiceConfig>,
-) -> VendorOutcome {
+) -> Result<ComposerPrelude, VendorOutcome> {
     // ── coordinates ──────────────────────────────────────────────────────
     let Some(((vendor, name), version)) = parse_composer_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a composer purl: {purl}"));
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a composer purl: {purl}"),
+        ));
     };
-    let version = version.as_ref();
+    let version = version.to_string();
+    let version = version.as_str();
     // Canonical (packagist) lowercase form keys the on-disk copy dir and the
     // dist URL; the lock's own pretty casing is preserved untouched.
     let vendor = vendor.to_lowercase();
@@ -103,16 +124,16 @@ pub async fn vendor_composer(
     // would escape `.socket/vendor/composer/` — reject fail-closed before any
     // disk access.
     let Some(uuid_dir_rel) = vendor_uuid_dir_rel("composer", &record.uuid) else {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!("non-canonical patch uuid {:?}", record.uuid),
-        );
+        ));
     };
     if !is_safe_multi_segment(&pkg) || !is_safe_single_segment(version) {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!("unsafe composer coordinates `{pkg}` @ `{version}`"),
-        );
+        ));
     }
 
     let copy_rel = format!("{uuid_dir_rel}/{pkg}@{version}");
@@ -122,7 +143,7 @@ pub async fn vendor_composer(
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
         let result = synthesized_result(purl, &copy_dir, Vec::new(), true, None);
-        return done(result, None, Vec::new());
+        return Err(done(result, None, Vec::new()));
     }
 
     // ── lock presence + entry ────────────────────────────────────────────
@@ -130,42 +151,134 @@ pub async fn vendor_composer(
     let lock_text = match read_regular_to_string(&lock_path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return refused(
+            return Err(refused(
                 "vendor_lockfile_missing",
                 format!("no composer.lock at {}", lock_path.display()),
-            );
+            ));
         }
         Err(e) => {
-            return refused(
+            return Err(refused(
                 "vendor_lockfile_missing",
                 format!("unreadable composer.lock: {e}"),
-            );
+            ));
         }
     };
     // An unparseable lock is as unusable as a missing one — same refusal code.
-    let mut lock: Value = match serde_json::from_str(&lock_text) {
+    let lock = match LOCK_MEMO.parse(lock_text.as_bytes(), || {
+        serde_json::from_str::<Value>(&lock_text)
+    }) {
         Ok(v) => v,
         Err(e) => {
-            return refused(
+            return Err(refused(
                 "vendor_lockfile_missing",
                 format!("unparseable composer.lock: {e}"),
-            );
+            ));
         }
     };
     let Some((section, idx)) = find_lock_entry(&lock, &pkg, version) else {
-        return refused(
+        return Err(refused(
             "vendor_lock_entry_not_found",
             format!("{pkg}@{version} is in neither packages[] nor packages-dev[] of composer.lock"),
-        );
+        ));
     };
+
+    let wired = entry_is_wired(&lock[section][idx], &copy_rel);
+    let in_sync = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
+    Ok(ComposerPrelude {
+        vendor,
+        name,
+        pkg,
+        version: version.to_string(),
+        copy_rel,
+        uuid_dir,
+        copy_dir,
+        lock_path,
+        lock,
+        section,
+        idx,
+        wired,
+        in_sync,
+    })
+}
+
+/// Whether [`vendor_composer`] — a wet run with the service enabled — asks
+/// the patch service for `record`: past every refusal it raises first and
+/// not answered by the in-sync hot path. The vendor loop's download plan
+/// consults this, so it only ever names downloads the loop will make.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Option<crate::api::client::PlannedDownload> {
+    let prelude = composer_prelude(purl, project_root, record)
+        .await
+        .ok()
+        .filter(|p| !p.in_sync)?;
+    // `composer_service_copy` extracts the dist zip into the copy dir's stage.
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::extract(
+            project_root,
+            &prelude.copy_dir,
+            extract_dist_zip,
+        )),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
+}
+
+/// Extract a composer dist zip, which carries a single variable top-level
+/// dir, into `dest`.
+fn extract_dist_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    extract_zip(bytes, dest, /*strip_first=*/ true)
+}
+
+/// Vendor a composer package: materialize a patched copy under
+/// `.socket/vendor/composer/<uuid>/<vendor>/<name>@<version>` and rewire the
+/// matching `composer.lock` entry at it (see the module doc for the surgery).
+///
+/// `installed_dir` is the crawler's package dir (`vendor/<v>/<n>` — the same
+/// root `apply` patches, so the manifest file keys resolve relative to it).
+/// The lock edit runs LAST: any copy/patch failure removes the copy and
+/// leaves the lock untouched.
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_composer<'a>(
+    purl: &str,
+    installed_dir: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
+    let ComposerPrelude {
+        vendor,
+        name,
+        pkg,
+        version,
+        copy_rel,
+        uuid_dir,
+        copy_dir,
+        lock_path,
+        lock,
+        section,
+        idx,
+        wired,
+        in_sync,
+    } = match composer_prelude(purl, project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
+    };
+    let version = version.as_str();
 
     // ── idempotent hot path ──────────────────────────────────────────────
     // Copy already carries every afterHash and the lock entry already points
     // at the uuid path → touch nothing, report AlreadyPatched. `entry` stays
     // `None`: the first run's ledger entry holds the only copy of the
     // verbatim pre-vendor original, and re-recording here would clobber it.
-    if entry_is_wired(&lock[section][idx], &copy_rel) {
-        if copy_matches_after_hashes(&copy_dir, &record.files).await {
+    if wired {
+        if in_sync {
             let result = already_patched_result(purl, &copy_dir, &record.files);
             return done(result, None, Vec::new());
         }
@@ -229,6 +342,24 @@ pub async fn vendor_composer(
     // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
         let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        // The verify reads the installed tree, so a lazily-fetched source
+        // materialises here — the one dry-run branch that touches it.
+        let installed_dir = match installed_dir.materialize().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                return done(
+                    synthesized_result(
+                        purl,
+                        &copy_dir,
+                        Vec::new(),
+                        false,
+                        Some(format!("failed to copy installed package: {e}")),
+                    ),
+                    None,
+                    dry_warnings,
+                )
+            }
+        };
         let mut result = super::force_apply_staged(
             purl,
             installed_dir,
@@ -282,6 +413,10 @@ pub async fn vendor_composer(
         };
 
     // ── lock rewrite ─────────────────────────────────────────────────────
+    // The memo hands the parse out shared; this is the one branch that
+    // mutates it, so it takes its own copy — exactly the allocation the
+    // parse it replaced would have made.
+    let mut lock = (*lock).clone();
     let original_entry = lock[section][idx].clone();
     let Some(original_obj) = original_entry.as_object() else {
         // find_lock_entry only matches objects; defensive.
@@ -305,7 +440,15 @@ pub async fn vendor_composer(
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
     let write_result = match composer_json_bytes(&lock) {
-        Ok(bytes) => atomic_write_bytes_preserving_mode(&lock_path, &bytes).await,
+        Ok(bytes) => match atomic_write_bytes_preserving_mode(&lock_path, &bytes).await {
+            // The bytes now on disk and the doc they came from: the next
+            // package in this run reads them back and skips the parse.
+            Ok(()) => {
+                LOCK_MEMO.store(bytes, lock);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     if let Err(e) = write_result {
@@ -558,7 +701,7 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
 #[allow(clippy::too_many_arguments)]
 async fn copy_and_patch(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: PackageSource<'_>,
     copy_dir: &Path,
     uuid_dir: &Path,
     record: &PatchRecord,
@@ -570,8 +713,11 @@ async fn copy_and_patch(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, ApplyResult> {
     let stage = stage_dir_for(copy_dir);
-    // `fresh_copy` removes + recreates the stage itself.
-    if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+    // The local build is the first branch that reads the source. An
+    // installed package is copied out of `vendor/`; a fetched one is
+    // written straight here from the verified dist zip. `stage_into`
+    // removes + recreates the stage itself.
+    if let Err(e) = installed_dir.stage_into(&stage, None).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(synthesized_result(
             purl,
@@ -642,27 +788,34 @@ async fn composer_service_copy(
         }
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
+        ServiceArtifact::Ready(mut archive) => {
             // Extract into a STAGE sibling and swap it into the copy dir only
             // once fully verified — a failure then leaves any pre-existing
             // (possibly live-wired) copy and its marker untouched and no husk
             // behind.
             let stage = stage_dir_for(copy_dir);
-            let _ = remove_tree(&stage).await;
-            if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot create {}: {e}", stage.display()),
-                );
-            }
-            // composer dist zips carry a single variable top-level dir.
-            if let Err(e) = extract_zip(&archive.bytes, &stage, /*strip_first=*/ true) {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_extract_failed",
-                    format!("cannot extract the prebuilt dist zip: {e}"),
-                );
+            // A tree the download plan already extracted from these bytes
+            // (see `prestage`) is moved into the stage instead; otherwise —
+            // or should the move fail — extract here, as always.
+            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+                let _ = remove_tree(&stage).await;
+                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+                    cleanup_failed_stage(&stage, uuid_dir, false).await;
+                    return hard(
+                        "vendor_prebuilt_write_failed",
+                        format!("cannot create {}: {e}", stage.display()),
+                    );
+                }
+                // composer dist zips carry a single variable top-level dir.
+                let zip_bytes = std::mem::take(&mut archive.bytes);
+                if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, extract_dist_zip).await
+                {
+                    cleanup_failed_stage(&stage, uuid_dir, false).await;
+                    return hard(
+                        "vendor_prebuilt_extract_failed",
+                        format!("cannot extract the prebuilt dist zip: {e}"),
+                    );
+                }
             }
             // Verify the EXTRACTED TREE, not just the archive bytes. The
             // archive-bytes SRI (checked in fetch_verified_archive) proves
@@ -856,7 +1009,7 @@ async fn stranded_wired_packages(
     let Ok(text) = read_regular_to_string(lock_path).await else {
         return Vec::new();
     };
-    let Ok(lock) = serde_json::from_str::<Value>(&text) else {
+    let Ok(lock) = LOCK_MEMO.parse(text.as_bytes(), || serde_json::from_str::<Value>(&text)) else {
         return Vec::new();
     };
     stranded_in(&lock, uuid, restorable)
@@ -907,19 +1060,26 @@ async fn restore_lock_entry(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable composer.lock: {e}")),
     };
-    let mut lock: Value =
-        serde_json::from_str(&lock_text).map_err(|e| format!("unparseable composer.lock: {e}"))?;
+    let lock = LOCK_MEMO
+        .parse(lock_text.as_bytes(), || {
+            serde_json::from_str::<Value>(&lock_text)
+        })
+        .map_err(|e| format!("unparseable composer.lock: {e}"))?;
 
     let Some(idx) = wired_entry_index(&lock, section, pkg, uuid) else {
         return Ok(false);
     };
 
     if !dry_run {
+        let mut lock = (*lock).clone();
         lock[section][idx] = original;
         let bytes = composer_json_bytes(&lock).map_err(|e| e.to_string())?;
         atomic_write_bytes_preserving_mode(lock_path, &bytes)
             .await
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
+        // Re-seeded the same way the vendor path does, so the next record's
+        // restore reads back its own write for free.
+        LOCK_MEMO.store(bytes, lock);
     }
     Ok(true)
 }
@@ -1066,6 +1226,62 @@ mod tests {
         }
     }
 
+    /// The download plan's gate names exactly the packages whose vendor call
+    /// asks the patch service for a grant: none the lock does not carry or
+    /// whose uuid is not canonical, not the empty patch's no-op, and — once
+    /// vendored — not the in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_packages_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (dir, blobs, installed, record) = fixture(&lock_value("psr/log", "3.0.2", false)).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (
+                "pkg:composer/psr/log@9.9.9",
+                with_uuid(&record, PLAN_UUID_B),
+            ),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            (
+                "pkg:composer/monolog/monolog@1.0.0",
+                with_uuid(&record, PLAN_UUID_C),
+            ),
+            (PURL, empty_patch(&record, PLAN_UUID_B)),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec).await.is_some() })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (installed, sources, cfg) = (&installed, &sources, &cfg);
+            Box::pin(async move {
+                vendor_composer(
+                    &purl,
+                    installed.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string()]);
+        // Vendored now: the re-run is in sync and asks nothing.
+        let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
+        assert!(rerun.is_empty(), "{rerun:?}");
+    }
+
     async fn run_vendor(
         root: &Path,
         blobs: &Path,
@@ -1175,6 +1391,150 @@ mod tests {
         assert_eq!(w.key.as_deref(), Some("packages:psr/log"));
         assert_eq!(w.original.as_ref().unwrap(), &lock["packages"][0]);
         assert_eq!(w.new.as_ref().unwrap(), e);
+    }
+
+    /// The memo hands the second package of a run the document the FIRST
+    /// one mutated in memory, re-seeded against the bytes it wrote — not a
+    /// fresh parse of those bytes. Pin that the two paths agree: the same
+    /// two-package run, warm and cold, must leave the same composer.lock
+    /// bytes and raise the same warnings in the same order.
+    #[tokio::test]
+    async fn a_memoized_run_writes_the_same_lock_as_an_always_reparsing_one() {
+        const DEV_UUID: &str = "3c1d5e7f-9a2b-4c6d-8e0f-1a2b3c4d5e6f";
+        const DEV_PURL: &str = "pkg:composer/phpunit/phpunit@10.0.0";
+
+        async fn two_packages(cold: bool) -> (String, Vec<String>) {
+            let lock = lock_value("psr/log", "3.0.2", false);
+            let (dir, blobs, installed, record) = fixture(&lock).await;
+            let root = dir.path();
+            let cool = || {
+                if cold {
+                    LOCK_MEMO.invalidate();
+                }
+            };
+            cool();
+            let (first, _entry, first_warnings) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+            assert!(first.success, "{:?}", first.error);
+            cool();
+
+            let dev_installed = root.join("vendor/phpunit/phpunit");
+            tokio::fs::create_dir_all(dev_installed.join("src"))
+                .await
+                .unwrap();
+            tokio::fs::write(dev_installed.join("src/LoggerInterface.php"), PRISTINE)
+                .await
+                .unwrap();
+            let dev_record = PatchRecord {
+                uuid: DEV_UUID.to_string(),
+                ..record.clone()
+            };
+            let (second, _entry, second_warnings) = unwrap_done(
+                run_vendor(root, &blobs, &dev_installed, &dev_record, DEV_PURL, false).await,
+            );
+            assert!(second.success, "{:?}", second.error);
+
+            let warnings = first_warnings
+                .iter()
+                .chain(second_warnings.iter())
+                .map(|w| format!("{}|{}", w.code, w.detail))
+                .collect();
+            (
+                tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                    .await
+                    .unwrap(),
+                warnings,
+            )
+        }
+
+        let (warm_lock, warm_warnings) = two_packages(false).await;
+        let (cold_lock, cold_warnings) = two_packages(true).await;
+        assert_eq!(
+            warm_lock, cold_lock,
+            "composer.lock differs between the memoized and the always-reparse path"
+        );
+        assert_eq!(
+            warm_warnings, cold_warnings,
+            "the warnings differ between the memoized and the always-reparse path"
+        );
+    }
+
+    /// Two packages in one run with a hand edit to composer.lock between
+    /// them: the second package must wire against the bytes on DISK, not the
+    /// parse the first one left in the memo. The memo only ever skips the
+    /// parse — the read, and with it the edit, always happens.
+    #[tokio::test]
+    async fn test_external_lock_edit_between_packages_is_not_memoized() {
+        const DEV_UUID: &str = "3c1d5e7f-9a2b-4c6d-8e0f-1a2b3c4d5e6f";
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        // Package one: composer.lock is rewritten, the memo seeded with it.
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+
+        // Someone else edits the lock — a `composer update`, a hand edit —
+        // touching a key neither vendor call writes.
+        let mut edited: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        edited["content-hash"] = json!("edited-between-packages");
+        tokio::fs::write(
+            root.join(COMPOSER_LOCK),
+            composer_json_bytes(&edited).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Package two: the packages-dev[] entry, under its own uuid.
+        let dev_installed = root.join("vendor/phpunit/phpunit");
+        tokio::fs::create_dir_all(dev_installed.join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(dev_installed.join("src/LoggerInterface.php"), PRISTINE)
+            .await
+            .unwrap();
+        let dev_record = PatchRecord {
+            uuid: DEV_UUID.to_string(),
+            ..record.clone()
+        };
+        let (result, _entry, _w) = unwrap_done(
+            run_vendor(
+                root,
+                &blobs,
+                &dev_installed,
+                &dev_record,
+                "pkg:composer/phpunit/phpunit@10.0.0",
+                false,
+            )
+            .await,
+        );
+        assert!(result.success, "{:?}", result.error);
+
+        let after: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after["content-hash"], "edited-between-packages",
+            "the second package must build on the edited bytes, not on the \
+             first package's memoized parse"
+        );
+        assert_eq!(
+            after["packages"][0]["dist"]["type"], "path",
+            "the first package's wiring must survive"
+        );
+        assert_eq!(
+            after["packages-dev"][0]["dist"]["type"], "path",
+            "the second package must still be wired"
+        );
     }
 
     #[tokio::test]
@@ -1818,6 +2178,89 @@ mod tests {
     /// Service success: the prebuilt dist zip is extracted into the copy dir
     /// (patched bytes), the lock is rewired, and a `vendor_prebuilt_downloaded`
     /// advisory is emitted — WITHOUT touching the installed package.
+    /// A dist zip the download plan pre-staged is claimed into the stage,
+    /// leaving exactly the outcome and the tree the loop's own extraction
+    /// leaves; a pre-stage the extractor refuses stages nothing, and the
+    /// live extraction then refuses with its own words.
+    #[tokio::test]
+    async fn a_prestaged_dist_zip_leaves_what_the_live_extraction_leaves() {
+        let _serial = super::super::prestage::TEST_LOCK.lock().await;
+        fn listing(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for e in std::fs::read_dir(&dir).unwrap() {
+                    let p = e.unwrap().path();
+                    let rel = p.strip_prefix(root).unwrap().display().to_string();
+                    if p.is_dir() {
+                        out.push((rel, None));
+                        stack.push(p);
+                    } else {
+                        out.push((rel, Some(std::fs::read(&p).unwrap())));
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+        for broken in [false, true] {
+            let mut runs = Vec::new();
+            for planned in [false, true] {
+                let lock = lock_value("psr/log", "3.0.2", false);
+                let (dir, blobs, installed, record) = fixture(&lock).await;
+                let root = dir.path();
+                let zip = if broken {
+                    b"PK not a zip".to_vec()
+                } else {
+                    make_dist_zip(
+                        "php-fig-log-f16e1d5",
+                        &[
+                            ("src/LoggerInterface.php", PATCHED),
+                            ("composer.json", b"{\"name\": \"psr/log\"}\n"),
+                        ],
+                    )
+                };
+                let server = wiremock::MockServer::start().await;
+                mount_composer_granted(&server, &sri_sha512(&zip), &zip).await;
+                let cfg = composer_service_cfg(&server.uri(), VendorSource::Service, false);
+                let plan = service_preflight(PURL, root, &record)
+                    .await
+                    .expect("a fresh package asks the service");
+                let guard = planned.then(|| {
+                    cfg.client.as_ref().unwrap().prefetch_vendor_downloads(
+                        vec![plan],
+                        false,
+                        None,
+                        None,
+                        4,
+                        usize::MAX,
+                    )
+                });
+                let claims_before = super::super::prestage::CLAIMS.with(|c| c.get());
+                let outcome = vendor_with_service(root, &blobs, &installed, &record, &cfg).await;
+                drop(guard);
+                super::super::prestage::settle().await;
+                let claimed = super::super::prestage::CLAIMS.with(|c| c.get()) - claims_before;
+                assert_eq!(claimed, usize::from(planned && !broken), "broken={broken}");
+                let summary = match outcome {
+                    VendorOutcome::Done {
+                        result, warnings, ..
+                    } => format!(
+                        "done {} {:?}",
+                        result.success,
+                        warnings.iter().map(|w| w.code).collect::<Vec<_>>()
+                    ),
+                    VendorOutcome::Refused { code, detail } => format!(
+                        "refused {code} {}",
+                        detail.replace(&root.display().to_string(), "ROOT")
+                    ),
+                };
+                runs.push((summary, listing(root)));
+            }
+            assert_eq!(runs[0], runs[1], "broken={broken}");
+        }
+    }
+
     #[tokio::test]
     async fn service_success_extracts_dist_and_rewrites_lock() {
         let lock = lock_value("psr/log", "3.0.2", false);

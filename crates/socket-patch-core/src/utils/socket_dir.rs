@@ -47,7 +47,7 @@ pub async fn prune_empty_dirs(dir: &Path, stop_dir: &Path) {
 /// than NotFound propagates BEFORE any pruning: a read-only parent leaves the
 /// file — and the caller's fail-closed error — exactly where they were.
 pub async fn remove_file_and_prune(path: &Path, stop_dir: &Path) -> std::io::Result<()> {
-    match tokio::fs::remove_file(path).await {
+    match super::fs::remove_file(path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),

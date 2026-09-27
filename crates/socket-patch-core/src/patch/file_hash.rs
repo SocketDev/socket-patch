@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::hash::git_sha256::compute_git_sha256_from_reader;
-use crate::utils::fs::open_regular_file;
+use crate::hash::git_sha256::{compute_git_sha256_from_reader, compute_git_sha256_from_std_reader};
+use crate::utils::fs::{open_regular_file, open_regular_file_sync};
 
 /// Compute Git-compatible SHA256 hash of file contents using streaming.
 ///
@@ -30,6 +30,14 @@ pub(crate) async fn compute_file_git_sha256(
     let reader = tokio::io::BufReader::new(file);
 
     compute_git_sha256_from_reader(file_size, reader).await
+}
+
+/// Blocking twin of [`compute_file_git_sha256`] for callers that hash a
+/// batch of files in one blocking-pool task: the same FIFO-safe single
+/// open, handle-derived size and streaming hash.
+pub(crate) fn compute_file_git_sha256_sync(filepath: &Path) -> Result<String, std::io::Error> {
+    let (file, metadata) = open_regular_file_sync(filepath)?;
+    compute_git_sha256_from_std_reader(metadata.len(), std::io::BufReader::new(file))
 }
 
 #[cfg(test)]

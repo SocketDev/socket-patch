@@ -266,26 +266,8 @@ fn for_each_directive_body(
         if line.is_empty() {
             continue;
         }
-        if in_block {
-            if line == ")" {
-                in_block = false;
-            } else {
-                f(i, line)?;
-            }
-        } else if let Some(after) = line.strip_prefix(keyword) {
-            let rest = after.trim_start();
-            match rest {
-                "(" => in_block = true,
-                "()" => {} // empty inline block — nothing inside
-                _ => {
-                    // Go's lexer separates tokens on ANY whitespace, so
-                    // `replace\tmod …` is as valid as `replace mod …` (and
-                    // `replaceX` is a different word entirely).
-                    if after.starts_with(char::is_whitespace) && !rest.is_empty() {
-                        f(i, rest)?;
-                    }
-                }
-            }
+        if let Some(body) = directive_body(line, keyword, &mut in_block) {
+            f(i, body)?;
         }
     }
     Ok(())
@@ -300,6 +282,35 @@ fn unquote(tok: &str) -> &str {
         }
     }
     tok
+}
+
+/// One step of [`for_each_directive_body`]'s walk for `keyword` over an
+/// already comment-stripped, trimmed, non-empty `line`: the directive body
+/// the walk hands its callback, if any, updating the block state.
+fn directive_body<'l>(line: &'l str, keyword: &str, in_block: &mut bool) -> Option<&'l str> {
+    if *in_block {
+        if line == ")" {
+            *in_block = false;
+            None
+        } else {
+            Some(line)
+        }
+    } else if let Some(after) = line.strip_prefix(keyword) {
+        let rest = after.trim_start();
+        match rest {
+            "(" => {
+                *in_block = true;
+                None
+            }
+            "()" => None, // empty inline block — nothing inside
+            // Go's lexer separates tokens on ANY whitespace, so
+            // `replace\tmod …` is as valid as `replace mod …` (and
+            // `replaceX` is a different word entirely).
+            _ => (after.starts_with(char::is_whitespace) && !rest.is_empty()).then_some(rest),
+        }
+    } else {
+        None
+    }
 }
 
 /// True if a replacement RHS token is a filesystem path (vs a module path).
@@ -516,14 +527,27 @@ fn upsert_socket_replace(
     version: &str,
     target: &str,
 ) -> Result<Option<String>, String> {
-    let want_line = format!("replace {module} {version} => {target}");
-
     // Locate the existing socket-owned replace lines for `module`, and detect
     // a conflicting user-authored replace pinning the same module+version.
     let mut socket_lines: Vec<usize> = Vec::new();
     for_each_directive_body(content, "replace", |i, body| {
         inspect_existing(body, module, version, target, i, &mut socket_lines)
     })?;
+    let mut out = content.to_string();
+    Ok(apply_socket_replace(&mut out, &socket_lines, module, version, target).then_some(out))
+}
+
+/// The write half of [`upsert_socket_replace`], in place: refresh the first
+/// socket-owned directive in `socket_lines` (dropping the rest), or append
+/// one. Returns whether `content` changed.
+fn apply_socket_replace(
+    content: &mut String,
+    socket_lines: &[usize],
+    module: &str,
+    version: &str,
+    target: &str,
+) -> bool {
+    let want_line = format!("replace {module} {version} => {target}");
 
     if let Some((&idx, duplicates)) = socket_lines.split_first() {
         // Rewrite the first socket-owned line in place, preserving whether it
@@ -565,10 +589,11 @@ fn upsert_socket_replace(
             }
         }
         if !changed {
-            return Ok(None);
+            return false;
         }
         let kept: Vec<String> = lines.into_iter().flatten().collect();
-        return Ok(Some(join_preserving_trailing_newline(&kept, content)));
+        *content = join_preserving_trailing_newline(&kept, content);
+        return true;
     }
 
     // No socket-owned entry yet → append a single-line directive, separated
@@ -577,7 +602,7 @@ fn upsert_socket_replace(
     // committed go.mod). New lines use the file's own terminator so a CRLF
     // go.mod round-trips byte-identical through ensure→drop.
     let eol = super::common::detect_eol(content);
-    let mut body = content.to_string();
+    let body = content;
     if !body.is_empty() && !body.ends_with('\n') {
         body.push_str(eol);
     }
@@ -586,7 +611,101 @@ fn upsert_socket_replace(
     }
     body.push_str(&want_line);
     body.push_str(eol);
-    Ok(Some(body))
+    true
+}
+
+/// Everything the hosted rewriter reads from `go.mod` for one dep, gathered
+/// in ONE walk instead of three (`parse_replace_entries`,
+/// `parse_required_versions`, and [`upsert_hosted_replace_entry`]'s own scan).
+pub(crate) struct HostedReplaceScan {
+    /// The first socket-owned `replace` for the module — exactly
+    /// `parse_replace_entries(content).find(module && socket_owned)`.
+    pub(crate) prior: Option<ReplaceEntry>,
+    /// `parse_required_versions(content).get(module)` (last wins).
+    pub(crate) required: Option<String>,
+    /// The socket-owned lines [`upsert_hosted_replace_entry`] would refresh
+    /// (the first) and drop (the rest), or the conflict it would refuse with.
+    upsert: Result<Vec<usize>, String>,
+}
+
+/// Scan `content` for [`HostedReplaceScan`]: the `replace` and `require`
+/// walks of [`for_each_directive_body`] run side by side over the same lines,
+/// each with its own block state, exactly as the separate walks would.
+pub(crate) fn scan_hosted_replace(
+    content: &str,
+    module: &str,
+    version: &str,
+    rhs_module: &str,
+    rhs_version: &str,
+) -> HostedReplaceScan {
+    let target = format!("{rhs_module} {rhs_version}");
+    let mut prior: Option<(usize, ReplaceEntry)> = None;
+    let mut required: Option<String> = None;
+    let mut socket_lines: Vec<usize> = Vec::new();
+    let mut conflict: Option<String> = None;
+    let mut in_replace = false;
+    let mut in_require = false;
+    for (i, raw) in content.lines().enumerate() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(body) = directive_body(line, "replace", &mut in_replace) {
+            if conflict.is_none() {
+                if let Err(e) =
+                    inspect_existing(body, module, version, &target, i, &mut socket_lines)
+                {
+                    conflict = Some(e);
+                }
+            }
+            if prior.is_none() {
+                if let Some(e) = parse_replace_body(body) {
+                    if e.module == module && e.socket_owned() {
+                        prior = Some((i, e));
+                    }
+                }
+            }
+        }
+        if let Some(body) = directive_body(line, "require", &mut in_require) {
+            let mut toks = body.split_whitespace().map(unquote);
+            if let (Some(m), Some(v)) = (toks.next(), toks.next()) {
+                if m == module {
+                    required = Some(v.to_string());
+                }
+            }
+        }
+    }
+    let upsert = match conflict {
+        Some(e) => Err(e),
+        None => Ok(socket_lines),
+    };
+    HostedReplaceScan {
+        prior: prior.map(|(_, e)| e),
+        required,
+        upsert,
+    }
+}
+
+/// [`upsert_hosted_replace_entry`] from a [`scan_hosted_replace`] of the
+/// same `content`, editing it in place (an append no longer copies the
+/// file). `Ok(true)` when it changed.
+pub(crate) fn apply_hosted_replace(
+    content: &mut String,
+    scan: &HostedReplaceScan,
+    module: &str,
+    version: &str,
+    rhs_module: &str,
+    rhs_version: &str,
+) -> Result<bool, String> {
+    debug_assert!(is_hosted_module_path(rhs_module));
+    let socket_lines = scan.upsert.as_deref().map_err(Clone::clone)?;
+    Ok(apply_socket_replace(
+        content,
+        socket_lines,
+        module,
+        version,
+        &format!("{rhs_module} {rhs_version}"),
+    ))
 }
 
 /// Inspect an existing replace `body` (after `replace `, or a block line) for
@@ -1879,5 +1998,137 @@ replace (
         )
         .await
         .is_err());
+    }
+
+    // ── single-walk equivalence ──────────────────────────────────────
+
+    /// [`for_each_directive_body`] before its step moved into
+    /// [`directive_body`], verbatim.
+    fn for_each_directive_body_oracle(
+        content: &str,
+        keyword: &str,
+        mut f: impl FnMut(usize, &str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut in_block = false;
+        for (i, raw) in content.lines().enumerate() {
+            let line = strip_comment(raw).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if in_block {
+                if line == ")" {
+                    in_block = false;
+                } else {
+                    f(i, line)?;
+                }
+            } else if let Some(after) = line.strip_prefix(keyword) {
+                let rest = after.trim_start();
+                match rest {
+                    "(" => in_block = true,
+                    "()" => {}
+                    _ => {
+                        if after.starts_with(char::is_whitespace) && !rest.is_empty() {
+                            f(i, rest)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Random go.mod-grammar text: directive keywords (and near misses),
+    /// block opens/closes (balanced or not), comments, blank lines, CRLF.
+    fn random_go_mod(seed: u64) -> String {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |n: usize| {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
+        };
+        const PIECES: &[&str] = &[
+            "replace",
+            "require",
+            "replacex",
+            "requires",
+            " ",
+            "\t",
+            "(",
+            ")",
+            "()",
+            "( )",
+            "m",
+            "example.com/m",
+            "v1.0.0",
+            "=>",
+            "patch.socket.dev/gopatch/00000000-0000-4000-8000-000000000001",
+            "./.socket/vendor/golang/u/m@v1",
+            "./.socket/go-patches/m@v1",
+            "../fork",
+            "// c",
+            "//",
+            "\r",
+        ];
+        let mut out = String::new();
+        for _ in 0..next(40) {
+            for _ in 0..next(6) {
+                out.push_str(PIECES[next(PIECES.len())]);
+                if next(2) == 0 {
+                    out.push(' ');
+                }
+            }
+            out.push_str(if next(4) == 0 { "\r\n" } else { "\n" });
+        }
+        out
+    }
+
+    #[test]
+    fn directive_walk_matches_the_pre_split_walker() {
+        for seed in 1..=4000u64 {
+            let text = random_go_mod(seed);
+            for keyword in ["replace", "require"] {
+                let mut want = Vec::new();
+                let _ = for_each_directive_body_oracle(&text, keyword, |i, b| {
+                    want.push((i, b.to_string()));
+                    Ok(())
+                });
+                let mut got = Vec::new();
+                let _ = for_each_directive_body(&text, keyword, |i, b| {
+                    got.push((i, b.to_string()));
+                    Ok(())
+                });
+                assert_eq!(got, want, "seed {seed} {keyword}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_scan_matches_the_three_separate_reads() {
+        let rhs = "patch.socket.dev/gopatch/00000000-0000-4000-8000-000000000001";
+        for seed in 1..=4000u64 {
+            let text = random_go_mod(seed);
+            for (module, version) in [("m", "v1.0.0"), ("example.com/m", "v1.0.0"), ("m", "v2")] {
+                let scan = scan_hosted_replace(&text, module, version, rhs, "v1.0.0");
+                let prior = parse_replace_entries(&text)
+                    .into_iter()
+                    .find(|e| e.module == module && e.socket_owned());
+                assert_eq!(scan.prior, prior, "seed {seed}: {text:?}");
+                assert_eq!(
+                    scan.required.as_ref(),
+                    parse_required_versions(&text).get(module),
+                    "seed {seed}: {text:?}"
+                );
+                let want = upsert_hosted_replace_entry(&text, module, version, rhs, "v1.0.0");
+                let mut got = text.clone();
+                let applied = apply_hosted_replace(&mut got, &scan, module, version, rhs, "v1.0.0");
+                match (want, applied) {
+                    (Err(w), Err(g)) => assert_eq!(g, w, "seed {seed}"),
+                    (Ok(None), Ok(false)) => assert_eq!(got, text),
+                    (Ok(Some(w)), Ok(true)) => assert_eq!(got, w, "seed {seed}"),
+                    (w, g) => panic!("seed {seed}: {w:?} vs {g:?} on {text:?}"),
+                }
+            }
+        }
     }
 }

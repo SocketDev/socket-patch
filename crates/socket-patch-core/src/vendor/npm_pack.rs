@@ -15,7 +15,7 @@ use base64::Engine as _;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_artifact;
 
 use super::common::is_executable;
 
@@ -77,7 +77,9 @@ pub async fn pack_deterministic(staged_dir: &Path, dest: &Path) -> std::io::Resu
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))??;
 
-    atomic_write_bytes(dest, &bytes).await?;
+    // A content-verified artifact: no fsync of its own, the next durable
+    // commit point's barrier covers it (see `crate::utils::durability`).
+    atomic_write_artifact(dest, &bytes).await?;
 
     Ok(PackedTarball::from_bytes(&bytes))
 }

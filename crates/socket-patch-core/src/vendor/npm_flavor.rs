@@ -26,6 +26,7 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
 use super::pnpm_lock_legacy::PnpmLockGrammar;
+use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
     bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, yarn_berry_lock, yarn_classic_lock,
@@ -316,9 +317,9 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static
 /// surface verbatim; the detected flavor is stamped onto the ledger entry so
 /// `revert_npm_any` routes back to the same backend.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_npm_any(
+pub async fn vendor_npm_any<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -327,6 +328,7 @@ pub async fn vendor_npm_any(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let (flavor, probe_warnings) = match detect_npm_lock_flavor(project_root).await {
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
@@ -372,6 +374,129 @@ pub async fn vendor_npm_any(
         }
     }
     outcome
+}
+
+/// Which of `packages` — npm purls with their records, in vendor-loop
+/// order — [`vendor_npm_any`] would refuse before it first asks the patch
+/// service for a prebuilt archive. `Ok(())` means the loop reaches the
+/// service for that package; `Err(code)` names the refusing gate. The
+/// vendor loop's download plan consults this so it never asks the service
+/// for a package the loop then refuses: a download grant can start a
+/// server-side build and counts against quota.
+///
+/// Every gate is the loop's own, evaluated against the project as it is
+/// when the plan is built, in the loop's order: the flavor probe (a probe
+/// refusal refuses every package), then per package the coordinates guard
+/// — the flavors' first gate, ahead of any read, so a malformed record in
+/// a project the flavor refuses carries `unsafe_coordinates` as the loop
+/// would report it — then the flavor's project read (lock present,
+/// parseable, supported version, line endings, cache configuration) and
+/// its per-package pre-flight (the entry present and rewritable, override
+/// conflicts, workspace gates). The project is read once for the whole
+/// plan. Gates the loop can only evaluate after the service has answered,
+/// or that only a local build reaches — the bundled-dependencies refusal,
+/// the prebuilt archive's afterHash check — are not pre-flight gates and
+/// stay in the loop: they run after the loop has already taken its planned
+/// download, so the refusal is the loop's own and costs no request the
+/// serial loop would not have made.
+pub async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    let flavor = match detect_npm_lock_flavor(project_root).await {
+        Ok((flavor, _probe_warnings)) => flavor,
+        Err((code, _detail)) => return vec![Err(code); packages.len()],
+    };
+    match flavor {
+        NpmLockFlavor::PackageLock => npm_lock::preflight_packages(project_root, packages).await,
+        NpmLockFlavor::YarnClassic => {
+            yarn_classic_lock::preflight_packages(project_root, packages).await
+        }
+        NpmLockFlavor::YarnBerry => {
+            yarn_berry_lock::preflight_packages(project_root, packages).await
+        }
+        NpmLockFlavor::Pnpm => pnpm_lock::preflight_packages(project_root, packages).await,
+        NpmLockFlavor::PnpmLegacy => {
+            pnpm_lock_legacy::preflight_packages(project_root, packages).await
+        }
+        NpmLockFlavor::Bun => bun_lock::preflight_packages(project_root, packages).await,
+    }
+}
+
+/// The lock-text refusals [`vendor_npm_any`] raises for `packages` in a
+/// pnpm, yarn classic or yarn berry project — each package's `(code,
+/// detail)` when its backend refuses it on the project's lock and manifest
+/// text alone, `None` otherwise (and for every package of any other
+/// flavor, or a project the flavor probe refuses).
+///
+/// Those backends evaluate every such gate — the coordinates, the lock and
+/// manifest reads, override conflicts, the entry present and rewritable —
+/// before they first read the package or its patch, dry run or not. So a
+/// package [`preflight_packages`] refuses is refused again here by the
+/// backend itself, dry-run, with no source and no patch content: its code
+/// must be the pre-flight's, and its detail is the backend's own words. A
+/// vendored run consults this before it fetches views and pristine
+/// sources, so a package that will be refused costs no network at all.
+pub async fn lock_text_refusals(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Option<(&'static str, String)>> {
+    let flavor = match detect_npm_lock_flavor(project_root).await {
+        Ok((flavor, _)) => flavor,
+        Err(_) => return vec![None; packages.len()],
+    };
+    if !matches!(
+        flavor,
+        NpmLockFlavor::Pnpm | NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry
+    ) {
+        return vec![None; packages.len()];
+    }
+    let verdicts = preflight_packages(project_root, packages).await;
+    if verdicts.iter().all(Result::is_ok) {
+        return vec![None; packages.len()];
+    }
+    // No installed copy and no patch content: a path inside a fresh, empty
+    // private directory is guaranteed not to exist (an empty path would
+    // resolve against the process cwd if anything ever read it).
+    let scratch = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(_) => return vec![None; packages.len()],
+    };
+    let nowhere_buf = scratch.path().join("no-installed-copy");
+    let nowhere = nowhere_buf.as_path();
+    let no_sources = PatchSources {
+        blobs_path: nowhere,
+        packages_path: None,
+        diffs_path: None,
+        mem_blobs: None,
+    };
+    let mut refusals = Vec::with_capacity(packages.len());
+    for ((purl, record), verdict) in packages.iter().zip(verdicts) {
+        let Err(code) = verdict else {
+            refusals.push(None);
+            continue;
+        };
+        let outcome = vendor_npm_any(
+            purl,
+            nowhere,
+            project_root,
+            record,
+            &no_sources,
+            "",
+            true,
+            false,
+            None,
+        )
+        .await;
+        refusals.push(match outcome {
+            VendorOutcome::Refused {
+                code: refused,
+                detail,
+            } if refused == code => Some((refused, detail)),
+            _ => None,
+        });
+    }
+    refusals
 }
 
 /// Is this npm-vendored entry still consumed by its lockfile's dependency
@@ -490,6 +615,112 @@ pub async fn revert_npm_any_opts(
             "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
              socket-patch and re-run"
         )),
+    }
+}
+
+#[cfg(test)]
+mod lock_text_refusal_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const UUID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn record() -> PatchRecord {
+        PatchRecord {
+            uuid: UUID.to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    /// A pnpm 9 project: `pkg-a` plain, `pkg-b` behind a peer-suffixed
+    /// snapshot key (which the pnpm backend cannot rewire), nothing else.
+    fn pnpm_project(root: &Path) {
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "t", "version": "0.0.0", "dependencies": { "pkg-a": "1.0.0", "pkg-b": "1.0.0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      pkg-a:\n        specifier: 1.0.0\n        version: 1.0.0\n      pkg-b:\n        specifier: 1.0.0\n        version: 1.0.0(peer-x@1.0.0)\n\npackages:\n\n  pkg-a@1.0.0:\n    resolution: {integrity: sha512-AAAA==}\n\n  pkg-b@1.0.0:\n    resolution: {integrity: sha512-BBBB==}\n    peerDependencies:\n      peer-x: '*'\n\nsnapshots:\n\n  pkg-a@1.0.0: {}\n\n  pkg-b@1.0.0(peer-x@1.0.0): {}\n",
+        )
+        .unwrap();
+    }
+
+    /// Every lock-text refusal is exactly the one the backend's own WET
+    /// call returns — code and words — and a package the backend accepts
+    /// has none.
+    #[tokio::test]
+    async fn pnpm_refusals_are_the_backends_own_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        pnpm_project(root);
+        let rec = record();
+        let purls = [
+            "pkg:npm/pkg-a@1.0.0",
+            "pkg:npm/pkg-b@1.0.0",
+            "pkg:npm/pkg-z@1.0.0",
+        ];
+        let packages: Vec<(&str, &PatchRecord)> = purls.iter().map(|p| (*p, &rec)).collect();
+        let refusals = lock_text_refusals(root, &packages).await;
+        assert_eq!(refusals[0], None, "pkg-a is wireable");
+        let nowhere = root.join("not-installed");
+        let sources = PatchSources {
+            blobs_path: &nowhere,
+            packages_path: None,
+            diffs_path: None,
+            mem_blobs: None,
+        };
+        for (i, code) in [
+            (1, "vendor_lock_entry_unsupported"),
+            (2, "vendor_lock_entry_not_found"),
+        ] {
+            let backend = vendor_npm_any(
+                purls[i],
+                nowhere.as_path(),
+                root,
+                &rec,
+                &sources,
+                "t",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let VendorOutcome::Refused { code: got, detail } = backend else {
+                panic!("the backend must refuse {}", purls[i]);
+            };
+            assert_eq!(got, code);
+            assert_eq!(refusals[i], Some((got, detail)), "{}", purls[i]);
+        }
+    }
+
+    /// Only the pnpm / yarn classic / yarn berry gates answer: a
+    /// package-lock project refuses nothing here, whatever its backend does.
+    #[tokio::test]
+    async fn other_flavors_refuse_nothing_early() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"t","version":"0.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{"name":"t","version":"0.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"t","version":"0.0.0"}}}"#,
+        )
+        .unwrap();
+        let rec = record();
+        assert_eq!(
+            lock_text_refusals(root, &[("pkg:npm/pkg-z@1.0.0", &rec)]).await,
+            vec![None]
+        );
     }
 }
 
@@ -1354,5 +1585,130 @@ mod tests {
         assert_eq!(npm_use, None);
         assert_eq!(yarn_use, None);
         assert_eq!(bun_use, None);
+    }
+
+    // ── download-plan pre-flight routing ──────────────────────────────────
+
+    const OTHER_UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
+
+    fn record(uuid: &str) -> PatchRecord {
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    /// A v9 pnpm project with two patched packages: `left-pad` the backend
+    /// vendors, `peer-pad` it refuses (a peer-suffixed snapshot key).
+    async fn pnpm_project(root: &Path) {
+        touch(
+            root,
+            "package.json",
+            r#"{ "name": "plan", "dependencies": { "left-pad": "1.3.0", "peer-pad": "1.0.0" } }"#,
+        )
+        .await;
+        touch(
+            root,
+            PNPM_LOCK,
+            "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+      peer-pad:
+        specifier: 1.0.0
+        version: 1.0.0(react@18.2.0)
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+
+  peer-pad@1.0.0:
+    resolution: {integrity: sha512-peerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpee==}
+
+snapshots:
+
+  left-pad@1.3.0: {}
+
+  peer-pad@1.0.0(react@18.2.0): {}
+",
+        )
+        .await;
+    }
+
+    /// The download plan's pre-flight routes by the same probe as the
+    /// vendoring and answers in input order: the package the flavor
+    /// backend vendors is admitted, the one it refuses carries that
+    /// backend's own code, and a project the probe refuses refuses every
+    /// package with the probe's code.
+    #[tokio::test]
+    async fn preflight_routes_by_flavor_and_answers_in_input_order() {
+        let (left, peer) = (record(UUID), record(OTHER_UUID));
+        let packages: [(&str, &PatchRecord); 3] = [
+            ("pkg:npm/peer-pad@1.0.0", &peer),
+            ("pkg:npm/left-pad@1.3.0", &left),
+            ("pkg:npm/absent@0.0.1", &left),
+        ];
+
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(tmp.path()).await;
+        assert_eq!(
+            preflight_packages(tmp.path(), &packages).await,
+            vec![
+                Err("vendor_lock_entry_unsupported"),
+                Ok(()),
+                Err("vendor_lock_entry_not_found"),
+            ]
+        );
+
+        // The probe's own refusals apply to every package.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            preflight_packages(tmp.path(), &packages).await,
+            vec![Err("vendor_lockfile_missing"); 3]
+        );
+        touch(tmp.path(), ".pnp.cjs", "/* pnp */").await;
+        touch(tmp.path(), "package-lock.json", "{}").await;
+        assert_eq!(
+            preflight_packages(tmp.path(), &packages).await,
+            vec![Err("vendor_yarn_berry_unsupported"); 3]
+        );
+
+        // Malformed coordinates refuse before any read, as the backends do
+        // — even in a project the backend's own read then refuses (here
+        // the pnpm pair with its `package.json` gone): the loop guards the
+        // coordinates first, so the plan's code is the loop's for both.
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(tmp.path()).await;
+        let bad_uuid = record("not-a-uuid");
+        assert_eq!(
+            preflight_packages(tmp.path(), &[("pkg:npm/left-pad@1.3.0", &bad_uuid)]).await,
+            vec![Err("unsafe_coordinates")]
+        );
+        tokio::fs::remove_file(tmp.path().join("package.json"))
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight_packages(
+                tmp.path(),
+                &[
+                    ("pkg:npm/left-pad@1.3.0", &bad_uuid),
+                    ("pkg:npm/left-pad@1.3.0", &left),
+                ],
+            )
+            .await,
+            vec![Err("unsafe_coordinates"), Err("vendor_lockfile_missing")]
+        );
+        assert_eq!(preflight_packages(tmp.path(), &[]).await, Vec::new());
     }
 }

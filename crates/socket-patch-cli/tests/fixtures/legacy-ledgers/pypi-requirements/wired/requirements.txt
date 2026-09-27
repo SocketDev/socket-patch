@@ -1,0 +1,2 @@
+./.socket/vendor/pypi/11111111-1111-4111-8111-000000000001/alpha-1.0.0-py3-none-any.whl --hash=sha256:9064609f1885c0bffb2e651f3339a6833010a9d388d2dadb5ddc2a629129574d  # socket-patch vendor: alpha==1.0.0
+./.socket/vendor/pypi/11111111-1111-4111-8111-000000000002/beta-1.0.0-py3-none-any.whl --hash=sha256:5f2338b259764f7a63e5a9234c9b18d7ccd556bd76f6b31da48c4e2018c0e17e  # socket-patch vendor: beta==1.0.0

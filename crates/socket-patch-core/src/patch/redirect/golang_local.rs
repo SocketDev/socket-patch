@@ -37,13 +37,13 @@ use crate::vendor::common::{
 };
 
 use crate::constants::SOCKET_DIR;
-use crate::patch::copy_tree::fresh_copy;
 use crate::patch::path_safety;
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::go_mod_edit::{
     self, read_replace_entries, read_required_versions, replace_target_path, ReplaceOwner,
     GO_PATCHES_DIR,
 };
+use crate::vendor::PackageSource;
 
 /// A discrepancy between the committed redirect artifacts and the manifest,
 /// reported by [`verify_go_redirect_state`].
@@ -167,11 +167,11 @@ pub fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
 /// * `base_rel` — the project-relative copy base ([`GO_PATCHES_DIR`] for
 ///   apply's redirect, `<GO_VENDOR_DIR>/<uuid>` for the vendor backend).
 #[allow(clippy::too_many_arguments)]
-pub async fn apply_go_redirect(
+pub async fn apply_go_redirect<'a>(
     purl: &str,
     module: &str,
     version: &str,
-    pristine_src: &Path,
+    pristine_src: impl Into<PackageSource<'a>>,
     project_root: &Path,
     base_rel: &str,
     files: &HashMap<String, PatchFileInfo>,
@@ -180,6 +180,7 @@ pub async fn apply_go_redirect(
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
+    let pristine_src = pristine_src.into();
     // SECURITY: refuse coordinates that would escape the copy base.
     // A `..`/separator-laden `module`/`version` (a tampered manifest PURL) would
     // otherwise make `fresh_copy` + the apply pipeline write the patched tree to
@@ -242,6 +243,19 @@ pub async fn apply_go_redirect(
     if dry_run {
         // Verify (read-only) against the pristine source for an accurate
         // "would patch" report, without creating the copy or editing go.mod.
+        // The verify reads it, so a lazily-fetched source materialises here.
+        let pristine_src = match pristine_src.materialize().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                return synthesized_result(
+                    purl,
+                    &copy_dir,
+                    Vec::new(),
+                    false,
+                    Some(format!("failed to copy pristine source: {e}")),
+                )
+            }
+        };
         let mut result =
             apply_package_patch(purl, pristine_src, files, sources, uuid, true, policy).await;
         result.package_path = copy_dir.display().to_string();
@@ -256,8 +270,11 @@ pub async fn apply_go_redirect(
         return already_patched_result(purl, &copy_dir, files);
     }
 
-    // Fresh copy pristine → copy_dir.
-    if let Err(e) = fresh_copy(pristine_src, &copy_dir, None).await {
+    // Materialise pristine → copy_dir: a module-cache source is copied, a
+    // fetched one is written straight here from the verified module zip
+    // (unless an earlier branch already extracted it, which `stage_into`
+    // copies from instead).
+    if let Err(e) = pristine_src.stage_into(&copy_dir, None).await {
         teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return synthesized_result(
             purl,
@@ -640,7 +657,12 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
     if tokio::fs::metadata(&go_mod).await.is_ok() {
         return Ok(());
     }
-    crate::utils::fs::atomic_write_bytes(&go_mod, format!("module {module}\n").as_bytes()).await
+    let body = format!("module {module}\n");
+    if crate::utils::durability::in_artifact_scope() {
+        crate::utils::fs::atomic_write_artifact(&go_mod, body.as_bytes()).await
+    } else {
+        crate::utils::fs::atomic_write_bytes(&go_mod, body.as_bytes()).await
+    }
 }
 
 /// Recursively find every patched-copy module dir under `go_patches_root`,

@@ -11,6 +11,7 @@
 
 use serde_json::json;
 use socket_patch_core::api::client::{ApiClient, ApiClientOptions, ApiError};
+use socket_patch_core::api::retry::{ApiRetryPolicy, RetryHooks};
 use wiremock::matchers::{body_json, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -232,14 +233,17 @@ async fn proxy_batch_over_capacity_503_surfaces_without_fallback() {
         .await;
     mount_by_package(&server, by_package_response_body(), 0).await;
 
-    let client = proxy_client(&server.uri());
+    // Single-answer classification: retries off (the bounded 429 / 503
+    // retry is pinned in api_retry_e2e.rs).
+    let client =
+        proxy_client(&server.uri()).with_api_retry(ApiRetryPolicy::none(), RetryHooks::default());
     let err = client
         .search_patches_batch(&[PURL.to_string()])
         .await
         .expect_err("over-capacity 503 must surface");
     assert!(
-        matches!(&err, ApiError::Other(msg) if msg.contains("503")),
-        "over-capacity 503 must be Other with the status embedded; got: {err:?}"
+        matches!(&err, ApiError::ServiceUnavailable(msg) if msg.contains("503")),
+        "over-capacity 503 must be ServiceUnavailable with the status embedded; got: {err:?}"
     );
 }
 
@@ -254,7 +258,10 @@ async fn proxy_batch_429_surfaces_as_rate_limited_without_fallback() {
         .await;
     mount_by_package(&server, by_package_response_body(), 0).await;
 
-    let client = proxy_client(&server.uri());
+    // Single-answer classification: retries off (the bounded 429 / 503
+    // retry is pinned in api_retry_e2e.rs).
+    let client =
+        proxy_client(&server.uri()).with_api_retry(ApiRetryPolicy::none(), RetryHooks::default());
     let err = client
         .search_patches_batch(&[PURL.to_string()])
         .await
