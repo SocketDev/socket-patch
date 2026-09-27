@@ -449,6 +449,19 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         env["vendor"]["summary"]["applied"], 0,
         "({tag}) nothing may be vendored: {env}"
     );
+    let vendor_events_for_purl: Vec<&serde_json::Value> = env["vendor"]["events"]
+        .as_array()
+        .map(|events| events.iter().filter(|e| e["purl"] == PURL).collect())
+        .unwrap_or_default();
+    assert!(
+        vendor_events_for_purl.is_empty(),
+        "({tag}) the vendor step must emit nothing for the package refused in the \
+         download phase: {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["failed"], 0,
+        "({tag}) the refusal is not double-counted by the vendor step: {env}"
+    );
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
         lock_before,
