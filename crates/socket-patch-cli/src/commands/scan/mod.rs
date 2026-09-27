@@ -851,7 +851,7 @@ pub(super) const VENDOR_SUPERSEDES_REDIRECT: &str = "vendor_supersedes_redirect"
 pub(super) const REDIRECT_PRUNE_IGNORED: &str = "redirect_prune_ignored";
 pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
     "--prune has no effect with --mode hosted: the hosted flow rewrites lockfiles only and \
-     runs no GC sweep of `.socket/` state; run `scan --prune` (agent mode) or \
+     runs no GC sweep of `.socket/` state; run `scan --mode agent --prune` or \
      `scan --mode vendored --prune` to garbage-collect";
 
 /// The PURLs claimed by BOTH the hosted redirect ledger
@@ -1752,13 +1752,15 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         .filter(|pkg| args.common.purl_ecosystem_selected(&pkg.purl))
         .collect();
 
-    let filtered_crawled: Vec<_> = if args.packages.is_empty() {
+    let package_specs: Vec<&String> =
+        args.packages.iter().filter(|s| !s.trim().is_empty()).collect();
+    let filtered_crawled: Vec<_> = if package_specs.is_empty() {
         filtered_crawled
     } else {
         filtered_crawled
             .into_iter()
             .filter(|pkg| {
-                args.packages
+                package_specs
                     .iter()
                     .any(|spec| package_spec_matches(spec, &pkg.purl))
             })
@@ -2680,16 +2682,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Scan always takes the top-ranked patch (see `selection_args`).
     let mut select_common = selection_args(&args.common);
     select_common.silent |= report_only;
-    // Never true for scan: `selection_args` sets `yes`.
-    if !select_common.silent
-        && super::get::selection_has_choice(
-            &all_search_results,
-            can_access_paid_patches,
-            &select_common,
-        )
-    {
-        eprintln!();
-    }
     let selected: Vec<PatchSearchResult> =
         match select_patches(&all_search_results, can_access_paid_patches, &select_common) {
             Ok(s) => s,

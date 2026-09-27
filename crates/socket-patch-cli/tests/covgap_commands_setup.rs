@@ -1320,7 +1320,7 @@ fn remove_human_real_run_prints_python_gem_composer_sections() {
     let (code, stdout, stderr) = run(cwd, &["setup", "--remove", "--yes"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("Will remove the socket-patch-hook dependency from:"),
+        stdout.contains("Will remove the socket-patch[hook] dependency from:"),
         "the python remove preview section must print; stdout=\n{stdout}"
     );
     assert!(
@@ -1511,7 +1511,7 @@ fn setup_human_preview_and_commit_notes_for_python_and_gem() {
     let (code, stdout, stderr) = run(cwd, &["setup", "--yes"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("Python manifests to update (socket-patch-hook):"),
+        stdout.contains("Python manifests to update (socket-patch[hook]):"),
         "the python preview section must print; stdout=\n{stdout}"
     );
     assert!(

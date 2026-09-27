@@ -1935,7 +1935,7 @@ fn format_remove_preview(
         .filter(|r| r.status == PthStatus::Updated)
         .collect();
     if !py_remove.is_empty() {
-        out.push_str("\nWill remove the socket-patch-hook dependency from:\n");
+        out.push_str("\nWill remove the socket-patch[hook] dependency from:\n");
         for r in &py_remove {
             out.push_str(&format!("  - {}\n", pathdiff(&r.path, cwd)));
         }
@@ -2457,7 +2457,7 @@ fn format_setup_preview(
         .filter(|r| r.status == PthStatus::Updated)
         .collect();
     if !py_changes.is_empty() {
-        out.push_str("\nPython manifests to update (socket-patch-hook):\n");
+        out.push_str("\nPython manifests to update (socket-patch[hook]):\n");
         for r in &py_changes {
             out.push_str(&format!("  + {}\n", pathdiff(&r.path, cwd)));
         }
@@ -2892,7 +2892,7 @@ mod tests {
             "\nProposed changes:\n\nWill remove socket-patch from:\n  - package.json\n    \
              postinstall:    \"socket-patch apply && echo hi\"\n    -> postinstall: \"echo \
              hi\"\n    dependencies:    \"socket-patch apply\"\n    -> dependencies: \
-             (removed)\n\nWill remove the socket-patch-hook dependency from:\n  - \
+             (removed)\n\nWill remove the socket-patch[hook] dependency from:\n  - \
              requirements.txt\n\nGem: remove the socket-patch Bundler plugin wiring from:\n  \
              - Gemfile\n"
         );

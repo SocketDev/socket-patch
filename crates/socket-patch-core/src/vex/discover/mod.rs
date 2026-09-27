@@ -1725,8 +1725,8 @@ pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uui
 /// The root files a vendored `eco` artifact can be wired from — the vendor
 /// backends' lockfile / wiring config for that ecosystem (npm: every
 /// npm-family lock the `vendor_probe` table flags, `vlt-lock.json`
-/// included; cargo: only the pre-v5 `.cargo/config.toml` / `.cargo/config`
-/// `[patch.crates-io]` spellings, not the v5 root `Cargo.toml`; maven /
+/// included; cargo: the root `Cargo.toml` `[patch.crates-io]` table and the
+/// pre-v5 `.cargo/config.toml` / `.cargo/config` spellings; maven /
 /// nuget: the repository / source that serves the vendored dir). Manifests
 /// such as package.json are deliberately absent: the lock is what the
 /// install consumes.
@@ -1742,7 +1742,7 @@ pub fn vendored_wiring_probe_files(root: &Path, eco: &str) -> Vec<String> {
             "pyproject.toml",
             "hatch.toml",
         ],
-        "cargo" => vec![".cargo/config.toml", ".cargo/config"],
+        "cargo" => vec!["Cargo.toml", ".cargo/config.toml", ".cargo/config"],
         "golang" => vec!["go.mod"],
         "gem" => vec!["Gemfile.lock"],
         "composer" => vec!["composer.lock"],
@@ -2951,7 +2951,7 @@ mod tests {
                     "uv.lock",
                 ],
             ),
-            ("cargo", &[".cargo/config", ".cargo/config.toml"]),
+            ("cargo", &[".cargo/config", ".cargo/config.toml", "Cargo.toml"]),
             ("golang", &["go.mod"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),
@@ -3021,6 +3021,15 @@ mod tests {
             format!("[patch.crates-io]\nsmallvec = {{ path = \".socket/vendor/cargo/{UUID_A}/smallvec-1.6.0\" }}\n"),
         );
         assert!(vendored_wiring_live(c.root(), &[], "cargo", UUID_A).await);
+        // v5 cargo wiring lives in the root Cargo.toml (repair rebuilds such
+        // entries with no recorded wiring).
+        let m = Project::new();
+        m.write(
+            "Cargo.toml",
+            format!("[package]\nname = \"app\"\n\n[patch.crates-io]\nsmallvec = {{ path = \".socket/vendor/cargo/{UUID_A}/smallvec-1.6.0\" }}\n"),
+        );
+        assert!(vendored_wiring_live(m.root(), &[], "cargo", UUID_A).await);
+        assert!(!vendored_wiring_live(m.root(), &[], "cargo", UUID_B).await);
     }
 
     /// Cross-package-manager union: one root carrying the committed hosted

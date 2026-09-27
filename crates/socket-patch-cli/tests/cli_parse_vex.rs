@@ -71,6 +71,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_FORCE",
     // ScanArgs-specific
     "SOCKET_BATCH_SIZE",
+    "SOCKET_SCAN_PACKAGES",
     "SOCKET_ALL_RELEASES",
 ];
 

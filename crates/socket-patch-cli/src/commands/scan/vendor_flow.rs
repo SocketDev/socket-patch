@@ -25,7 +25,6 @@ use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
-use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
@@ -618,12 +617,6 @@ async fn run_vendor_interactive_path(
     // The download phase is quiet about its own header in vendored mode
     // (only the manifest-mode download prints it), so this arm does.
     if !args.common.silent && !selected.is_empty() {
-        // Extra separator on a terminal run without `--yes` (a vestige of
-        // the removed confirm prompt); otherwise the listing's trailing
-        // blank line already separates the sections.
-        if !args.common.yes && std::io::stdin().is_terminal() {
-            eprintln!();
-        }
         eprintln!(
             "Downloading {}...",
             plural(selected.len(), "patch", "patches")

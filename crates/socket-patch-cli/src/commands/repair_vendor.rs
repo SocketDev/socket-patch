@@ -755,7 +755,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_uuid_mismatch",
                     "the manifest's patch uuid moved on; run `socket-patch vendor` (or \
-                     `scan --vendor`) to re-vendor",
+                     `scan --mode vendored`) to re-vendor",
                 ),
             );
             continue;
