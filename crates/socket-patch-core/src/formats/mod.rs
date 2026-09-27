@@ -19,8 +19,14 @@
 //! stays with the caller, so the disk engines and the in-memory hosted
 //! engine (`MemoryProject`) share one parse per format. An architecture
 //! test below enforces it.
+//!
+//! [`registry()`] is the one table of which project files carry a lock or
+//! its wiring, and in which roles.
 
 pub mod pnpm;
+pub mod registry;
+
+pub use registry::registry;
 
 /// The default upstream resolution a hosted pin is restored to: the
 /// registry artifact of `name@version` as the package manager itself
