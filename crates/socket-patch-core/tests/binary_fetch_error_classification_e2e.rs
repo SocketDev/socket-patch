@@ -1,11 +1,12 @@
-//! The binary transport path (`fetch_blob` / `fetch_diff`, both sharing
-//! `fetch_binary`) must classify authenticated 401 / 403 / 429 responses the
-//! same way the JSON path does.
+//! Regression: the binary transport path (`fetch_blob` / `fetch_diff`,
+//! both sharing `fetch_binary`) must classify authenticated
+//! 401 / 403 / 429 responses the same way the JSON path does.
 //!
-//! Collapsing them into `ApiError::Other` would defeat `is_fallback_candidate`
-//! (which keys on `Unauthorized` / `Forbidden`), so a stale/revoked token would
-//! block binary downloads instead of rerouting to the public proxy, and the
-//! tailored 401/403/429 operator messages would be lost.
+//! Before the fix, `fetch_binary` collapsed every non-OK/404 status into
+//! `ApiError::Other`. That defeated `is_fallback_candidate` (which keys on
+//! `Unauthorized` / `Forbidden`) so a stale/revoked token blocked binary
+//! downloads instead of rerouting to the public proxy, and the tailored
+//! 401/403/429 operator messages were lost.
 //!
 //! These tests drive the *authenticated* `fetch_binary` branch (token + org
 //! slug, not public-proxy) against a mock server, so they exercise exactly the
@@ -111,7 +112,7 @@ async fn fetch_blob_429_classifies_as_rate_limited_and_not_fallback() {
 #[tokio::test]
 async fn fetch_blob_500_still_classifies_as_other() {
     // Genuine server errors must keep flowing through to `Other` with the
-    // status code embedded — the classification must not over-reach.
+    // status code embedded — the fix must not over-classify.
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/my-org/patches/blob/{VALID_HASH}")))

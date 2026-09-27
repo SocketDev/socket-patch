@@ -1,10 +1,14 @@
 //! `scan --silent` contract tests.
 //!
-//! CLI_CONTRACT.md defines `--silent` as "Errors only": the "No packages
-//! found" hint, the "Found N packages" / "Found N patches" stderr chatter,
-//! the results table, the summary, the "Patches to apply" listing, the
-//! post-apply GC line, and the nested apply step's progress must all be
-//! muted under `--silent` (not just gated on `!json`).
+//! CLI_CONTRACT.md defines `--silent` as "Errors only". Regression
+//! guard: `scan` gated all of its human-readable output on `!json`
+//! alone — the "No packages found" hint, the "Found N packages" /
+//! "Found N patches" stderr chatter, the results table, the summary,
+//! the "Patches to apply" listing, and the post-apply GC line all
+//! printed under `--silent` — and the human download path hardcoded
+//! `silent: false` into `DownloadParams`, so the nested apply step's
+//! progress printed too. Same bug class previously fixed in `list`,
+//! `repair`, `get`, and `remove`.
 //!
 //! The apply-flow test runs against a wiremock API (same fixture shape
 //! as `scan_sync_e2e.rs`) so the full human-mode scan→select→download→
@@ -361,8 +365,9 @@ fn seed_manifest_with_gone_entry(root: &Path) {
 
 /// The vendored-mode GC line must honor `--silent` like the apply-mode one
 /// does: `scan --vendor --prune --silent --yes` prints nothing when it
-/// succeeds: `run_vendor_interactive_path` must not print "GC: pruned N
-/// manifest entries and removed …" (or the vendored-revert GC line).
+/// succeeds. Regression guard: `run_vendor_interactive_path` printed
+/// "GC: pruned N manifest entries and removed …" (and the vendored-revert GC line)
+/// unconditionally.
 #[tokio::test]
 async fn scan_vendor_silent_gc_prints_nothing() {
     let purl = "pkg:npm/silent-target@1.0.0";
@@ -517,8 +522,10 @@ fn scan_silent_vex_failure_keeps_error_output() {
 /// under `--silent` too ("errors only", not "nothing"): `scan --redirect
 /// --vex out.json --silent` with nothing to attest (the reference is
 /// forbidden, no manifest exists) exits 1, and the failure message must
-/// still reach stderr: `run_redirect`'s `vex_error` must not sit inside the
-/// `!silent` human branch (the non-redirect twin is
+/// still reach stderr. Regression guard: `run_redirect` printed its
+/// `vex_error` inside the `!silent` human branch, so the run failed with
+/// exit 1 and no output at all — the same bug `embed_vex_human` already
+/// fixed on the non-redirect path (see
 /// `scan_silent_vex_failure_keeps_error_output` above).
 #[tokio::test]
 async fn scan_redirect_silent_vex_failure_keeps_error_output() {

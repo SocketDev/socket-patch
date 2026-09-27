@@ -289,8 +289,8 @@ async fn gem_crawler_finds_real_installed_gem() {
     }
     let tmp = tempfile::tempdir().expect("tempdir");
     let lib_file = install_colorize(tmp.path());
-    // A bare scan (hosted mode) rewires lockfiles only; capture the installed
-    // file so we can prove it is left byte-for-byte untouched.
+    // A scan WITHOUT --sync is read-only; capture the installed file so we can
+    // prove it is left byte-for-byte untouched after discovery.
     let before_scan = std::fs::read(&lib_file).expect("read colorize.rb before scan");
 
     let server = MockServer::start().await;
@@ -358,7 +358,9 @@ async fn gem_crawler_finds_real_installed_gem() {
         "crawler did not discover the installed gem: no batch request carried {purl}"
     );
 
-    // A bare scan (hosted mode) must never write the installed gem copy.
+    // A discovery-only scan (no --sync, no --apply) must not mutate any
+    // installed file. This catches a regression where scan silently writes
+    // patches behind the user's back during a read-only pass.
     let after_scan = std::fs::read(&lib_file).expect("read colorize.rb after scan");
     assert_eq!(
         after_scan,

@@ -48,7 +48,7 @@
 //! is pinned from both sides as [`TARBALL_INTEGRITY_ENFORCED_FROM`]. The
 //! vendored twin lives in `e2e_vendor_bun_build.rs`.
 //!
-//! The get-driven twin (v4.0) runs step 3 as `get <uuid> --mode hosted`
+//! The get-driven twin (v3.6) runs step 3 as `get <uuid> --mode hosted`
 //! instead of `scan --mode hosted` — same hosted engine by construction
 //! (get routes through scan's `run_redirect_selected`), so the lock/ledger
 //! assertions and the fresh-checkout proof are shared via [`HostedDriver`].
@@ -549,7 +549,7 @@ enum HostedDriver {
     /// `scan --mode hosted --vex …` — the original capstone path, in-run
     /// VEX assertions included.
     ScanVex,
-    /// `get <uuid> --mode hosted` — the v4.0 per-advisory selector. The
+    /// `get <uuid> --mode hosted` — the v3.6 per-advisory selector. The
     /// UUID identifier path is exempt from installed narrowing, so the
     /// fixture's view + reference mocks are all it needs. No manifest, no
     /// blobs, no vex flags (get has none).
@@ -1203,7 +1203,7 @@ async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
     assert_patched_fresh_install(&fx);
 }
 
-/// get-driven twin (v4.0): `get <uuid> --mode hosted` must land the SAME
+/// get-driven twin (v3.6): `get <uuid> --mode hosted` must land the SAME
 /// hosted rewrite as the scan capstone — same engine by construction — and a
 /// fresh checkout carrying only package.json + bun.lock + .socket/ must
 /// install the patched bytes from the hosted tarball. The fixture's GetUuid

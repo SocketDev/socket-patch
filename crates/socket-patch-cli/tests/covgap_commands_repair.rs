@@ -2,7 +2,7 @@
 //! output arms that every existing suite drove through `--json`, plus the
 //! warn-and-continue housekeeping contracts.
 //!
-//! Ranges pinned:
+//! Ranges pinned (audited at d5e1815, file unchanged since):
 //!   * the loud `manifest_not_found` / `repair_failed` stderr prints,
 //!   * the loud "All {artifacts} are present locally." summary,
 //!   * the `... and N more` truncation of the offline warning (>5 missing)
@@ -18,7 +18,7 @@
 //!
 //! Everything runs offline or against a wiremock server — no real hosts.
 //! Fixtures mirror `repair_invariants.rs` / `repair_vendor_e2e.rs` (this
-//! suite owns its own copies).
+//! suite owns its own copies; those files are owned by other agents).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

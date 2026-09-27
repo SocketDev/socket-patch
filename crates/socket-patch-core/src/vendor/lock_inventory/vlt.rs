@@ -1,5 +1,5 @@
 //! `vlt-lock.json`: the entry model lockfile discovery shares
-//! ([`vlt_lock_nodes`]) and the registry view.
+//! ([`vlt_lock_nodes`]) and the registry view (DESIGN §4.8).
 
 #[cfg(test)]
 use std::path::Path;

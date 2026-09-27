@@ -245,7 +245,7 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
     let lock = std::fs::read_to_string(boot.join("yarn.lock")).ok()?;
     // yarn 4.0.x writes the bare hex, 4.1+ `10c0/<hex>`: the API form is the
     // prefixed one. A lock with neither is a harness failure, never a
-    // silent pass.
+    // silent pass (the old `?` here returned before any assertion ran).
     let checksum = yarn_berry_common::yarn_written_checksum(&lock);
     if checksum.is_none() {
         skip!(
@@ -270,7 +270,7 @@ struct BerryRedirectFixture {
 }
 
 /// Which CLI front door drives the hosted engine. Both consume the SAME
-/// engine by construction (v4.0): `scan --mode hosted` discovers the dep,
+/// engine by construction (v3.6): `scan --mode hosted` discovers the dep,
 /// while `get <uuid> --mode hosted` names the patch explicitly (the uuid
 /// identifier path is exempt from installed narrowing and needs only the
 /// view + reference mocks, which the fixture mounts anyway). get has no
@@ -698,7 +698,7 @@ async fn berry_redirect_fresh_checkout_installs_patched_bytes() {
     hosted_manifestless_vex_matrix(&fx, HostedDriver::Scan);
 }
 
-/// get-driven hosted twin (v4.0): `get <uuid> --mode hosted --json --yes`
+/// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
 /// routes through the SAME hosted engine as `scan --mode hosted`, so the
 /// berry chain must hold unchanged — including the `10c0` cacheKey bootstrap
 /// (the fixture still resolves the patched tarball with a real yarn to pin

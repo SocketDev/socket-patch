@@ -11,9 +11,10 @@
 //!    (`a_view_whose_only_contentless_files_are_zero_delta_vendors`).
 //! 2. A file the patch CHANGES that is served without content is genuinely
 //!    unsatisfiable. That is a broken PACKAGE, not a broken run: it gets
-//!    its own `failed` event and the rest of the run carries on — it must
-//!    not make the WHOLE run bail `no_local_source` with every OTHER
-//!    package left unvendored without a word.
+//!    its own `failed` event and the rest of the run carries on. A single
+//!    such patch used to make the WHOLE run bail `no_local_source` — exit
+//!    1, `status: error`, zero events, and every OTHER package in the
+//!    manifest left unvendored without a word.
 //!
 //! A package whose patch content cannot be obtained is an unsatisfiable
 //! package like any other (`vendor_fetch_failed`, `redirect_revert_failed`,
@@ -552,9 +553,8 @@ async fn a_dropped_package_is_never_granted_a_service_download() {
 
 // ── the other caller of the per-package drop ────────────────────────────
 //
-// `drop_unstageable` is wired into `vendor` (above) and `scan --mode
-// vendored` / `get --mode vendored` (`scan::vendor_flow`); `repair` drops
-// unstageable candidates with its own partition in `repair_vendor`. The vendored
+// `drop_unstageable` is wired into `vendor` (above), `scan --mode vendored`
+// / `get --mode vendored` (`scan::vendor_flow`) and `repair`. The vendored
 // SCAN fold — `Ok(staging_errors || engine_errors)` — has its own error
 // path, and every existing suite that touches it mounts a single-patch
 // manifest, so it only ever exercised the preserved whole-run bail.

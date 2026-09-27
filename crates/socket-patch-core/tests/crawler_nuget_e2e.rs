@@ -504,8 +504,8 @@ async fn crawl_all_handles_unreadable_pkg_path() {
 }
 
 /// `scan_global_cache_package` returns None when the per-name version
-/// directory is unreadable — drives its empty-listing path
-/// (`list_dir_sync` on an unreadable dir).
+/// directory is unreadable — drives the inner read_dir Err arm at
+/// nuget_crawler.rs:236.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -552,7 +552,7 @@ async fn crawl_all_handles_unreadable_version_dir() {
 }
 
 /// `scan_package_dir` skips entries that are not directories — covers
-/// `classify_package_entry`'s non-directory skip. Drive this by staging
+/// the `if !ft.is_dir()` continue arm at L183. Drive this by staging
 /// a plain file alongside a valid global-cache package.
 #[tokio::test]
 #[serial_test::parallel]
@@ -580,7 +580,7 @@ async fn crawl_all_skips_files_at_top_level() {
 }
 
 /// `scan_package_dir` short-circuits when the package dir doesn't
-/// exist — covers its empty-listing path for a missing dir.
+/// exist — covers `read_dir(...).await` Err arm at L169.
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_missing_pkg_path_returns_empty() {
@@ -609,7 +609,7 @@ fn nuget_crawler_default_and_new_construct_cleanly() {
 
 /// `global=true` with no `global_prefix` falls through to `nuget_home`
 /// which honors NUGET_PACKAGES. When the resulting home exists, the
-/// crawler returns it as the only path.
+/// crawler returns it as the only path (line 38-39).
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_global_mode_returns_nuget_home() {
@@ -635,7 +635,8 @@ async fn get_nuget_package_paths_global_mode_returns_nuget_home() {
 }
 
 /// `global=true` but NUGET_PACKAGES points at a non-existent dir →
-/// `is_dir` check fails and the crawler returns an empty list.
+/// `is_dir` check fails and the crawler returns an empty list
+/// (line 41).
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_global_mode_missing_home_returns_empty() {
@@ -673,8 +674,8 @@ async fn get_nuget_package_paths_global_mode_missing_home_returns_empty() {
 }
 
 /// `is_dotnet_project` accepts a NuGet.Config marker without any
-/// project file extensions — covers the case-insensitive `nuget.config`
-/// marker branch.
+/// project file extensions — covers the L355 `if name == "NuGet.Config"`
+/// branch.
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_with_nuget_config_falls_back_to_global() {
@@ -851,8 +852,7 @@ async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_path
 }
 
 /// Malformed JSON in project.assets.json must not crash — discovery
-/// just skips it (the `from_str(...).ok()?` arm in
-/// `parse_project_assets_package_folders`).
+/// just skips it (line 442 `from_str.ok()?` arm).
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_assets_json_malformed_skipped() {

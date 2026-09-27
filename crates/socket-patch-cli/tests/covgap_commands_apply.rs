@@ -1,4 +1,4 @@
-//! Coverage-gap tests for `commands/apply.rs`.
+//! Coverage-gap tests for `commands/apply.rs` (2026-09 audit).
 //!
 //! The uncovered surface of apply.rs is dominated by HUMAN-mode output —
 //! nearly every existing apply test passes `--json` and/or `--silent` — plus
@@ -13,8 +13,7 @@
 //!   3. `reconcile_local_go`'s human report (`Removed` / `Would remove`
 //!      N stale go patch redirect(s));
 //!   4. mismatch-blob prefetch messages: the `--offline` warning, the
-//!      transient "Downloading ..." status resolving to the "Downloaded N
-//!      full patched blob(s)" result line, and the broken-TMPDIR
+//!      "Downloading N full patched blob(s)" line, and the broken-TMPDIR
 //!      transient-stage failure warning;
 //!   5. human-mode output block: "No patches to apply.", the no-matching-
 //!      packages warning, the npm per-package failure line, the dry-run
@@ -25,9 +24,7 @@
 //!   7. apply-loop wiring: a vendored release-variant base with its
 //!      installed tree PRESENT is skipped (not re-patched), and a qualified
 //!      singleton whose record holds only NEW files (no representative)
-//!      is treated as installed and applied; a ledger-only vendored
-//!      project with no manifest is the `noManifest` no-op;
-//!   8. the `apply --dry-run --vex` skip message.
+//!      is treated as installed and applied.
 //!
 //! Binary-driven throughout (`common::run_with_env`, `SOCKET_*`-scrubbed
 //! children), hand-written camelCase manifests, git-sha256 oracle,
@@ -181,7 +178,8 @@ fn write_drifted_go_manifest(root: &Path) {
 
 /// `apply --check --json` WITH drift: the machine-readable envelope carries
 /// one Failed event per drift with `errorCode: go_redirect_drift`, status
-/// `partialFailure`, exit 1.
+/// `partialFailure`, exit 1. (Every prior drift run was human/silent —
+/// the envelope had never been serialized.)
 #[test]
 fn check_json_with_drift_emits_failed_events_envelope() {
     let tmp = tempfile::tempdir().unwrap();
@@ -444,8 +442,8 @@ fn offline_mismatch_blob_gap_warns_and_fails_in_human_mode() {
     );
 }
 
-/// Online, human mode: the transient "Downloading ..." status resolves to
-/// the "Downloaded 1 full patched blob for mismatched files" result line, the blob is fetched from the
+/// Online, human mode: the "Downloading N full patched blob(s)..."
+/// progress line prints before the prefetch, the blob is fetched from the
 /// API into a transient overlay (never `.socket/blobs/`), and the mismatch
 /// is warn-overwritten with the verified patched bytes.
 #[tokio::test]
@@ -539,7 +537,8 @@ fn broken_tmpdir_surfaces_transient_blob_stage_warning() {
 // ═══════════ 5. human-mode apply output block ═══════════
 
 /// The empty-scope clean success prints "No patches to apply." — the
-/// postinstall-hook UX for fresh projects (json/silent suppress the line).
+/// postinstall-hook UX for fresh projects (previously covered only in
+/// json/silent modes, where the line is suppressed).
 #[test]
 fn empty_manifest_prints_no_patches_to_apply_in_human_mode() {
     let tmp = tempfile::tempdir().unwrap();
@@ -730,7 +729,7 @@ fn verbose_dry_run_prints_per_file_labels_and_hashes() {
 }
 
 /// A pnpm store layout gets the informational stderr note in human mode
-/// (json/silent mute it).
+/// (previously detected only under json/silent, where the note is muted).
 #[test]
 fn pnpm_layout_prints_informational_note_in_human_mode() {
     let tmp = tempfile::tempdir().unwrap();

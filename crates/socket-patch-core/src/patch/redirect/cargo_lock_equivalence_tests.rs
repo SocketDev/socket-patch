@@ -165,7 +165,7 @@ fn bound_matches_unbounded_on_hand_written_edges() {
     }
 }
 
-/// The large-lock shape: ≥1k blocks, where the unbounded search was
+/// The CG1 guard shape: ≥1k blocks, where the unbounded search was
 /// quadratic. Checked at every block body (what `plan_cargo_lock` asks for)
 /// and along the `next_lock_block` walk its dependents loop takes.
 #[test]

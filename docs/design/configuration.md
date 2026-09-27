@@ -98,11 +98,11 @@ UX policy and are ignored.
   Requires teaching the TS zod twin
   (`npm/socket-patch/src/schema/manifest-schema.ts`) to model `setup`.
   Precedence would be flag > env > `setup.defaults` > default.
-- **Env cleanup sweep**: core's direct env readers (`SOCKET_OFFLINE` in
-  `utils/env_compat.rs`, `SOCKET_TELEMETRY_DISABLED` in `telemetry.rs`)
-  still match only `1|true`, unlike `parse_bool_flag`'s vocabulary (the CLI
-  mirrors `--offline` into `SOCKET_OFFLINE=1`, so only a hand-set env value
-  sees the narrower dialect); consider `FORCE_COLOR` as an alias for `CLICOLOR_FORCE` in
+- **Env cleanup sweep** (separate task, agreed 2026-07-21): unify the four
+  bool-parsing dialects (`parse_bool_flag` vs stock `BoolishValueParser` on
+  `--all-releases`, bare clap bool on `get --one-off`, `env_truthy`'s
+  `1|true`-only match on the experimental gates and core's `SOCKET_OFFLINE`
+  reader); consider `FORCE_COLOR` as an alias for `CLICOLOR_FORCE` in
   `ui::color_enabled` (which already honors `NO_COLOR`, `CLICOLOR`,
   `CLICOLOR_FORCE` and `TERM=dumb`); document
   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` support in the README.

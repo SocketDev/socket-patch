@@ -231,8 +231,8 @@ fn mismatched_fallback_home_copy_is_nonfatal_when_store_patched() {
 }
 
 /// (b) Parity pin: with NO bundle-store copy, the fallback-home copy IS
-/// the primary install — a mismatch there is a loud failure (exit 1), as
-/// in plain apply.
+/// the primary install — a mismatch there keeps the historic loud
+/// failure (exit 1), exactly as plain apply behaved before #218.
 #[test]
 fn fallback_only_mismatch_keeps_loud_failure_parity() {
     let fx = build_fixture(false, b"totally different bytes\n", QUALIFIED_PURL);

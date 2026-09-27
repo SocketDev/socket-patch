@@ -247,7 +247,7 @@ fn expected_defaults(identifier: &str) -> Snap {
 fn defaults_with_only_required_identifier() {
     let a = parse_get(&["some-id"]);
     // Pin the *entire* default surface in one shot against the independent
-    // oracle. This covers every field (manifest_path,
+    // oracle. This covers fields the old test silently skipped (manifest_path,
     // proxy_url, offline, verbose, silent, dry_run, lock_timeout,
     // debug, no_telemetry, ecosystems) — any of which could regress to a
     // non-default and go unnoticed under a field-cherry-picked assertion.
@@ -491,7 +491,7 @@ fn download_mode_file() {
     assert_eq!(snapshot(&a), want);
 }
 
-// --- `--mode` selector (v4.0) --------------------------------------------
+// --- `--mode` selector (v3.6) --------------------------------------------
 //
 // `get --mode <hosted|vendored|agent>` reuses scan's `ScanMode` value-enum
 // (see cli_parse_scan.rs) so the two commands can never drift on mode

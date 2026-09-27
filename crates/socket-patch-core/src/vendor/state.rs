@@ -211,7 +211,7 @@ pub struct PipenvMeta {
 #[serde(rename_all = "camelCase")]
 pub struct VendorEntry {
     /// Vendor ecosystem dir name (`npm`, `cargo`, `golang`, `composer`,
-    /// `gem`, `pypi`, `nuget`, `maven`).
+    /// `gem`, `pypi`).
     pub ecosystem: String,
     /// Qualifier-free base PURL (`pkg:npm/lodash@4.17.21`). The map key is
     /// the manifest PURL (possibly qualified); this is the resolved base.
@@ -233,10 +233,9 @@ pub struct VendorEntry {
     /// npm: `package-lock` | `yarn-classic` | `yarn-berry` | `pnpm` |
     /// `pnpm-legacy` | `bun` | `vlt` (absent on pre-flavor entries ⇒
     /// `package-lock`; a `vlt` artifact is a package directory, whose
-    /// `fileInventory` excludes its `node_modules/`); pypi: `uv` |
-    /// `python-lock` | `requirements` | `hatch` | `poetry` | `pdm` |
-    /// `pipenv`. Reverts route on this and fail closed on flavors this build
-    /// has no backend for.
+    /// `fileInventory` excludes its `node_modules/`); pypi: `uv` | `requirements` |
+    /// `poetry` | `pdm` | `pipenv`. Reverts route on this and fail closed
+    /// on flavors this build has no backend for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flavor: Option<String>,
     /// pypi/uv extras.
@@ -613,8 +612,8 @@ fn parse_snapshot_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorStat
 /// questions for every patched package — which entry carries this uuid, and
 /// which wiring record already allows direct references — and a ledger
 /// holding a whole-file snapshot per wired file runs to megabytes, so an
-/// idempotent re-run (which writes no ledger at all) would otherwise parse
-/// the same bytes once per package. See [`ParseMemo`]: the read still happens every time,
+/// idempotent re-run (which writes no ledger at all) parsed the same bytes
+/// once per package. See [`ParseMemo`]: the read still happens every time,
 /// and a ledger something else rewrote between two packages differs in its
 /// bytes and is re-parsed.
 static STATE_MEMO: ParseMemo<VendorState> = ParseMemo::new();

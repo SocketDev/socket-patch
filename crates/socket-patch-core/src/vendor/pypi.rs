@@ -233,20 +233,16 @@ const SETUP_ALTERNATIVE: &str =
 /// uv > poetry > pdm > pipenv), and a lock-less tool MARKER refuses with a
 /// "run `<tool> lock`" pointer — falling through to `requirements.txt` when
 /// one exists (a marker alone must not block the requirements wiring):
-/// 1. `uv.lock` → uv;
-/// 2. standalone `pylock*.toml` / `*.py.lock` locks containing this package
-///    → python-lock;
-/// 3. `poetry.lock` → poetry;  4. `pdm.lock` → pdm;  5. `Pipfile.lock` → pipenv;
-/// 6. lock-less `[tool.uv]`/`[tool.poetry]`/`[tool.pdm]`/`Pipfile` →
+/// 1. `uv.lock` → uv;  2. `poetry.lock` → poetry;  3. `pdm.lock` → pdm;
+/// 4. `Pipfile.lock` → pipenv;
+/// 5. lock-less `[tool.uv]`/`[tool.poetry]`/`[tool.pdm]`/`Pipfile` →
 ///    `<tool>_no_lockfile` refusal unless requirements.txt exists;
-/// 7. `requirements.txt` → requirements;
-/// 8. `hatch.toml` / `[tool.hatch]` / hatchling build backend → hatch;
-/// 9. a lone pyproject → refuse;  10. nothing → refuse.
+/// 6. `requirements.txt` → requirements;
+/// 7. a lone pyproject → refuse;  8. nothing → refuse.
 ///
 /// When more than one tool lockfile coexists, the winner is wired and a LOUD
 /// `pypi_multiple_lockfiles` warning names the ignored locks — they go
-/// stale-but-valid, which is otherwise invisible. Standalone locks that don't
-/// contain the package get a `pypi_unmatched_lockfiles` warning instead.
+/// stale-but-valid, which is otherwise invisible.
 async fn detect_pypi_flavor(
     project_root: &Path,
     target: Option<(&str, &str)>,
@@ -558,14 +554,14 @@ pub async fn vendor_pypi<'a>(
 /// site.
 ///
 /// [`pipenv_stale_install_warning`] judges every patched package against the
-/// same venvs; re-listing the whole directory (a `.dist-info` scan plus a
-/// METADATA read per installed package) per judgement would answer one
-/// question about one purl. A vendor run never writes into a venv, so
+/// same venvs, and each judgement re-listed the whole directory (a
+/// `.dist-info` scan plus a METADATA read per installed package) to answer
+/// one question about one purl. A vendor run never writes into a venv, so
 /// one listing per site answers for every package that asks.
 ///
-/// The ONE thing this gives up, deliberately: an
+/// The ONE thing this gives up, deliberately (plan §2.1 row 11): an
 /// EXTERNAL installer landing mid-run — `pip install -U`, `pipenv sync` in
-/// another terminal — is not seen by the packages judged after the
+/// another terminal — is no longer seen by the packages judged after the
 /// first ask for that site, where re-listing per package would have seen
 /// it. Only the `(canonicalized name, version)` SET is frozen: which files
 /// are stale is still read live, per package, through `verify_file_patch`.
@@ -1379,6 +1375,8 @@ pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool
     revert_pypi_opts(entry, project_root, RevertOpts::new(dry_run)).await
 }
 
+/// [`revert_pypi`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion while the per-flavor wiring restore runs unchanged.
 /// Fail-closed twin of [`super::npm_lock::guard_unwired_textual_revert`]
 /// for the Python backends. A ledger entry with NO wiring records cannot
 /// restore any project file — that is the shape `socket-patch repair`
@@ -1455,8 +1453,8 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
     }
     // Enumerate the locks ourselves instead of through
     // `python_lock_paths`, which follows symlinks and DROPS every entry
-    // whose target cannot be stat'ed; a listing `Err` must not read as "no
-    // Python locks here" either. Neither may fail open here.
+    // whose target cannot be stat'ed — and whose `Err` the previous shape
+    // read as "no Python locks here". Neither may fail open here.
     let listing = match std::fs::read_dir(project_root) {
         Ok(listing) => listing,
         Err(_) => {
@@ -1531,8 +1529,6 @@ const KNOWN_PYPI_FLAVORS: [&str; 7] = [
     "pipenv",
 ];
 
-/// [`revert_pypi`] with full [`RevertOpts`]: `keep_artifact` skips the
-/// artifact deletion while the per-flavor wiring restore runs unchanged.
 pub async fn revert_pypi_opts(
     entry: &VendorEntry,
     project_root: &Path,
@@ -1602,8 +1598,8 @@ pub async fn revert_pypi_opts(
     if !outcome.success || dry_run {
         return outcome;
     }
-    // LOSSINESS GUARD (the RevertOutcome contract every npm-family backend
-    // honors): when any wiring record was left alone
+    // LOSSINESS GUARD (residual #131 — the RevertOutcome contract every
+    // npm-family backend honors): when any wiring record was left alone
     // ("drifted; left untouched"), the lockfile may still resolve through
     // the uuid dir, and the ledger entry holds the only recorded pre-vendor
     // originals. Keep both (the caller keeps the entry when `kept_artifact`
@@ -1667,13 +1663,15 @@ pub async fn revert_pypi_opts(
     outcome
 }
 
+/// The patched wheel plus the facts the wiring + ledger need, however it was
+/// acquired (service download or local build).
 /// The committed wheel for a Fresh-plan re-run, when the ledger anchors it
 /// and it verifies (see [`reuse`]): directly under `uuid_dir_rel`, a
 /// well-formed wheel filename for THIS distribution and version (the leaf
 /// comes from the committed ledger, and the wirings splice it verbatim into
 /// requirements.txt / uv.lock / poetry.lock — see [`reusable_wheel_leaf`]),
 /// and not platform-locked by either the ledger flag or the filename's own
-/// tags (a platform-specific wheel committed on another OS keeps the usual
+/// tags (a platform-specific wheel committed on another OS keeps today's
 /// acquire-and-pin behavior). `None` acquires as usual.
 async fn fresh_reuse_wheel(
     base: &str,
@@ -1767,8 +1765,6 @@ fn reuse_preview_result(base: &str, abs: &Path, record: &PatchRecord) -> ApplyRe
     super::common::synthesized_result(base, abs, files_verified, true, None)
 }
 
-/// The patched wheel plus the facts the wiring + ledger need, however it was
-/// acquired (service download, local build, or reuse of the committed wheel).
 struct AcquiredWheel {
     wheel_name: String,
     rel_wheel: String,
@@ -2087,9 +2083,8 @@ mod tests {
         tokio::fs::write(root.join(name), content).await.unwrap();
     }
 
-    /// One assert per row of the routing table (locks > lock-less markers
-    /// with requirements fallthrough > requirements > pyproject > nothing;
-    /// the python-lock and hatch rows are covered elsewhere).
+    /// One assert per row of the v2 routing table (locks > lock-less markers
+    /// with requirements fallthrough > requirements > pyproject > nothing).
     #[tokio::test]
     async fn flavor_routing_table_v2_precedence() {
         let flavor = |tmp: &Path| {
@@ -2110,7 +2105,7 @@ mod tests {
             .any(|warning| warning.code == "pypi_multiple_lockfiles"
                 && warning.detail.contains("pylock.toml")));
 
-        // 3-5. Tool locks route to their flavors.
+        // 2-4. Tool locks route to their flavors.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "poetry.lock", "").await;
         assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::Poetry);
@@ -2137,7 +2132,7 @@ mod tests {
             warnings[0].detail
         );
 
-        // 6. Lock-less tool markers refuse with the per-tool pointer...
+        // 5. Lock-less tool markers refuse with the per-tool pointer...
         let tmp = tempfile::tempdir().unwrap();
         touch(
             tmp.path(),
@@ -2176,7 +2171,8 @@ mod tests {
         );
 
         // ...but every lock-less marker falls through to requirements.txt when
-        // one exists (the marker alone must not block the pip wiring).
+        // one exists (the marker alone must not block the pip wiring) — this
+        // expands v1, where a bare Pipfile + requirements.txt refused.
         for marker in [
             ("pyproject.toml", "[tool.uv]\n"),
             ("pyproject.toml", "[tool.poetry]\n"),
@@ -2193,12 +2189,12 @@ mod tests {
             );
         }
 
-        // 7. requirements.txt at the root.
+        // 6. requirements.txt at the root.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
         assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::Requirements);
 
-        // 9. a lone pyproject.
+        // 7. a lone pyproject.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pyproject.toml", "[project]\nname = \"x\"\n").await;
         assert_eq!(
@@ -2206,7 +2202,7 @@ mod tests {
             "pypi_pyproject_only"
         );
 
-        // 10. nothing at all.
+        // 8. nothing at all.
         let tmp = tempfile::tempdir().unwrap();
         let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_no_requirements");
@@ -3313,7 +3309,7 @@ wheels = [
         save_state(root, &state).await.unwrap();
     }
 
-    /// In-sync rebuild × service: the in-sync probes key only on
+    /// BUG GUARD (in-sync rebuild × service): the in-sync probes key only on
     /// the patch uuid, so the lockfile still pins the FIRST vendor's exact
     /// wheel sha256. A service-built wheel with different bytes must not
     /// silently replace the missing artifact — under `auto` the rebuild must
@@ -3806,10 +3802,10 @@ wheels = [
 
     /// A ledger entry with NO wiring (the shape `socket-patch repair`
     /// re-synthesizes when state.json is lost) cannot restore any file.
-    /// A flavor revert that iterates zero records would "succeed", and the
-    /// caller would then delete the uuid dir and drop the entry while the
-    /// lock still resolves through the vendored wheel. Both Python-lock
-    /// backends must refuse while anything references it.
+    /// Routing it into a flavor revert that iterates zero records used to
+    /// "succeed", after which the caller deleted the uuid dir and dropped
+    /// the entry while the lock still resolved through the vendored wheel.
+    /// Both Python-lock backends must refuse while anything references it.
     #[tokio::test]
     async fn unwired_python_entry_revert_refuses_while_lock_references_artifact() {
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
@@ -3945,10 +3941,10 @@ wheels = [
 
     /// `rollback/remove --preserve-state` (`keep_artifact`) never deletes the
     /// artifact, and an unwired entry has nothing to restore — so there is
-    /// nothing for the in-use guard to protect: no
-    /// `vendor_wiring_unknown_revert_blocked` refusal (npm skips the guard
-    /// under `keep_artifact` for the same reason: the refusal exists only to
-    /// protect the deletion).
+    /// nothing for the in-use guard to protect. It used to refuse with
+    /// `vendor_wiring_unknown_revert_blocked` although the revert would
+    /// have touched nothing (npm skips the guard under `keep_artifact` for
+    /// exactly this reason: the refusal exists only to protect the deletion).
     #[tokio::test]
     async fn unwired_entry_preserve_state_skips_guard() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3993,10 +3989,12 @@ wheels = [
         }
     }
 
-    /// A `read_dir` failure on the project root (an execute-only root) is
-    /// not "no Python locks here": an unlistable root cannot prove the
-    /// absence of a reference in uv.lock / pylock.toml, so refuse,
-    /// fail-closed.
+    /// The guard used to treat a `read_dir` failure on the project root as
+    /// "no Python locks here" (and its static list lacked uv.lock and
+    /// pylock.toml), so on an execute-only root nothing was probed and the
+    /// referenced wheel was deleted while uv.lock / pylock.toml still
+    /// resolved through it. An unlistable root cannot prove the absence of
+    /// a reference: refuse, fail-closed.
     #[cfg(unix)]
     #[tokio::test]
     async fn unwired_python_entry_revert_refuses_when_root_unlistable() {
@@ -4079,9 +4077,10 @@ wheels = [
         }
     }
 
-    /// A lock that is a SYMLINK whose target cannot be stat'ed must stay on
-    /// the probe list (a lister that follows the link would drop it and let
-    /// the wheel it may reference be deleted). Listing keeps symlinks on
+    /// A lock that is a SYMLINK whose target cannot be stat'ed used to be
+    /// dropped from the probe list (the lister follows the link and drops
+    /// any entry whose metadata fails), so the guard never saw it and the
+    /// wheel it may reference was deleted. Listing must keep symlinks on
     /// lstat alone; the unreadable target then hits the fail-closed read.
     /// Both a static-list name and a listing-only name are covered.
     #[cfg(unix)]
@@ -4149,9 +4148,8 @@ wheels = [
     }
 
     /// Once the guard finds no reference, an unwired entry is a plain
-    /// orphan and must be reclaimable — never dispatched by flavor, which
-    /// would fail forever (flavor `uv` with uv.lock gone → "cannot read
-    /// uv.lock").
+    /// orphan and must be reclaimable. Dispatching it by flavor used to
+    /// fail forever: flavor `uv` with uv.lock gone → "cannot read uv.lock".
     #[tokio::test]
     async fn unwired_uv_entry_without_uv_lock_reclaims_orphan() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4182,8 +4180,8 @@ wheels = [
     }
 
     /// Same reclaim contract for flavor `None` — the shape `repair` stamps
-    /// for requirements/poetry/pdm/pipenv reconstructions (never rejected as
-    /// "unknown pypi vendor flavor None").
+    /// for requirements/poetry/pdm/pipenv reconstructions, which the
+    /// dispatch used to reject with "unknown pypi vendor flavor None".
     #[tokio::test]
     async fn unwired_entry_flavor_none_reclaims_orphan() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4242,8 +4240,8 @@ wheels = [
     }
 
     /// The requirements planner writes vendored pins into `-r` includes, so
-    /// a reference may live ONLY in an include; the guard must probe the
-    /// includes, not just the root requirements.txt.
+    /// a reference may live ONLY in an include. The guard used to probe the
+    /// root requirements.txt alone and let the include-referenced wheel go.
     #[tokio::test]
     async fn unwired_requirements_entry_refuses_on_include_reference() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4318,7 +4316,7 @@ wheels = [
 
     /// A relock regenerated the wired entry to a registry reference whose
     /// hash list differs from the recorded original (Pipenv 2022.12.19 does
-    /// exactly this; 2026.x reproduces the original and converges silently):
+    /// exactly this; 2026 reproduces the original and converges silently):
     /// the vendored reference is gone, so the revert must RETIRE the record
     /// — success, no drift-keep, artifact removed — instead of keeping the
     /// uuid dir and ledger entry forever for a reference nothing points at.
@@ -4457,8 +4455,8 @@ wheels = [
         assert!(wheel.is_file());
     }
 
-    /// Drift-keep gate (the npm-family RevertOutcome contract): a
-    /// drift-skipped pipenv revert leaves the
+    /// BUG GUARD (missing drift-keep gate — the npm-family RevertOutcome
+    /// contract, residual #131): a drift-skipped pipenv revert leaves the
     /// vendor-pointing entry in Pipfile.lock, so deleting the uuid dir
     /// bricks every subsequent `pipenv install`/`sync` and pruning the
     /// ledger entry destroys the only recorded pre-vendor original. The
@@ -4525,7 +4523,7 @@ wheels = [
         );
     }
 
-    /// The splice flavors (poetry/pdm) share the same drift-keep gate: a
+    /// The splice flavors (poetry/pdm) share the same missing gate: a
     /// hand-edited-but-still-vendor-pointing `[[package]]` unit is left
     /// alone with a drift warning, so the uuid dir it references must
     /// survive the revert (and the ledger entry with it).
@@ -4946,10 +4944,11 @@ wheels = [
 
     // ───────── full lock-flavor orchestration (poetry / pdm / pipenv) ─────────
     //
-    // Byte-exact copies of the sibling modules' six==1.16.0 registry lock
-    // fixtures (pypi_poetry.rs tests::LOCK21_DIRECT_REGISTRY,
+    // Byte-exact copies of the sibling modules' spike-derived six==1.16.0
+    // registry lock fixtures (pypi_poetry.rs tests::LOCK21_DIRECT_REGISTRY,
     // pypi_pdm.rs / pypi_pipenv.rs tests::LOCK_DIRECT_REGISTRY — private to
-    // their mods, duplicated verbatim). They pair exactly with e2e_fixture()'s installed six 1.16.0,
+    // their mods, duplicated verbatim; the spike dirs are the source of
+    // truth). They pair exactly with e2e_fixture()'s installed six 1.16.0,
     // so one vendor_pypi → revert_pypi cycle runs the flavor's plan arm,
     // wire arm, flavor tag, and MetaSlot arm end to end.
 
@@ -5454,7 +5453,7 @@ wheels = [
     /// every other backend) — a failed write is a `vendor_marker_write_failed`
     /// warning riding an otherwise successful run: the wheel stays, the
     /// wiring lands (the marker is written BEFORE the wiring, and its failure
-    /// does not short-circuit that), and the ledger entry is emitted.
+    /// no longer short-circuits that), and the ledger entry is emitted.
     #[tokio::test]
     async fn fresh_marker_write_failure_warns_but_vendor_succeeds() {
         let fx = e2e_fixture().await;
@@ -6000,7 +5999,7 @@ wheels = [
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
 
         // A non-empty directory squatting at the destination wheel filename
-        // makes atomic_write_artifact's rename fail deterministically.
+        // makes atomic_write_bytes' rename fail deterministically.
         let blocker = fx
             .root
             .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"));
@@ -6718,8 +6717,8 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
             ]
         }
 
-        /// An in-sync re-run after a flip, in both directions, is a no-op
-        /// with no request, for every flavor.
+        /// Regression (the analysts' repro): an in-sync re-run after a flip,
+        /// in both directions, is a no-op with no request, for every flavor.
         #[tokio::test]
         async fn all_flavors_rerun_flip_is_in_sync() {
             let alt = rezip(&local_wheel().await);
@@ -6899,7 +6898,7 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         }
 
         /// P6: a platform-locked ledger entry is never reused on the Fresh
-        /// path (a platform wheel committed on another OS keeps the usual
+        /// path (a platform wheel committed on another OS keeps today's
         /// acquire-and-pin behavior).
         #[tokio::test]
         async fn platform_locked_entry_is_not_reused() {
@@ -6922,8 +6921,8 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         /// Dry run of the relock re-scan: the preview agrees with the real
         /// run (which re-wires offline, see above) — success, a verified
         /// preview, the reuse note, nothing written, no request — instead
-        /// of the `service` + `--offline` refusal an acquisition preview
-        /// would raise.
+        /// of the `service` + `--offline` refusal the acquisition preview
+        /// raised.
         #[tokio::test]
         async fn relock_rescan_dry_run_previews_the_reuse_under_service_offline() {
             let alt = rezip(&local_wheel().await);

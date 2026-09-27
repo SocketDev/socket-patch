@@ -6,8 +6,7 @@
 //! `common/temp/pnpm-lock.yaml` from `common/config/rush/pnpm-lock.yaml`, then
 //! `rush install` runs `pnpm install --frozen-lockfile` inside `common/temp`.
 //!
-//! Tier 1 (`#[ignore]`d, runs as an e2e CI matrix leg on all 3 OSes;
-//! self-skips without corepack pnpm@9): run the REAL CLI
+//! Tier 1 (default-runnable, gated on corepack pnpm): run the REAL CLI
 //! `scan --mode hosted` against wiremock over a committed Rush-shaped fixture
 //! (rush.json + common/config/rush/pnpm-lock.yaml), then REPLICATE rush's
 //! install step in-test — clearly labeled a simulation: copy the rewritten
@@ -402,7 +401,7 @@ fn assert_rush_manifestless_vex(root: &Path, patch_server: &str, patched: &[u8],
     });
 }
 
-// ── Tier 1: pnpm simulation (CI matrix leg) ───────────────────────────
+// ── Tier 1: default-runnable pnpm simulation ───────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]

@@ -67,7 +67,7 @@ opt-level = "s"
 
 # CI-only profile for the test-release job. Inherits the shipped profile's
 # semantics (opt-level = "s", debug-assertions off, overflow-checks off) —
-# which is what test-release exists to validate — but drops
+# which is what test-release exists to validate (commit b96a13f) — but drops
 # the full-LTO link: ~23m of that job's ~29m was LTO-relinking 159 test
 # binaries, and LTO relinks are structurally uncacheable. release.yml still
 # builds the real full-LTO [profile.release] for every shipped target.
@@ -84,8 +84,9 @@ lto = "thin"
 
 # Test-execution speed: `cargo test` builds dependencies with the dev
 # profile; at opt-level 0 the hash/compression/bsdiff hot loops are 10-100x
-# slower (the self_update fixtures gzip and sha256-hash the multi-MB debug
-# CLI binary per test: ~403s debug vs ~2s release). Workspace members are NOT matched by "*" — they stay
+# slower (the self_update fixture family measured 403s debug vs ~2s release
+# on CI run 30289993021 — it gzips and sha256-hashes the multi-MB debug CLI
+# binary per test). Workspace members are NOT matched by "*" — they stay
 # opt-level 0, so incremental compile speed, debugging, and llvm-cov line
 # fidelity (reports filter to workspace crates) are unchanged. Dependencies
 # keep debug-assertions and overflow-checks ON — only codegen opt changes.

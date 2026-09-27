@@ -1,6 +1,5 @@
-//! Coverage-gap tests for `commands/setup.rs`. Each section's "Covers NNN"
-//! refs are setup.rs line numbers at the d5e1815 audit and have drifted
-//! since; use the named functions/messages to locate the code.
+//! Coverage-gap tests for `commands/setup.rs` (audit at d5e1815; the file is
+//! unchanged since). Each section names the uncovered line ranges it drives.
 //!
 //! Everything here runs on the host with no Docker and no ecosystem
 //! toolchain: `setup` edits package.json / requirements.txt / pyproject.toml /
@@ -816,8 +815,8 @@ fn exclude_already_persisted_skips_manifest_rewrite() {
 // ---------------------------------------------------------------------------
 
 /// `setup --exclude` in a directory with no project files reports `no_files`
-/// and must NOT leave a `.socket/manifest.json` behind (the exclude list is
-/// persisted only after discovery).
+/// and must NOT leave a `.socket/manifest.json` behind (the exclude list
+/// used to be persisted before discovery).
 #[test]
 fn setup_exclude_in_empty_dir_writes_no_socket_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1320,7 +1319,7 @@ fn remove_human_real_run_prints_python_gem_composer_sections() {
     let (code, stdout, stderr) = run(cwd, &["setup", "--remove", "--yes"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("Will remove the socket-patch[hook] dependency from:"),
+        stdout.contains("Will remove the socket-patch-hook dependency from:"),
         "the python remove preview section must print; stdout=\n{stdout}"
     );
     assert!(
@@ -1511,7 +1510,7 @@ fn setup_human_preview_and_commit_notes_for_python_and_gem() {
     let (code, stdout, stderr) = run(cwd, &["setup", "--yes"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("Python manifests to update (socket-patch[hook]):"),
+        stdout.contains("Python manifests to update (socket-patch-hook):"),
         "the python preview section must print; stdout=\n{stdout}"
     );
     assert!(
@@ -1775,8 +1774,8 @@ fn setup_does_not_persist_an_unmatched_exclude() {
 /// `Warning: Unreadable vendor state (…)` line plus a `vendor_ledger` error
 /// entry — verdict `error`, exit 1 — never as a `configured` verdict. The
 /// manifest-free vendored project (the only `scan`/`get --mode vendored`
-/// posture) is exactly where a swallowed corrupt ledger would read as
-/// hooks wired, no manifest, garbage `state.json` → `configured`, exit 0.
+/// posture) is exactly where the corrupt ledger used to be swallowed: hooks
+/// wired, no manifest, garbage `state.json` → `configured`, exit 0, silence.
 #[test]
 fn check_reports_an_unreadable_vendor_ledger_instead_of_configured() {
     let tmp = tempfile::tempdir().unwrap();

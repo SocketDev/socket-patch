@@ -614,7 +614,7 @@ fn single_walk_golang_rewrite_matches_oracle() {
     }
 }
 
-/// Runs the oracle over the benchmark go.mod / go.sum pairs (too
+/// Runs the oracle over the Phase 3 benchmark go.mod / go.sum pairs (too
 /// large to commit) when `SOCKET_PATCH_GO_FIXTURES` names their directory,
 /// redirecting every required module; a no-op otherwise.
 #[test]

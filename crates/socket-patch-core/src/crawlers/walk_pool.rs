@@ -1,28 +1,32 @@
 //! The dedicated thread pool the npm crawler's parallel walks run on, and
 //! the file-descriptor budget that sizes it.
 //!
-//! Two properties the parallel sync walks must provide:
+//! Two properties of the old one-`spawn_blocking`-per-call async walk must
+//! survive the move to parallel sync walks:
 //!
-//! - **Stack depth.** The recursive gather needs the same 8 MiB the
-//!   `#[tokio::main]` thread has (8 MiB on Unix, and on Windows via the
-//!   `/STACK` link flag in `.cargo/config.toml`). Rayon's and tokio's
-//!   worker threads default to 2 MiB, so it runs on pool threads built
-//!   with 8 MiB ([`WALK_STACK_SIZE`]).
+//! - **Stack depth.** The async walk recursed through `Box::pin` futures
+//!   polled on the `#[tokio::main]` thread (8 MiB on Unix, and on Windows
+//!   via the `/STACK` link flag in `.cargo/config.toml`). Rayon's and
+//!   tokio's worker threads default to 2 MiB, so the recursive gather runs
+//!   on pool threads built with the same 8 MiB ([`WALK_STACK_SIZE`]).
 //!   When not even one walk thread could be spawned the walk falls back to
 //!   the blocking-pool thread and its 2 MiB: only `node_modules` nesting
 //!   depth is exposed there, since the workspace-roots walk (the one that
 //!   sees arbitrary project trees) is iterative.
-//! - **Descriptor headroom.** Every walker treats a failed `read_dir`/open
-//!   — `EMFILE` included — as "absent", so running out of descriptors
-//!   silently drops packages. A single sequential walk holds at most one
-//!   directory stream (or package.json) open at a time; under a tight
-//!   `RLIMIT_NOFILE` ([`fd_limit_is_tight`]) the pool gets ONE thread and
-//!   the crawlers run serially to keep that profile; otherwise the thread
-//!   count is capped so the extra descriptors stay well inside the limit.
+//! - **Descriptor headroom.** The sequential walk held at most one
+//!   directory stream (or package.json) open at a time, and the nine
+//!   ecosystem crawlers ran one after another. Every walker treats a failed
+//!   `read_dir`/open — `EMFILE` included — as "absent", so a process that
+//!   needs more descriptors than the old one would silently drop packages
+//!   under a tight `RLIMIT_NOFILE` the old one handled. Under such a limit
+//!   ([`fd_limit_is_tight`]) the pool gets ONE thread and the crawlers run
+//!   serially (the old descriptor profile); otherwise the thread count is
+//!   capped so the extra descriptors stay well inside the limit.
 //!
-//! Peak MEMORY has no such budget: the walk holds up to one package.json
-//! per walk thread at once (each read sizes its buffer from the file, with
-//! no cap), where a sequential walk would hold one. Real trees barely notice — package.json files are kilobytes — but
+//! Peak MEMORY has no such budget, and does not survive the move: the walk
+//! holds up to one package.json per walk thread at once (each read sizes
+//! its buffer from the file, with no cap), where the sequential walk held
+//! one. Real trees barely notice — package.json files are kilobytes — but
 //! one outsized file in an untrusted tree now costs [`walk_threads`]
 //! copies instead of one. Capping the read would change what the crawler
 //! inventories, so the trade is deliberate, not an oversight. What the

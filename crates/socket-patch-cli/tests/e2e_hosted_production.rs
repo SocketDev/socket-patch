@@ -143,11 +143,10 @@ const GEM_PURL: &str = "pkg:gem/activestorage@6.0.3";
 const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "6.0.3";
 /// Acceptable patch UUIDs for [`GEM_PURL`] — an any-of set, mirroring
-/// [`PYPI_UUIDS`]: patch selection is ranked by `api::ranking` (merged
-/// patches first, newest first) and scan always auto-selects the top
-/// candidate, so pinning a single UUID would red the required check whenever
-/// production publishes a newer or merged 6.0.3 patch. The gem leg parses
-/// the UUID actually WIRED into the rewritten
+/// [`PYPI_UUIDS`]: patch selection is server-ranked and the non-TTY scan
+/// auto-selects the top candidate, so pinning a single UUID would red the
+/// required check on a server-side reorder or a second published 6.0.3
+/// patch. The gem leg parses the UUID actually WIRED into the rewritten
 /// Gemfile, asserts it is one of these, and content-verifies against that
 /// exact patch's `/patch/view` manifest. When production publishes another
 /// acceptable 6.0.3 patch, verify it and append its UUID here.
@@ -156,27 +155,40 @@ const GEM_UUIDS: &[&str] = &[
     // 2026-08-18 catalog republish.
     "15e960b5-f432-4b6c-b8aa-534a2b419323",
     // GHSA-w749-p3v6-hccq / CVE-2022-21831 (image_processing_transformer.rb),
-    // published 2026-08-19T21:19Z — the second advisory.
+    // published 2026-08-19T21:19Z when production re-extended 6.0.3 with the
+    // second advisory; the server-ranked selection now wires this one.
+    // Content live-verified 2026-08-20: served .gem matches the /info
+    // checksum, carries the Socket patch header in the transformer, and every
+    // other file is byte-identical to stock rubygems 6.0.3.
     "6c4141c5-1535-4fd2-9db1-b5f8e4834bdb",
     // GHSA-9xrj-h377-fr87 / CVE-2026-33195 (disk_service.rb +
     // disk_controller.rb + errors.rb), published 2026-08-20T16:14Z when
-    // production extended 6.0.3 with a third advisory.
+    // production extended 6.0.3 with a third advisory. /patch/view blobs
+    // live-verified 2026-08-20: every touched file carries the Socket
+    // Community Patch header.
     "eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a",
     // GHSA-r4mg-4433-c7g3 / CVE-2025-24293 (image_processing_transformer.rb),
-    // published 2026-08-20T20:31Z — the fourth advisory.
+    // published 2026-08-20T20:31Z — the fourth advisory. /patch/view blobs
+    // live-verified 2026-08-20: carries the Socket Community Patch header.
     "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
     // GHSA-xr9x-r78c-5hrm / CVE-2026-66066 (image_processing_transformer.rb +
     // NEW lib/active_storage/vips.rb backporting the libvips
     // unfuzzed-operations hardening), published 2026-08-21T19:07Z — the fifth
-    // advisory; selected until the 2026-09-04 merged patch below.
+    // advisory, and the one the server-ranked selection now wires.
+    // /patch/view blobs live-verified 2026-08-24: both files carry the Socket
+    // Community Patch header and git-blob-sha256-match their manifest
+    // afterHash entries.
     "9c2b4925-b413-4a3a-bb3a-9990440fb446",
     // MERGED patch — the first one production has published for any pinned
     // purl: GHSA-w749-p3v6-hccq / CVE-2022-21831 + GHSA-r4mg-4433-c7g3 /
     // CVE-2025-24293 + GHSA-xr9x-r78c-5hrm / CVE-2026-66066 in one artifact
     // (image_processing_transformer.rb allowlist + unsupported-method guard,
     // engine.rb + active_storage.rb config plumbing, NEW vips.rb libvips
-    // backport). Published 2026-09-04T21:23Z; the client-side merge rung in
-    // `api::ranking` now selects this one.
+    // backport). Published 2026-09-04T21:23Z; the server-ranked selection
+    // (merge rung) now wires this one. Served .gem live-verified 2026-09-08:
+    // sha256 matches the registry /info checksum, all four touched files
+    // carry the Socket Community Patch header naming this UUID, metadata and
+    // every other file are byte-identical to stock rubygems 6.0.3.
     "01019627-b481-4bae-bc09-e93b5a5e4481",
 ];
 
@@ -294,7 +306,7 @@ fn has_command(cmd: &str) -> bool {
 }
 
 /// The three legacy `SOCKET_PATCH_*` names still honored at runtime via
-/// `socket_patch_core::utils::env_compat` — not in the clap-bound lists, so they need
+/// `socket_patch_core::env_compat` — not in the clap-bound lists, so they need
 /// scrubbing separately.
 const LEGACY_ENV_VARS: &[&str] = &[
     "SOCKET_PATCH_PROXY_URL",
@@ -1154,13 +1166,13 @@ fn pnpm_hosted_install_proof() {
     //   (https://patch.socket.dev/...) that does not match the registry's
     //   published metadata (https://registry.npmjs.org/minimist/-/...)
     //
-    // `--trust-lockfile` is pnpm's documented opt-out. The CLI warns with
-    // `redirect_pnpm_trust_lockfile` and, by default, auto-configures
-    // `trustLockfile: true` in pnpm-workspace.yaml; the `--trust-lockfile`
-    // retry below is the fallback for layouts that auto-config does not
-    // cover. It proves the artifact IS correctly served and installs cleanly
-    // once the policy is relaxed — and fails loudly if the failure is
-    // anything OTHER than that known policy rejection.
+    // `--trust-lockfile` is pnpm's documented opt-out. This is a real
+    // compatibility gap in socket-patch's pnpm hosted mode, not a test bug:
+    // the CLI should emit a `redirect_pnpm_*` warning naming the flag, the way
+    // it already does for the gem CHECKSUMS and Rush repo-state cases. Until
+    // it does, this leg proves the artifact IS correctly served and installs
+    // cleanly once the policy is relaxed — and it fails loudly if the failure
+    // is anything OTHER than that known policy rejection.
     let detail = dump(&reinstall);
     assert!(
         detail.contains("ERR_PNPM_TARBALL_URL_MISMATCH"),
@@ -2060,10 +2072,16 @@ fn pypi_uv_lock_hosted_install_proof() {
 /// the patch rewrites is verified on disk against the `/patch/view`
 /// afterHash.
 ///
-/// The patch-registry's `/info/<gem>` line must declare the served `.gem`'s
-/// runtime dependencies, or bundler's `ensure_same_dependencies` check fails
-/// closed with `Bundler::APIResponseMismatchError` (production's defect until
-/// the 2026-08-18 gem catalog republish).
+/// # History
+///
+/// Hosted gem mode was long blocked by a **server-side** compact-index
+/// defect: the patch-registry's `/info/<gem>` line declared no runtime
+/// dependencies while the `.gem` it served declared several, so bundler's
+/// `ensure_same_dependencies` check failed closed with
+/// `Bundler::APIResponseMismatchError`. The 2026-08-18 gem catalog republish
+/// fixed the index (deps now served, `/versions` 200), and the probe-based
+/// tolerance this leg used to carry — pass on a non-2xx `/versions`, enforce
+/// on 2xx — retired itself exactly as designed and was deleted.
 ///
 /// NOTE (latent, server-side): the registry's `/api/v1/dependencies` route
 /// still answers 200 with an empty body. That bug is unreachable today —
@@ -2129,10 +2147,9 @@ async fn gem_bundler_hosted_install_proof() {
 
     // Hard assertions: the redirect itself must be correct. The wired patch
     // UUID is parsed back out of the rewritten Gemfile rather than assumed:
-    // selection is ranked client-side by `api::ranking` and scan always
-    // auto-selects the top candidate, so the leg accepts any UUID in the
-    // pinned any-of set and then content-verifies against the one bundler
-    // was actually given.
+    // selection is server-ranked (the non-TTY scan auto-selects the top
+    // candidate), so the leg accepts any UUID in the pinned any-of set and
+    // then content-verifies against the one bundler was actually given.
     let gemfile = read(&proj.join("Gemfile"));
     let wired_uuid = wired_gem_registry_uuid(&gemfile).unwrap_or_else(|| {
         panic!(
@@ -2152,7 +2169,7 @@ async fn gem_bundler_hosted_install_proof() {
         lock.contains("CHECKSUMS"),
         "{LEG}: Gemfile.lock lost its CHECKSUMS section:\n{lock}"
     );
-    // Converged-lock proof: a rewrite that only moved the
+    // Converged-lock proof (the #212 shape): a rewrite that only moved the
     // CHECKSUMS pin would leave the lock's GEM section on rubygems.org — a
     // mixed state an unfrozen install can silently paper over. The GEM
     // section must carry a patch-registry remote and DEPENDENCIES must

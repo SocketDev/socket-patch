@@ -1,6 +1,6 @@
-//! Coverage-gap tests for `commands/scan/mod.rs`.
+//! Coverage-gap tests for `commands/scan/mod.rs` (2026-09 audit).
 //!
-//! Pins the otherwise-untested surfaces of `scan`:
+//! Pins the audited-but-untested surfaces of `scan`:
 //!
 //! * the remaining `resolve_mode_flags` cross-mode conflict arms (and
 //!   `ScanMode::Agent.cli_name()` reaching an error message);
@@ -19,14 +19,12 @@
 //! * per-patch vulnerability rendering in the "Patches to apply" preview;
 //! * the human post-apply GC line (both pluralization arms) and the
 //!   `hosted_wiring_retained` stderr warning after an in-place apply;
-//! * human runs: a bare scan runs hosted mode; a mode-less `--prune`/global
-//!   scan is report-only (no download, no `.socket/`, prints the
-//!   `scan --mode agent` hint), while `--mode agent` / `--apply` apply
-//!   without prompting;
-//! * the hosted human arm's results table and `[UPDATE]` detection (parity
-//!   with the agent/vendored arms);
-//! * scan on a PTY: never prompts, never opens the select menu under
-//!   --json, and renders the live status line cleanly.
+//! * non-TTY human runs: a mode-less scan is report-only (no download, no
+//!   `.socket/`), while `--mode agent` / `--apply` / `--prune` auto-proceed;
+//! * the hosted human arm's results table, `[UPDATE]` detection and
+//!   confirm prompt (parity with the agent/vendored arms);
+//! * the declined download / redirect confirm via a PTY (exit 0, hint, no
+//!   mutation).
 //!
 //! Subprocess runs scrub the `SOCKET_*` flag environment (the
 //! `cli_scan_silent.rs` pattern) so ambient developer/CI configuration
@@ -659,7 +657,7 @@ async fn scan_human_table_renders_update_marker_and_vuln_overflow() {
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
     seed_manifest(tmp.path(), &[(purl, OLD_UUID)]);
 
-    // --dry-run keeps the run read-only past the table (the download and
+    // --dry-run keeps the run read-only past the table (the confirm and
     // apply never run), so no view/blob mocks are needed.
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run", "--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
@@ -1273,10 +1271,10 @@ async fn scan_human_empty_batch_reports_no_patches_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Human scans never prompt: a mode-less --prune/global scan is report-only,
-// agent mode applies
+// Non-TTY human scans: the mode-less scan is report-only, explicit intent
+// auto-proceeds
 // ---------------------------------------------------------------------------
-// A bare scan runs hosted mode; a `--prune` or
+// v5: scan never prompts. A bare scan runs hosted mode; a `--prune` or
 // global scan with no mode only reports (it has no lockfile to rewire),
 // and `--mode agent` applies in place without asking.
 
@@ -1385,9 +1383,9 @@ async fn scan_human_agent_prune_applies_and_collects() {
 }
 
 /// An empty discovery stops every human mode at "No patches available"
-/// with exit 0 and no `.socket/`: vendored mode does not fall through to
+/// with exit 0 and no `.socket/`: vendored mode no longer falls through to
 /// its vendor step to re-vendor a committed manifest (scan vendors what
-/// discovery selects), and hosted mode does not enter its engine for a
+/// discovery selects), and hosted mode no longer enters its engine for a
 /// zero-package redirect.
 #[tokio::test]
 async fn scan_human_empty_discovery_stops_in_every_mode() {
@@ -1423,13 +1421,15 @@ async fn scan_human_empty_discovery_stops_in_every_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Human hosted scan: table + update detection parity
+// Human `--mode hosted`: table + update detection parity and the confirm
 // ---------------------------------------------------------------------------
-// The hosted human arm shares the table/update block with the agent/vendored
-// arms, then runs the engine without prompting (scan never prompts).
+// The hosted human arm used to return straight into the redirect engine —
+// no results table, no `[UPDATE]` marker, and no prompt (while `get --mode
+// hosted` and scan's agent/vendored arms all confirm). It now shares the
+// table/update block and confirms before the engine runs.
 
 /// Reference endpoint denying the grant: the engine runs (proving the
-/// hosted arm reached it) but rewrites nothing, so no lockfile fixture is
+/// prompt was accepted) but rewrites nothing, so no lockfile fixture is
 /// needed.
 async fn mount_forbidden_reference(mock: &MockServer, purl: &str) {
     Mock::given(method("POST"))
@@ -1607,8 +1607,8 @@ mod pty {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        // Scrub the flag-bound SOCKET_* surface so ambient configuration
-        // cannot reroute the run; keep telemetry disabled and the
+        // Scrub the flag-bound SOCKET_* surface (SOCKET_YES=true would skip
+        // the very prompt under test); keep telemetry disabled and the
         // update notifier off — this child gets a REAL terminal, so the
         // stderr-TTY guard does not protect it.
         for (key, _) in std::env::vars_os() {
@@ -2169,7 +2169,7 @@ async fn mount_empty_batch(mock: &MockServer) {
 }
 
 /// `scan --prune` with nothing to apply still garbage-collects, like the
-/// JSON path, and a
+/// JSON path (it used to return early and silently skip the GC), and a
 /// `--dry-run` previews it without touching the manifest.
 #[tokio::test]
 async fn scan_human_prune_runs_gc_even_when_no_patches_are_available() {
@@ -2338,8 +2338,8 @@ async fn scan_human_does_not_offer_an_already_recorded_patch() {
     );
 }
 
-/// The human table's PACKAGE column grows to fit the PURL (a fixed-width
-/// cut would drop the version), and the rule matches the table.
+/// The human table's PACKAGE column grows to fit the PURL (the old fixed
+/// 40-column cut dropped the version), and the rule matches the table.
 #[tokio::test]
 async fn scan_human_table_shows_full_purl_with_version() {
     let mock = MockServer::start().await;

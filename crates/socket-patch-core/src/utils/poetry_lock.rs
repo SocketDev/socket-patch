@@ -269,7 +269,7 @@ pub fn rewrite_poetry_lock_in<'a>(
         package_name,
     } = plan;
     // The original's fragments come from the same parse; an error surfaces
-    // where a fresh parse would raise it, after the rewrite.
+    // where the fresh parse used to raise it, after the rewrite.
     let before = poetry_lock_fragments_in(&doc, text, name);
     let mut lock = doc.into_mut();
     let package = lock
@@ -429,7 +429,7 @@ fn plan_poetry_rewrite(
 /// End (exclusive, before its line break) of the first top-level TOML header
 /// line at or after `from`, skipping blank lines; `text.len()` at EOF; `from`
 /// itself when the next non-blank line is not a header (a shape Poetry never
-/// writes — the fragment is then not extended).
+/// writes — the fragment then ends where it used to).
 fn next_header_end(text: &str, from: usize) -> usize {
     let mut pos = from;
     for line in text[from..].split_inclusive('\n') {
@@ -605,7 +605,7 @@ mod tests {
     }
 
     /// A user-editable lock with a malformed integrity table must be refused,
-    /// never panic (no `IndexMut` straight into `metadata.files`).
+    /// never panic (it used to `IndexMut` straight into `metadata.files`).
     #[test]
     fn malformed_integrity_tables_are_refused_without_panicking() {
         let lock = fixture("1.2.2");
@@ -639,8 +639,8 @@ mod tests {
 
     /// Poetry bumps the 2.x minor additively; the vendored loader accepts a
     /// newer minor with an advisory, so the shared rewriter must too — the
-    /// same lock must get the same treatment on every path (LF vendored, CRLF
-    /// vendored, hosted).
+    /// same lock used to be applied (LF vendored), hard-failed (CRLF vendored)
+    /// and silently skipped (hosted) depending only on the path taken.
     #[test]
     fn newer_2x_minor_is_rewritten_like_2_1() {
         let lock = fixture("2.4.3").replace("lock-version = \"2.1\"", "lock-version = \"2.2\"");

@@ -6,8 +6,8 @@
 //! restores the verbatim original when the live file is still exactly what
 //! vendoring wrote, and otherwise does a structural or fragment-level
 //! restore that needs both texts. A record's `new` is its `original` plus
-//! the package's own few-hundred-byte edit; stored in full beside it, every
-//! package of a project would hold two near-identical copies of the
+//! the package's own few-hundred-byte edit, yet was stored in full beside
+//! it, so every package of a project held two near-identical copies of the
 //! (growing) file — tens of megabytes on a hundred-package maven or pylock
 //! project, re-serialized after every package and re-parsed by every later
 //! command.

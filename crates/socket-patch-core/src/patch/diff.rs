@@ -167,8 +167,15 @@ mod tests {
 
     #[test]
     fn test_apply_diff_forged_oversize_header_is_safe() {
-        // The header's target size (bytes 24..32) is unvalidated; see
-        // `MAX_PREALLOC_BYTES`. We build a genuine, small delta and then overwrite only the target
+        // Regression: `apply_diff` used to feed `hint_target_size()` straight
+        // into `Vec::with_capacity`. That field is the bsdiff header's target
+        // size (little-endian bytes 24..32) and is NOT validated by qbsdiff
+        // against the real payload, so a corrupt/hostile delta can claim an
+        // enormous size. A multi-exabyte `with_capacity` aborts the process
+        // (allocator failure) or panics with "capacity overflow" — neither is
+        // recoverable, which would let a single bad patch take the tool down.
+        //
+        // We build a genuine, small delta and then overwrite only the target
         // size field with ~1.15 EiB. Because `apply` is driven by the control
         // stream and ignores the hint, the clamp lets the patch still produce
         // the correct bytes instead of dying on the allocation.
@@ -190,9 +197,15 @@ mod tests {
 
     #[test]
     fn test_apply_diff_forged_negative_block_length_does_not_panic() {
-        // A csize field with the sign bit set would panic qbsdiff's parser
-        // (see `validate_bsdiff_header`); `apply_diff` must reject it as a
-        // normal `io::Error`.
+        // Regression: qbsdiff's `parse` reads the control/diff block lengths
+        // (header bytes 8..16 and 16..24) via a sign-magnitude decoder, casts
+        // them to `u64`, and checks `32 + csize + dsize > patch.len()` with
+        // *wrapping* arithmetic before doing `split_at(csize)`. A header whose
+        // csize field has the high bit set decodes to a "negative" length whose
+        // `as u64` is enormous; the sum wraps back under `patch.len()`, slips
+        // past the guard, and then `split_at(huge)` panics (or the add itself
+        // panics in debug builds). `apply_diff` must reject such a header as a
+        // normal `io::Error`, upholding its never-panic-on-bad-input contract.
         let before = b"the quick brown fox jumps over the lazy dog";
         let after = b"the quick brown cat jumps over the lazy dog";
         let mut forged = make_delta(before, after);

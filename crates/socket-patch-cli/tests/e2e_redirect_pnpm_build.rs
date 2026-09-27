@@ -229,7 +229,7 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 /// Which CLI front door drives the hosted engine. Both consume the SAME
-/// engine by construction (v4.0): `scan --mode hosted` discovers the dep,
+/// engine by construction (v3.6): `scan --mode hosted` discovers the dep,
 /// while `get <uuid> --mode hosted` names the patch explicitly (the uuid
 /// identifier path is exempt from installed narrowing and needs no
 /// discovery mocks beyond view + reference, which the fixture mounts
@@ -1140,7 +1140,7 @@ async fn pnpm10_redirect_tampered_hosted_tarball_fails_fresh_frozen_install() {
     }
 }
 
-/// get-driven hosted twin (v4.0): `get <uuid> --mode hosted --json --yes`
+/// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
 /// routes through the SAME hosted engine as `scan --mode hosted`, so the
 /// full pnpm@10 chain must hold unchanged — the fixture's lock splice,
 /// trustLockfile auto-config (pnpm-workspace.yaml gains `trustLockfile:

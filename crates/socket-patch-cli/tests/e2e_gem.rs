@@ -289,10 +289,8 @@ fn percent_decode(s: &str) -> String {
 /// with an empty (no-patch) result. Returns the running server.
 ///
 /// In proxy mode (no API token — `run()` strips `SOCKET_API_TOKEN`) the scan
-/// first POSTs `/patch/batch`, which this mock leaves unrouted (404), so the
-/// client falls back to one `GET /patch/by-package/<percent-encoded-purl>`
-/// per discovered package. Capturing those fallback requests lets us assert
-/// the *exact* PURLs the
+/// issues one `GET /patch/by-package/<percent-encoded-purl>` per discovered
+/// package. Capturing those requests lets us assert the *exact* PURLs the
 /// gem crawler synthesized — name, version, and `pkg:gem/` ecosystem — rather
 /// than trusting a self-reported count.
 async fn start_proxy() -> MockServer {

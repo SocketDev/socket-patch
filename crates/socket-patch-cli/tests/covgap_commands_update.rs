@@ -1,5 +1,5 @@
-//! Coverage-gap tests for `commands/update.rs`: the pinned already-there
-//! message (a zero-network path), the
+//! Coverage-gap tests for `commands/update.rs` (audit of 2026-09, commit
+//! d5e1815): the pinned already-there message (a zero-network path), the
 //! already-latest `--json` envelope shape, the human-mode dry-run prints
 //! (both the `--force` "Would reinstall" wording and the plain
 //! "Update available" wording), and the PTY-driven interactive decline.
@@ -7,7 +7,8 @@
 //! Every wet run drives a COPY of the built binary staged into a tempdir
 //! (`update_fixture::staged_install`) — `CARGO_BIN_EXE_socket-patch`
 //! itself must never be a swap target. Fixture shapes are copied from
-//! self_update_e2e.rs / interactive_prompts_e2e.rs.
+//! self_update_e2e.rs / interactive_prompts_e2e.rs (do not edit those
+//! files).
 
 #[path = "common/pty_io.rs"]
 mod pty_io;
@@ -27,11 +28,11 @@ const DEAD_ENDPOINT: &str = "http://127.0.0.1:9";
 
 /// `--update <CURRENT>`: an explicit pin equal to the compiled version is
 /// an informational no-op that never creates a network client — no
-/// latest-resolution, no sums, no download. It must use
+/// latest-resolution, no sums, no download (update.rs:225). It must use
 /// the PINNED wording ("already version X", not "already the latest": the
 /// pin path cannot know what the latest is), and it must NOT refresh the
-/// passive notifier cache (the `if !pinned` state-write gate in `run()` —
-/// a pin says nothing about the latest release, so caching it
+/// passive notifier cache (update.rs:170 gates the state write on
+/// `!pinned` — a pin says nothing about the latest release, so caching it
 /// as `latestSeen` would poison the nag).
 #[test]
 fn update_pin_to_current_is_noop_zero_network() {
@@ -69,8 +70,9 @@ fn update_pin_to_current_is_noop_zero_network() {
     update_fixture::StagedInstall::assert_build_artifact_untouched(&real_hash);
 }
 
-/// The already-latest `--json` envelope is a machine contract scripts
-/// branch on: exit 0, `status: success`, `dryRun: false`, exactly one
+/// The already-latest `--json` envelope (update.rs:229-241) is a machine
+/// contract scripts branch on, and it has only ever been exercised in
+/// human mode: exit 0, `status: success`, `dryRun: false`, exactly one
 /// skipped/already_latest event carrying `details.current`/`details.latest`,
 /// summary agreeing, and the empty `warnings` omitted (additive-only
 /// envelope contract). One resolve, zero sums, zero downloads.
@@ -133,8 +135,9 @@ async fn update_already_latest_json_envelope_shape() {
 /// `--dry-run --force` when already up to date: the probe still reports
 /// first (one resolve, zero downloads, zero mutation), and the human
 /// message is the documented "Would reinstall … (dry run; --force)"
-/// wording via the human-mode dry-run print (the other dry-run tests pass
-/// `--json`).
+/// wording (update.rs:193) via the human-mode dry-run print
+/// (update.rs:215) — both existing dry-run tests pass `--json`, so this
+/// interactive-facing surface never executed.
 #[tokio::test]
 async fn update_dry_run_force_up_to_date_human_says_would_reinstall() {
     let real_hash = update_fixture::real_binary_hash();
@@ -169,9 +172,9 @@ async fn update_dry_run_force_up_to_date_human_says_would_reinstall() {
     update_fixture::StagedInstall::assert_build_artifact_untouched(&real_hash);
 }
 
-/// The plain human dry-run with an update available: "Update available:
-/// socket-patch X → Y (dry run; not installed)", exit 0, nothing
-/// downloaded, nothing swapped.
+/// The plain human dry-run with an update available (update.rs:190-191 via
+/// the 215 print): "Update available: socket-patch X → Y (dry run; not
+/// installed)", exit 0, nothing downloaded, nothing swapped.
 #[tokio::test]
 async fn update_dry_run_human_reports_update_available() {
     let install = staged_install();
@@ -204,10 +207,10 @@ async fn update_dry_run_human_reports_update_available() {
 }
 
 // ---------------------------------------------------------------------------
-// Interactive decline — PTY-driven: ui::confirm
+// Interactive decline (update.rs:251-255) — PTY-driven: ui::confirm
 // auto-proceeds with default-yes on non-TTY stdin (and under --yes/--json),
 // so only a real terminal reaches the cancel branch. Runner copied from
-// interactive_prompts_e2e.rs, adapted to spawn the
+// interactive_prompts_e2e.rs (do not edit that file), adapted to spawn the
 // STAGED binary with injected env — so even a decline-regression that
 // proceeds to a swap can only ever touch the tempdir copy, and the dead
 // SOCKET_UPDATE_BASE_URL kills such a run at download.
@@ -295,9 +298,9 @@ mod pty {
         )
     }
 
-    /// Declining the reinstall confirm must cancel with exit 1 and
-    /// "Reinstall cancelled.", leaving the installed binary byte-identical.
-    /// The pin-to-current + `--force` combination reaches the confirm with
+    /// Declining the update confirm must cancel with exit 1 and "Update
+    /// cancelled.", leaving the installed binary byte-identical. The
+    /// pin-to-current + `--force` combination reaches the confirm with
     /// ZERO network before the prompt (pinned skips latest-resolution,
     /// --force skips the already-there return), and the dead endpoint
     /// guarantees that even a decline-regression dies at download instead

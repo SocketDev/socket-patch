@@ -2,8 +2,7 @@
 //!
 //! Validates the OpenVEX document shape produced by a real invocation
 //! of the compiled binary. When `vexctl` is on `PATH` the test also
-//! pipes the output through `vexctl merge` (a single-file parse gate,
-//! since vexctl has no `validate` subcommand) to confirm spec
+//! pipes the output through `vexctl validate` to confirm spec
 //! conformance — the CI workflow installs vexctl before the test
 //! step, so this branch is exercised in CI.
 //!
@@ -24,17 +23,16 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
 };
 
-/// Ecosystems opted in via `setup.manual` in test fixtures so the
+/// Setup-supported ecosystems, declared `manual` in test fixtures so the
 /// property-7 setup-state filter (`commands/setup::configured_ecosystems`)
-/// keeps these patches — these tests exercise VEX document GENERATION, not
-/// setup state. Only npm/pypi/gem/composer are setup-capable; cargo, golang,
-/// maven and nuget have no setup hook and get in only through `manual`
-/// (maven/nuget are appended by [`all_manual`]).
+/// does not drop these patches — these tests exercise VEX document
+/// GENERATION, not setup state, so they opt every patch in via the `manual`
+/// escape hatch. The apply-only ecosystems (maven/nuget) are appended by
+/// [`all_manual`].
 const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
 
 /// [`ALL_MANUAL`] plus the apply-only ecosystems (maven/nuget), so the
-/// all-ecosystem agent matrix below can declare every non-Deno ecosystem
-/// (8 of the 9).
+/// all-ecosystem agent matrix below can declare every one of the 8.
 fn all_manual() -> Vec<String> {
     let mut names: Vec<String> = ALL_MANUAL.iter().map(|s| (*s).to_string()).collect();
     names.push("maven".to_string());
@@ -273,7 +271,7 @@ fn two_patches_sharing_ghsa_merge_subcomponents() {
 // ──────────────────────────────────────────────────────────────────────
 // Cross-ecosystem AGENT matrix — the agent-mode twin of
 // `e2e_vex_redirect::no_verify_attests_redirected_patches_across_ecosystems`.
-// One manifest patch per non-Deno ecosystem (qualified PURLs for the
+// One manifest patch per official ecosystem (qualified PURLs for the
 // release-variant ones: pypi `?artifact_id=`, gem `?platform=`, maven
 // `?classifier=&ext=`), `setup.manual` declaring every ecosystem (via
 // `all_manual`) so property 7 keeps them all, and `--no-verify` attests
@@ -350,7 +348,7 @@ fn no_verify_attests_agent_patches_across_ecosystems() {
         );
     }
     // write_manifest stamps setup.manual = all_manual(), which declares
-    // every non-Deno ecosystem (8 of the 9).
+    // every one of the 8 ecosystems.
     write_manifest(cwd, &manifest);
 
     let out = cli()
@@ -991,7 +989,7 @@ fn verify_mode_resolves_qualified_pypi_purl() {
     let after_hash = compute_git_sha256_from_bytes(patched);
     std::fs::write(site_packages.join("mod.py"), patched).unwrap();
 
-    // Manifest keyed by a *qualified* PyPI PURL, as `get` / `scan --mode agent` write
+    // Manifest keyed by a *qualified* PyPI PURL, as `get --sync` writes
     // for release-variant ecosystems.
     let qualified_purl = "pkg:pypi/examplepkg@1.2.3?artifact_id=sdist";
     let mut manifest = PatchManifest::new();

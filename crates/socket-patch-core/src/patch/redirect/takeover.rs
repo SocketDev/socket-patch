@@ -1443,13 +1443,12 @@ mod tests {
         (tmp, state)
     }
 
-    /// Two redirected versions of one crate share the manifest edit key
-    /// (the crate name). Removing one version must revert ONLY its own
+    /// Bug I: two redirected versions of one crate share the manifest edit
+    /// key (the crate name). Removing one version must revert ONLY its own
     /// declaration + lock entry + registry block — claiming the sibling's
-    /// manifest edit would revert the other pin while its lock entry stayed
-    /// hosted (a broken build), and dropping the sibling's registry edit
-    /// would leave the created `.cargo/config.toml` behind on the second
-    /// removal.
+    /// manifest edit reverted the other pin while its lock entry stayed
+    /// hosted (a broken build), and dropped the sibling's registry edit, so
+    /// the second removal left the created `.cargo/config.toml` behind.
     #[tokio::test]
     async fn multi_version_removes_each_version_independently() {
         const UUID_OLD: &str = "3c5d7e9f-2a4b-4c6d-8e0f-1a3b5c7d9e1f";
@@ -1668,8 +1667,11 @@ mod tests {
     }
 
     /// A v1 lock names every dependency by its full id, so the root block
-    /// references BOTH patched cfg-if versions. Removing the versions in any
-    /// order must succeed — not only in exact reverse apply order.
+    /// references BOTH patched cfg-if versions. REGRESSION: each dependent
+    /// block was one whole-block edit, the second version's edit recorded
+    /// the first one's output as its `original`, and removing the
+    /// first-applied version alone found neither fragment — `remove`
+    /// refused as drifted unless purls went in exact reverse apply order.
     #[tokio::test]
     async fn v1_lock_multi_version_removes_in_any_order() {
         const UUID_OLD: &str = "3c5d7e9f-2a4b-4c6d-8e0f-1a3b5c7d9e1f";
@@ -1749,9 +1751,10 @@ mod tests {
     /// both cfg-if versions: each run pinned BOTH declarations to its own
     /// registry, so the file ends with both on the 0.1.10 registry and the
     /// ledger holds plain→1.0.4 then 1.0.4→0.1.10 edits for both lines.
-    /// Removing either version first must neither refuse as drifted (by
-    /// claiming only half of a declaration's chain) nor drop a
-    /// still-referenced registry edit and leave the config behind.
+    /// REGRESSION: removing 1.0.4 first claimed the plain→1.0.4 edit of the
+    /// 0.1.10 declaration but not its 1.0.4→0.1.10 successor, found neither
+    /// fragment and refused as drifted; removing 0.1.10 first dropped the
+    /// still-referenced 0.1.10 registry edit and left the config behind.
     #[tokio::test]
     async fn legacy_name_only_multi_version_ledger_removes_in_any_order() {
         let (toml, lock) = multi_version_project();
@@ -1872,9 +1875,9 @@ mod tests {
     /// An older CLI redirected only 1.0.4 and its name-only matcher also
     /// pinned the 0.1.10 declaration to 1.0.4's registry; the current
     /// planner then repaired it (superseding that pin with 0.1.10's own
-    /// registry) while redirecting 0.1.10. Removing 1.0.4 must not claim the
-    /// superseded mis-pin edit (whose fragments are both gone) and refuse as
-    /// drifted.
+    /// registry) while redirecting 0.1.10. REGRESSION: removing 1.0.4
+    /// claimed the old mis-pin edit, whose fragments were both gone, and
+    /// refused as drifted.
     #[tokio::test]
     async fn repaired_legacy_mispin_removes_in_any_order() {
         let (toml, lock) = multi_version_project();
@@ -2203,8 +2206,7 @@ mod tests {
             .await
             .expect("dry-run revert succeeds");
 
-        // Nothing reached disk (the in-memory claim is checked below; the
-        // persisted ledger is the caller's and is never written on a dry run).
+        // Nothing reached disk and the ledger still claims everything.
         assert_eq!(
             tokio::fs::read_to_string(root.join("Cargo.toml"))
                 .await
@@ -3075,10 +3077,11 @@ mod tests {
         assert!(state.edits.is_empty(), "{state:?}");
     }
 
-    /// A symlinked `.npmrc` refuses while planning — never at
-    /// `flush_npmrc` time, after `flush_staged` had written the reverted
-    /// lock while the ledger still recorded the redirect: lock
-    /// byte-identical, ledger untouched. While another
+    /// Finding: a symlinked `.npmrc` passed planning (the read followed
+    /// the link), `flush_staged` wrote the reverted lock, and only then did
+    /// `flush_npmrc` refuse the link — leaving the lock un-hosted while the
+    /// ledger still recorded the redirect. The refusal now happens while
+    /// planning: lock byte-identical, ledger untouched. While another
     /// package-lock entry still needs the setting, the odd `.npmrc` shape
     /// does not block the revert at all (the file is never read).
     #[cfg(unix)]
@@ -4091,7 +4094,8 @@ mod tests {
             .unwrap()
     }
 
-    /// The takeover claims the purl's `redirect_bun_lock_package` edit
+    /// The bun revert used to be a hard refusal ("cannot replay yet");
+    /// now the takeover claims the purl's `redirect_bun_lock_package` edit
     /// by the recorded line's spec and replays the registry line back,
     /// leaving the sibling-version and foreign entries untouched.
     #[tokio::test]
@@ -4177,8 +4181,8 @@ mod tests {
     /// (`bun add`, `bun install` after a manifest change): the recorded
     /// `new` is no longer on disk byte-for-byte, but the 2-tuple with the
     /// same key/spec/meta IS our wiring — the claim must not refuse as
-    /// drift (that would block hosted→vendored takeover, scoped `rollback`
-    /// and `remove` for every user on those releases). The registry line comes
+    /// drift (that blocked hosted→vendored takeover, scoped `rollback` and
+    /// `remove` for every user on those releases). The registry line comes
     /// back and the ledger is cleared.
     fn drop_digest(line: &str) -> String {
         let cut = line
@@ -4903,10 +4907,10 @@ mod tests {
         assert!(state.edits.is_empty(), "edits dropped");
     }
 
-    /// Removing the block the redirect APPENDED to an existing config (the
-    /// legacy `.cargo/config` here) restores the user's bytes — no trailing
-    /// blank line (`[net]\nretry = 2\n\n`) left behind — and never touches
-    /// blank runs of the user's own elsewhere in the file.
+    /// Bug H: removing the block the redirect APPENDED to an existing
+    /// config (the legacy `.cargo/config` here) restores the user's bytes —
+    /// it left a trailing blank line (`[net]\nretry = 2\n\n`) — and never
+    /// touches blank runs of the user's own elsewhere in the file.
     #[tokio::test]
     async fn appended_registry_block_revert_restores_the_config_bytes() {
         let cases = [
@@ -4989,7 +4993,7 @@ mod tests {
         }
     }
 
-    /// A CRLF project (manifest, lock and legacy config) is
+    /// Bug K: a CRLF project (manifest, lock and legacy config) is
     /// redirected with CRLF kept and `remove` restores every byte.
     #[tokio::test]
     async fn crlf_project_reverts_byte_for_byte() {
@@ -5044,8 +5048,8 @@ mod tests {
     /// files checked out on the other: a Windows scan (CRLF fragments,
     /// JSON-escaped, so git never converts them) removed on an LF checkout,
     /// and an LF scan removed on a CRLF (`core.autocrlf`) checkout — through
-    /// `remove` and through the whole-ledger replay — neither may refuse as
-    /// "drifted" because no fragment matches byte-for-byte.
+    /// `remove` and through the whole-ledger replay. REGRESSION: both
+    /// refused as "drifted" (neither fragment found byte-for-byte).
     #[tokio::test]
     async fn revert_survives_a_checkout_line_ending_conversion() {
         let crlf = |s: &str| s.replace('\n', "\r\n");
@@ -5152,9 +5156,9 @@ mod tests {
         assert!(state.edits.is_empty(), "edits dropped");
     }
 
-    /// The whole-ledger replay keeps a hand-pinned block too (removing it
-    /// would leave the hand pin naming an undefined registry), while still
-    /// unwinding the wiring it owns.
+    /// The whole-ledger replay keeps a hand-pinned block too (it removed
+    /// it unconditionally, leaving the hand pin naming an undefined
+    /// registry), while still unwinding the wiring it owns.
     #[tokio::test]
     async fn replay_keeps_a_registry_block_still_referenced() {
         let (tmp, mut state) = redirected_fixture().await;

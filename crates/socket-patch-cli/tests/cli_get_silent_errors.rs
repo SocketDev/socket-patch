@@ -1,9 +1,13 @@
 //! `get --silent` must still surface errors.
 //!
 //! CLI_CONTRACT.md defines `--silent` as "Errors only" — informational
-//! chatter is suppressed, errors are not. The per-patch failure lines
-//! (`[fail] …`) in `download_and_apply_patches_with` must reach stderr under
-//! `--silent`, matching the by-uuid path (`save_and_apply_patch`).
+//! chatter is suppressed, errors are not. Regression guard: the download
+//! loop in `download_and_apply_patches` gated its per-patch failure lines
+//! (`[fail] …`) on `!silent` alongside the informational prints, so
+//! `get <purl> --silent` against a failing patch fetch exited 1 with ZERO
+//! output anywhere — no stdout (correct) and no stderr (the bug). The
+//! by-uuid path (`save_and_apply_patch`) already kept its blob errors
+//! visible under `--silent`; the search path must match.
 //!
 //! Hermetic: the search endpoint answers with one free patch and the
 //! patch view endpoint answers 500, all on a local wiremock; ambient API
@@ -34,7 +38,7 @@ fn dead_env<'a>() -> Vec<(&'a str, &'a str)> {
 }
 
 /// Search succeeds (one free patch) but the patch view fails: the run
-/// reaches `download_and_apply_patches_with`' failure branch and must exit 1.
+/// reaches `download_and_apply_patches`' failure branch and must exit 1.
 async fn mount_search_ok_view_500(mock: &MockServer) {
     Mock::given(method("GET"))
         .and(path(format!(
@@ -65,8 +69,6 @@ fn get_args<'a>(uri: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec![
         "get",
         PURL,
-        "--mode",
-        "agent",
         "--yes",
         "--api-url",
         uri,
@@ -103,8 +105,8 @@ async fn get_silent_download_failure_still_prints_the_error() {
         stderr.contains("[fail]") && stderr.contains(PURL),
         "--silent must still print the download failure to stderr; got {stderr:?}"
     );
-    // Informational chatter stays suppressed: --silent failures must not
-    // become fully loud runs.
+    // Informational chatter stays suppressed: the fix must not turn
+    // --silent failures into fully loud runs.
     assert!(
         !stderr.contains("Downloading"),
         "--silent must keep suppressing informational lines; got {stderr:?}"

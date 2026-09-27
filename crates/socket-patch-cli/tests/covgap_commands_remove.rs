@@ -1,5 +1,5 @@
-//! Coverage-gap tests for `commands/remove.rs`: the lock-contention
-//! return, the vendor-ledger hard-failure
+//! Coverage-gap tests for `commands/remove.rs` (audit of 2026-09, commit
+//! d5e1815): the lock-contention return, the vendor-ledger hard-failure
 //! aborts, the hosted-redirect leg's dry-run / preserve-state / refusal /
 //! failure branches, the drift-keep exclusion arms, the mixed drift-keep
 //! partial failure, and the human-mode output surfaces that were only ever
@@ -10,7 +10,7 @@
 //! offline: every fixture is hand-written camelCase JSON, and every wet run
 //! passes `--offline`. Fixture shapes are copied from
 //! remove_invariants.rs / remove_duality_invariants.rs /
-//! interactive_prompts_e2e.rs.
+//! interactive_prompts_e2e.rs (do not edit those files).
 
 #[path = "common/pty_io.rs"]
 mod pty_io;
@@ -121,7 +121,7 @@ fn write_two_entry_manifest(
 /// Vendor ledger with one npm entry keyed `key` (extra: raw JSON fields
 /// appended to the entry — e.g. `"flavor": "...",` or `"detached": true,`),
 /// plus the artifact dir it names. Fixture shape copied from
-/// remove_invariants.rs::write_vendored_ledger.
+/// remove_invariants.rs::write_vendored_ledger (do not edit that file).
 fn write_vendor_ledger_entry(
     root: &Path,
     key: &str,
@@ -154,11 +154,12 @@ fn write_vendor_ledger_entry(
 
 /// A wiring record naming a file the npm revert backend does not edit: the
 /// revert drift-keeps (`kept_artifact`) — fixture copied from
-/// remove_duality_invariants.rs.
+/// remove_duality_invariants.rs (do not edit that file).
 const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }]"#;
 
 // ---------------------------------------------------------------------------
-// Hosted-redirect fixtures (copied from remove_duality_invariants.rs).
+// Hosted-redirect fixtures (copied from remove_duality_invariants.rs —
+// do not edit that file).
 // ---------------------------------------------------------------------------
 
 const NPM_PURL: &str = "pkg:npm/left-pad@1.3.0";
@@ -246,13 +247,13 @@ fn expected_reverted_lock_text() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Lock contention
+// 1. Lock contention (remove.rs:207)
 // ---------------------------------------------------------------------------
 
 /// `remove` against an externally-held `.socket/apply.lock` must refuse
 /// with the same `lock_held` envelope contract apply pins in
-/// e2e_safety_lock.rs. After the lock is released the same removal must
-/// proceed.
+/// e2e_safety_lock.rs — remove had never been run against a held lock.
+/// After the lock is released the same removal must proceed.
 #[test]
 fn remove_lock_held_returned_then_proceeds_after_release() {
     use fs2::FileExt;
@@ -323,8 +324,8 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Corrupt vendor ledger fails the remove closed (the human branch also
-//    covers emit_error_envelope's stderr arm)
+// 2. Corrupt vendor ledger fails the remove closed (remove.rs:457-464; the
+//    human branch also covers emit_error_envelope's stderr arm at 87-88)
 // ---------------------------------------------------------------------------
 
 /// Garbage `.socket/vendor/state.json` must abort the remove BEFORE any
@@ -398,7 +399,7 @@ fn remove_corrupt_vendor_ledger_fails_closed_human() {
 
 // ---------------------------------------------------------------------------
 // 3. Vendor revert hard failure aborts before the manifest mutation
-//    (main flow + ledger-only twin)
+//    (remove.rs:517-533 main flow; 1240-1255 detached twin)
 // ---------------------------------------------------------------------------
 
 /// An unknown wiring flavor fails the revert closed (the VendorEntry
@@ -457,7 +458,7 @@ fn remove_unknown_vendor_flavor_fails_closed_before_manifest_mutation() {
 }
 
 /// Detached twin (no manifest at all): the failure surfaces through
-/// `remove_ledger_only`'s own `vendor_revert_failed` branch, and the
+/// `remove_detached_only`'s own `vendor_revert_failed` branch, and the
 /// ledger entry survives.
 #[test]
 fn remove_detached_unknown_vendor_flavor_fails_closed() {
@@ -498,8 +499,8 @@ fn remove_detached_unknown_vendor_flavor_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. save_state failure after a successful revert (main flow + ledger-only
-//    twin). Unix-only chmod choreography:
+// 4. save_state failure after a successful revert (remove.rs:592-598 main
+//    flow; 1273-1279 detached twin). Unix-only chmod choreography:
 //    `.socket/vendor` goes read-only while `.socket/vendor/npm/` stays
 //    writable, so the artifact delete succeeds but the ledger write fails.
 // ---------------------------------------------------------------------------
@@ -582,7 +583,7 @@ fn remove_vendor_state_write_failure_aborts_before_manifest_mutation() {
     );
 }
 
-/// Detached twin: same choreography through `remove_ledger_only`.
+/// Detached twin: same choreography through `remove_detached_only`.
 #[cfg(unix)]
 #[test]
 fn remove_detached_vendor_state_write_failure_fails_with_code() {
@@ -622,7 +623,8 @@ fn remove_detached_vendor_state_write_failure_fails_with_code() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Hosted leg: dry-run previews (main flow + hosted-only)
+// 5. Hosted leg: dry-run previews (remove.rs:716 main flow; 1164
+//    hosted-only)
 // ---------------------------------------------------------------------------
 
 /// A dry-run remove touching hosted records had NEVER run. The preview
@@ -723,6 +725,7 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
 
 // ---------------------------------------------------------------------------
 // 6. Hosted leg: --preserve-state note + preserve-state human summary
+//    (remove.rs:706-713, 809-813)
 // ---------------------------------------------------------------------------
 
 /// `--preserve-state` still unwinds hosted redirects (hosted has no
@@ -772,7 +775,7 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Corrupt hosted-redirect ledger: warn-and-continue
+// 7. Corrupt hosted-redirect ledger: warn-and-continue (remove.rs:623-629)
 // ---------------------------------------------------------------------------
 
 /// A corrupt redirect ledger must not block a manifest removal: the main
@@ -841,7 +844,7 @@ fn remove_corrupt_hosted_ledger_json_still_removes() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Hosted-only refusal + human listing
+// 8. Hosted-only refusal + human listing (remove.rs:1066-1076, 1080-1084)
 // ---------------------------------------------------------------------------
 
 /// With no manifest entry to delete, removing a hosted patch can only mean
@@ -907,8 +910,8 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Hosted per-purl revert failure fails closed (main flow + hosted-only
-//    twin)
+// 9. Hosted per-purl revert failure fails closed (remove.rs:694-703 main
+//    flow; 1152-1159 hosted-only twin)
 // ---------------------------------------------------------------------------
 
 /// A package-lock.json that is no longer valid JSON makes the recorded
@@ -981,7 +984,7 @@ fn remove_hosted_only_revert_failure_fails_closed() {
 
 // ---------------------------------------------------------------------------
 // 10. Hosted ledger persist failure after successful lockfile reverts
-//     (main flow + hosted-only). Unix-only.
+//     (remove.rs:669-675 main flow; 1122-1128 hosted-only). Unix-only.
 // ---------------------------------------------------------------------------
 
 /// The per-purl reverts flush lockfile writes as they go; when the ledger
@@ -1077,7 +1080,8 @@ fn remove_hosted_only_ledger_persist_failure_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// 11. Drift-keep exclusion arms + mixed partial failure
+// 11. Drift-keep exclusion arms (remove.rs:741-745) + mixed partial
+//     failure (remove.rs:1009, 1022-1031)
 // ---------------------------------------------------------------------------
 
 const MIXED_UUID: &str = "88888888-8888-4888-8888-888888888888";
@@ -1173,7 +1177,7 @@ fn remove_mixed_drift_keep_is_partial_failure_json() {
 }
 
 /// Human twin: exit 1 plus the singular drift-keep error line on stderr
-/// (the count + pluralization surface).
+/// (the count + pluralization surface at remove.rs:1022-1030).
 #[test]
 fn remove_mixed_drift_keep_is_partial_failure_human() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1195,7 +1199,7 @@ fn remove_mixed_drift_keep_is_partial_failure_human() {
     );
 }
 
-/// Qualifier-stripped exclusion arm: a drift-kept ledger
+/// Qualifier-stripped exclusion arm (remove.rs:741): a drift-kept ledger
 /// key for ONE release variant keeps the manifest entries of ALL sibling
 /// variants of that package@version (vendored state is per-package, so
 /// dropping a sibling's record would strand the surviving vendored state).
@@ -1252,8 +1256,8 @@ fn remove_drift_keep_excludes_sibling_variants_by_stripped_key() {
     );
 }
 
-/// Base-purl exclusion arm (and the base_purl match arm of
-/// vendor_entries_matching): a drift-kept ledger entry
+/// Base-purl exclusion arm (remove.rs:742-745, and the base_purl match arm
+/// of vendor_entries_matching at remove.rs:44): a drift-kept ledger entry
 /// whose KEY differs from the manifest purl but whose `basePurl` resolves
 /// to it still keeps the manifest entry.
 #[test]
@@ -1299,7 +1303,7 @@ fn remove_drift_keep_excludes_manifest_entry_by_base_purl() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. Detached entry matched by base_purl only: the golang
+// 12. Detached entry matched by base_purl only (remove.rs:44): the golang
 //     case-encoded ledger key, whose decoded basePurl is what users type.
 // ---------------------------------------------------------------------------
 
@@ -1374,7 +1378,7 @@ fn remove_matches_detached_entry_by_base_purl() {
 }
 
 // ---------------------------------------------------------------------------
-// 13. Detached-only --skip-rollback refusal
+// 13. Detached-only --skip-rollback refusal (remove.rs:1194-1204)
 // ---------------------------------------------------------------------------
 
 /// With no manifest entry to delete, removing a detached vendored patch
@@ -1418,7 +1422,8 @@ fn remove_detached_skip_rollback_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Human-mode output surfaces
+// 14. Human-mode output surfaces (remove.rs:319-324, 421, 559, 579,
+//     809-813)
 // ---------------------------------------------------------------------------
 
 /// A base PURL expanding to multiple manifest entries must make the blast
@@ -1458,10 +1463,10 @@ fn remove_multi_variant_blast_radius_prints_expansion() {
     );
 }
 
-/// The "already in original state" count line: an entry
+/// The "already in original state" count line (remove.rs:421): an entry
 /// whose installed file is already at its original bytes rolls back as
 /// already-original, and the human run must say so. (JSON twin lives in
-/// remove_invariants.rs.)
+/// remove_invariants.rs; the human surface was never exercised.)
 #[test]
 fn remove_already_original_human_prints_count_line() {
     let original = b"covgap original bytes\n";
@@ -1527,8 +1532,8 @@ fn remove_already_original_human_prints_count_line() {
 }
 
 /// Wet `--preserve-state` on a vendored entry, human mode: the per-key
-/// "Unwired vendoring … (artifact preserved)" line plus
-/// the final preserve summary, with all state kept.
+/// "Unwired vendoring … (artifact preserved)" line (remove.rs:579) plus
+/// the final preserve summary (809-813), with all state kept.
 #[test]
 fn remove_preserve_state_vendored_human_wet_surfaces() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1563,7 +1568,7 @@ fn remove_preserve_state_vendored_human_wet_surfaces() {
 }
 
 /// Dry-run `--preserve-state` twin: the "Would unwire vendoring …
-/// (artifact preserved)" preview line, nothing mutated.
+/// (artifact preserved)" preview line (remove.rs:559), nothing mutated.
 #[test]
 fn remove_preserve_state_vendored_human_dry_run_previews() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1593,7 +1598,8 @@ fn remove_preserve_state_vendored_human_dry_run_previews() {
 }
 
 // ---------------------------------------------------------------------------
-// 15. Blob/archive cleanup failures warn, never fatal
+// 15. Blob/archive cleanup failures warn, never fatal (remove.rs:887-891,
+//     905-908)
 // ---------------------------------------------------------------------------
 
 /// Plant `.socket/blobs`, `.socket/diffs`, `.socket/packages` as regular
@@ -1641,7 +1647,7 @@ fn remove_cleanup_failures_warn_not_fatal() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. rollback_patches_inner Err(String) plumbing (remove.rs's rollback match) — distinct
+// 16. rollback_patches Err(String) plumbing (remove.rs:429-437) — distinct
 //     from the covered Ok(success=false) gate abort.
 // ---------------------------------------------------------------------------
 
@@ -1724,9 +1730,10 @@ fn remove_rollback_infrastructure_error_surfaces_rollback_failed() {
 }
 
 // ---------------------------------------------------------------------------
-// 17. Hosted-only interactive decline — PTY-driven
+// 17. Hosted-only interactive decline (remove.rs:1092-1095) — PTY-driven
 //     (the non-TTY confirm auto-proceeds, so only a real terminal reaches
-//     the cancel branch). Runner copied from interactive_prompts_e2e.rs.
+//     the cancel branch). Runner copied from interactive_prompts_e2e.rs
+//     (do not edit that file).
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -1845,7 +1852,8 @@ mod pty {
 
 /// `remove --preserve-state` on a ledger-only entry unwires the lockfile
 /// but KEEPS the artifact and the ledger entry — the documented
-/// `--preserve-state` promise. The empty wiring
+/// `--preserve-state` promise, which the ledger-only path used to ignore
+/// (deleting the very state it promised to preserve). The empty wiring
 /// makes the unwire an offline no-op, so the keep-everything half is what
 /// shows: exit 0, a `skipped`/`vendor_state_preserved` event, no `removed`
 /// event, ledger byte-identical, artifact on disk. Dry-run twin previews
@@ -1940,9 +1948,10 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
 /// (`kept_artifact`), and the ledger-only path must honor it exactly like
 /// the manifest path — keep the ledger entry and the artifact, report
 /// `skipped`/`vendor_revert_kept`, and fail the run (`partialFailure`,
-/// top-level `vendor_revert_kept` since every match kept, exit 1) — never
-/// drop the entry while its wiring and artifact stay behind (the "wired but
-/// ledgerless" recovery state `repair` exists for).
+/// top-level `vendor_revert_kept` since every match kept, exit 1). Before
+/// the fix the entry was dropped from the ledger while its wiring and
+/// artifact stayed behind — the "wired but ledgerless" recovery state
+/// `repair` exists for — and the run reported a clean removal.
 #[test]
 fn remove_detached_drift_keep_holds_ledger_entry_and_exits_one() {
     let tmp = tempfile::tempdir().expect("tempdir");

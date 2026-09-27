@@ -8,8 +8,9 @@
 //! converter is what turns that into the Ruby form, and serves it as the
 //! `gem-stub-gemspec` second artifact). So build mode cannot vendor a
 //! fetched gem, ever — and the vendor loop refuses it `gem_spec_missing`
-//! BEFORE downloading it (the X1b deferred-fetch gate).
-//! `vendor_rerun_no_network_e2e` pins the gate itself;
+//! BEFORE downloading it (the X1b deferred-fetch gate), where the
+//! auto-fetch rung used to download the `.gem` first and only then hit the
+//! backend's refusal. `vendor_rerun_no_network_e2e` pins the gate itself;
 //! this suite pins its SCOPE: `auto` still fetches, and the three runs a
 //! fetch would never have happened for (nothing resolves the gem, the lock
 //! cannot verify it, the ledger already vendors it) keep their own

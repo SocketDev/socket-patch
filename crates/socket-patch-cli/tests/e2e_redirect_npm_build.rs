@@ -27,7 +27,7 @@
 //! the real sha512: the fresh `npm ci` must FAIL with an integrity error —
 //! the lockfile pin is enforcement, not decoration.
 //!
-//! v4.0 adds get-driven twins through the SAME fixture: `get <uuid> --mode
+//! v3.6 adds get-driven twins through the SAME fixture: `get <uuid> --mode
 //! hosted` must land the identical redirect (no manifest, no blobs — the
 //! ledger is the persistence), and `get <GHSA> --mode hosted` must narrow a
 //! two-version fan-out to the installed version BEFORE the grant request.
@@ -860,7 +860,7 @@ async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
     );
 }
 
-// ── get --mode hosted twins (v4.0) ────────────────────────────────────
+// ── get --mode hosted twins (v3.6) ────────────────────────────────────
 
 /// `get <uuid> --mode hosted` twin of the capstone: the same fixture (real
 /// npm install, patched hosted tarball, API mocks) driven by get's UUID path

@@ -541,7 +541,8 @@ mod fixture_selftests {
     /// `open` and its `exec` inherits the still-open write fd, and our
     /// `exec` in that window fails with "Text file busy" (os error 26).
     /// The window is a fork/exec race, not a property of the binary, so
-    /// retry briefly rather than failing the run.
+    /// retry briefly rather than failing the run. Observed on
+    /// `ubuntu-latest` here and on PR #139's `coverage` job.
     fn exec_freshly_written(path: &std::path::Path) -> std::process::Output {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {

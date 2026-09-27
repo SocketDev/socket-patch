@@ -833,7 +833,7 @@ async fn local_rebuild_jar(
 /// dependency resolve reads the central directory, so lexicographic entry
 /// order + fixed timestamps yield stable bytes across re-runs). The in-memory
 /// repack assembles the same entry list from the members it never wrote out;
-/// an archive that had to be extracted is walked on disk.
+/// an archive that had to be extracted is walked as before.
 async fn rebuild_jar_bytes(repack: Option<MemoryRepack>, stage: &Path) -> Result<Vec<u8>, String> {
     let rezip = match repack {
         Some(repack) => {
@@ -1705,7 +1705,7 @@ mod tests {
         Some(out)
     }
 
-    /// In-memory repack equivalence: keeping the jar's members in memory must rebuild the
+    /// X10 equivalence: keeping the jar's members in memory must rebuild the
     /// EXACT bytes the extract-to-disk rebuild produced — the artifact's sha1
     /// sidecar and every downstream pin ride on them. Driven twice over one
     /// fixture, once with the in-memory repack forced off.
@@ -2172,7 +2172,7 @@ mod tests {
         // sibling vendor run inserts ANOTHER <repository> into that same
         // section (simulated by inserting before </repositories>). Reverting
         // us must excise ONLY our block and keep the sibling's wiring intact —
-        // a whole-file restore would wipe it.
+        // the old whole-file restore would have wiped it.
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
 
@@ -2609,8 +2609,8 @@ mod tests {
     /// must read as out-of-sync — triggering the artifact rebuild that
     /// atomically replaces it — instead of wedging the in-sync hot path
     /// forever in an `open(2)` waiting for a writer. The jar half of this
-    /// probe (`read_zip_artifact` + `zip_bytes_match_after_hashes`) is
-    /// already guarded in common.rs; this pins the `sidecar_matches` half.
+    /// probe (`zip_matches_after_hashes`) is already guarded in common.rs;
+    /// this pins the `sidecar_matches` half.
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_vendored_pom_fails_fast_and_rebuilds_on_hot_path() {
@@ -2802,7 +2802,7 @@ mod tests {
         );
     }
 
-    // ── coverage: refusal and edge arms ──────────────────────────────────────
+    // ── coverage-gap additions (2026-09 audit) ───────────────────────────────
 
     /// Save/restore guard for env-var tests (same shape as the maven crawler's
     /// tests); every user must also be `#[serial_test::serial]`.

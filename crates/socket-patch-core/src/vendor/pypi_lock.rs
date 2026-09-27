@@ -37,9 +37,10 @@ pub(super) struct PythonLocks {
 /// FIFO-safe read that FOLLOWS a symlink to a regular file. Discovery
 /// (`python_lock_paths`) follows links too, so a shared `pylock.dev.toml`
 /// link beside a regular `pylock.toml` reads like the file it points at —
-/// `contains_target`/`load_python_locks` bubble the FIRST unreadable
-/// sibling, so rejecting links here would let one stray link block
-/// vendoring of the whole project. Whether a linked file may be WRITTEN is a separate question,
+/// an lstat-based "is this a regular file" pre-check here rejected the
+/// link, and because `contains_target`/`load_python_locks` bubble the FIRST
+/// unreadable sibling, one stray link blocked vendoring of the whole
+/// project. Whether a linked file may be WRITTEN is a separate question,
 /// answered by [`refuse_symlinked`] right before the writers run.
 async fn read_file(path: &Path) -> Result<String, Failure> {
     read_regular_to_string(path).await.map_err(|error| {
@@ -74,9 +75,9 @@ async fn refuse_symlinked(root: &Path, files: impl Iterator<Item = &String>) -> 
         .map(symlink_refusal)
 }
 
-/// The run's PEP 751 / script-lock parses. Both readers below would
-/// otherwise re-read and re-parse every one of the project's locks for every
-/// patched package; the lock set is small but the documents are not. Four slots so a project
+/// The run's PEP 751 / script-lock parses. Both readers below re-read AND
+/// re-parsed every one of the project's locks for every patched package;
+/// the lock set is small but the documents are not. Four slots so a project
 /// with a handful of locks does not evict its own parses between packages;
 /// see [`ParseMemo`].
 ///
@@ -888,11 +889,14 @@ mod tests {
     }
 
     /// A stray `pylock.dev.toml` SYMLINK (pointing at a lock that does not
-    /// contain the target) beside a REGULAR `pylock.toml` that does.
-    /// Discovery follows links, and `contains_target` / `load_python_locks`
-    /// bubble the FIRST unreadable sibling, so a link to a regular file must
-    /// read like the file (`open_regular_file`'s fstat accepts it) or the
-    /// stray link would block vendoring of the whole project.
+    /// contain the target) beside a REGULAR `pylock.toml` that does. On main
+    /// the symlink was invisible (`python_lock_paths` skipped links); since
+    /// discovery started following links, `read_file`'s
+    /// `symlink_metadata().is_file()` pre-check rejected it with
+    /// `pypi_lock_read_failed`, and because `contains_target` /
+    /// `load_python_locks` bubble the FIRST unreadable sibling, the stray link
+    /// blocked vendoring of the whole project. A link to a regular file must
+    /// read like the file (`open_regular_file`'s fstat already accepts it).
     #[cfg(unix)]
     #[tokio::test]
     async fn stray_sibling_symlink_does_not_block_regular_pylock() {
@@ -1228,7 +1232,7 @@ mod tests {
         assert_eq!(restored, original);
     }
 
-    /// KNOWN LIMITATION: two TRANSITIVE deps
+    /// KNOWN LIMITATION (documented, not fixed here): two TRANSITIVE deps
     /// vendored into one PEP 723 script share the `[tool.uv]
     /// override-dependencies` ARRAY. Reverting the OLDER one first (`one`,
     /// while `two`'s override is still live) cannot be expressed by

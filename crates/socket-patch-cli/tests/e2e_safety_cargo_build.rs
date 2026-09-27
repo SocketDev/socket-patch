@@ -605,7 +605,7 @@ fn apply_with_malformed_checksum_reports_sidecar_fixup_failed() {
     stage_socket_manifest(&consumer);
 
     // Corrupt the checksum file so cargo::fixup hits the
-    // `serde_json::from_slice` Malformed error path. The fixup runs
+    // `serde_json::from_str` Malformed error path. The fixup runs
     // AFTER the patch is committed atomically, so the patch itself
     // succeeds; only the sidecar emits an Error-severity advisory.
     let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
@@ -843,9 +843,10 @@ fn apply_with_readonly_checksum_still_rewrites_it() {
 }
 
 /// Third Malformed branch: when `.cargo-checksum.json` exists but
-/// is a *directory* rather than a file. `read_regular_to_bytes`'s
-/// regular-file check rejects it with a non-`NotFound` I/O error, so the
-/// fixup hits the generic `Err(source)` arm and returns
+/// is a *directory* rather than a file. `tokio::fs::read_to_string`
+/// returns an I/O error with kind `IsADirectory` (Linux) /
+/// `InvalidInput` (macOS) — NOT `NotFound` — so the fixup hits the
+/// generic `Err(source)` arm in cargo.rs (lines 61-65) and returns
 /// `SidecarError::Io`. The boundary converts that to a
 /// `sidecar_fixup_failed` advisory.
 ///
@@ -860,7 +861,8 @@ fn apply_with_checksum_directory_reports_sidecar_fixup_failed() {
     stage_socket_manifest(&consumer);
 
     // Replace the regular `.cargo-checksum.json` file with a
-    // directory of the same name, which `read_regular_to_bytes` refuses.
+    // directory of the same name. `read_to_string` will refuse to
+    // treat it as a string.
     let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
     std::fs::remove_file(&checksum).unwrap();
     std::fs::create_dir(&checksum).unwrap();
@@ -908,7 +910,7 @@ fn apply_with_checksum_directory_reports_sidecar_fixup_failed() {
 }
 
 /// Cargo sidecar no-op: no `.cargo-checksum.json` present at all.
-/// The fixup returns `Ok(None)` and the
+/// The fixup returns `Ok(None)` (lines 56-60 of cargo.rs) and the
 /// envelope carries no cargo record at all — apply still succeeds
 /// because the sidecar contract treats "no checksum file" as
 /// "nothing to do, package isn't from a directory source".

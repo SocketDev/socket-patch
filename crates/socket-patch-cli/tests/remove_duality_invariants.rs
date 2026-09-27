@@ -9,9 +9,16 @@
 //! offline: every fixture is hand-written camelCase JSON plus blobs staged
 //! under `.socket/blobs`, and every wet run passes `--offline`.
 //!
-//! The hosted leg is covered on both paths: through a manifest entry, and
-//! manifest-less via `remove_hosted_only` (CLI_CONTRACT.md: "a hosted-only
-//! match works with no manifest at all").
+//! DISCREPANCY PINS (implementation is the source of truth):
+//! CLI_CONTRACT.md ("remove unwinds hosted redirects (v5.0)") promises "a
+//! hosted-only match works with no manifest at all (mirroring the
+//! detached-vendored escape)". The implementation does NOT deliver that:
+//! `remove.rs`'s manifest-missing gate recognizes the hosted-only match and
+//! proceeds, but the `matching.is_empty()` branch afterwards knows only the
+//! detached-vendored escape and falls through to `not_found` (exit 1)
+//! without ever reaching the hosted leg. The two `*_pins_not_found` tests
+//! below pin that ACTUAL behavior; the hosted leg itself is reachable (and
+//! covered here) only when the identifier also matches a manifest entry.
 
 use std::path::{Path, PathBuf};
 
@@ -609,7 +616,7 @@ fn hosted_only_remove_without_manifest_unwinds_redirect() {
     );
 }
 
-/// The hosted leg on the manifest path: the identifier matches a manifest
+/// The hosted leg where it IS reachable: the identifier matches a manifest
 /// entry AND the redirect ledger's record for the same purl. The remove
 /// unwinds the redirect (per-purl npm revert): the lock entry gets its
 /// original resolved/integrity back byte-exactly, the emptied ledger is
@@ -718,8 +725,8 @@ fn gem_plus_npm_ledger_text() -> String {
     )
 }
 
-/// With a manifest entry for the gem purl (the manifest path; the
-/// manifest-less twin is below), the unsupported-ecosystem hosted
+/// With a manifest entry for the gem purl (the only way the hosted leg is
+/// reachable — see the module docs), the unsupported-ecosystem hosted
 /// target fails closed BEFORE the manifest mutation: exit 1, top-level
 /// `hosted_revert_unsupported`, and BOTH stores byte-identical.
 #[test]

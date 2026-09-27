@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(packages[0].purl, "pkg:nuget/newtonsoft.json@13.0.3");
     }
 
-    /// Direct guard on the `seen`-dedup arm of `scan_package_dir`:
+    /// Direct guard on the `seen`-dedup arm of `scan_global_cache_package`:
     /// the same package reached through TWO scanned paths (e.g. a local
     /// `packages/` folder and the global cache both holding it) must be
     /// emitted only once. `test_deduplication` above creates a single
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(first[0].path, pkg_dir);
 
         // Second scan of the same tree: the version dir verifies again
-        // (so `scan_global_cache_package` returns it as a candidate), but
+        // (so `scan_global_cache_package` reports `found_any` for it), but
         // the purl is already in `seen`, so no duplicate package is
         // emitted.
         let second = crawler.scan_package_dir(dir.path(), &mut seen).await;
@@ -931,8 +931,8 @@ mod tests {
         let pkg = dir.path().join("Foo.1.0.0");
         // Top-level marker — this is a valid legacy package.
         tokio::fs::create_dir_all(pkg.join("lib")).await.unwrap();
-        // A content folder that itself contains a lib/ dir, which a naive
-        // global-cache heuristic would mistake for a version dir.
+        // A content folder that itself contains a lib/ dir. This is what
+        // tripped the old global-cache heuristic.
         tokio::fs::create_dir_all(pkg.join("tools").join("lib"))
             .await
             .unwrap();
@@ -1119,9 +1119,10 @@ mod tests {
     /// `1`), `i+1 < dir_name.len()` is true, split_idx = Some(0).
     /// The name slice ends up empty; the defensive guard at the
     /// bottom of parse_legacy_dir_name rejects rather than producing
-    /// a `("", "1.0.0")` ghost package. (Hidden dirs are already
-    /// skipped upstream in classify_package_entry, so this guard is
-    /// pure defense-in-depth for the parser.)
+    /// a `("", "1.0.0")` ghost package. (Hidden dirs are skipped
+    /// upstream in scan_package_dir, but the parser is also called
+    /// from find_by_purls without the hidden-dir filter, so the
+    /// guard is real defense-in-depth.)
     #[test]
     fn test_parse_legacy_dir_name_empty_name_guard() {
         assert_eq!(parse_legacy_dir_name(".1.0.0"), None);

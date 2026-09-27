@@ -20,16 +20,13 @@
 //!     (lock + pyproject/Pipfile + .socket/) are copied to a fresh dir; the
 //!     tool's STRICTEST install runs cold+offline and a Python import probe
 //!     proves `six.py` is the PATCHED bytes.
-//!   manifest-less VEX, per flavor: poetry stage 2b (`--network none`, then
-//!     the host) over copies of the installed fresh checkout — manifest
-//!     deleted → attested offline from the ledger (standalone + `apply
-//!     --vex`); ledgers deleted → attested from the poetry.lock wiring + a
-//!     wiremock patch API (host side), `record_unavailable` under
-//!     `--offline`; lock reverted with ledger + artifact kept →
-//!     `vendor_unwired`, `--no-verify` too. pdm runs the same matrix at the
-//!     end of stage 2 (offline only); pipenv has its own stage 2b (offline
-//!     only; the online ledger-less step is covered by
-//!     e2e_vex_build/e2e_vex_lockfile).
+//!   stage 2b (poetry, `--network none`, then the host): manifest-less VEX
+//!     over copies of the installed fresh checkout — manifest deleted →
+//!     attested offline from the ledger (standalone + `apply --vex`);
+//!     ledgers deleted → attested from the poetry.lock wiring + a wiremock
+//!     patch API (host side), `record_unavailable` under `--offline`; lock
+//!     reverted with ledger + artifact kept → `vendor_unwired`, `--no-verify`
+//!     too.
 //!   stage 3 (`--network none`): re-vendor is idempotent (already_vendored,
 //!     lock byte-stable) → `vendor --revert` restores the lock byte-identical
 //!     to the pre-vendor snapshot and removes `.socket/vendor` → re-vendor

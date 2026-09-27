@@ -6,10 +6,10 @@
 //! local-config installs) and the flat `vendor/bundle/gems/` store
 //! (bundler 1 with an env `BUNDLE_PATH`). Both can coexist — a bundler-2
 //! install beside a bundler-1 install of the SAME project — each holding a
-//! REAL physical copy of the same `gem@version`. `apply` must patch every
-//! store's copy: resolving the purl to ONE copy (first-wins merge) would
-//! report `success` while whichever bundler loaded the OTHER store ran
-//! pristine (vulnerable) bytes.
+//! REAL physical copy of the same `gem@version`. `apply` used to resolve
+//! the purl to ONE store's copy (first-wins merge), patch it, and report
+//! `success` while whichever bundler loaded the OTHER store ran pristine
+//! (vulnerable) bytes.
 //!
 //! These tests build the coexisting layout by hand (hermetic, offline, no
 //! ruby toolchain), hand-stage a `.socket/` manifest + blobs, run the REAL

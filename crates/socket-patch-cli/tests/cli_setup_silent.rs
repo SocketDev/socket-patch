@@ -1,10 +1,12 @@
 //! `setup --silent` contract tests.
 //!
-//! CLI_CONTRACT.md defines `--silent` as "Errors only": `setup` (and its
-//! `--check` / `--remove` modes) must mute the "Configuring..." /
+//! CLI_CONTRACT.md defines `--silent` as "Errors only". Regression
+//! guard: `setup` (and its `--check` / `--remove` modes) gated all of
+//! its human-readable output on `!json` alone — the "Configuring..." /
 //! "Searching..." headers, the previews, the summaries, the
-//! configuration-status report, and the commit hints (not just gate them
-//! on `!json`).
+//! configuration-status report, and the commit hints all printed under
+//! `--silent`. Same bug class previously fixed in `list`, `repair`,
+//! `get`, `remove`, and `scan`.
 //!
 //! `--silent` suppresses informational output only: the mutation still
 //! happens, exit codes still distinguish states, and (matching the

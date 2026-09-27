@@ -518,8 +518,8 @@ pub struct Wired {
     pub flavor: Flavor,
     pub mode: Mode,
     /// Every file after the wiring run (the venv and VEX output excluded):
-    /// wired project files, the mode's ledger, the committed wheel
-    /// (vendored); neither mode writes `.socket/manifest.json`.
+    /// wired project files, `.socket/manifest.json` (vendored non-detached),
+    /// the mode's ledger, the committed wheel (vendored).
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
@@ -715,7 +715,7 @@ pub fn assert_no_statement(out: &VexOutcome, what: &str) {
 
 /// a) no manifest, no ledgers, online → attested from the wiring alone;
 /// vex never writes the manifest or a ledger. Also the committed `.socket/`
-/// (ledger, plus the wheel when vendored) baseline, offline.
+/// (manifest + ledger) baseline, offline.
 pub fn a_wiring_only_checkout_attests_online(flavors: &[Flavor]) {
     for (flavor, mode) in cells(flavors) {
         let wired = wired(&flavor, mode);

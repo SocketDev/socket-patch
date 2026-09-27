@@ -940,10 +940,11 @@ mod tests {
         )
     }
 
-    /// A merged section (bundler <= 2.1) must stay attributable — being
-    /// RECOGNIZED, an unattributable one would also kill the redirect
-    /// ledger's claim, so a correctly patched bundler 1.17-2.1 project could
-    /// not attest its hosted patch at all. The source pin (DEPENDENCIES `!` + the Gemfile block on that remote) attributes
+    /// REGRESSION: a merged section (bundler <= 2.1) used to be flatly
+    /// unattributable — and, being RECOGNIZED, it killed the redirect
+    /// ledger's claim too, so a correctly patched bundler 1.17-2.1 project
+    /// could not attest its hosted patch at all, ledger or not. The source
+    /// pin (DEPENDENCIES `!` + the Gemfile block on that remote) attributes
     /// the gem; the upstream spec in the same section stays silent.
     #[tokio::test]
     async fn merged_section_source_pinned_gem_is_hosted() {

@@ -506,12 +506,15 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
          the unchanged file does not prove dry-run suppressed a real patch; \
          bodies: {batch_bodies:?}"
     );
-    // Discovery alone doesn't prove a patch was selected. Requiring the
-    // per-package fetch (`discover_selected`, which runs before the dry-run
-    // gate) proves a real patch was selected before dry-run declined to
-    // write. Hosted mode's `run_redirect` also calls `discover_selected`, so
-    // this does NOT tell a broken `--apply` → agent fold (which would fall
-    // into the hosted default) apart from a working one.
+    // Discovery alone still doesn't pin the APPLY path: a scan that
+    // degraded to plain listing (e.g. a broken `--apply` → agent-mode
+    // fold in `resolve_mode_flags`) also queries batch with the purl,
+    // exits 0, and leaves the file untouched — vacuously green. In JSON
+    // mode only the agent-mode apply branch fetches per-package patch
+    // details (`discover_selected`, which runs before the dry-run gate),
+    // so requiring that fetch proves dry-run reached the apply path with
+    // a real patch selected and then declined to write. Mutation-verified:
+    // dropping the `--apply` fold passes every assert above but fails here.
     assert!(
         requests.iter().any(|r| r
             .url

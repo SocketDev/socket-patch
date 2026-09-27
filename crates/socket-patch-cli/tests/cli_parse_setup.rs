@@ -92,9 +92,9 @@ fn remove_long_form() {
 fn ecosystems_flag_parses_on_setup() {
     // Setup command contract, property 2 ("ecosystem-scoped"): `setup` accepts
     // the global `--ecosystems` filter (long form + the `-e` short form, CSV
-    // split). This pins the *parse* surface only; whether `setup` restricts
-    // its work to the named ecosystems at runtime is covered by
-    // setup_contract_gaps::setup_ecosystems_filter_scopes_work_to_named_ecosystem.
+    // split). This pins the *parse* surface only; whether `setup` actually
+    // restricts its work to the named ecosystems at runtime is a separate
+    // (currently unimplemented) guarantee, RED-guarded in setup_contract_gaps.rs.
     let long = parse_setup(&["--ecosystems", "npm,cargo"]);
     assert_eq!(
         long.common.ecosystems.as_deref(),

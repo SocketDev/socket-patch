@@ -1,7 +1,8 @@
 //! Minimal timestamp parser for the `publishedAt` field on patch records.
 //!
 //! The Socket patch API serves `publishedAt` as an **RFC 2822 / HTTP-date**
-//! string — `Fri, 27 Mar 2026 19:12:42 GMT`. Test fixtures throughout this repo use RFC 3339
+//! string — `Fri, 27 Mar 2026 19:12:42 GMT` — verified live across npm,
+//! PyPI, cargo and gem. Test fixtures throughout this repo use RFC 3339
 //! (`2026-03-27T19:12:42Z`) instead, so both spellings must parse.
 //!
 //! This matters because these strings are *ordered*: patch selection ranks

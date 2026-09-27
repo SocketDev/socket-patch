@@ -1,4 +1,5 @@
-//! Coverage-gap tests for the interactive TTY branches of `src/ui/prompt.rs`:
+//! Coverage-gap tests for the interactive TTY branches of `src/ui/prompt.rs`
+//! (2026-09 coverage audit):
 //!
 //! * `confirm()`'s bare-Enter -> `default_yes` return. Every production
 //!   caller passes `default_yes = true`, so this IS the "Enter proceeds
@@ -25,7 +26,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Pulled in for `git_sha256` (the patch-view blob fixture below must clear
-// the "patch has no applicable files" guardrail with a real blob
+// PR #158's "patch has no applicable files" guardrail with a real blob
 // hash). Read-only reuse of the shared helper module.
 #[path = "common/mod.rs"]
 mod common;
@@ -317,7 +318,7 @@ async fn received_paths(mock: &MockServer) -> Vec<String> {
         .collect()
 }
 
-/// A single-file patch-view `files` map that survives the "patch has
+/// A single-file patch-view `files` map that survives PR #158's "patch has
 /// no applicable files" guardrail: one net-new file with an all-zero
 /// `beforeHash`, a real git-blob `afterHash`, and matching base64
 /// `blobContent`. These tests pass `--save-only`, which records without
@@ -341,7 +342,7 @@ fn single_file_view() -> serde_json::Value {
 /// be caught by the request log rather than dying on a confusing 404.
 ///
 /// Both patches carry the same `publishedAt` and no vulnerabilities, so
-/// `cmp_search_results` falls through merge coverage/severity/recency/tier to its
+/// `cmp_search_results` falls through severity/coverage/recency to its
 /// uuid-ascending backstop: UUID_A ranks first, deterministically, without
 /// depending on how the date string parses.
 async fn mount_two_free_patches(mock: &MockServer, purl: &str, encoded: &str) {
@@ -530,7 +531,7 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
     // Cancelling the dialoguer menu → `interact_opt()` returns `Ok(None)` →
     // `select_one` maps it to `SelectError::Cancelled` (ui/prompt.rs) →
     // get prints "Selection cancelled." and exits 0 without downloading
-    // anything (get.rs, the SelectError::Cancelled arm after select_one).
+    // anything (get.rs:660-663).
     //
     // The keystroke is `q`, not ESC: dialoguer 0.11's Select treats
     // `Key::Escape | Key::Char('q')` identically (both return `None` from

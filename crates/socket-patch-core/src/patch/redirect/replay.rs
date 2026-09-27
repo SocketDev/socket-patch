@@ -3,11 +3,10 @@
 //! The per-purl reverts in [`super::takeover`] cover cargo, the
 //! npm-family lock flavors, and golang (which reuses the golang inverses
 //! here). Everything else the hosted rewriters touch —
-//! gem, pypi, composer, and the non-package rideshare edits
+//! gem, pypi, composer, bun, and the non-package rideshare edits
 //! (such as the pnpm `trustLockfile` auto-config) —
-//! has no per-purl revert (bun edits the per-purl revert does not claim
-//! also fall through to this replay): their unwind rides the ledger's
-//! designed whole-list contract ("edits appended in write order, a revert walks
+//! has no per-purl revert: their unwind rides the ledger's designed
+//! whole-list contract ("edits appended in write order, a revert walks
 //! them in reverse", see [`super::state`]).
 //!
 //! [`revert_remaining_redirect_edits`] performs that walk over whatever
@@ -2469,10 +2468,10 @@ mod tests {
         assert_eq!(read(dir.path(), ".npmrc").await, "allow-remote=all\n");
     }
 
-    /// The replay twin of the per-purl planning guard: a symlinked `.npmrc`
+    /// The replay twin of the per-purl finding: a symlinked `.npmrc`
     /// refuses the npm group while planning (the link and its target are
-    /// never written), and a section-scoped copy of the line does not make
-    /// the unwind ambiguous.
+    /// never written), and a section-scoped copy of the line no longer
+    /// makes the unwind ambiguous.
     #[cfg(unix)]
     #[tokio::test]
     async fn npmrc_symlink_refuses_at_plan_time_and_section_copies_are_inert() {
@@ -2927,8 +2926,8 @@ mod tests {
     async fn directory_squatting_a_lockfile_refuses_each_arm_fail_fast() {
         // A directory planted at the lockfile path makes open_regular_file
         // return InvalidInput (open + fstat) — the fail-fast posture the
-        // `staged` module documents for its guarded reads. Every per-arm
-        // read must refuse the group with the read error and keep the ledger.
+        // module doc claims. Every per-arm read must refuse the group with
+        // the read error and keep the ledger.
         #[allow(clippy::type_complexity)]
         let cases: [(&str, &str, &str, Option<&str>, Option<&str>); 4] = [
             (

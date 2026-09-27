@@ -1282,8 +1282,8 @@ mod tests {
             build_telemetry_context("apply").version,
             env!("CARGO_PKG_VERSION")
         );
-        // A hardcoded "1.0.0" literal must never appear unless the crate is
-        // genuinely at that version.
+        // The previously-hardcoded literal must never reappear unless the crate
+        // is genuinely at that version.
         assert!(
             PACKAGE_VERSION != "1.0.0" || env!("CARGO_PKG_VERSION") == "1.0.0",
             "telemetry version is still hardcoded to the stale 1.0.0 literal"

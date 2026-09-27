@@ -692,9 +692,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // intact (mirroring the `rollback_failed` contract). A corrupt ledger
     // is a hard error: we are about to mutate and cannot know what we
     // would leave wired. `--skip-rollback` ("don't touch my tree") skips
-    // the revert too — the wiring stays until `vendor --revert` / a later
-    // `remove` undoes it (a manifest-tracked entry is also reconcile-reverted
-    // by the next `vendor` run; detached entries never are).
+    // the revert too — the wiring stays until the next `vendor` run
+    // reconciles the then-dropped entry.
     let mut vendor_state = match vendor_state_result {
         Ok(s) => s,
         Err(e) => {
@@ -746,7 +745,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     // ── hosted leg ──────────────────────────────────────────────────────
     // An identifier can also (or only) match hosted records in the
-    // redirect ledger. Supported ecosystems (cargo, npm-family, golang) unwind
+    // redirect ledger. Supported ecosystems (cargo, npm-family) unwind
     // per-purl; when the identifier covers EVERY record the whole-ledger
     // replay serves the rest; otherwise unsupported targets fail closed
     // BEFORE the manifest mutation. A corrupt ledger skips the leg with a

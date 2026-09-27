@@ -338,7 +338,8 @@ async fn composer_gem_uv_fragments_recover() {
 
 // A pdm.lock produced with the `static_urls` strategy inlines the wheel
 // URL exactly like uv.lock, but records it under the `pdm_lock_package`
-// wiring kind; recovery accepts every pypi kind, not just `uv_lock_package`.
+// wiring kind. Recovery used to look only at `uv_lock_package`, so it was
+// blind to pdm/poetry/pipenv projects; it now accepts every pypi kind.
 #[tokio::test]
 async fn recover_pypi_pdm_static_urls_recovers_pure_wheel() {
     let tmp = tempfile::tempdir().unwrap();
@@ -361,8 +362,10 @@ async fn recover_pypi_pdm_static_urls_recovers_pure_wheel() {
 
 // Default pdm/poetry (`file = …`), pipenv (`hashes` only) and pip
 // (`--hash=`) locks record the wheel hash but no fetchable URL. Recovery
-// recognizes those fragments and returns an accurate, actionable message
-// rather than a "no recoverable fragment" error.
+// now RECOGNIZES those fragments (previously they fell through to the
+// uv-specific "no uv.lock fragment recorded" error) and returns an
+// accurate, actionable message instead of the false "not installed / no
+// recoverable fragment".
 #[tokio::test]
 async fn recover_pypi_urlless_locks_report_no_fetchable_url() {
     let tmp = tempfile::tempdir().unwrap();
@@ -619,7 +622,8 @@ async fn recover_composer_empty_shasum_and_gem_hexless_checksum_fail_closed() {
 /// Fragments PRESENT but invalid (non-SRI pnpm integrity, a yarn block
 /// with neither SRI nor 40-hex fragment, a malformed berry checksum, a
 /// bun tuple without an SRI token) must all fall through to the final
-/// fail-closed error. An empty-name base purl is unparseable outright.
+/// fail-closed error — only the no-fragment-at-all path was tested. An
+/// empty-name base purl is unparseable outright.
 #[tokio::test]
 async fn recover_present_but_invalid_npm_fragments_fail_closed() {
     let tmp = tempfile::tempdir().unwrap();

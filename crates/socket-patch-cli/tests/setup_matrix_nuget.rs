@@ -50,12 +50,12 @@ mod vex_e2e_common;
 /// real teeth live in [`host_guard`] below.
 #[test]
 #[serial_test::serial]
-// nuget's aspirational setup-matrix cases are a BASELINE GAP (no install
-// hook for setup to wire); this passes on CI only because the runners lack
-// `dotnet` (cases soft-skip) and fails on any host that has it. Ignore so
-// nuget can never block the blocking --all-features jobs; `host_guard` below
-// still pins the real no-op contract. Run with `--features setup-e2e -- --ignored`.
-#[ignore = "BASELINE GAP (nuget): no install hook for setup to wire; not gating CI; run with --ignored"]
+// Experimental ecosystem (nuget): aspirational setup-matrix cases are a
+// BASELINE GAP today; this passes on CI only because the runners lack `dotnet`
+// (cases soft-skip) and fails on any host that has it. Ignore so nuget can
+// never block the blocking --all-features jobs; `host_guard` below still pins
+// the real no-op contract. Run with `--features setup-e2e,nuget -- --ignored`.
+#[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 fn dotnet() {
     smc::run_pm("nuget", "dotnet");
 }
@@ -156,7 +156,7 @@ mod host_guard {
     }
 
     /// The `.csproj` must be byte-for-byte what we wrote — `setup` (in any
-    /// mode) operates on package.json / Python / Gemfile / composer.json manifests and must
+    /// mode) operates on package.json / Python / Cargo manifests and must
     /// NEVER touch a dotnet project file.
     fn assert_csproj_pristine(root: &Path, who: &str) {
         assert_eq!(

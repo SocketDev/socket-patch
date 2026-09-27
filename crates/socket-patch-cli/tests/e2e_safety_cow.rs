@@ -14,7 +14,7 @@
 //!     with a private regular file; the target stays put.
 //!   * a multi-file patch where every patched file is hardlinked.
 //!   * regular files (no hardlink, no symlink) — CoW must be a
-//!     no-op, no stage litter in the parent directory.
+//!     no-op, no `.socket-cow-*` litter in the parent directory.
 //!
 //! These tests use the npm crawler against a synthetic
 //! `node_modules/<pkg>/` layout (no real npm install needed). The
@@ -272,9 +272,10 @@ fn apply_breaks_hardlink_before_patching() {
         1,
         "after CoW, the outside file should be a single-link inode"
     );
-    // The atomic writer's `.socket-stage-*` rename-over broke the link;
-    // the stage must be gone (`.socket-cow-*` is checked only as a
-    // regression tripwire).
+    // CoW broke the link via a `.socket-cow-*` stage + rename; that
+    // stage file (and the atomic-writer's `.socket-stage-*`) must be
+    // gone. This is the only scenario class that exercises the CoW
+    // stager, so this is where a stage-cleanup regression would show.
     assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
@@ -317,8 +318,8 @@ fn apply_replaces_symlink_with_private_file() {
         git_sha256(ORIGINAL_BYTES),
         "the symlink target must NOT have been mutated; CoW must replace the link with a private file"
     );
-    // The `.socket-stage-*` rename-over replaced the link; no litter may
-    // remain.
+    // The symlink branch of CoW also stages a `.socket-cow-*` private
+    // copy and renames it over the link; no litter may remain.
     assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
@@ -468,8 +469,8 @@ fn run_scrubs_ambient_socket_env() {
 /// Regular files (no hardlink, no symlink) are the common case.
 /// CoW must be a no-op fast path: no stage litter in the parent
 /// directory, no extra inodes created, the file is rewritten in
-/// place via the atomic-write path. This pins the plain regular-file
-/// path through `atomic_write_bytes`.
+/// place via the atomic-write path. This pins the
+/// `CowAction::AlreadyPrivate` route.
 #[test]
 #[serial_test::serial]
 fn apply_against_regular_file_leaves_no_cow_litter() {
@@ -483,13 +484,16 @@ fn apply_against_regular_file_leaves_no_cow_litter() {
     // File patched.
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(PATCHED_BYTES));
 
-    // No `.socket-stage-*` (or tripwire `.socket-cow-*`) litter in the
-    // package directory after a successful apply.
+    // No `.socket-cow-*` or `.socket-stage-*` litter in the package
+    // directory after a successful apply. (For a regular file the
+    // `AlreadyPrivate` path never stages a `.socket-cow-*` copy, so this
+    // mainly guards the atomic writer's `.socket-stage-*` cleanup here;
+    // the hardlink/symlink tests are what cover the CoW stager.)
     assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
-/// The pre-write hash gate fires before any stage/rename — so on a
-/// hash-mismatch failure (where apply errors out without writing), the hardlink
+/// CoW happens before the atomic write — so on a hash-mismatch
+/// failure (where apply errors out without writing), the hardlink
 /// pair must NOT have been broken either. The original outside
 /// file's inode and content must be byte-identical AND still
 /// share the same inode as the package file.

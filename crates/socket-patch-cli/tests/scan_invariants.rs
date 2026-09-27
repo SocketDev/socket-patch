@@ -985,9 +985,10 @@ async fn scan_handles_api_500_error_gracefully() {
         panic!("scan must emit valid JSON even on API failure; err={e}; stdout={stdout}; stderr={stderr}")
     });
 
-    // CONTRACT (commands/scan/mod.rs, all-batches-failed bail): "If every
-    // batch errored, surface this as a full scan failure rather than
-    // silently reporting zero patches." Here there is exactly one package → exactly one batch,
+    // CONTRACT (scan.rs:598-600): "If every batch errored, surface this as
+    // a full scan failure rather than silently reporting zero patches
+    // (which historically looked identical to 'no patches for these
+    // packages')." Here there is exactly one package → exactly one batch,
     // and it returns 500, so EVERY batch failed. scan must therefore NOT
     // present this as a clean success. A scan that emits status="success"
     // / exit 0 with scannedPackages=1, totalPatches=0 is reporting the
@@ -1257,8 +1258,8 @@ async fn scan_prune_removes_withdrawn_patch_entry() {
 /// same PURL that's in the manifest, `scan` surfaces that in the
 /// `updates` array even without `--apply`. Sibling to
 /// `scan_emits_updates_entry_when_newer_uuid_available` but exercised
-/// with a stub blob on disk so we pin that scan without `--apply` never
-/// rewrites the manifest or existing blobs.
+/// with a stub blob on disk so we pin the read-only behavior: scan
+/// alone never mutates files.
 #[tokio::test]
 async fn scan_detects_update_without_touching_existing_blobs() {
     const OLD_UUID: &str = "44444444-4444-4444-8444-444444444444";
@@ -1324,7 +1325,7 @@ async fn scan_detects_update_without_touching_existing_blobs() {
     assert_eq!(updates[0]["oldUuid"], OLD_UUID);
     assert_eq!(updates[0]["newUuid"], NEW_UUID);
 
-    // Scan without --apply never rewrites the manifest or blobs. The manifest still records the OLD
+    // Critical: scan is read-only. The manifest still records the OLD
     // UUID and the marker blob is byte-for-byte unchanged.
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
@@ -1358,8 +1359,7 @@ async fn scan_detects_update_without_touching_existing_blobs() {
 // * `hosted_wiring_retained`: agent-mode scan over a live hosted redirect
 //   (lockfile still pinned to the patch server + redirect ledger records
 //   live) applies in place and reports success with zero hint that the
-//   hosted wiring was NOT unwound (an agent run does not unwind hosted
-//   wiring; `rollback` or `scan --mode vendored` does).
+//   hosted wiring was NOT unwound (no hosted revert exists for npm/yarn).
 
 const AGENT_WARN_UUID: &str = "33333333-3333-4333-8333-333333333333";
 
@@ -1671,12 +1671,15 @@ async fn scan_agent_hosted_warning_silent_when_lock_is_registry_clean() {
 }
 
 // ---------------------------------------------------------------------------
-// Report-only cross-mode visibility — the `redirectState` envelope block
+// Read-only cross-mode visibility — the `redirectState` envelope block
 // ---------------------------------------------------------------------------
 //
 // The `hosted_wiring_retained` warning above only rides the AGENT-mode
-// envelope; a report-only scan (`scan --prune` or a global scan with no
-// mode) must still say something about a live hosted redirect. These pin the additive top-level `redirectState` block: the
+// envelope, and report-only `scan --json` (the documented read-only state
+// probe) said nothing at all about a live hosted redirect: a hosted-wired
+// project's `scan --json` was byte-identical to a never-touched project's
+// (verified against production on bundler 1.17/2.7/4.0 — the gem live-matrix
+// D3 defect). These pin the additive top-level `redirectState` block: the
 // redirect ledger's records (project STATE, not an anomaly — so a block, not
 // a warning) plus the scanned purls whose hosted lockfile wiring the live
 // lock still proves.
@@ -1951,9 +1954,9 @@ async fn hosted_mode_envelopes_omit_redirect_state() {
 /// Vendored-mode envelopes never carry `redirectState` either: the vendored
 /// takeover reconciliation may retire ledger records mid-run (the
 /// `vendor_supersedes_redirect` warning covers that state), so a pre-run
-/// snapshot would go stale. The zero-discovery leg pins that the
-/// early-return does not leak the block into `scan --mode vendored --json`
-/// over an empty crawl.
+/// snapshot would go stale. The zero-discovery leg is the regression pin —
+/// the early-return used to gate the block on `!hosted` alone, leaking it
+/// into `scan --mode vendored --json` over an empty crawl.
 #[tokio::test]
 async fn vendored_mode_envelopes_omit_redirect_state() {
     let mock = MockServer::start().await;

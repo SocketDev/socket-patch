@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn test_has_table_trailing_comment_and_padding() {
         // A trailing inline comment after the header is valid TOML and must
-        // not defeat detection (`trim_end_matches(']')` alone would leave the
+        // not defeat detection (previously `trim_end_matches(']')` left the
         // comment glued to the header).
         assert!(has_table("[tool.uv] # the uv table\n", "tool.uv"));
         assert!(has_table("[tool.uv.sources]  # comment\n", "tool.uv"));

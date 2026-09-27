@@ -3,8 +3,8 @@
 //! pypi vendoring cannot reuse a registry artifact: the patch applies to the
 //! *installed* site-packages tree, so the committable `.socket/vendor/pypi/`
 //! artifact must be reconstructed from that tree. The installed
-//! `*.dist-info/RECORD` is the authoritative member list (pip 26 / uv 0.11
-//! only require RECORD to exist and parse at install time — per
+//! `*.dist-info/RECORD` is the authoritative member list (spike-verified: pip
+//! 26 / uv 0.11 only require RECORD to exist and parse at install time — per
 //! file hashes are unchecked — but we regenerate it correctly anyway, because
 //! the RECORD drives uninstall bookkeeping and post-hoc audits). The rebuild
 //! is byte-for-byte deterministic so the emitted `--hash` / uv lock hash pin
@@ -341,7 +341,7 @@ pub async fn build_patched_wheel(
         // row that escapes site-packages (`../../../bin/x`, absolute paths)
         // must never be staged or zipped — only the installer-regenerated
         // console/gui scripts (matched by entry_points.txt NAME, never by
-        // extension heuristics, which would wrongly drop
+        // extension heuristics: the spike's splitext shortcut wrongly dropped
         // `../../../share/man/man6/pycowsay.6`) are silently excluded; any
         // OTHER out-of-tree entry is data the rebuilt wheel cannot carry, so
         // the whole vendor is refused fail-closed.
@@ -385,7 +385,7 @@ pub async fn build_patched_wheel(
     // once and carried straight into the wheel. That holds only while no two
     // names can fold into one another on the staging filesystem (a
     // case-insensitive or Unicode-normalising volume) — for anything else the
-    // whole member set is staged and read back from there.
+    // whole member set is staged and read back from there, as before.
     // `patch_target_paths` is sorted, so the directory pass below — which
     // returns on its first failure — names the same target on every run.
     let target_paths = patch_target_paths(&record.files);
@@ -963,7 +963,7 @@ mod tests {
         assert_eq!(zip_file(&bytes, "six.py"), PATCHED);
     }
 
-    /// Equivalence: keeping the installed tree's members in memory must
+    /// X10 equivalence: keeping the installed tree's members in memory must
     /// rebuild the EXACT wheel bytes the stage-everything build produced —
     /// the emitted `--hash` / uv lock pin rides on them. Driven twice over
     /// one fixture (an exec-bit member, a zero-length member, a nested tree,
@@ -1163,7 +1163,7 @@ mod tests {
     #[tokio::test]
     async fn out_of_tree_data_file_is_refused() {
         // `share/man/...` is a wheel .data payload, NOT a console script —
-        // name-stem heuristics must not swallow it.
+        // the spike showed name-stem heuristics must not swallow it.
         let fx = make_fixture(
             "../../../share/man/man6/six.6,sha256=ee,10\n",
             Some("[console_scripts]\nsix-cmd = six:main\n"),
@@ -1452,8 +1452,7 @@ mod tests {
         assert!(is_console_script_artifact("pycowsay", &names));
         assert!(is_console_script_artifact("pycowsay.exe", &names));
         assert!(is_console_script_artifact("pycowsay-script.py", &names));
-        // A splitext-style stem heuristic's trap: `pycowsay.6` (a man page)
-        // must NOT match.
+        // The spike's splitext bug: `pycowsay.6` (a man page) must NOT match.
         assert!(!is_console_script_artifact("pycowsay.6", &names));
         assert!(!is_console_script_artifact("other", &names));
     }

@@ -278,8 +278,7 @@ impl Fixture {
         co
     }
 
-    /// The lock-level warnings the boundary table (docs/testing/vlt-compatibility.md) predicts for the
-    /// lock vlt wrote.
+    /// The lock-level warnings DESIGN §3.8 predicts for the lock vlt wrote.
     pub fn lock_warnings(&self) -> Vec<&'static str> {
         expected_lock_warnings(&self.lock_before, &self.proj)
     }
@@ -390,8 +389,7 @@ pub fn slash(u: &str) -> String {
     }
 }
 
-/// The boundary table (docs/testing/vlt-compatibility.md) applied to the lock vlt wrote and the
-/// project's vlt.json.
+/// DESIGN §3.8 over the lock vlt wrote and the project's vlt.json.
 pub fn expected_lock_warnings(lock_bytes: &[u8], proj: &Path) -> Vec<&'static str> {
     let lock: Value = serde_json::from_slice(lock_bytes).unwrap();
     let mut out = Vec::new();

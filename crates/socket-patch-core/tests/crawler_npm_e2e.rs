@@ -542,15 +542,16 @@ async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     assert_eq!(pkg.purl, qualified);
 }
 
-/// A qualifier value that itself contains an `@`
+/// Regression: a qualifier value that itself contains an `@`
 /// (`?vcs_url=git@github.com:...`) must NOT corrupt version parsing.
 /// `parse_purl_components` strips the `?qualifier` *before* it calls
 /// `rfind('@')` to split name from version. If those two steps were
 /// reordered, `rfind('@')` would latch onto the `@` inside `git@github`
 /// and parse a bogus version (`github.com:...`), so the package would
 /// fail to match its on-disk `1.0.0` and silently drop out of
-/// apply/rollback. The other qualified-PURL tests only use qualifiers
-/// WITHOUT an `@`, so this is the one that pins the strip order.
+/// apply/rollback. The existing qualified-PURL tests only use
+/// qualifiers WITHOUT an `@`, so they cannot catch a strip-order
+/// regression — this pins it.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
@@ -585,7 +586,7 @@ async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
 }
 
 /// PURL with no `@` (no version separator) must be rejected via the
-/// `rfind('@')?` arm.
+/// `rfind('@')?` arm (line 707).
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_purl_without_at_skipped() {
@@ -600,7 +601,7 @@ async fn find_by_purls_purl_without_at_skipped() {
 }
 
 /// PURL with `@` but an empty version (`pkg:npm/lodash@`) — covers the
-/// `version.is_empty()` arm.
+/// `version.is_empty()` arm at line 711-712.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_purl_with_empty_version_skipped() {
@@ -615,7 +616,7 @@ async fn find_by_purls_purl_with_empty_version_skipped() {
 }
 
 /// PURL with scope marker but no slash (`pkg:npm/@foo@1.0`) — covers
-/// the scoped-namespace `find('/')` split.
+/// the `find('/')?` arm at line 716.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_scoped_purl_without_slash_skipped() {
@@ -630,7 +631,7 @@ async fn find_by_purls_scoped_purl_without_slash_skipped() {
 }
 
 /// Scoped PURL with empty name after slash (`pkg:npm/@scope/@1.0`) —
-/// covers the `name.is_empty()` arm.
+/// covers the `if name.is_empty()` arm at line 719-720.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_scoped_purl_with_empty_name_skipped() {
@@ -793,7 +794,7 @@ async fn crawl_all_skips_hidden_and_skip_dirs() {
 #[path = "common/mod.rs"]
 mod common;
 
-/// `gather_node_modules` short-circuits when read_dir returns Err.
+/// `scan_node_modules` short-circuits when read_dir returns Err.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -819,8 +820,8 @@ async fn crawl_all_handles_unreadable_node_modules() {
 }
 
 /// `find_workspace_node_modules` short-circuits cleanly when it
-/// encounters an unreadable workspace subdir — drives its
-/// unreadable-dir arm by chmod 000-ing one workspace
+/// encounters an unreadable workspace subdir — drives the read_dir
+/// Err arm at npm_crawler.rs:440-441 by chmod 000-ing one workspace
 /// while leaving a readable one alongside.
 #[cfg(unix)]
 #[tokio::test]
@@ -858,7 +859,8 @@ async fn crawl_all_handles_unreadable_workspace_dir() {
 }
 
 /// Drives scoped-package scanning + nested node_modules recursion +
-/// the hidden-and-file-entries skip arms of both walks.
+/// the hidden-and-file-entries skip arms inside `scan_scoped_packages`
+/// and `scan_nested_node_modules`. Covers L552, 581-604, 619-665.
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_handles_nested_and_messy_scope_dir() {
@@ -866,15 +868,15 @@ async fn crawl_all_handles_nested_and_messy_scope_dir() {
     let nm = tmp.path().join("node_modules");
 
     // Regular package with its own nested node_modules containing another
-    // package — exercises the unscoped → nested node_modules path.
+    // package — exercises the unscoped → scan_nested_node_modules path.
     stage_npm_pkg(&nm, "outer", "1.0.0").await;
     stage_npm_pkg(&nm.join("outer").join("node_modules"), "inner", "2.0.0").await;
 
-    // Scoped package — exercises the scoped-walk happy path.
+    // Scoped package — exercises scan_scoped_packages happy path.
     stage_npm_pkg(&nm, "@scope/scoped-pkg", "3.0.0").await;
 
-    // Scoped package WITH a nested node_modules → the nested walk is
-    // reached from inside the scoped walk.
+    // Scoped package WITH a nested node_modules → scan_nested_node_modules
+    // is reached from inside scan_scoped_packages (L599-604).
     stage_npm_pkg(
         &nm.join("@scope").join("scoped-pkg").join("node_modules"),
         "scoped-dep",
@@ -882,23 +884,23 @@ async fn crawl_all_handles_nested_and_messy_scope_dir() {
     )
     .await;
 
-    // Hidden subdir inside @scope — must be skipped.
+    // Hidden subdir inside @scope — must be skipped (L581-583).
     tokio::fs::create_dir_all(nm.join("@scope").join(".hidden"))
         .await
         .unwrap();
     // A plain file inside @scope — must be skipped via the !is_dir &&
-    // !is_symlink arm.
+    // !is_symlink arm (L590-591).
     tokio::fs::write(nm.join("@scope").join("README.md"), b"x")
         .await
         .unwrap();
     // A plain file at top of node_modules too — exercises the same arm
-    // in the top-level walk.
+    // in scan_node_modules.
     tokio::fs::write(nm.join("top-level-file.txt"), b"y")
         .await
         .unwrap();
 
-    // Nested node_modules with a scoped subentry — drives the
-    // nested → scoped arm.
+    // Nested node_modules with a scoped subentry — drives the L650-653 arm
+    // (nested → scan_scoped_packages).
     stage_npm_pkg(
         &nm.join("outer").join("node_modules"),
         "@nest/leaf",
@@ -1007,14 +1009,15 @@ async fn crawl_all_skips_dirs_with_corrupt_package_json() {
     assert!(result.is_empty());
 }
 
-/// A symlinked package inside a nested `node_modules` (the
+/// Regression: a symlinked package inside a nested `node_modules` (the
 /// shape pnpm and `npm link` produce — top-level entries are symlinks
 /// into a content-addressed store) must itself be recorded, but the
 /// crawler must NOT recurse *through* the symlink into the store. Doing
 /// so would surface store-internal packages that aren't part of the
 /// project's dependency tree and could escape the project root
-/// entirely. The nested node_modules walk only descends into real
-/// directories (never through a symlink); this pins that behavior.
+/// entirely. `scan_nested_node_modules` guards its deeper recursion with
+/// `if file_type.is_dir()`, matching its sibling scanners; this pins
+/// that behavior.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -1057,12 +1060,12 @@ async fn crawl_all_does_not_recurse_through_symlinked_nested_package() {
 
 // ── regression pins: metadata identity + nested lookup ─────────
 
-/// npm (and Node's own loader) strip a leading UTF-8 BOM from
+/// Regression: npm (and Node's own loader) strip a leading UTF-8 BOM from
 /// `package.json`, so a published package may legitimately ship one
 /// (Windows-authored packages do). `serde_json::from_str` rejects the BOM,
-/// so without stripping it the crawler would silently skip the package — a
-/// vulnerable install invisible to `scan` and unpatchable by `apply`. Same
-/// class as the `strip_bom` handling in `package_json/detect.rs`.
+/// which made the crawler silently skip the package — a vulnerable install
+/// invisible to `scan` and unpatchable by `apply`. Same class as the
+/// `strip_bom` fixes in `package_json/detect.rs`.
 #[tokio::test]
 #[serial_test::parallel]
 async fn read_package_json_tolerates_utf8_bom() {
@@ -1104,12 +1107,13 @@ async fn read_package_json_tolerates_utf8_bom() {
     );
 }
 
-/// `find_by_purls` must verify the *name* of the probed `package.json`, not
-/// just its version. An npm alias install (`npm i foo@npm:bar@1.0.0`) puts
-/// package `bar` in `node_modules/foo`; a version-only probe would
-/// "resolve" a patch for `foo@1.0.0` to bar's directory and apply it to a
-/// completely different package's files (with the default mismatch policy
-/// applying the full patched blob of `foo` over `bar`).
+/// Regression: `find_by_purls` verified only the *version* of the
+/// `package.json` it probed, never the *name*. An npm alias install
+/// (`npm i foo@npm:bar@1.0.0`) puts package `bar` in `node_modules/foo`;
+/// a patch for `foo@1.0.0` would then be "resolved" to bar's directory and
+/// applied to a completely different package's files (with the default
+/// mismatch policy applying the full patched blob of `foo` over `bar`).
+/// The probe must require the on-disk name to match the PURL identity.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_rejects_alias_dir_with_matching_version() {
@@ -1156,12 +1160,13 @@ async fn find_by_purls_rejects_alias_dir_with_matching_version() {
     );
 }
 
-/// CLI_CONTRACT promises "deeply nested transitive dependencies are fully
-/// supported … `apply` is path-agnostic … patched identically to a direct
-/// one", and `crawl_all` (scan) discovers them at unbounded depth — so
-/// `find_by_purls` (apply's resolver) must too. A version that exists
-/// *only* nested (root holds a different major, the classic
-/// hoisting-conflict layout) must not be scannable yet unpatchable.
+/// Regression: CLI_CONTRACT promises "deeply nested transitive dependencies
+/// are fully supported … `apply` is path-agnostic … patched identically to a
+/// direct one", and `crawl_all` (scan) discovers them at unbounded depth —
+/// but `find_by_purls` (apply's resolver) probed only the tree root, so a
+/// version that exists *only* nested (root holds a different major, the
+/// classic hoisting-conflict layout) was scannable yet unpatchable: apply
+/// reported "No packages found that match available patches".
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_resolves_nested_only_install() {
@@ -1204,12 +1209,13 @@ async fn find_by_purls_resolves_nested_only_install() {
     assert_eq!(d[0].path, a_nm.join("@s").join("d"));
 }
 
-/// A FIFO planted at a `package.json` path must be skipped promptly, never
-/// opened blockingly. A plain `open(2)` on a FIFO waits for a writer that
-/// never comes — so one special file inside `node_modules` (a malicious
-/// package's postinstall can create one; npm itself never extracts FIFOs)
-/// would wedge `scan` (crawl_all) and `apply` (find_by_purls) indefinitely,
-/// with no error and no timeout. Same class as the `open_regular_file` guards in
+/// Regression: a FIFO planted at a `package.json` path must be skipped
+/// promptly, never opened blockingly. `tokio::fs::read_to_string` performs a
+/// plain `open(2)`, which on a FIFO waits for a writer that never comes — so
+/// one special file inside `node_modules` (a malicious package's postinstall
+/// can create one; npm itself never extracts FIFOs) wedged `scan`
+/// (crawl_all) and `apply` (find_by_purls) indefinitely, with no error and
+/// no timeout. Same class as the `open_regular_file` guards in
 /// `patch/file_hash.rs`, the cargo sidecar, and the vendor harvest/verify
 /// readers.
 #[cfg(unix)]
@@ -1378,10 +1384,10 @@ async fn stage_pnpm_isolated_tree(root: &Path) -> std::path::PathBuf {
     nm
 }
 
-/// pnpm 7–12: a transitive-only dependency living solely at
-/// `.pnpm/<x>/node_modules/<name>` must be visible to `find_by_purls`, or
-/// apply reports `package_not_installed` for a package that is installed
-/// and runtime-loaded. The virtual store must be probed;
+/// Regression (pnpm 7–12, empirically confirmed): a transitive-only
+/// dependency living solely at `.pnpm/<x>/node_modules/<name>` was invisible
+/// to `find_by_purls` — apply reported `package_not_installed` for a package
+/// that is installed and runtime-loaded. The virtual store must be probed;
 /// the name@version match keeps two store versions of one package distinct;
 /// the root-linked direct dep must still resolve at its importer-root path
 /// (BFS root-first); and the hoist-dir/hidden decoys must stay unreachable.
@@ -1462,8 +1468,8 @@ async fn find_by_purls_resolves_pnpm_virtual_store_transitives() {
     assert_eq!(result.len(), 4, "exactly the four real packages resolve");
 }
 
-/// Scan twin of the resolver test: `crawl_all` must not skip `.pnpm` as
-/// just-another-hidden-dir, or a transitive-only install never reaches the
+/// Scan twin of the resolver regression: `crawl_all` skipped `.pnpm` as
+/// just-another-hidden-dir, so a transitive-only install never reached the
 /// batch API request. Each package must be inventoried exactly once (the
 /// root pass wins the `seen` dedup for the root-linked direct dep; store
 /// entries are accepted only as real dirs so a sibling symlink cannot
@@ -1519,9 +1525,9 @@ async fn crawl_all_inventories_pnpm_virtual_store_exactly_once() {
 /// name decodes to a non-pending package (perf: a manifest routinely
 /// lists packages that simply aren't installed), but a target physically
 /// present ONLY inside such an entry must still resolve — the unfiltered
-/// fallback pass probes every entry for the leftovers. A final filter
-/// would leave these installed, scan-visible packages invisible to apply
-/// (fail-open).
+/// fallback pass probes every entry for the leftovers. Pre-fix the filter
+/// was final, leaving these installed, scan-visible packages invisible to
+/// apply (fail-open).
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_fallback_pass_probes_store_entries_decoding_to_other_names() {
@@ -1678,11 +1684,11 @@ async fn crawl_all_inventories_bundled_dep_under_seen_store_entry() {
     assert_eq!(result.len(), 2, "exactly host + bundled; got {names:?}");
 }
 
-/// Multi-copy: when the same `name@version` exists at the root *and*
+/// Multi-copy P0: when the same `name@version` exists at the root *and*
 /// nested, BOTH physical copies must be returned (patching only one leaves
 /// a live vulnerable copy — the silent partial). Root preference survives
-/// as ORDERING ONLY — the root copy leads the list for a caller needing one
-/// representative — never as a stop condition that
+/// as ORDERING ONLY — the root copy leads the list so a caller needing one
+/// representative keeps the old behavior — never as a stop condition that
 /// drops the nested duplicate.
 #[tokio::test]
 #[serial_test::parallel]
@@ -1813,12 +1819,13 @@ async fn stage_pnpm4_nested_tree(root: &Path) -> std::path::PathBuf {
     nm
 }
 
-/// pnpm 4/5 (layout captured from a real pnpm 4.14.4 tree): the `.pnpm`
-/// store nests entries under a `registry.npmjs.org` child that has no
-/// `node_modules`, so a walk of FLAT `name@version` entries only (one
-/// level of `.pnpm/<entry>/node_modules`) would silently skip a
-/// transitive-only dep and apply would exit 0 with nothing written. The
-/// nested descent must find it; a target hidden behind another entry's advertised
+/// Regression (empirically confirmed on a real pnpm 4.14.4 tree, same on
+/// synthetic pnpm-5): the `.pnpm` walk handled FLAT `name@version` entries
+/// only. The nested `registry.npmjs.org` child has no `node_modules`, the
+/// conservative fallback enqueued exactly `.pnpm/<entry>/node_modules`
+/// (one level), so a transitive-only dep was silently skipped — apply
+/// exited 0 claiming success while the file was never written. The nested
+/// descent must find it; a target hidden behind another entry's advertised
 /// name resolves via the unfiltered fallback pass; the cycle symlink must
 /// not hang the walk.
 #[cfg(unix)]
@@ -2006,11 +2013,11 @@ async fn stage_pnpm3_legacy_tree(root: &Path) -> std::path::PathBuf {
     nm
 }
 
-/// pnpm 1–3 (layout captured from a real pnpm 3.8.1 tree): pre-`.pnpm`
-/// pnpm hides the virtual store at `node_modules/.registry.npmjs.org`,
-/// which must not be skipped as just-another-hidden-dir — otherwise a
-/// transitive-only dep is unresolvable and apply exits 0 with nothing
-/// written.
+/// Regression (empirically confirmed on a real pnpm 3.8.1 tree; pnpm 1/2
+/// captures show the identical layout): pre-`.pnpm` pnpm hides the virtual
+/// store at `node_modules/.registry.npmjs.org`, which the walk skipped as
+/// just-another-hidden-dir — a transitive-only dep was unresolvable, apply
+/// exited 0 claiming success with nothing written.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -2089,11 +2096,12 @@ async fn crawl_all_inventories_pnpm3_legacy_registry_store_exactly_once() {
 
 // ── pnpm peer-variant duplicates & bundled-only targets ────────
 
-/// pnpm materializes one physical store copy PER PEER COMBINATION —
-/// `.pnpm/foo@1.0.0(react@17…)/` and `.pnpm/foo@1.0.0(react@18…)/` are both
-/// real dirs holding the same `foo@1.0.0`. The resolver hands apply ONE
-/// primary path (root-linked install wins); patching only that copy would
-/// exit 0 claiming the CVE fixed while the twin stays vulnerable and
+/// Regression (adversarial review, CONFIRMED): pnpm materializes one
+/// physical store copy PER PEER COMBINATION — `.pnpm/foo@1.0.0(react@17…)/`
+/// and `.pnpm/foo@1.0.0(react@18…)/` are both real dirs holding the same
+/// `foo@1.0.0`. The resolver hands apply ONE primary path (root-linked
+/// install wins), and apply used to patch only that copy — exiting 0
+/// claiming the CVE fixed while the twin stayed vulnerable and
 /// runtime-loaded. Apply must patch EVERY physical copy, rollback must
 /// restore every copy, and the copy-on-write break must protect the shared
 /// content-store inode per copy.
@@ -2227,8 +2235,8 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
     );
 }
 
-/// Healing half of the peer-variant test: a tree whose primary copy is
-/// patched and whose twin is still vulnerable. Re-running apply reports
+/// Healing half of the peer-variant regression: a pre-fix apply left the
+/// primary copy patched and the twin vulnerable. Re-running apply reports
 /// the primary AlreadyPatched — and must STILL patch the lagging twin
 /// instead of early-returning success.
 #[cfg(unix)]
@@ -2306,10 +2314,11 @@ async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
     );
 }
 
-/// A target that exists ONLY as a bundled dependency inside another
-/// package's store entry (`.pnpm/host@1.0.0/node_modules/host/node_modules/leaf`)
-/// is skipped by the resolver's pending-name filter (it drops the
-/// `host@1.0.0` entry) while `crawl_all` (scan) lists it. After the filtered pass
+/// Regression (adversarial review, CONFIRMED): a target that exists ONLY
+/// as a bundled dependency inside another package's store entry
+/// (`.pnpm/host@1.0.0/node_modules/host/node_modules/leaf`) was invisible
+/// to the resolver — the pending-name filter skipped the `host@1.0.0`
+/// entry — while `crawl_all` (scan) listed it. After the filtered pass
 /// leaves targets unresolved, an unfiltered fallback pass must find them.
 #[tokio::test]
 #[serial_test::parallel]

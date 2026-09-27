@@ -2,7 +2,9 @@
 //! ecosystem's auto-re-apply hook into a user's project, consumed by the
 //! CLI's `setup` command.
 //!
-//! The backends:
+//! One concept, one home — these previously lived as four top-level modules
+//! under four naming schemes (`gem_setup`, `composer_setup`, `pth_hook`,
+//! plus `package_json`'s setup surface):
 //!
 //! * [`gem`] — Bundler plugin directive in the Gemfile + generated plugin
 //!   gem, re-applying gem patches on `bundle install`.

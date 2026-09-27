@@ -622,7 +622,6 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_SETUP_EXCLUDE",
     "SOCKET_VENDOR_REVERT",
     "SOCKET_BATCH_SIZE",
-    "SOCKET_SCAN_PACKAGES",
     "SOCKET_VEX",
     "SOCKET_VEX_OUTPUT",
     "SOCKET_VEX_PRODUCT",
@@ -887,8 +886,8 @@ mod tests {
     /// `scrub_empty_env_vars` removes exactly-empty `SOCKET_*` flag vars
     /// (the `VAR=` blank-without-unsetting idiom) — global and local — and
     /// nothing else: set, non-empty values — even whitespace-only ones,
-    /// which are significant in paths — survive, and the parse then sees
-    /// plain defaults.
+    /// which are significant in paths — survive, and the
+    /// previously-crashing parse then sees plain defaults.
     #[test]
     #[serial_test::serial]
     fn scrub_empty_env_vars_unsets_only_empties() {
@@ -984,7 +983,8 @@ mod tests {
     }
 
     /// Regression: scan's vendored flow must build its service config FROM
-    /// `--vendor-source`, not hardcode build-only. Under the default (`auto`), the config must permit the
+    /// `--vendor-source`, not hardcode build-only (the pre-fix `service =
+    /// None`). Under the default (`auto`), the config must permit the
     /// vendoring service exactly as the `vendor` command's default does —
     /// otherwise `scan --mode vendored` silently builds locally while a
     /// plain `vendor` service-downloads, and the two commit different bytes /
@@ -1105,7 +1105,7 @@ mod tests {
         }
     }
 
-    /// An empty (or whitespace-only) string is `false`, not an
+    /// The bug fix: an empty (or whitespace-only) string is `false`, not an
     /// error. Shells/CI export `SOCKET_OFFLINE=` to mean "unset".
     #[test]
     fn parse_bool_flag_treats_empty_as_false() {
@@ -1122,9 +1122,9 @@ mod tests {
         assert!(parse_bool_flag("tru").is_err());
     }
 
-    /// Regression: an exported-but-empty bool env var must NOT crash the parse
-    /// (`BoolishValueParser` rejects it, taking down every subcommand); it
-    /// resolves to `false`.
+    /// Regression: an exported-but-empty bool env var must NOT crash the parse.
+    /// Before the fix, `BoolishValueParser` aborted with "value was not a
+    /// boolean", taking down every subcommand. Now it resolves to `false`.
     #[test]
     #[serial_test::serial]
     fn empty_bool_env_var_parses_as_false_not_crash() {
@@ -1643,7 +1643,6 @@ mod tests {
 
         const VALUE_BINDINGS: &[(&str, &[&str])] = &[
             ("SOCKET_BATCH_SIZE", &["socket-patch", "scan"]),
-            ("SOCKET_SCAN_PACKAGES", &["socket-patch", "scan"]),
             ("SOCKET_PATCH_VERSION", &["socket-patch", "self-update"]),
             ("SOCKET_SETUP_EXCLUDE", &["socket-patch", "setup"]),
             ("SOCKET_VEX", &["socket-patch", "apply"]),

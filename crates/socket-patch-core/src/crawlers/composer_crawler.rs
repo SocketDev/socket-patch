@@ -278,14 +278,14 @@ pub fn parse_composer_home_output(stdout: &str) -> Option<PathBuf> {
 /// whole environment (every variable, and the working directory) is exactly
 /// what it was when the answer was produced — the subprocess's only inputs
 /// the CLI controls. A different environment re-runs it and replaces the
-/// entry; concurrent first callers may each run it.
+/// entry; concurrent first callers may each run it, as before.
 ///
 /// Only an answer is kept. A FAILED probe (spawn error under fd pressure,
-/// a non-zero exit, empty stdout) is asked again by the next caller —
-/// global discovery runs at least twice per command (the crawl, then the
-/// package-lookup pass), so a transient first failure must not stick. So
-/// is an answer the environment changed under, which the key would
-/// misfile. Same rule as the `gem env`
+/// a non-zero exit, empty stdout) is asked again by the next caller, as
+/// every caller used to ask — global discovery runs at least twice per
+/// command (the crawl, then the package-lookup pass), and before the memo
+/// a transient first failure cost nothing. So is an answer the environment
+/// changed under, which the key would misfile. Same rule as the `gem env`
 /// memo in `ruby_crawler`.
 struct EnvKeyedMemo {
     slot: std::sync::Mutex<Option<(EnvKey, String)>>,
@@ -494,8 +494,9 @@ async fn resolve_local_vendor_dir(cwd: &Path) -> Option<PathBuf> {
 
 /// Reduce a `config.vendor-dir` value to plain `a/b` segments before the
 /// safety gate. Composer accepts `./`-prefixed and `.`-interleaved values
-/// (`./vendor`, `lib/./deps`) and either separator, so those shapes must
-/// resolve rather than be refused. `..` is resolved lexically the way Composer's own
+/// (`./vendor`, `lib/./deps`) and either separator; refusing those shapes
+/// outright regressed projects that previously resolved fine at the
+/// hardcoded `vendor/`. `..` is resolved lexically the way Composer's own
 /// path resolution does; a value that climbs above the project root (or
 /// reduces to it) fails closed as `None`.
 fn normalize_config_vendor_dir(raw: &str) -> Option<String> {

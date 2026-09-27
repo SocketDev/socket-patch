@@ -1722,11 +1722,10 @@ pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uui
     vendored_wiring_in_files(root, &probe, eco, uuid).await
 }
 
-/// The root files a vendored `eco` artifact can be wired from — the vendor
-/// backends' lockfile / wiring config for that ecosystem (npm: every
+/// The root files a vendored `eco` artifact can be wired from — every
+/// vendor backend's lockfile / wiring config for that ecosystem (npm: every
 /// npm-family lock the `vendor_probe` table flags, `vlt-lock.json`
-/// included; cargo: the root `Cargo.toml` `[patch.crates-io]` table and the
-/// pre-v5 `.cargo/config.toml` / `.cargo/config` spellings; maven /
+/// included; cargo: the `[patch.crates-io]` config; maven /
 /// nuget: the repository / source that serves the vendored dir). Manifests
 /// such as package.json are deliberately absent: the lock is what the
 /// install consumes.
@@ -1742,7 +1741,7 @@ pub fn vendored_wiring_probe_files(root: &Path, eco: &str) -> Vec<String> {
             "pyproject.toml",
             "hatch.toml",
         ],
-        "cargo" => vec!["Cargo.toml", ".cargo/config.toml", ".cargo/config"],
+        "cargo" => vec![".cargo/config.toml", ".cargo/config"],
         "golang" => vec!["go.mod"],
         "gem" => vec!["Gemfile.lock"],
         "composer" => vec!["composer.lock"],
@@ -2581,8 +2580,7 @@ mod tests {
     /// the patch host is outside the allowlist (no `hosted_claim`); only a
     /// LIVE `source "<patch registry>" do` block declaring rails keeps the
     /// record alive — the uuid in a `#` comment, inside `=begin` … `=end`,
-    /// or in a block for another gem must not (as a raw substring scan
-    /// would).
+    /// or in a block for another gem used to (a raw substring scan).
     #[tokio::test]
     async fn gemfile_liveness_reads_live_source_blocks_only() {
         let index = format!("https://patches.example.com/patch-registry/gem/{TOKEN}/{UUID_A}/");
@@ -2882,8 +2880,8 @@ mod tests {
 
     /// REGRESSION: a redirect ledger naming `deno.lock` (which no hosted
     /// writer edits — Deno has no rewriter) must not stay alive on the
-    /// user's own Socket-url import text there: a fallback that treated
-    /// every unknown file as a pin would let `vex --no-verify` attest the
+    /// user's own Socket-url import text there: the fallback used to treat
+    /// every unknown file as a pin, so `vex --no-verify` attested the
     /// forged record. `deno.json(c)` likewise.
     #[tokio::test]
     async fn hosted_ledger_proof_never_trusts_deno_files() {
@@ -2951,7 +2949,7 @@ mod tests {
                     "uv.lock",
                 ],
             ),
-            ("cargo", &[".cargo/config", ".cargo/config.toml", "Cargo.toml"]),
+            ("cargo", &[".cargo/config", ".cargo/config.toml"]),
             ("golang", &["go.mod"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),
@@ -3014,22 +3012,13 @@ mod tests {
             !vendored_wiring_live(root, &["package-lock.json"], "npm", UUID_A).await,
             "an existing recorded wiring file that was reverted is authoritative"
         );
-        // Pre-v5 cargo wiring lives in the cargo config, not Cargo.lock.
+        // cargo's wiring lives in the config, not Cargo.lock.
         let c = Project::new();
         c.write(
             ".cargo/config.toml",
             format!("[patch.crates-io]\nsmallvec = {{ path = \".socket/vendor/cargo/{UUID_A}/smallvec-1.6.0\" }}\n"),
         );
         assert!(vendored_wiring_live(c.root(), &[], "cargo", UUID_A).await);
-        // v5 cargo wiring lives in the root Cargo.toml (repair rebuilds such
-        // entries with no recorded wiring).
-        let m = Project::new();
-        m.write(
-            "Cargo.toml",
-            format!("[package]\nname = \"app\"\n\n[patch.crates-io]\nsmallvec = {{ path = \".socket/vendor/cargo/{UUID_A}/smallvec-1.6.0\" }}\n"),
-        );
-        assert!(vendored_wiring_live(m.root(), &[], "cargo", UUID_A).await);
-        assert!(!vendored_wiring_live(m.root(), &[], "cargo", UUID_B).await);
     }
 
     /// Cross-package-manager union: one root carrying the committed hosted

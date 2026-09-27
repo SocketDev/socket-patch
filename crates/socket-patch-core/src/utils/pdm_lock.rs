@@ -262,7 +262,7 @@ pub fn rewrite_pdm_lock_in<'a>(
         }
     };
     // The original's fragments come from the same parse; an error surfaces
-    // where a fresh parse would raise it, after the rewrite.
+    // where the fresh parse used to raise it, after the rewrite.
     let before = pdm_lock_fragments_in(&doc, text, name);
     let mut lock = doc.into_mut();
     for (index, inline_files, files_key) in edits {
@@ -422,7 +422,7 @@ fn plan_pdm_rewrite(
 /// End (exclusive, before its line break) of the first top-level TOML header
 /// line at or after `from`, skipping blank/comment lines; `text.len()` at EOF;
 /// `from` itself when the next non-blank line is not a header (a shape PDM never
-/// writes — the fragment is then not extended). Kept local, like this
+/// writes — the fragment then ends where it used to). Kept local, like this
 /// module's own `extend_span`.
 fn next_header_end(text: &str, from: usize) -> usize {
     let mut pos = from;

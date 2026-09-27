@@ -4,7 +4,7 @@
 //! tarball under `.socket/vendor/npm/<uuid>/` (`super::npm_pack`) and
 //! rewrite every matching lockfile entry's `resolved` to a relative `file:`
 //! spec + `integrity` to the tarball's recomputed sha512. That lock-only
-//! rewrite passes `npm ci` (spike-proven):
+//! rewrite passes `npm ci` (spike-proven; see `spikes/PHASE0-FINDINGS.txt`):
 //! a relative `file:` resolves against the project dir and npm never
 //! rewrites/normalizes the entry.
 //!
@@ -42,9 +42,9 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use super::npm_common::{is_safe_npm_name, parse_npm_purl, tgz_rel_leaf};
 use crate::constants::npm_family::NPM_LOCKS;
 
-/// `npm-shrinkwrap.json` is the primary lock when both exist (npm <= 11
-/// installs from it); npm 12 installs from the `package-lock.json` beside
-/// it, so that sibling is rewired identically (step 3b of [`vendor_npm`]).
+/// `npm-shrinkwrap.json` wins over `package-lock.json` when both exist —
+/// npm itself ignores the package-lock in that case, so editing it would be
+/// a silent no-op.
 const SHRINKWRAP: &str = NPM_LOCKS[0];
 const PACKAGE_LOCK: &str = NPM_LOCKS[1];
 
@@ -65,7 +65,7 @@ const KIND_LOCK_LEGACY_ENTRY: &str = "npm_lock_legacy_entry";
 /// Lock-entry fields that mirror the package's own `package.json`. When the
 /// patch rewrites that manifest, these go stale in the lock and `npm ci`
 /// would resolve the OLD dependency graph — so they are recomputed from the
-/// patched manifest (step 8 of [`vendor_npm`]).
+/// patched manifest (step 7 of [`vendor_npm`]).
 const DEP_MANIFEST_FIELDS: [&str; 4] = [
     "dependencies",
     "peerDependencies",
@@ -550,12 +550,11 @@ pub(crate) async fn preflight_packages(
 /// restored entry carries empty wiring). Revert has nothing to replay for
 /// them — it cannot un-wire the lock — so removing the artifact while the
 /// lockfile still resolves through it bricks every subsequent install
-/// (ENOENT on the missing `file:` tarball).
+/// (ENOENT on the missing `file:` tarball), and used to do so silently.
 /// The in-use probe is textual and EXACT for these flavors (the uuid dir
 /// path appears iff some resolution still points at the artifact — see
-/// [`super::npm_flavor::vendored_entry_in_use`]), over every lock in
-/// `lock_names` (a mention in any of them counts — npm 12 installs from the
-/// package-lock.json beside a shrinkwrap). Mentioned ⇒
+/// [`super::npm_flavor::vendored_entry_in_use`]), over `lock_names` in the
+/// caller's own precedence order (npm: shrinkwrap wins). Mentioned ⇒
 /// refuse; readable and provably absent ⇒ `None`, the caller's removal
 /// proceeds unchanged; no readable lock ⇒ refuse, fail-closed (it may still
 /// resolve through the artifact) UNLESS no lock file exists at all — a
@@ -736,7 +735,7 @@ pub async fn revert_npm_opts(
         }
     }
 
-    // LOSSINESS GUARD: when any wiring record was left
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
     // alone ("drifted; left alone"), the uuid dir may hold the only copy of
     // what the lock — or the redirect ledger's recorded originals — still
     // points at. Keep it (and let the CLI keep the ledger entry) instead of
@@ -761,9 +760,8 @@ pub async fn revert_npm_opts(
     // npm-shrinkwrap.json (carrying the file: entries with it), and a
     // re-install can hoist the entry to a key the wiring never recorded.
     // Deleting the uuid dir then fails every subsequent install with
-    // ENOENT on the missing tarball, silently. Probe every npm lock (a
-    // mention in either counts — npm <= 11 installs from the shrinkwrap,
-    // npm 12 from the package-lock beside it): mentioned ⇒ refuse; absent or
+    // ENOENT on the missing tarball, silently. Probe the winning lock
+    // (shrinkwrap-first, like installs): mentioned ⇒ refuse; absent or
     // unprovable keeps the wired revert's existing missing-lock tolerance.
     if super::npm_flavor::lock_text_mentions_uuid(
         project_root,
@@ -2357,10 +2355,10 @@ mod tests {
         );
     }
 
-    /// npm 12 auto-creates package-lock.json beside a committed
-    /// npm-shrinkwrap.json and installs FROM package-lock.json (npm 12.0.0 /
-    /// 12.1.0), so wiring only the shrinkwrap would be a silent false
-    /// success there. BOTH locks are rewired
+    /// REGRESSION (npm 12): npm 12 auto-creates package-lock.json beside a
+    /// committed npm-shrinkwrap.json and installs FROM package-lock.json
+    /// (verified against real npm 12.0.0 / 12.1.0), so wiring only the
+    /// shrinkwrap was a silent false success there. BOTH locks are rewired
     /// identically, each wiring record names its own file, a re-run is a
     /// byte-stable no-op, and revert restores both byte-for-byte.
     #[tokio::test]
@@ -2974,7 +2972,7 @@ mod tests {
             default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
             "non-drifted instance restored"
         );
-        // A drift-skip keeps the artifact dir (the drifted
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
         // entry's recorded original may still be needed later) and says so.
         assert!(
             fx.root()
@@ -3383,10 +3381,11 @@ mod tests {
     }
 
     // ── empty-wiring (reconstructed) revert guard ──────────────────────────
-    // Same brick as the pnpm backends': a `repair`-reconstructed entry
-    // carries no wiring records; removing the artifact dir unconditionally
-    // would leave the lock resolving through a deleted tarball — every later
-    // `npm ci` fails ENOENT, and nothing says so.
+    // Same brick as the pnpm backends' (empirically confirmed 2026-08-18):
+    // a `repair`-reconstructed entry carries no wiring records; revert used
+    // to remove the artifact dir unconditionally, leaving the lock resolving
+    // through a deleted tarball — every later `npm ci` failed ENOENT, and
+    // nothing said so.
 
     /// Reshape a vendored entry into what `repair`'s no-ledger
     /// reconstruction persists: same uuid/artifact, EMPTY wiring.
@@ -3456,11 +3455,11 @@ mod tests {
         );
     }
 
-    /// A clean shrinkwrap does not "win" the probe: npm 12 installs from
-    /// package-lock.json beside a committed npm-shrinkwrap.json, so a
-    /// package-lock.json still resolving through the artifact must block its
-    /// deletion — otherwise every later npm 12 install fails ENOENT on the
-    /// missing tarball.
+    /// REGRESSION (npm 12): a clean shrinkwrap no longer "wins" the probe.
+    /// npm 12 installs from package-lock.json beside a committed
+    /// npm-shrinkwrap.json, so a package-lock.json still resolving through
+    /// the artifact must block its deletion — it used to be removed, and
+    /// every later npm 12 install failed ENOENT on the missing tarball.
     #[tokio::test]
     async fn empty_wiring_revert_refuses_while_the_sibling_package_lock_is_wired() {
         let (fx, entry) = reconstructed_fixture().await;

@@ -1,5 +1,4 @@
-//! End-to-end tests for the npm crawler's global-prefix resolution
-//! (`crawlers/npm_crawler.rs`), exercised via the
+//! End-to-end tests for `global_packages.rs` paths, exercised via the
 //! `apply --global` / `rollback --global` flags. Two strategies:
 //!
 //! 1. Real-tool path: when `npm` / `yarn` / `pnpm` are on PATH, the

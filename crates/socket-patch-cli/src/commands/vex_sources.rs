@@ -65,7 +65,7 @@
 //! when any exist ("installed evidence wins") and otherwise, for a
 //! DISCOVERED Socket-host reference with a lockfile pin, attests from the
 //! pinned wiring (the in-run `scan --mode hosted --vex` evidence);
-//! `Installed` is the agent-mode path.
+//! `Installed` is the pre-existing agent-mode path.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -111,9 +111,14 @@ pub(crate) const WIRING_CONFLICT: &str = "wiring_conflict";
 /// carries blob content, so it is heavy).
 const FETCH_CONCURRENCY: usize = 10;
 
-/// The in-flight cap for the record fetch: `SOCKET_API_CONCURRENCY` applies
-/// here like every other patch-API window, with [`FETCH_CONCURRENCY`] as
-/// this window's own ceiling on top (a view is heavy).
+/// The in-flight cap for the record fetch.
+///
+/// These are patch-API requests — `scan --vex` makes them too — so the
+/// documented escape hatch has to reach them like it reaches every other
+/// window: an operator behind something that caps in-flight requests per
+/// client sets `SOCKET_API_CONCURRENCY=1` and gets one view at a time.
+/// [`FETCH_CONCURRENCY`] is this window's own ceiling on top of that, for
+/// the size of a view.
 fn fetch_concurrency(use_public_proxy: bool) -> usize {
     api_concurrency(use_public_proxy).min(FETCH_CONCURRENCY)
 }
@@ -207,7 +212,7 @@ pub(crate) struct HostedWiring {
 
 /// How one view purl is verified.
 enum Basis {
-    /// The agent-mode path: installed tree / go-patches copy.
+    /// The pre-existing agent-mode path: installed tree / go-patches copy.
     Installed,
     /// The committed `.socket/vendor` artifact named by this entry.
     Vendored(Box<VendorEntry>),
@@ -551,7 +556,7 @@ fn expected_package(cand: &Cand) -> String {
 }
 
 /// One candidate per manifest key, then per unclaimed vendor-ledger key,
-/// then per unclaimed redirect-ledger key — the collision rule
+/// then per unclaimed redirect-ledger key — the pre-existing collision rule
 /// (the manifest owns a key it records; ledgers fill the rest), in sorted
 /// order so the output is deterministic.
 fn build_candidates(
@@ -919,9 +924,16 @@ async fn fetch_records(
     loop {
         let mut auth_refused: Vec<String> = Vec::new();
         let mut auth_error: Option<String> = None;
-        // A sliding window of views in flight, consumed in `pending` order,
-        // so the reported `auth_error` and the retried `pending` list are
-        // deterministic.
+        // A sliding window of at most FETCH_CONCURRENCY views in flight
+        // (it used to wait for each whole chunk of that size to drain
+        // before starting the next), consumed in `pending` order.
+        //
+        // That IS an observable change, the one in this area: the chunked
+        // JoinSet folded each chunk in COMPLETION order, so which refusal
+        // was reported as `auth_error` (printed in the fallback note) and
+        // the order of the retried `pending` list were a race. They now
+        // follow `pending` order — deterministic, and the same order the
+        // notes above already came out in.
         {
             let client = &client;
             let mut views = std::pin::pin!(ordered_concurrent(
@@ -1046,8 +1058,9 @@ mod tests {
         }
     }
 
-    /// `SOCKET_API_CONCURRENCY=1` means one view at a time here as well.
-    /// Serial: `SOCKET_*` is process-global.
+    /// `scan --vex` reaches this window, so the documented escape hatch
+    /// has to reach it too: `SOCKET_API_CONCURRENCY=1` means one view at a
+    /// time here as well. Serial: `SOCKET_*` is process-global.
     #[test]
     #[serial_test::serial]
     fn socket_api_concurrency_paces_the_record_fetch() {
@@ -1077,6 +1090,8 @@ mod tests {
     /// server happens to answer: the FIRST refusal in `pending` is the one
     /// reported in the fallback note, even when it answers last, and the
     /// refused uuids are retried against the proxy in that same order.
+    /// (The chunked JoinSet this replaced folded by completion, so which
+    /// refusal was reported was a race.)
     #[tokio::test]
     #[serial_test::serial]
     async fn refused_records_fold_in_pending_order_not_completion_order() {
@@ -1365,7 +1380,8 @@ mod tests {
     /// `redirect_unwired`, with a note naming the file and the extractor's
     /// reason — although the raw-text fallbacks would call both live (the
     /// files hold each uuid in pin position; the unrecognized control run
-    /// proves it).
+    /// proves it). Before, exactly this re-derivation from raw text attested
+    /// an orphaned berry entry and a reverted cargo pin.
     #[tokio::test]
     async fn recognized_but_rejected_uuids_are_dead_whatever_the_raw_text_says() {
         use socket_patch_core::vendor::state::{WiringAction, WiringRecord};
@@ -1574,12 +1590,14 @@ mod tests {
         );
     }
 
-    /// The bundler < 2.6 hosted rewrite leaves the pair MIXED — the
-    /// Gemfile's `source "<patch registry>" do` block pins the patch, the
+    /// REGRESSION: the bundler < 2.6 hosted rewrite leaves the pair MIXED —
+    /// the Gemfile's `source "<patch registry>" do` block pins the patch, the
     /// CHECKSUMS-less lock still resolves the gem from rubygems.org until
-    /// the next unfrozen `bundle install` converges it. That keeps the
-    /// redirect record live under both spellings (`Gemfile`/`gems.rb`);
-    /// reverting the Gemfile too kills it.
+    /// the next unfrozen `bundle install` converges it. The lock inventory
+    /// reads `Gemfile.lock`'s registry url and used to call the redirect
+    /// record dead (while the identical `gems.rb` / `gems.locked` pair was
+    /// live, the inventory not reading `gems.locked`). Reverting the
+    /// Gemfile too kills it under both spellings.
     #[tokio::test]
     async fn gemfile_source_block_keeps_a_mixed_gem_pair_live() {
         let purl = "pkg:gem/vexprobe@1.2.3";

@@ -495,8 +495,8 @@ pub struct Wired {
     pub flavor: Flavor,
     pub mode: Mode,
     /// Every file after the wiring run (the venv and VEX output excluded):
-    /// wired project files, the mode's ledger, the committed wheel
-    /// (vendored).
+    /// wired project files, `.socket/manifest.json` (vendored non-detached),
+    /// the mode's ledger, the committed wheel (vendored).
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
@@ -769,8 +769,8 @@ pub fn c_ledger_without_manifest_attests_offline(flavors: &[Flavor]) {
 }
 
 /// d) wiring reverted to the registry while ledger + artifact remain →
-/// `redirect_unwired` / `vendor_unwired`, `--no-verify` included; a legacy
-/// (pre-5.0) manifest put back as well still attests nothing; with the ledger gone too
+/// `redirect_unwired` / `vendor_unwired`, `--no-verify` included; the
+/// manifest back as well still attests nothing; with the ledger gone too
 /// nothing is discovered at all (the orphaned wheel is never evidence).
 pub fn d_reverted_wiring_is_unwired_even_with_no_verify(flavors: &[Flavor]) {
     for (flavor, mode) in cells(flavors) {

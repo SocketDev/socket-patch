@@ -105,7 +105,7 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
         save_only: true,
         one_off: false,
         all_releases: false,
-        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
+        mode: None,
     }
 }
 
@@ -178,7 +178,7 @@ async fn get_by_uuid_honors_custom_manifest_path() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. --manifest-path honored on the search flow (download_and_apply_patches_with)
+// 2. --manifest-path honored on the search flow (download_and_apply_patches)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

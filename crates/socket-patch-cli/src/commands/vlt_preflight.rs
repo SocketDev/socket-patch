@@ -1,4 +1,4 @@
-//! The vlt vendored-mode preflight, the per-purl twin of
+//! The vlt vendored-mode preflight (DESIGN §4.6), the per-purl twin of
 //! [`crate::commands::bun_preflight`]: every refusal the vlt backend can
 //! decide from `vlt-lock.json`, the importer package.json files, the vendor
 //! ledger and the installed store copy, evaluated read-only before any

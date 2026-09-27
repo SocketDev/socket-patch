@@ -1299,7 +1299,7 @@ mod tests {
     /// jar's `.sha1` sidecar is part of the wiring. With it stale or gone,
     /// real Maven (3.6.3 → 4.0.0-rc-6, `e2e_vendor_maven_build`) rejects the
     /// file:// copy and silently resolves Central's pristine jar — while the
-    /// committed members still hash-verify, so the ref must not attest a
+    /// committed members still hash-verify, so this ref used to attest a
     /// build that no longer consumes the patch.
     #[tokio::test]
     async fn vendored_jar_sidecar_must_match_the_jar() {

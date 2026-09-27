@@ -950,7 +950,7 @@ version = "fake"
     // --- regression: dir-name version splitting ------------------------
 
     /// A numeric pre-release segment (legal SemVer) must stay part of the
-    /// version; a "last hyphen-before-digit" heuristic would split
+    /// version. Previously the "last hyphen-before-digit" heuristic split
     /// `mycrate-1.0.0-2` into (`mycrate-1.0.0`, `2`).
     #[test]
     fn test_parse_dir_name_version_numeric_prerelease() {

@@ -71,7 +71,7 @@
 //! and whatever it mentions is recognized as unwired (rule 11). The canonical
 //! one-entry-per-line layout is not required here (the writers check it).
 //!
-//! Non-goals: nested `*/vlt-lock.json` (a separate project with its own root), the
+//! Non-goals: nested `*/vlt-lock.json` (a separate project, DESIGN D3), the
 //! hidden `node_modules/.vlt-lock.json` (install state, not wiring) and
 //! `vlt.json` as wiring (it is read only for its `modifiers`, above).
 

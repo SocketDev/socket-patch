@@ -139,18 +139,17 @@ pub struct Case {
 }
 
 impl Case {
-    /// Baseline outcome: applied is expected only when the target
-    /// advertises `baseline_supported` (the PMs whose install hook `setup`
-    /// wires: npm family, pip/uv/hatch, bundler, composer) AND the scenario
+    /// Baseline (currently-known) outcome under today's code:
+    /// `setup` only wires npm-family hooks, so applied is expected only
+    /// when the target advertises `baseline_supported` AND the scenario
     /// aspires to apply.
     fn baseline_applied(&self) -> bool {
         self.expect_applied && self.baseline_supported
     }
 
     /// npm-family package managers (plus the polyglot monorepo's npm slice)
-    /// are the cases where the driver runs the check/remove round-trip;
-    /// other supported ecosystems (pypi, gem, composer) are round-tripped by
-    /// their host_guard tests instead.
+    /// are the surface `setup` actually configures today — the only cases
+    /// where the check/remove round-trip is expected to do real work.
     fn is_npm_family(&self) -> bool {
         matches!(self.pm.as_str(), "npm" | "yarn" | "pnpm" | "bun" | "vlt")
             || self.layout == "monorepo"
@@ -504,8 +503,9 @@ fn run_cases(label: &str, cases: Vec<Case>) {
         }
 
         // check/remove round-trip — only asserted for npm-family cases that
-        // ran setup. Other ecosystems either have no setup hook (no-op) or
-        // are round-tripped by their own host_guard tests.
+        // ran setup (the surface setup configures today). For other
+        // ecosystems setup writes nothing, so the round-trip is a no-op and
+        // we leave it untagged, consistent with the BASELINE GAP convention.
         if case.run_setup && case.is_npm_family() && !case.known_regression {
             if let Some(msg) = round_trip_failure(case, &res) {
                 failures.push(msg);

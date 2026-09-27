@@ -25,7 +25,7 @@
 //! relative to the **parent of the `.cargo/` directory** (i.e. the project
 //! root), so the committed `<root>/.socket/vendor/cargo/<uuid>/<name>-<ver>`
 //! copy is found on any clone (spike-verified, including builds invoked from a
-//! subdirectory).
+//! subdirectory — see `spikes/PHASE0-FINDINGS.txt` cargo claim 7).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -712,7 +712,7 @@ mod tests {
         );
     }
 
-    /// `crates-io` written as an INLINE table —
+    /// COVERAGE 2026-09: `crates-io` written as an INLINE table —
     /// `[patch]` + `crates-io = { cfg-if = { path = "…" } }` — is valid TOML
     /// that cargo honors identically to `[patch.crates-io]` (a hand edit or
     /// another tool re-serializing this user-owned file produces it). The
@@ -735,7 +735,7 @@ mod tests {
         assert!(upsert_patch_entry(&out, "cfg-if", &want).unwrap().is_none());
     }
 
-    /// A USER-authored entry in the inline form is
+    /// COVERAGE 2026-09: …and a USER-authored entry in the inline form is
     /// still refused, never silently overwritten.
     #[test]
     fn test_upsert_refuses_user_authored_inline_form() {
@@ -807,7 +807,7 @@ mod tests {
             .is_none());
     }
 
-    /// Removal twin of the inline-form blindness. A
+    /// COVERAGE 2026-09: removal twin of the inline-form blindness. A
     /// socket-owned entry inside `crates-io = { … }` must be removed on
     /// rollback — a silent no-op here means revert_cargo_vendor_opts still
     /// deletes the `.socket/vendor/cargo/<uuid>/` copy, leaving a dangling
@@ -836,7 +836,7 @@ mod tests {
         assert!(!out.contains("patch"), "emptied inline patch pruned: {out}");
     }
 
-    /// Sibling user entries sharing the inline table
+    /// COVERAGE 2026-09: sibling user entries sharing the inline table
     /// survive the removal.
     #[test]
     fn test_remove_inline_crates_io_form_keeps_user_entry() {
@@ -852,7 +852,7 @@ mod tests {
         assert!(doc["patch"]["crates-io"].get("other").is_some());
     }
 
-    /// The ownership guard holds through the inline form —
+    /// COVERAGE 2026-09: the ownership guard holds through the inline form —
     /// a user-authored same-name entry stays a no-op.
     #[test]
     fn test_remove_inline_form_user_entry_is_noop() {
@@ -892,7 +892,7 @@ mod tests {
         );
     }
 
-    /// `[patch]` exists but `crates-io` is absent or not a
+    /// COVERAGE 2026-09: `[patch]` exists but `crates-io` is absent or not a
     /// table. Only `[patch.crates-io]` is managed — an entry under some other
     /// registry's patch table is never ours, even when its `path` value looks
     /// socket-owned; and a scalar `crates-io` (adversarial hand edit) must be
@@ -949,7 +949,7 @@ mod tests {
         assert!(entries["mine"].socket_owned);
     }
 
-    /// Read twin of the inline-form blindness — an unread
+    /// COVERAGE 2026-09: read twin of the inline-form blindness — an unread
     /// entry makes verify / pre-flight report the vendor copy unwired (so
     /// GC-reclaimable) while cargo still resolves through it.
     #[test]
@@ -1229,7 +1229,7 @@ mod tests {
         assert!(out.is_empty(), "FIFO configs contribute no registries");
     }
 
-    /// The skip branches of `socket_registry_indexes` — a
+    /// COVERAGE 2026-09: the skip branches of `socket_registry_indexes` — a
     /// malformed legacy `.cargo/config` alongside a good `config.toml` (a
     /// real mixed/legacy state) contributes nothing, per the doc's
     /// "malformed files contribute nothing" promise; a user-authored
@@ -1355,7 +1355,7 @@ mod tests {
         );
     }
 
-    /// A real `remove_file` failure in the delete branch
+    /// COVERAGE 2026-09: a real `remove_file` failure in the delete branch
     /// must propagate as `Err("remove {path}: …")` — a swallowed unlink error
     /// would make `drop_legacy_patch_entries` report a successful revert while the
     /// stale `[patch]` wiring still sits on disk.

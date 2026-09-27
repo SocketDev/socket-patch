@@ -26,6 +26,8 @@ pub(crate) mod vlt;
 pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
 pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
 
+/// Candidate lockfiles / registry configs the redirect rewriters may touch —
+/// read from the project when present and handed to `rewrite_registry_redirect`.
 /// Fragment-edit kinds whose lockfile the package manager re-lays in place
 /// (keeping the Socket source) — a re-scan REBASES their ledger edits instead
 /// of appending; see the ledger merge below.
@@ -35,8 +37,6 @@ pub(crate) const REBASE_KINDS: &[&str] = &[
     socket_patch_core::patch::redirect::vlt::KIND,
 ];
 
-/// Candidate lockfiles / registry configs the redirect rewriters may touch —
-/// read from the project when present and handed to `rewrite_registry_redirect`.
 pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -98,13 +98,15 @@ pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "settings.gradle.kts",
     "build.gradle",
     "build.gradle.kts",
-    // deno.lock is deliberately absent: no redirect rewriter edits its
-    // integrity entries.
+    // deno.lock is knowingly absent: deno is its own ecosystem and no
+    // redirect rewriter edits its integrity entries today — recording the
+    // decision here so the omission reads as deliberate, not forgotten.
 ];
 
 /// Most hosted wheel-metadata downloads in flight at once, below the patch
 /// API's own in-flight cap: each one buffers a whole wheel (up to
-/// `MAX_VENDOR_PACKAGE_BYTES`).
+/// `MAX_VENDOR_PACKAGE_BYTES`) where the serial loop held one, so the
+/// window is bounded by what it costs as well as by what it saves.
 const WHEEL_METADATA_CONCURRENCY: usize = 4;
 
 /// The in-flight cap for the hosted wheel-metadata window.
@@ -113,7 +115,9 @@ const WHEEL_METADATA_CONCURRENCY: usize = 4;
 /// every other patch-API window ([`api_concurrency`], and with it
 /// `SOCKET_API_CONCURRENCY`) — an operator who caps in-flight requests per
 /// client must be able to cap this one too, or a `uv.lock` project's wheels
-/// land in `skipped` as `python_metadata_unavailable`.
+/// land in `skipped` as `python_metadata_unavailable`. `api_concurrency`
+/// already returns 1 under a tight descriptor limit, which is what the
+/// serial loop's one-socket-at-a-time profile needs.
 fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
     api_concurrency(use_public_proxy).min(WHEEL_METADATA_CONCURRENCY)
 }
@@ -229,8 +233,11 @@ pub(crate) fn pnpm_trust_workspace_unreadable_detail(server: &str, err: &std::io
 /// The pnpm-workspace.yaml read, classified for the trust auto-config:
 /// `Ok(Some(text))` — read fine; `Ok(None)` — ABSENT (`ErrorKind::NotFound`,
 /// the only state where planning a Create is safe); `Err(e)` — present but
-/// unreadable, so the caller must fall back to warning-only guidance
-/// (planning a Create would overwrite the user's `packages:` globs).
+/// unreadable, so the caller must fall back to warning-only guidance. It
+/// was: a bare `.ok()` collapsed EVERY read error to `None`, so a
+/// present-but-unreadable workspace file was planned as a Create and
+/// OVERWRITTEN with the root-only scaffold, destroying the user's
+/// `packages:` globs.
 ///
 /// FIFO-safe (`read_regular_to_string_sync`: non-blocking open + fstat): a
 /// FIFO planted at the path classifies as unreadable (`InvalidInput`) instead
@@ -249,7 +256,8 @@ fn read_workspace_for_trust(path: &std::path::Path) -> std::io::Result<Option<St
 /// `artifact_url_present`, plus the percent-encoded form) so a writer's
 /// spelling can never be one this probe misses. Lets an idempotent re-scan
 /// plan the trust config for a project that missed it once (opted-out first
-/// run, or a crash between the lock write and the workspace write).
+/// run, or a crash between the lock write and the workspace write) — the
+/// splice-only trigger skipped both forever on such projects.
 fn pnpm_lock_carries_hosted_redirect(
     lock_text: &str,
     overrides: &[socket_patch_core::patch::redirect::DepOverride],
@@ -314,7 +322,8 @@ pub(crate) fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run:
 }
 
 /// `lockfileVersion` major sniffed from a pnpm-lock.yaml head. pnpm 9-12
-/// emit `lockfileVersion: '9.0'` (single doc, first line); pnpm 8 emits
+/// emit `lockfileVersion: '9.0'` (single doc, first line — verified against
+/// real 7/8/9/10/11/12-rc locks in the 2026-08-18 matrix); pnpm 8 emits
 /// `'6.0'`, pnpm 7 an unquoted `5.4`. `None` when no parseable version line
 /// exists — callers treat that as "not trust-policy era" and stay
 /// hands-off (fail closed: never write config for a lock we can't read).
@@ -607,7 +616,8 @@ fn build_redirect_json_envelope(
 /// spelling of its key set (`mode`, `redirected`, `rewrittenFiles`,
 /// `skipped`, `warnings`, `dryRun`), shared by the ≥1-package path here and
 /// the zero-discovery arm in `run`, so the two cannot drift by convention.
-/// `mode` is `"hosted"`: an additive key so consumers dispatch on the mode without inferring it from which
+/// `mode` is `"hosted"` (the final mode name for `--redirect`): an additive
+/// key so consumers dispatch on the mode without inferring it from which
 /// sub-object is present.
 pub(crate) fn redirect_json_block(
     redirected: usize,
@@ -811,8 +821,9 @@ async fn installed_stale_positive_evidence(
         .stale_evidence
 }
 
-/// Post-rewrite stale-materialization probe for gem redirects: `bundle
-/// install` never refetches an already-materialized gem (see the "Gem
+/// Post-rewrite stale-materialization probe for gem redirects — the guard
+/// for the live-verified warm-path defect where `bundle install` never
+/// refetches an already-materialized gem (full narrative: the "Gem
 /// stale-install guard" section of CLI_CONTRACT.md).
 ///
 /// Judgment sources and rules:
@@ -849,7 +860,10 @@ async fn gem_stale_install_warnings(
     global_prefix: Option<std::path::PathBuf>,
     confirmed: &[(String, String)],
     // This run's fetched records MERGED with the ledger's persisted ones
-    // (the caller hands the post-merge ledger map).
+    // (the caller hands the post-merge ledger map): the persisted half is
+    // the fallback judgment source when this run's /patches/view fetch
+    // failed transiently, so the warning keeps firing until the stale
+    // materialization is gone.
     records: &std::collections::BTreeMap<String, socket_patch_core::manifest::schema::PatchRecord>,
     gem_artifact_shas: &std::collections::BTreeMap<(String, String), String>,
 ) -> StaleInstallOutcome {
@@ -1024,8 +1038,10 @@ fn pipenv_probe_certain<'a>(
     candidates: impl Iterator<Item = &'a DepOverride>,
     fetched_wheel_urls: impl Iterator<Item = &'a str>,
 ) -> bool {
-    // Cheap pre-check: every hosted run reaches this, so skip building the
-    // list when there is no Pipfile.lock.
+    // `pipenv_lock_targets` answers false on its first line when there is
+    // no Pipfile.lock, and EVERY hosted redirect run reaches this — an
+    // npm-only one with hundreds of candidates included. Ask that question
+    // before building the list to ask it with.
     if !files.contains_key("Pipfile.lock") {
         return false;
     }
@@ -1046,7 +1062,7 @@ fn gem_sha_key(purl: &str) -> (String, String) {
         .unwrap_or_default()
 }
 
-/// `scan --mode hosted`: resolve hosted-patch references for the selected patches,
+/// `scan --redirect`: resolve hosted-patch references for the selected patches,
 /// then rewrite ONLY those dependencies' lockfile/registry-config entries to
 /// point at the hosted vendored patches (the byte-identical counterpart of the
 /// GitHub-app registry mode). No artifact bytes land in the repo.
@@ -1091,8 +1107,8 @@ pub(super) async fn run_redirect(
             if args.common.json {
                 emit_json_error(scan_result.take(), &message);
             } else if code == 0 && !args.common.silent {
-                // Unreachable from scan (it never prompts, so selection
-                // cannot be cancelled); kept for a code-0 selection error.
+                // Exit 0 without an error is the cancelled selection
+                // (`Selection cancelled.` already printed).
                 eprintln!("Nothing was redirected.");
             }
             return code;
@@ -1138,7 +1154,11 @@ enum ProbeStep {
 /// - The artifact URL in the rewriters' own spellings
 ///   ([`artifact_url_spellings`](socket_patch_core::patch::redirect::artifact_url_spellings),
 ///   raw or the `\/`-escaped slashes an old composer.lock spells them with),
-///   so a writer's spelling can never be one this probe misses.
+///   so a writer's spelling can never be one this probe misses. It was: the
+///   composer rewriter emitted `\/`-escaped urls this probe never looked for,
+///   so a fully successful composer redirect reported `redirected: 0`, fetched
+///   no patch record into the ledger, and left the patch unattestable by
+///   `vex`.
 /// - The percent-encoded URL: the berry rewriter writes it into the lock's
 ///   `::__archiveUrl=` binding, so the raw form is absent.
 /// - The registry index URL and the maven suffixed version, when present.
@@ -1188,11 +1208,12 @@ fn candidate_present_oracle(
 /// allow-remote config →
 /// confirmation probe → ledger merge-then-persist → file writes → gem stale
 /// probe → warnings → optional VEX. Shared VERBATIM by `scan --mode hosted`
-/// (its `--json` arm through the `run_redirect` wrapper, its human arm
-/// through [`boxed_run_redirect_selected`] in `scan/mod.rs`; both select via
-/// `discover_selected`, with no prompt) and by `get --mode hosted` (which
-/// pins the advisory-resolved uuid), so all produce identical on-disk
-/// results for the same selection. The redirect ledger is loaded HERE, under the apply
+/// — its `--json` arm through the `run_redirect` wrapper (which selects via
+/// `discover_selected`), its human arm through
+/// [`boxed_run_redirect_selected`] directly, after its own table + confirm
+/// prompt (`scan/mod.rs`) — and by `get --mode hosted` (which pins the
+/// advisory-resolved uuid), so all produce identical on-disk results for
+/// the same selection. The redirect ledger is loaded HERE, under the apply
 /// lock whenever this run holds one (never handed in pre-loaded: a copy
 /// read before the lock could merge over a concurrent writer's edits); a
 /// dry run or a zero-grant run reads it strictly but writes nothing,
@@ -1322,8 +1343,9 @@ pub(crate) async fn run_redirect_selected(
             // level before the patch uuid. Recover it so the rewriters'
             // rotation-idempotency guards (which wildcard the token path
             // level of a previously-written URL) don't depend on it being
-            // derivable from the URL alone (an empty token makes the gem
-            // guard nest a new source block on every re-scan).
+            // derivable from the URL alone: with an empty token the gem
+            // guard used to miss the previous grant's source block and NEST
+            // a new one around it on every re-scan.
             let token = reference
                 .registry_override
                 .as_ref()
@@ -1409,15 +1431,12 @@ pub(crate) async fn run_redirect_selected(
     // The apply lock (see `acquire_hosted_lock`), taken only by a WET run
     // that holds at least one granted reference — the only runs that can
     // write anything: the takeover pre-reverts (lockfiles + the vendored
-    // ledger), the redirect-ledger merge and the lockfile writes. Dry runs
+    // ledger) and the lockfile writes. Dry runs
     // and zero-grant runs never touch `.socket/`, so they never lock (a
     // preview must not create `.socket/`, flip to `lock_held` under a
-    // concurrent wet run, or fail on a read-only checkout). Acquired BEFORE
-    // the ledger load so load → merge → persist is one critical section
-    // (rollback's rule: a ledger a run will persist is loaded under the
-    // lock) and held to the end of the function. Read below: it also gates
-    // the corrupt-ledger quarantine, the one write the load itself can make.
-    let lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
+    // concurrent wet run, or fail on a read-only checkout). Held to the end
+    // of the function.
+    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
         match acquire_hosted_lock(common, &mut scan_result) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
@@ -1426,36 +1445,13 @@ pub(crate) async fn run_redirect_selected(
         None
     };
 
-    // Load the existing redirect ledger before any file changes, including
-    // Cargo takeover reverts. It stores the originals a future revert needs, so
-    // a malformed (torn/hand-mangled) ledger must abort the run while the
-    // project is still untouched, or the merge below would silently
-    // overwrite that revert data. The malformed file is moved aside to
-    // redirect-state.json.corrupt (never clobbered) — but only by a run
-    // holding the apply lock; a dry run or zero-grant run reports the same
-    // error and moves nothing, so `.socket/vendor/` is never mutated
-    // lock-free.
-    //
-    // Held as the ONE in-memory ledger for the whole run: the write below
-    // merges into it in place, the stale-install probes read its records
-    // (persisted ones are the fallback when this run's /patches/view fetch
-    // fails transiently), and the takeover classification at the end reads
-    // the merged state.
-    let mut ledger =
-        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
-            Ok(state) => state.unwrap_or_else(RedirectState::new),
-            Err(mut corrupt) => {
-                if lock.is_some() {
-                    corrupt.quarantine().await;
-                }
-                let message = corrupt.to_string();
-                eprintln!("{}", format_error_line(&message));
-                if common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
-        };
+    // v5 hosted mode keeps no ledger: the lockfiles are the only record of
+    // a redirect (vex, list, vendor and rollback read the hosted pins from
+    // them). This run's edits and records still collect here in memory,
+    // for the edit rebasing below, the stale-install probes and the
+    // takeover classification. A pre-v5 ledger on disk is left untouched:
+    // it only goes stale, and replaying a stale edit fails closed.
+    let mut ledger = RedirectState::new();
     // The vendored ledger, loaded ONCE per run (under the same lock, so no
     // other writer can move the on-disk file under it): the takeover below
     // mutates it in place per reverted purl (saving after each), and the
@@ -1471,14 +1467,20 @@ pub(crate) async fn run_redirect_selected(
     // entry; for the npm family a `file:./.socket/vendor/…` lock resolution
     // (plus a berry `resolutions` pin) and its committed tarball; for golang
     // the vendor-owned go.mod `replace`, its committed module copy, and its
-    // ledger entry. The hosted rewriters know nothing about that wiring
-    // (cargo would refuse `--locked` builds over the unused `[patch]` entry;
-    // yarn classic would hijack a resolution the vendored ledger still
-    // claims; yarn berry refuses `file:` outright). A takeover must leave the
-    // project FULLY hosted: revert each such purl's vendored state first (the
-    // per-purl machinery `vendor --revert` runs), and only then redirect —
-    // which also hands the redirect the PRISTINE registry lock fragment to
-    // record as its own revert original. A purl
+    // ledger entry (left behind, a later `vendor` run takes the module back
+    // and the modes flip-flop). The hosted
+    // rewriters know nothing about that wiring: cargo then refuses every
+    // `--locked` build over the now-unused `[patch]` entry while this run
+    // reports success, and the npm rewriters either hijack the vendored
+    // resolution while the vendored ledger still claims it (yarn classic)
+    // or fail-closed refuse the `file:` protocol entirely (yarn berry). A
+    // takeover must leave the project FULLY hosted: revert each such purl's
+    // vendored state first (the exact per-purl machinery `vendor --revert`
+    // runs — restore the lock originals from the ledger, drop the vendored
+    // wiring, remove the committed artifact and the ledger entry), and only
+    // then redirect. This ordering also hands the redirect the PRISTINE
+    // registry lock fragment to record as its own revert original, keeping
+    // the originals chain intact across repeated mode migrations. A purl
     // whose vendored state cannot be cleanly reverted (revert failure, or
     // vendored wiring with a missing/corrupt ledger) is REFUSED — skipped
     // with an actionable error — never half-migrated.
@@ -1574,8 +1576,10 @@ pub(crate) async fn run_redirect_selected(
         // Yarn berry twin of the bun gate: the berry rewriter's project-level
         // refusals (mixed line endings, cacheKey, `.yarnrc.yml`
         // compressionLevel) must be known before the takeover reverts a
-        // vendored berry purl, or the revert strips the live vendored patch
-        // and the rewriter then refuses the lock. Only entries the
+        // vendored berry purl — the vendored revert keeps a mixed lock mixed
+        // (it never refuses on line endings), so reverting first stripped
+        // the live vendored patch and then the rewriter refused the lock,
+        // leaving the package unpatched in both modes. Only entries the
         // vendor ledger wired through the yarn-berry backend are gated (the
         // lock is read only when one exists); an unreadable lock is left to
         // the revert's own diagnostics.
@@ -1662,10 +1666,13 @@ pub(crate) async fn run_redirect_selected(
                     })
             };
         // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
-        // SYMLINK GUARD below, applied to each ledger entry's recorded wiring
-        // (the revert backends also stage and rename over the file). Checked
-        // BEFORE any revert dispatches (and under --dry-run too) so "nothing
-        // was written" stays true.
+        // SYMLINK GUARD below, applied to the files the reverts rewrite
+        // (each ledger entry's recorded wiring): the revert backends stage
+        // and rename over the lock like the rewriters do, so a symlinked
+        // package-lock.json would be detached — or a later refusal would
+        // find the purl neither vendored nor hosted — before the general
+        // guard ever ran. Checked in one pass BEFORE any revert dispatches
+        // (and under --dry-run too) so "nothing was written" stays true.
         let revert_targets = takeover
             .iter()
             .filter_map(|(c, entry)| {
@@ -1700,7 +1707,11 @@ pub(crate) async fn run_redirect_selected(
                     // vendored state the wet run would refuse to revert is
                     // refused here too, and one it would revert is announced
                     // as a takeover — never handed to the rewriters, which
-                    // would refuse the still-vendored wiring.
+                    // would preview against the still-vendored wiring and
+                    // fail-closed refuse it, prescribing a manual
+                    // `vendor --revert` for a purl this run just promised to
+                    // revert itself while reporting `redirected: 0` for a
+                    // migration the wet run lands.
                     let outcome =
                         crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, true)
                             .await;
@@ -1868,13 +1879,20 @@ pub(crate) async fn run_redirect_selected(
     let binary_bun = !bun_lock_present && common.cwd.join("bun.lockb").exists();
     // Read the project's candidate files, run the rewriters. Every read goes
     // through the FIFO-safe reader (non-blocking open + fstat regular-file
-    // check), so a FIFO under a candidate name is skipped like a missing file
-    // instead of wedging the run in open(2).
+    // check): a FIFO planted under any candidate name — pyproject.toml,
+    // uv.lock, a paired script, a rush lock — wedged `scan`/`get --mode
+    // hosted` forever in a plain `read_to_string` open(2) waiting for a
+    // writer. A non-regular file now reads as "unreadable" and is skipped
+    // exactly like a missing one.
     //
-    // Skipped when no candidate survived and no dry-run takeover preview is
-    // pending (the rewriters do nothing without a dep); everything after the
-    // rewrite still runs. A dry-run takeover preview still needs the root
-    // locks for the install-policy previews below.
+    // Skipped entirely when no candidate survived (every reference skipped
+    // or refused) and no dry-run takeover preview is pending: the rewriters
+    // place nothing and warn about nothing without a dep, so the ~45 reads
+    // would only feed an empty rewrite. Everything after the rewrite still
+    // runs — the skips and warnings reported, a requested VEX still
+    // attempted. A dry-run takeover preview still needs the root locks: the
+    // install-policy previews below (pnpm `trustLockfile`, npm `.npmrc`)
+    // judge the lock the wet run splices after its revert.
     use socket_patch_core::utils::fs::read_regular_to_string;
     let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     // Rush monorepos have no root package.json/lock pair: the single pnpm
@@ -1960,6 +1978,9 @@ pub(crate) async fn run_redirect_selected(
         }
     }
 
+    // `mut`: the pnpm trustLockfile auto-config below may fold a
+    // pnpm-workspace.yaml write (plus its ledger edit) into the rewrite set so
+    // it rides the same atomic-write / ledger-first machinery as the locks.
     let mut python_metadata = std::collections::BTreeMap::new();
     let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
     // `pipenv --version` (see `pipenv_major` below), started before the
@@ -2014,7 +2035,8 @@ pub(crate) async fn run_redirect_selected(
         // The only candidates the metadata fetch can still drop are those
         // sharing a fetched wheel's artifact URL. If the rest already
         // target an entry of Pipfile.lock, the Pipenv probe below is certain
-        // to run: start it now so it overlaps the fetch.
+        // to run: start it now so it overlaps the fetch. Otherwise it runs
+        // (or not) exactly where it always did.
         if pipenv_probe_certain(
             &files,
             candidates.iter().map(|c| &c.dep),
@@ -2026,16 +2048,27 @@ pub(crate) async fn run_redirect_selected(
             }));
         }
         // The wheels' FIRST attempts run concurrently and are folded in dep
-        // order, so `python_metadata`, `unavailable_python_artifacts`,
-        // `skipped` and the held-back debug lines come out in dep order.
+        // order, so `python_metadata`, `unavailable_python_artifacts` and
+        // `skipped` come out exactly as the serial loop's did; each attempt's
+        // opt-in debug lines are held back and printed at its fold, so they
+        // keep the serial order too.
         //
         // An attempt the client would RETRY (a 429 / 5xx / transport
-        // failure) is never settled concurrently: at the first one no
-        // further attempt starts, the in-flight ones are awaited (host idle
-        // again), and that dep plus every later one finish one at a time. A
-        // deferred attempt is RESUMED, not restarted (`Retry-After` waited
-        // out, only its remaining budget spent), so each wheel costs the
-        // host the same requests a serial fetch would.
+        // failure) is never settled concurrently. At the first one no
+        // further attempt is started, the ones already in flight are awaited
+        // (so the host is idle again, as the serial loop would find it), and
+        // that dep plus every later one are finished one at a time. A
+        // deferred attempt is RESUMED, not restarted: `Retry-After` is
+        // waited out and only the budget it left is spent, so each wheel
+        // costs the host exactly the requests the serial loop's would have.
+        // What stays different is only their overlap: a host that answers a
+        // burst differently than it answers the same requests one at a time
+        // (a sliding-window limiter, a bot challenge) can still hand back a
+        // status the serial loop would not have seen. The first such answer
+        // is what closes the window.
+        //
+        // Kept small on purpose, and paced by `SOCKET_API_CONCURRENCY` like
+        // every other patch-API window — see `wheel_metadata_concurrency`.
         let wheel_metadata_concurrency = wheel_metadata_concurrency(api_client.uses_public_proxy());
         use futures_util::StreamExt as _;
         use socket_patch_core::vendor::pypi::{
@@ -2148,9 +2181,6 @@ pub(crate) async fn run_redirect_selected(
     // runtime worker; `files` comes back for the confirmation probe below.
     let bun_lockb_present = common.cwd.join("bun.lockb").exists();
     let withheld_from_vlt = vlt_preflight.withheld_from_vlt.clone();
-    // `mut`: the pnpm trustLockfile auto-config below may fold a
-    // pnpm-workspace.yaml write (plus its ledger edit) into the rewrite set so
-    // it rides the same atomic-write / ledger-first machinery as the locks.
     let (files, mut rewrite) = tokio::task::spawn_blocking(move || {
         let rewrite = rewrite_registry_redirect_withholding_vlt(
             &files,
@@ -2220,28 +2250,41 @@ pub(crate) async fn run_redirect_selected(
 
     // pnpm >=11 enforces a lockfile supply-chain policy: it compares each
     // resolution's tarball URL against the registry's published metadata and
-    // REFUSES a lock whose URLs differ: pnpm 11 with
+    // REFUSES a lock whose URLs differ. The failure spelling changed across
+    // majors (both observed against real installs): pnpm 11 fails with
     // ERR_PNPM_TARBALL_URL_MISMATCH (ERR_PNPM_META_FETCH_FAIL when the
-    // registry is unreachable), pnpm 12 with
-    // ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION, whose own text tells users
-    // to rebuild the lock — which silently discards the redirect, so the
-    // warning must pre-empt that advice. The working recoveries are
-    // `pnpm install --trust-lockfile` and the pnpm-workspace.yaml
-    // `trustLockfile: true` key; the `.npmrc` `trust-lockfile=true` spelling
-    // is IGNORED by pnpm and must never be recommended.
+    // registry is unreachable); pnpm 12 fails with
+    // ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION, and its OWN error text tells
+    // users to rebuild the lock (`pnpm clean --lockfile` + install) — which
+    // silently discards the redirect and reinstalls the vulnerable upstream,
+    // so the warning must pre-empt that advice. The recoveries verified on
+    // both majors are the per-run `pnpm install --trust-lockfile` flag and
+    // the committable pnpm-workspace.yaml `trustLockfile: true` key; the
+    // `.npmrc` `trust-lockfile=true` spelling is IGNORED by pnpm and must
+    // never be recommended.
     //
     // ZERO-TOUCH DEFAULT: when this run rewrote the ROOT pnpm-lock.yaml and
-    // its lockfileVersion is >= 9 (5.x/6.0 locks mean pnpm 7/8, which have
-    // neither the policy nor the flag and get their own guidance), the run
-    // auto-ensures `trustLockfile: true` in pnpm-workspace.yaml. The same
+    // its lockfileVersion is >= 9 (pnpm 9-12 emit '9.0'; 5.x/6.0 locks mean
+    // pnpm 7/8, which have neither the policy nor the flag — those legacy
+    // locks get their own installs-work-unchanged guidance instead, never
+    // the `--trust-lockfile` headline pnpm 7/8 reject as an unknown option),
+    // the run auto-ensures `trustLockfile: true` in pnpm-workspace.yaml so
+    // CI needs no modification and installs need no flags. The same
     // auto-config re-engages on a run that spliced NOTHING when the root v9
-    // lock already carries a granted hosted artifact URL (HEAL-ON-RERUN
-    // below). pnpm <=10 ignores the key; the per-entry sha512 pin still fails
-    // closed on tampered bytes. An explicit user `trustLockfile: <non-true>`
-    // is RESPECTED (never flipped), and `--no-trust-lockfile-config` opts out.
-    // Rush nested/subspace locks are excluded: rush runs pnpm in common/temp,
-    // which never reads the repo-root pnpm-workspace.yaml. The warning names
-    // the host(s) the lock now points at (they follow --api-url).
+    // lock already carries a granted hosted artifact URL (see HEAL-ON-RERUN
+    // below), so a missed config is healed by re-running the scan. Verified against real installs (2026-08-18 matrix +
+    // tolerance spikes): pnpm 9.15.9 / 10.34.5 silently ignore the key
+    // (frozen installs stay green), pnpm 11.22.0 / 12.0.0-rc.7 accept the
+    // redirected lock with it, and the per-entry sha512 integrity pin still
+    // fails closed on tampered bytes. An explicit user `trustLockfile:
+    // <non-true>` is RESPECTED (never flipped — the warning explains the
+    // manual recoveries instead), and `--no-trust-lockfile-config` opts out
+    // entirely. Rush nested/subspace locks are excluded: rush runs pnpm in
+    // common/temp, which never reads the repo-root pnpm-workspace.yaml, so a
+    // root write would be config theater — those runs keep the manual
+    // guidance. The warning names the host(s) the lock now points at: the
+    // hosted artifact host follows --api-url, so it is not always
+    // patch.socket.dev.
     let mut pnpm_warnings: Vec<serde_json::Value> = Vec::new();
     // The pnpm-workspace.yaml content + ledger edit this run will fold into
     // the rewrite set (decided inside the borrow scope, applied after it).
@@ -2270,8 +2313,9 @@ pub(crate) async fn run_redirect_selected(
         // config even though this run spliced nothing — so a project that
         // missed the config once (opted-out first run, or a crash between the
         // lock write and the workspace write) is healed by simply re-running
-        // the scan. An AlreadyTrue workspace keeps the re-run a byte-stable
-        // no-op.
+        // the scan. Without this, the idempotent no-op re-scan skipped both
+        // the config and the warning forever. An AlreadyTrue workspace keeps
+        // the re-run a byte-stable no-op.
         let heal_root: Option<&String> = pnpm_heal_root(
             rewrite.files.contains_key("pnpm-lock.yaml"),
             files.get("pnpm-lock.yaml"),
@@ -2307,7 +2351,10 @@ pub(crate) async fn run_redirect_selected(
             // already-redirected heal root): an npm override may have matched
             // only a sibling lock (e.g. package-lock.json), and naming its host
             // here would point users at a server the pnpm lock never references.
-            // Same needles as the confirmation probe below.
+            // Same presence predicate as the confirmation probe below (raw /
+            // `\/`-escaped via artifact_url_present, plus the percent-encoded
+            // spelling) so a writer's spelling can never be one this filter
+            // misses.
             let npm_overrides: Vec<_> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
             let groups: Vec<Vec<String>> = npm_overrides
                 .iter()
@@ -2344,10 +2391,13 @@ pub(crate) async fn run_redirect_selected(
                     .get("pnpm-lock.yaml")
                     .and_then(|text| pnpm_lock_version_major(text))
                     .is_some_and(|major| major >= 9);
-            // Every touched pnpm lock is a KNOWN legacy (5.x/6.0) format,
-            // where `--trust-lockfile` is rejected as an unknown option. An
-            // unparseable version stays on the manual guidance: never claim
-            // "no trust step needed" for a lock whose era is unknown.
+            // Every touched pnpm lock is a KNOWN legacy (5.x/6.0) format —
+            // pnpm 7/8 territory, where neither the trust policy nor the
+            // `--trust-lockfile` flag exists (the flag is rejected as an
+            // unknown option), so the manual guidance's headline would hand
+            // users a command that errors. An unparseable version stays on
+            // the manual guidance: never claim "no trust step needed" for a
+            // lock whose era is unknown.
             let all_locks_legacy = pnpm_lock_texts.iter().all(|text| {
                 pnpm_lock_version_major(text).is_some_and(|major| major < 9)
                     || text
@@ -2440,10 +2490,13 @@ pub(crate) async fn run_redirect_selected(
     }
     // npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every
     // tarball whose `resolved` origin is not the configured registry — which
-    // is exactly what a hosted redirect writes. npm <= 11 installs it
-    // unchanged; `allow-remote=all` in the project `.npmrc` makes npm 12
-    // install the patched bytes with the sha512 pins still enforced (`root`
-    // only admits DIRECT dependencies, so it is not enough).
+    // is exactly what a hosted redirect writes. Verified against real
+    // installs (npm 12.0.0 / 12.1.0): a fresh `npm ci` of the redirected lock
+    // fails before fetching anything, while npm <= 11 (11.x ships
+    // `allow-remote=all`; <= 10 has no such setting) installs it unchanged,
+    // and `allow-remote=all` in the project `.npmrc` makes npm 12 install
+    // the patched bytes with the sha512 pins still enforced. `root` is not
+    // enough in general: it only admits DIRECT dependencies of the project.
     //
     // ZERO-TOUCH DEFAULT (the npm twin of the pnpm trustLockfile auto-config
     // above): whenever a root npm lock ends this run carrying a granted
@@ -2587,11 +2640,14 @@ pub(crate) async fn run_redirect_selected(
     // one. A granted reference whose rewriter found nothing to edit (e.g. no
     // lockfile) must NOT be recorded or attested: nothing pins the patch.
     // A `pdm.lock` that is NOT the PyPI install driver (a `uv.lock` or
-    // `poetry.lock` sits beside it) is never rewritten, yet can still carry a
-    // Socket artifact URL from an earlier run. That stale text pins nothing,
-    // so it must not feed the substring probe below. When pdm DOES drive,
-    // pypi confirmation keys off `confirmed_pdm_uuids`, so dropping the file
-    // is always safe.
+    // `poetry.lock` sits beside it) is never rewritten this run, yet it can
+    // still carry a Socket artifact URL from an earlier run when pdm drove.
+    // That stale text pins nothing now, so it must not feed the substring
+    // confirmation probe below — otherwise an untouched uv/poetry project whose
+    // real lock was never redirected would report a bogus `redirected: 1` and
+    // persist a ledger record. When pdm DOES drive, pypi confirmation keys off
+    // `confirmed_pdm_uuids` and never consults this probe, so dropping the file
+    // here is always safe; `pdm.lock` only ever carries pypi URLs.
     let pdm_inactive =
         files.contains_key("pdm.lock") && !socket_patch_core::patch::redirect::pdm_drives(&files);
     // Likewise a `vlt-lock.json` the vlt rewrite was withheld from (its
@@ -2615,7 +2671,7 @@ pub(crate) async fn run_redirect_selected(
     // All needle groups are answered in ONE multi-needle pass per text
     // (`groups_present`), which is the per-candidate `any()` exactly —
     // presence does not depend on search order, and `confirmed` keeps
-    // candidate order. `candidate_present_oracle` is the reference form.
+    // candidate order. See `confirm_candidates_oracle` for the old form.
     let steps: Vec<ProbeStep> = candidates
         .iter()
         .map(|c| {
@@ -2756,11 +2812,15 @@ pub(crate) async fn run_redirect_selected(
     // SYMLINK GUARD — fail-closed, whole rewrite, before the ledger and before
     // any write (hosted rewrites are transactional). The writer below stages
     // next to the path and renames over it, which REPLACES a symbolic link
-    // with a detached regular copy: the link target goes stale and
-    // `--revert` restores bytes but never the link. The revert side
-    // (replay.rs) already refuses linked files, so the write side must too.
-    // Applies to every ecosystem's files and to dry runs, so a dry run
-    // predicts the refusal.
+    // with a detached regular copy: the link target goes stale (uv itself
+    // writes THROUGH a linked uv.lock/pylock/pyproject), and `--revert`
+    // restores bytes but never the link (git shows a 120000→100644
+    // typechange). Since Python lock discovery follows links, a shared
+    // symlinked lock reaches this point as an ordinary rewrite target; the
+    // revert side (replay.rs) already refuses linked files, so the write
+    // side must too. Applies to every ecosystem's files (a symlinked
+    // package-lock.json has the same defect) and to dry runs, so a dry run
+    // predicts the refusal instead of a rewrite that will never happen.
     if let Some(linked) = socket_patch_core::utils::fs::first_symlink(
         &common.cwd,
         rewrite
@@ -2777,11 +2837,15 @@ pub(crate) async fn run_redirect_selected(
     if !common.dry_run {
         let total = confirmed.len();
         // The views are fetched concurrently but consumed in `confirmed`
-        // order, so `records` (newest wins), `record_warnings` and the
-        // held-back `--debug` lines fold deterministically. Each response is
-        // reduced to its record inside the window: a view carries every
-        // file's `blobContent`, which would otherwise be buffered for the
-        // whole window.
+        // order, so `records` (newest wins) and `record_warnings` fold
+        // exactly as the serial loop's did. Each response is reduced to
+        // its record inside the window: a view carries every file's
+        // `blobContent`, so buffering whole responses would hold the cap's
+        // worth of patch payloads in memory at once, where the loop only
+        // ever needed the hashes. `record_from_patch_response` is pure, so
+        // folding it early changes nothing downstream. Each fetch's
+        // `--debug` lines are held back and printed at its fold, where the
+        // serial loop would have made the request.
         let mut views = std::pin::pin!(ordered_concurrent(
             confirmed.iter(),
             api_concurrency_for(api_client.uses_public_proxy(), confirmed.len()),
@@ -2817,26 +2881,15 @@ pub(crate) async fn run_redirect_selected(
         status.finish();
     }
 
-    // Whether this run persisted the redirect ledger (human next steps).
-    let mut ledger_written = false;
     if !common.dry_run {
-        // Ledger (mirrors the vendor state.json shape): recorded edits for a
-        // future revert + the patch records (file hashes + vulnerabilities) so
-        // a post-install `socket-patch vex` can attest the redirected patches.
-        // MERGE with any existing ledger rather than overwriting: an idempotent
-        // re-run produces no new edits (the lockfile already points at the
-        // hosted patch), and clobbering the file would lose the original
-        // pre-redirect values a future revert needs. New edits APPEND (revert
-        // walks them in reverse), skipping byte-identical re-plans from a
-        // retried partial failure; records are keyed by PURL, newest wins.
-        //
-        // Persisted BEFORE the project files, and atomically (stage + fsync +
-        // rename): a crash between the two leaves a complete ledger whose
-        // originals match files never rewritten, never rewritten files whose
-        // originals reached no ledger.
+        // Fold this run's edits and records into the in-memory ledger.
+        // New edits append, skipping byte-identical re-plans; records are
+        // keyed by purl, newest wins.
         if !rewrite.edits.is_empty() || !records.is_empty() {
-            // Older ledgers carry `"mode": "redirect"`; normalize on rewrite
-            // (the loader accepts either).
+            // Ledgers written before the mode-string rename carry
+            // `"mode": "redirect"`; normalize on rewrite so the on-disk
+            // ledger converges on the documented "hosted" name (the
+            // loader accepts either — mode is an opaque string to it).
             ledger.mode = "hosted".to_string();
             // REBASE instead of append for fragment kinds whose file the
             // package manager itself rewrites in place: when the ledger already
@@ -2845,8 +2898,9 @@ pub(crate) async fn run_redirect_selected(
             // `poetry lock --no-update` keeps the Socket source but re-lays the
             // unit and drops the inserted `files` line), appending this run's
             // edits — recorded against the RELOCKED text — would build a chain
-            // whose older links match nothing, so rollback and remove refuse
-            // forever. Keeping the oldest `original` (the pristine
+            // whose older links match nothing: rollback and remove then refuse
+            // forever, and the refusal's own remedy ("re-run scan") is what
+            // lengthened the chain. Keeping the oldest `original` (the pristine
             // fragment) and adopting the fresh `new` keeps the chain a single
             // invertible link: replay swaps the fragment this run wrote back to
             // the fragment the very first run found.
@@ -2914,7 +2968,9 @@ pub(crate) async fn run_redirect_selected(
             // Dedup against the ledger as this run found it, never within
             // this run: one run legitimately records identical edits (a
             // Cargo.toml declaring the crate with the same line in two
-            // sections), and each one reverts one occurrence.
+            // sections), and each one reverts one occurrence — collapsing
+            // them made `remove` leave the second pin (and its registry
+            // block) in place while reporting success.
             let recorded = ledger.edits.len();
             for (i, edit) in rewrite.edits.iter().enumerate() {
                 if vlt_merged[i] {
@@ -2933,20 +2989,6 @@ pub(crate) async fn run_redirect_selected(
                 }
             }
             ledger.records.extend(records);
-            // The ledger is the only revert path and the VEX record store —
-            // a swallowed write failure would let the lockfile writes below
-            // proceed with no revert data persisted while reporting success.
-            let saved =
-                socket_patch_core::patch::redirect::save_redirect_state(&common.cwd, &ledger).await;
-            ledger_written = saved.is_ok();
-            if let Err(e) = saved {
-                let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
-                eprintln!("{}", format_error_line(&message));
-                if common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
         }
         for (rel, content) in rewrite
             .files
@@ -2978,9 +3020,12 @@ pub(crate) async fn run_redirect_selected(
     // Gem stale-install probe (see `gem_stale_install_warnings`): runs after
     // the writes so the warning describes the project as this run leaves it.
     // Idempotent re-scans re-confirm and re-probe, so the warning keeps
-    // firing until the stale materialization is actually gone. Skipped
-    // EXPLICITLY on --dry-run: the probe's ledger-record fallback would
-    // otherwise judge state the run did not (re)create.
+    // firing until the stale materialization is actually gone. The gate is
+    // deliberately EXPLICIT, not derived from empty fresh records: --dry-run
+    // rewrites nothing (there is no post-rewrite state to warn about), but
+    // the probe's ledger-record fallback could still judge an
+    // already-redirected project, so without this gate a dry-run would warn
+    // about state the run did not (re)create.
     let gem_stale: StaleInstallOutcome = if common.dry_run {
         StaleInstallOutcome::default()
     } else {
@@ -3021,8 +3066,8 @@ pub(crate) async fn run_redirect_selected(
         .await
     };
 
-    // vlt warm-tree heal: stale installed copies of the Socket-owned nodes
-    // are invalidated (classified only on a dry run or
+    // vlt warm-tree heal (DESIGN §3.9): stale installed copies of the
+    // Socket-owned nodes are invalidated (classified only on a dry run or
     // with --no-vlt-install-cleanup), and every confirmed vlt purl whose
     // installed or next-installed bytes are not known to be patched is
     // withheld from the in-run VEX attestation.
@@ -3055,9 +3100,8 @@ pub(crate) async fn run_redirect_selected(
     // LIVE lockfile actually routes to the hosted patch server (see
     // `classify_overlap_takeover`), so a dry-run / no-op over a lock that still
     // points at the vendored files stays silent instead of pointing cleanup at
-    // the live vendored ledger. The takeover pre-revert above already
-    // reconciled what it could; this only warns (JSON `warnings[]` and
-    // stderr) about any overlap left, WITHOUT deleting the other ledger.
+    // the live vendored ledger. Warn (JSON `warnings[]` and stderr) WITHOUT
+    // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
     // Classified over this run's in-memory ledgers — the redirect ledger as
     // merged and persisted above, the vendored ledger as the takeover left
     // it — so a non-dry-run reflects this run without re-reading either file.
@@ -3079,8 +3123,9 @@ pub(crate) async fn run_redirect_selected(
 
     // `--prune` is a no-op in hosted mode (both hosted terminals return
     // before the GC blocks): make that explicit in the JSON `warnings[]`
-    // rather than silently dropping the flag. The human path warns once up
-    // front in `run`.
+    // rather than silently dropping the flag — a bot migrating from
+    // `--mode agent --prune` must see WHY it stopped pruning. The human
+    // path warns once up front in `run` (before this flow is entered).
     let mut prune_warnings: Vec<serde_json::Value> = Vec::new();
     if prune_requested {
         prune_warnings.push(prune_ignored_warning());
@@ -3092,10 +3137,13 @@ pub(crate) async fn run_redirect_selected(
     // records WITHOUT hash verification (`assume_applied` — the integrity
     // pins written into the lockfile are the evidence), while any OTHER
     // manifest patches (previously applied / vendored — and any stale ledger
-    // records this run did not confirm) still verify normally (a
-    // post-install `socket-patch vex` re-proves them — see
-    // `commands::vex_sources`). Requested-but-failed VEX (including "nothing
-    // to attest") flips the exit code.
+    // records this run did not confirm) still verify normally. A post-install
+    // `socket-patch vex` hash-verifies the redirected patches against the
+    // installed tree (it reads the records back from the redirect ledger and
+    // re-proves their lockfile wiring — see `commands::vex_sources`), or,
+    // with no install yet, attests from the pinned hosted wiring it finds in
+    // the lockfile. Requested-but-failed VEX (including "nothing to attest")
+    // flips the exit code, matching `scan --vex`.
     let mut vex_statements: Option<usize> = None;
     // VEX run-level advisories: `note_warning` keeps them off stderr under
     // --json, so the envelope's `vex.warnings` is their only channel there.
@@ -3107,14 +3155,18 @@ pub(crate) async fn run_redirect_selected(
         // Hosted mode wrote only lockfiles and config files since scan's
         // crawl, never a directory the npm root walk descends into, so its
         // roots and packages still describe the tree (the snapshot checks
-        // it was taken with these crawler options). `get --mode hosted`
-        // passes none.
+        // it was taken with these crawler options). The interactive scan
+        // hands none in when its confirm prompt waited on a person — the
+        // tree may have changed while it did.
         params.npm_prior = npm_prior.cloned();
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
         // the ledger would contradict the run's own warning. Excluded purls
-        // fall back to `vex`'s normal installed-tree verification.
+        // fall back to `vex`'s normal installed-tree verification — a
+        // patched install still attests (with hash evidence), a stale one is
+        // omitted (and "nothing to attest" fails the command, per the
+        // embedded-VEX contract).
         params.assume_applied = confirmed
             .iter()
             .map(|(purl, _)| purl.clone())
@@ -3174,8 +3226,11 @@ pub(crate) async fn run_redirect_selected(
     if common.json {
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
-        // vendored mode's nested `vendor` block, so the hosted `--json`
-        // envelope keeps the same top-level scan keys as every other scan.
+        // vendored mode's nested `vendor` block. This keeps the hosted `--json`
+        // envelope schema-consistent with the zero-discovery and non-hosted
+        // scan envelopes — same top-level scan keys (scannedPackages,
+        // totalPatches, canAccessPaidPatches) plus the `packages` enumeration —
+        // instead of the bare `{status, redirect}` it used to emit.
         let redirect = redirect_json_block(
             confirmed.len(),
             rewritten,
@@ -3312,7 +3367,7 @@ pub(crate) async fn run_redirect_selected(
             }
             if !common.dry_run {
                 for line in
-                    format_next_steps(&human_files, ledger_written, !takeover_migrated.is_empty())
+                    format_next_steps(&human_files, !takeover_migrated.is_empty())
                 {
                     println!("{line}");
                 }
@@ -3614,30 +3669,17 @@ fn join_names(names: &[String], max: usize) -> String {
 
 /// Next steps after a wet run that rewrote files (stdout, after the
 /// summary — the same place vendored mode prints its own): commit the
-/// ledger and the rewritten files, reinstall so the installed tree picks
-/// up the patched artifacts, then verify with `vex`. After a
-/// vendored→hosted takeover (`vendored_removed`) the commit also has to
-/// carry the deleted vendored ledger entries and artifacts, so the whole
-/// `.socket/vendor/` directory is named instead of the redirect ledger.
-fn format_next_steps(
-    files: &[String],
-    ledger_written: bool,
-    vendored_removed: bool,
-) -> Vec<String> {
+/// rewritten files, reinstall so the installed tree picks up the patched
+/// artifacts, then verify with `vex`. After a vendored→hosted takeover
+/// (`vendored_removed`) the commit also has to carry the deleted vendored
+/// ledger entries and artifacts.
+fn format_next_steps(files: &[String], vendored_removed: bool) -> Vec<String> {
     if files.is_empty() && !vendored_removed {
         return Vec::new();
     }
     let mut commit: Vec<String> = Vec::new();
     if vendored_removed {
-        commit.push(if ledger_written {
-            ".socket/vendor/ (the redirect ledger, plus the removed vendored ledger entries and \
-             artifacts)"
-                .to_string()
-        } else {
-            ".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string()
-        });
-    } else if ledger_written {
-        commit.push(".socket/vendor/redirect-state.json".to_string());
+        commit.push(".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string());
     }
     commit.extend(files.iter().cloned());
     let npm = files
@@ -3835,7 +3877,8 @@ mod tests {
         }
     }
 
-    /// Lock-head version sniff against real pnpm 7/8/9-12 heads: quoted `'9.0'` and `'6.0'`,
+    /// Lock-head version sniff against the byte-real heads the 2026-08-18
+    /// matrix captured from pnpm 7/8/9-12: quoted `'9.0'` and `'6.0'`,
     /// unquoted `5.4`; a headless/garbled lock yields `None` (hands-off).
     #[test]
     fn pnpm_lock_version_major_sniffs_real_lock_heads() {
@@ -3994,11 +4037,13 @@ mod tests {
         assert!(!manual.contains('@'), "{manual}");
     }
 
-    /// The legacy-lock (5.x/6.0 — pnpm 7/8) guidance must NEVER mention
-    /// `--trust-lockfile` (pnpm 7/8 reject the flag as an unknown option) nor
-    /// the `trustLockfile` setting (pnpm 7/8 ignore it); it must say installs
-    /// work unchanged with no trust step, keep the don't-regenerate caution,
-    /// and leak no URL authority.
+    /// FINDING-10 regression: the legacy-lock (5.x/6.0 — pnpm 7/8) guidance
+    /// must NEVER mention `--trust-lockfile` (pnpm 7/8 reject the flag as an
+    /// unknown option) nor the `trustLockfile` setting (pnpm 7/8 ignore it);
+    /// it must say installs work unchanged with no trust step, keep the
+    /// don't-regenerate caution, and leak no URL authority. RED-verified: the
+    /// pre-fix manual guidance headlined `pnpm install --trust-lockfile` for
+    /// legacy locks, which errors out on pnpm 7/8.
     #[test]
     fn pnpm_trust_legacy_detail_never_recommends_the_trust_flag() {
         let server = "the hosted patch server (patch.test)";
@@ -4020,10 +4065,12 @@ mod tests {
         assert!(!legacy.contains('@'), "no URL authority may leak: {legacy}");
     }
 
-    /// A PRESENT-but-unreadable pnpm-workspace.yaml must classify as `Err` —
-    /// never as `Ok(None)`, which plans a Create that overwrites the user's
-    /// file (destroying their `packages:` globs). Absent stays `Ok(None)`
-    /// (the only Create-safe state); readable stays `Ok(Some)`.
+    /// FINDING-5 regression: a PRESENT-but-unreadable pnpm-workspace.yaml
+    /// must classify as `Err` — never as `Ok(None)`, which plans a Create
+    /// that overwrites the user's file (destroying their `packages:` globs).
+    /// Absent stays `Ok(None)` (the only Create-safe state); readable stays
+    /// `Ok(Some)`. RED-verified: the pre-fix `.ok()` collapsed the
+    /// invalid-UTF-8 read error below to `None`.
     #[test]
     fn read_workspace_for_trust_distinguishes_unreadable_from_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4148,7 +4195,8 @@ mod tests {
     }
 
     /// Without a Pipfile.lock the gate is false whatever the candidates
-    /// are, exactly as `pipenv_lock_targets` answers it.
+    /// are, exactly as `pipenv_lock_targets` answers it — so the early
+    /// return skips only the list the question would have been asked with.
     #[test]
     fn pipenv_probe_certain_is_false_without_a_pipfile_lock() {
         use super::pipenv_probe_certain;
@@ -4189,7 +4237,7 @@ mod tests {
         }
     }
 
-    /// Heal-on-rerun probe: a root lock ALREADY
+    /// FINDING-6 regression (heal-on-rerun probe): a root lock ALREADY
     /// carrying a granted hosted artifact URL from an earlier run — raw,
     /// `\/`-escaped, or percent-encoded — is detected even when this run
     /// spliced nothing, so the trust config can be (re)planned for a project
@@ -4203,7 +4251,9 @@ mod tests {
         cargo.ecosystem = "cargo".to_string();
         let overrides = vec![npm_override(url), cargo];
 
-        // The exact splice shape an earlier run wrote.
+        // The exact splice shape an earlier run wrote (heal-on-rerun with a
+        // pre-redirected lock and a missing workspace file: this probe is
+        // what re-engages the trust planning on the re-scan).
         let redirected = format!(
             "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
              resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
@@ -4233,11 +4283,14 @@ mod tests {
         assert!(!pnpm_lock_carries_hosted_redirect(&redirected, &[]));
     }
 
-    /// Heal-on-rerun gate (`pnpm_heal_root`): a re-scan that spliced NOTHING
-    /// over a pre-redirected root v9 lock with a MISSING pnpm-workspace.yaml
-    /// must engage the trust block (heal → plan Create), while a legacy
+    /// FINDING-6 regression (heal-on-rerun gate, the production
+    /// `pnpm_heal_root` wiring): a re-scan that spliced NOTHING over a
+    /// pre-redirected root v9 lock with a MISSING pnpm-workspace.yaml must
+    /// engage the trust block (heal → plan Create), while a legacy
     /// pre-redirected lock, an unparseable-version lock, a pristine lock,
     /// and a root lock this run DID splice all stay out of the heal path.
+    /// RED-verified by construction: the pre-fix trigger was
+    /// `!spliced.is_empty()` alone, i.e. this gate always answered None.
     #[test]
     fn pnpm_heal_root_re_engages_trust_planning_for_pre_redirected_v9_locks() {
         let url = "http://patch.test/patch/npm/in-proc-heal/1.0.0/tok/uuid/in-proc-heal-1.0.0.tgz";
@@ -4249,7 +4302,8 @@ mod tests {
 
         // The heal scenario: nothing spliced this run, root lock already
         // redirected, workspace file missing → the gate engages and the
-        // planning it feeds produces the Create.
+        // planning it feeds produces the Create the crashed/opted-out first
+        // run never wrote.
         let healed = pnpm_heal_root(false, Some(&redirected_v9), &overrides)
             .expect("a pre-redirected root v9 lock must re-engage the trust block");
         assert_eq!(healed, &redirected_v9);
@@ -4305,11 +4359,14 @@ mod tests {
 
     #[test]
     fn hosted_json_envelope_nests_redirect_into_classic_scan_object() {
-        // With ≥1 package, the hosted `--json` envelope must carry the SAME
-        // top-level scan keys as a zero-discovery / non-hosted scan AND nest
-        // the redirect summary under `redirect`. Built through the ONE
-        // spelling of the block (`run`'s zero-discovery arm uses the same
-        // helper).
+        // Regression for hosted-scan-json-schema-flips-with-discovery /
+        // hosted-scan-json-omits-enumeration: with ≥1 package, the hosted
+        // `--json` envelope must carry the SAME top-level scan keys as a
+        // zero-discovery / non-hosted scan (the old bare `{status, redirect}`
+        // dropped them) AND nest the redirect summary under `redirect`.
+        // Built through the ONE spelling of the block (the production
+        // site and `run`'s zero-discovery arm use the same helper), so the
+        // key set asserted below is the tested single source.
         let redirect = redirect_json_block(
             1,
             vec!["package-lock.json".to_string()],
@@ -4319,7 +4376,7 @@ mod tests {
         );
         let envelope = build_redirect_json_envelope(Some(classic_scan_result()), redirect);
 
-        // Classic scan keys survive.
+        // Classic scan keys survive — the bug was that they did not.
         assert_eq!(envelope["status"], "success");
         assert_eq!(envelope["scannedPackages"], 3);
         assert_eq!(envelope["packagesWithPatches"], 1);
@@ -4329,7 +4386,7 @@ mod tests {
         assert_eq!(envelope["canAccessPaidPatches"], false);
         assert!(envelope["updates"].is_array());
 
-        // Per-package / patch-uuid enumeration is present.
+        // Per-package / patch-uuid enumeration is present (the omission).
         assert!(envelope["packages"].is_array());
         assert_eq!(envelope["packages"][0]["purl"], "pkg:npm/minimist@1.2.2");
         assert_eq!(envelope["packages"][0]["patches"][0]["uuid"], "abc-123");
@@ -5379,14 +5436,12 @@ mod tests {
     }
 
     #[test]
-    fn next_steps_name_the_ledger_files_and_reinstall() {
-        assert!(format_next_steps(&[], true, false).is_empty());
+    fn next_steps_name_the_rewritten_files_and_reinstall() {
+        assert!(format_next_steps(&[], false).is_empty());
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], true, false),
+            format_next_steps(&["package-lock.json".to_string()], false),
             vec![
-                "Commit .socket/vendor/redirect-state.json and package-lock.json to keep the \
-                 redirect."
-                    .to_string(),
+                "Commit package-lock.json to keep the redirect.".to_string(),
                 "Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages \
                  pick up the patched artifacts, then run `socket-patch vex` to verify them."
                     .to_string(),
@@ -5398,7 +5453,6 @@ mod tests {
                 "pnpm-workspace.yaml".to_string(),
             ],
             false,
-            false,
         );
         assert_eq!(
             steps[0],
@@ -5409,13 +5463,13 @@ mod tests {
 
     #[test]
     fn next_steps_add_the_vlt_ci_line_only_for_a_rewritten_vlt_lock() {
-        let steps = format_next_steps(&["vlt-lock.json".to_string()], true, false);
+        let steps = format_next_steps(&["vlt-lock.json".to_string()], false);
         assert_eq!(
             steps.last().map(String::as_str),
             Some("vlt: commit vlt-lock.json; CI should run `vlt ci`")
         );
         assert!(
-            !format_next_steps(&["package-lock.json".to_string()], true, false)
+            !format_next_steps(&["package-lock.json".to_string()], false)
                 .iter()
                 .any(|s| s.starts_with("vlt:"))
         );
@@ -5593,18 +5647,13 @@ mod tests {
     #[test]
     fn next_steps_after_a_takeover_name_the_removed_vendored_state() {
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], true, true)[0],
-            "Commit .socket/vendor/ (the redirect ledger, plus the removed vendored ledger \
-             entries and artifacts) and package-lock.json to keep the redirect."
-        );
-        assert_eq!(
-            format_next_steps(&["pnpm-lock.yaml".to_string()], false, true)[0],
+            format_next_steps(&["pnpm-lock.yaml".to_string()], true)[0],
             "Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
              pnpm-lock.yaml to keep the redirect."
         );
     }
 
-    /// Every hosted npm redirect variant tells the user
+    /// REGRESSION (npm 12): every hosted npm redirect variant tells the user
     /// that npm >= 12 refuses the redirected lock (EALLOWREMOTE) without
     /// `allow-remote=all`, and carries the whole-tree tradeoff disclosure —
     /// the auto-configured, already-set, explicit-other, opted-out and
@@ -5741,8 +5790,8 @@ mod tests {
     }
 }
 
-/// The one-pass multi-needle confirmation probe answers exactly what the
-/// per-candidate `any()` oracle answers.
+/// H1 equivalence: the one-pass multi-needle confirmation probe answers
+/// exactly what the per-candidate `any()` it replaced answered.
 #[cfg(test)]
 mod probe_equivalence_tests {
     use super::{candidate_presence_needles, candidate_present_oracle, npm_lock_url_needles};

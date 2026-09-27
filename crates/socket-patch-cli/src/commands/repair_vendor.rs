@@ -464,6 +464,11 @@ fn rebuild_reason_label(code: &str) -> &str {
     }
 }
 
+/// A soft (healthy-by-members, unanchored) reconstruction whose trustworthy
+/// rebuild cannot proceed: the entry stays restored WITHOUT a whole-file
+/// fingerprint — the legacy member-only state pass 1 keeps warning about
+/// (`vendor_inventory_missing` for gems) — and the gap is surfaced, instead
+/// of either failing the repair or canonizing the unverifiable live tree.
 /// The npm-family lockfiles and the vlt importers' package.json files as
 /// they are now, for the unverified-source rebuild's put-back. Read through
 /// the FIFO-safe opener: a FIFO or device at one of these paths is left out
@@ -493,11 +498,6 @@ async fn snapshot_npm_wiring_files(cwd: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)
     snap
 }
 
-/// A soft (healthy-by-members, unanchored) reconstruction whose trustworthy
-/// rebuild cannot proceed: the entry stays restored WITHOUT a whole-file
-/// fingerprint — the legacy member-only state pass 1 keeps warning about
-/// (`vendor_inventory_missing` for gems) — and the gap is surfaced, instead
-/// of either failing the repair or canonizing the unverifiable live tree.
 /// The entry itself was already persisted by the pre-rebuild restore.
 fn soft_restore_without_fingerprint(
     env: &mut Envelope,
@@ -652,7 +652,7 @@ async fn restore_orphaned_pre_rebuild_dirs(common: &GlobalArgs) {
 /// unreadable ledger fails this phase loudly (`vendor_state_unreadable`);
 /// the caller's own degrade-to-empty policy for its download scoping is
 /// its own. `run_client` is the run's API client when the caller already
-/// built one (repair.rs's lazily built download-phase `client`): the uuid lookups and the
+/// built one (repair.rs's `telemetry_client`): the uuid lookups and the
 /// staging fetch reuse it instead of constructing a second (or third) one
 /// and re-printing its token advisory; `None` builds lazily on first need.
 pub(crate) async fn repair_vendored_artifacts_with_references(
@@ -755,7 +755,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
                     "vendor_uuid_mismatch",
                     "the manifest's patch uuid moved on; run `socket-patch vendor` (or \
-                     `scan --mode vendored`) to re-vendor",
+                     `scan --vendor`) to re-vendor",
                 ),
             );
             continue;
@@ -866,7 +866,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             ArtifactHealth::Healthy => {
                 // vlt's `<uuid>/.gitignore` and `.gitattributes` are not
                 // part of the artifact: a missing or edited one is simply
-                // rewritten.
+                // rewritten (DESIGN §4.8).
                 if entry.ecosystem == "npm"
                     && entry.flavor.as_deref() == Some(vendor::vlt_lock::FLAVOR)
                     && !common.dry_run
@@ -887,12 +887,11 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 // Dir-shaped artifacts from pre-inventory vendors: the
                 // health check above could only verify the PATCHED members
                 // — unpatched-file drift is invisible until a re-vendor
-                // records the whole-tree inventory. Name the gap for gem
-                // only: vlt also records inventories but has no
-                // pre-inventory entries to warn about, and the other
-                // dir-shaped backends (cargo/golang/composer) don't record
-                // one, so a re-vendor there records nothing and the advice
-                // would be permanent per-run noise.
+                // records the whole-tree inventory. Name the gap — for gem
+                // only, the one backend that records inventories; the other
+                // dir-shaped backends (cargo/golang/composer) don't yet, so
+                // a re-vendor there records nothing and the advice would be
+                // permanent per-run noise.
                 if entry.ecosystem == "gem"
                     && !artifact_is_file_shaped(&entry.artifact.path)
                     && entry.artifact.file_inventory.is_none()
@@ -1323,9 +1322,8 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
         patches: records_map,
         setup: None,
     };
-    // The ledger this pass already holds feeds the staging harvest; repair's
-    // download phase writes blobs to disk (harvested from socket_dir), so
-    // there is no in-memory seed.
+    // The ledger this pass already holds feeds the staging harvest; repair
+    // has no download phase, so no seed.
     let staged = match stage_vendor_sources_in_memory(
         common,
         &synth,
@@ -2139,7 +2137,7 @@ mod tests {
 
     /// A FIFO under a wiring-file name (here the paired `<script>.py` of a
     /// `*.py.lock`, which the lister cannot filter because it derives the
-    /// script name without stat'ing it) must not wedge `repair`: a
+    /// script name without stat'ing it) used to wedge `repair` forever: a
     /// plain `read_to_string` blocks in open(2) waiting for a writer. Every
     /// reference read must go through the FIFO-safe reader and skip it.
     #[cfg(unix)]
@@ -2201,9 +2199,9 @@ mod tests {
     }
 
     /// The requirements planner writes vendored pins into `-r` includes,
-    /// so a reference may live ONLY in an include. Reading the root
-    /// requirements.txt alone would leave such a wheel unrecoverable by
-    /// `repair` and deletable by the orphan sweep.
+    /// so a reference may live ONLY in an include. The scan used to read
+    /// the root requirements.txt alone, leaving such a wheel unrecoverable
+    /// by `repair` and deletable by the orphan sweep.
     #[tokio::test]
     async fn scan_recovers_include_hosted_requirements_reference() {
         let tmp = tempfile::tempdir().unwrap();

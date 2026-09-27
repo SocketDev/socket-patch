@@ -14,7 +14,7 @@
 //! The router fans `vendor`/`revert` out per detected flavor. Every flavor
 //! has a real backend: package-lock ([`super::npm_lock`]), yarn classic
 //! ([`super::yarn_classic_lock`]), yarn berry ([`super::yarn_berry_lock`]),
-//! pnpm ([`super::pnpm_lock`], legacy [`super::pnpm_lock_legacy`]), bun ([`super::bun_lock`]) and vlt
+//! pnpm ([`super::pnpm_lock`]), bun ([`super::bun_lock`]) and vlt
 //! ([`super::vlt_lock`]); a lockfile the probe can't classify refuses with
 //! a stable code. Reverts fail CLOSED on a flavor this build has no
 //! backend for — never guess at another flavor's wiring records.
@@ -138,9 +138,8 @@ pub(super) fn project_root_location(project_root: &Path) -> String {
 /// 4. `pnpm-lock.yaml` → head-sniff `lockfileVersion`: `'9.0'` → Pnpm;
 ///    `5.4`/`'6.0'` (pnpm 7/8) → PnpmLegacy; anything else → Err
 ///    `vendor_lockfile_version_unsupported` (version-aware remedy);
-/// 5. `yarn.lock` → head-sniff: column-0 `__metadata:` → YarnBerry
-///    (node-modules linker; PnP was already refused in step 1);
-///    `# yarn lockfile v1` → YarnClassic;
+/// 5. `yarn.lock` → head-sniff: column-0 `__metadata:` → Err
+///    `vendor_yarn_berry_unsupported`; `# yarn lockfile v1` → YarnClassic;
 ///    neither → Err `vendor_lockfile_version_unsupported`;
 /// 6. `npm-shrinkwrap.json` | `package-lock.json` → PackageLock;
 /// 7. nothing recognized, but `rush.json` present → Err
@@ -350,8 +349,8 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static
 
 /// Vendor one npm package through whichever lockfile-flavor backend serves
 /// this project (package-lock / yarn classic / yarn berry node-modules /
-/// pnpm / pnpm legacy / bun / vlt). Probe refusals (PnP, unsupported lock
-/// versions) surface verbatim; the detected flavor is stamped onto the ledger entry so
+/// pnpm / bun). Probe refusals (PnP, unsupported lock versions)
+/// surface verbatim; the detected flavor is stamped onto the ledger entry so
 /// `revert_npm_any` routes back to the same backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_npm_any<'a>(
@@ -377,7 +376,7 @@ pub async fn vendor_npm_any<'a>(
         };
     }
     // Every backend takes the identical 9-argument tuple; the macro collapses
-    // the seven-way repetition (same shape as the CLI dispatcher's `vend!`).
+    // the five-way repetition (same shape as the CLI dispatcher's `vend!`).
     macro_rules! vend {
         ($backend:path) => {
             $backend(
@@ -670,8 +669,8 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
 /// the textual backends' unwired-revert guard
 /// ([`super::npm_lock::guard_unwired_textual_revert`]).
 ///
-/// It never stops at the first readable name (npm <= 11's shrinkwrap-wins
-/// rule): npm 12 installs from package-lock.json beside a committed
+/// It used to stop at the FIRST readable name (npm <= 11's shrinkwrap-wins
+/// rule), but npm 12 installs from package-lock.json beside a committed
 /// npm-shrinkwrap.json, so a mention in either lock can be the one an
 /// install resolves through.
 pub(super) async fn lock_text_mentions_uuid(
@@ -1079,7 +1078,7 @@ mod tests {
         let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
 
-        // A berry (node-modules) lock routes to the YarnBerry backend
+        // A berry (node-modules) lock now routes to the YarnBerry backend
         // (cache-zip checksum is reproducible from our tarball — berry_zip).
         // Only PnP (`.pnp.*` markers, caught earlier) stays refused.
         let tmp = tempfile::tempdir().unwrap();
@@ -1465,8 +1464,9 @@ mod tests {
 
     /// The PackageLock arm: the router runs the npm_lock backend and stamps
     /// the ledger entry's flavor. (Every OTHER known lockfile outranks
-    /// package-lock in the decision table, so the PackageLock arm never
-    /// carries probe warnings; the merge matters for the other arms.)
+    /// package-lock in the decision table, so the PackageLock arm can never
+    /// carry probe warnings today — the merge matters once the yarn/pnpm/bun
+    /// arms become real backends.)
     #[tokio::test]
     async fn package_lock_arm_stamps_flavor_on_the_ledger_entry() {
         let (tmp, record) = npm_project().await;
@@ -1493,8 +1493,9 @@ mod tests {
         )));
     }
 
-    /// A yarn.lock ROUTES to the yarn-classic backend. With a header-only
-    /// lock that has no matching block, the backend's own `vendor_lock_entry_not_found`
+    /// A yarn.lock now ROUTES to the yarn-classic backend (no longer the old
+    /// `vendor_pkg_manager_unsupported` gate). With a header-only lock that
+    /// has no matching block, the backend's own `vendor_lock_entry_not_found`
     /// proves the dispatch reached it — and nothing is written.
     #[tokio::test]
     async fn yarn_lock_routes_to_the_backend_not_the_old_gate() {
@@ -1522,9 +1523,9 @@ mod tests {
     /// The router's documented contract: backend format errors and probe
     /// refusals (unsupported versions, missing locks) surface VERBATIM through
     /// `vendor_npm_any` — same code, same detail, nothing remapped — and a
-    /// refusal writes nothing. (The bare `bun.lockb` case is a backend
-    /// format error from the native parser after a successful probe; the
-    /// missing-lock case exercises the probe-refusal arm itself.)
+    /// refusal writes nothing. (The one other Refused-outcome test gets its
+    /// refusal from a backend AFTER a successful probe; this one exercises
+    /// the probe-refusal arm itself.)
     #[tokio::test]
     async fn router_surfaces_probe_refusals_verbatim() {
         let (tmp, record) = npm_project().await;
@@ -1648,8 +1649,7 @@ mod tests {
         touch(tmp.path(), "package-lock.json", "{\"packages\":{}}").await;
         assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
 
-        // A mention in either npm lock counts (npm <= 11 installs from the
-        // shrinkwrap, npm 12 from package-lock.json).
+        // shrinkwrap wins over package-lock (same precedence as vendoring).
         touch(
             tmp.path(),
             "npm-shrinkwrap.json",
@@ -1846,7 +1846,7 @@ mod tests {
     /// in-use probe behind scan's GC and the textual backends' unwired-revert
     /// guard, forever in an `open(2)` waiting for a writer that never comes.
     /// Same `open_regular_file` guard class as the vendor siblings
-    /// (lock_inventory/, cargo_lock.rs, gem.rs). The probe stays
+    /// (lock_inventory.rs, cargo_lock.rs, gem.rs). The probe stays
     /// fail-closed (`vendor_lockfile_missing` names the unreadable file); the
     /// in-use probe stays fail-safe (`None` = keep the entry).
     #[cfg(unix)]

@@ -1731,7 +1731,7 @@ fn cargo_hosted_and_vendored_in_one_project_attest_together() {
     );
 }
 
-/// Embedded `scan --vex` (a bare scan, which runs hosted mode) on the manifest-less, ledger-less
+/// Embedded `scan --vex` (read-only scan) on the manifest-less, ledger-less
 /// mixed project: the scan attests the same patches standalone `vex` does
 /// and folds the summary into its envelope; an API that serves no view
 /// fails the requested VEX (and removes a stale document).

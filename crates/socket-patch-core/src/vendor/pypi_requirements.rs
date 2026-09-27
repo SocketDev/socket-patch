@@ -535,8 +535,8 @@ async fn plan_requirements(
 
     if !rewrote_any {
         // Transitive: append a managed line at the ROOT file's EOF. pip
-        // treats it as one more requirement and the resolver folds it into
-        // the graph.
+        // treats it as one more requirement; the resolver folds it into the
+        // graph exactly like the spike's mixed-requirements run.
         let root_file = files
             .first()
             .expect("collect_requirements_files always yields the root file first");
@@ -1321,11 +1321,12 @@ mod tests {
 
     // ── revert edge cases ────────────────────────────────────────────────
 
-    /// SECURITY: a poisoned state.json wiring record naming a
+    /// SECURITY regression: a poisoned state.json wiring record naming a
     /// `..`/absolute `file` must never make `--revert` read or rewrite a file
     /// outside the project root — the record is skipped with a warning and
-    /// the out-of-tree target stays byte-identical (joining `rec.file`
-    /// unvalidated would be an arbitrary content-injection write).
+    /// the out-of-tree target stays byte-identical. (Found by adversarial
+    /// review: revert previously joined `rec.file` unvalidated, an arbitrary
+    /// content-injection write.)
     #[tokio::test]
     async fn revert_refuses_unsafe_wiring_file_paths() {
         let outer = tempfile::tempdir().unwrap();

@@ -397,8 +397,10 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
-    // summary.applied / the event action are pinned by
-    // `go_vendor_reports_applied_event` below.
+    // NOTE: summary.applied / the event action are pinned in the
+    // `go_vendor_reports_applied_event` below — successful golang vendors
+    // are currently misreported as skipped/`vendored` (shared
+    // result_to_event bug). The wiring/build proofs here are unaffected.
 
     // The replace directive points at the uuid copy, with the mandatory
     // `./` prefix (a bare path fails go.mod parsing — spike claim 6).
@@ -582,9 +584,8 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
 /// advisory-selector path must land the SAME committed vendor shape — but
 /// with the patch record served over the wire (wiremock `view/{uuid}` with
 /// the suite's real hashes + inline blobContent) instead of `write_patch`'s
-/// local manifest+blobs seed. The download phase writes nothing under
-/// `.socket/` (NO manifest, NO blobs — content stays in memory, scan
-/// parity; the ledger's detached entry is the record), the vendor
+/// local manifest+blobs seed. The download phase writes ONLY the manifest
+/// (NO `.socket/blobs` — content stays in memory, scan parity), the vendor
 /// step builds the artifact locally (`--vendor-source build`) from the
 /// installed module, and the fresh-checkout proof builds the PATCHED module
 /// fully offline. The revert half stays the vendor capstone's job.
@@ -1002,9 +1003,9 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
 /// Correct-behavior pin for the vendor envelope: a successful first-time
 /// golang vendor must surface as an `applied` event with
 /// `summary.applied == 1` (CLI_CONTRACT.md: vendor events are `Applied`
-/// (= vendored)). Regression guard: `result_to_event` must match only the
-/// exact `VENDOR_OWNED_MARKER` sentinel, not a `.socket/vendor/` copy-dir
-/// package_path (see `cargo_vendor_reports_applied_event`).
+/// (= vendored)). See `cargo_vendor_reports_applied_event` in
+/// `e2e_vendor_cargo_build.rs` for the root cause (shared `result_to_event`
+/// misroutes results whose package_path is the `.socket/vendor/` copy dir).
 #[test]
 fn go_vendor_reports_applied_event() {
     if !golang_e2e_matrix::toolchain_ready("e2e_vendor_golang_build") {

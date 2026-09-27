@@ -39,8 +39,8 @@
 //! **Cost:** a filled slot holds a parsed document AND a copy of the bytes
 //! it came from, in a `static`, until a write drops it or the process
 //! exits — and a parsed document is itself several times its own source
-//! text. Measured on a 2.5 MB `composer.lock`, the memo adds
-//! +3 MB of peak RSS on an idempotent re-run and +15-21 MB on the
+//! text. Measured against the pre-memo build on a 2.5 MB `composer.lock`,
+//! peak RSS moved by +3 MB on an idempotent re-run and +15-21 MB on the
 //! fresh and revert paths, so the sites whose file runs to megabytes
 //! (uv.lock, a package-lock.json, the vendor ledger) are the ones that
 //! decide a run's peak. Keying a slot on an `Arc<[u8]>` the reader already

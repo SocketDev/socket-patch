@@ -2,17 +2,19 @@
 //!
 //! The fresh-clone case: `.socket/vendor/` and the wired lockfile are
 //! committed, the package itself is not installed (no `bundle install`, no
-//! venv, an empty module/registry cache). The pristine-source ladder must
-//! not download the pristine artifact before the backend's in-sync check —
-//! the backend never reads that tree on this path, and with no network the
-//! download (and so the run) would fail for every already-vendored pypi,
-//! cargo, go and lockfile-only gem package.
+//! venv, an empty module/registry cache). The missing purl used to go
+//! through the pristine-source ladder BEFORE the backend's in-sync check —
+//! recovering the pre-vendor registry resolution from the ledger and
+//! downloading the pristine artifact just to hand the backend a tree it
+//! never reads on that path. With no network the download failed and so
+//! did the run, for every already-vendored pypi, cargo, go and
+//! lockfile-only gem package.
 //!
-//! The ladder defers that download to the backend branch that reads
+//! The ladder now defers that download to the backend branch that reads
 //! the tree, for a purl whose ledger entry records the record's patch uuid
 //! and whose committed artifact is on disk. The backend's hot path answers
 //! from the committed bytes, so the re-run is green (`already_vendored`),
-//! makes no registry request, and reports no
+//! makes no registry request, and no longer reports a
 //! `vendor_fetched_missing` fetch it did not need — both with the registry
 //! unreachable and under `--offline`.
 //!
@@ -233,7 +235,7 @@ fn write_six_project(root: &Path, uuid: &str) {
     const ORIG: &[u8] = b"# six\nVERSION = '1.16.0'\n";
     const PATCHED: &[u8] = b"# six\nVERSION = '1.16.0'\nSAFE = True\n";
     // A hash-pinned requirement: the ledger-recovered pre-vendor line is
-    // then fetchable, so an eager ladder would really go to the registry.
+    // then fetchable, so the old ladder really went to the registry.
     std::fs::write(
         root.join("requirements.txt"),
         format!("six==1.16.0 --hash=sha256:{}\n", "a".repeat(64)),
@@ -418,7 +420,7 @@ fn golang_rerun_without_network_is_in_sync() {
         format!("module example.com/app\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
     )
     .unwrap();
-    // A verifiable go.sum pin: an eager ladder would fetch it from GOPROXY.
+    // A verifiable go.sum pin: the old ladder fetched it from GOPROXY.
     std::fs::write(
         root.join("go.sum"),
         format!(
@@ -1054,8 +1056,8 @@ async fn cargo_rerun_over_a_drifted_copy_reports_the_deferred_fetch_first() {
 /// (a peer-suffixed snapshot key it cannot rewire) is never fetched: the
 /// pristine download is deferred to the backend, which refuses before it
 /// reads anything, so the run makes no registry request and reports the
-/// real reason (an eager fetch would fail first with `vendor_fetch_failed`
-/// and hide it).
+/// real reason. With the registry unreachable, the old eager fetch failed
+/// first (`vendor_fetch_failed`) and hid it.
 #[test]
 fn a_lockfile_only_package_refused_on_lock_text_is_never_fetched() {
     const UUID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";

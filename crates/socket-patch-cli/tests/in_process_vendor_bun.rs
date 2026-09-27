@@ -4,7 +4,7 @@
 //! vendored`, their `--dry-run` previews, `--silent`, and the agent
 //! `--save-only` exemption — driven through the built binary against a
 //! wiremock patch API, on lockfiles written in the grammar REAL bun
-//! releases emit (captured in the bun compatibility matrix and from a
+//! releases emit (captured in the PR #245 compatibility matrix and from a
 //! bun 1.1.45 `--save-text-lockfile` run):
 //!
 //! * lockfileVersion 1 (bun 1.2.x–1.3.x) / 2 (bun 1.4.x) workspace locks:
@@ -572,10 +572,12 @@ async fn scan_vendored_refusal_preserves_seeded_manifest_record() {
 // scan --mode vendored --detached: the same refusal, BEFORE any fetch
 // ---------------------------------------------------------------------------
 
-/// Every vendored download phase (with or without the no-op `--detached`)
-/// refuses pre-fetch with the vendor code — never fetching the view and
-/// deferring the refusal to the vendor engine (which degrades to
-/// `package_not_installed` for alias installs) — and writes no manifest.
+/// The detached download phase used to skip the preflight: the patch view
+/// was fetched (`download.downloaded: 1`) and the refusal only surfaced
+/// from the vendor engine afterwards (degrading to `package_not_installed`
+/// for alias installs). Now it refuses exactly like the manifest-tracked
+/// phase — pre-fetch, with the vendor code — and, being detached, writes
+/// no manifest at all.
 #[tokio::test]
 async fn scan_vendored_detached_refuses_v1_workspace_before_fetch() {
     let mock = MockServer::start().await;
@@ -1159,8 +1161,9 @@ async fn preserved_ledger_does_not_bypass_bun_refusal_after_rollback() {
 /// The download phase must NOT refuse a purl the ledger already wires at
 /// the selected uuid: the re-run classifies it `skipped` (the ledger's
 /// embedded record is reused) exactly as on a non-Bun project, instead of
-/// `failed`. Pinned independently of the vendor step (see the next test) so
-/// a regression in the CLI half fails on its own.
+/// `failed`. Pinned
+/// independently of the vendor step below so the CLI half of the
+/// exemption is guarded even while the engine half lands separately.
 #[tokio::test]
 async fn already_vendored_v1_workspace_rerun_download_phase_is_skipped_not_refused() {
     let mock = MockServer::start().await;

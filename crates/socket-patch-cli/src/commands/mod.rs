@@ -69,9 +69,7 @@ pub(crate) async fn discover_wiring(
 /// from `load_redirect_state`'s contract — the warning is advisory
 /// (muted by `--silent`, "errors only"), because every path that would
 /// WRITE or ATTEST from the ledger hard-errors on the same corruption
-/// instead. Used by scan's empty-discovery `redirectState` consult; the
-/// main-path consult inlines the same posture so it can flush telemetry
-/// before the warning.
+/// instead. Shared by both of scan's read-only consults.
 pub(crate) async fn load_redirect_state_lenient(
     cwd: &Path,
     silent: bool,

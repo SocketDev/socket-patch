@@ -2,7 +2,7 @@
 //! ([`ProjectView::Disk`]) or an in-memory file map
 //! ([`ProjectView::Memory`]) handed in by a host that never materializes
 //! the repository (the hosted in-memory engine). The disk variant calls the
-//! plain FIFO-safe filesystem readers.
+//! exact readers the views always used, so on-disk behavior is unchanged.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;

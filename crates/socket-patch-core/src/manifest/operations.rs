@@ -288,7 +288,7 @@ mod tests {
     }
 
     /// Deserializing straight into the struct rejects a REPEATED struct field
-    /// (a `Value` round-trip would silently keep the last value). A
+    /// (the old `Value` round-trip silently kept the last value). A
     /// hand-edited manifest with two `uuid` keys in one record is malformed
     /// and classified as a data error. The fixture is a raw string on purpose:
     /// `json!` would collapse the duplicate before the parser ever saw it.

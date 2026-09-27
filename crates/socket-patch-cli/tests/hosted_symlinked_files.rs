@@ -1,7 +1,7 @@
 //! `scan --mode hosted` against project files that are NOT plain regular
 //! files: symbolic links and FIFOs.
 //!
-//! Policy: symlinked project files are DISCOVERED (the
+//! Policy (PR #239 review): symlinked project files are DISCOVERED (the
 //! Python lock discovery follows links) but never REWRITTEN in place — every
 //! writer stages a replacement next to the path and renames over it, which
 //! replaces the link with a detached regular copy, leaves the link target

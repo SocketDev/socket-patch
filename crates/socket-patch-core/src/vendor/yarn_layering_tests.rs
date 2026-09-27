@@ -11,12 +11,12 @@
 //!    resolve) stay byte-identical, no `patch:` protocol string is ever
 //!    introduced, and the crate's own lockfile parser still reads the file;
 //! 2. the rewritten block's `#<sha1>` fragment and `integrity` SRI match the
-//!    actual vendored blob bytes;
+//!    actual vendored blob bytes (the chain the forensics verified 48/48);
 //! 3. hosted-over-vendored layering records the vendored blocks as its
 //!    `original`s (data-level reversibility) — and `vendor --revert` after
 //!    that overlay is drift-skipped AND keeps the blob dir + surfaces the
-//!    keep (deleting the blob while the lock stays hosted would strand the
-//!    redirect ledger's recorded `original`s);
+//!    keep (residual #131 fixed: deleting the blob while the lock stayed
+//!    hosted stranded the redirect ledger's recorded `original`s);
 //! 4. yarn berry locks containing builtin `patch:` resolution entries pass
 //!    through both the vendor backend and the hosted redirect rewriter with
 //!    those entries byte-identical — even when the redirected package IS the
@@ -364,8 +364,9 @@ async fn classic_vendor_rewrites_only_target_block_and_stays_parseable() {
     );
 }
 
-/// Incident guard 2: the rewritten block's `resolved` keeps the
-/// `<url>#<sha1>` shape where the sha1 fragment and the `integrity` sha512 SRI are recomputed
+/// Incident guard 2 (the chain the forensics verified 48/48 on the strapi
+/// tree): the rewritten block's `resolved` keeps the `<url>#<sha1>` shape
+/// where the sha1 fragment and the `integrity` sha512 SRI are recomputed
 /// from the ACTUAL vendored blob bytes, and the ledger's artifact.sha256
 /// matches the same bytes.
 ///
@@ -405,7 +406,7 @@ async fn classic_rewritten_block_hashes_match_vendored_blob_bytes() {
 /// Incident guard 3, forward direction (exactly what the strapi user did):
 /// a hosted redirect layered over vendored wiring records the VENDORED
 /// block as its `original` (redirect edit.original == vendor wiring.new —
-/// the cross-ledger invariant), produces hosted
+/// the cross-ledger invariant the forensics checked 48/48), produces hosted
 /// URLs, leaves every other block byte-identical, introduces no `patch:`
 /// string, is idempotent, and its recorded originals are sufficient data to
 /// restore the vendored lock byte-exactly.
@@ -487,16 +488,19 @@ async fn classic_hosted_redirect_layers_over_vendored_wiring() {
     assert!(again.edits.is_empty(), "{:?}", again.edits);
 }
 
-/// Incident guard 3, reverse direction — the drift-skip KEEP contract:
-/// `vendor --revert` after a hosted overlay finds
+/// Incident guard 3, reverse direction — the drift-skip KEEP contract
+/// (residual #131, fixed): `vendor --revert` after a hosted overlay finds
 /// every block re-resolved (the hosted URL fails the
 /// `.socket/vendor/npm/<uuid>` ownership gate), warns
 /// `vendor_lock_entry_drifted`, leaves the lock byte-identical at the
 /// hosted URLs — and KEEPS the blob dir, surfacing the keep honestly
 /// (`vendor_artifact_kept`). The blob is the only surviving copy of what
 /// the redirect ledger's recorded `original` (`file:` fragment) points at:
-/// deleting it while claiming success would plant a dangling replay hazard
-/// and destroy the pre-vendor originals a later restore needs.
+/// deleting it while claiming success planted a dangling replay hazard and
+/// destroyed the pre-vendor originals a later restore needs.
+///
+/// This test previously PINNED the lossy behavior (blob deleted); it was
+/// flipped when the drift-skip keep shipped.
 #[tokio::test]
 async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_keeps_blob() {
     let fx = classic_fx(CLASSIC_BEFORE);
@@ -534,7 +538,7 @@ async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_keeps_b
         hosted_text,
         "drift-skip must leave the hosted lock untouched"
     );
-    // 4. the blob dir SURVIVES — "left alone" holds end-to-end.
+    // 4. the blob dir SURVIVES — "left alone" now holds end-to-end.
     assert!(
         fx.tgz_path().exists(),
         "drift-skip must keep the blob: it is the only copy the redirect \
@@ -579,7 +583,7 @@ async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_keeps_b
 /// the block back to `file:` but records the HOSTED block as the wiring
 /// `original` (`block_points_into_vendor` is false for https URLs), so a
 /// subsequent revert restores the hosted block exactly — never a fabricated
-/// registry URL.
+/// registry URL. Pins the provenance-supersession the forensics traced.
 ///
 /// RED-verified: asserting original == the registry block fails; asserting
 /// revert lands on registry URLs fails.
@@ -988,7 +992,7 @@ async fn berry_hosted_redirect_leaves_builtin_patch_entries_untouched() {
 /// and the builtin `resolve@patch:...#builtin<compat/resolve>` entry at the
 /// same version) rewrites ONLY the npm: entry and leaves the builtin
 /// `patch:` block byte-identical, warning about the block it refused to
-/// touch. Without the protocol gate the rewriter would splice an
+/// touch. Without the protocol gate the rewriter spliced an
 /// `npm:...::__archiveUrl=` resolution under the still-`patch:` key — a
 /// corrupted key/resolution protocol mismatch in the incident's exact error
 /// family, emitted as a silent second edit.

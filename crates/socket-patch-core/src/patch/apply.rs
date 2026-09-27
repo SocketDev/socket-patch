@@ -87,7 +87,8 @@ impl AppliedVia {
 /// Patch sources the apply pipeline may use to obtain patched bytes.
 ///
 /// `blobs_path` is always required and serves as the universal fallback.
-/// `packages_path` and `diffs_path` are optional opt-ins.
+/// `packages_path` and `diffs_path` are optional opt-ins to the new
+/// pathways introduced in socket-patch 2.2.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchSources<'a> {
     pub blobs_path: &'a Path,
@@ -142,6 +143,9 @@ pub struct ApplyResult {
     pub sidecar: Option<crate::patch::sidecars::SidecarRecord>,
 }
 
+/// Normalize file path by removing the "package/" prefix if present.
+/// Patch files come from the API with paths like "package/lib/file.js"
+/// but we need relative paths like "lib/file.js" for the actual package directory.
 /// A patch's files in file-name order: the verify and write loops walk
 /// this, not the `HashMap`, so the file named in a "Cannot apply patch"
 /// error (the first one that fails) and every per-file list are the same
@@ -154,9 +158,6 @@ pub(crate) fn files_in_order(
     ordered
 }
 
-/// Normalize file path by removing the "package/" prefix if present.
-/// Patch files come from the API with paths like "package/lib/file.js"
-/// but we need relative paths like "lib/file.js" for the actual package directory.
 pub(crate) fn normalize_file_path(file_name: &str) -> &str {
     const PACKAGE_PREFIX: &str = "package/";
     if let Some(stripped) = file_name.strip_prefix(PACKAGE_PREFIX) {
@@ -392,10 +393,11 @@ pub async fn select_installed_variants(
 /// files must look identical to pre-patch perms-wise):
 ///
 /// 1. **Existing file**. Snapshot mode + owner + group before writing.
-///    The patched bytes land on a fresh inode (stage + rename), so a
-///    read-only target needs no write grant; only a read-only parent
-///    directory is relaxed for the write. After the rename, chown back
-///    to the pre-patch uid/gid, then restore the **exact** original mode.
+///    If the file is read-only, temporarily grant owner-write so the
+///    overwrite succeeds (e.g. Go's module cache marks sources read-only).
+///    After the write, restore the **exact** original mode and chown
+///    back to the pre-patch uid/gid. Owners stay put even when
+///    `tokio::fs::write` truncates and rewrites.
 ///
 /// 2. **New file** (created by the patch). Inherit owner + group from
 ///    the parent directory and force mode `0o444` (read-only for all).
@@ -440,8 +442,10 @@ pub(crate) async fn apply_file_patch_at(
     }
     let filepath = pkg_path.join(normalized);
 
-    // Hash-check the in-memory content BEFORE touching disk: a corrupt
-    // upstream blob errors out before any disk write.
+    // Hash-check the in-memory content BEFORE touching disk. Removes
+    // the prior "wrote bytes, then post-write verify failed, can't
+    // restore" failure mode — if the upstream blob is corrupt we
+    // error out before any disk write.
     let content_hash = compute_git_sha256_from_bytes(patched_content);
     if content_hash != expected_hash {
         return Err(std::io::Error::new(
@@ -675,8 +679,8 @@ async fn restore_file_permissions(
     {
         match pre_patch {
             Some(meta) => {
-                // Re-apply the pre-patch readonly state: the rename
-                // installed a fresh file that does not carry it.
+                // Re-apply the pre-patch readonly state; tokio::fs::write
+                // does not preserve it across the truncate+rewrite.
                 let perms = meta.permissions();
                 tokio::fs::set_permissions(filepath, perms).await?;
             }
@@ -725,7 +729,7 @@ async fn chown_blocking(
 /// `uuid` is the patch UUID. Pass `Some` to enable package- and
 /// diff-archive lookup (the corresponding `sources.packages_path` /
 /// `sources.diffs_path` must also be set). Pass `None` to restrict the
-/// pipeline to per-file blobs only.
+/// pipeline to per-file blobs only — equivalent to pre-2.2 behavior.
 ///
 /// For npm packages, one on-disk `pkg_path` is not necessarily the only
 /// physical home of `package@version`: pnpm and vlt materialize a separate
@@ -1225,7 +1229,7 @@ mod tests {
         for bad in ["\\\\server\\share\\x", "C:\\Windows\\x"] {
             assert!(!is_safe_relative_subpath(bad), "should reject {bad:?}");
         }
-        // The `package/`-prefixed escape:
+        // The `package/`-prefixed escape that previously slipped through:
         // `package//etc/passwd` normalizes to `/etc/passwd`.
         assert!(!is_safe_relative_subpath(normalize_file_path(
             "package//etc/passwd"
@@ -1436,9 +1440,9 @@ mod tests {
         assert_eq!(tokio::fs::read(&store).await.unwrap(), b"original");
     }
 
-    /// Existing read-only file: the patched bytes replace it via stage +
-    /// rename and its 0o444 mode is restored bit-for-bit. Mirrors the Go
-    /// module cache scenario.
+    /// Existing read-only file: temporarily made writable for the
+    /// overwrite, restored to read-only afterward, content updated.
+    /// Mirrors the Go module cache scenario.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_apply_file_patch_preserves_readonly_mode() {
@@ -1575,6 +1579,8 @@ mod tests {
     /// 0o444 AND directories 0o555). The stage+rename write path needs
     /// owner-write on the directory; `apply_file_patch_at` must grant it for
     /// the write and then restore the directory to its exact prior mode.
+    /// Regression: before the `DirWriteGuard` fix the stage-file creation
+    /// failed with EACCES and the patch could not be applied at all.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_apply_file_patch_in_readonly_dir() {
@@ -1684,7 +1690,8 @@ mod tests {
 
     /// setuid/setgid bits survive the patch round-trip. `chown(2)` strips
     /// these bits even when the uid/gid are unchanged, so the restore
-    /// must chown BEFORE it chmods.
+    /// must chown BEFORE it chmods. Regression: the prior chmod-then-chown
+    /// order silently dropped the setuid bit on every patched file.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_apply_file_patch_preserves_setuid_bit() {
@@ -1951,7 +1958,7 @@ mod tests {
     /// beforeHash mismatch across the three policies: the DEFAULT (Warn)
     /// overwrites with the verified patched content and keeps the
     /// promoted warning signature (`Ready` + `expected_hash: Some` +
-    /// differing `current_hash`); `Strict` is a hard error; `Force`
+    /// differing `current_hash`); `Strict` is the old hard error; `Force`
     /// behaves like Warn (its extra tolerance is missing files).
     #[tokio::test]
     async fn test_apply_package_patch_hash_mismatch_policies() {
@@ -2005,7 +2012,7 @@ mod tests {
             assert_eq!(written, patched, "{policy:?}");
         }
 
-        // Strict: fail-closed, file untouched.
+        // Strict: the old fail-closed behavior, file untouched.
         tokio::fs::write(pkg_dir.path().join("index.js"), divergent)
             .await
             .unwrap();
@@ -2134,7 +2141,7 @@ mod tests {
 
     // ── Fallback-chain tests ─────────────────────────────────────────
     //
-    // Tests below exercise the archive strategies:
+    // Tests below exercise the new strategies introduced in 2.2:
     // package archive (.socket/packages/<uuid>.tar.gz) and per-file diff
     // archive (.socket/diffs/<uuid>.tar.gz), plus the priority order
     // package → diff → blob.
@@ -2338,7 +2345,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_uuid_none_disables_alt_sources() {
         // Even if archives exist, passing `uuid = None` must restrict the
-        // pipeline to the blob path.
+        // pipeline to the blob path — preserving pre-2.2 behavior.
         let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, _patched) =
             make_fixture().await;
 
@@ -2477,8 +2484,10 @@ mod tests {
 
     /// New file in a NEW subdirectory inside a read-only package
     /// directory. Go's module cache marks directories 0o555; a patch that
-    /// adds a file under a not-yet-existing subdir must still apply, and
-    /// the directory's mode must be restored afterward.
+    /// adds a file under a not-yet-existing subdir must still apply.
+    /// Regression: `create_dir_all` ran before any directory-permission
+    /// relaxation, so the mkdir failed with EACCES and the patch could not
+    /// be applied at all. The directory's mode must be restored afterward.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_apply_file_patch_new_file_in_new_subdir_of_readonly_dir() {
@@ -2581,9 +2590,13 @@ mod tests {
     /// against a file that can actually discriminate between
     /// distributions. A NEW file (empty `beforeHash`) verifies Ready
     /// against ANY environment, so it must never be the basis for
-    /// selecting a variant, whatever the `HashMap` iteration order. The
-    /// loop re-builds the maps each round so the randomized iteration
-    /// order is exercised.
+    /// selecting a variant. Regression: the representative file was taken
+    /// via `HashMap::iter().next()`, whose order is randomized per map
+    /// instance — whenever the new file came up first, a variant
+    /// describing a different, NOT-installed distribution matched, and
+    /// the result flipped between runs (wrong-variant rollback attempts,
+    /// wrong variants kept by `get`). The loop re-builds the maps each
+    /// round so the randomized iteration order is exercised.
     #[tokio::test]
     async fn test_select_installed_variants_new_file_never_drives_selection() {
         let dir = tempfile::tempdir().unwrap();
@@ -2679,7 +2692,7 @@ mod tests {
         assert!(sources.diffs_path.is_none());
     }
 
-    /// Retried partial apply must not wedge cargo: a previous apply
+    /// Regression (retried partial apply wedges cargo): a previous apply
     /// that failed partway (e.g. a missing blob for the second file) left
     /// the first file PATCHED on disk but returned before the sidecar
     /// boundary, so `.cargo-checksum.json` still carries that file's
@@ -3278,8 +3291,9 @@ mod tests {
     // ── hygiene / hardening pins ─────────────────────────────────────
 
     /// A manifest key whose parent component is a regular FILE: the open
-    /// fails ENOTDIR (Windows: path-not-found), which must read as a
-    /// missing file — "File not found" for a pre-existing entry, `Ready` for a new-file entry (the write then fails in mkdir).
+    /// fails ENOTDIR (Windows: path-not-found), which must read exactly like
+    /// the old `metadata` probe did — "File not found" for a pre-existing
+    /// entry, `Ready` for a new-file entry (the write then fails in mkdir).
     #[tokio::test]
     async fn test_verify_file_patch_parent_is_regular_file_reports_not_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -3304,10 +3318,10 @@ mod tests {
     }
 
     /// SECURITY: `afterHash` is joined onto the blobs directory. A committed
-    /// manifest carrying `afterHash: "../outside"` must not make apply read
+    /// manifest carrying `afterHash: "../outside"` used to make apply read
     /// the out-of-tree file and echo its content hash back in the mismatch
-    /// error (an oracle): the disk-blob read refuses anything that is not a
-    /// 64-hex blob hash before any path is built.
+    /// error (an oracle). The disk-blob read now refuses anything that is
+    /// not a 64-hex blob hash before any path is built.
     #[tokio::test]
     async fn test_apply_package_patch_refuses_invalid_blob_hash() {
         let root = tempfile::tempdir().unwrap();
@@ -3460,9 +3474,10 @@ mod tests {
         assert_eq!(written, patched);
     }
 
-    /// A write failure under the archive strategy must surface as itself,
-    /// not be swallowed as "not applicable" and reported as the blob
-    /// fallback's `Failed to read blob …: No such file`.
+    /// A write failure under the archive strategy used to be swallowed as
+    /// "not applicable" and the pipeline fell through to the blob, so the
+    /// user saw `Failed to read blob …: No such file` while the real
+    /// failure was the write. The write error must surface as itself.
     /// `chflags uchg` on the package dir is the unprivileged deterministic
     /// route to a stage-creation failure (the guard defeats 0o555).
     #[cfg(target_os = "macos")]

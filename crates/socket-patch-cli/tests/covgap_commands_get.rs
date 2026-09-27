@@ -1,8 +1,8 @@
-//! Coverage-gap tests for `commands/get.rs`.
+//! Coverage-gap tests for `commands/get.rs` (coverage audit 2026-09).
 //!
-//! Targets otherwise-untested branches: `run()`'s flag/package-path
+//! Targets the audited never-executed branches: `run()`'s flag/package-path
 //! edges, the `save_patch_record` failure ladder on the uuid path, the
-//! `download_and_apply_patches_with` engine failure branches, the release-variant
+//! `download_and_apply_patches` engine failure branches, the release-variant
 //! narrowing fallbacks (fabricated PyPI venv — no real python needed), the
 //! search-path `--mode vendored` flow, the vendor-step error arms, and every
 //! human-mode (non `--json`) output path the existing suites left to
@@ -105,7 +105,7 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
         save_only: true,
         one_off: false,
         all_releases: false,
-        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
+        mode: None,
     }
 }
 
@@ -132,10 +132,15 @@ async fn mount_view_files(server: &MockServer, uuid: &str, purl: &str, files: se
         .await;
 }
 
+/// `view/{uuid}` served exactly ONCE: the get's own fetch succeeds, and the
+/// vendor step's in-memory staging — which fetches the view again — then
+/// 404s, tripping the `no_local_source` staging refusal.
 /// A view whose files carry hashes but NO `blobContent`: the download
 /// phase records it fine (hashes only), but the vendor step has nothing to
 /// stage from — not in the download phase's blob seed, not on disk, and not
-/// from the view it re-fetches — so it dies `no_local_source`.
+/// from the view it re-fetches — so it dies `no_local_source`. (Serving a
+/// good view exactly once no longer produces that: the step stages from
+/// the seed and never fetches the view a second time.)
 async fn mount_contentless_view(server: &MockServer, uuid: &str, purl: &str) {
     let mut files = good_files();
     files["package/index.js"]
@@ -439,10 +444,6 @@ async fn mount_ghsa_fanout(server: &MockServer) {
 fn run_get_bin(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec!["get"];
     args.extend_from_slice(extra);
-    // v5 `get` defaults to hosted; these fixtures drive agent mode.
-    if !extra.contains(&"--mode") {
-        args.extend_from_slice(&["--mode", "agent"]);
-    }
     args.extend_from_slice(&[
         "--api-url",
         api_url,
@@ -472,7 +473,9 @@ fn parse_single_json_doc(stdout: &str) -> serde_json::Value {
 // ===========================================================================
 
 /// Two identifier type flags together must be rejected up front: exit 1,
-/// nothing fetched, nothing written (the `type_flags > 1` guard).
+/// nothing fetched, nothing written. This branch (line-level: the
+/// `type_flags > 1` guard) had never executed — every caller passes at most
+/// one flag.
 #[tokio::test]
 #[serial]
 async fn get_conflicting_type_flags_rejected_before_any_network() {
@@ -1797,9 +1800,9 @@ async fn human_uuid_not_found_prints_message() {
     assert_no_manifest(tmp.path());
 }
 
-/// Human CVE search with no results: the per-type not-found message prints
-/// on stdout, while the transient `Searching patches for …` status line
-/// never reaches a pipe.
+/// Human CVE search with no results: both the search label and the
+/// per-type not-found message (the `IdentifierType` Display impl's only
+/// consumer) must print.
 #[tokio::test]
 async fn human_cve_search_empty_prints_search_label_and_not_found() {
     let server = MockServer::start().await;
@@ -2998,8 +3001,6 @@ async fn agent_dry_run_previews_only_the_installed_release_variant() {
         &[
             "get",
             GHSA,
-            "--mode",
-            "agent",
             "--dry-run",
             "--json",
             "--api-url",

@@ -266,11 +266,10 @@ async fn find_site_packages_under(
 ///
 /// Checks (in order):
 /// 1. `VIRTUAL_ENV` environment variable
-/// 2. `.venv` and `venv` directories in `cwd`
-/// 3. Poetry's out-of-tree virtualenv(s) for a Poetry project (see
+/// 2. `.venv` directory in `cwd`
+/// 3. `venv` directory in `cwd`
+/// 4. Poetry's out-of-tree virtualenv(s) for a Poetry project (see
 ///    [`find_poetry_virtualenv_site_packages`])
-/// 4. Pipenv's out-of-tree virtualenv for a Pipenv project (see
-///    [`find_pipenv_virtualenv_site_packages`])
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
@@ -292,14 +291,19 @@ pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     }
 
     // 3. Poetry keeps its virtualenv OUTSIDE the project by default, so a plain
-    // `poetry install` leaves nothing above to find; without this probe the
-    // crawl would fall through to the global interpreter.
+    // `poetry install` leaves nothing above to find and the crawl used to fall
+    // through to the global interpreter (patching the wrong site-packages, or
+    // nothing, and reporting success).
     if results.is_empty() {
         results.extend(find_poetry_virtualenv_site_packages(cwd).await);
     }
 
     // 4. Pipenv keeps its virtualenv OUTSIDE the project by default
-    // (`$WORKON_HOME/<dir>-<hash>`); same reasoning as Poetry above.
+    // (`$WORKON_HOME/<dir>-<hash>`), so a plain `pipenv install` leaves
+    // nothing above to find and the crawl used to fall through to the global
+    // interpreter's site-packages — patching the wrong Python (or nothing)
+    // and reporting success. Measured on real Pipenv 11.10.4, 2018.11.26 and
+    // 2026.8.0.
     if results.is_empty() {
         results.extend(find_pipenv_virtualenv_site_packages(cwd).await);
     }
@@ -1332,9 +1336,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 ///
 /// Used by `PythonCrawler::get_site_packages_paths` to decide
 /// whether to fall back to the global-discovery path when no venv
-/// was found. Mirrors `is_dotnet_project` in nuget_crawler and
-/// `RubyCrawler::has_bundler_manifest` (Gemfile / Gemfile.lock / gems.rb /
-/// gems.locked) in ruby_crawler.
+/// was found. Mirrors `is_dotnet_project` in nuget_crawler and the
+/// `has_gemfile || has_gemfile_lock` check in ruby_crawler.
 ///
 /// The list intentionally covers all major Python toolchains:
 ///   * `pyproject.toml` — PEP 518 / 621 (poetry, hatch, uv, flit,
@@ -1381,10 +1384,11 @@ impl PythonCrawler {
     ///
     /// Local-mode discovery has two stages:
     ///   1. `find_local_venv_site_packages` — handles `VIRTUAL_ENV`,
-    ///      `.venv`, and `venv` directories, then Poetry's and Pipenv's
-    ///      out-of-tree virtualenvs.
+    ///      `.venv`, and `venv` directories (covers the common case
+    ///      of an activated or project-local venv).
     ///   2. If no venv was found AND the cwd looks like a Python
-    ///      project (see `is_python_project`), fall through
+    ///      project (`pyproject.toml`, `setup.py`, `setup.cfg`,
+    ///      `requirements.txt`, or `uv.lock` present), fall through
     ///      to `get_global_python_site_packages`. This mirrors the
     ///      cargo / ruby / go pattern where a project marker
     ///      indicates "scan this ecosystem globally for this project".
@@ -1568,7 +1572,8 @@ impl PythonCrawler {
 /// Scan a `site-packages` directory for `.dist-info` entries, returning
 /// `(canonicalized name, version)` for each package that yields metadata,
 /// in listing order. One blocking-pool task for the listing and every
-/// METADATA read, rather than a runtime hop per open, read and stat.
+/// METADATA read (one runtime hop per open, read and stat used to set the
+/// scan's pace).
 pub(crate) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
     let site_packages_path = site_packages_path.to_path_buf();
     run_blocking(move || list_dist_info_packages_sync(&site_packages_path)).await
@@ -1795,6 +1800,10 @@ mod tests {
             .is_empty());
     }
 
+    /// The crawler's public entry point wires step 3 in: with no VIRTUAL_ENV
+    /// and no in-project venv, `find_local_venv_site_packages` returns the
+    /// out-of-tree Pipenv venv instead of nothing (which used to trigger the
+    /// global fallback).
     /// Pipenv 2018–2021 with an absolute PIPENV_PYTHON append the whole
     /// interpreter path to the venv name, so the virtualenv sits at the
     /// bottom of `<workon>/<name>-<hash>-/<abs>/<python>/`; the crawler must
@@ -2403,7 +2412,8 @@ mod tests {
 
     /// Regression for the macOS Python.framework layout: the `Versions/`
     /// directory holds bare version dirs (`3.11`), so the version segment
-    /// must be matched with `*`. A `python3.*` pattern matches nothing.
+    /// must be matched with `*`. A `python3.*` pattern matches nothing —
+    /// which is exactly the bug that was fixed.
     #[tokio::test]
     async fn test_find_python_dirs_framework_versions_layout() {
         let dir = tempfile::tempdir().unwrap();

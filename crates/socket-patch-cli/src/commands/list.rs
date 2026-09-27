@@ -28,7 +28,9 @@ enum Source {
     Manifest,
     /// A hosted redirect-ledger record: `scan --mode hosted` records its
     /// patches ONLY in `.socket/vendor/redirect-state.json` and never
-    /// writes the manifest.
+    /// writes the manifest — without these, a purely hosted-wired project
+    /// listed as `manifest_not_found` while its patches were demonstrably
+    /// live.
     Hosted,
     /// A vendor-ledger record: vendored mode is manifest-free, so every
     /// `scan`/`get --mode vendored` patch lives ONLY in
@@ -118,8 +120,14 @@ fn combined_entries<'a>(
 ///
 /// Events are emitted in the entries' given order — [`combined_entries`]
 /// owns the by-PURL event sort; this builder sorts each event's
-/// vulnerabilities (by advisory ID) and files (by path) so the output is
-/// stable across runs (`HashMap` iteration is not).
+/// vulnerabilities (by advisory ID) and files (by path). `HashMap`
+/// iteration is otherwise nondeterministic, so without these sorts the
+/// vuln/file ordering would change run-to-run — breaking consumers that
+/// diff this output in CI logs. Mirrors the stable-ordering guarantee
+/// `get` already provides for its vulnerability lists.
+///
+/// Shared by `run` and the unit tests so the tests exercise the exact code
+/// path `list --json` uses, rather than a hand-copied duplicate.
 fn build_list_envelope(entries: &[ListEntry<'_>]) -> Envelope {
     let mut env = Envelope::new(Command::List);
 
@@ -245,7 +253,11 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
     let mut lines = vec![format!("Package: {}", sanitize(entry.purl))];
     lines.extend(field("  ", "UUID", &patch.uuid));
     if let Some((mode, ledger)) = ledger_label(entry.source) {
-        // Same labeling rule as the JSON details.
+        // Same labeling rule as the JSON details: the record comes from a
+        // ledger, not the manifest — hosted installs resolve the package
+        // to the hosted patch server, vendored ones to the committed
+        // `.socket/vendor/` artifact; no manifest entry exists or is
+        // needed.
         lines.push(format!("  Mode: {mode} (recorded in {ledger})"));
     }
     lines.extend(field("  ", "Tier", &patch.tier));
@@ -253,6 +265,7 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
     lines.extend(field("  ", "Exported", &patch.exported_at));
     lines.extend(field("  ", "Description", &patch.description));
 
+    // Sort vulnerabilities by advisory ID for stable output.
     let mut vuln_entries: Vec<_> = patch.vulnerabilities.iter().collect();
     vuln_entries.sort_by(|a, b| a.0.cmp(b.0));
     if !vuln_entries.is_empty() {
@@ -277,6 +290,7 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
         }
     }
 
+    // Sort patched files by path for stable output.
     let mut file_list: Vec<_> = patch.files.keys().collect();
     file_list.sort();
     if !file_list.is_empty() {
@@ -309,16 +323,23 @@ pub async fn run(args: ListArgs) -> i32 {
 
     // `read_manifest` is the single source of truth for the three error
     // states: `Ok(None)` (file absent), `Err(InvalidData)` (present but
-    // unparseable), and any other `Err` (genuine I/O failure). No stat
-    // pre-check: it would report any stat failure as `manifest_not_found`
-    // and open a TOCTOU window.
+    // unparseable), and any other `Err` (genuine I/O failure). We deliberately
+    // do NOT stat the path first: a `metadata` pre-check is both redundant and
+    // wrong — it reports *any* stat failure (e.g. an unreadable parent dir) as
+    // `manifest_not_found`, masking real I/O errors that owe a
+    // `manifest_unreadable`, and it opens a TOCTOU window where a file removed
+    // between the stat and the read lands in the wrong error arm.
     let manifest = match read_manifest(&manifest_path).await {
         Ok(manifest) => manifest,
         Err(e) => {
-            // `InvalidData` (bad JSON or schema) is the contract's
-            // `manifest_invalid`; everything else is `manifest_unreadable`
-            // (see CLI_CONTRACT.md error-code table). Ledger records never
-            // mask either: a present-but-broken manifest is an error state.
+            // A manifest that exists but is unparseable (bad JSON or a
+            // schema violation) surfaces as `ErrorKind::InvalidData` — the
+            // contract's `manifest_invalid`. Everything else is a genuine
+            // I/O failure (`manifest_unreadable`). Conflating the two would
+            // tell a consumer to retry on a corrupt file, or to give up on a
+            // transient I/O error. See CLI_CONTRACT.md error-code table.
+            // Hosted-ledger records never mask either: a present-but-broken
+            // manifest is an error state, not a hosted-only project.
             let code = if e.kind() == std::io::ErrorKind::InvalidData {
                 "manifest_invalid"
             } else {
@@ -377,7 +398,12 @@ pub async fn run(args: ListArgs) -> i32 {
         vendor_state.as_ref().map(|s| &s.entries),
     );
     if manifest.is_none() && entries.is_empty() {
-        // No manifest AND no ledger records: nothing is listable anywhere.
+        // No manifest AND no ledger records: nothing is listable anywhere —
+        // the classic missing-manifest error. `read_manifest` returns
+        // `Ok(None)` only when the file does not exist (its documented
+        // contract), so this is `manifest_not_found`, NOT `manifest_invalid`
+        // (which means the file is present but corrupt). See CLI_CONTRACT.md
+        // error-code table.
         emit_error(
             &args,
             "manifest_not_found",
@@ -387,11 +413,15 @@ pub async fn run(args: ListArgs) -> i32 {
         return 1;
     }
 
-    // Records found (any store) ⇒ a successful list, exit 0.
+    // Records found (either store) ⇒ a successful list, exit 0 — including
+    // the purely hosted-wired project that used to hard-fail here.
     //
-    // Telemetry: `patch_listed`'s `patches_count` means "manifest patches"
-    // to its consumers, so it counts the manifest ONLY (0 on a ledger-only
-    // project) rather than the listed entries.
+    // Telemetry: `patch_listed`'s `patches_count` predates the hosted
+    // folding and its consumers read it as "manifest patches", so it keeps
+    // counting the manifest ONLY (0 on a hosted-only project) — folding the
+    // listed entries in would silently redefine the metric and double-count
+    // purls present in both stores. Hosted visibility, if wanted, belongs
+    // in a new dedicated field.
     let manifest_patch_count = manifest.as_ref().map_or(0, |m| m.patches.len());
     let (api_token, org_slug) = args.common.telemetry_credentials();
     track_patch_listed(
@@ -406,7 +436,9 @@ pub async fn run(args: ListArgs) -> i32 {
         env.warnings = warnings;
         println!("{}", env.to_pretty_json());
     } else if args.common.silent {
-        // `--silent` is "errors only" (CLI_CONTRACT.md).
+        // `--silent` is "errors only" (CLI_CONTRACT.md): suppress the
+        // entire human-readable listing, mirroring `get`/`repair`.
+        // The exit code still distinguishes the manifest states.
     } else {
         println!("{}", format_listing(&entries, crate::ui::stdout_color()));
     }
@@ -416,8 +448,8 @@ pub async fn run(args: ListArgs) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    //! Inline tests for `list` output. Pin the envelope shape so downstream
-    //! consumers (PR bots, dashboards) can rely on it.
+    //! Inline tests for `list` JSON output. Pin the new envelope shape
+    //! so downstream consumers (PR bots, dashboards) can rely on it.
     use super::*;
     use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
     use std::collections::HashMap;
@@ -569,9 +601,11 @@ mod tests {
         assert_eq!(v["summary"]["discovered"], 0);
     }
 
-    // -- Stable ordering -------------------------------------------------
-    // Pin the sorted events / vulnerabilities / files contract so consumers
-    // can diff `list --json` output.
+    // -- Regression: stable ordering -------------------------------------
+    // `HashMap` iteration order is randomized per run, so without explicit
+    // sorting the events / vulnerabilities / files arrays would shuffle
+    // between invocations. These pin the sorted contract so consumers can
+    // diff `list --json` output in CI logs.
 
     #[test]
     fn events_are_sorted_by_purl() {

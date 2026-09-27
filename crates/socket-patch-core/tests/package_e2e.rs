@@ -187,14 +187,16 @@ fn read_archive_to_map_rejects_parent_traversal() {
 
 #[test]
 fn read_archive_to_map_rejects_double_slash_package_escape() {
-    // Validate AFTER normalize. The raw entry `package//etc/passwd` passes every PRE-strip check (not absolute,
+    // Regression for the validate-AFTER-normalize fix. The raw entry
+    // `package//etc/passwd` passes every PRE-strip check (not absolute,
     // no leading separator, the `//` collapses so there is no `..`), but
     // `strip_prefix("package/")` yields the absolute path `/etc/passwd`,
     // and `pkg_path.join("/etc/passwd")` discards the base — an arbitrary
     // out-of-tree write. The guard MUST run on the post-strip path.
     //
-    // Unlike the bare-`/etc/passwd` test above, this case would pass a
-    // pre-strip-only validation, so it is the one that polices the order.
+    // Unlike the bare-`/etc/passwd` test above, this case stays green
+    // under the OLD (pre-strip) validation, so it is the one that
+    // actually polices the fix.
     let tmp = tempfile::tempdir().unwrap();
     let archive = tmp.path().join("arc.tar.gz");
     write_raw_archive(&archive, b"package//etc/passwd", b"evil");
@@ -219,7 +221,7 @@ fn read_archive_to_map_rejects_package_prefixed_backslash_escape() {
 #[test]
 fn read_archive_to_map_rejects_package_prefixed_parent_traversal() {
     // A `..` that survives the `package/` strip must still be rejected
-    // when validation happens after normalization.
+    // now that validation happens after normalization.
     let tmp = tempfile::tempdir().unwrap();
     let archive = tmp.path().join("arc.tar.gz");
     write_raw_archive(&archive, b"package/../../etc/passwd", b"evil");

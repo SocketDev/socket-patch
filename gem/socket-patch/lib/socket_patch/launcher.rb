@@ -86,8 +86,8 @@ module SocketPatch
       Gem::Specification.find_by_name("socket-patch").version.to_s
     rescue StandardError, Gem::LoadError
       # Gem::MissingSpecError (the gem isn't installed at all — running from
-      # a checkout) is a Gem::LoadError, which is NOT a StandardError, so it
-      # must be rescued by name for the fallback to engage.
+      # a checkout) is a Gem::LoadError, which is NOT a StandardError; without
+      # naming it the documented fallback never engaged.
       VERSION
     end
 

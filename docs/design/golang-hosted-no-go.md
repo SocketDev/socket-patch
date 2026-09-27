@@ -103,12 +103,12 @@ steps:
 The token enters through the CI secret store, never a committed file; the
 runner is discarded so no drifted `go env` survives; and `GOPRIVATE` is scoped
 to the single patched module so sumdb verification stays on for the rest of
-the graph. This recipe is documentation-only — neither `scan --mode hosted` nor
+the graph. This recipe is documentation-only — neither `scan --redirect` nor
 the backend PR flow will ever write it into a repository.
 
 ## Decision
 
-`scan --mode hosted` (and the backend hosted PR flow) emit
+`scan --redirect` (and the backend hosted PR flow) emit
 `redirect_golang_unsupported` naming the remedy — run `socket-patch vendor`
 (committable, offline-verified) — and the golang dependency is otherwise left
 untouched. Vendored mode already gives Go users everything hosted mode

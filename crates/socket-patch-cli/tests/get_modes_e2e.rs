@@ -1213,8 +1213,8 @@ async fn get_save_only_agent_ignores_vlt_preflight() {
 
 /// Manifest-less VEX over what `get <uuid> --mode hosted` and `get <uuid>
 /// --mode vendored` commit for an npm project: a checkout of package.json,
-/// the lock and `.socket/` (no manifest — neither hosted nor vendored get
-/// writes one) attests with the ledger, then from
+/// the lock and `.socket/` (no manifest — hosted never writes one, vendored's
+/// is deleted like an uncommitted one) attests with the ledger, then from
 /// lockfile discovery + the patch API with the ledgers gone, never
 /// `--offline` (`record_unavailable`, zero requests), and not once the lock
 /// is reverted (`redirect_unwired` / `vendor_unwired`, `--no-verify` too).

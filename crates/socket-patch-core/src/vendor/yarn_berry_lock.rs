@@ -3,7 +3,8 @@
 //!
 //! Berry verifies every install against the sha512 of the *converted cache
 //! zip* (`checksum: 10c0/<hex>`), so a lock-only rewrite à la classic is not
-//! enough — but the full recipe is reproducible offline:
+//! enough — but spike B2/B3 (`spikes/PHASE0-V2-FINDINGS.txt` +
+//! `spikes/yarn-berry-nm/`) proved the full recipe is reproducible offline:
 //!
 //! 1. `package.json` gains `"resolutions": {"<name>": "file:./<rel-tgz>"}`
 //!    (the dependency ranges stay untouched);
@@ -16,10 +17,10 @@
 //!
 //! A fresh checkout of exactly {package.json, yarn.lock, .yarnrc.yml,
 //! .socket/} then passes `yarn install --immutable --check-cache` fully
-//! offline.
+//! offline (spike B5).
 //!
 //! Fail-closed gates, all BEFORE any write: the checksum recipe only holds
-//! for cacheKey `10c0` (compressionLevel 0, the yarn 4 default —
+//! for cacheKey `10c0` (compressionLevel 0, the yarn 4 default — B4 showed
 //! `compressionLevel: mixed` changes both the cacheKey and the checksum), and
 //! a user-authored resolutions entry for the same package is never
 //! overwritten. The pair is committed package.json-first, lock-second, and
@@ -75,8 +76,9 @@ const YARN_LOCK: &str = "yarn.lock";
 const PACKAGE_JSON: &str = "package.json";
 const YARNRC: &str = ".yarnrc.yml";
 
-/// The run's project-`package.json` parse: the `resolutions` gate reads the
-/// manifest once per patched package. See [`ParseMemo`].
+/// The run's project-`package.json` parse: berry re-read AND re-parsed the
+/// manifest for every patched package to check the `resolutions` gate. See
+/// [`ParseMemo`].
 static PKG_JSON_MEMO: ParseMemo<Value> = ParseMemo::new();
 
 /// Wiring kinds this backend owns.
@@ -132,7 +134,7 @@ pub async fn vendor_yarn_berry<'a>(
         return outcome;
     }
 
-    // ── 3. .yarnrc.yml knobs that change the checksum ───────────────────
+    // ── 3. .yarnrc.yml knobs that change the checksum (spike B4) ─────────
     if let Some(outcome) = refuse_unsupported_compression(project_root).await {
         return outcome;
     }
@@ -271,7 +273,7 @@ pub async fn vendor_yarn_berry<'a>(
     }
     let tgz_sha512 = hex::encode(Sha512::digest(&tgz_bytes));
     // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
-    // tamper guard on the tarball itself (flips on any byte edit).
+    // tamper guard on the tarball itself (spike B3, flips on any byte edit).
     let hash6 = &tgz_sha512[..6];
     let checksum = match berry_cache_checksum_10c0(&tgz_bytes, name) {
         Ok(c) => checksum_in_lock_spelling(&lock_text, &c),
@@ -305,7 +307,7 @@ pub async fn vendor_yarn_berry<'a>(
         ));
     }
     // The exact entry yarn 4 emits for a resolutions-driven `file:` tarball
-    // (the B3 fixture, verbatim), carried sections in yarn's position between
+    // (spike B3, verbatim), carried sections in yarn's position between
     // `resolution` and `checksum`.
     let mut new_lines = vec![
         format!("{lock_key}:"),
@@ -793,7 +795,7 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
-    // LOSSINESS GUARD: when any wiring record was left
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
     // alone ("drifted; left alone"), the uuid dir may hold the only copy of
     // what the lock — or the redirect ledger's recorded originals — still
     // points at. Keep it (and let the CLI keep the ledger entry) instead of
@@ -925,7 +927,7 @@ fn revert_resolution_record(
         return;
     }
     // A takeover recorded the user's pinned value: restore it in place
-    // (the key and table stay). Otherwise remove our entry.
+    // (the key and table stay). Otherwise remove our entry as before.
     if let Some(orig) = rec.original.as_ref().and_then(Value::as_str) {
         res_obj.insert(key.to_string(), Value::String(orig.to_string()));
         *changed = true;
@@ -990,7 +992,7 @@ fn refuse_unsupported_cache(blocks: &[LockBlock]) -> Option<VendorOutcome> {
     })
 }
 
-/// The `.yarnrc.yml` `compressionLevel` gate: any level but 0
+/// The `.yarnrc.yml` `compressionLevel` gate (spike B4): any level but 0
 /// changes berry's cache checksums.
 async fn refuse_unsupported_compression(project_root: &Path) -> Option<VendorOutcome> {
     match read_regular_to_string(&project_root.join(YARNRC)).await {
@@ -1024,8 +1026,8 @@ async fn refuse_unsupported_compression(project_root: &Path) -> Option<VendorOut
 /// vendored` over a hosted-redirected purl): the takeover reverts the
 /// hosted lock edits and drops the redirect-ledger record BEFORE this
 /// backend runs, and a hosted revert keeps a mixed lock mixed — so without
-/// this preflight a refusal here would land after the hosted redirect was
-/// gone, leaving the package unpatched in both modes. Returns `(code, detail)`,
+/// this preflight a refusal here landed after the hosted redirect was gone,
+/// leaving the package unpatched in both modes. Returns `(code, detail)`,
 /// exactly the refusal the backend would raise.
 pub async fn yarn_berry_vendor_preflight(project_root: &Path) -> Option<(&'static str, String)> {
     use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
@@ -1295,7 +1297,7 @@ fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
 }
 
 /// The `.yarnrc.yml` `compressionLevel` value, when set. A flat line scan is
-/// enough: yarn writes the knob as a top-level scalar, and any
+/// enough: yarn writes the knob as a top-level scalar (spike B4), and any
 /// value we cannot positively read as `0` makes the caller refuse. Shared
 /// with the hosted-redirect rewriter, whose cache-checksum gate is identical.
 /// CRLF lines split like LF ones (`str::lines`), and a leading BOM is
@@ -1383,8 +1385,7 @@ mod tests {
     const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";
     const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
 
-    /// Verbatim `package.json` of the B3 fixture (a real yarn 4.12.0
-    /// project with a vendored resolution), before vendoring.
+    /// Verbatim `spikes/yarn-berry-nm/fixtures/b3-vendored-resolutions/before/package.json`.
     const B3_BEFORE_PKG: &str = r#"{
   "name": "vendor-spike",
   "version": "1.0.0",
@@ -1395,7 +1396,7 @@ mod tests {
 }
 "#;
 
-    /// Verbatim B3 `package.json` after vendoring.
+    /// Verbatim `…/b3-vendored-resolutions/after/package.json`.
     const B3_AFTER_PKG: &str = r#"{
   "name": "vendor-spike",
   "version": "1.0.0",
@@ -1409,7 +1410,7 @@ mod tests {
 }
 "#;
 
-    /// Verbatim B3 `yarn.lock` before vendoring (yarn 4.12.0).
+    /// Verbatim `…/b3-vendored-resolutions/before/yarn.lock` (yarn 4.12.0).
     const B3_BEFORE_LOCK: &str = r#"# This file is generated by running "yarn install" inside your project.
 # Manual changes might be lost - proceed with caution!
 
@@ -1433,7 +1434,7 @@ __metadata:
   linkType: soft
 "#;
 
-    /// Verbatim B3 `yarn.lock` after vendoring (yarn-emitted).
+    /// Verbatim `…/b3-vendored-resolutions/after/yarn.lock` (yarn-emitted).
     const B3_AFTER_LOCK: &str = r#"# This file is generated by running "yarn install" inside your project.
 # Manual changes might be lost - proceed with caution!
 
@@ -1457,7 +1458,7 @@ __metadata:
   linkType: soft
 "#;
 
-    /// The captured tarball's hash constants inside the after-lock fixture; the
+    /// The spike tarball's hash constants inside the after-lock fixture; the
     /// tests substitute the recomputed hashes of the tarball this build
     /// packs (everything else must match byte-for-byte).
     const SPIKE_HASH6: &str = "39ea9b";
@@ -1692,14 +1693,14 @@ __metadata:
         assert!(warnings.is_empty(), "{warnings:?}");
         let entry = entry.expect("success carries a ledger entry");
 
-        // package.json: byte-for-byte the B3 after fixture.
+        // package.json: byte-for-byte the spike's after fixture.
         assert_eq!(
             tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
             B3_AFTER_PKG
         );
         // yarn.lock: byte-for-byte modulo the recomputed hash= + checksum of
         // the tarball THIS build packed (checksum equality with the
-        // captured value is berry_zip's own oracle test).
+        // spike-captured value is berry_zip's own oracle test).
         let (hash6, checksum) = fx.packed_berry_facts().await;
         assert_eq!(
             tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
@@ -2214,7 +2215,7 @@ __metadata:
             outcome.warnings
         );
         // The drifted lock entry stays; the (still-ours) resolutions entry
-        // was removed; the artifact is KEPT (the drifted
+        // was removed; the artifact is KEPT (residual #131: the drifted
         // entry's recorded original may still be needed later) and the keep
         // is surfaced.
         let after = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
@@ -2307,7 +2308,7 @@ __metadata:
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             fx.lock_bytes
         );
-        // The manifest drift-skip keeps the artifact too.
+        // The manifest drift-skip keeps the artifact too (residual #131).
         assert!(fx.tgz_path().exists(), "drift-skip must keep the artifact");
     }
 
@@ -2583,7 +2584,7 @@ __metadata:
     /// fail fast instead of wedging vendor or revert forever in an
     /// `open(2)` waiting for a writer that never comes. Same
     /// `open_regular_file` guard class as the vendor siblings (npm_lock.rs,
-    /// pnpm_lock.rs, lock_inventory/).
+    /// pnpm_lock.rs, lock_inventory.rs).
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_files_fail_fast_instead_of_wedging_vendor_and_revert() {
@@ -3405,13 +3406,13 @@ __metadata:
         );
     }
 
-    /// The vendored backend splits berry keys with the ONE berry splitter
-    /// (`split_berry_key_patterns`, which the redirect and the lock
-    /// inventory's `berry_entries` use). The classic splitter reads berry's
-    /// single outer quote pair as one pattern, so a multi-descriptor key
-    /// would look like a single `left-pad` / `a` descriptor: the mixed-name
-    /// refusal would never fire, and an alias sharing the real package's
-    /// block would go unseen.
+    /// REGRESSION: the vendored backend splits berry keys with the ONE
+    /// berry splitter (`split_berry_key_patterns`, which the redirect and
+    /// the lock inventory's `berry_entries` use). The classic splitter read
+    /// berry's single outer quote pair as one pattern, so a multi-descriptor
+    /// key looked like a single `left-pad` / `a` descriptor: the mixed-name
+    /// refusal never fired, and an alias sharing the real package's block
+    /// was not seen.
     #[test]
     fn multi_descriptor_berry_keys_split_like_every_other_reader() {
         let block = |key: &str, version: &str| {
@@ -3531,10 +3532,10 @@ __metadata:
         }
     }
 
-    /// yarn 4.0.x: a lock whose checksums are spelled bare (yarn
-    /// 4.0.0–4.0.2 at cacheKey `10c0`) gets the vendored entry's checksum
-    /// spelled bare too — byte-exact against the B3 after-lock with
-    /// every checksum de-prefixed. The prefixed spelling makes the
+    /// REGRESSION (yarn 4.0.x): a lock whose checksums are spelled bare
+    /// (yarn 4.0.0–4.0.2 at cacheKey `10c0`) gets the vendored entry's
+    /// checksum spelled bare too — byte-exact against the spike after-lock
+    /// with every checksum de-prefixed. The prefixed spelling made the
     /// fresh-checkout `yarn install --immutable` fail with YN0028.
     #[tokio::test]
     async fn yarn40_bare_checksum_lock_gets_a_bare_vendored_checksum() {
@@ -3566,7 +3567,7 @@ __metadata:
     /// The Windows shape — yarn writes a new `yarn.lock` and the
     /// `package.json` it first pretty-prints with `os.EOL` (CRLF) — plus a
     /// BOM and a missing trailing newline: vendoring keeps each file's
-    /// layout (the B3 LF oracle bytes in that layout), the ledger
+    /// layout (the spike's LF oracle bytes in that layout), the ledger
     /// records terminator-free lines, the re-run is in sync, and revert
     /// lands byte-exactly on the pre-vendor files.
     #[tokio::test]

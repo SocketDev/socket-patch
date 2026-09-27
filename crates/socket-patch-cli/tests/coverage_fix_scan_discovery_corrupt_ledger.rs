@@ -1,8 +1,12 @@
-//! A corrupt `.socket/vendor/state.json` must not defeat the vendored prune
-//! safeguards. With the ledger unreadable, `vendored_ledger_supplement`
-//! (discovery) and core's `vendored_purl_keys` prune exemption (fail-open
-//! by contract) both see nothing, so the vendored set is recovered from the
-//! committed ground truth: manifest entries whose patch uuid owns a live
+//! Regression: a corrupt `.socket/vendor/state.json` must not defeat the
+//! vendored prune safeguards. With the ledger unreadable, BOTH protection
+//! legs used to degrade to empty — `vendored_ledger_supplement` (discovery)
+//! silently returned no packages, so the vendored purls never entered
+//! `scanned_purls`, and core's `vendored_purl_keys` prune exemption is
+//! fail-open by contract — so `scan --prune` deleted a still-vendored
+//! package's manifest entry and swept its blobs while the committed
+//! artifacts remained. The fix recovers the vendored set from the committed
+//! ground truth: manifest entries whose patch uuid owns a live
 //! `.socket/vendor/<eco>/<uuid>` artifact dir.
 //!
 //! Modeled on `scan_vendor_e2e.rs` (mock API + real fixture through the
@@ -126,8 +130,10 @@ async fn mount_empty_discovery(mock: &MockServer) {
 }
 
 /// `scan --prune` on a fresh clone whose vendor ledger is corrupt: the
-/// vendored package's manifest entry and blob must survive the GC while the
-/// committed artifacts remain.
+/// vendored package's manifest entry and blob must survive the GC. Before
+/// the fix, discovery's ledger supplement silently returned empty, the
+/// prune exemption was also empty, and the entry + blob were deleted while
+/// the committed artifacts remained.
 #[tokio::test]
 async fn corrupt_ledger_scan_prune_keeps_vendored_manifest_entry() {
     let mock = MockServer::start().await;

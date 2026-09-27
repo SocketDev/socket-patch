@@ -1071,9 +1071,9 @@ pub fn manifestless_matrix(m: &Matrix<'_>, row: &dyn Fn(&str, &str)) {
         assert_attested(out.doc(), m.purl, m.uuid, marker, m.vulns);
         row(label, "attested");
         if run.via == VexVia::Scan && m.mode == Mode::Vendored {
-            // `scan --mode vendored` is manifest-free (records go into the
-            // vendor ledger), so no manifest should appear; strip
-            // defensively.
+            // `scan --mode vendored` is a WRITER: it records the vendored
+            // patch in the manifest it (re)creates — the checkout goes back
+            // to the manifest-less shape for the next steps.
             strip_manifest(fresh);
         }
         assert!(

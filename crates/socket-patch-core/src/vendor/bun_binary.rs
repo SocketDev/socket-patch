@@ -911,7 +911,7 @@ mod rebuild_tests {
     /// A service outage (here a 403) after a prebuilt vendor: the committed
     /// prebuilt archive is anchored by the ledger, so the re-run reuses it —
     /// entry `None`, bun.lockb and every workspace mirror byte-unchanged, no
-    /// request.
+    /// request (the flip no longer re-pins).
     #[tokio::test]
     async fn same_uuid_prebuilt_then_outage_reuses_the_committed_archive() {
         let archive = prebuilt_archive();

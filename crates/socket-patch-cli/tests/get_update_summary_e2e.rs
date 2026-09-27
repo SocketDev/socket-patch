@@ -1,6 +1,6 @@
 //! The human-readable `get` summary must not report one patch twice.
 //!
-//! `download_and_apply_patches_with` prints an `Added: / Skipped: / Failed: /
+//! `download_and_apply_patches` prints an `Added: / Skipped: / Failed: /
 //! Updated:` block after writing the manifest. Regression guard: the "added"
 //! tally was bumped for EVERY record it wrote — including the ones classified
 //! `Updated` — so replacing an existing manifest entry printed both

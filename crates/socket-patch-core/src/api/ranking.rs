@@ -153,23 +153,6 @@ pub fn cmp_search_results(a: &PatchSearchResult, b: &PatchSearchResult) -> Order
     rank_search_result(a).cmp(&rank_search_result(b))
 }
 
-/// Whether `candidate` is strictly better than `applied` on a meaningful
-/// rung of the ranking: merged state, severity (between unmerged patches),
-/// or a real, strictly later publish date. The paid-tier and uuid tiebreaks
-/// never count, and neither does a missing date (the batch endpoint omits
-/// `publishedAt`), so an equal sibling is never reported as an update.
-pub fn batch_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) -> bool {
-    let (c, a) = (rank_batch_info(candidate), rank_batch_info(applied));
-    if c.not_merged != a.not_merged {
-        return !c.not_merged;
-    }
-    if c.severity != a.severity {
-        return c.severity < a.severity;
-    }
-    let (Reverse(c_date), Reverse(a_date)) = (c.patch_published, a.patch_published);
-    c_date > 0 && a_date > 0 && c_date > a_date
-}
-
 /// Compare two batch-shaped patches best-first. Pass straight to `sort_by`.
 ///
 /// Same key as [`cmp_search_results`], but the batch shape carries a

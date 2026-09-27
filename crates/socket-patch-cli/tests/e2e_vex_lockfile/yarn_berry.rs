@@ -21,7 +21,7 @@
 //! | vendored CRLF + BOM | lock AND root `package.json` CRLF + BOM (yarn's Windows output) | the committed artifact attests; offline `record_unavailable`; `resolutions` reverted: nothing discovered |
 //! | two uuids for one package | two live blocks wiring one purl to different patches | never attested (`wiring_conflict`) |
 //! | user `yarn patch` on top | `patch:` entry wrapping the hosted locator | the hosted base entry still attests when the user patch leaves the Socket file intact; a user patch rewriting it is `hash_mismatch` |
-//! | foreign / look-alike hosts | `__archiveUrl` not on the patch host, or with the uuid only in a query string or fragment | nothing discovered (exit 2), zero requests |
+//! | foreign / look-alike hosts, uuid-shaped token only | `__archiveUrl` not on the patch host, or whose LAST uuid is the grant token of another patch | nothing discovered (exit 2), zero requests |
 //! | record for another package | API record names `@scope/other` for the wired uuid | `record_mismatch` |
 
 use std::path::Path;
@@ -833,9 +833,9 @@ fn user_yarn_patch_on_top_of_hosted() {
 // ── spoofing ─────────────────────────────────────────────────────────────
 
 /// An `__archiveUrl` that is not on the Socket patch host — including
-/// look-alikes — or that carries its uuid only in a query string or
-/// fragment, is never a patch reference: nothing is discovered and nothing
-/// is fetched.
+/// look-alikes — or whose uuid-shaped segments are only a GRANT TOKEN of
+/// the patch host's path grammar, is never a patch reference: nothing is
+/// discovered and nothing is fetched.
 #[test]
 fn foreign_hosts_and_token_only_urls_are_not_references() {
     let api = api_for(LP);

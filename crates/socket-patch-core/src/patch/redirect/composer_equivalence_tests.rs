@@ -498,7 +498,7 @@ fn byte_walk_matches_the_char_walk() {
     }
 }
 
-/// Runs the oracle over a large benchmark composer.lock (too large to
+/// Runs the oracle over the Phase 3 benchmark composer.lock (too large to
 /// commit) when `SOCKET_PATCH_COMPOSER_FIXTURE` names it, redirecting every
 /// package; a no-op otherwise.
 #[test]

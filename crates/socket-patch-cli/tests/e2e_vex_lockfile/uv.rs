@@ -1837,10 +1837,10 @@ fn embedded_vex(p: &Proj, command: &str, extra: &[&str]) -> (Option<i32>, Value,
     (out.status.code(), env, doc)
 }
 
-/// `apply --vex` / `vendor --vex` in a manifest-less uv checkout must run
-/// the embedded VEX (`generate_vex_without_manifest`) rather than return
-/// `noManifest` / exit 0 with the requested document silently never
-/// written. Every flavor × mode, with
+/// REGRESSION (fixed on the feature branch, `generate_vex_without_manifest`):
+/// `apply --vex` / `vendor --vex` in a manifest-less uv checkout used to
+/// return `noManifest` / exit 0 BEFORE the embedded VEX ran, so the
+/// requested document was silently never written. Every flavor × mode, with
 /// the writer's ledger and fully offline: the document is written (exit 0,
 /// envelope `vex` summary) with the right marker; `--dry-run` writes none;
 /// the lock reverted with the ledger left behind fails the command (exit 1,

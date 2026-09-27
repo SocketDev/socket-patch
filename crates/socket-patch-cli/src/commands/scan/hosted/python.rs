@@ -10,9 +10,8 @@ use socket_patch_core::vex::verify::judge_installed_record;
 use super::StaleInstallOutcome;
 
 /// A lock rewrite cannot prove a warm virtualenv has installed the wheel.
-/// Use the project's own venv discovery (`--global`/`--global-prefix` use
-/// the crawler's global paths), and inspect every interpreter rather than
-/// deduplicating by package name.
+/// Use the same discovery as apply (including Poetry's out-of-tree venvs),
+/// and inspect every interpreter rather than deduplicating by package name.
 /// Missing/unreadable files are not positive evidence of stale bytes.
 pub(super) async fn stale_install_warnings(
     common: &crate::args::GlobalArgs,
@@ -41,9 +40,10 @@ pub(super) async fn stale_install_warnings(
     let crawler = PythonCrawler::new();
     // Only venvs that belong to THIS project (VIRTUAL_ENV, ./.venv, ./venv,
     // Poetry's and Pipenv's out-of-tree venvs): the crawler's project-marker
-    // fallback to the global interpreters would judge an unrelated Python's
-    // copy of the release (a tool venv on PATH) and warn falsely.
-    // --global / --global-prefix keep their meaning.
+    // fallback to the global interpreters would judge some unrelated Python's
+    // copy of the release (a tool venv on PATH) and warn about a venv the
+    // project's installer never touches — a false positive that also fails
+    // the same-run --vex. --global / --global-prefix keep their meaning.
     let paths = if common.is_global() {
         crawler
             .get_site_packages_paths(&common.crawler_options())

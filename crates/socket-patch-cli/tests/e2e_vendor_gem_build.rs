@@ -32,9 +32,8 @@
 //! the patch record comes from a wiremock `view/{uuid}` (real hashes of the
 //! ACTUAL installed bytes + inline `blobContent`), `--vendor-source build`
 //! keeps the artifact build local, and the result must match a plain
-//! `vendor` run by construction — `.socket/vendor/` artifact + ledger (a
-//! detached entry) + the mandatory Gemfile/lock pair edit, with NO manifest
-//! and NO `.socket/blobs`
+//! `vendor` run by construction — manifest + `.socket/vendor/` artifact +
+//! ledger + the mandatory Gemfile/lock pair edit, but NO `.socket/blobs`
 //! (get's vendored download phase holds content in memory).
 //!
 //! MANIFEST-LESS VEX (every capstone, `vendored_manifestless_vex_matrix`,
@@ -1060,7 +1059,7 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
 
 /// GET-DRIVEN TWIN of the direct-dep capstone: `get <uuid> --mode vendored`
 /// (v3.6, the per-advisory selector) must leave the same committable state
-/// as a plain `vendor` run — the ledger's detached entry (no manifest), `.socket/vendor/` artifact +
+/// as a plain `vendor` run — manifest record, `.socket/vendor/` artifact +
 /// ledger, the mandatory Gemfile/lock pair edit — with NO `.socket/blobs`
 /// (get's vendored download phase holds content in memory) and get's
 /// envelope nesting the vendor Envelope (and dropping `applied`). The patch

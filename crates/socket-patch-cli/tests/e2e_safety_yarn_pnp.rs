@@ -779,13 +779,17 @@ fn pnp_project_with_no_npm_patches_still_applies_its_other_patches() {
 // ── the silent no-op (P0) ────────────────────────────────────────────────────
 //
 // Under PnP, `node_modules/` is absent, so the crawler leg of scan discovery
-// is empty and a scan that swallowed the flavor probe's PnP diagnosis would
-// report `status: success` / `scannedPackages: 0` with NO warning while
-// checking nothing (yarn 2.4.3 / 3.8.7 / 4.6.0, plain PnP and zero-install).
-// The tests below pin: an explicit `yarn_pnp_unsupported` refusal warning in
-// scan's JSON envelope in every mode (exit semantics deliberately unchanged:
-// still exit 0 / status success), a stderr line in human mode, and a loud
-// apply refusal even without a manifest.
+// is empty; the lockfile-supplement leg used to swallow the flavor probe's
+// PnP diagnosis and return nothing. Scan then hit its `package_count == 0`
+// early-return and printed `status: success` / `scannedPackages: 0` with NO
+// warning — in ALL THREE modes — and, because scan wrote no manifest,
+// apply's documented loud refusal above was unreachable (apply exited 0 with
+// the calm `noManifest` status). The user believed they were protected;
+// nothing was checked. Reproduced on yarn 2.4.3 / 3.8.7 / 4.6.0, plain PnP
+// and zero-install. The tests below pin the fix: an explicit
+// `yarn_pnp_unsupported` refusal warning in scan's JSON envelope (exit
+// semantics deliberately unchanged: still exit 0 / status success), a stderr
+// line in human mode, and a loud apply refusal even without a manifest.
 
 /// Recursively snapshot every file under `root` as relative path → git
 /// sha256, for whole-tree no-mutation assertions.
@@ -1001,11 +1005,12 @@ fn scan_on_pnpm_pnp_project_surfaces_pnpm_refusal_warning() {
     );
 }
 
-/// The apply half: on a PnP checkout WITHOUT a manifest (scan never writes
-/// one on PnP projects), the loud `yarn_pnp_unsupported` refusal (pinned by
-/// the tests at the top of this file) must fire before the calm
-/// `noManifest` early-return, matching the with-manifest envelope shape
-/// exactly.
+/// The apply half of the P0: on a PnP checkout WITHOUT a manifest, apply
+/// used to exit 0 with the calm `noManifest` status — the documented loud
+/// `yarn_pnp_unsupported` refusal (pinned by the tests at the top of this
+/// file) sat BELOW the noManifest early-return and was unreachable, because
+/// scan never writes a manifest on PnP projects. The refusal must fire
+/// first, matching the with-manifest envelope shape exactly.
 #[test]
 fn apply_without_manifest_on_pnp_project_refuses_loudly() {
     let dir = tempfile::tempdir().unwrap();
@@ -1065,9 +1070,7 @@ fn apply_without_manifest_on_pnp_project_refuses_in_human_mode() {
     );
 }
 
-/// Control for the refusal-scope tests
-/// (`non_npm_ecosystem_apply_is_not_refused_in_a_pnp_project`,
-/// `pnp_project_with_no_npm_patches_still_applies_its_other_patches`): an in-scope npm patch in the SAME
+/// Control for the two tests above: an in-scope npm patch in the SAME
 /// polyglot manifest still refuses. Without this, scoping the detector down
 /// to nothing at all would leave every positive test in this file passing
 /// only because they happen to use npm-only manifests.

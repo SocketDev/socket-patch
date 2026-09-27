@@ -152,7 +152,7 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
     let status = v["status"].as_str().expect("status string");
     // A clean apply against a pristine fixture MUST fully succeed. Accepting
     // "partial_failure" here would mask the apply step silently failing
-    // (`commands/scan/mod.rs` flips status to partial_failure exactly when apply_code != 0).
+    // (`scan.rs` flips status to partial_failure exactly when apply_code != 0).
     assert_eq!(
         status, "success",
         "scan --sync against a clean project must fully succeed; envelope={v}"

@@ -1,10 +1,11 @@
 //! Group commit of a vendored run's commit points.
 //!
-//! Committing after every package — each backend writing its lockfile /
-//! `package.json` / `pnpm-workspace.yaml` / config edits durably, then the
-//! engine rewriting the whole ledger durably behind it — would cost a run
-//! over N packages N rounds of durable writes of the same few files, each
-//! rewriting whole lockfiles and a ledger that grows with every package.
+//! A vendored run used to commit after every package: each backend wrote
+//! its lockfile / `package.json` / `pnpm-workspace.yaml` / config edits
+//! durably, and the engine rewrote the whole ledger durably behind it. A
+//! run over N packages paid N rounds of durable writes of the same few
+//! files, each round rewriting whole lockfiles and a ledger that grows with
+//! every package.
 //!
 //! While a [`GroupCommit`] is open for a project root, the durable writers
 //! in [`super::fs`] ([`super::fs::atomic_write_bytes`],

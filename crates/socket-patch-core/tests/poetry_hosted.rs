@@ -416,9 +416,10 @@ fn rotated_grant_token_supersedes_the_prior_hosted_url() {
 
 /// A relock (or hand edit) that drops the inserted `files` line but keeps
 /// `[package.source]` must be REFUSED by rollback, never mistaken for an
-/// already-reverted lock (the fragment's boundary header keeps the pristine
-/// unit from matching as a prefix, which would delete the ledger and leave the
-/// lock redirecting with upstream hashes in `[metadata.files]`).
+/// already-reverted lock: before the fragment carried its boundary header the
+/// pristine unit matched as a prefix, replay reported success, deleted the
+/// ledger, and left the lock redirecting with upstream hashes in
+/// `[metadata.files]`.
 #[tokio::test]
 async fn dropped_files_line_with_source_kept_is_refused_not_converged() {
     for version in ["1.2.2", "2.4.3"] {

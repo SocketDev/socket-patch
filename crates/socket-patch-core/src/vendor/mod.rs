@@ -7,7 +7,7 @@
 //! committing `.socket/vendor/` + the lockfile edits, a fresh checkout builds
 //! with the patched dependency on machines with no socket-patch installed and
 //! no Socket API access (spike-proven per ecosystem against real package
-//! managers).
+//! managers — see `spikes/PHASE0-FINDINGS.txt`).
 //!
 //! ## Per-ecosystem wiring
 //!
@@ -24,8 +24,7 @@
 //!
 //! npm requests route through [`npm_flavor`], which content-sniffs the
 //! project's lockfile (not just file presence) and dispatches to the
-//! matching backend — every flavor (package-lock, yarn classic/berry, pnpm
-//! v9 and legacy, bun, vlt) has a real backend; a lockfile the
+//! matching backend — all five flavors have real backends; a lockfile the
 //! probe can't classify (or a berry PnP layout) refuses with a stable
 //! reason code.
 //!
@@ -117,12 +116,12 @@ pub use state::{
     carry_forward_wiring, load_state, lookup_entry, save_state, save_state_shared, VendorEntry,
     VendorState, VENDOR_STATE_REL,
 };
+// The hosted→vendored takeover refuses a berry project the backend would
+// refuse BEFORE it reverts the hosted redirect.
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory,
     compute_package_dir_inventory, file_sha256_hex, ArtifactHealth,
 };
-// The hosted→vendored takeover refuses a berry project the backend would
-// refuse BEFORE it reverts the hosted redirect.
 pub use yarn_berry_lock::yarn_berry_vendor_preflight;
 
 use std::collections::{HashMap, HashSet};
@@ -159,8 +158,8 @@ impl VendorWarning {
 /// Yarn 2+ (berry) migrates a classic (v1) `yarn.lock` to its own format on
 /// install and re-resolves every entry from the registry — the vendored
 /// `file:./.socket/vendor/…` resolutions are dropped with no warning and the
-/// packages install unpatched (observed end-to-end on a real monorepo).
-/// Returns the warning when ALL of:
+/// packages install unpatched (observed end-to-end on a real monorepo,
+/// 2026-07). Returns the warning when ALL of:
 ///
 /// * `yarn.lock` exists and is classic (`# yarn lockfile v1` marker), AND
 /// * it carries vendored wiring (`.socket/vendor/` resolutions), AND
@@ -173,7 +172,7 @@ impl VendorWarning {
 pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWarning> {
     // The guarded sync reader (`O_NONBLOCK` open + fstat regular-file check):
     // this probe runs at envelope-finalize time on every vendor / scan
-    // --mode vendored run, and a plain `open(2)` of a FIFO planted at `yarn.lock` or
+    // --vendor run, and a plain `open(2)` of a FIFO planted at `yarn.lock` or
     // `package.json` would wedge the whole run after the real work is done.
     let lock = read_regular_to_string_sync(&project_root.join("yarn.lock")).ok()?;
     if !lock.contains("# yarn lockfile v1") || !lock.contains(".socket/vendor/") {
@@ -213,8 +212,8 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
 ///   integrity-verified before use.
 /// * `Service` — require the vendoring service; fail closed on a miss. Useful
 ///   for CI / exercising the service path exclusively.
-/// * `Build` — always build the artifact locally (never contacts the
-///   vendoring service).
+/// * `Build` — always build the artifact locally (the pre-service behavior;
+///   never contacts the vendoring service).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VendorSource {
     #[default]
@@ -263,7 +262,8 @@ impl VendorSource {
 ///
 /// Built once per `vendor` run in the CLI and threaded as
 /// `Option<&VendorServiceConfig>` through the dispatch chain — `None` means
-/// "build-only".
+/// "build-only" (the pre-service behavior), which keeps every caller that
+/// doesn't opt in (and every existing test) unchanged.
 #[derive(Debug, Clone)]
 pub struct VendorServiceConfig {
     /// The `auto` / `service` / `build` policy.
@@ -615,8 +615,9 @@ fn fallback_scans_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
 /// common case costs one seek and one inflate per needed hash instead of
 /// inflating the whole archive. Everything the name lookup does not settle —
 /// a member renamed since the patch was exported, a duplicate name, an
-/// entry the caps reject — falls back to an exhaustive index scan, which is
-/// what keeps the result identical to reading every entry: the name path only ever admits an entry whose hash IS one of
+/// entry the caps reject — falls back to the exhaustive index scan the
+/// harvest always did, which is what keeps the result identical to reading
+/// every entry: the name path only ever admits an entry whose hash IS one of
 /// the wanted ones, and the scan then supplies every hash still outstanding.
 fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String, Vec<u8>> {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -690,7 +691,7 @@ fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String
     }
 
     // Fallback: the member names disagree with the record's keys (or an
-    // entry was rejected above). Scan every entry.
+    // entry was rejected above). Scan every entry, exactly as before.
     #[cfg(test)]
     FALLBACK_SCANS.with(|n| n.set(n.get() + 1));
     for i in 0..archive.len() {
@@ -809,8 +810,8 @@ pub struct RevertOpts {
 }
 
 impl RevertOpts {
-    /// The default revert: the artifact directory is deleted on a
-    /// successful wet revert.
+    /// The classic revert shape every `dry_run: bool` caller used: the
+    /// artifact directory is deleted on a successful wet revert.
     pub fn new(dry_run: bool) -> Self {
         Self {
             dry_run,
@@ -827,7 +828,7 @@ pub struct RevertOutcome {
     pub error: Option<String>,
     /// True when the backend deliberately KEPT the artifact uuid dir
     /// because at least one wiring record was left alone during the
-    /// restore (a `vendor_lock_entry_drifted` skip). The
+    /// restore (a `vendor_lock_entry_drifted` skip — residual #131). The
     /// entry's recorded pre-vendor originals and vendored blob may be the
     /// only surviving inputs a later restore needs (the lockfile — or the
     /// hosted redirect ledger's recorded `original` fragments — can still
@@ -1365,7 +1366,7 @@ mod harvest_tests {
         assert!(harvest_artifact_blobs(&project, &patches).await.is_empty());
     }
 
-    /// Release a reader wedged in `open(2)` on `fifo` (an unguarded open) so
+    /// Release a reader wedged in `open(2)` on `fifo` (pre-fix behavior) so
     /// the tokio blocking pool can shut down; the write side closing
     /// immediately EOFs the read.
     #[cfg(unix)]
@@ -1515,15 +1516,15 @@ mod harvest_tests {
         );
     }
 
-    // ── The name-seeking harvest against an exhaustive-scan oracle ──────
+    // ── The name-seeking harvest against the scan it replaced ───────────
     // `harvest_zip_blobs` returns the same blobs whichever path produced
     // them, which is what makes it safe and also what makes a scenario test
     // blind to the path: every test below still passes with the name lookup
-    // deleted. The oracle pins the RESULT against an exhaustive scan, and
+    // deleted. The oracle pins the RESULT against the pre-change scan, and
     // `fallback_scans_of` pins the PATH.
 
-    /// Reference oracle: a whole-archive scan over the hashes a record
-    /// needs, reading every entry.
+    /// The whole-archive scan `harvest_zip_blobs` replaced, verbatim, over
+    /// the hashes a record needs.
     fn exhaustive_scan(path: &Path, needed: &HashSet<&str>) -> HashMap<String, Vec<u8>> {
         use std::io::Read as _;
 
@@ -2285,9 +2286,9 @@ mod berry_migration_risk_tests {
     }
 
     /// Run the sync probe on another thread with a timeout: a FIFO planted
-    /// at either probed path would wedge an unguarded `read_to_string` in
+    /// at either probed path wedged the pre-fix `read_to_string` in
     /// `open(2)` forever — and the probe runs unconditionally at
-    /// envelope-finalize time on EVERY vendor / scan --mode vendored run.
+    /// envelope-finalize time on EVERY vendor / scan --vendor run.
     #[cfg(unix)]
     fn probe_with_timeout(root: &Path, fifo: &Path) -> Option<VendorWarning> {
         let root = root.to_path_buf();

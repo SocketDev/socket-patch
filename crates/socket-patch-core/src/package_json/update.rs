@@ -709,7 +709,7 @@ mod tests {
     /// `os.EOL`, so CRLF; an editor may add a BOM; some tools drop the final
     /// newline) must keep its layout through `setup`, and `setup --remove`
     /// must land byte-identical on the pre-setup file. serde's serializer
-    /// emits bare `\n` and no BOM, which would flip every line to LF — a
+    /// emits bare `\n` and no BOM, which used to flip every line to LF — a
     /// whole-file diff yarn then keeps (it follows the majority ending).
     #[tokio::test]
     async fn test_setup_then_remove_round_trips_crlf_bom_and_final_newline_shape() {

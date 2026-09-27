@@ -24,11 +24,13 @@ use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, RunWarnin
 pub const UPDATE_TARGET: &str = env!("SOCKET_PATCH_TARGET");
 
 // `socket-patch --update --help` must describe the public `--update`
-// flag, not the hidden `self-update` subcommand it is rewritten to. lib.rs
-// sets an explicit `about`/`override_usage` on the hidden variant, and this
-// template keeps `--update --help` on the public wording; both are pinned by
-// lib.rs `update_help_shows_self_update_help` and help_text_hygiene
-// `self_update_help_shows_the_public_spelling`.
+// flag, not the hidden `self-update` subcommand it is rewritten to. The
+// variant's doc comment in lib.rs (developer notes) becomes the
+// subcommand's `about` and is applied after these attributes, so the help
+// text is fixed through a template that never renders `{about}`.
+// (The usage line still reads `socket-patch self-update ...`: lib.rs's
+// `update_help_shows_self_update_help` pins that; overriding it to
+// `socket-patch --update [VERSION] [OPTIONS]` belongs with that test.)
 #[derive(Args)]
 #[command(
     help_template = "Update socket-patch itself to the latest release (or to VERSION).\n\n\

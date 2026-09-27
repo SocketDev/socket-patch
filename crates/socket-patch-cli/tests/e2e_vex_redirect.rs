@@ -384,7 +384,8 @@ fn redirected_no_verify_attests_without_installed_tree() {
     let purl = "pkg:npm/left-pad@1.3.0";
 
     // No node_modules, no manifest — the redirect ledger is the only record
-    // source. The ledger alone does not attest; the lockfile must still wire the hosted patch (see the gated twin below),
+    // source. DELIBERATE CHANGE: the ledger alone no longer attests; the
+    // lockfile must still wire the hosted patch (see the gated twin below),
     // so the fixture carries the rewrite `scan --redirect` recorded.
     write_redirect_state(
         cwd,
@@ -635,7 +636,8 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
 
     // The ledger records both halves `scan --redirect` persists: the
     // records AND the file edits (whose files still carry each patch's
-    // hosted wiring — the liveness proof the ledger record needs).
+    // hosted wiring — the liveness proof for formats lockfile discovery
+    // does not read yet).
     let mut state = RedirectState::new();
     for (purl, ghsa, eco, uuid) in cases {
         state.records.insert(
@@ -704,10 +706,11 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 4b. The redirect ledger alone does not attest.
+// 4b. DELIBERATE CHANGE — the redirect ledger alone no longer attests.
 // A record whose hosted wiring the lockfile no longer carries (no lockfile,
 // or one reverted to the registry) is `redirect_unwired`, INCLUDING under
 // `--no-verify`: the gate is about what the build consumes, not hashing.
+// Before, both shapes attested `(redirected)` — a false `not_affected`.
 // ──────────────────────────────────────────────────────────────────────
 
 /// `vex --json --output` in `cwd` (hermetic: no ambient token or socket-cli
@@ -1274,10 +1277,10 @@ fn hosted_takeover_of_a_vendored_package_attests_the_hosted_patch() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 8. Core discover rule 11: a redirect ledger record whose patch the
-// lockfiles still MENTION, but only in a shape the package manager does not
-// consume, is dead — the ledger fallback never re-derives "live" from the
-// raw text the extractor already rejected.
+// 8. REGRESSION (core discover rule 11): a redirect ledger record whose
+// patch the lockfiles still MENTION, but only in a shape the package
+// manager does not consume, is dead — the ledger fallback no longer
+// re-derives "live" from the raw text the extractor already rejected.
 // ──────────────────────────────────────────────────────────────────────
 
 /// A committed hosted-rewriter golden (`crates/socket-patch-core/tests/
@@ -1492,15 +1495,15 @@ fn rejected_hosted_wiring_never_keeps_a_redirect_ledger_alive() {
     }
 }
 
-/// No false attestation: the ledger's hosted wiring lives in one
+/// REGRESSION (false attestation): the ledger's hosted wiring lives in one
 /// lock while a SIBLING lock resolves the same version from the registry —
 /// a stale `yarn.lock` beside the hosted `package-lock.json`, a registry
 /// `uv.lock` (what `uv sync --frozen` installs) beside a hosted
 /// `requirements.txt`, a registry `vlt-lock.json` beside a hosted
 /// `package-lock.json`. Which one the build installs from depends on the
 /// package manager that runs, so the record is not attested
-/// (`redirect_unwired`, with a note naming the contesting lock). Without the
-/// stale lock it attests.
+/// (`redirect_unwired`, with a note naming the contesting lock) where it
+/// used to be `not_affected (redirected)`. Without the stale lock it attests.
 #[test]
 fn a_sibling_lock_resolving_the_registry_contests_a_ledger_record() {
     const U: &str = "5e1f0a3c-2b4d-4c6e-8f10-123456789abc";

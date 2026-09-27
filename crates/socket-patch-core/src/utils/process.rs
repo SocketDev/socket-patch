@@ -23,10 +23,10 @@ use std::process::Command;
 /// The executable `name` on ABSOLUTE `PATH` entries only, or `None` when
 /// no entry holds one.
 ///
-/// Shared by every tool the CLI spawns from inside a scanned project
-/// (`git`, `vlt`, `node`, `pipenv`): a relative `PATH`
-/// component (`.`, an empty string) resolves against the child's cwd, so a
-/// bare `Command::new("git")` would execute a `git` planted in the repository
+/// Shared by every tool the CLI spawns with the scanned project as its
+/// working directory (`bun`, `pipenv`): a relative `PATH` component (`.`,
+/// an empty string) resolves against the child's cwd, so a bare
+/// `Command::new("bun")` would execute a `bun` planted in the repository
 /// being scanned — and on macOS `posix_spawnp` can run BOTH the planted
 /// file and the next absolute entry's binary for one spawn. Skipping
 /// non-absolute entries closes that; callers must then spawn the RESOLVED
@@ -34,7 +34,7 @@ use std::process::Command;
 ///
 /// On Windows every `PATHEXT` extension is tried (falling back to
 /// `.exe`/`.bat`/`.cmd` when the variable is unset or empty), so an npm-global
-/// `vlt.cmd` / pyenv-win `pipenv.bat` shim is found where Rust's own
+/// `bun.cmd` / pyenv-win `pipenv.bat` shim is found where Rust's own
 /// `Command` resolution — which appends only `.exe` — would report NotFound.
 /// A plain file without execute permission is skipped like execvp does.
 pub fn resolve_tool(name: &str) -> Option<PathBuf> {
@@ -189,7 +189,7 @@ mod tests {
     }
 
     /// Exit 0 but stdout is empty → None. This is the fourth arm of
-    /// the contract. A successful command
+    /// the contract and was previously untested. A successful command
     /// that prints nothing carries no information for the crawlers.
     #[cfg(unix)]
     #[test]

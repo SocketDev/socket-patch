@@ -414,7 +414,7 @@ mod tests {
                 .contains("non-UTF-8 file name in staged package"),
             "unexpected error: {err}"
         );
-        // The error fires while packing in memory, before atomic_write_artifact:
+        // The error fires while packing in memory, before atomic_write_bytes:
         // a failed pack must leave no torn artifact behind.
         assert!(
             !dest.exists(),

@@ -453,7 +453,7 @@ mod tests {
         ));
     }
 
-    /// IntegrityMismatch is a hard error in EVERY mode — under the
+    /// AUDIT B3: IntegrityMismatch is a hard error in EVERY mode — under the
     /// default `auto` the Tier-A copy must refuse, never fall back to a local
     /// rebuild on tampered bytes (the enum's own contract: "never fall back").
     #[tokio::test]
@@ -536,7 +536,8 @@ mod tests {
     }
 
     /// The h1-dirhash verify's SUCCESS continuation: a service archive whose
-    /// golang `h1:` dirhash matches its zip contents passes through to Ready.
+    /// golang `h1:` dirhash matches its zip contents passes through to Ready
+    /// (only the mismatch side of this gate had ever executed).
     #[tokio::test]
     async fn ready_when_golang_h1_dirhash_matches() {
         let server = MockServer::start().await;

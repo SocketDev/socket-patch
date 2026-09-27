@@ -393,9 +393,9 @@ async fn rerun_is_idempotent() {
     );
     assert_eq!(env["summary"]["failed"], 0);
     assert_eq!(env["summary"]["skipped"], 1);
-    // The in-sync re-run is a counted skip with reason `already_vendored`
-    // (distinct from the `vendored` tag `apply` uses for vendor-owned
-    // packages) — pin the actual contract.
+    // The in-sync re-run synthesizes its result against the vendored
+    // artifact path, which routes to the `vendored` skip reason (the same
+    // tag `apply` uses for vendor-owned packages) — pin the actual contract.
     let skipped = find_event(&env, "skipped", Some("already_vendored"));
     assert_eq!(skipped["purl"], PURL);
 
@@ -1547,17 +1547,23 @@ async fn vendored_npm_purl_skipped_even_without_installed_tree() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 10a′. rollback after vendor — vendoring is reverted
+// 10a′. rollback after vendor — vendored purls are excluded
 // ─────────────────────────────────────────────────────────────────────
 
-/// `rollback` reverts vendor-owned purls (lock restored byte-for-byte,
-/// artifact + ledger entry gone, manifest entry removed), surfaced in
-/// `vendoredReverted`; both the unscoped and identifier-scoped spellings
-/// act.
+/// `rollback` excludes vendor-owned purls from in-place restoration: the
+/// patch lives in the committed artifact + lock wiring, so before-blob
+/// restoration has nothing to restore (and would only hash-mismatch).
+/// The skip is benign (exit 0) and surfaced in the JSON `vendored` array;
+/// an identifier that targets ONLY a vendored purl is still exit 0, not
+/// `not_found`.
 #[tokio::test]
 async fn vendored_purl_excluded_from_rollback() {
-    // The fixture is re-vendored between the unscoped and the
-    // identifier-scoped runs.
+    // v4 duality rework: `rollback` REVERTS vendored state by default —
+    // lock restored byte-for-byte, artifact + ledger entry gone, manifest
+    // entry removed. (The pre-v4 benign skip is what `--preserve-state`'s
+    // artifact/entry retention replaced.) Both the unscoped and the
+    // identifier-scoped spellings act; the fixture is re-vendored between
+    // them.
     let fx = npm_fixture();
     // The default rollback now removes the manifest entry AND sweeps the
     // now-unused blobs, and re-vendoring needs both back — snapshot the
@@ -2650,8 +2656,9 @@ async fn scan_vendor_gem_end_to_end_and_reverts() {
 /// the served patch records carry the QUALIFIED gem purl (`?platform=ruby`)
 /// — the spelling production has published since the 2026-08-18 gem catalog
 /// republish. `platform=ruby` is the portable default: the vendor gate
-/// refuses only non-empty, non-`ruby` platform qualifiers, so this must
-/// vendor exactly like the bare purl (never `platform_gem_unsupported`);
+/// refuses only non-empty, non-`ruby` platform qualifiers (#172), so this
+/// must vendor exactly like the bare purl. This is the CLI-level pin that
+/// keeps the old `platform_gem_unsupported` gap from silently reopening;
 /// the core-level twin is
 /// `vendor::gem::tests::test_platform_ruby_gem_from_autofetch_staging_dir_vendors`.
 #[tokio::test]
@@ -2983,8 +2990,8 @@ async fn scan_vendor_gem_artifact_rebuild_over_other_uuid_entry_keeps_ledger() {
 //     not the grant-tokenized hosted splice — and a re-vendor
 //     (`already_vendored`) is silent,
 //   * `vendor --revert` therefore restores the REGISTRY lock byte-exactly
-//     (never an expiring hosted URL with no CLI path back to registry
-//     state).
+//     (pre-#206 it restored an expiring hosted URL with no CLI path back to
+//     registry state).
 mod hosted_to_vendor_conversion {
     use super::*;
     use serial_test::serial;
@@ -3233,7 +3240,7 @@ snapshots:
 
         // The pre-revert leaves nothing to supersede, so the
         // vendor_supersedes_redirect warning must not fire — not on this run
-        // and not on any later one.
+        // (pre-#206 it fired here) and not on any later one.
         assert!(
             takeover_warnings(&env1).is_empty(),
             "the pre-revert must preempt vendor_supersedes_redirect: {env1:#}"
@@ -3420,10 +3427,13 @@ snapshots:
 /// orchestrator must ALSO keep the artifact dir and the state.json entry,
 /// and account for it honestly — a COUNTED `Skipped` (`vendor_revert_kept`),
 /// never a `Removed`. Undoing the drift and re-running `--revert` then
-/// completes the revert fully. Deleting the artifact dir or pruning the
-/// ledger entry here would destroy the only pre-vendor originals a later
-/// restore (or the redirect ledger's recorded `original` fragments) could
-/// use.
+/// completes the revert fully.
+///
+/// Previously (residual #131) this path deleted the artifact dir and pruned
+/// the ledger entry while the lock stayed pointed elsewhere — destroying the
+/// only pre-vendor originals a later restore (or the redirect ledger's
+/// recorded `original` fragments) could use — and reported plain success
+/// with `summary.skipped == 0`.
 #[tokio::test]
 async fn revert_after_drift_keeps_artifact_and_ledger_then_completes() {
     let fx = npm_fixture();

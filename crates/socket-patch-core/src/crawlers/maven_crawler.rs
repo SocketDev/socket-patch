@@ -1585,7 +1585,7 @@ mod tests {
     #[test]
     fn test_parse_pom_skip_section_close_tag_with_whitespace() {
         // XML permits whitespace before `>` in a closing tag (`</build >`).
-        // An exact `</build>` match would miss it, leaving `build` open and
+        // The exact `</build>` match used to miss it, leaving `build` open and
         // leaking the plugin's coordinates. The boundary-aware close handles it.
         let content = r#"<project>
   <groupId>com.example</groupId>

@@ -56,6 +56,7 @@ pub(super) async fn inventory_gemfile_lock_raw_in(
     for section in &gem_sections {
         let remotes: Vec<&str> = section.remote_bases().collect();
         for spec in section.specs.iter().filter_map(|line| line.parsed) {
+            // Platform-suffixed specs are unsupported for vendoring anyway.
             if spec.platform.is_some() {
                 continue;
             }

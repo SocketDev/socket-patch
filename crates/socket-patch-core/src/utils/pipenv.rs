@@ -40,12 +40,13 @@ fn parse_major(output: &str) -> Option<u32> {
 }
 
 /// The `pipenv` executable, searched on ABSOLUTE `PATH` entries only: the
-/// CLI runs inside the project being scanned, so a relative entry (`.`, an
-/// empty component) would execute a `pipenv` planted in that repository. On Windows every `PATHEXT` extension is tried,
+/// probe runs with the project as its working directory, so a relative entry
+/// (`.`, an empty component) would execute a `pipenv` planted in the
+/// repository being scanned. On Windows every `PATHEXT` extension is tried,
 /// so `pipenv.exe` and the `pipenv.bat` / `pipenv.cmd` shims (pyenv-win,
 /// hand-written wrappers) are both found. The rule lives in
 /// [`crate::utils::process::resolve_tool_with`], shared with every other
-/// tool the CLI spawns inside a project (`git`, `vlt`, `node`).
+/// tool the CLI spawns inside a project (`bun`).
 fn resolve_on_path(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     crate::utils::process::resolve_tool_with("pipenv", var)
 }

@@ -496,7 +496,7 @@ struct PatchToRollback {
 /// satisfies that end state — so even a run whose in-scope targets ALL turn
 /// out not-installed exits 0 / `success`. Do not "fix" this into symmetry:
 /// `remove` also rides on it (it drops long-uninstalled entries from the
-/// manifest via `RollbackOutcome::not_installed`).
+/// manifest via its "No packages found to rollback" path).
 pub(crate) struct RollbackOutcome {
     /// No attempted rollback failed (per-package; see above).
     pub(crate) success: bool,
@@ -673,7 +673,11 @@ pub(crate) fn all_files_already_original(result: &RollbackResult) -> bool {
             .all(|f| f.status == VerifyRollbackStatus::AlreadyOriginal)
 }
 
-/// One `results[]` record of the rollback JSON envelope.
+/// Number of packages that have files which actually need restoring,
+/// used by the dry-run summary. Successful-but-already-original packages
+/// are no-ops reported on their own line, so they are excluded here —
+/// mirroring apply's dry-run split — to avoid double-counting them
+/// against "can be rolled back".
 fn result_to_json(result: &RollbackResult) -> serde_json::Value {
     serde_json::json!({
         "purl": result.package_key,
@@ -1024,7 +1028,7 @@ async fn run_vendored_leg(
 }
 
 /// Unwind the in-scope hosted redirects: per-purl reverts where they
-/// exist (cargo, npm-family, golang), and — when the scope covers the ENTIRE
+/// exist (cargo + npm-family), and — when the scope covers the ENTIRE
 /// record set — the whole-ledger reverse replay for everything else.
 /// Mutates `state`; the caller persists on wet runs.
 pub(crate) async fn run_hosted_leg(
@@ -1240,7 +1244,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // Rollback infers what to undo from the three state stores: the
     // manifest (in-place/agent patches), the vendor ledger (vendored
     // patches), and the redirect ledger (hosted lockfile redirects). A
-    // missing manifest is not fatal when a ledger holds work.
+    // missing manifest is no longer fatal when a ledger holds work.
     //
     // Only cheap EXISTENCE probes happen before the lock (they decide the
     // truly-empty error path, which never locks: acquiring would create
@@ -2478,13 +2482,18 @@ pub(crate) async fn rollback_patches_inner(
     // actually attempt to restore in place:
     //
     //   * Narrowed-away sibling variants (they describe a distribution
-    //     that is not on disk) don't gate: that variant is never attempted.
+    //     that is not on disk) don't gate: an unfetchable sibling
+    //     before-blob used to abort the WHOLE rollback even though that
+    //     variant was never going to be attempted.
     //   * In-scope purls the crawler could NOT resolve (package not
     //     installed) don't gate either: there is nothing on disk to
-    //     restore, so no before-blob is ever read for them (apply reports
-    //     the same entry as a benign `package_not_installed` skip). They
-    //     surface via `not_installed` below instead.
-    //   * Local-redirect PURLs (local-mode go) are excluded:
+    //     restore, so no before-blob is ever read for them. They used to
+    //     be gated "fail-closed", which hard-failed the run (exit 1,
+    //     `Cannot roll back: ... Before blob not found`, `path: ""`) over
+    //     an entry that had nothing to roll back — the same entry apply
+    //     reports as a benign `package_not_installed` skip. They surface
+    //     via `not_installed` below instead.
+    //   * Local-redirect PURLs (local-mode go) are excluded as before:
     //     their rollback just drops the project-local redirect + copy and
     //     reads no blobs, so a missing before-blob must not block an
     //     offline redirect rollback.
@@ -2728,9 +2737,9 @@ pub(crate) async fn rollback_patches_inner(
         // (rollback's "had no matching installed package" warning,
         // remove's crawler-miss warning).
         //
-        // `success: true` — not-installed entries already satisfy
-        // rollback's end state (see `RollbackOutcome`); callers report
-        // `not_installed` as an informational warning, never an exit 1.
+        // `success: true` — per-package semantics for the `remove`
+        // delegation. The CLI boundary layers apply's "nothing matched at
+        // all" exit-1 on top via `not_installed`.
         return Ok(RollbackOutcome {
             success: true,
             results: Vec::new(),
@@ -2835,8 +2844,9 @@ mod tests {
     // The returned `bool` is `RollbackOutcome::success` — per-package semantics
     // only. Manifest entries whose package is not installed are NOT failures
     // here (there is nothing on disk to restore), so `remove` proceeds to drop
-    // them from the manifest. Like the CLI boundary, not-installed entries
-    // never fail the run (see `RollbackOutcome`).
+    // them from the manifest; the CLI `rollback` boundary's apply-mirroring
+    // "none matched → exit 1" rule deliberately does NOT apply to this
+    // delegation (it would wedge `remove` for packages long uninstalled).
     //
     // The `not_installed` element exists because that drop is IRREVERSIBLE in a
     // way a genuine rollback is not: "not installed" can also mean "installed
@@ -3298,9 +3308,11 @@ mod tests {
         );
     }
 
-    /// Cargo patches in place (vendored or registry cache) and rolls back
-    /// from before-blobs like npm/pypi, so the before-blob gate must NOT
-    /// exclude a cargo PURL: a missing cargo before-blob is a real problem.
+    /// Cargo now patches in place (vendored or registry cache) and rolls back
+    /// by restoring from before-blobs — exactly like npm/pypi. So a cargo PURL
+    /// must NOT be excluded by the before-blob gate: a missing cargo before-blob
+    /// IS a real problem the gate should surface. This guards against cargo
+    /// being mistakenly reclassified as a redirect again.
     #[tokio::test]
     async fn gate_manifest_keeps_cargo_before_blobs_in_missing_check() {
         let mut patches = HashMap::new();
@@ -3341,11 +3353,13 @@ mod tests {
         assert!(!is_local_go("pkg:cargo/serde@1.0.0", &common));
     }
 
-    /// Local-GO redirects must be excluded from the before-blob gate (cargo
-    /// is not — it restores in place). A go redirect drops the `go.mod`
+    /// Regression: local-GO redirects must be excluded from the before-blob
+    /// gate exactly like local-cargo. A go redirect drops the `go.mod`
     /// `replace` directive + the patched copy and reads no before-blob, so a
     /// missing before-blob must not abort (nor trigger a needless download for)
-    /// an offline local-go rollback.
+    /// an offline local-go rollback. Before the fix only cargo was excluded, so
+    /// a local-go patch with an absent before-blob aborted the whole rollback
+    /// under `--offline`.
     #[tokio::test]
     async fn gate_manifest_excludes_local_go_before_blobs_from_missing_check() {
         let mut patches = HashMap::new();
@@ -3373,8 +3387,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Full manifest: the go before-blob shows up as missing, which an
-        // unfiltered gate would spuriously abort on.
+        // Full manifest: the go before-blob shows up as missing — exactly what
+        // the buggy (cargo-only) gate left in, spuriously aborting rollback.
         let full_missing = get_missing_before_blobs(&manifest, blobs).await;
         assert!(full_missing.contains("go_before"));
 
@@ -3425,9 +3439,13 @@ mod tests {
 
     /// Regression: rolling back a local-GO patch must DROP the project-local
     /// redirect (the `go.mod` `replace` directive + the patched copy under
-    /// `.socket/go-patches/`), not fall through to in-place rollback against
-    /// the pristine module cache (a silent "already original" no-op that
-    /// leaves the build using the patched copy).
+    /// `.socket/go-patches/`), not fall through to in-place rollback.
+    ///
+    /// Before the fix, `rollback` only had a cargo redirect backend; a go PURL
+    /// fell through to `rollback_package_patch` against the pristine module
+    /// cache, every file verified `AlreadyOriginal`, and the redirect was left
+    /// active — a silent no-op that reported "already original" while the build
+    /// kept using the patched copy.
     #[tokio::test]
     async fn try_rollback_local_go_drops_redirect_and_copy() {
         use socket_patch_core::vendor::go_mod_edit::{
@@ -3514,7 +3532,10 @@ mod tests {
     /// rolled back. The engine leaves `files_rolled_back` empty on dry-run
     /// (verify only — `rollback_package_patch` pushes into it only on the
     /// mutating path), and the JSON envelope counts `rolledBack` from a
-    /// non-empty `files_rolled_back`.
+    /// non-empty `files_rolled_back`. Before the fix the go backend populated
+    /// it unconditionally, so `rollback --dry-run --json` reported
+    /// `rolledBack: 1` (with the files listed in `filesRolledBack`) for a run
+    /// that mutated nothing.
     #[tokio::test]
     async fn try_rollback_local_go_dry_run_reports_no_files_rolled_back() {
         use socket_patch_core::vendor::go_mod_edit::{
@@ -3780,10 +3801,16 @@ mod tests {
 
     // --- Before-blob gate `--ecosystems` scoping --------------------------
     //
+    // Twin of apply's (fixed) "offline guard unscoped" bug: the gate must
+    // only consider patches this run can actually roll back — the
+    // `--ecosystems` filter.
+
     /// Regression: an out-of-scope patch's missing before-blob must not abort
-    /// an `--ecosystems`-scoped rollback (`rollback --ecosystems npm --offline`
-    /// must not fail on a pypi patch it never touches, nor download for it
-    /// online).
+    /// an `--ecosystems`-scoped rollback. Before the fix the gate ran on the
+    /// identifier-filtered manifest BEFORE `partition_purls`, so
+    /// `rollback --ecosystems npm --offline` aborted the whole run because a
+    /// pypi patch — which this run would never touch — was missing its
+    /// before-blob (and online, the gate triggered needless downloads for it).
     #[tokio::test]
     async fn before_blob_gate_ignores_ecosystem_filtered_patches() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3938,9 +3965,10 @@ mod tests {
     }
 
     /// Regression (rollback ordering): a manifest entry whose package is
-    /// NOT installed must never enter the before-blob plan: its missing
-    /// before-blob must not hard-fail an offline run with nothing on disk to
-    /// roll back. Through the
+    /// NOT installed must never enter the before-blob plan. Before the gate
+    /// reorder, its missing before-blob hard-failed the whole offline run
+    /// (exit 1, `Cannot roll back: ... Before blob not found`, `path: ""`)
+    /// even though there was nothing on disk to roll back. Through the
     /// `remove`-facing delegation this is a benign no-op: success with zero
     /// results, exactly as when the blob IS present — so `remove` can drop
     /// the entry of a long-uninstalled package either way.

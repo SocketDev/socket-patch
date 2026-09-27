@@ -5,10 +5,12 @@
 //! `--strict` refuses, `--force` also skips missing files (see
 //! `apply_network.rs::apply_hash_mismatch_default_warns_and_applies_strict_fails`).
 //! Release-variant ecosystems (gem/pypi/maven) route through the variant
-//! loop instead, whose installed-distribution gate must still let the
-//! default policy reach an UNQUALIFIED SINGLETON base (one bare manifest
-//! record for the `package@version`, the common case) with a
-//! locally-modified file: warn-overwrite, not "no matching variant found".
+//! loop instead, whose installed-distribution gate used to skip ANY
+//! variant whose representative file mismatched — making the default
+//! policy unreachable for them: an UNQUALIFIED SINGLETON base (one bare
+//! manifest record for the `package@version`, the common case) with a
+//! locally-modified file failed with "no matching variant found" instead
+//! of warn-overwriting.
 //!
 //! Behaviors pinned (all offline, real binary, synthetic gem trees):
 //!   * unqualified singleton + locally-modified file: default apply warns
@@ -166,7 +168,8 @@ fn singleton_fixture(cwd: &Path) -> (PathBuf, Vec<u8>) {
 
 /// Default policy: the singleton's local modification is overwritten with
 /// the full verified patched content and surfaced as a warning — the same
-/// npm contract, not "no matching variant found" with the file untouched.
+/// npm contract, previously unreachable for gem (the run failed with
+/// "no matching variant found" and left the file untouched).
 #[test]
 fn singleton_mismatch_default_warns_and_applies() {
     let tmp = tempfile::tempdir().expect("tempdir");

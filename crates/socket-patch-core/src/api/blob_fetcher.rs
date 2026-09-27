@@ -180,8 +180,7 @@ pub async fn fetch_blobs_by_hash(
 
 /// Return the set of patch UUIDs whose archive at
 /// `<archives_dir>/<uuid>.tar.gz` is missing from disk. Used as the
-/// "what do I need to download" query for diff mode, and as a presence
-/// check for locally staged package archives (`.socket/packages/`).
+/// "what do I need to download" query for diff and package modes.
 pub async fn get_missing_archives(
     manifest: &PatchManifest,
     archives_dir: &Path,

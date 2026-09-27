@@ -7,11 +7,13 @@
 //! the skip itself: `crawl_scope`'s unit test pins the decision and
 //! `ecosystem_dispatch`'s `scoped_crawl_is_the_full_crawl_filtered_to_its_ecosystems`
 //! pins that a scoped crawl never runs the other crawlers. What these pin
-//! is the lockfile-only count: a scoped run cannot tell whether a skipped
-//! ecosystem's entry is installed, so `lockfileOnlyPackages` counts the
-//! selected ecosystems only. A GC run still crawls everything — the prune
-//! judges every manifest entry against the full installed set — and keeps
-//! the all-ecosystem count (and keeps an installed crate of an unselected
+//! is the one output that used to see past the filter, the lockfile-only
+//! count: a selected-ecosystem scan counted the OTHER ecosystems'
+//! uninstalled lockfile entries too. A scoped run cannot tell whether a
+//! skipped ecosystem's entry is installed, so `lockfileOnlyPackages` now
+//! counts the selected ecosystems only. A GC run still crawls everything —
+//! the prune judges every manifest entry against the full installed set —
+//! and keeps the old count (and keeps an installed crate of an unselected
 //! ecosystem out of the prune).
 //!
 //! The fixture: an npm project (one installed package, one lockfile-only)

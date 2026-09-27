@@ -25,7 +25,7 @@
 //!      patch uuid survives into `vendor/composer/installed.json`
 //!      (`dist.reference`).
 //!      Then the **manifest-less VEX legs** run on that fresh checkout (the shape a
-//!      depscan PR / a `scan --mode vendored` checkout has): with
+//!      depscan PR / a `vendor --detached` checkout has): with
 //!      `.socket/manifest.json` deleted, standalone `vex` (and embedded
 //!      `vendor --vex` / `apply --vex`) still attests `(vendored)` from the
 //!      ledger; with both ledgers deleted too it attests from the
@@ -200,8 +200,7 @@ fn lock_entry(lock_path: &Path, name: &str) -> serde_json::Value {
 /// `.socket/` manifest + blob fully offline, while `get <uuid> --mode
 /// vendored` fetches the record from the mocked API (the uuid path is
 /// exempt from installed narrowing, so only the `view/{uuid}` route is
-/// needed), writes NO manifest (the vendor ledger's detached entry is the
-/// record), and stages patch content in memory
+/// needed), writes the manifest itself, and stages patch content in memory
 /// — `.socket/blobs` must stay absent. `--vendor-source build` keeps the
 /// get flow off the vendoring service (no grant/tarball mocks needed).
 enum VendorDriver<'a> {
@@ -575,7 +574,7 @@ fn assert_manifestless_vendored_vex(
 // ── the capstone ──────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
+#[ignore = "host capstone: shells out to a real composer 2; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
 fn composer_vendor_fresh_checkout_install_and_revert() {
     let Some(major) = composer_e2e_common::composer_major("e2e_vendor_composer_build") else {
@@ -774,15 +773,14 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
 /// get's uuid path — exempt from installed narrowing, so only the mocked
 /// `view/{uuid}` route is needed. Unlike the capstone, NOTHING is staged
 /// locally: the record and the patched content come from the API mock, get
-/// writes NO manifest (the ledger's detached entry in
-/// `.socket/vendor/state.json` is the record), and `.socket/blobs` must stay
+/// writes `.socket/manifest.json` itself, and `.socket/blobs` must stay
 /// absent (vendored downloads live in memory). Ends with the same
 /// fresh-checkout `composer install` proof; the revert half stays with the
 /// vendor capstone (same engine, same ledger).
 // multi_thread: the CLI/composer subprocesses block a worker thread while
 // wiremock keeps serving the view route on the others.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
+#[ignore = "host capstone: shells out to a real composer 2; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
 async fn composer_get_uuid_vendored_fresh_checkout_install() {
     let Some(major) = composer_e2e_common::composer_major("e2e_vendor_composer_build(get)") else {
@@ -927,9 +925,8 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
     // capstone — cold home + cache, path dist the only source.
     let fresh = assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
 
-    // Manifest-less VEX legs on the get-produced checkout: `get --mode
-    // vendored` writes no manifest, so this checkout already is the
-    // depscan / detached shape.
+    // Manifest-less VEX legs on the get-produced checkout: `get` wrote the
+    // manifest, so deleting it is exactly the depscan / detached shape.
     tokio::task::block_in_place(|| {
         assert_manifestless_vendored_vex(tmp.path(), &fresh, &purl, &patched, &lock_before, "get")
     });

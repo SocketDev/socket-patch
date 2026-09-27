@@ -1,8 +1,11 @@
 //! `remove --silent` contract tests.
 //!
-//! CLI_CONTRACT.md defines `--silent` as "Errors only": `remove`'s
-//! human-readable chatter (and the nested rollback's) must be muted, not
-//! just gated on `!json`. Runs fully offline: the patch record has no
+//! CLI_CONTRACT.md defines `--silent` as "Errors only". Regression
+//! guard: `remove` gated all of its human-readable chatter on `!json`
+//! alone, and passed only `json` as `rollback_patches`' silent param —
+//! so `remove --silent` printed everything. Same bug class previously
+//! fixed in `list`, `repair`, and `get`. Runs fully offline: the patch
+//! record has no
 //! files (so rollback fetches no blobs) and the project dir has no
 //! installed packages, so the internal rollback takes the
 //! "not installed" path and the manifest mutation needs no network.

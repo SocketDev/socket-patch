@@ -698,10 +698,12 @@ mod tests {
         assert!(is_lock_contended(&fs2::lock_contended_error()));
     }
 
-    /// Genuine I/O failures of `try_lock_exclusive` must NOT masquerade
-    /// as contention: a real fault (e.g. ENOLCK on a full kernel lock
-    /// table, or a filesystem without advisory locks) must never be
-    /// reported as "another process is operating here".
+    /// Regression: genuine I/O failures of `try_lock_exclusive` must
+    /// NOT masquerade as contention. Previously every error funnelled
+    /// into the retry/`Held` path, so a real fault (e.g. ENOLCK on a
+    /// full kernel lock table, or a filesystem without advisory locks)
+    /// was reported as "another process is operating here" — and, with
+    /// a positive timeout, only after busy-sleeping the entire budget.
     #[test]
     fn genuine_io_errors_are_not_contention() {
         use std::io::{Error, ErrorKind};
@@ -770,6 +772,8 @@ mod tests {
     fn overflowing_timeout_does_not_panic_when_free() {
         let dir = tempfile::tempdir().unwrap();
         let socket = socket_dir(&dir);
+        // Would panic ("overflow when adding duration to instant") under
+        // the old `Instant::now() + timeout`.
         let guard = acquire(&socket, Duration::from_secs(u64::MAX)).unwrap();
         assert!(socket.join("apply.lock").is_file());
         drop(guard);
@@ -779,7 +783,7 @@ mod tests {
     /// Regression companion: with an overflowing (effectively infinite)
     /// timeout AND a contended lock, `acquire` must *wait* — not panic
     /// and not give up — and then succeed once the holder releases.
-    /// Proves both that nothing overflows and that a `None` deadline
+    /// Proves both the no-overflow-panic fix and that a `None` deadline
     /// never spuriously elapses into `Held`. The holder's release also
     /// unlinks the file and prunes `.socket/`, so the parked waiter has
     /// to recreate both — the mkdir-inside-the-loop path.
@@ -801,8 +805,9 @@ mod tests {
             drop(dir2);
         });
 
-        // u64::MAX seconds: waits indefinitely and acquires once `held`
-        // drops above.
+        // u64::MAX seconds == astronomically large; under the bug this
+        // panics before ever sleeping. With the fix it waits indefinitely
+        // and acquires once `held` drops above.
         let start = Instant::now();
         let guard = acquire(&socket, Duration::from_secs(u64::MAX)).unwrap();
         let waited = start.elapsed();
@@ -828,8 +833,9 @@ mod tests {
     /// now, or nothing) and send it back around the loop, where it either
     /// wins the free window itself or sees the fresh holder and reports
     /// `Held`. Both are correct; two live guards at once is the bug this
-    /// pins, and the identity check makes it impossible, so every
-    /// iteration asserts it outright.
+    /// pins, and — unlike the pre-identity-check protocol, which merely
+    /// called that window "vanishingly rare" — it is now impossible, so
+    /// every iteration asserts it outright.
     #[test]
     fn waiter_does_not_lock_orphaned_inode_after_holder_release() {
         use std::sync::mpsc;
@@ -1090,7 +1096,8 @@ mod tests {
             }
         }
         // The fault arm returns without ever entering the retry/backoff
-        // path: nowhere near the 5 s budget.
+        // path: nowhere near the 5 s budget (the old funnel-everything-
+        // into-retry behaviour slept the full budget before erroring).
         assert!(
             elapsed < Duration::from_secs(1),
             "Io fault must not burn the retry budget, took {:?}",
@@ -1128,7 +1135,7 @@ mod tests {
     }
 
     /// The retry loop must not overshoot the deadline by a full sleep
-    /// quantum. A 150 ms budget should resolve well under an unclamped
+    /// quantum. A 150 ms budget should resolve well under the old
     /// fixed-100 ms-sleep worst case (~200 ms) — the final sleep is
     /// clamped to the remaining slice.
     #[test]
@@ -1147,7 +1154,7 @@ mod tests {
         );
         // Loose upper bound: clamped sleeps mean we don't blow well past
         // the budget. Generous slack keeps slow CI hosts non-flaky while
-        // still failing an unclamped sleep's pathological cases.
+        // still failing the old uncapped behaviour's pathological cases.
         assert!(
             elapsed < Duration::from_millis(450),
             "clamped sleep should keep us near the budget, got {:?}",

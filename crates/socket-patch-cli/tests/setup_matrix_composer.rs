@@ -94,8 +94,8 @@ mod host_guard {
 
     /// Assert composer.json is byte-for-byte what we wrote, AND that the
     /// project directory still contains *only* composer.json. The directory
-    /// check is the real teeth: after `--remove` the project must hold
-    /// NOTHING else — not an npm `package.json` hook, not a `.socket/`
+    /// check is the real teeth: a clean no-op for an unsupported ecosystem
+    /// must create NOTHING — not an npm `package.json` hook, not a `.socket/`
     /// dir, not a lockfile, not a `.pth`, nothing. Probing for one specific
     /// filename (`package.json`) would let any other foreign artifact through.
     fn assert_manifest_pristine(root: &Path, who: &str) {
@@ -120,7 +120,8 @@ mod host_guard {
     /// ecosystem: `setup` wires `socket-patch apply` into `composer.json`'s
     /// post-install/post-update script events, `--check` reflects it, and
     /// `--remove` restores the manifest byte-for-byte. Non-skippable (no Docker,
-    /// no PHP toolchain) — it edits composer.json directly.
+    /// no PHP toolchain) — it edits composer.json directly. This is the positive
+    /// twin of `composer_setup_is_a_clean_noop_host` (the two never co-exist).
     #[test]
     fn composer_setup_round_trips_host() {
         let tmp = tempfile::tempdir().unwrap();
@@ -222,8 +223,8 @@ mod host_guard {
     }
 
     /// The hook `setup` wires into a MANIFEST-LESS hosted / vendored
-    /// checkout (a depscan-opened PR, a `scan --mode vendored` or `scan
-    /// --mode hosted` project: the patches live in composer.lock, no
+    /// checkout (a depscan-opened PR, a `vendor --detached` or `scan
+    /// --redirect` project: the patches live in composer.lock, no
     /// `.socket/manifest.json`, no ledger). composer runs the hook after
     /// every install, so it must be a silent, write-free exit 0 there — and
     /// the same `apply` with `--vex` must attest the lockfile-wired patch

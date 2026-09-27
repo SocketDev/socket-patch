@@ -22,7 +22,7 @@
 //!   runs without it (its call skipped by the breaker, its plan position
 //!   passed over) builds in its own stage undisturbed.
 //! * Any failure — the extraction's own refusal included — just drops the
-//!   pre-staged tree: the backend then extracts live, exactly as without it,
+//!   pre-staged tree: the backend then extracts live, exactly as before,
 //!   and reports whatever that extraction reports, word for word.
 //! * The swap, the wiring, the marker and the ledger stay in the loop, in
 //!   record order; the backend claims the tree right where it would have

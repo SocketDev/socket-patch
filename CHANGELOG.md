@@ -65,8 +65,8 @@ into the new version's section — see docs/releasing.md.
   refusals were the vendor step's only failures (and when every selected
   package is refused this way, the human arm prints `Nothing was
   vendored: N patches failed (see above).`).
-  (The human `scan --mode vendored` arm still fetches the views its
-  baseline pre-check verifies.) Purls the hosted redirect ledger
+  (The interactive human `scan --vendor` arm still fetches the views its
+  pre-prompt baseline check verifies.) Purls the hosted redirect ledger
   claims keep the vendor loop's refusal. Because no view is fetched, the
   lock-text refusal now takes precedence over every outcome that came
   from the view: a package that would also have hit a paid-access 403, a
@@ -263,11 +263,6 @@ into the new version's section — see docs/releasing.md.
   malformed redirect ledger on a human hosted run that stops before the
   engine is reported as the read-only `Warning: the redirect ledger … is
   malformed` advisory instead of nowhere.
-- **`get` defaults to hosted mode too.** `socket-patch get <id>` (and the
-  bare-UUID shortcut `socket-patch <uuid>`) now redirects the package's
-  lockfile entry to its Socket-hosted patched copy, like `scan`. Agent mode
-  (manifest + in-place apply) is `--mode agent`, and stays the default with
-  `--save-only` or `--global`/`--global-prefix`.
 - **scan picks the newest merged patch.** When a package has several
   patches, `scan` (and `get`, and the `[UPDATE]` detection) now takes the
   newest merged patch (one that fixes several advisories in one blob — the
@@ -726,8 +721,8 @@ into the new version's section — see docs/releasing.md.
   already-redirected or already-vendored lock-only checkout re-confirms it;
   a lock that resolves only from private indexes is never looked up on
   pypi.org.
-- **Pipenv's out-of-tree virtualenv is discovered.** Discovery (`scan` in
-  every mode, `rollback`, `vex`) now finds `$WORKON_HOME/<dir>-<hash>[-<python>]` (the
+- **Pipenv's out-of-tree virtualenv is discovered.** Agent mode (bare `scan`,
+  `rollback`, `vex`) now finds `$WORKON_HOME/<dir>-<hash>[-<python>]` (the
   `.venv` file pointer, `PIPENV_CUSTOM_VENV_NAME` and `PIPENV_PIPFILE`
   included) exactly as Pipenv 7 through 2026 place it, instead of falling
   through to the global interpreter's site-packages.
@@ -1190,8 +1185,8 @@ into the new version's section — see docs/releasing.md.
     `--json`/`--silent`. `fetch`, `vendor`, `setup`, lock waits and
     `--update` checks now show progress instead of going quiet.
   - **Prompts:** Ctrl-D at a `[Y/n]` prompt now declines instead of
-    accepting. Keys pressed while a command is working no longer answer
-    the prompt that follows (`get`, `rollback`). The cursor is restored when a selection menu is
+    accepting. Keys pressed while a scan is running no longer answer the
+    prompt that follows. The cursor is restored when a selection menu is
     interrupted.
   - **Color:** `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE` and `TERM=dumb` are
     honored. Colored table rows now align.
@@ -1307,7 +1302,7 @@ into the new version's section — see docs/releasing.md.
   connect timeout (a blackholed endpoint no longer stalls every command for
   the full request budget), and `--update` maps only a contention errno to
   `update_in_progress` — other lock failures surface their real cause.
-- **A scan that writes nothing never creates `.socket/`.** Report-only, `--dry-run`,
+- **A normal `scan` never creates `.socket/`.** Report-only, `--dry-run`,
   zero-discovery and no-op runs (hosted or otherwise) no longer scaffold the
   directory or a lock file; a GC pass checks for a manifest before it locks.
 - **`apply --silent` on an all-unmatched manifest prints its error line** —

@@ -484,14 +484,17 @@ fn nuget_apply_deletes_metadata_and_records_files() {
     );
 }
 
-/// NuGet `has_signed_marker` non-UTF8 filename: a file with a non-UTF8
-/// name in the package directory is byte-matched (it is not a
-/// `.nupkg.sha512` marker) and left untouched. The fixup continues — no
-/// advisory; the `.nupkg.metadata` deletion still fires because we stage
-/// it too.
+/// NuGet `has_signed_marker` non-UTF8 filename skip: dropping a
+/// file with a non-UTF8 name into the package directory exercises
+/// the `entry.file_name().to_str()` None arm of
+/// `has_signed_marker`'s iteration (line 93). The fixup then
+/// continues — the sha512 marker isn't present, no advisory; the
+/// `.nupkg.metadata` deletion still fires because we stage it too.
 ///
-/// Unix-only (`OsStr::from_bytes` is Unix-gated). Skips where the
-/// filesystem rejects non-UTF8 names.
+/// Linux-only (`OsStr::from_bytes` is Unix-gated; macOS HFS+/APFS
+/// also accept arbitrary byte sequences in filenames). Falls back
+/// to a portable shape on other Unices where the filesystem
+/// rejects non-UTF8 names.
 #[cfg(unix)]
 #[test]
 fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
@@ -508,18 +511,26 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
         r#"{"contentHash":"deadbeef"}"#,
     )
     .unwrap();
-    // Drop a file with a non-UTF8 name into the package dir;
-    // `has_signed_marker` matches entries on their raw bytes, so this one
-    // is simply not a marker. Some networked filesystems reject non-UTF8
-    // names; skip there.
+    // Drop a file with a non-UTF8 name into the package dir. The
+    // sidecar's `has_signed_marker` iteration calls
+    // `entry.file_name().to_str()` on each entry; this one returns
+    // None and the iteration skips past it (covering line 93 of
+    // nuget.rs).
+    //
+    // APFS/HFS+/ext4 all accept arbitrary byte sequences in
+    // filenames; some networked filesystems may reject. If the
+    // filesystem rejects, skip — the iteration arm is exercised on
+    // the runners where it can run.
     let bad_name = OsStr::from_bytes(&[0xff, 0xfe, b'-', b'b', b'a', b'd']);
     let bad_path = pkg_dir.join(bad_name);
     if std::fs::write(&bad_path, b"binary").is_err() {
         eprintln!("SKIP: filesystem rejects non-UTF8 filenames");
         return;
     }
-    // Without the fixture this would pass as a plain `.nupkg.metadata`
-    // deletion and guard nothing.
+    // Precondition must be genuinely established — otherwise the rest of
+    // this test would pass as a plain `.nupkg.metadata` deletion without
+    // ever exercising the non-UTF8 `to_str() == None` skip arm it exists
+    // to lock. A silent no-op here would mean the test guards nothing.
     assert!(
         bad_path.exists(),
         "non-UTF8 fixture file must exist so has_signed_marker's None arm is reached"
@@ -586,7 +597,7 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
 /// converts that into a `sidecar_fixup_failed` advisory.
 ///
 /// Covers the non-NotFound arm of the remove_file match in
-/// `patch/sidecars/nuget.rs::fixup` — the path the existing
+/// `sidecars/nuget.rs` (lines 50-54) — the path the existing
 /// success and signed-package tests can't reach. As with the
 /// cargo equivalent, the directory-as-file ruse beats chmod
 /// because it fails uniformly across uids and platforms.

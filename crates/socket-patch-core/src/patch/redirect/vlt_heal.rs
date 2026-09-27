@@ -1,4 +1,4 @@
-//! Warm-tree heal for hosted vlt redirects.
+//! Warm-tree heal for hosted vlt redirects (DESIGN D7).
 //!
 //! vlt never refreshes a store entry it already holds: after the lock is
 //! repointed, `vlt install` keeps `node_modules/.vlt/<DepID>` and the
@@ -370,7 +370,7 @@ async fn bytes_check(dir: &Path, target: &Target<'_>, expected: Expected) -> Byt
 }
 
 /// Is `target`'s store entry stale against `expected`, healthy, or
-/// impossible to judge? The module doc states the rules.
+/// impossible to judge? See DESIGN §3.9 "Heal" for the rules.
 pub async fn classify_target(
     state: &InstallState,
     root: &Path,

@@ -339,7 +339,7 @@ async fn get_emits_patch_fetched_telemetry_on_uuid_lookup_success() {
         "license": "MIT",
         "description": "test patch",
         // A recordable new-file patch (afterHash is the git-blob sha256 of
-        // the decoded blobContent "patched\n"). A patch whose
+        // the decoded blobContent "patched\n"). Post-#158, a patch whose
         // applicable-files map is empty is a hard failure ("no applicable
         // files"), so the success path this test asserts needs a real file.
         "files": {
@@ -506,7 +506,9 @@ async fn apply_skips_telemetry_in_airgap_mode() {
 
     // Anti-vacuous guard: apply must have run its command body and emitted
     // its JSON result envelope (with a summary), proving the suppression
-    // wasn't a side effect of an early crash.
+    // wasn't a side effect of an early crash. (Apply on an empty manifest
+    // currently reports partialFailure — a separately tracked design gap —
+    // so we assert on the envelope shape, not the status string.)
     let v: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("apply stdout not JSON: {e}\n{stdout}"));
     assert_eq!(
@@ -862,14 +864,14 @@ async fn scan_flushes_background_telemetry_before_exit() {
 /// A consumer that exits early (`scan | head`, `scan | true`) closes
 /// stdout, and the CLI dies of SIGPIPE on its first result write (main
 /// restores SIG_DFL). The background send must already be delivered by
-/// then — flushed before that write —
-/// not lost with the process. Covers the empty-crawl and all-batches-failed
-/// terminals, which print right after the event fires (so they fail
-/// deterministically without the flush), and the hosted and vendored arms
-/// (flushed at `discover_selected`; the "plain envelope" case is a bare
-/// scan, i.e. hosted too). The hosted/vendored arms do enough work before
-/// printing that an unflushed send usually wins the race anyway, so for
-/// them this is a delivery check rather than a pin on the flush point.
+/// then — flushed before that write, as the inline send it replaced was —
+/// not lost with the process. Covers each JSON flush point: the empty-crawl
+/// and all-batches-failed terminals, the plain envelope, and the hosted and
+/// vendored arms (flushed at `discover_selected`). The first three print
+/// right after the event fires, so they fail deterministically without the
+/// flush; the hosted/vendored arms do enough work before printing that an
+/// unflushed send usually wins the race anyway, so for them this is a
+/// delivery check rather than a pin on the flush point.
 #[tokio::test]
 async fn scan_delivers_telemetry_before_writing_to_a_closed_stdout() {
     const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
@@ -972,11 +974,10 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stdout() {
 /// read-only consult) right after the scan event fires, BEFORE any stdout
 /// write — so with stderr closed that warning is the run's first
 /// SIGPIPE-raising write, and the background send must be flushed ahead of
-/// it. The agent preview (`--mode agent --dry-run`) does no network work
-/// between the event and the warning, so without the flush the delayed send
-/// deterministically loses the race (a bare scan is hosted and reads the
-/// ledger strictly, so it is not a case here); the vendored arm is covered
-/// too (its warning also precedes `discover_selected`'s flush).
+/// it, as the inline send it replaced always was. The plain envelope does
+/// no network work between the event and the warning, so without the flush
+/// the delayed send deterministically loses the race; the vendored arm is
+/// covered too (its warning also precedes `discover_selected`'s flush).
 #[tokio::test]
 async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
     const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);

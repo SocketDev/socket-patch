@@ -36,7 +36,7 @@ fn binary() -> &'static str {
 /// `--vex-product`/`SOCKET_VEX_PRODUCT`, `--vex-no-verify`/
 /// `SOCKET_VEX_NO_VERIFY`, `--vex-doc-id`, `--vex-compact`), as do the
 /// `GlobalArgs` (`SOCKET_OFFLINE`, `SOCKET_FORCE`, `SOCKET_API_TOKEN`,
-/// `SOCKET_ORG_SLUG`, …). If the ambient environment leaks any of these into
+/// `SOCKET_ORG`, …). If the ambient environment leaks any of these into
 /// the child, a test silently stops exercising the path it names —
 /// `apply_vex_failure_flips_exit_code` would no longer hit
 /// product-detection failure if `SOCKET_VEX_PRODUCT` were exported, and the
@@ -419,9 +419,11 @@ fn apply_json_envelope_carries_vex_summary() {
 }
 
 /// `--dry-run` applies nothing, so embedded VEX generation must be
-/// skipped entirely (verifying the deliberately-unapplied tree would
-/// classify every patch `not_applied` and exit 1 with
-/// `no_applicable_patches`). A dry run must exit 0, report no `vex` summary,
+/// skipped entirely. Before the fix, VEX ran anyway and verified the
+/// deliberately-unapplied tree: every patch classified `not_applied`,
+/// `build_document` produced nothing, and the whole command exited 1
+/// with `no_applicable_patches` even though the dry-run verification
+/// itself succeeded. A dry run must exit 0, report no `vex` summary,
 /// and never write an attestation file.
 #[test]
 fn apply_dry_run_skips_embedded_vex() {
@@ -510,8 +512,10 @@ fn apply_vex_failure_flips_exit_code() {
 
 /// `--silent` means "errors only", never "nothing" (CLI_CONTRACT): a
 /// requested-but-failed VEX still exits 1, and the failure message must
-/// reach stderr: the human-readable VEX status block must not gate its
-/// error arm on `!silent`. Same fixture as `apply_vex_failure_flips_exit_code`:
+/// reach stderr. Regression guard: the human-readable VEX status block
+/// gated ALL of its arms — the error arm included — on `!silent`, so
+/// `apply --silent --vex out.json` on a VEX failure exited 1 with zero
+/// diagnostic output. Same fixture as `apply_vex_failure_flips_exit_code`:
 /// apply succeeds offline, then product detection fails (no root
 /// package.json / git remote, no `--vex-product`).
 #[test]
@@ -722,9 +726,10 @@ fn apply_vex_product_non_iri_warns_in_human_mode() {
 
 /// Under `--json` the run-level VEX advisories are silenced on stderr
 /// (`note_warning` skips the print), so the envelope's `vex.warnings` is
-/// the ONLY channel they reach a consumer on: the embedded hosts' `vex`
-/// summary must carry them (not just `statements`), or a non-IRI product's
-/// warning would be absent from the envelope AND from stderr.
+/// the ONLY channel they reach a consumer on. Regression guard: the
+/// embedded hosts built their `vex` summary from `statements` alone, so a
+/// non-IRI product produced a warning that was invisible on exactly the
+/// machine channel — absent from the envelope AND absent from stderr.
 #[test]
 fn apply_json_vex_warnings_ride_in_envelope() {
     let tmp = tempfile::tempdir().expect("create tempdir");

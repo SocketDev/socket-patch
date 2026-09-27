@@ -236,9 +236,9 @@ async fn update_dry_run_checks_without_downloading() {
 }
 
 /// `--dry-run` on an ALREADY-CURRENT install still reports through the
-/// verified/update_check probe shape (`updateAvailable: false`), not the
-/// skipped/already_latest path, so scripts can branch on the documented
-/// probe fields.
+/// verified/update_check probe shape (`updateAvailable: false`) — review
+/// regression: it used to fall into the skipped/already_latest path,
+/// breaking scripts that branch on the documented probe fields.
 #[tokio::test]
 async fn update_dry_run_up_to_date_still_reports_probe_shape() {
     let install = staged_install();

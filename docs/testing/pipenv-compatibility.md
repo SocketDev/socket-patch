@@ -77,8 +77,9 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   interpreter's basename on 2026, the full string on 2018 and 11). The
   crawler reproduces it (and honours the `.venv` file pointer,
   `PIPENV_CUSTOM_VENV_NAME`, `PIPENV_PIPFILE`, `WORKON_HOME` and Pipenv's
-  case-insensitive-filesystem fallback) so an agent-mode `scan`/`rollback`
-  run outside `pipenv run` sees the project's venv.
+  case-insensitive-filesystem fallback) so a bare `scan`/`rollback` sees the
+  project's venv; before, it fell through to the global interpreter and
+  reported success while the venv stayed unpatched.
 - **CLI scope.** The CLI reads `<cwd>/Pipfile.lock` and discovers the
   project's venv from that directory; it does not walk up to a parent
   Pipfile the way Pipenv does (`PIPENV_MAX_DEPTH`) and does not follow
@@ -120,7 +121,7 @@ rejection, what `pipenv lock` does to the entry, rollback after that relock
 hybrid that still carries our reference rolls back to the original entry),
 `vex`, and a byte-exact `rollback`. Agent mode additionally checks that
 repeat installs and `sync` keep the in-place patch, and the out-of-tree leg
-requires an agent-mode scan run outside `pipenv run` to see Pipenv's venv.
+requires the bare scan to see Pipenv's venv.
 
 ## Results
 

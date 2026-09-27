@@ -1,9 +1,14 @@
 //! End-to-end tests for API client error paths — exercises 4xx/5xx/
 //! malformed responses + connection failure paths via wiremock.
 //!
-//! Each test pins the *exact* exit code and inspects the JSON envelope
-//! (`status`/`error`) on stdout, so a regression that turns a real API
-//! failure into a fake success fails loudly.
+//! Hardening note (audit/test-review): every test in this file previously
+//! asserted only `code == 0 || code == 1`, which is satisfied by *both* a
+//! correct error-handling impl AND a broken one that silently swallows the
+//! failure and reports success. That is a disjoint-outcome loophole: it can
+//! never distinguish "handled the 401 gracefully" from "ignored the 401".
+//! Each test below now pins the *exact* exit code and inspects the JSON
+//! envelope (`status`/`error`) emitted on stdout, so a regression that turns
+//! a real API failure into a fake success fails the test loudly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -266,8 +271,8 @@ async fn get_uuid_with_malformed_json_reports_parse_error() {
 /// A scan whose only API batch is rejected (400) must NOT report success.
 /// A clean `status:"success"`/exit-0 here would tell a CI gate the project
 /// is fully scanned and patch-free when in fact the scan never reached the
-/// API — exactly the silent-zero failure the "If every batch errored" block
-/// in `commands/scan/mod.rs` prevents.
+/// API — exactly the silent-zero failure the production comment at
+/// scan.rs:598-611 claims to prevent.
 #[tokio::test]
 async fn scan_with_400_bad_request_reports_failure() {
     let mock = MockServer::start().await;
@@ -301,8 +306,10 @@ async fn scan_with_400_bad_request_reports_failure() {
     // calls the API) could also avoid "success" for the wrong reason.
     assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/batch")).await;
     let v = json_stdout(&out);
-    // A fully-failed scan must be surfaced so a CI gate does not mistake it
-    // for "no vulnerabilities".
+    // KNOWN PRODUCTION BUG (left red intentionally — see file summary):
+    // `scan` currently emits `status:"success"`/exit 0 even when every
+    // batch failed. The intended contract is that a fully-failed scan is
+    // surfaced, so a CI gate does not mistake it for "no vulnerabilities".
     assert_ne!(
         v["status"], "success",
         "a scan where the only batch returned 400 must not report success; got: {v}"
@@ -370,6 +377,7 @@ async fn scan_with_unreachable_api_url_reports_failure() {
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
     let v = json_stdout(&out);
+    // KNOWN PRODUCTION BUG (left red intentionally — see file summary).
     assert_ne!(
         v["status"], "success",
         "a scan where the only batch was unreachable must not report success; got: {v}"

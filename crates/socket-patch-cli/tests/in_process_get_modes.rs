@@ -70,7 +70,7 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
         save_only: false,
         one_off: false,
         all_releases: false,
-        mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
+        mode: None,
     }
 }
 

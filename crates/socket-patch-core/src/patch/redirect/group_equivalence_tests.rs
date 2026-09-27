@@ -1,4 +1,4 @@
-//! Group equivalence: the rewriter groups run concurrently and merged in order
+//! H4 equivalence: the rewriter groups run concurrently and merged in order
 //! produce the same [`RewriteResult`] — every channel, edits and warnings in
 //! order — as the serial chain they replaced.
 

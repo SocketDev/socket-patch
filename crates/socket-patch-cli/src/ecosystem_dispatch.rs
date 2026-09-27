@@ -53,7 +53,7 @@ pub fn partition_purls(
 /// scans; pass `""` to suppress that line. The banner is progress chrome
 /// and goes to STDERR like the macro's two warnings: stdout belongs to
 /// `--json` envelopes and the VEX document, so a caller that forgets to
-/// fold `json` into `$silent` cannot corrupt them.
+/// fold `json` into `$silent` can no longer corrupt them.
 macro_rules! scan_ecosystem {
     (
         out = $out:ident,
@@ -165,10 +165,12 @@ fn merge_first_wins(
 /// discovery (precedence) order. The gem crawler legitimately discovers
 /// several coexisting stores holding REAL physical copies of one
 /// `gem@version` (bundler's scoped `<engine>/<abi>/gems` beside the flat
-/// `gems/` layout, or an env `BUNDLE_PATH` store) — first-wins would drop
-/// the second copy, so apply would patch one store while the other bundler
-/// loads pristine bytes. Collapsing consumers still take the first
-/// (highest-precedence) path; apply fans out per-copy for gem
+/// `gems/` layout, or an env `BUNDLE_PATH` store) — first-wins here
+/// dropped the second copy, so apply patched one store and reported
+/// success while the other bundler loaded pristine bytes (the gem sibling
+/// of the npm multi-copy P0). Collapsing consumers still take the first
+/// (highest-precedence) path, so this changes nothing for
+/// vendor/vex/setup/get/repair-vendor; apply fans out per-copy for gem
 /// only (PyPI/Maven keep their one-install-dir contract — see the apply
 /// variant loop).
 fn merge_variant_copies(
@@ -183,8 +185,9 @@ fn merge_variant_copies(
 
 /// npm merge: the npm crawler returns EVERY physical copy of each PURL
 /// (nested duplicates, diamonds, `file:` dups), so fold every path in.
-/// A one-path `HashMap<String, PathBuf>` would silently drop every copy
-/// after the first.
+/// This is the type shape that carries the second copy the old
+/// `HashMap<String, PathBuf>` could not — the fix for the multi-copy silent
+/// partial P0.
 fn merge_npm_copies(
     out: &mut HashMap<String, Vec<PathBuf>>,
     _purls: &[String],
@@ -395,8 +398,8 @@ async fn dispatch_find(
 /// Collapse a multi-copy map to one representative path per PURL (the
 /// first-discovered — root-copy-first for npm). Consumers that only need
 /// "is it installed / where is a representative copy" (`vendor`, `vex`,
-/// `setup`, `get`, `repair vendor`) use the collapsing wrappers below
-/// (`HashMap<String, PathBuf>`). `apply` and
+/// `setup`, `get`, `repair vendor`) use the collapsing wrappers below and
+/// keep the old `HashMap<String, PathBuf>` contract unchanged. `apply` and
 /// `rollback` — which must touch EVERY copy — use the `_all` variants.
 pub(crate) fn collapse_to_first(multi: HashMap<String, Vec<PathBuf>>) -> HashMap<String, PathBuf> {
     multi
@@ -1422,10 +1425,11 @@ mod tests {
         assert_eq!(out.get("pkg:npm/ms@2.1.3"), Some(&transitive));
     }
 
-    /// Multi-copy at the dispatch layer: `find_all_packages_for_purls`
+    /// Multi-copy P0 at the dispatch layer: `find_all_packages_for_purls`
     /// must carry EVERY physical copy of a duplicated npm PURL (a root copy
-    /// plus a nested duplicate), root-copy-first. `apply` iterates this to
-    /// patch both copies.
+    /// plus a nested duplicate), root-copy-first — the second path the old
+    /// `HashMap<String, PathBuf>` return type could not hold. `apply`
+    /// iterates this to patch both copies.
     #[tokio::test]
     async fn find_all_packages_for_purls_carries_every_duplicate_copy() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1458,15 +1462,15 @@ mod tests {
         assert_eq!(copies[0], root_copy, "root copy first");
         assert!(copies.contains(&nested_copy), "nested copy must be present");
 
-        // The collapsing wrapper (test-only; pins the one-representative
-        // contract) keeps exactly the root-preferred copy.
+        // The collapsing wrapper (used by vendor/vex/setup/get) keeps the
+        // old one-path contract: exactly the root-preferred representative.
         let single =
             find_packages_for_purls(&partitioned, &local_options(tmp.path().to_path_buf()), true)
                 .await;
         assert_eq!(single.get("pkg:npm/dup@1.0.0"), Some(&root_copy));
     }
 
-    /// Multi-copy for gem (mirrors the npm test above): bundler's scoped
+    /// Multi-copy P0 for gem (mirrors the npm test above): bundler's scoped
     /// (`<engine>/<abi>/gems`) and flat (`gems/`) store layouts coexist under
     /// one `vendor/bundle` root — a bundler-2 `--path` install beside a
     /// bundler-1 env install — each holding a REAL physical copy of the same
@@ -1506,8 +1510,8 @@ mod tests {
         assert_eq!(copies[0], scoped_copy, "scoped store copy first");
         assert!(copies.contains(&flat_copy), "flat store copy present");
 
-        // The collapsing wrapper (test-only; pins the one-representative
-        // contract) keeps the first store's copy.
+        // The collapsing wrapper (vendor/vex/setup/get/repair-vendor) keeps
+        // the one-representative contract: the first store's copy.
         let single = find_packages_for_purls(&partitioned, &opts, true).await;
         assert_eq!(single.get(&purl), Some(&scoped_copy));
     }
@@ -1529,8 +1533,8 @@ mod tests {
 
     #[tokio::test]
     async fn find_packages_for_rollback_keeps_full_npm_key() {
-        // Non-variant ecosystems keep their own crawler-keyed merge (npm:
-        // `merge_npm_copies`) even on the rollback path, so a qualified npm PURL must round-trip under its exact key
+        // Non-variant ecosystems use `merge_first_wins` even on the rollback
+        // path, so a qualified npm PURL must round-trip under its exact key
         // (a regression that routed npm through `merge_qualified` would drop
         // it, since the crawler echoes the verbatim PURL back).
         let tmp = tempfile::tempdir().unwrap();
@@ -1556,8 +1560,8 @@ mod tests {
         // rollback resolver so its `all_packages.contains_key(qualified)`
         // check recognizes the installed gem. Using `find_packages_for_purls`
         // (base-keyed) misses the qualified key, falsely classifying the
-        // installed gem "not installed" (spurious `vendor_fetched_missing`
-        // events and a gem platform coin-flip).
+        // installed gem "not installed" — the bug that produced spurious
+        // `vendor_fetched_missing` events and the gem platform coin-flip.
         let tmp = tempfile::tempdir().unwrap();
         // A platform gem installs into a `<name>-<version>` dir (with an
         // optional `-<platform>` suffix); lay down the plain-platform case.
@@ -1610,7 +1614,9 @@ mod tests {
 
     // ---- Maven/NuGet are first-class ecosystems ---------------------------
     //
-    // Every ecosystem is crawled unconditionally in every flow. The observable
+    // Maven and NuGet used to sit behind `SOCKET_EXPERIMENTAL_MAVEN` /
+    // `SOCKET_EXPERIMENTAL_NUGET` runtime gates. The gates are gone: every
+    // ecosystem is crawled unconditionally in every flow. The observable
     // pin is the per-ecosystem `counts` map — a crawled-but-empty ecosystem
     // gets a `0` entry, so presence proves the crawler ran without needing
     // a real Maven repo / NuGet cache fixture.
@@ -1890,7 +1896,7 @@ mod tests {
     /// concatenation, so its POSITION in the consumption array is
     /// unobservable and a reordering would ship silently. That order is
     /// shipped behavior: `scan` chunks the crawl-ordered purls into
-    /// batches, so it decides batch composition, the `API batch N of M failed`
+    /// batches, so it decides batch composition, the `batch N/M failed`
     /// warning text and order, and `last_batch_error`.
     #[tokio::test(flavor = "multi_thread")]
     async fn crawl_all_ecosystems_matches_serial_order() {
@@ -2005,8 +2011,9 @@ mod tests {
     }
 
     /// The `!silent` banner branch — "Using <label> at: <prefix>", printed
-    /// on global/global-prefix runs (`apply --global` shows it). Drive it
-    /// for all eight labeled ecosystems
+    /// on global/global-prefix runs (`apply --global` shows it) — has never
+    /// executed for ANY labeled ecosystem: every existing dispatch test
+    /// passes `silent = true`. Drive it for all eight labeled ecosystems
     /// (pypi's label is "" — deliberately suppressed) and pin the real
     /// output contract: an empty prefix resolves NOTHING, so the banner
     /// path must not fabricate phantom mappings. Every crawler's

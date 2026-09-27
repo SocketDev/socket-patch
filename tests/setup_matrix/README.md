@@ -5,9 +5,9 @@ This suite verifies the **intended** end-to-end behavior of
 package-manager install applies the project's patches *on its own*, with
 no explicit `scan`/`apply` step.
 
-It is **experimental and non-blocking**. `setup` configures npm-family,
-pip/uv/hatch (the `.pth` hook), Bundler (plugin) and Composer hooks; the
-remaining ecosystems are the *expected-to-fail* `known_gap` cases. The suite encodes the **aspirational** end state and records a
+It is **experimental and non-blocking**. `setup` only configures
+npm-family install hooks today, so most non-npm cases are *expected to
+fail*. The suite encodes the **aspirational** end state and records a
 per-case **baseline** of what works now — the failing cases are a TODO
 list for `setup`, not a broken test.
 
@@ -118,7 +118,6 @@ and the recorded `baseline`:
 | `known_gap`  | fails the ideal, exactly as recorded — expected today, non-blocking |
 | `progress`   | better than the recorded baseline — update `baseline_supported` in `matrix.json`! |
 | `regression` | diverged from the baseline the wrong way — the only thing that fails the runner |
-| `known_regression` | would be a regression, but is on the matrix.json `known_regressions` allowlist (tracked, non-blocking) |
 | `error`      | the driver produced no parseable result |
 
 The Rust wrappers (`tests/setup_matrix_<eco>.rs`) assert the **ideal**

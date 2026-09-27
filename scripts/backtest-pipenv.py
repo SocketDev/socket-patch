@@ -699,6 +699,9 @@ def main():
         python = venv / "bin/python"
         penv = pipenv_env(version, tool)
 
+        # Pipenv 0.x installs plain string pins only: inline-table entries with
+        # markers / extras are not understood, so nothing gets installed for
+        # agent mode to patch — nothing to measure there.
         if mode in ("agent", "agent-oot") and major < 7 and shape in ("marker", "marker-excluded", "extras"):
             # Pipenv 0.x–6.x install plain string pins only: inline-table
             # entries are mis-handled (markers ignored, extras fail to

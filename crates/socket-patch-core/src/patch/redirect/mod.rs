@@ -1,4 +1,4 @@
-//! Registry-redirect rewriters (the hosted-mode `scan` engine).
+//! Registry-redirect rewriters (the `scan --redirect` engine).
 //!
 //! Rewrites lockfiles / registry configs so ONLY the patched dependency points
 //! at Socket's HOSTED vendored patches — the Rust counterpart of the depscan
@@ -7,8 +7,7 @@
 //! `tests/fixtures/redirect/` (see `tests/redirect_golden.rs`): a fixture's
 //! `expected/` bytes are produced identically by the TS backend (the GitHub-app
 //! PR flow) and by this CLI, so a customer gets the same result whether Socket
-//! opens the PR or they run `socket-patch scan --mode hosted` (or a bare
-//! `socket-patch scan`) locally.
+//! opens the PR or they run `socket-patch scan --redirect` locally.
 //!
 //! Python lockfiles use TOML-aware edits to keep source identities consistent.
 //! Other non-JSON formats use targeted text edits; JSON uses `serde_json` with
@@ -754,7 +753,7 @@ fn rewrite_npm_lock(
     // `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
     // install and reifies the install FROM `package-lock.json`. So the
     // dual-lock state is the DEFAULT for a shrinkwrap repo under npm 12.
-    // Rewriting only the first present lock would patch the file npm doesn't
+    // Rewriting only the first present lock patched the file npm doesn't
     // install from — a silent FALSE SUCCESS. Rewrite EVERY present npm lock so
     // a fresh `npm install`/`npm ci` from EITHER is redirected (shrinkwrap-only
     // repos on npm <= 6 keep working: only that one file is present).
@@ -2715,7 +2714,8 @@ fn plan_cargo_toml(
             }
             // Plain version: `crate = "1.0"` (+ optional trailing comment).
             // The rewrite is line-scoped, so the trailing newline / blank
-            // line after the entry is untouched.
+            // line after the entry is untouched (the old `\s*$` regex
+            // swallowed it).
             let c = regex::escape(crate_name);
             let line_re = Regex::new(&format!(
                 r#"^(\s*(?:{c}|"{c}")\s*=\s*)"([^"]+)"([ \t]*(?:#.*)?)$"#
@@ -3010,8 +3010,8 @@ fn plan_cargo_lock(
     // `redirect_cargo_lock_reference` edit holding just the quoted id —
     // never a dependent's whole block: a block referencing two patched
     // packages (the root of a v1 lock) would hold two overlapping block
-    // edits, and reverting the first-applied one alone would find neither of
-    // its fragments. The id names this name + version + source exactly, so its
+    // edits, and reverting the first-applied one alone found neither of its
+    // fragments. The id names this name + version + source exactly, so its
     // inverse puts back EVERY occurrence, independently of any other
     // package's edits and in any removal order.
     if let Some(old) = old_source.filter(|old| old != index_url) {
@@ -3157,9 +3157,9 @@ struct CargoConfigPlan {
 /// HEALTHY block is already wired in — an uncommented header with an
 /// uncommented `index = "<index_url>"` line. Comments never satisfy the
 /// check: a user who commented the managed block out gets it restored on the
-/// next run (a substring test would match the commented text and leave
-/// `registry = "socket-patch-…"` in Cargo.toml naming an undefined
-/// registry). A degraded block (missing/stale index line) is
+/// next run (the old substring test matched the commented text, reported
+/// success, and left `registry = "socket-patch-…"` in Cargo.toml naming an
+/// undefined registry). A degraded block (missing/stale index line) is
 /// regenerated in place — it is ours, the header grammar proves it.
 fn plan_cargo_config(
     config: &str,
@@ -3564,7 +3564,8 @@ fn rewrite_pnpm_lock(
             }
         }
         // ANY residual anywhere refuses the dep across the WHOLE lock set —
-        // nothing rewritten, nothing recorded, nothing confirmed: a rewrite
+        // nothing rewritten, nothing recorded, nothing confirmed (the same
+        // fail-closed contract the pre-splice v5/v6 refusal had): a rewrite
         // committed in one lock while another still resolves the dep
         // upstream would confirm the dep set-wide.
         if !residuals.is_empty() {
@@ -3920,8 +3921,8 @@ fn berry_cache_key(content: &str) -> Option<String> {
 /// Exposed so the vendored→hosted mode takeover (`scan`/`get --mode hosted`
 /// over a vendored berry purl) can refuse BEFORE it reverts the vendored
 /// wiring: the vendored revert never refuses on line endings (it keeps a
-/// mixed lock mixed), so without this preflight the takeover would strip the
-/// live vendored patch and then this rewriter would refuse the lock, leaving the
+/// mixed lock mixed), so without this preflight the takeover stripped the
+/// live vendored patch and then this rewriter refused the lock, leaving the
 /// package unpatched in both modes — the bun twin is
 /// [`preflight_bun_hosted`].
 ///
@@ -4042,7 +4043,7 @@ fn rewrite_yarn_berry(
             });
             continue;
         };
-        // Berry versions are UNQUOTED (`  version: 1.3.0`).
+        // Berry versions are UNQUOTED (`  version: 1.3.0`, spike B3 ground truth).
         let version_re =
             Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
                 .expect("version regex from the escaped version is valid");
@@ -4117,8 +4118,8 @@ fn rewrite_yarn_berry(
             }
             // Descriptor ranges carry a protocol; only an `npm:` range names
             // a registry tarball this rewriter can own. A `patch:` range
-            // (including yarn's OWN builtin compat patches), `workspace:`,
-            // `portal:`, or `link:` block
+            // (yarn's OWN builtin compat patches — the 2026-07 strapi
+            // incident family), `workspace:`, `portal:`, or `link:` block
             // must survive byte-identically: splicing an npm resolution
             // under such a key corrupts the key/resolution protocol pairing.
             // Mirrors the vendor backend's fail-closed gate
@@ -4143,10 +4144,9 @@ fn rewrite_yarn_berry(
                 // the real way out. `remove <purl>` is the per-package
                 // retirement; `vendor --revert` works too but unwinds EVERY
                 // vendored package, so it is scoped, not recommended. The
-                // CLI's vendored→hosted takeover (scan/hosted.rs) reverts
-                // ledger-recorded vendored npm purls, berry included, before
-                // this rewriter runs; this refusal is only reached when that
-                // wiring was not taken over (e.g. no vendor ledger entry).
+                // remedy holds whether or not a vendored→hosted pre-revert
+                // ever lands for npm-family — today no berry counterpart of
+                // the cargo takeover exists.
                 if ranges
                     .iter()
                     .any(|r| r.starts_with("file:") && r.contains(".socket/vendor/"))
@@ -4808,9 +4808,10 @@ fn rewrite_uv_lock(
 /// `\/`-escaped slashes an older composer wrote, which redirect the install just
 /// as well. Shared by the composer rewriter's already-redirected check and the
 /// CLI's post-rewrite confirmation probe so the writer's spelling and the
-/// probe's cannot drift: a probe blind to `\/` would report a fully
-/// successful composer redirect as nothing redirected, leaving `vex` nothing
-/// to attest.
+/// probe's cannot drift: the probe searched only raw and percent-encoded urls
+/// while the composer rewriter emitted `\/`, so a fully successful composer
+/// redirect reported nothing redirected — no patch record reached the ledger and
+/// `vex` had nothing to attest.
 pub fn artifact_url_present(text: &str, artifact_url: &str) -> bool {
     text.contains(artifact_url) || text.contains(&artifact_url.replace('/', "\\/"))
 }
@@ -4884,8 +4885,8 @@ enum ComposerEntry {
 /// hand-written mixed-case locks install fine and would otherwise silently miss
 /// the redirect. The locked version must match the patched one through
 /// composer's leading-`v` normalization (locks carry the pretty `v6.4.1`, PURLs
-/// the bare `6.4.1`); matching on name alone would repoint whatever version
-/// the lock happened to hold at a patch built for a different one.
+/// the bare `6.4.1`); matching on name alone repointed whatever version the
+/// lock happened to hold at a patch built for a different one.
 fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry {
     let mut mismatched: Option<String> = None;
     for (name_idx, _) in content.match_indices("\"name\": \"") {
@@ -4920,8 +4921,8 @@ fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry
 
 /// Append `"shasum": "<sha1>"` as the last key of a `"dist": { … }` block,
 /// indented like the keys already in it. VCS/zipball dists omit `shasum`
-/// entirely; redirecting such a block without inserting the pin would leave the
-/// hosted artifact unverified, so composer would install whatever the URL returned.
+/// entirely; redirecting such a block without inserting the pin left the hosted
+/// artifact unverified, so composer would install whatever the URL returned.
 /// `block` is the whole dist object and already holds at least a `url`.
 fn append_composer_shasum(block: &str, sha1: &str) -> String {
     let Some(close) = block.rfind('}') else {
@@ -5026,7 +5027,7 @@ fn rewrite_composer_lock(
                 }
             };
         // The dist block MUST belong to the located entry. Scanning forward
-        // from the name for the next `"dist": {` would walk into the FOLLOWING
+        // from the name for the next `"dist": {` walked into the FOLLOWING
         // package whenever the target was installed from source, repointing a
         // bystander's url + shasum — a checksum-clean install of the wrong
         // code. A target with no dist of its own pins nothing: fail closed.
@@ -5104,8 +5105,8 @@ fn rewrite_composer_lock(
                 }
             };
         if rewritten != original {
-            // In place: a fresh whole-lock copy per edit would hold one
-            // lock-sized buffer per redirected dep.
+            // In place: a fresh whole-lock copy per edit left the allocator
+            // holding one lock-sized buffer per redirected dep.
             content.replace_range(edit_start..=dist_end, &rewritten);
             changed = true;
             result.edits.push(FileEdit {
@@ -5491,7 +5492,7 @@ fn rewrite_nuget(
 /// version-constraint args (`"7.0.0"`, `'~> 7.0'`, `">= 1", "< 2"`) — i.e. the
 /// options (`require: false`, `group: :test`, …) that must survive the move
 /// into the source block. Empty when the line carries none; bails to empty on
-/// an unparseable tail (unbalanced quote).
+/// an unparseable tail (unbalanced quote), matching the previous behavior.
 /// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`),
 /// which has the same drop-the-options failure mode.
 pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
@@ -5674,8 +5675,8 @@ pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec
 /// A dep's Socket index URL as a regex source with the per-request rotating
 /// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
 /// misses the URL a previous run wrote under an older grant. The grant token
-/// is wildcarded even when the caller left `dep.token` empty: the token path
-/// level is derived from
+/// is wildcarded even when the caller left `dep.token` empty (the CLI
+/// historically never populated it): the token path level is derived from
 /// the index URL itself as the segment immediately preceding the patch-uuid
 /// level, so the idempotency guard never silently degrades into the
 /// nesting-corruption failure mode when a caller forgets the token.
@@ -5779,7 +5780,7 @@ struct GemLockSection {
 /// into `result`); false when the dep cannot be attributed safely — spec
 /// entry absent or duplicated, a legacy multi-remote `GEM` section, or no
 /// DEPENDENCIES section — in which case nothing is touched and the caller
-/// surfaces the frozen-install caveat.
+/// surfaces the frozen-install caveat exactly as before.
 fn converge_gem_lock_source(
     lk: &mut String,
     dep: &DepOverride,
@@ -5934,7 +5935,7 @@ fn converge_gem_lock_source(
         // frozen mode can't update the lockfile") any difference is fatal:
         // "Your lockfile needs to be updated, but it can't be because frozen
         // mode is set". Appending after `https://rubygems.org/` when the
-        // patch registry (`https://patch.socket.dev/…`) sorts first would break
+        // patch registry (`https://patch.socket.dev/…`) sorts first broke
         // every converged hosted pair under `BUNDLE_FROZEN` / deployment
         // mode (verified: 4.0.15 installs it, 4.0.21 refuses it).
         let mut last = spec_idx;
@@ -6049,8 +6050,8 @@ fn rewrite_gem(
     // Static regex — compile once, not per-dependency (clippy: regex-in-loop).
     // `\r?` throughout the lock handling: a CRLF Gemfile.lock is legal to
     // bundler (verified: `bundle check`/frozen install both accept one on
-    // 4.0.15), and without the tolerance the CHECKSUMS header would never
-    // match, misdiagnosing the lock as bundler <2.6.
+    // 4.0.15), and without the tolerance the CHECKSUMS header never matched,
+    // misdiagnosing the lock as bundler <2.6.
     let checksums_re =
         Regex::new(r"(?m)^CHECKSUMS(\r?)$").expect("static CHECKSUMS header regex is valid");
     // True once any redirected dep leaves the pair MIXED: the lock still
@@ -6371,7 +6372,7 @@ fn rewrite_gem(
                 // no-op
             } else if let Some(m) = sum_line_re.captures(lk) {
                 // The pre-edit line goes into the ledger as `original` so a
-                // revert can restore the upstream sha.
+                // future `--revert` can restore the upstream sha.
                 let old_val = format!(
                     "{} ({}) sha256={}",
                     dep.name,
@@ -6426,7 +6427,7 @@ fn rewrite_gem(
             // sha pinned, bundler still attributes the gem to the upstream
             // remote and refuses the pair outright (unfrozen: exit 37
             // "mismatched checksums"; frozen: exit 16). A pre-CHECKSUMS lock
-            // has no sha to converge around, so it keeps the
+            // has no sha to converge around, so it keeps today's
             // mixed-but-installable state + the frozen-install caveat.
             if !checksums_era
                 || !converge_gem_lock_source(
@@ -6687,7 +6688,8 @@ fn rewrite_maven_pom(
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
-        // policy `fail`) and warn that this is NOT fail-closed.
+        // policy `fail`) exactly as before and warn that this is NOT
+        // fail-closed.
         let Some(suffixed_version) = suffixed_version else {
             // Verify-only inspection: warn when the redirect can't take effect.
             // Only the FIRST match matters here (legacy behavior).
@@ -7148,7 +7150,7 @@ fn go_token_safe(s: &str) -> bool {
 // grant-free/content-addressed (one build-once artifact per patch, public on
 // the free tier), and with the pinned replace in force go never fetches or
 // verifies the original module at all. A dep whose reference carries no
-// `goproxy` override falls back to the `redirect_golang_unsupported`
+// `goproxy` override falls back to the historical `redirect_golang_unsupported`
 // warning (the paid tier's tokened URLs remain a genuine no-go — see the
 // design doc's paid-tier analysis).
 fn rewrite_golang(
@@ -7478,7 +7480,7 @@ mod tests {
     /// Re-running a rewriter over its own output must be a no-op: zero new
     /// edits, byte-identical files. Recorded edits whose `original` is the
     /// already-redirected value would grow the committed ledger on every
-    /// hosted `scan` run and poison a future revert.
+    /// `scan --redirect` run and poison a future revert.
     #[test]
     fn second_pass_over_rewritten_output_is_a_noop() {
         let mut files = BTreeMap::new();
@@ -7541,7 +7543,7 @@ mod tests {
 
     /// The requirements marker is taken from the requirement portion only —
     /// a previously appended `--hash=…` must never be swallowed into the
-    /// marker (that would duplicate the hash on every re-run).
+    /// marker (that duplicated the hash on every re-run).
     #[test]
     fn requirements_marker_line_is_rerun_stable() {
         let mut files = BTreeMap::new();
@@ -8101,7 +8103,7 @@ mod tests {
         }
     }
 
-    /// An `<add>` keyed nuget.org that a strict scan would miss (XML
+    /// An `<add>` keyed nuget.org that the strict scan used to miss (XML
     /// allows whitespace around `=` and any attribute order) is a REAL
     /// source: it must be harvested as the catch-all target — not
     /// double-added by the seed, and not left out of the `*` fan-out.
@@ -8130,10 +8132,11 @@ mod tests {
     /// A `<packageSources >`-style open tag, or single-quoted `<add>`
     /// attributes — both valid XML NuGet parses — is a REAL source list: its
     /// keys must be harvested and the socket source inserted into the
-    /// EXISTING element. Read as zero sources, a SECOND `<packageSources>`
-    /// element would appear carrying a duplicate nuget.org seed, and the
-    /// catch-all would fan `*` only to nuget.org — every corp-feed-only
-    /// package would NU1100. Mirrors the tolerant vendor/nuget_feed twin.
+    /// EXISTING element. The literal probes used to read it as zero sources:
+    /// a SECOND `<packageSources>` element appeared carrying a duplicate
+    /// nuget.org seed, and the catch-all fanned `*` only to nuget.org —
+    /// every corp-feed-only package then NU1100s. Mirrors the tolerant
+    /// vendor/nuget_feed twin.
     #[test]
     fn nuget_open_tag_whitespace_and_single_quotes_harvested_not_reseeded() {
         for config in [
@@ -8172,7 +8175,7 @@ mod tests {
 
     /// A root open tag that isn't the literal `<configuration>` — trailing
     /// whitespace or attributes, both valid XML NuGet parses fine — must
-    /// still receive the source insert. A literal `replacen` would no-op
+    /// still receive the source insert. The literal `replacen` used to no-op
     /// silently while the mapping (anchored on the close tag) still landed,
     /// routing the patched id to a source that was never defined.
     #[test]
@@ -8291,9 +8294,9 @@ mod tests {
         )
     }
 
-    /// yarn 4.0.x: a lock that spells its `10c0` checksums bare (yarn
-    /// 4.0.0–4.0.2) gets the hosted entry's checksum spelled bare — the
-    /// API's prefixed `yarnBerry10c0` would make `yarn install --immutable`
+    /// REGRESSION (yarn 4.0.x): a lock that spells its `10c0` checksums
+    /// bare (yarn 4.0.0–4.0.2) gets the hosted entry's checksum spelled bare
+    /// — the API's prefixed `yarnBerry10c0` made `yarn install --immutable`
     /// reject the rewritten lock (YN0028). A 4.1+ (prefixed) lock keeps it.
     #[test]
     fn yarn_berry_checksum_follows_the_lock_spelling() {
@@ -8411,14 +8414,17 @@ mod tests {
 
     /// A `file:` lock entry carrying the `.socket/vendor/` signature is
     /// socket-patch's OWN vendored wiring (a `scan --mode vendored` project
-    /// being converted to hosted). The refusal is fail-closed and
-    /// byte-identical, but it must carry a DISTINCT code (not the generic
-    /// `redirect_yarn_berry_unsupported_protocol`) and the real per-package
-    /// remediation: retire the vendored wiring first (`socket-patch remove
-    /// <purl>`; `vendor --revert` unwinds EVERY vendored package), then
-    /// re-run `scan --mode hosted`. This refusal covers vendored wiring the
-    /// CLI takeover did not revert (e.g. no vendor ledger entry), where
-    /// manual retirement is the way out.
+    /// being converted to hosted). Refusing it under the generic
+    /// `redirect_yarn_berry_unsupported_protocol` code misdiagnosed it —
+    /// the detail hardcoded "(workspace:/patch:/portal:/link:)" (`file:`
+    /// was not even listed) and named no way out. The refusal itself is
+    /// correct (fail-closed, byte-identical), but it must carry a DISTINCT
+    /// code and the real per-package remediation: retire the vendored
+    /// wiring first (`socket-patch remove <purl>`; `vendor --revert`
+    /// unwinds EVERY vendored package), then re-run `scan --mode hosted`.
+    /// That remedy holds whether or not a vendored→hosted pre-revert ever
+    /// lands for npm-family — today no berry counterpart of the cargo
+    /// takeover exists, so manual retirement is the only path.
     #[test]
     fn yarn_berry_vendored_file_entry_refused_with_distinct_code_and_remediation() {
         let checksum = format!("10c0/{}", "7".repeat(128));
@@ -8477,8 +8483,8 @@ mod tests {
             "must name the re-run step: {}",
             w.detail
         );
-        // Not the generic four-protocol list that does not even include
-        // `file:`.
+        // The old misdiagnosis must be gone: no four-protocol list that
+        // does not even include `file:`.
         assert!(
             !w.detail.contains("(workspace:/patch:/portal:/link:)"),
             "must not misdiagnose the vendored entry with the generic \
@@ -8490,7 +8496,8 @@ mod tests {
     /// The generic unsupported-protocol refusal must name the entry's
     /// ACTUAL protocol (backticked), not a hardcoded four-item list that
     /// omits, e.g., `file:` — an operator debugging the refusal needs the
-    /// real cause, and a fixed list misdirects for any protocol outside it.
+    /// real cause, and the old list actively misdirected for any protocol
+    /// outside it.
     #[test]
     fn yarn_berry_unsupported_protocol_detail_names_actual_protocol() {
         let checksum = format!("10c0/{}", "7".repeat(128));
@@ -8560,7 +8567,7 @@ mod tests {
     }
 
     /// Two-entry classic lock: a decoy entry FIRST, the target second — the
-    /// shape that catches a CRLF wrong-entry rewrite.
+    /// shape that exposed the CRLF wrong-entry rewrite.
     fn classic_lock_two_entries() -> String {
         "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
          # yarn lockfile v1\n\n\n\
@@ -8575,8 +8582,10 @@ mod tests {
 
     /// A CRLF classic lock (Windows `core.autocrlf` checkout) must rewrite
     /// the TARGET entry, not whichever entry happens to come first, and every
-    /// untouched line must keep its CRLF ending byte-exactly (see the CRLF
-    /// note in `rewrite_yarn_classic`).
+    /// untouched line must keep its CRLF ending byte-exactly. Regression:
+    /// `split("\n\n")` never matched in a CRLF file, so the whole lock was
+    /// one block and the leftmost `resolved`/`integrity` — the decoy's —
+    /// were rewritten (then confirmed and attested downstream).
     #[test]
     fn yarn_classic_crlf_lock_rewrites_only_the_target_entry() {
         let ovr = npm_override(
@@ -8974,7 +8983,7 @@ mod tests {
     /// the registry `name@version` spec is gone — so when the artifact URL
     /// changes (patch republish rotates the uuid segment, token rotation
     /// changes the token) the entry MUST still be re-pinned to the new URL;
-    /// exact-URL matching alone would strand the stale pin forever. Ownership is
+    /// exact-URL matching alone stranded the stale pin forever. Ownership is
     /// origin + `<name>-<version>.tgz` leaf, so user URL deps and
     /// other-version artifacts stay untouched.
     #[test]
@@ -9549,7 +9558,7 @@ mod tests {
     /// `[patch.crates-io]` on top of a live hosted redirect) reads back
     /// EVERY declaration shape this rewriter pins — driven through the
     /// rewriter itself so the two can never drift apart. A single-line
-    /// `<name> = { … }` regex would see only the first of these.
+    /// `<name> = { … }` regex saw only the first of these.
     #[test]
     fn cargo_socket_registry_pin_reads_back_every_written_shape() {
         let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n";
@@ -9755,12 +9764,12 @@ mod tests {
         files
     }
 
-    /// A crate declared in BOTH [dev-dependencies] and
+    /// AUDIT A1+A7: a crate declared in BOTH [dev-dependencies] and
     /// [dependencies] must gain the registry pin in BOTH sections — a
     /// first-match-only rewrite gives the two sections different sources for
     /// the same dep, which cargo rejects at manifest-parse time, bricking
     /// every cargo command. The blank separator line after each entry must
-    /// survive.
+    /// survive (the old `\s*$` regex swallowed it).
     #[test]
     fn cargo_two_sections_rewrites_all_occurrences_and_preserves_blank_lines() {
         let files = cargo_files(
@@ -9795,11 +9804,11 @@ mod tests {
         );
     }
 
-    /// The multi-line `[dependencies.<name>]` table form is a completely
-    /// standard manifest shape — it gains a `registry = "…"` line instead of
-    /// being reported not-found (which would leave the lock repointed while
-    /// the manifest still said crates.io: `--locked` builds break, unlocked
-    /// builds silently drop the patch).
+    /// AUDIT A2: the multi-line `[dependencies.<name>]` table form is a
+    /// completely standard manifest shape — it gains a `registry = "…"` line
+    /// instead of being reported not-found (which used to leave the lock
+    /// repointed while the manifest still said crates.io: `--locked` builds
+    /// broke, unlocked builds silently dropped the patch).
     #[test]
     fn cargo_table_form_dep_gains_registry_line() {
         let files = cargo_files(
@@ -9834,7 +9843,7 @@ mod tests {
         assert!(second.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
-    /// Rename-aware matching. An entry whose KEY matches the
+    /// AUDIT A5: rename-aware matching. An entry whose KEY matches the
     /// patched crate but whose `package = "<other>"` names a different crate
     /// is NOT the patched crate (pinning it would point a foreign package at
     /// the single-crate socket registry — resolution hard-fails); the patched
@@ -10021,7 +10030,7 @@ mod tests {
         }
     }
 
-    /// Rename case alone: when the ONLY key match renames a different crate,
+    /// AUDIT A5(a) alone: when the ONLY key match renames a different crate,
     /// the dep is genuinely not declared → not-found, and NOTHING is written
     /// (no config block, no lock repoint).
     #[test]
@@ -10047,12 +10056,12 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// A re-scan that selects a NEWER patch uuid over an existing redirect
-    /// must supersede the old `registry = "socket-patch-<old>"` pin in place
-    /// — classifying it as a foreign registry would leave the manifest on
-    /// the OLD uuid while moving the lock to the NEW one (broken `--locked`
-    /// builds, unlocked builds resolving the superseded patch, VEX attesting
-    /// the new one).
+    /// AUDIT A4: a re-scan that selects a NEWER patch uuid over an existing
+    /// redirect must supersede the old `registry = "socket-patch-<old>"` pin
+    /// in place — the old code classified it as a foreign registry and left
+    /// the manifest on the OLD uuid while moving the lock to the NEW one
+    /// (broken `--locked` builds, unlocked builds resolving the superseded
+    /// patch, VEX attesting the new one).
     #[test]
     fn cargo_supersede_replaces_previous_socket_registry_pin() {
         const OLD_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
@@ -10152,7 +10161,7 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// Transactionality: when ONE occurrence is rewritable but
+    /// AUDIT A2/A3 (transactionality): when ONE occurrence is rewritable but
     /// ANOTHER is not, the dep is skipped ENTIRELY — a partial pin (one
     /// section redirected, one not) gives the dep two different sources and
     /// cargo refuses the manifest.
@@ -10176,11 +10185,12 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// The cargo analogue of npm's `no_lockfile_redirect_is_not_attested`:
-    /// a granted dep the project does not declare at all (e.g. surfaced by
-    /// the machine-wide $CARGO_HOME crawl) must produce NO writes — an inert
-    /// `[registries.…]` block's index URL would satisfy the hosted confirmed
-    /// check and produce a false VEX attestation.
+    /// AUDIT A3 (the cargo analogue of npm's
+    /// `no_lockfile_redirect_is_not_attested`): a granted dep the project
+    /// does not declare at all (e.g. surfaced by the machine-wide
+    /// $CARGO_HOME crawl) must produce NO writes — the old code still wrote
+    /// the inert `[registries.…]` block, whose index URL then satisfied the
+    /// hosted confirmed check and produced a false VEX attestation.
     #[test]
     fn cargo_undeclared_dep_writes_nothing_not_even_the_config_block() {
         let mut files = BTreeMap::new();
@@ -10225,11 +10235,11 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// A user who commented the managed [registries] block out (to debug an
-    /// install) and re-runs the scan gets the block RESTORED. A substring
-    /// idempotence check would match the commented text, write nothing, and
-    /// report the dep redirected while every cargo command failed on the
-    /// undefined registry.
+    /// AUDIT A6: a user who commented the managed [registries] block out (to
+    /// debug an install) and re-runs the scan gets the block RESTORED. The
+    /// old substring idempotence check matched the commented text, wrote
+    /// nothing, and the run still reported the dep redirected while every
+    /// cargo command failed on the undefined registry.
     #[test]
     fn cargo_commented_config_block_is_restored() {
         // First run to produce the redirected state.
@@ -10360,7 +10370,7 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
-    /// An empty-string `cargoCksumSha256` is MISSING (the TS twin's
+    /// AUDIT A9: an empty-string `cargoCksumSha256` is MISSING (the TS twin's
     /// falsy check), never written as `checksum = ""` into Cargo.lock — that
     /// hard-fails the next `cargo fetch --locked`.
     #[test]
@@ -10389,7 +10399,7 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
-    /// Service-supplied strings are validated against their exact
+    /// AUDIT A8: service-supplied strings are validated against their exact
     /// grammars before interpolation into raw TOML — a hostile patch uuid,
     /// index URL, or cksum must be refused, never written (TOML injection:
     /// a `]`+newline uuid can define `[source.crates-io] replace-with = …`
@@ -10569,11 +10579,11 @@ mod tests {
     const CFG_IF_MULTI_DEPS: &str = "[dependencies]\ncfg-if = \"1.0.4\"\n\
          cfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n";
 
-    /// A manifest pin matched by crate NAME only would pin every same-named
-    /// declaration — `cfg-if-legacy = { package = "cfg-if", version =
-    /// "0.1.10" }` too — to the one patched version's registry, where
-    /// `^0.1.10` cannot resolve. Each declaration is pinned only by the
-    /// patch its version requirement selects.
+    /// Bug B: the manifest pin matched the crate NAME only, so every
+    /// same-named declaration — `cfg-if-legacy = { package = "cfg-if",
+    /// version = "0.1.10" }` too — was pinned to the one patched version's
+    /// registry, where `^0.1.10` cannot resolve. Each declaration is pinned
+    /// only by the patch its version requirement selects.
     #[test]
     fn cargo_multi_version_pins_only_the_declaration_the_version_selects() {
         let files = cfg_if_multi_files(CFG_IF_MULTI_DEPS);
@@ -10738,10 +10748,10 @@ mod tests {
         files
     }
 
-    /// Pinning only the root's `[workspace.dependencies]` would leave member
-    /// `b`'s own `serde = "1.0.190"` on crates.io, so `--locked` fails
-    /// against the repointed lock while the dep is reported redirected.
-    /// Every member manifest the caller supplies is planned in
+    /// Bug F: only the root's `[workspace.dependencies]` was pinned; member
+    /// `b`'s own `serde = "1.0.190"` stayed on crates.io, so `--locked`
+    /// failed against the repointed lock while the dep was reported
+    /// redirected. Every member manifest the caller supplies is planned in
     /// the same transaction; inheritors are satisfied by the root's pin.
     #[test]
     fn cargo_workspace_member_direct_declaration_is_pinned() {
@@ -10931,8 +10941,9 @@ mod tests {
         }
     }
 
-    /// CRLF manifests and locks (Windows checkouts): every planner matches
-    /// LF text, so a CRLF-only file is planned as LF and written back CRLF, recorded fragments included, and a
+    /// Bug K: CRLF manifests and locks (Windows checkouts) were refused —
+    /// every planner matched LF text only. A CRLF-only file is now planned
+    /// as LF and written back CRLF, recorded fragments included, and a
     /// re-run over the output is a silent no-op.
     #[test]
     fn cargo_crlf_files_are_rewritten_with_crlf_kept() {
@@ -11001,7 +11012,7 @@ mod tests {
         );
     }
 
-    /// A crate only reached transitively cannot be
+    /// Bug J (kept a refusal): a crate only reached transitively cannot be
     /// pinned by a manifest `registry` key. Nothing is written or
     /// confirmed, and the warning says it is transitive-only, unpatched, and
     /// which mode can patch it.
@@ -11344,9 +11355,11 @@ mod tests {
         );
     }
 
-    /// The CLI derives `token` from the reference URLs (`scan/hosted.rs`,
-    /// `hosted_memory/redirect.rs`), but the rotated-grant idempotency guard
-    /// must not depend on any caller populating it: a re-scan under a rotated
+    /// The CLI's ONLY production `DepOverride` construction site
+    /// (`scan/hosted.rs`) builds every override with an EMPTY `token` — the
+    /// reference endpoint hands the grant token back only inside the URLs it
+    /// returns. The rotated-grant idempotency guard must therefore never
+    /// depend on the caller populating `token`: a re-scan under a rotated
     /// grant must still recognize the source block a previous run wrote and
     /// refresh its URL in place. With a token-dependent guard the recognizer
     /// misses the old block, `gem_line_re` matches the INDENTED gem line
@@ -11358,7 +11371,7 @@ mod tests {
         const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
         fn ov(token: &str) -> DepOverride {
             let mut o = gem_override("rails", "7.0.0");
-            // A caller that leaves the grant token empty.
+            // Exactly as the CLI builds it: the grant token never populated.
             o.token = String::new();
             o.patch_uuid = PATCH_UUID.into();
             if let Some(r) = o.registry_override.as_mut() {
@@ -11423,7 +11436,7 @@ mod tests {
     /// The gems.rb/Gemfile divergence guard erases the redirect's own
     /// footprint with the same token-wildcard pattern, so it too must not
     /// depend on `DepOverride.token` being populated: identical twins
-    /// re-scanned under a rotated grant with an empty token must reach
+    /// re-scanned under a rotated grant with the CLI's empty token must reach
     /// the in-place refresh, not be trapped behind
     /// `redirect_gem_gemfile_spellings_diverge` by run 1's own edit.
     #[test]
@@ -11880,7 +11893,7 @@ mod tests {
 
     /// The rewritten CHECKSUMS edit must carry the pre-edit line as
     /// `original` — with `None` the ledger cannot restore the upstream sha on
-    /// revert.
+    /// a future revert.
     #[test]
     fn gem_lock_rewrite_records_original_checksum_line() {
         let mut files = BTreeMap::new();
@@ -11912,8 +11925,8 @@ mod tests {
     /// come out FULLY CONVERGED, not mixed-state: the dep's spec entry moves
     /// out of the upstream GEM section into a patch-registry GEM section
     /// (`remote: <index-url>`), DEPENDENCIES pins `<name> (= <ver>)!`, and
-    /// CHECKSUMS carries the patched sha. A mixed rewrite (CHECKSUMS
-    /// pinned, GEM section left upstream) makes bundler refuse the prescribed
+    /// CHECKSUMS carries the patched sha. The old mixed rewrite (CHECKSUMS
+    /// pinned, GEM section left upstream) made bundler refuse the prescribed
     /// unfrozen install with exit 37 "mismatched checksums" — and the
     /// converged pair needs no frozen-install caveat at all.
     #[test]
@@ -11974,11 +11987,11 @@ mod tests {
         );
     }
 
-    /// Bundler 4.0.19+: the patch-registry `GEM` section must
+    /// REGRESSION (bundler 4.0.19+): the patch-registry `GEM` section must
     /// land where bundler itself renders it — rubygems sections sorted by
     /// remote (`SourceList#lock_rubygems_sources`) — because a frozen install
     /// re-renders the lock and, since rubygems#9750, FAILS on any difference.
-    /// Appending after the upstream section would produce a lock bundler 4.0.21
+    /// Appending after the upstream section produced a lock bundler 4.0.21
     /// refuses under `BUNDLE_FROZEN=true` whenever the patch registry sorts
     /// first (`https://patch.socket.dev/` < `https://rubygems.org/`), i.e. on
     /// every production pair. Pinned both ways, with a third section present.
@@ -12256,7 +12269,8 @@ mod tests {
     }
 
     /// Bundler's modern `gems.rb`/`gems.locked` spelling must be redirected
-    /// exactly like the classic pair.
+    /// exactly like the classic pair — before this, a gems.rb project was a
+    /// silent no-op (the rewriter keyed on the literal "Gemfile" names).
     #[test]
     fn gems_rb_pair_is_rewritten_with_modern_paths() {
         let mut files = BTreeMap::new();
@@ -12430,9 +12444,8 @@ mod tests {
 
     /// The identical-twins re-run with a ROTATED grant (the token/uuid URL
     /// segments rotate per request) must still reach the in-place URL
-    /// refresh — with a raw-byte divergence guard, run 1's edit would trip
-    /// the trap and the redirect would go permanently stale under the old
-    /// grant.
+    /// refresh — with a raw-byte divergence guard, run 1's edit tripped the
+    /// trap and the redirect went permanently stale under the old grant.
     #[test]
     fn gems_rb_identical_twins_rerun_refreshes_rotated_grant_url() {
         fn ov(token: &str) -> DepOverride {
@@ -12603,9 +12616,9 @@ mod tests {
 
     /// A CRLF Gemfile.lock is legal to bundler (`bundle check` and a frozen
     /// install both accept one — verified on 4.0.15). The CHECKSUMS pin must
-    /// land in place, byte-preserving the `\r\n` endings — `(?m)^…$`
-    /// matchers blind to the `\r`-terminated lines would misdiagnose the lock
-    /// as bundler <2.6 (`redirect_gem_no_checksums_section`).
+    /// land in place, byte-preserving the `\r\n` endings — before this, the
+    /// `(?m)^…$` matchers never saw the `\r`-terminated lines and the lock
+    /// was misdiagnosed as bundler <2.6 (`redirect_gem_no_checksums_section`).
     #[test]
     fn gem_crlf_lock_checksum_pinned_preserving_crlf() {
         let mut files = BTreeMap::new();
@@ -12694,7 +12707,7 @@ mod tests {
         );
     }
 
-    /// npm 6: a lockfileVersion 1 lock is only ever written by
+    /// REGRESSION (npm 6): a lockfileVersion 1 lock is only ever written by
     /// npm <= 6, which ignores `resolved` for registry deps (verified against
     /// real npm 6.14.18) — so its installs of the redirected lock fail
     /// EINTEGRITY. The rewrite still happens (npm >= 7 installs it), but the
@@ -12756,10 +12769,10 @@ mod tests {
     /// `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
     /// install — and reifies the install from `package-lock.json`. So a
     /// shrinkwrap repo's DEFAULT state under npm 12 is BOTH locks present,
-    /// byte-divergent but pinning the same versions. Rewriting only the FIRST
-    /// present lock (`npm-shrinkwrap.json`) would leave `package-lock.json` —
-    /// the file npm actually installs from — pristine, with no warning: a
-    /// silent FALSE SUCCESS. EVERY present npm lock must be
+    /// byte-divergent but pinning the same versions. The old rewriter rewrote
+    /// only the FIRST present lock (`npm-shrinkwrap.json`) and left
+    /// `package-lock.json` — the file npm actually installs from — pristine,
+    /// with no warning: a silent FALSE SUCCESS. EVERY present npm lock must be
     /// rewritten so a fresh install/ci from EITHER is redirected.
     #[test]
     fn npm_dual_lock_shrinkwrap_and_package_lock_both_rewritten() {
@@ -12850,8 +12863,8 @@ mod tests {
 
     /// A shrinkwrap-ONLY project (the npm <= 6 world, where `npm shrinkwrap`
     /// wrote the sole lock and no `package-lock.json` was auto-created) must
-    /// still be rewritten with zero warnings — the dual-lock handling must
-    /// not perturb the single-lock path.
+    /// still be rewritten with zero warnings — the dual-lock fix must not
+    /// perturb the single-lock path.
     #[test]
     fn npm_shrinkwrap_only_still_rewritten_no_warnings() {
         let ovr = npm_override(
@@ -12903,7 +12916,7 @@ mod tests {
 
     /// An unparseable package-lock.json must surface a warning, not silently
     /// skip the npm redirect entirely (missing-lockfile already warns; a
-    /// corrupt lockfile is strictly worse).
+    /// corrupt lockfile is strictly worse and was silent).
     #[test]
     fn npm_unparseable_lockfile_warns() {
         let mut files = BTreeMap::new();
@@ -13198,7 +13211,7 @@ mod tests {
     /// A granted npm override matching no lock entry (not installed, or the
     /// lock drifted to another version) must warn — parity with
     /// `redirect_pnpm_entry_not_found` / `redirect_yarn_berry_entry_not_found`.
-    /// Silence here would make every npm redirect miss unreadable in CI.
+    /// Silence here made every npm redirect miss unreadable in CI.
     #[test]
     fn npm_entry_not_found_warns() {
         let mut files = BTreeMap::new();
@@ -13370,10 +13383,10 @@ snapshots:
     }
 
     /// A source-only target (composer.lock records `source`, no `dist` — a VCS
-    /// install) must fail closed. Scanning FORWARD from the name for the next
-    /// `"dist": {` with no package boundary would repoint the FOLLOWING
-    /// package's url AND shasum at the target's patch: a checksum-clean
-    /// install of the wrong code.
+    /// install) must fail closed. The rewriter used to find the package by name
+    /// and then scan FORWARD for the next `"dist": {` with no package boundary,
+    /// so it repointed the FOLLOWING package's url AND shasum at the target's
+    /// patch: a checksum-clean install of the wrong code.
     #[test]
     fn composer_source_only_target_never_touches_the_next_package() {
         let lock = composer_lock_with(
@@ -13441,8 +13454,8 @@ snapshots:
     }
 
     /// The locked version must match the patched one. Matching on name alone
-    /// would repoint whichever version the lock happened to hold at a patch
-    /// built for a different one.
+    /// repointed whichever version the lock happened to hold at a patch built
+    /// for a different one.
     #[test]
     fn composer_version_mismatch_fails_closed() {
         let lock = composer_lock_with(
@@ -13985,7 +13998,7 @@ snapshots:",
 
     /// A v6 dep resolved ONLY through a peer-suffixed key (pnpm 8 dedupes a
     /// workspace onto the peered instantiation — captured live from corepack
-    /// pnpm@8.15.9) is spliced in place like any other instance,
+    /// pnpm@8.15.9, 2026-08-18) is spliced in place like any other instance,
     /// scoped names included, with the peered key preserved verbatim in the
     /// ledger edit.
     #[test]
@@ -14186,7 +14199,7 @@ packages:
     /// Byte-accurate pnpm 7 (lockfileVersion 5.4) grammar, captured live from
     /// `corepack pnpm@7.33.5 install` of a workspace where pkg-a consumes
     /// use-sync-external-store@1.2.0 bare and pkg-b consumes it beside
-    /// react@18.2.0: the plain and `_react@18.2.0`-suffixed
+    /// react@18.2.0 (2026-08-18): the plain and `_react@18.2.0`-suffixed
     /// instances each carry their own resolution and BOTH get spliced, with
     /// every sibling line (`peerDependencies:`, `dependencies:`, `dev:`)
     /// byte-preserved. The spliced shape is exactly what pnpm@7.33.5 then
@@ -14286,7 +14299,7 @@ packages:
     }
 
     /// Byte-accurate pnpm 8 (lockfileVersion '6.0') grammar from the same
-    /// live capture (`corepack pnpm@8.15.9`): pnpm 8 deduped both
+    /// live capture (`corepack pnpm@8.15.9`, 2026-08-18): pnpm 8 deduped both
     /// importers onto the single peer-suffixed instance
     /// `/use-sync-external-store@1.2.0(react@18.2.0):` — the real-world v6
     /// peered shape — and the spliced lock frozen-installed from an empty
@@ -14421,10 +14434,10 @@ snapshots:
     }
 
     /// A clean, fully-successful redirect must emit EXACTLY zero rewrite
-    /// warnings — for the npm lock AND for a pnpm-only project:
-    /// `rewrite_npm_lock` must not push a spurious `redirect_npm_no_lockfile`
-    /// onto pnpm/yarn/bun/Rush runs, which (correctly) have no
-    /// package-lock.json.
+    /// warnings — for the npm lock AND for a pnpm-only project. The pnpm leg
+    /// regressed silently for a long time: `rewrite_npm_lock` pushed a
+    /// spurious `redirect_npm_no_lockfile` onto every pnpm/yarn/bun/Rush run
+    /// because those projects (correctly) have no package-lock.json.
     #[test]
     fn clean_success_run_emits_no_warnings_for_npm_and_pnpm() {
         let ovr = npm_override(
@@ -14602,7 +14615,7 @@ snapshots:
     /// key is `<name>@file:.socket/vendor/…` (v9) and the generic
     /// entry-not-found wording invites a wild-goose `pnpm install`. The
     /// warning must name the vendored state and the `vendor --revert` path
-    /// instead, while a genuinely unlocked dep keeps the generic code, and a
+    /// instead, while a genuinely unlocked dep keeps the old code, and a
     /// same-name USER `file:` dep (not under .socket/vendor/) is never
     /// misreported as vendored. Fail-closed in all three: zero rewrites.
     #[test]
@@ -14614,8 +14627,8 @@ snapshots:
             "sha512-PATCHED==",
         );
 
-        // Byte-real v9 vendored lock shape (captured from a real
-        // mode-conversion run): overrides + file:-keyed packages/snapshots.
+        // Byte-real v9 vendored lock shape (2026-08-18 mode-conversion
+        // matrix, projB snap): overrides + file:-keyed packages/snapshots.
         let vendored_lock = "lockfileVersion: '9.0'
 
 settings:
@@ -14914,7 +14927,8 @@ packages:
 
     /// The whole-file gates read the NORMALIZED lock: a CRLF lock at an
     /// unsupported cacheKey is refused naming THAT key — never
-    /// "`(missing)`".
+    /// "`(missing)`", which is what the `\n\n` grammar made of a CRLF
+    /// `__metadata` block before line endings were handled.
     #[test]
     fn berry_crlf_lock_cache_key_gate_names_the_real_key() {
         let checksum = format!("10c0/{}", "7".repeat(128));
@@ -15453,15 +15467,15 @@ packages:
                     .contains("v1.4.2-socketpatch.1"))));
     }
 
-    // ── warning/refusal legs ─────────────────────────────────────────────────
-    // These and the rare-lock-shape branches the golden fixtures
+    // ── coverage-audit 2026-09 additions ─────────────────────────────────────
+    // Warning/refusal legs and rare-lock-shape branches the golden fixtures
     // deliberately do not pin (they are byte-shared with the TS backend).
 
     /// A crafted lock entry that carries BOTH `link: true` and a version gets
     /// the specific link diagnosis; the REAL npm-emitted link shape (no
     /// `version` key at all) falls through to the generic not-found today —
     /// pinned here so a future link-aware diagnosis flips this test
-    /// deliberately.
+    /// deliberately (audit bug anchor #2).
     #[test]
     fn npm_link_entry_versioned_skips_loudly_versionless_is_generic_not_found() {
         let ovr = npm_override(
@@ -16084,12 +16098,13 @@ packages:
     /// Cargo.lock v1 (cargo < 1.41; every cargo still reads it and, under
     /// `--locked`, never rewrites it): the checksum lives in `[metadata]`
     /// keyed by the source, and dependents reference the crate by its full
-    /// `"name version (source)"` id. Repointing only the entry's `source`
-    /// would leave the dependent's reference naming a package no longer in
-    /// the lock (real cargo discards the lock and re-resolves; `cargo fetch
-    /// --locked` fails) with nothing pinning the patched `.crate` (the v1
-    /// entry has no inline checksum). Every fragment follows the source,
-    /// each as its own revertible edit.
+    /// `"name version (source)"` id. REGRESSION: only the entry's `source`
+    /// was repointed — the dependent's reference then named a package no
+    /// longer in the lock (real cargo discards the lock and re-resolves;
+    /// `cargo fetch --locked` fails) and nothing pinned the patched
+    /// `.crate` (the v1 entry has no inline checksum, and the insert after a
+    /// block-final `source` line never matched). Every fragment now follows
+    /// the source, each as its own revertible edit.
     #[test]
     fn cargo_lock_v1_repoints_metadata_checksum_and_full_id_references() {
         const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -16168,12 +16183,12 @@ packages:
     /// The OLDEST v1 locks (cargo before the `[root]` removal) record the
     /// root package in a standalone `[root]` table — not in the
     /// `[[package]]` array — and its `dependencies` spell full package ids
-    /// the same way. A reference walk over `[[package]]` blocks only would
-    /// leave `[root]` naming the crates.io id of a package the repointed
-    /// lock no longer contains: `cargo build --locked` fails and an unlocked
-    /// build silently discards the lock, while the scan reports the crate
-    /// redirected. The vendored twin handles this table too
-    /// (`dependency_tables_mut`).
+    /// the same way. REGRESSION: the reference walk searched `[[package]]`
+    /// blocks only, so `[root]` kept naming the crates.io id of a package
+    /// the repointed lock no longer contained: `cargo build --locked` fails
+    /// and an unlocked build silently discards the lock, while the scan
+    /// reports the crate redirected. The vendored twin has handled this
+    /// table since `dependency_tables_mut`.
     #[test]
     fn cargo_lock_v1_root_table_references_are_repointed() {
         const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -16297,7 +16312,8 @@ packages:
     /// crate (cfg-if, libc, serde…) cannot be hosted-redirected: the pin
     /// reaches only the root's declaration, the other crate keeps resolving
     /// it from crates.io, so the repointed lock fails `--locked` and the
-    /// unpatched copy is compiled.
+    /// unpatched copy is compiled. REGRESSION: it was pinned, repointed and
+    /// confirmed (reported redirected, attested by VEX).
     #[test]
     fn cargo_crate_another_lock_package_depends_on_is_refused() {
         const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -17547,8 +17563,9 @@ packages:
         assert!(checksums.contains(&format!("{}  ", "d".repeat(64))));
     }
 
-    // ── residual branches ────────────────────────────────────────────────────
-    // Malformed-input tolerance legs, workspace-inheritance satisfaction, and the remaining
+    // ── coverage mop-up 2026-09 (final wave) ─────────────────────────────────
+    // Residual branches the earlier audit passes did not pin: malformed-input
+    // tolerance legs, workspace-inheritance satisfaction, and the remaining
     // diagnosis spellings.
 
     #[test]
@@ -17948,8 +17965,7 @@ packages:
 
     /// A dep whose registry override is of a FOREIGN kind writes nothing —
     /// the nuget and golang arms skip it rather than misinterpreting the
-    /// override's fields, and each warns its missing-override code, as for
-    /// an absent override.
+    /// override's fields (silently, matching the TS twin).
     #[test]
     fn foreign_override_kind_warns_missing_override_for_nuget_and_golang() {
         let mut nuget = nuget_override();

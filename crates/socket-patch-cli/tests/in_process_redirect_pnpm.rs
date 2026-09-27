@@ -30,8 +30,7 @@ const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const GHSA: &str = "GHSA-rdir-pnpm-bbbb";
 
-/// `--mode hosted` (the documented spelling; the hidden `--redirect` boolean
-/// folds into it).
+/// `--mode hosted` (the released spelling that folds to `redirect: true`).
 fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
         paths: Vec::new(),
@@ -876,7 +875,7 @@ specifiers:
     assert!(!doc.to_string().contains("redirect_pnpm_legacy_lockfile"));
 
     // The lockfile-only supplement reads shrinkwrap.yaml: the uninstalled
-    // `/legacy-only-dep/2.0.0` entry surfaces.
+    // `/legacy-only-dep/2.0.0` entry surfaces (it was 0 before the fix).
     assert_eq!(
         doc["lockfileOnlyPackages"], 1,
         "shrinkwrap.yaml must feed the lockfile-only supplement: {doc}"

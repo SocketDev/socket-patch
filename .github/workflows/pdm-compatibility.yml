@@ -16,7 +16,7 @@ on:
       - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-core/src/vendor/pypi*.rs'
       - 'crates/socket-patch-core/src/vendor/common.rs'
-      - 'crates/socket-patch-core/src/vendor/lock_inventory/**'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory.rs'
       - 'crates/socket-patch-cli/src/commands/scan/**'
       - 'crates/socket-patch-cli/src/commands/rollback.rs'
       - 'crates/socket-patch-core/tests/fixtures/pdm-native/**'

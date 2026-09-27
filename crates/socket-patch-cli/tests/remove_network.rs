@@ -4,17 +4,18 @@
 //! rollback fetches any missing `beforeHash` blobs from the API. Two
 //! contractual behaviours are exercised here against a wiremock server:
 //!
-//!   1. **online (default):** with the package installed at its patched
-//!      bytes, the missing `beforeHash` blob is downloaded, rollback
-//!      restores the original file, and the manifest entry is dropped.
+//!   1. **online (default):** a missing `beforeHash` blob is downloaded,
+//!      rollback succeeds (no package installed → nothing to restore),
+//!      and the manifest entry is dropped.
 //!   2. **`--offline`:** the strict-airgap contract ("never contact the
 //!      network on *any* command") must hold. With a missing blob,
 //!      `remove --offline` must refuse to roll back rather than reach out,
 //!      and therefore must leave the manifest entry intact.
 //!
-//! Test (2) fails loudly if `remove` stops forwarding `--offline` to
-//! `rollback_patches` (the binary would contact the mock, succeed, and
-//! delete the entry).
+//! Regression guard: `remove` previously hard-coded `offline = false`
+//! when delegating to `rollback_patches`, so `--offline` was silently
+//! ignored — the binary would contact the mock, succeed, and delete the
+//! entry. Test (2) fails loudly if that bug returns.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

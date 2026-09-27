@@ -87,8 +87,8 @@ fn write_manifest_with_patch(
 }
 
 fn run_apply(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
-    // Pass the API URL/token/org via env vars (equivalent to the global
-    // --api-url/--api-token/--org flags).
+    // CLI rejects --api-token / --api-url / --org on apply (those are
+    // rollback-only flags) — apply respects them via env vars instead.
     let mut argv: Vec<&str> = vec!["apply", "--json"];
     argv.extend_from_slice(extra);
     let out = Command::new(binary())
@@ -246,10 +246,12 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     // Filtering out npm leaves nothing in scope: there is genuinely no
     // work this run can do, so apply is a clean no-op SUCCESS (exit 0) —
     // the same documented contract as an empty manifest (npm `postinstall`
-    // runs `apply` on every install). The `--ecosystems` filter scopes the
-    // source probes and download planner up front, so the excluded npm
-    // patch's missing artifacts are never fetched against this route-less
-    // mock.
+    // runs `apply` on every install). This test previously pinned exit
+    // 1/partialFailure, but that outcome was an artifact of a scoping bug:
+    // the excluded npm patch's missing artifacts were fetched (and failed,
+    // against this route-less mock) BEFORE the `--ecosystems` filter was
+    // applied, so the run never reached the no-in-scope success path. The
+    // filter now scopes the source probes and download planner up front.
     assert_eq!(
         code, 0,
         "ecosystem filter with nothing in scope is a clean no-op success; stdout={stdout}; stderr={stderr}"
@@ -522,7 +524,8 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
         "stderr warning present: {stderr}"
     );
 
-    // --strict: fail closed — exit 1, failed event, file untouched.
+    // --strict: the old fail-closed contract — exit 1, failed event, file
+    // untouched.
     let tmp = fixture();
     let out = Command::new(binary())
         .args(["apply", "--json", "--offline", "--strict"])
@@ -903,10 +906,12 @@ fn write_package_archive(packages: &Path, uuid: &str, entries: &[(&str, &[u8])])
 
 /// A cached `.socket/packages/<uuid>.tar.gz` is a complete source for the
 /// patch: the same tree applies fine under `--offline`. Going online must
-/// not make it FAIL: when the (default) diff fetch and the blob fallback
-/// both fail (no archives served, blob GC'd, entitlement change, dead
-/// network), the stage step must only bail if some patch is actually left
-/// without a source.
+/// not make it FAIL — but the stage step used to bail whenever the
+/// (default) diff fetch and the blob fallback both reported failures,
+/// without checking whether any patch was actually left without a source.
+/// A server that serves no archives and no longer has the blob (GC'd,
+/// entitlement change, dead network) therefore turned a fully satisfiable
+/// apply into a whole-run abort.
 #[tokio::test]
 async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
     let before = b"pkgcache before\n";
@@ -991,8 +996,9 @@ async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
 /// stage step download nothing, so the on-demand mismatch top-up is the
 /// ONLY chance to fetch the full afterHash blob the nested copy needs under
 /// the default warn-and-overwrite policy — and copies drift independently,
-/// so the top-up must probe EVERY copy, not just the first (clean, root)
-/// one.
+/// so the top-up must probe EVERY copy. Before the fix it probed only the
+/// first (root) copy, found it clean, queued nothing, and the nested copy
+/// failed to apply (exit 1) — the very failure the top-up exists to prevent.
 #[tokio::test]
 async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
     let before = b"before\n";

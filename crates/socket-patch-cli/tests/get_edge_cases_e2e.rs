@@ -32,11 +32,12 @@ async fn received_paths(mock: &MockServer) -> Vec<String> {
         .collect()
 }
 
-/// A single-file patch-view `files` map that survives the "patch has no
-/// applicable files" guardrail (a fetched view whose `files_for_manifest`
-/// map is empty is an exit-1 failure, not a silent `applied:1`). The tests
-/// below assert SELECTION / paid-token / drift-warning /
-/// manifest-replacement behavior, not file content.
+/// A single-file patch-view `files` map that survives PR #158's
+/// "patch has no applicable files" guardrail (5d7eb6f): a fetched view
+/// whose `files_for_manifest` map is empty is now an exit-1 failure, not a
+/// silent `applied:1`. The tests below assert SELECTION / paid-token /
+/// drift-warning / manifest-replacement behavior — the empty `"files": {}`
+/// they used to carry was only ever a lazy stand-in, never the point.
 ///
 /// Modeled on the passing `get_invariants::patch_response_json` fixture: a
 /// net-new file with an all-zero `beforeHash`, a real git-blob `afterHash`
@@ -89,7 +90,7 @@ fn get_one_off_and_save_only_together_errors() {
 
 #[tokio::test]
 async fn get_with_id_flag_selects_specific_patch() {
-    // Multiple patches available for a PURL; `get <UUID> --id` fetches exactly that one.
+    // Multiple patches available for a PURL, `--id <UUID>` picks one.
     let mock = MockServer::start().await;
     let purl = "pkg:npm/multi@1.0.0";
     let encoded = "pkg%3Anpm%2Fmulti%401.0.0";
@@ -602,7 +603,7 @@ async fn get_uuid_replacing_existing_manifest_entry_reports_updated() {
     // `apply`, `scan --sync`, `get` — means "a different UUID replaced an
     // older one for this PURL. `oldUuid` set." The fetch-by-UUID save path
     // (`save_and_apply_patch`) must classify against the pre-insert manifest
-    // exactly like `download_and_apply_patches_with` does; reporting the
+    // exactly like `download_and_apply_patches` does; reporting the
     // replacement as `added` (without `oldUuid`) hides the overwrite from
     // consumers that diff on `action == "updated"` — including the jq
     // recipe the contract itself documents.

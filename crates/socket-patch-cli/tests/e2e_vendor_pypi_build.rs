@@ -323,8 +323,7 @@ fn assert_vendored_applied(env: &serde_json::Value) {
 /// `.socket/` manifest + blob fully offline, while `get <uuid> --mode
 /// vendored` fetches the record from the mocked API (the uuid path is
 /// exempt from installed narrowing, so only the `view/{uuid}` route is
-/// needed), records it in the vendor ledger (detached entry, no manifest),
-/// and stages patch content in memory
+/// needed), writes the manifest itself, and stages patch content in memory
 /// — `.socket/blobs` must stay absent. `--vendor-source build` keeps the
 /// get flow off the vendoring service (no grant/tarball mocks needed).
 enum VendorDriver<'a> {
@@ -371,7 +370,7 @@ fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String)
 
 /// Mount `view/{UUID}` on the mock API: the patch record with REAL git-blob
 /// hashes over the ACTUAL installed bytes plus inline base64 `blobContent`,
-/// so `get --mode vendored` both records the patch in the vendor ledger and stages the
+/// so `get --mode vendored` both saves the manifest record and stages the
 /// after-bytes in memory (nothing is staged locally). The purl is the
 /// suite's bare (unqualified) spelling and the file key is
 /// site-packages-relative — exactly what [`stage_patch`]'s manifest carries.
@@ -774,7 +773,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     // `uv sync --frozen --offline` (spike claim 3).
     assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired, python.as_deref());
 
-    // Manifest-less VEX over that fresh checkout (a `scan --mode vendored` /
+    // Manifest-less VEX over that fresh checkout (a `vendor --detached` /
     // depscan checkout's shape once the manifest is gone).
     manifestless_vex_tail(
         &uv,
@@ -826,9 +825,8 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 /// SAME vendor engine and wiring, driven through get's uuid path — exempt
 /// from installed narrowing, so only the mocked `view/{uuid}` route is
 /// needed. Unlike the capstone, NOTHING is staged locally: the record and
-/// the patched content come from the API mock, get writes NO
-/// `.socket/manifest.json` (the ledger's detached entry is the record), and
-/// `.socket/blobs` must stay absent
+/// the patched content come from the API mock, get writes
+/// `.socket/manifest.json` itself, and `.socket/blobs` must stay absent
 /// (vendored downloads live in memory). Ends with the same fresh-checkout
 /// `uv sync --frozen --offline` committability proof; the revert half stays
 /// with the vendor capstone (same engine, same ledger).
@@ -950,8 +948,8 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
     let lock_wired = std::fs::read(proj.join("uv.lock")).unwrap();
     assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired, python.as_deref());
 
-    // Manifest-less VEX over the fresh checkout: get never wrote a manifest;
-    // the vendor ledger (+ wheel) and the pair remain.
+    // Manifest-less VEX over the fresh checkout: get wrote the manifest, the
+    // checkout deletes it; the vendor ledger (+ wheel) and the pair remain.
     // Off the async runtime: the matrix's patch API owns its own runtime.
     std::thread::scope(|scope| {
         scope

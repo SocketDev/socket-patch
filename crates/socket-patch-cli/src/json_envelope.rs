@@ -1,10 +1,8 @@
 //! Unified JSON output envelope shared across every subcommand.
 //!
-//! The `--json` output of `apply`, `list`, `remove`, `repair`/`gc`,
-//! `vendor`, `self-update` and `vex --json --output` (and every command's
-//! lock-contention error) uses this top-level shape; `scan`, `get`,
-//! `rollback` and `setup` still emit their legacy shapes (see
-//! CLI_CONTRACT.md's migration status):
+//! Every `--json` invocation of socket-patch (whether `scan`, `apply`,
+//! `get`, `list`, `gc`/`repair`, `remove`, or `rollback`) emits the same
+//! top-level shape:
 //!
 //! ```json
 //! {
@@ -21,7 +19,7 @@
 //! one observable thing that happened during the run (a patch was
 //! downloaded, applied, skipped, etc.). A downstream consumer (PR-comment
 //! bot, dashboard, log shipper) only needs to learn this single vocabulary
-//! to interpret output from every envelope-emitting subcommand.
+//! to interpret output from every subcommand.
 //!
 //! See `CLI_CONTRACT.md` for the per-subcommand action matrix and example
 //! `jq` recipes.
@@ -30,7 +28,7 @@ use serde::Serialize;
 
 pub use socket_patch_core::patch::sidecars::{SidecarFile, SidecarFileAction, SidecarRecord};
 
-/// Top-level JSON envelope (see the module doc for which commands emit it).
+/// Top-level JSON envelope emitted by every `--json` invocation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Envelope {
@@ -218,8 +216,9 @@ pub struct PatchEvent {
     pub error: Option<String>,
     /// Command-specific additional fields. Consumers MUST NOT depend on
     /// the shape of this object — different subcommands attach different
-    /// keys here, e.g. `list` (vulnerabilities, license, tier,
-    /// description).
+    /// keys here. Used today for `list` (vulnerabilities, license, tier,
+    /// description) and `scan` (discovered metadata not covered by the
+    /// other event fields).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
 }
@@ -314,18 +313,20 @@ pub struct PatchEventFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PatchAction {
-    /// `list`: a patch recorded for this package (hosted/vendored lockfile
-    /// reference or manifest entry).
+    /// `scan`: a patch exists upstream for this package, but no action
+    /// taken yet (no `--apply` / `--sync`).
     Discovered,
-    /// Patch bytes were fetched from the registry.
+    /// `get` / `scan --apply` / `apply` (online): patch bytes were
+    /// fetched from the registry.
     Downloaded,
-    /// `apply`: patch was applied to disk. `files` enumerates which files
-    /// changed.
+    /// `apply` / `scan --sync`: patch was applied to disk. `files`
+    /// enumerates which files changed.
     Applied,
-    /// Patch replaced an older patch (the manifest already had a different
-    /// UUID for this PURL). `oldUuid` carries the previous UUID.
+    /// `apply` / `scan --sync`: patch replaced an older patch (the
+    /// manifest already had a different UUID for this PURL). `oldUuid`
+    /// carries the previous UUID.
     Updated,
-    /// The patch was a no-op — already
+    /// `apply` / `scan` / `get`: the patch was a no-op — already
     /// applied, not in scope, or filtered out. `errorCode` carries the
     /// reason tag.
     Skipped,
@@ -335,7 +336,7 @@ pub enum PatchAction {
     /// `gc` / `repair` / `remove` / `rollback`: data was removed from
     /// `.socket/` (or from disk in the rollback case).
     Removed,
-    /// `apply --dry-run`: patch *would* apply
+    /// `apply --dry-run` / `scan --dry-run`: patch *would* apply
     /// cleanly. `files` lists what would change.
     Verified,
     /// `repair`: a missing/corrupt vendored artifact was rebuilt in place
@@ -395,11 +396,9 @@ pub enum Status {
     /// there's nothing to apply. Distinct from `Success` because some
     /// consumers want to early-exit on this state.
     NoManifest,
-    /// Reserved: the requested patch requires a paid plan but the caller's
-    /// API token isn't entitled. Nothing emits it yet (`get` reports this
-    /// via its legacy `status: "paid_required"` shape; scan never does).
-    /// Distinct from `Error` so PR bots can post a "upgrade your plan"
-    /// comment instead of failing.
+    /// `get` / `scan`: the requested patch requires a paid plan but the
+    /// caller's API token isn't entitled. Distinct from `Error` so PR
+    /// bots can post a "upgrade your plan" comment instead of failing.
     PaidRequired,
     /// `remove` / `rollback`: the patch identifier didn't resolve to
     /// anything in the local manifest.

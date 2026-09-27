@@ -25,8 +25,7 @@
 #   SM_PM                npm|yarn|pnpm|bun|vlt|pip|uv|poetry|pdm|hatch|cargo|
 #                        bundler|go|mvn|composer|dotnet|deno
 #   SM_SCENARIO          scenario id (echoed back)
-#   SM_PATCHSET          primary|alt|empty|wrong|none
-#   SM_LAYOUT            single|workspace|monorepo
+#   SM_PATCHSET          primary|alt|empty|wrong
 #   SM_RUN_SETUP         1|0  — run `socket-patch setup` before install
 #   SM_EXPECT_APPLIED    1|0  — the aspirational expectation
 #   SM_PACKAGE           dependency name (e.g. minimist, six, cfg-if)
@@ -425,8 +424,7 @@ run_install() {
       uv pip install --python venv/bin/python --quiet "$SM_PACKAGE==$SM_VERSION"
       pth_trigger venv ;;
     # poetry / pdm are resolver-based: `add` re-resolves the whole manifest
-    # (which setup edited to add `socket-patch[hook]`, whose `hook` extra pulls
-    # the unpublished socket-patch-hook wheel) against a package index.
+    # (which setup edited to add `socket-patch-hook`) against a package index.
     # In this hermetic test the hook wheel isn't published, so resolution
     # fails — these PMs can't be exercised without a local index, so they stay
     # documented gaps (baseline_supported:false). The .pth mechanism itself is
@@ -653,9 +651,9 @@ run_file() { # $1 = absolute path to the resolved package file
     pypi)
       # Run the patched module with the in-project venv interpreter directly.
       # Going through `<pm> run` re-resolves the project, which (after setup)
-      # includes the committed `socket-patch[hook]` dependency, whose hook wheel
-      # is unpublished in this hermetic test, so the resolve would fail for a
-      # reason unrelated to whether six.py is patched. Direct execution faithfully runs the on-disk
+      # includes the committed `socket-patch-hook` dependency — unpublished in
+      # this hermetic test, so the resolve would fail for a reason unrelated to
+      # whether six.py is patched. Direct execution faithfully runs the on-disk
       # patched file and observes its marker. (hatch manages its env outside
       # an in-project .venv, and its skip-install env doesn't re-resolve, so it
       # keeps using `hatch run`.)
@@ -693,8 +691,8 @@ verify_applied() {
   log "verify(run): marker '$check_marker' in runtime output=$APPLIED (candidates=$n_found, target=${TARGET:-<none>})"
 }
 
-# The full check/remove round trip runs only for npm-family cases; the other
-# supported hooks use the simple single-install flow.
+# npm-family is the surface `setup` actually configures today — the only place
+# the behavioral check/remove round-trip is expected to do real work.
 is_npm_family() {
   [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun|vlt)$ ]] || [ "$SM_LAYOUT" = monorepo ]
 }
@@ -728,6 +726,9 @@ if [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun|vlt|deno)$ ]] || [ "$SM_LAYOUT" = monorepo
 fi
 
 # Hermetic apply env inherited by the install hook's `socket-patch apply`.
+# NOTE: SOCKET_OFFLINE/SOCKET_FORCE must be "true"/"false" — the apply
+# `--force` flag (unlike its siblings) has no boolish value parser, so
+# SOCKET_FORCE=1 is rejected with "invalid value '1' for '--force'".
 export SOCKET_OFFLINE=true SOCKET_FORCE=true SOCKET_API_TOKEN=fake SOCKET_ORG_SLUG=test-org
 export SOCKET_TELEMETRY_DISABLED=1 VLT_TELEMETRY=0
 # Isolate the pypi `.pth` hook's change-detection stamp per case so runs

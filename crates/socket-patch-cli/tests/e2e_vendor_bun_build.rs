@@ -40,8 +40,8 @@
 //! The get-driven twin (v3.6) replaces steps 2–3 with a wiremock
 //! `view/{uuid}` (same hashes, base64 `blobContent` of the after bytes) and
 //! `get <uuid> --mode vendored --vendor-source build` — scan's vendored
-//! posture end to end: committed artifact + ledger (detached record) + wired
-//! lock, NO manifest, NO `.socket/blobs` — then re-runs the same fresh-checkout install proof.
+//! posture end to end: manifest + committed artifact + ledger + wired lock,
+//! NO `.socket/blobs` — then re-runs the same fresh-checkout install proof.
 //! The revert half is not repeated there: `vendor --revert` on the
 //! capstone already covers it (same ledger, same engine).
 //!
@@ -260,9 +260,9 @@ fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
 
 /// Run `bun <args>` in `cwd` with the given private cache dir, the shared
 /// cache sandbox for everything bun keeps outside that dir (`~/.bun`, the
-/// npmrc it reads), and the ambient env scrubbed by the scrub the bun
+/// npmrc it reads), and the ambient env scrubbed by the scrub the three bun
 /// suites share (`cache_env::scrub_ambient_bun_env`: `SOCKET_*`, every
-/// `BUN_*`, case-insensitive `npm_config_*`, `VIRTUAL_ENV` — an ambient registry mirror
+/// `BUN_*`, case-insensitive `npm_config_*` — an ambient registry mirror
 /// would put the mirror tarball URL in the 4-tuple's registry slot and fail
 /// the pre-vendor assertions).
 fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
@@ -1327,8 +1327,8 @@ async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8])
 }
 
 /// get-driven twin: `get <uuid> --mode vendored` must land scan's vendored
-/// result — committed artifact + ledger (detached record) + wired lock, NO
-/// manifest, NO blobs — and the fresh-checkout install proof must materialize the
+/// result — manifest record + committed artifact + ledger + wired lock, NO
+/// blobs — and the fresh-checkout install proof must materialize the
 /// patched bytes. The revert half is deliberately not repeated here:
 /// `vendor --revert` on the capstone above already proves it (same ledger,
 /// same engine).

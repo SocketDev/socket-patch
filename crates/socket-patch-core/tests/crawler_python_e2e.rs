@@ -130,7 +130,7 @@ async fn find_python_dirs_python3_wildcard_matches_versions() {
 }
 
 /// `*` generic wildcard matches every directory entry. Covers the
-/// generic `*` wildcard branch of `find_python_dirs`.
+/// generic wildcard branch (L142-L160 of python_crawler.rs).
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_python_dirs_star_wildcard_matches_all() {
@@ -159,7 +159,7 @@ async fn find_python_dirs_star_wildcard_matches_all() {
 }
 
 /// `*` wildcard skips non-directory entries (regular files). Covers
-/// the `entry_is_dir` skip arm.
+/// the `if !ft.is_dir() { continue; }` arm.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_python_dirs_star_wildcard_skips_files() {
@@ -341,11 +341,12 @@ async fn get_global_python_site_packages_discovers_anaconda() {
 /// Both Apple's `/usr/bin/python3` and Homebrew's `python3` are framework
 /// builds and use it, so a stock Mac has several of these trees.
 ///
-/// The well-known scan needs a macOS entry alongside pip --user on Linux
-/// (`~/.local`) and Windows (`%APPDATA%\Python`): the
-/// `site.getusersitepackages()` query reports at most the ONE interpreter
-/// first on PATH, so everything `pip3 install --user`ed under any other
-/// interpreter would be invisible to global discovery.
+/// The well-known scan covers pip --user on Linux (`~/.local`) and Windows
+/// (`%APPDATA%\Python`) but had no macOS entry, so the only thing that ever
+/// surfaced such a package was the `site.getusersitepackages()` query — which
+/// reports at most the ONE interpreter first on PATH. Everything
+/// `pip3 install --user`ed under any other interpreter was invisible to
+/// global discovery.
 ///
 /// Two versions are staged deliberately: the runtime-query arm can only ever
 /// contribute the host interpreter's own version, so requiring BOTH to surface
@@ -592,9 +593,12 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
 /// `uv.lock` alone is also a valid Python-project marker — a fresh
 /// clone of a uv-managed repo shouldn't need a venv to be scannable.
 ///
-/// Stages a real global layout under the stubbed HOME and asserts it
-/// surfaces — which can ONLY happen if the `uv.lock` marker triggered
-/// the global fallback (no marker returns an empty Vec).
+/// Previously this test only asserted the call returned `Ok` without
+/// staging anything discoverable, so a regression that dropped
+/// `uv.lock` from the marker list (returning an empty Vec via the
+/// no-marker early-out) stayed green. We now stage a real global
+/// layout under the stubbed HOME and assert it surfaces — which can
+/// ONLY happen if the `uv.lock` marker triggered the global fallback.
 #[tokio::test]
 #[serial]
 async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
@@ -864,8 +868,7 @@ async fn read_python_metadata_rejects_fifo_metadata_without_hanging() {
 mod common;
 
 /// `find_by_purls` short-circuits when the site-packages dir is
-/// unreadable. Drives the unreadable-listing arm of
-/// `list_dist_info_packages`.
+/// unreadable. Drives the python_crawler.rs:530 read_dir Err arm.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -889,8 +892,8 @@ async fn find_by_purls_handles_unreadable_site_packages() {
     assert!(result.is_empty());
 }
 
-/// `list_dist_info_packages` yields nothing when site-packages is
-/// unreadable (`list_dir_sync` degrades to an empty listing).
+/// `scan_site_packages` short-circuits when site-packages is
+/// unreadable — drives python_crawler.rs:584 read_dir Err arm.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::parallel]
@@ -995,8 +998,8 @@ async fn find_by_purls_strips_qualifiers() {
 /// A bare `#subpath` (no `?qualifier`) is valid PURL grammar and must be
 /// stripped the same way qualifiers are — cutting only at `?` leaks the
 /// subpath into the version (`2.28.0#src/requests`), so the installed
-/// package silently fails to match. Twin of `strip_purl_qualifiers`'
-/// subpath handling in utils::purl.
+/// package silently fails to match. Twin of the strip_purl_qualifiers
+/// subpath fix in utils::purl.
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_strips_subpath() {
@@ -1176,7 +1179,7 @@ async fn crawl_all_with_unparseable_dist_info_skips() {
 }
 
 /// `get_site_packages_paths` with `global_prefix` set returns just that
-/// prefix — exercises its `global_prefix` early-return arm.
+/// prefix — exercises the early-return arm at python_crawler.rs:473-474.
 #[tokio::test]
 #[serial_test::parallel]
 async fn get_site_packages_paths_with_global_prefix_passthrough() {

@@ -50,18 +50,17 @@ pub(super) struct PipenvProject {
     /// wired lock and the reverted lock stay byte-comparable to the original.
     pub crlf: bool,
     /// Non-fatal advisories raised during load. ALWAYS contains the
-    /// `vendor_integrity_unverified` warning (Pipenv does not consistently
-    /// enforce file-ref hashes: 2018–2022 verify the `hashes` list, 2023+ do
-    /// not) — the orchestrator must surface these.
+    /// `vendor_integrity_unverified` warning (spike V4: pipenv never enforces
+    /// hashes on file-ref entries) — the orchestrator must surface these.
     pub warnings: Vec<VendorWarning>,
 }
 
 /// The run's Pipfile.lock parse. `load_pipenv_project` runs once per patched
-/// package and would re-parse the whole lock each time; an idempotent re-run
+/// package and re-parsed the whole lock each time; an idempotent re-run
 /// parses bytes nothing has changed. Not re-seeded after a write: the wire
 /// step re-serializes with the lock's own line endings restored, so the
 /// document in hand is not the one those bytes parse to — the next package
-/// pays one parse. See [`ParseMemo`].
+/// pays one parse, as before. See [`ParseMemo`].
 static LOCK_MEMO: ParseMemo<Value> = ParseMemo::new();
 
 /// What the target entries already look like.
@@ -137,9 +136,8 @@ pub(super) async fn load_pipenv_project(
         }
     }
 
-    // ALWAYS pushed (Pipenv does not consistently enforce file-ref hashes:
-    // 2018–2022 verify the `hashes` list, 2023+ do not): the recorded hash is
-    // self-documentation, not a guaranteed check.
+    // ALWAYS pushed (spike V4 refuted hash enforcement): the recorded hash is
+    // self-documentation, not a pipenv-enforced check.
     let warnings = vec![VendorWarning::new(
         "vendor_integrity_unverified",
         "Pipenv does not consistently enforce the hashes recorded on file-ref lock entries \
@@ -156,8 +154,8 @@ pub(super) async fn load_pipenv_project(
 }
 
 /// Target-specific guards (also re-run by [`wire_pipenv`] right before
-/// writing). Entries match by PEP 503 canonical NAME in every package
-/// category. Registry pins and existing vendored wheel identities
+/// writing). Entries match by PEP 503 canonical NAME in `default` and
+/// custom categories. Registry pins and existing vendored wheel identities
 /// must both match the selected patch version.
 pub(super) fn check_target_guards(
     p: &PipenvProject,
@@ -275,13 +273,12 @@ pub(super) fn check_target_guards(
     })
 }
 
-/// Wire Pipfile.lock for the vendored wheel: replace every matching entry
-/// in every package category (all keys but `_meta`) with the spike-captured
-/// file-ref shape (`path` instead of `file` when the entry carries extras;
-/// the new document is fully computed, then committed atomically with the
-/// pinned pipenv serialization). `rel_wheel` is the project-relative wheel
-/// path (`.socket/vendor/pypi/<uuid>/<wheel>`, no `./` prefix — the
-/// fixture's `./` spelling is applied here).
+/// Wire Pipfile.lock for the vendored wheel: replace every matching
+/// `default`/`develop` entry with the V1/V2-captured file-ref shape (the new
+/// document is fully computed, then committed atomically with the pinned
+/// pipenv serialization). `rel_wheel` is the project-relative wheel path
+/// (`.socket/vendor/pypi/<uuid>/<wheel>`, no `./` prefix — the fixture's
+/// `./` spelling is applied here).
 pub(super) async fn wire_pipenv(
     p: &PipenvProject,
     root: &Path,
@@ -323,9 +320,9 @@ pub(super) async fn wire_pipenv(
             .collect();
         for key in keys {
             let old = map.get(&key).cloned().unwrap_or(Value::Null);
-            // The file-ref entry shape: file + OUR hash; markers preserved
+            // The V1/V2 entry shape: file + OUR hash; markers preserved
             // verbatim; index/version dropped (transitive entries never had
-            // an index key).
+            // an index key — V3).
             let mut new_entry = Map::new();
             // Pipenv 2022 misparses local file URLs carrying extras.
             let source_key = if old
@@ -472,9 +469,8 @@ pub(super) async fn revert_pipenv(
             ));
             continue;
         }
-        // SECURITY: the section component is also untrusted — `_meta` and
-        // empty names are refused, and only an existing object-valued
-        // category of the live lock is ever dereferenced.
+        // SECURITY: the section component is also untrusted — only the two
+        // known section names are ever dereferenced.
         let Some((section, name)) = rec.key.as_deref().and_then(|k| k.split_once(':')) else {
             warnings.push(drifted());
             continue;
@@ -609,6 +605,10 @@ fn find_entries<'a>(lock: &'a Value, canon_name: &str) -> Vec<(&'a str, String, 
     out
 }
 
+/// pipenv's exact serialization (spike V7): 4-space indent, ALL keys sorted
+/// at every nesting level, default separators, one trailing newline —
+/// byte-identical to `json.dumps(obj, indent=4, sort_keys=True) + "\n"` for
+/// the ASCII content pipenv locks carry.
 /// A hosted Socket patch reference as `scan --mode hosted` writes it:
 /// `https://<host>/patch/pypi/<name>/<version>/<grant>/<uuid>/<wheel>[#sha256=…]`.
 fn is_socket_hosted_reference(value: &str) -> bool {
@@ -630,10 +630,6 @@ fn with_line_ending(text: String, crlf: bool) -> String {
     }
 }
 
-/// pipenv's exact serialization (spike-verified): 4-space indent, ALL keys
-/// sorted at every nesting level, default separators, one trailing newline —
-/// byte-identical to `json.dumps(obj, indent=4, sort_keys=True) + "\n"` for
-/// the ASCII content pipenv locks carry.
 fn to_canonical_json(value: &Value) -> String {
     fn sorted(value: &Value) -> Value {
         match value {
@@ -663,17 +659,18 @@ mod tests {
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const REL_WHEEL: &str =
         ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl";
-    /// sha256 of the spike's patched wheel.
+    /// sha256 of the spike's patched wheel (spikes/pipenv/artifacts/SHA256SUMS).
     const WHEEL_SHA: &str = "573ecfcc2c1f54aeb4e3d6198d58069a3a3258a5a2b18906aae2761a4b2568a0";
 
     // ── fixture constants ──────────────────────────────────────────────
-    // Byte-exact copies of pipenv-generated output (pipenv 2026.6.2,
-    // pipfile-spec 6; captured 2026-06-10 during the phase-0 spike, not
-    // committed). The registry locks are tool-generated (`pipenv lock`); the
-    // vendored locks are the `.lock-only-edit` splices that pass sync /
-    // --deploy / verify byte-stably. These constants are the source of truth.
+    // Byte-exact copies of the spikes/pipenv/ fixtures (pipenv 2026.6.2,
+    // pipfile-spec 6; spike date 2026-06-10). The registry locks are
+    // tool-generated (`pipenv lock`); the vendored locks are the
+    // `.lock-only-edit` splices that pass sync / --deploy / verify
+    // byte-stably (V2/V3). If these drift from the committed fixtures, the
+    // spike dirs are the source of truth.
 
-    /// The spike's direct-registry Pipfile.lock (verbatim).
+    /// spikes/pipenv/direct-registry/Pipfile.lock (verbatim).
     const LOCK_DIRECT_REGISTRY: &str = r#"{
     "_meta": {
         "hash": {
@@ -706,8 +703,8 @@ mod tests {
 }
 "#;
 
-    /// The spike's direct-file Pipfile.lock.lock-only-edit (verbatim —
-    /// the splice: file + patched hash, index/version dropped, markers
+    /// spikes/pipenv/direct-file/Pipfile.lock.lock-only-edit (verbatim —
+    /// the V2 splice: file + patched hash, index/version dropped, markers
     /// kept, _meta untouched).
     const LOCK_DIRECT_VENDORED: &str = r#"{
     "_meta": {
@@ -739,7 +736,7 @@ mod tests {
 }
 "#;
 
-    /// The spike's transitive-registry Pipfile.lock (verbatim — six is
+    /// spikes/pipenv/transitive-registry/Pipfile.lock (verbatim — six is
     /// FLAT in default at the resolver's 1.17.0, no index key).
     const LOCK_TRANSITIVE_REGISTRY: &str = r#"{
     "_meta": {
@@ -781,8 +778,8 @@ mod tests {
 }
 "#;
 
-    /// The spike's transitive-file Pipfile.lock.lock-only-edit (verbatim —
-    /// note the silent 1.17.0 → 1.16.0 pin-down, which pipenv
+    /// spikes/pipenv/transitive-file/Pipfile.lock.lock-only-edit (verbatim —
+    /// the V3 splice; note the silent 1.17.0 → 1.16.0 pin-down, which pipenv
     /// accepts: install is per-entry with no cross-check).
     const LOCK_TRANSITIVE_VENDORED: &str = r#"{
     "_meta": {
@@ -870,7 +867,7 @@ mod tests {
     }
 
     /// The load-bearing oracle: wiring the registry lock must produce the
-    /// `.lock-only-edit` fixture BYTE-IDENTICALLY (direct + transitive,
+    /// `.lock-only-edit` fixture BYTE-IDENTICALLY (direct V2 + transitive V3,
     /// which includes the version pin-down replacement), `_meta` untouched.
     #[tokio::test]
     async fn wiring_matches_fixtures_byte_identically() {
@@ -949,9 +946,8 @@ mod tests {
         assert_eq!(read_lock(tmp.path()).await, before_text);
     }
 
-    /// Pipenv does not consistently enforce file-ref hashes (2018–2022
-    /// verify the `hashes` list, 2023+ do not), so EVERY load carries the
-    /// integrity warning for the orchestrator to surface.
+    /// Spike V4 (REFUTED): pipenv never enforces file-ref hashes, so EVERY
+    /// load carries the integrity warning for the orchestrator to surface.
     #[tokio::test]
     async fn integrity_unverified_warning_always_present() {
         let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
@@ -971,7 +967,7 @@ mod tests {
         assert_eq!(p.warnings[0].code, "vendor_integrity_unverified");
     }
 
-    /// Our serializer reproduces pipenv's own
+    /// Spike V7: our serializer reproduces pipenv's own
     /// `json.dumps(indent=4, sort_keys=True) + "\n"` byte-for-byte, so a
     /// parse → serialize round trip of a pipenv-written lock is the identity.
     #[test]
@@ -1321,7 +1317,7 @@ mod tests {
     }
 
     /// A third-party edit to the entry we wrote (e.g. `pipenv lock`
-    /// regenerated it) is left alone with a drift warning;
+    /// regenerated it — spike V6) is left alone with a drift warning;
     /// unknown wiring kinds from a newer ledger degrade the same way.
     #[tokio::test]
     async fn revert_warns_and_skips_on_drifted_entry_and_unknown_kind() {

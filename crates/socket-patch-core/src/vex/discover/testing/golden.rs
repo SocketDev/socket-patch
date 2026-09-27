@@ -23,8 +23,7 @@
 //! ```
 //!
 //! Unix only: Windows checkouts convert some fixtures' line endings (only
-//! `redirect/**`, `pdm-native/*.lock`, `pnpm-hosted/**` and `vlt-locks/**`
-//! among the corpus trees are `-text`),
+//! `redirect/**`, `pdm-native/*.lock` and `pnpm-hosted/**` are `-text`),
 //! and I/O error texts differ, so the snapshot would describe different
 //! inputs. The Unix legs (Linux + macOS) pin the behavior.
 //!

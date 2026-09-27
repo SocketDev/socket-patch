@@ -1,5 +1,5 @@
 //! Coverage-gap e2e for `update::swap::acquire_update_lock`'s unlocked
-//! degrade: when no per-user state dir resolves
+//! degrade (2026-09 coverage audit): when no per-user state dir resolves
 //! at all — the `SOCKET_UPDATE_STATE_DIR` override, `XDG_CACHE_HOME`, and
 //! `HOME` all unset/empty — the updater proceeds WITHOUT the single-flight
 //! lock rather than refusing on exotic environments. A documented

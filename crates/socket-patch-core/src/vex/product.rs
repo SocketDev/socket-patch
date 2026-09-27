@@ -873,7 +873,8 @@ mod tests {
 
     /// Regression: a malformed `url ...` line WITHOUT an `=` must be
     /// skipped, allowing a later well-formed `url = ...` line in the
-    /// same section to still be picked up.
+    /// same section to still be picked up. (Previously the `?` on the
+    /// `=` strip aborted the whole function, returning None.)
     #[test]
     fn scan_origin_url_skips_malformed_url_line_then_finds_valid_one() {
         let cfg = "[remote \"origin\"]\n\turl no-equals-here\n\turl = git@github.com:foo/bar.git\n";
@@ -1128,7 +1129,7 @@ mod tests {
     }
 
     /// `package.json` with only `version` (no `name`) → None.
-    /// Exercises the `v.get("name")?` early return in `parse_package_json`.
+    /// Currently the early `is_empty()` branch in `read_package_json`.
     #[tokio::test]
     async fn package_json_missing_name_returns_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -1325,12 +1326,16 @@ mod tests {
     }
 
     /// `[remote "origin"]` block has a line that starts with `url`
-    /// but has no `=` (e.g. `url ` then EOL). The scanner skips it
-    /// (`split_once('=')` → `continue`) and exhausts the section with no
-    /// url.
+    /// but has no `=` (e.g. `url ` then EOL). The `strip_prefix('=')?`
+    /// inside `scan_remote_origin_url` returns None and the scanner
+    /// continues — eventually exhausting the section with no url.
     #[test]
     fn scan_origin_url_skips_url_line_without_equals_sign() {
         let cfg = "[remote \"origin\"]\n\turl no-equals-here\n";
+        // The `url` line has no `=`, so the scanner returns None
+        // from the inner `strip_prefix('=')?` — but per the code
+        // shape (line 224 with `?` on an Option), that propagates
+        // out of `scan_remote_origin_url` as None.
         assert!(scan_remote_origin_url(cfg).is_none());
     }
 
@@ -1351,8 +1356,9 @@ mod tests {
 
     /// Regression: a remote URL carrying BOTH a `.git` suffix AND a
     /// trailing slash (`https://github.com/owner/repo.git/`) must still
-    /// normalize to `pkg:github/owner/repo` — the slash must be trimmed
-    /// before `.git` is stripped.
+    /// normalize to `pkg:github/owner/repo`. Previously `.git` was
+    /// stripped before the slash was trimmed, so the strip no-opped and
+    /// the PURL kept `repo.git`.
     #[test]
     fn remote_url_dotgit_with_trailing_slash_is_normalized() {
         assert_eq!(
@@ -1401,7 +1407,8 @@ mod tests {
     /// Regression: when the highest-priority manifest is present but
     /// fails to parse (invalid JSON), detection falls through to the
     /// next manifest — and the warning must name the manifest ACTUALLY
-    /// used, not the one that failed (not `found[0]`).
+    /// used, not the one that failed. Previously the warning hard-coded
+    /// `found[0]` ("package.json") even though Cargo.toml was used.
     #[tokio::test]
     async fn multi_manifest_warning_names_actually_used_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -1435,9 +1442,11 @@ mod tests {
     // (it would name a manifest that wasn't actually used).
     // ── Regression: TOML single-quoted (literal) string values ────────
     // TOML permits `key = 'value'` (literal strings) as well as
-    // `key = "value"`, so a manifest written with single quotes (common
-    // with cargo-edit / hand-edited files) must still yield a product.
-    // Mirrors the cargo crawler's single-quote handling.
+    // `key = "value"`. The scanner previously only accepted the
+    // double-quoted form, so a manifest written with single quotes
+    // (common with cargo-edit / hand-edited files) yielded None and
+    // product detection silently failed. Mirrors the cargo-crawler
+    // single-quote fix.
 
     /// `parse_toml_string_kv`: single-quoted literal value is accepted.
     #[test]
@@ -1494,7 +1503,7 @@ mod tests {
     }
 
     /// End-to-end: a `Cargo.toml` with single-quoted name/version still
-    /// produces a cargo PURL.
+    /// produces a cargo PURL (previously returned None).
     #[tokio::test]
     async fn detect_cargo_toml_single_quoted() {
         let dir = tempfile::tempdir().unwrap();

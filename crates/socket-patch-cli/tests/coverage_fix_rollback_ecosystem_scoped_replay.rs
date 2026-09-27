@@ -115,7 +115,7 @@ async fn ecosystems_scoped_rollback_leaves_other_ecosystems_leftover_edits() {
     );
 }
 
-/// Control: an UNSCOPED rollback
+/// Control (the behavior the fix must not break): an UNSCOPED rollback
 /// still replays the records-empty ledger's leftover edits and deletes
 /// the emptied ledger.
 #[tokio::test]

@@ -1059,7 +1059,7 @@ async fn local_rebuild(
     };
 
     if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &nupkg_bytes).await {
-        // atomic_write_artifact cleans up its own stage file, so an existing
+        // atomic_write_bytes cleans up its own stage file, so an existing
         // committed nupkg in the dir is intact; on the wired hot path it (and
         // the marker) must stay — the config still routes restores here.
         if !config_wired {
@@ -1075,7 +1075,7 @@ async fn local_rebuild(
 /// OPC zip; NuGet reads the central directory, so entry order is free to be
 /// lexicographic for stable bytes across re-runs). The in-memory repack
 /// assembles the same entry list from the parts it never wrote out; a package
-/// that had to be extracted is walked from the stage on disk.
+/// that had to be extracted is walked as before.
 async fn rebuild_nupkg_bytes(
     repack: Option<MemoryRepack>,
     stage: &Path,
@@ -2312,7 +2312,7 @@ mod tests {
         .await
     }
 
-    /// Equivalence: keeping the package's parts in memory must rebuild
+    /// X10 equivalence: keeping the package's parts in memory must rebuild
     /// the EXACT bytes the extract-to-disk rebuild produced — the lock's
     /// `contentHash` pin rides on them. Driven twice over one fixture, once
     /// with the in-memory repack forced off. The fixture also exercises the
@@ -2540,7 +2540,8 @@ mod tests {
         // A pre-existing config. Vendor wires OUR source + mapping. Then a
         // sibling vendor run adds ITS OWN source + mapping (simulated by the
         // same insertion shape). Reverting us must excise ONLY our source
-        // `<add>` and our `<packageSource>` mapping, keeping the sibling's.
+        // `<add>` and our `<packageSource>` mapping, keeping the sibling's —
+        // the old whole-file restore would have wiped the sibling entirely.
         let orig_cfg = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
                         <configuration>\n\
                         \x20 <packageSources>\n\
@@ -2748,7 +2749,7 @@ mod tests {
         assert!(!root.join("nuget.config").exists());
     }
 
-    // ── comment-blind wiring ───────────────────────────────────────────────
+    // ── comment-blind wiring regressions ───────────────────────────────────
 
     /// `t` with every `<!-- … -->` span dropped — what NuGet actually reads.
     fn visible_text(t: &str) -> String {
@@ -2910,7 +2911,7 @@ mod tests {
         );
     }
 
-    // ── wired hot-path rebuild ─────────────────────────────────────────────
+    // ── wired hot-path rebuild regressions ─────────────────────────────────
 
     #[tokio::test]
     async fn wired_rebuild_reports_vendored_nupkg_path() {
@@ -3099,7 +3100,7 @@ mod tests {
         );
     }
 
-    // ── tamper-able wiring `file` ──────────────────────────────────────────
+    // ── tamper-able wiring `file` regression ───────────────────────────────
 
     #[tokio::test]
     async fn revert_refuses_wiring_file_outside_project_root() {
@@ -3438,9 +3439,8 @@ mod tests {
     /// A FIFO planted as the committed vendored nupkg (the tamper-able tree)
     /// must read as out-of-sync — triggering the artifact rebuild that
     /// atomically replaces it — instead of wedging the in-sync hot path
-    /// forever. The one guarded read of the nupkg (`read_zip_artifact` in
-    /// common.rs) feeds both the member-hash check and the lock content-hash
-    /// pin; this pins that the read fails fast on a FIFO.
+    /// forever. The zip probe (`zip_matches_after_hashes`) is already guarded
+    /// in common.rs; this pins the lock-hash read beside it.
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_vendored_nupkg_fails_fast_and_rebuilds_on_hot_path() {
@@ -3596,7 +3596,7 @@ mod tests {
         );
     }
 
-    // ── refusal + no-op edges ──────────────────────────────────────────────
+    // ── covgap 2026-09: refusal + no-op edges ───────────────────────────────
 
     /// A purl from another ecosystem is refused before any disk access.
     #[tokio::test]
@@ -3645,7 +3645,7 @@ mod tests {
         );
     }
 
-    // ── wired hot path without a lockfile ──────────────────────────────────
+    // ── covgap 2026-09: wired hot path without a lockfile ───────────────────
 
     /// The in-sync rerun of a project with NO packages.lock.json short-circuits
     /// to AlreadyPatched (an absent lock is trivially in sync).
@@ -3697,7 +3697,7 @@ mod tests {
         );
     }
 
-    // ── wired hot-path rebuild failure legs ────────────────────────────────
+    // ── covgap 2026-09: wired hot-path rebuild failure legs ─────────────────
 
     /// Wired + stale with the cached pristine nupkg ALSO gone: the rebuild leg
     /// bubbles the terminal refusal, and the wired config stays untouched.
@@ -3833,7 +3833,7 @@ mod tests {
         );
     }
 
-    // ── config-edit failure shapes ─────────────────────────────────────────
+    // ── covgap 2026-09: config-edit failure shapes ──────────────────────────
 
     /// A pre-existing config with no `</configuration>` fails the FRESH vendor
     /// after the artifact was built — the partial uuid dir is removed and no
@@ -3939,7 +3939,7 @@ mod tests {
         assert!(err.contains("no </configuration> to edit"), "{err}");
     }
 
-    // ── marker write failure is a warning, not a failure ───────────────────
+    // ── covgap 2026-09: marker write failure is a warning, not a failure ────
 
     #[tokio::test]
     async fn marker_write_failure_warns_but_vendor_succeeds() {
@@ -3979,7 +3979,7 @@ mod tests {
         assert!(lock.contains(&content_hash(&nupkg)));
     }
 
-    // ── revert entry validation edges ──────────────────────────────────────
+    // ── covgap 2026-09: revert entry validation edges ───────────────────────
 
     fn entry_with_wiring(uuid: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
         VendorEntry {
@@ -4194,7 +4194,7 @@ mod tests {
         assert!(!root.join("nuget.config").exists(), "no config resurrected");
     }
 
-    // ── dry-run revert previews without writes ─────────────────────────────
+    // ── covgap 2026-09: dry-run revert previews without writes ──────────────
 
     #[tokio::test]
     async fn dry_run_revert_in_sync_touches_nothing() {
@@ -4267,7 +4267,7 @@ mod tests {
         assert!(root.join(format!(".socket/vendor/nuget/{UUID}")).exists());
     }
 
-    // ── local-rebuild failure shapes ───────────────────────────────────────
+    // ── covgap 2026-09: local-rebuild failure shapes ────────────────────────
 
     /// A cached .nupkg that is not a zip cannot be staged: failed result, and
     /// no project file (or artifact dir) is written after the failure.
@@ -4366,7 +4366,7 @@ mod tests {
         );
     }
 
-    // ── service prebuilt (Tier A) arms ─────────────────────────────────────
+    // ── covgap 2026-09: service prebuilt (Tier A) arms ──────────────────────
 
     #[tokio::test]
     async fn service_prebuilt_used_writes_served_bytes_verbatim() {
@@ -4522,7 +4522,7 @@ mod tests {
         assert!(!root.join("nuget.config").exists());
     }
 
-    // ── edit_lock / lock_pinned pure edges ─────────────────────────────────
+    // ── covgap 2026-09: edit_lock / lock_pinned pure edges ──────────────────
 
     #[test]
     fn edit_lock_absent_shapes_are_nothing_to_pin() {
@@ -4588,7 +4588,7 @@ mod tests {
         assert!(!lock_pinned(&lock, "Newtonsoft.Json", "12.0.0", "H=="));
     }
 
-    // ── revert_lock_record pure edges ──────────────────────────────────────
+    // ── covgap 2026-09: revert_lock_record pure edges ───────────────────────
 
     fn lock_wiring(original: Option<&str>, new: Option<&str>) -> WiringRecord {
         WiringRecord {
@@ -4655,7 +4655,7 @@ mod tests {
         assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
     }
 
-    // ── unwind of a CREATED config ─────────────────────────────────────────
+    // ── covgap 2026-09: unwind of a CREATED config ──────────────────────────
 
     /// When vendor CREATED nuget.config and the lock edit then fails, the
     /// unwind must DELETE the created config (the None arm), not restore it.
@@ -4690,7 +4690,7 @@ mod tests {
         );
     }
 
-    // ── comment blanking + key scan edges ──────────────────────────────────
+    // ── covgap 2026-09: comment blanking + key scan edges ───────────────────
 
     #[test]
     fn blank_comments_unterminated_blanks_through_eof() {
@@ -4718,7 +4718,7 @@ mod tests {
         assert_eq!(parse_config_source_keys(text), vec!["a"]);
     }
 
-    // ── permission-failure unwinds (unix) ──────────────────────────────────
+    // ── covgap 2026-09: permission-failure unwinds (unix) ───────────────────
 
     /// Fresh-path nuget.config write failure: the artifact already staged into
     /// the (pre-created, writable) uuid dir must be cleaned up so a failed
@@ -4902,7 +4902,7 @@ mod tests {
         );
     }
 
-    // ── remaining prod arms ────────────────────────────────────────────────
+    // ── covgap 2026-09 mop-up: remaining prod arms ───────────────────────────
 
     /// `attr_value` scanning edges: a substring hit on the attribute NAME
     /// (`keyring`) and a malformed unquoted value both advance the scan to the
@@ -5080,7 +5080,7 @@ mod tests {
         );
     }
 
-    // ── source flip: the hot path decides "in sync" from the
+    // ── source-flip regression: the hot path decides "in sync" from the
     //    COMMITTED copy before any service call, so a service ↔ local flip
     //    between runs is a byte-identical no-op with no request. ──
 

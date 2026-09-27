@@ -1,7 +1,7 @@
 //! Pure text builders for `scan`'s human output: the results table, the
-//! summary lines, the dry-run line, the per-patch preview, and the hints.
-//! No I/O and no terminal state (color is decided by the caller and passed
-//! in), so every string is unit-testable byte for byte.
+//! summary and prompt lines, the per-patch preview, and the hints. No I/O
+//! and no terminal state (color is decided by the caller and passed in),
+//! so every string is unit-testable byte for byte.
 
 use std::collections::HashMap;
 
@@ -202,6 +202,8 @@ fn quoted_list(items: &[String], one: &str, many: &str) -> String {
     format!("{label}: {}", items.join(", "))
 }
 
+/// Warning printed when `--prune` cannot run because nothing was crawled
+/// (pruning every manifest entry is too destructive to do implicitly).
 /// The warning for one failed API batch of several (the scan goes on
 /// with the others). A one-batch scan prints only [`all_batches_failed`].
 pub(super) fn batch_failed_warning(batch: usize, total: usize, err: &str) -> String {
@@ -217,8 +219,6 @@ pub(super) fn all_batches_failed(total: usize, err: &str) -> String {
     }
 }
 
-/// Warning printed when `--prune` cannot run because nothing was crawled
-/// (pruning every manifest entry is too destructive to do implicitly).
 pub(super) const PRUNE_SKIPPED_EMPTY: &str = "Warning: --prune skipped: no installed packages \
      were found, and pruning every manifest entry is too destructive to do implicitly; run \
      `socket-patch repair` to clean up .socket/ explicitly.";
@@ -248,8 +248,8 @@ pub(super) fn dry_run_line(plan: Plan, refused: usize) -> String {
     format!("[dry-run] Would {what}. No changes made.")
 }
 
-/// Lines printed after a report-only scan (`--prune` or global with no
-/// mode, so no lockfile to rewire): how to apply what it found.
+/// Lines printed after a report-only scan (path-scoped, `--prune` or
+/// global, so no lockfile to rewire): how to apply what it found.
 pub(super) fn report_only_hint() -> [String; 3] {
     [
         "To apply these patches in place, run:".to_string(),

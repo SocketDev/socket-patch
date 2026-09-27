@@ -276,7 +276,7 @@ record from the ledgers or the patch API, and verifies the installed tree
   manifest, reverted and half-reverted pairs (including script pairs),
   tampered installed trees and wheel members, spoofed hosts and vendor paths,
   record mismatches, and the embedded `apply --vex` / `vendor --vex` /
-  `scan --mode hosted|vendored --vex` paths.
+  `scan --redirect|--vendor --vex` paths.
 - `e2e_redirect_uv_build` (hosted, wiremock patch API serving the patched
   wheel) and `e2e_vendor_pypi_build` (vendored) — the REAL uv under test
   (`SOCKET_PATCH_UV_E2E_BIN` / `_VERSION` / `_PYTHON` / `_REQUIRED`) builds
