@@ -78,6 +78,7 @@ pub mod nuget_feed;
 pub(crate) mod parse_memo;
 pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
+pub mod prestage;
 pub mod pypi;
 mod pypi_hatch;
 mod pypi_lock;
@@ -888,25 +889,20 @@ pub fn is_vendorable(purl: &str) -> bool {
     ecosystem_dir_for_purl(purl).is_some()
 }
 
-/// The served secondary artifact `purl`'s backend downloads right after a
-/// verified prebuilt archive — gem's stub gemspec — for the download plan to
-/// fetch along with it; `None` for every other ecosystem.
-pub fn service_secondary_kind(purl: &str) -> Option<&'static str> {
-    (ecosystem_dir_for_purl(purl) == Some("gem")).then_some(gem::GEM_STUB_ARTIFACT_KIND)
-}
-
-/// Whether the vendor loop's backend call for `purl` — a wet run with the
-/// patch service enabled — asks the service for `record`'s prebuilt
-/// archive: past every refusal the backend raises before that call, and
-/// answered neither by its in-sync hot path nor by the reuse of a committed
-/// artifact. Each backend answers with the same functions its `vendor_*`
+/// The download the vendor loop's backend call for `purl` — a wet run with
+/// the patch service enabled — asks the service for, when it asks at all:
+/// past every refusal the backend raises before that call, and answered
+/// neither by its in-sync hot path nor by the reuse of a committed
+/// artifact. The download carries what rides it: the secondary artifact the
+/// backend fetches right after (gem's stub gemspec) and the recipe that
+/// stages the archive ahead of the backend ([`prestage`]). Each backend answers with the same functions its `vendor_*`
 /// entry point runs first, so a download plan built from this never names a
 /// package the loop refuses before asking (a grant can start a server-side
 /// build and counts against quota). `source_path` is the package source's
 /// [`PackageSource::path`] (the gem backend reads its name and parents);
 /// `pipenv_version` and `installed_sites` are the loop's own pypi caches.
 /// npm is planned in one batch by [`npm_flavor::preflight_packages`] and
-/// answers `false` here, as does anything without a service path.
+/// answers `None` here, as does anything without a service path.
 pub async fn service_preflight(
     purl: &str,
     source_path: &Path,
@@ -914,7 +910,7 @@ pub async fn service_preflight(
     record: &crate::manifest::schema::PatchRecord,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &pypi::InstalledSiteListings,
-) -> bool {
+) -> Option<crate::api::client::PlannedDownload> {
     match ecosystem_dir_for_purl(purl) {
         Some("cargo") => cargo::service_preflight(purl, project_root, record).await,
         Some("composer") => composer_lock::service_preflight(purl, project_root, record).await,
@@ -926,7 +922,7 @@ pub async fn service_preflight(
             pypi::service_preflight(purl, project_root, record, pipenv_version, installed_sites)
                 .await
         }
-        _ => false,
+        _ => None,
     }
 }
 

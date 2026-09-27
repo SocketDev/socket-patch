@@ -46,7 +46,7 @@ use super::common::{
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_tgz};
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker,
@@ -370,21 +370,26 @@ async fn cargo_service_copy(
             // swap it into the copy dir only once fully verified — a failure
             // then leaves any pre-existing copy untouched and no husk behind.
             let stage = stage_dir_for(copy_dir);
-            let _ = remove_tree(&stage).await;
-            if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot create {}: {e}", stage.display()),
-                );
-            }
-            let crate_bytes = std::mem::take(&mut archive.bytes);
-            if let Err(e) = extract_on_blocking_pool(crate_bytes, &stage, extract_tgz).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_extract_failed",
-                    format!("cannot extract the prebuilt crate: {e}"),
-                );
+            // A tree the download plan already extracted from these bytes
+            // (see `prestage`) is moved into the stage instead; otherwise —
+            // or should the move fail — extract here, as always.
+            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+                let _ = remove_tree(&stage).await;
+                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+                    cleanup_failed_stage(&stage, uuid_dir, false).await;
+                    return hard(
+                        "vendor_prebuilt_write_failed",
+                        format!("cannot create {}: {e}", stage.display()),
+                    );
+                }
+                let crate_bytes = std::mem::take(&mut archive.bytes);
+                if let Err(e) = extract_on_blocking_pool(crate_bytes, &stage, extract_tgz).await {
+                    cleanup_failed_stage(&stage, uuid_dir, false).await;
+                    return hard(
+                        "vendor_prebuilt_extract_failed",
+                        format!("cannot extract the prebuilt crate: {e}"),
+                    );
+                }
             }
             let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
             // Verify the EXTRACTED TREE, not just the archive bytes: the SRI
@@ -816,21 +821,29 @@ pub(crate) async fn service_preflight(
     purl: &str,
     project_root: &Path,
     record: &PatchRecord,
-) -> bool {
-    let Ok(prelude) = cargo_prelude(purl, project_root, record).await else {
-        return false;
-    };
-    let Ok(lock_probe) =
-        cargo_wet_preflight(project_root, &prelude.name, &prelude.version, &record.uuid).await
-    else {
-        return false;
-    };
+) -> Option<crate::api::client::PlannedDownload> {
+    let prelude = cargo_prelude(purl, project_root, record).await.ok()?;
+    let lock_probe =
+        cargo_wet_preflight(project_root, &prelude.name, &prelude.version, &record.uuid)
+            .await
+            .ok()?;
     let hot = prelude.points_here
         && matches!(
             lock_probe,
             cargo_lock::LockEntryProbe::Detached(_) | cargo_lock::LockEntryProbe::NoLockfile
         );
-    !(hot && cargo_copy_matches(&prelude.copy_dir, &record.files).await)
+    if hot && cargo_copy_matches(&prelude.copy_dir, &record.files).await {
+        return None;
+    }
+    // `cargo_service_copy` extracts the `.crate` into the copy dir's stage.
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::extract(
+            project_root,
+            &prelude.copy_dir,
+            extract_tgz,
+        )),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
 }
 
 /// Vendor one cargo crate: patched copy + `[patch.crates-io]` entry +
@@ -3697,7 +3710,7 @@ mod tests {
             (PURL, empty_patch(&record, PLAN_UUID_B)),
         ];
         let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
-            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+            Box::pin(async move { service_preflight(&purl, root, &rec).await.is_some() })
         };
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (pristine, sources, cfg) = (&pristine, &sources, &cfg);
@@ -3721,6 +3734,107 @@ mod tests {
         // Vendored now: the re-run is in sync and asks nothing.
         let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
         assert!(rerun.is_empty(), "{rerun:?}");
+    }
+
+    /// Every entry under `root` with its bytes (dirs included, so a husk
+    /// shows), paths relative to it.
+    fn listing(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let p = e.unwrap().path();
+                let rel = p.strip_prefix(root).unwrap().display().to_string();
+                if p.is_dir() {
+                    out.push((rel, None));
+                    stack.push(p);
+                } else {
+                    out.push((rel, Some(std::fs::read(&p).unwrap())));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A `.crate` the download plan pre-staged is claimed into the stage,
+    /// leaving exactly the outcome and the tree the loop's own extraction
+    /// leaves; a pre-stage the extractor refuses stages nothing, and the
+    /// live extraction then refuses with its own words.
+    #[tokio::test]
+    async fn a_prestaged_crate_leaves_what_the_live_extraction_leaves() {
+        let _serial = super::super::prestage::TEST_LOCK.lock().await;
+        for broken in [false, true] {
+            let mut runs = Vec::new();
+            for planned in [false, true] {
+                let (dir, blobs, pristine, record) = fixture().await;
+                let root = dir.path();
+                let crate_bytes = if broken {
+                    b"not a gzip stream".to_vec()
+                } else {
+                    make_crate_tgz(
+                        "cfg-if-1.0.4",
+                        &[
+                            ("src/lib.rs", PATCHED),
+                            (
+                                "Cargo.toml",
+                                b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+                            ),
+                        ],
+                    )
+                };
+                let server = wiremock::MockServer::start().await;
+                mount_cargo_granted(&server, &sri_sha512(&crate_bytes), &crate_bytes).await;
+                let cfg = cargo_service_cfg(&server.uri(), VendorSource::Service, false);
+                let plan = service_preflight(PURL, root, &record)
+                    .await
+                    .expect("a fresh crate asks the service");
+                assert!(plan.stage.is_some(), "the crate's extraction is planned");
+                let _guard = planned.then(|| {
+                    cfg.client.as_ref().unwrap().prefetch_vendor_downloads(
+                        vec![plan],
+                        false,
+                        None,
+                        None,
+                        4,
+                        usize::MAX,
+                    )
+                });
+                let claims_before = super::super::prestage::CLAIMS.with(|c| c.get());
+                let sources = PatchSources::blobs_only(&blobs);
+                let outcome = vendor_cargo_crate(
+                    PURL,
+                    &pristine,
+                    root,
+                    &record,
+                    &sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(&cfg),
+                )
+                .await;
+                drop(_guard);
+                super::super::prestage::settle().await;
+                let claimed = super::super::prestage::CLAIMS.with(|c| c.get()) - claims_before;
+                assert_eq!(claimed, usize::from(planned && !broken), "broken={broken}");
+                let summary = match outcome {
+                    VendorOutcome::Done {
+                        result, warnings, ..
+                    } => format!(
+                        "done {} {:?}",
+                        result.success,
+                        warnings.iter().map(|w| w.code).collect::<Vec<_>>()
+                    ),
+                    VendorOutcome::Refused { code, detail } => format!(
+                        "refused {code} {}",
+                        detail.replace(&root.display().to_string(), "ROOT")
+                    ),
+                };
+                runs.push((summary, listing(root)));
+            }
+            assert_eq!(runs[0], runs[1], "broken={broken}");
+        }
     }
 
     /// Service success: the prebuilt crate is extracted into the copy dir (with

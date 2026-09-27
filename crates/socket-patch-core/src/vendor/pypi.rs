@@ -1014,11 +1014,24 @@ pub(crate) async fn service_preflight(
     record: &PatchRecord,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &InstalledSiteListings,
-) -> bool {
-    matches!(
-        pypi_prelude(purl, project_root, record, false, pipenv_version, installed_sites).await,
-        Ok(p) if p.reused_wheel.is_none()
+) -> Option<crate::api::client::PlannedDownload> {
+    pypi_prelude(
+        purl,
+        project_root,
+        record,
+        false,
+        pipenv_version,
+        installed_sites,
     )
+    .await
+    .ok()
+    .filter(|p| p.reused_wheel.is_none())?;
+    // `try_pypi_service_wheel` checks the wheel's members against the
+    // afterHashes before pinning the lockfile to it.
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::verify_zip(&record.files)),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1912,7 +1925,11 @@ async fn try_pypi_service_wheel(
             // members are site-packages-relative (the `record.files` keys),
             // so require each patched file to carry its afterHash before
             // reporting the package patched and pinning the lockfile to it.
-            if !zip_bytes_match_after_hashes(&archive.bytes, &record.files) {
+            if !archive
+                .prestaged
+                .zip_verdict(&record.files)
+                .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files))
+            {
                 return miss(
                     warnings,
                     "vendor_prebuilt_layout_mismatch",
@@ -3018,7 +3035,11 @@ wheels = [
             ("pkg:npm/six@1.16.0", with_uuid(record, PLAN_UUID_C)),
         ];
         let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
-            Box::pin(async move { service_preflight(&purl, root, &rec, pv, sites).await })
+            Box::pin(async move {
+                service_preflight(&purl, root, &rec, pv, sites)
+                    .await
+                    .is_some()
+            })
         };
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (sources, cfg) = (&sources, &cfg);

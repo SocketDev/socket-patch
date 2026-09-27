@@ -74,7 +74,8 @@ use super::gemfile_lock::{is_plain_gem_token, split_checksum_entry, split_entry}
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::service_fetch::{
-    fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult, ServiceArtifact,
+    claim_prestaged, fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult,
+    ServiceArtifact,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -427,12 +428,25 @@ pub(crate) async fn service_preflight(
     installed_path: &Path,
     project_root: &Path,
     record: &PatchRecord,
-) -> bool {
-    match gem_prelude(purl, installed_path, project_root, record).await {
-        Ok(prelude) if prelude.lock_wired => !prelude.copy_ok,
-        Ok(prelude) => gem_edits(purl, &prelude).is_ok(),
-        Err(_) => false,
-    }
+) -> Option<crate::api::client::PlannedDownload> {
+    let prelude = gem_prelude(purl, installed_path, project_root, record)
+        .await
+        .ok()?;
+    let asks = match prelude.lock_wired {
+        true => !prelude.copy_ok,
+        false => gem_edits(purl, &prelude).is_ok(),
+    };
+    // `gem_service_copy` fetches the stub gemspec right after the `.gem`,
+    // and extracts the `.gem`'s data.tar.gz into the copy dir's stage.
+    asks.then(|| crate::api::client::PlannedDownload {
+        secondary: Some(GEM_STUB_ARTIFACT_KIND.to_string()),
+        stage: Some(super::prestage::PrestageRecipe::extract(
+            project_root,
+            &prelude.copy_dir,
+            extract_gem_data,
+        )),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
 }
 
 /// Vendor a gem: materialize a patched copy (plus its stub gemspec) under
@@ -1099,21 +1113,26 @@ async fn gem_service_copy(
     // once fully verified — a failure then leaves any pre-existing (possibly
     // live-wired) copy untouched and no husk behind.
     let stage = stage_dir_for(copy_dir);
-    let _ = remove_tree(&stage).await;
-    if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        return hard(
-            "vendor_prebuilt_write_failed",
-            format!("cannot create {}: {e}", stage.display()),
-        );
-    }
-    let gem_bytes = std::mem::take(&mut archive.bytes);
-    if let Err(e) = extract_on_blocking_pool(gem_bytes, &stage, extract_gem_data).await {
-        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        return hard(
-            "vendor_prebuilt_extract_failed",
-            format!("cannot extract the prebuilt .gem: {e}"),
-        );
+    // A tree the download plan already extracted from these bytes (see
+    // `prestage`) is moved into the stage instead; otherwise — or should
+    // the move fail — extract here, as always.
+    if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+        let _ = remove_tree(&stage).await;
+        if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+            cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+            return hard(
+                "vendor_prebuilt_write_failed",
+                format!("cannot create {}: {e}", stage.display()),
+            );
+        }
+        let gem_bytes = std::mem::take(&mut archive.bytes);
+        if let Err(e) = extract_on_blocking_pool(gem_bytes, &stage, extract_gem_data).await {
+            cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+            return hard(
+                "vendor_prebuilt_extract_failed",
+                format!("cannot extract the prebuilt .gem: {e}"),
+            );
+        }
     }
     if let Err(e) = tokio::fs::write(stage.join(format!("{name}.gemspec")), &stub).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
@@ -3013,7 +3032,11 @@ mod tests {
         ];
         let installed = &installed;
         let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
-            Box::pin(async move { service_preflight(&purl, installed, root, &rec).await })
+            Box::pin(async move {
+                service_preflight(&purl, installed, root, &rec)
+                    .await
+                    .is_some()
+            })
         };
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (sources, cfg) = (&sources, &cfg);

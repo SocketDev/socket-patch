@@ -47,6 +47,10 @@ pub(crate) struct VerifiedArchive {
     /// unverified — a backend that needs one calls [`fetch_verified_secondary`]
     /// to download + integrity-verify it on demand.
     pub secondary: Vec<SecondaryArtifact>,
+    /// What the vendor prefetch plan already did with these bytes ahead of
+    /// the backend: an extracted tree to claim, an afterHash verdict (see
+    /// [`crate::vendor::prestage`]).
+    pub prestaged: crate::vendor::prestage::Prestaged,
 }
 
 impl VerifiedArchive {
@@ -129,7 +133,23 @@ pub(crate) async fn fetch_verified_archive(
         sha256_hex: std::sync::OnceLock::new(),
         source_url: pkg.source_url,
         secondary: pkg.secondary_artifacts,
+        prestaged: pkg.prestaged,
     })
+}
+
+/// Move the tree the download plan pre-staged from `archive`'s bytes (see
+/// [`crate::vendor::prestage`]) into `stage`, the backend's stage for
+/// `copy_dir`, where the backend would otherwise extract them. `false` —
+/// nothing pre-staged, or the move failed — and the backend extracts live.
+pub(crate) async fn claim_prestaged(
+    archive: &mut VerifiedArchive,
+    stage: &std::path::Path,
+    copy_dir: &std::path::Path,
+) -> bool {
+    match archive.prestaged.tree.take() {
+        Some(tree) => tree.claim_into(stage, copy_dir).await,
+        None => false,
+    }
 }
 
 /// Outcome of attempting to materialise a single-file artifact from the patch
@@ -187,7 +207,10 @@ pub(crate) async fn service_archive_copy(
         // Tier-B backends' extracted-tree check). Fail closed → `auto`
         // falls back to the local rebuild.
         ServiceArtifact::Ready(archive)
-            if !zip_bytes_match_after_hashes(&archive.bytes, &record.files) =>
+            if !archive
+                .prestaged
+                .zip_verdict(&record.files)
+                .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files)) =>
         {
             miss(
                 warnings,
@@ -784,6 +807,7 @@ mod tests {
                 url: format!("{}/stub", server.uri()),
                 integrity_sri: PackedTarball::from_bytes(b"x").integrity,
             }],
+            prestaged: Default::default(),
         };
         match fetch_verified_secondary(&cfg_for(&server), &archive, "gem-stub-gemspec").await {
             SecondaryArtifactResult::Failed(reason) => {

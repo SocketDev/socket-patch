@@ -52,7 +52,7 @@ use super::lock_inventory::{composer_lock_packages, ComposerLockPackage};
 use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -209,8 +209,26 @@ pub(crate) async fn service_preflight(
     purl: &str,
     project_root: &Path,
     record: &PatchRecord,
-) -> bool {
-    matches!(composer_prelude(purl, project_root, record).await, Ok(p) if !p.in_sync)
+) -> Option<crate::api::client::PlannedDownload> {
+    let prelude = composer_prelude(purl, project_root, record)
+        .await
+        .ok()
+        .filter(|p| !p.in_sync)?;
+    // `composer_service_copy` extracts the dist zip into the copy dir's stage.
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::extract(
+            project_root,
+            &prelude.copy_dir,
+            extract_dist_zip,
+        )),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
+}
+
+/// Extract a composer dist zip, which carries a single variable top-level
+/// dir, into `dest`.
+fn extract_dist_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    extract_zip(bytes, dest, /*strip_first=*/ true)
 }
 
 /// Vendor a composer package: materialize a patched copy under
@@ -776,26 +794,28 @@ async fn composer_service_copy(
             // (possibly live-wired) copy and its marker untouched and no husk
             // behind.
             let stage = stage_dir_for(copy_dir);
-            let _ = remove_tree(&stage).await;
-            if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot create {}: {e}", stage.display()),
-                );
-            }
-            // composer dist zips carry a single variable top-level dir.
-            let zip_bytes = std::mem::take(&mut archive.bytes);
-            if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, |b, d| {
-                extract_zip(b, d, /*strip_first=*/ true)
-            })
-            .await
-            {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_extract_failed",
-                    format!("cannot extract the prebuilt dist zip: {e}"),
-                );
+            // A tree the download plan already extracted from these bytes
+            // (see `prestage`) is moved into the stage instead; otherwise —
+            // or should the move fail — extract here, as always.
+            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+                let _ = remove_tree(&stage).await;
+                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+                    cleanup_failed_stage(&stage, uuid_dir, false).await;
+                    return hard(
+                        "vendor_prebuilt_write_failed",
+                        format!("cannot create {}: {e}", stage.display()),
+                    );
+                }
+                // composer dist zips carry a single variable top-level dir.
+                let zip_bytes = std::mem::take(&mut archive.bytes);
+                if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, extract_dist_zip).await
+                {
+                    cleanup_failed_stage(&stage, uuid_dir, false).await;
+                    return hard(
+                        "vendor_prebuilt_extract_failed",
+                        format!("cannot extract the prebuilt dist zip: {e}"),
+                    );
+                }
             }
             // Verify the EXTRACTED TREE, not just the archive bytes. The
             // archive-bytes SRI (checked in fetch_verified_archive) proves
@@ -1236,7 +1256,7 @@ mod tests {
             (PURL, empty_patch(&record, PLAN_UUID_B)),
         ];
         let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
-            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+            Box::pin(async move { service_preflight(&purl, root, &rec).await.is_some() })
         };
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (installed, sources, cfg) = (&installed, &sources, &cfg);
@@ -2158,6 +2178,89 @@ mod tests {
     /// Service success: the prebuilt dist zip is extracted into the copy dir
     /// (patched bytes), the lock is rewired, and a `vendor_prebuilt_downloaded`
     /// advisory is emitted — WITHOUT touching the installed package.
+    /// A dist zip the download plan pre-staged is claimed into the stage,
+    /// leaving exactly the outcome and the tree the loop's own extraction
+    /// leaves; a pre-stage the extractor refuses stages nothing, and the
+    /// live extraction then refuses with its own words.
+    #[tokio::test]
+    async fn a_prestaged_dist_zip_leaves_what_the_live_extraction_leaves() {
+        let _serial = super::super::prestage::TEST_LOCK.lock().await;
+        fn listing(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for e in std::fs::read_dir(&dir).unwrap() {
+                    let p = e.unwrap().path();
+                    let rel = p.strip_prefix(root).unwrap().display().to_string();
+                    if p.is_dir() {
+                        out.push((rel, None));
+                        stack.push(p);
+                    } else {
+                        out.push((rel, Some(std::fs::read(&p).unwrap())));
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+        for broken in [false, true] {
+            let mut runs = Vec::new();
+            for planned in [false, true] {
+                let lock = lock_value("psr/log", "3.0.2", false);
+                let (dir, blobs, installed, record) = fixture(&lock).await;
+                let root = dir.path();
+                let zip = if broken {
+                    b"PK not a zip".to_vec()
+                } else {
+                    make_dist_zip(
+                        "php-fig-log-f16e1d5",
+                        &[
+                            ("src/LoggerInterface.php", PATCHED),
+                            ("composer.json", b"{\"name\": \"psr/log\"}\n"),
+                        ],
+                    )
+                };
+                let server = wiremock::MockServer::start().await;
+                mount_composer_granted(&server, &sri_sha512(&zip), &zip).await;
+                let cfg = composer_service_cfg(&server.uri(), VendorSource::Service, false);
+                let plan = service_preflight(PURL, root, &record)
+                    .await
+                    .expect("a fresh package asks the service");
+                let guard = planned.then(|| {
+                    cfg.client.as_ref().unwrap().prefetch_vendor_downloads(
+                        vec![plan],
+                        false,
+                        None,
+                        None,
+                        4,
+                        usize::MAX,
+                    )
+                });
+                let claims_before = super::super::prestage::CLAIMS.with(|c| c.get());
+                let outcome = vendor_with_service(root, &blobs, &installed, &record, &cfg).await;
+                drop(guard);
+                super::super::prestage::settle().await;
+                let claimed = super::super::prestage::CLAIMS.with(|c| c.get()) - claims_before;
+                assert_eq!(claimed, usize::from(planned && !broken), "broken={broken}");
+                let summary = match outcome {
+                    VendorOutcome::Done {
+                        result, warnings, ..
+                    } => format!(
+                        "done {} {:?}",
+                        result.success,
+                        warnings.iter().map(|w| w.code).collect::<Vec<_>>()
+                    ),
+                    VendorOutcome::Refused { code, detail } => format!(
+                        "refused {code} {}",
+                        detail.replace(&root.display().to_string(), "ROOT")
+                    ),
+                };
+                runs.push((summary, listing(root)));
+            }
+            assert_eq!(runs[0], runs[1], "broken={broken}");
+        }
+    }
+
     #[tokio::test]
     async fn service_success_extracts_dist_and_rewrites_lock() {
         let lock = lock_value("psr/log", "3.0.2", false);

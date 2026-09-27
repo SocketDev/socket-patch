@@ -373,8 +373,17 @@ pub(crate) async fn service_preflight(
     purl: &str,
     project_root: &Path,
     record: &PatchRecord,
-) -> bool {
-    matches!(nuget_prelude(purl, project_root, record).await, Ok(p) if !p.in_sync)
+) -> Option<crate::api::client::PlannedDownload> {
+    nuget_prelude(purl, project_root, record)
+        .await
+        .ok()
+        .filter(|p| !p.in_sync)?;
+    // `service_archive_copy` checks the archive's members against the
+    // afterHashes before writing it verbatim.
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::verify_zip(&record.files)),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
 }
 
 /// Vendor a NuGet package: rebuild a patched `.nupkg` under
@@ -2255,7 +2264,7 @@ mod tests {
             ),
         ];
         let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
-            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+            Box::pin(async move { service_preflight(&purl, root, &rec).await.is_some() })
         };
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (installed, sources, cfg) = (&installed, &sources, &cfg);

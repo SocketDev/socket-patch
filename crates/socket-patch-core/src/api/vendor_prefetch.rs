@@ -96,6 +96,7 @@ use super::client::{
     VendorServiceOutcome, VENDOR_BREAKER_THRESHOLD,
 };
 use crate::vendor::lock_inventory::LockIntegrity;
+use crate::vendor::prestage::PrestageRecipe;
 use crate::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 
 /// One fetched outcome: `(outcome, retryable failure)` as
@@ -111,10 +112,11 @@ pub(crate) struct VendorPrefetch {
     patch_server_url: Option<String>,
     /// Planned uuids, in the order the vendor loop consumes them.
     planned: Vec<String>,
-    /// Per planned uuid, the kind of the served secondary artifact the
-    /// loop's backend downloads right after a verified archive (the gem
-    /// stub gemspec), fetched along with it.
-    secondary: Vec<Option<String>>,
+    /// Per planned uuid, what rides its download (see [`PlannedDownload`]):
+    /// the served secondary artifact the loop's backend downloads right
+    /// after a verified archive (the gem stub gemspec), and the recipe
+    /// that stages the archive ahead of the backend.
+    riders: Vec<Riders>,
     /// Most downloads in flight at once, and the most the task may run
     /// ahead of the loop.
     window: usize,
@@ -280,13 +282,24 @@ impl VendorPrefetch {
         window: usize,
         byte_budget: usize,
     ) -> Self {
-        let (planned, secondary) = planned.into_iter().map(|d| (d.uuid, d.secondary)).unzip();
+        let (planned, riders) = planned
+            .into_iter()
+            .map(|d| {
+                (
+                    d.uuid,
+                    Riders {
+                        secondary: d.secondary,
+                        stage: d.stage,
+                    },
+                )
+            })
+            .unzip();
         Self {
             free_only,
             vendor_url: vendor_url.map(str::to_string),
             patch_server_url: patch_server_url.map(str::to_string),
             planned,
-            secondary,
+            riders,
             window: window.max(1),
             look: Arc::new(Lookahead::new(byte_budget)),
             state: tokio::sync::Mutex::new(PrefetchState::default()),
@@ -371,10 +384,10 @@ impl VendorPrefetch {
     fn start(&self, state: &mut PrefetchState, client: &ApiClient, from: usize) {
         let (tx, rx) = tokio::sync::mpsc::channel(self.window);
         let client = client.clone();
-        let planned: Vec<(String, Option<String>)> = self.planned[from..]
+        let planned: Vec<(String, Riders)> = self.planned[from..]
             .iter()
             .cloned()
-            .zip(self.secondary[from..].iter().cloned())
+            .zip(self.riders[from..].iter().cloned())
             .collect();
         let (free_only, window) = (self.free_only, self.window);
         let vendor_url = self.vendor_url.clone();
@@ -388,29 +401,26 @@ impl VendorPrefetch {
             // nothing observable is folded here, and a passed-over
             // download must not delay the one the loop is waiting for.
             // `take` puts each outcome back on its own call.
-            let mut fetched = std::pin::pin!(futures_util::stream::iter(
-                planned.into_iter().enumerate()
-            )
-            .map(
-                move |(offset, (uuid, secondary)): (usize, (String, Option<String>))| async move {
-                    let index = from + offset;
-                    if !look.admits(index).await {
-                        return None;
-                    }
-                    let mut held = hold_back_debug(client.fetch_vendor_package_once(
-                        &uuid,
-                        free_only,
-                        vendor_url,
-                        patch_server_url,
-                    ))
-                    .await;
-                    if let Some(kind) = secondary {
-                        prefetch_secondary(client, &mut held, &kind).await;
-                    }
-                    Some((index, held))
-                }
-            )
-            .buffer_unordered(window));
+            let mut fetched =
+                std::pin::pin!(futures_util::stream::iter(planned.into_iter().enumerate())
+                    .map(
+                        move |(offset, (uuid, riders)): (usize, (String, Riders))| async move {
+                            let index = from + offset;
+                            if !look.admits(index).await {
+                                return None;
+                            }
+                            let mut held = hold_back_debug(client.fetch_vendor_package_once(
+                                &uuid,
+                                free_only,
+                                vendor_url,
+                                patch_server_url,
+                            ))
+                            .await;
+                            ride_along(client, &mut held, riders).await;
+                            Some((index, held))
+                        }
+                    )
+                    .buffer_unordered(window));
             while let Some(item) = fetched.next().await {
                 let Some((index, held)) = item else { continue };
                 // Counted before the send, released by `take`.
@@ -460,13 +470,28 @@ fn archive_bytes(fetched: &Fetched) -> usize {
     }
 }
 
-/// Fetch a planned download's secondary artifact of `kind` along with it —
-/// exactly when the loop's backend would ask for it: the archive is ready,
-/// passes the integrity checks `fetch_verified_archive` runs before
-/// handing it over, and the service served an artifact of that kind (the
-/// first one, as `fetch_verified_secondary` picks). Its outcome and debug
-/// lines are held on the artifact for `fetch_verified_secondary` to take.
-async fn prefetch_secondary(client: &ApiClient, held: &mut Fetched, kind: &str) {
+/// What rides one planned download (see [`PlannedDownload`]).
+#[derive(Debug, Clone)]
+struct Riders {
+    secondary: Option<String>,
+    stage: Option<PrestageRecipe>,
+}
+
+/// Do what rides a planned download — exactly when the loop's backend
+/// would get that far: the archive is ready and passes the integrity checks
+/// `fetch_verified_archive` runs before handing it over.
+///
+/// * The secondary artifact of `kind`, when the service served one (the
+///   first, as `fetch_verified_secondary` picks), is downloaded with its
+///   debug lines held on the artifact for `fetch_verified_secondary` to
+///   take.
+/// * The stage recipe runs on the bytes (see [`crate::vendor::prestage`]);
+///   what it produced rides the archive to the backend.
+async fn ride_along(client: &ApiClient, held: &mut Fetched, riders: Riders) {
+    let Riders { secondary, stage } = riders;
+    if secondary.is_none() && stage.is_none() {
+        return;
+    }
     let (VendorServiceOutcome::Ready(pkg), _) = held.peek_mut() else {
         return;
     };
@@ -483,11 +508,18 @@ async fn prefetch_secondary(client: &ApiClient, held: &mut Fetched, kind: &str) 
     if !intact {
         return;
     }
-    let Some(artifact) = pkg.secondary_artifacts.iter_mut().find(|a| a.kind == kind) else {
-        return;
-    };
-    let downloaded = hold_back_debug(client.download_artifact(&artifact.url)).await;
-    artifact.prefetched = Some(PrefetchedSecondary::new(downloaded));
+    if let Some(kind) = secondary {
+        if let Some(artifact) = pkg.secondary_artifacts.iter_mut().find(|a| a.kind == kind) {
+            let downloaded = hold_back_debug(client.download_artifact(&artifact.url)).await;
+            artifact.prefetched = Some(PrefetchedSecondary::new(downloaded));
+        }
+    }
+    if let Some(recipe) = stage {
+        let (bytes, prestaged) =
+            crate::vendor::prestage::run(&recipe, std::mem::take(&mut pkg.tarball)).await;
+        pkg.tarball = bytes;
+        pkg.prestaged = prestaged;
+    }
 }
 
 /// Keeps a [`VendorPrefetch`] plan attached to its client; dropping it
@@ -1040,10 +1072,7 @@ mod tests {
         let c = client(&server.uri());
         let _guard = c.prefetch_vendor_downloads(
             all.iter()
-                .map(|&i| PlannedDownload {
-                    uuid: uuid(i),
-                    secondary: None,
-                })
+                .map(|&i| PlannedDownload::archive(uuid(i)))
                 .collect(),
             false,
             None,
@@ -1126,8 +1155,8 @@ mod tests {
                 cfg.client.as_ref().unwrap().prefetch_vendor_downloads(
                     (0..3)
                         .map(|i| PlannedDownload {
-                            uuid: uuid(i),
                             secondary: Some(KIND.to_string()),
+                            ..PlannedDownload::archive(uuid(i))
                         })
                         .collect(),
                     false,

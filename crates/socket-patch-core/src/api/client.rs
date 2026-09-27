@@ -1188,13 +1188,7 @@ impl ApiClient {
         window: usize,
     ) -> VendorPrefetchGuard {
         self.prefetch_vendor_downloads(
-            uuids
-                .into_iter()
-                .map(|uuid| PlannedDownload {
-                    uuid,
-                    secondary: None,
-                })
-                .collect(),
+            uuids.into_iter().map(PlannedDownload::archive).collect(),
             free_only,
             vendor_url,
             patch_server_url,
@@ -1346,6 +1340,7 @@ impl ApiClient {
                     dirhash_h1: artifact.integrity.dirhash_h1.clone(),
                     source_url: download_url,
                     secondary_artifacts,
+                    prestaged: Default::default(),
                 }))
             }
             (ServeDownload::NotFound, _) => done(VendorServiceOutcome::Unavailable(
@@ -1738,6 +1733,9 @@ pub(crate) struct FetchedVendorPackage {
     /// each with a host-rewritten URL + normalized sha512, for a backend to
     /// download + verify lazily via [`ApiClient::download_artifact`].
     pub secondary_artifacts: Vec<SecondaryArtifact>,
+    /// What the vendor prefetch plan already did with these bytes ahead of
+    /// the backend (see [`crate::vendor::prestage`]).
+    pub prestaged: crate::vendor::prestage::Prestaged,
 }
 
 /// A non-tarball served artifact reference (e.g. `gem-stub-gemspec`): its kind,
@@ -1765,6 +1763,22 @@ pub struct PlannedDownload {
     /// passes its integrity checks and the service served that kind, the
     /// backend's own conditions — and the backend takes it in its place.
     pub secondary: Option<String>,
+    /// What to do with the archive once it has landed and passed its
+    /// integrity checks, ahead of the backend: extract it next to the
+    /// backend's stage, or run its afterHash check (see
+    /// [`crate::vendor::prestage`]). Built by the backends' plan gates.
+    pub stage: Option<crate::vendor::prestage::PrestageRecipe>,
+}
+
+impl PlannedDownload {
+    /// A plain archive download: no secondary artifact, nothing staged.
+    pub fn archive(uuid: String) -> Self {
+        Self {
+            uuid,
+            secondary: None,
+            stage: None,
+        }
+    }
 }
 
 /// A secondary artifact's download made ahead of the backend's call, with

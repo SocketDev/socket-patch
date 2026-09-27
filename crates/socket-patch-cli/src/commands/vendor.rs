@@ -1579,38 +1579,29 @@ async fn plan_service_downloads(
     // One gate at a time: several at once would each hold their own parse
     // of the project's lockfiles (a cargo gate clones the whole Cargo.lock
     // document), which a monorepo pays for in peak memory.
-    let mut others: Vec<bool> = Vec::with_capacity(reaching.len());
+    let mut planned = Vec::new();
     for (purl, record, source_path) in &reaching {
-        others.push(
-            !purl.starts_with("pkg:npm/")
-                && vendor::service_preflight(
-                    purl,
-                    source_path,
-                    cwd,
-                    record,
-                    pipenv_version,
-                    installed_sites,
-                )
-                .await,
-        );
+        let download = if purl.starts_with("pkg:npm/") {
+            npm_verdicts
+                .next()
+                .filter(|verdict| verdict.is_ok())
+                .map(|_| {
+                    socket_patch_core::api::client::PlannedDownload::archive(record.uuid.clone())
+                })
+        } else {
+            vendor::service_preflight(
+                purl,
+                source_path,
+                cwd,
+                record,
+                pipenv_version,
+                installed_sites,
+            )
+            .await
+        };
+        planned.extend(download);
     }
-    reaching
-        .iter()
-        .zip(others)
-        .filter(|((purl, _, _), other)| {
-            if purl.starts_with("pkg:npm/") {
-                npm_verdicts.next().is_some_and(|verdict| verdict.is_ok())
-            } else {
-                *other
-            }
-        })
-        .map(
-            |((purl, record, _), _)| socket_patch_core::api::client::PlannedDownload {
-                uuid: record.uuid.clone(),
-                secondary: vendor::service_secondary_kind(purl).map(str::to_string),
-            },
-        )
-        .collect()
+    planned
 }
 
 /// The vendoring engine, decoupled from the manifest file. `records` is the
@@ -2171,7 +2162,7 @@ pub(crate) async fn vendor_records_reusing(
     // call (see `VendorPrefetch`). Asking `wants_prefetch` first keeps the
     // walk off the runs that would drop the plan anyway (`--vendor-source
     // build`, `--offline`, one request at a time).
-    let _service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
+    let service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
         Some(cfg) => {
             let takeover_blocked = |purl: &str| {
                 redirect_ledger_corrupt.is_some()
@@ -2754,6 +2745,14 @@ pub(crate) async fn vendor_records_reusing(
             }
         }
     }
+
+    // The loop is done with the service: detach the download plan (and stop
+    // what is still in flight), then remove whatever it staged that no
+    // backend claimed — a download the breaker skipped or the loop passed
+    // over. Never earlier: the loop's own unwinds prune empty vendor levels,
+    // and a concurrent removal could race them.
+    drop(service_prefetch);
+    vendor::prestage::settle().await;
 
     // Every backend has staged what it needed, so the fetch tempdirs can
     // go. Dropping them removes whatever was extracted into them — a

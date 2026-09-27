@@ -36,7 +36,7 @@ use super::common::{
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip_with_prefix};
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -173,9 +173,25 @@ pub(crate) async fn service_preflight(
     purl: &str,
     project_root: &Path,
     record: &PatchRecord,
-) -> bool {
-    matches!(go_prelude(purl, project_root, record).await, Ok(p) if !p.copy_was_ok)
-        && !record.files.is_empty()
+) -> Option<crate::api::client::PlannedDownload> {
+    if record.files.is_empty() {
+        return None;
+    }
+    let prelude = go_prelude(purl, project_root, record)
+        .await
+        .ok()
+        .filter(|p| !p.copy_was_ok)?;
+    // `go_service_redirect` extracts the module zip (its literal
+    // `{module}@{version}/` prefix stripped) into the copy dir's stage.
+    let prefix = format!("{}@{}/", prelude.module, prelude.version);
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::extract(
+            project_root,
+            &prelude.copy_dir,
+            move |bytes, dest| extract_zip_with_prefix(bytes, dest, &prefix),
+        )),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
 }
 
 /// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
@@ -553,43 +569,48 @@ async fn go_service_redirect(
             // failed re-download never destroys a pre-existing copy the
             // vendor `replace` still points at.
             let stage = stage_dir_for(copy_dir);
-            let _ = remove_tree(&stage).await; // a crashed earlier run's litter
-            if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                cleanup_failed_service_stage(
-                    &stage,
-                    project_root,
-                    base_rel,
-                    copy_dir,
-                    module,
-                    wired,
-                )
-                .await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot create {}: {e}", stage.display()),
-                );
-            }
             let prefix = format!("{module}@{version}/");
-            let zip_bytes = std::mem::take(&mut archive.bytes);
-            let prefix_owned = prefix.clone();
-            if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, move |b, d| {
-                extract_zip_with_prefix(b, d, &prefix_owned)
-            })
-            .await
-            {
-                cleanup_failed_service_stage(
-                    &stage,
-                    project_root,
-                    base_rel,
-                    copy_dir,
-                    module,
-                    wired,
-                )
-                .await;
-                return hard(
-                    "vendor_prebuilt_extract_failed",
-                    format!("cannot extract the prebuilt module zip: {e}"),
-                );
+            // A tree the download plan already extracted from these bytes
+            // (see `prestage`) is moved into the stage instead; otherwise —
+            // or should the move fail — extract here, as always.
+            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+                let _ = remove_tree(&stage).await; // a crashed earlier run's litter
+                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+                    cleanup_failed_service_stage(
+                        &stage,
+                        project_root,
+                        base_rel,
+                        copy_dir,
+                        module,
+                        wired,
+                    )
+                    .await;
+                    return hard(
+                        "vendor_prebuilt_write_failed",
+                        format!("cannot create {}: {e}", stage.display()),
+                    );
+                }
+                let zip_bytes = std::mem::take(&mut archive.bytes);
+                let prefix_owned = prefix.clone();
+                if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, move |b, d| {
+                    extract_zip_with_prefix(b, d, &prefix_owned)
+                })
+                .await
+                {
+                    cleanup_failed_service_stage(
+                        &stage,
+                        project_root,
+                        base_rel,
+                        copy_dir,
+                        module,
+                        wired,
+                    )
+                    .await;
+                    return hard(
+                        "vendor_prebuilt_extract_failed",
+                        format!("cannot extract the prebuilt module zip: {e}"),
+                    );
+                }
             }
             // A `replace` target needs a go.mod declaring the module path;
             // pre-modules zips may lack one — synthesize the minimal form.
@@ -973,7 +994,7 @@ mod tests {
             ),
         ];
         let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
-            Box::pin(async move { service_preflight(&purl, root, &rec).await })
+            Box::pin(async move { service_preflight(&purl, root, &rec).await.is_some() })
         };
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (pristine, sources, cfg) = (&pristine, &sources, &cfg);
