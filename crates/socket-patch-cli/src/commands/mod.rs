@@ -1,5 +1,6 @@
 pub mod apply;
 pub(crate) mod bun_preflight;
+pub(crate) mod context;
 pub(crate) mod fetch_stage;
 pub mod get;
 pub mod hosted_bundle;
@@ -62,7 +63,7 @@ pub(crate) async fn discover_wiring(
     socket_patch_core::vex::discover_patched_refs_with(root, &opts).await
 }
 
-/// Read-only lenient load of the hosted redirect ledger: missing → `None`
+/// Read-only lenient view of a loaded hosted redirect ledger: missing → `None`
 /// (a fresh start); malformed → `None` with the corruption surfaced on
 /// stderr unless `silent`. This is the "read-only consumers may degrade a
 /// malformed ledger to nothing-to-consult, but must surface it" posture
@@ -72,12 +73,15 @@ pub(crate) async fn discover_wiring(
 /// instead. Used by scan's empty-discovery `redirectState` consult; the
 /// main-path consult inlines the same posture so it can flush telemetry
 /// before the warning.
-pub(crate) async fn load_redirect_state_lenient(
-    cwd: &Path,
+pub(crate) fn redirect_state_lenient(
+    loaded: &Result<
+        Option<socket_patch_core::patch::redirect::RedirectState>,
+        socket_patch_core::patch::redirect::CorruptRedirectState,
+    >,
     silent: bool,
-) -> Option<socket_patch_core::patch::redirect::RedirectState> {
-    match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
-        Ok(state) => state,
+) -> Option<&socket_patch_core::patch::redirect::RedirectState> {
+    match loaded {
+        Ok(state) => state.as_ref(),
         Err(corrupt) => {
             if !silent {
                 eprintln!("Warning: {corrupt}");
@@ -87,18 +91,18 @@ pub(crate) async fn load_redirect_state_lenient(
     }
 }
 
-/// Read-only lenient load of the vendor ledger (`.socket/vendor/state.json`):
+/// Read-only lenient view of a loaded vendor ledger (`.socket/vendor/state.json`):
 /// missing → an empty ledger; malformed/unreadable → `None` with the
 /// problem surfaced on stderr unless `silent`. The vendor twin of
-/// [`load_redirect_state_lenient`], with the same posture: a read-only
+/// [`redirect_state_lenient`], with the same posture: a read-only
 /// consumer (`list`) degrades a broken ledger to nothing-to-consult but
 /// must say so, while every path that writes or attests from it fails
 /// closed instead.
-pub(crate) async fn load_vendor_state_lenient(
-    root: &Path,
+pub(crate) fn vendor_state_lenient(
+    loaded: &std::io::Result<socket_patch_core::vendor::state::VendorState>,
     silent: bool,
-) -> Option<socket_patch_core::vendor::state::VendorState> {
-    match socket_patch_core::vendor::load_state(root).await {
+) -> Option<&socket_patch_core::vendor::state::VendorState> {
+    match loaded {
         Ok(state) => Some(state),
         Err(e) => {
             if !silent {
@@ -111,57 +115,30 @@ pub(crate) async fn load_vendor_state_lenient(
     }
 }
 
-/// Whether a vendor-ledger entry's embedded `record` stands on its own —
-/// the rule every reader of embedded records shares (`vex`'s record plan,
-/// `list`, and `setup --check` through [`fold_vendor_records`]), so one
-/// tree never lists "no patches" while its VEX document attests one.
-///
-/// A `detached` entry (every `scan`/`get --mode vendored` entry) has no
-/// manifest owner: its record is the only copy. A non-detached entry was
-/// written by the manifest-driven standalone `vendor`, which embeds the
-/// record as a fallback copy: the manifest record stays authoritative while
-/// the manifest covers the entry — its ledger key, or its base purl (the
-/// claim `vex_sources`' candidate builder applies) — and the embedded copy
-/// stands in only when it does not (a checkout that never committed its
-/// manifest, or one that dropped the purl while the lockfile still wires
-/// the artifact). `repair` deliberately stays narrower (the copy is used
-/// only with no manifest at all): it rebuilds artifacts, and a purl dropped
-/// from a live manifest is the reconcile's to revert, not repair's to heal.
-pub(crate) fn vendor_record_is_unowned(
-    key: &str,
-    entry: &socket_patch_core::vendor::VendorEntry,
-    manifest: Option<&socket_patch_core::manifest::schema::PatchManifest>,
-) -> bool {
-    entry.detached
-        || manifest.is_none_or(|m| {
-            !m.patches.contains_key(key) && !m.patches.contains_key(&entry.base_purl)
-        })
-}
-
 /// Fold the vendor ledger's embedded records into a manifest view.
 /// Vendored mode is manifest-free (every `scan`/`get --mode vendored` entry
 /// carries `detached: true` plus its embedded patch `record`), so the
 /// ledger is the only copy of those records: verification (`setup --check`,
-/// property 4) must see them exactly like manifest entries (`vex` gathers
-/// them through its own gated plan, `commands::vex_sources`). A standalone
-/// `vendor` entry's fallback copy folds in under the same
-/// [`vendor_record_is_unowned`] rule `vex` and `list` apply — only when the
-/// manifest does not cover the entry. Keyed by the ledger key; an existing
-/// manifest entry wins a collision (that purl is manifest-owned and
-/// verifies against the manifest's record). Ownership is judged against
-/// the manifest as given, never against records folded earlier in the same
-/// pass (`HashMap` order must not decide which entries fold).
+/// property 4) must see them exactly like manifest entries. Folds exactly
+/// the entries the shared owner rule
+/// ([`socket_patch_core::ledgers::Ledgers::owned`]) gives the vendor ledger
+/// — keyed by the ledger key; an entry the manifest claims (its key or base
+/// purl) stays behind the manifest's record. Record-less legacy entries
+/// never fold.
 pub(crate) fn fold_vendor_records(
     manifest: &mut socket_patch_core::manifest::schema::PatchManifest,
-    entries: &std::collections::HashMap<String, socket_patch_core::vendor::VendorEntry>,
+    vendor: &socket_patch_core::vendor::VendorState,
 ) {
-    let folded: Vec<(String, socket_patch_core::manifest::schema::PatchRecord)> = entries
-        .iter()
-        .filter(|(key, entry)| {
-            vendor_record_is_unowned(key, entry, Some(&*manifest))
-                && !manifest.patches.contains_key(key.as_str())
-        })
-        .filter_map(|(key, entry)| Some((key.clone(), entry.record.clone()?)))
+    let ledgers = socket_patch_core::ledgers::Ledgers {
+        manifest: Some(&*manifest),
+        vendor: Some(vendor),
+        redirect: None,
+    };
+    let folded: Vec<(String, socket_patch_core::manifest::schema::PatchRecord)> = ledgers
+        .owned()
+        .into_iter()
+        .filter(|o| o.store == socket_patch_core::ledgers::Store::Vendored)
+        .filter_map(|o| Some((o.key.to_string(), o.record?.clone())))
         .collect();
     manifest.patches.extend(folded);
 }
@@ -201,11 +178,9 @@ mod vendor_record_fold_tests {
         .expect("vendor entry fixture deserializes")
     }
 
-    /// `setup --check`'s fold follows the rule `vex` attests by: detached
-    /// records always fold (a manifest entry wins its own key), a standalone
-    /// `vendor` entry's fallback copy folds only when the manifest covers
-    /// neither its key nor its base purl, and a record-less legacy entry
-    /// never folds. Ownership is judged against the manifest as given.
+    /// `setup --check`'s fold follows the shared owner rule: an entry folds
+    /// only when the manifest covers neither its key nor its base purl, and
+    /// a record-less legacy entry never folds.
     #[test]
     fn standalone_vendor_fallback_folds_only_when_uncovered() {
         let mut entries = HashMap::new();
@@ -230,6 +205,10 @@ mod vendor_record_fold_tests {
             entry("pkg:npm/legacy@1.0.0", "u-legacy", false, false),
         );
 
+        let entries = socket_patch_core::vendor::VendorState {
+            entries,
+            ..socket_patch_core::vendor::VendorState::new()
+        };
         let mut manifest = PatchManifest::default();
         manifest
             .patches

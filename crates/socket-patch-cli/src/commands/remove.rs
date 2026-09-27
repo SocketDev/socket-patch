@@ -24,30 +24,26 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::ui::plural;
 
-/// Vendor-ledger entries matching a remove identifier (by ledger key,
-/// base purl or uuid — `VendorEntry::matches_identifier`), sorted by key
-/// for deterministic event order.
+/// Vendor-ledger entries matching a remove identifier
+/// ([`socket_patch_core::ledgers::Ledgers::matching`]), sorted by key for
+/// deterministic event order.
 fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
-    let mut matches: Vec<(String, VendorEntry)> = state
-        .entries
-        .iter()
-        .filter(|(key, entry)| entry.matches_identifier(key, identifier))
-        .map(|(k, e)| (k.clone(), e.clone()))
-        .collect();
-    matches.sort_by(|a, b| a.0.cmp(&b.0));
-    matches
+    socket_patch_core::ledgers::Ledgers {
+        vendor: Some(state),
+        ..Default::default()
+    }
+    .matching(identifier)
+    .vendor
 }
 
 /// Hosted redirect records matching a remove identifier, sorted.
 fn hosted_records_matching(state: &RedirectState, identifier: &str) -> Vec<String> {
-    let mut matches: Vec<String> = state
-        .records
-        .iter()
-        .filter(|(purl, rec)| patch_matches(purl, &rec.uuid, identifier))
-        .map(|(purl, _)| purl.clone())
-        .collect();
-    matches.sort();
-    matches
+    socket_patch_core::ledgers::Ledgers {
+        redirect: Some(state),
+        ..Default::default()
+    }
+    .matching(identifier)
+    .hosted
 }
 
 /// Drop every manifest entry matching `identifier` except `exclusions`

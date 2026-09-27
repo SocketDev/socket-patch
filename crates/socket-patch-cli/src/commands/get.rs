@@ -1491,9 +1491,10 @@ struct InstalledNarrowing {
 ///   installed copy (CI manifest-maintenance);
 /// * hosted/vendored modes only: resolved in the project lockfile(s)
 ///   (hosted rewrites the lock; vendored auto-fetches pristine) or claimed
-///   by the vendor ledger (fresh-clone re-vendor) — mirroring scan's
-///   lockfile/vendored-ledger discovery supplements, including their
-///   global-scan gate.
+///   by the vendor ledger (fresh-clone re-vendor) — scan's own
+///   lockfile/vendored-ledger discovery supplements (a corrupt vendor
+///   ledger falls back to the committed artifacts, as in scan), including
+///   their global-scan gate.
 ///
 /// PnP layouts are surfaced, never silently misreported: yarn PnP packages
 /// are structurally unpatchable in every mode (skip records carry
@@ -1532,24 +1533,27 @@ async fn filter_to_installed_purls(
     let found = find_packages_for_rollback(&partitioned, &common.crawler_options(), true).await;
     let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
 
+    let ctx = super::context::ProjectContext::rooted(common, common.cwd.clone());
     // Manifest membership counts as presence (read-only probe: a corrupt
     // manifest degrades to "no extension" here — the download path's
     // fail-closed read still guards every write).
-    if let Ok(Some(manifest)) = read_manifest(&common.resolved_manifest_path()).await {
+    if let Some(manifest) = ctx.ledgers().await.manifest {
         present.extend(manifest.patches.keys().map(|k| canon(k)));
     }
 
-    // Lockfile + vendor-ledger supplements (scan's discovery gate: never on
-    // global scans, which target the machine tree, not this project).
+    // scan's lockfile + vendored-ledger discovery supplements (and their
+    // gate: never on global scans, which target the machine tree, not this
+    // project).
     let mut pnp_diags: Vec<lock_inventory::UnsupportedNpmLayout> = Vec::new();
-    if !common.global && common.global_prefix.is_none() {
-        let (entries, unsupported) = lock_inventory::inventory_project_diagnosed(&common.cwd).await;
-        pnp_diags = unsupported;
+    if !common.is_global() {
+        let supplement = super::scan::project_lockfile_supplement(&ctx, &[], None).await;
+        pnp_diags = supplement.unsupported;
         if mode != super::scan::ScanMode::Agent {
-            present.extend(entries.iter().map(|e| canon(&e.purl)));
-            if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
-                present.extend(state.entries.values().map(|e| canon(&e.base_purl)));
-            }
+            present.extend(supplement.entries.iter().map(|e| canon(&e.purl)));
+            let vendored =
+                super::scan::project_vendored_supplement(common, &[], &ctx.loaded().await.vendor)
+                    .await;
+            present.extend(vendored.iter().map(|p| canon(&p.purl)));
         }
     }
 

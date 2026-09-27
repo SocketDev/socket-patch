@@ -1210,7 +1210,7 @@ async fn append_patch_consistency_entries(
     let mut manifest = manifest.unwrap_or_default();
     let ledger = match socket_patch_core::vendor::load_state(&common.cwd).await {
         Ok(state) => {
-            crate::commands::fold_vendor_records(&mut manifest, &state.entries);
+            crate::commands::fold_vendor_records(&mut manifest, &state);
             Ok(state)
         }
         Err(e) => {

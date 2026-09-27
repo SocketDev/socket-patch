@@ -15,13 +15,12 @@ use socket_patch_core::api::client::{
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
 };
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
@@ -50,7 +49,10 @@ use self::discovery::{
 // pinned entry into the hosted engine, the vendor step + its dry-run
 // preview, and the PnP layout-refusal warning mapping. `pub(crate)`
 // re-exports because the submodules themselves stay private to scan.
-pub(crate) use self::discovery::unsupported_layout_warnings;
+pub(crate) use self::discovery::{
+    lockfile_supplement as project_lockfile_supplement, unsupported_layout_warnings,
+    vendored_ledger_supplement as project_vendored_supplement,
+};
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
@@ -864,58 +866,12 @@ fn overlap_from_states(
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: &VendorState,
 ) -> Vec<String> {
-    let Some(redirect) = redirect else {
-        return Vec::new();
-    };
-    if vendor.entries.is_empty() {
-        return Vec::new();
+    socket_patch_core::ledgers::Ledgers {
+        manifest: None,
+        vendor: Some(vendor),
+        redirect,
     }
-    // Canonicalize both sides (drop qualifiers, percent-decode) so the API
-    // purl form the redirect records carry matches the vendor entry's base
-    // purl — mirrors `vendored_ledger_supplement`.
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let mut vendor_purls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (key, entry) in &vendor.entries {
-        vendor_purls.insert(canon(key));
-        vendor_purls.insert(canon(&entry.base_purl));
-    }
-    if !redirect.records.is_empty() {
-        let redirect_purls: std::collections::BTreeSet<String> =
-            redirect.records.keys().map(|p| canon(p)).collect();
-        return redirect_purls
-            .intersection(&vendor_purls)
-            .cloned()
-            .collect();
-    }
-    // The records map can be EMPTY while the ledger still asserts stale lock
-    // wiring (every per-uuid record fetch failed: `record_fetch_failed`), so
-    // fall back to matching the vendored purls against the recorded edit
-    // keys — npm `node_modules/<name>` (possibly nested), pnpm/yarn/cargo/uv
-    // `<name>@<version>` (vlt `<name>@<version>~<extra>`), bun
-    // `<prefix>/<name>`, gem/composer/pypi bare `<name>`. Name-level matching
-    // can over-claim across versions, but `classify_overlap_takeover` still
-    // requires the live lock to prove one side before anything is reported.
-    if redirect.edits.is_empty() {
-        return Vec::new();
-    }
-    vendor_purls
-        .into_iter()
-        .filter(|purl| {
-            let Some((name, version)) = purl_name_version(strip_purl_qualifiers(purl)) else {
-                return false;
-            };
-            redirect
-                .edits
-                .iter()
-                .filter_map(|e| e.key.as_deref())
-                .any(|key| {
-                    key == name
-                        || key == format!("{name}@{version}")
-                        || key.starts_with(&format!("{name}@{version}~"))
-                        || key.ends_with(&format!("/{name}"))
-                })
-        })
-        .collect()
+    .hosted_vendored_overlap()
 }
 
 /// The overlapping PURLs split by which mode the LIVE lockfile actually wires
@@ -1641,6 +1597,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // `--vex` side-effect reads the manifest at several terminal returns,
     // including the early "no packages" exit before the GC block.
     let manifest_path = args.common.resolved_manifest_path();
+    // The stores, lock set and wiring discovery this run reads before it
+    // writes anything, each loaded at most once (see `ProjectContext`).
+    let ctx =
+        crate::commands::context::ProjectContext::rooted(&args.common, args.common.cwd.clone());
     let socket_dir = args.common.socket_dir();
 
     let overrides = args.common.api_client_overrides();
@@ -1689,7 +1649,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery and are flagged "not yet installed". Scoped to the crawled
     // ecosystems.
-    let lockfile_only = lockfile_supplement(&args.common, &all_crawled, crawl_scope).await;
+    let lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
@@ -1720,9 +1680,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // and update detection. Failure policies differ on purpose: the
     // supplement falls back to the committed artifacts (fail-closed for the
     // prune), the key set degrades to empty (fail-open).
-    let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let vendor_state = &ctx.loaded().await.vendor;
     let ledger_supplement =
-        vendored_ledger_supplement(&args.common, &all_crawled, &vendor_state).await;
+        vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
@@ -1881,12 +1841,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 // `redirectState` rides the empty-discovery envelope too
                 // (same rule as the ≥1-package path). `wiringLive` is empty
                 // by construction: this run covered zero packages.
-                let redirect_state = crate::commands::load_redirect_state_lenient(
-                    &args.common.cwd,
+                let redirect_state = crate::commands::redirect_state_lenient(
+                    &ctx.loaded().await.redirect,
                     args.common.silent,
-                )
-                .await;
-                if let Some(state) = redirect_state_json(redirect_state.as_ref(), &[]) {
+                );
+                if let Some(state) = redirect_state_json(redirect_state, &[]) {
                     result["redirectState"] = state;
                 }
             }
@@ -2142,7 +2101,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     );
 
     // Read existing manifest once for update detection.
-    let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
+    let existing_manifest = ctx.ledgers().await.manifest;
     // Hosted and vendored modes record their patches ONLY in their ledgers,
     // so both ledgers' purl→uuid records are folded into update detection
     // (otherwise their `updates[]` would stay empty). A malformed redirect
@@ -2152,15 +2111,15 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // BEFORE the engine (empty discovery, nothing downloadable, a
     // detail-fetch failure) print it via `warn_unreported_corrupt_ledger`.
     let (redirect_state, hosted_corrupt_ledger) = if hosted {
-        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
-            Ok(state) => (state, None),
+        match &ctx.loaded().await.redirect {
+            Ok(state) => (state.as_ref(), None),
             Err(corrupt) => (None, Some(corrupt.to_string())),
         }
     } else {
-        // `load_redirect_state_lenient`, with the scan event flushed before
+        // `redirect_state_lenient`, with the scan event flushed before
         // its warning (possibly this run's first write since the event).
-        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
-            Ok(state) => (state, None),
+        match &ctx.loaded().await.redirect {
+            Ok(state) => (state.as_ref(), None),
             Err(corrupt) => {
                 if !args.common.silent {
                     telemetry.flush().await;
@@ -2172,21 +2131,20 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     };
     // The hosted pins the lockfiles wire count too: the lockfile is the
     // record of a hosted redirect even where no ledger was committed.
-    let hosted_pins: Vec<(String, String)> =
-        if args.common.is_global() {
-            Vec::new()
-        } else {
-            crate::commands::discover_wiring(&args.common, &args.common.cwd)
-                .await
-                .refs
-                .into_iter()
-                .filter(|r| r.mode == socket_patch_core::vex::discover::WiringMode::Hosted)
-                .map(|r| (r.purl, r.uuid))
-                .collect()
-        };
+    let hosted_pins: Vec<(String, String)> = if args.common.is_global() {
+        Vec::new()
+    } else {
+        ctx.discovery()
+            .await
+            .refs
+            .iter()
+            .filter(|r| r.mode == socket_patch_core::vex::discover::WiringMode::Hosted)
+            .map(|r| (r.purl.clone(), r.uuid.clone()))
+            .collect()
+    };
     let update_manifest = merge_ledger_records_for_updates(
-        existing_manifest.as_ref(),
-        redirect_state.as_ref(),
+        existing_manifest,
+        redirect_state,
         vendor_state.as_ref().ok(),
         &hosted_pins,
     );
@@ -2264,10 +2222,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         let hosted_retained = if vendor {
             Vec::new()
         } else {
-            hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await
+            hosted_wiring_retained_purls(&args.common, redirect_state, &all_purls).await
         };
         if !vendor {
-            if let Some(state) = redirect_state_json(redirect_state.as_ref(), &hosted_retained) {
+            if let Some(state) = redirect_state_json(redirect_state, &hosted_retained) {
                 result["redirectState"] = state;
             }
         }
@@ -2308,7 +2266,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             if dry {
                 // Synthesize the per-patch outcome without touching disk.
                 let empty_manifest = PatchManifest::new();
-                let manifest_for_preview = existing_manifest.as_ref().unwrap_or(&empty_manifest);
+                let manifest_for_preview = existing_manifest.unwrap_or(&empty_manifest);
                 let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
@@ -2911,7 +2869,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // vendored-ownership counterpart is the `[skip]` lines above.)
     if !vendor && !silent {
         let hosted_retained =
-            hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await;
+            hosted_wiring_retained_purls(&args.common, redirect_state, &all_purls).await;
         if !hosted_retained.is_empty() {
             eprintln!(
                 "Warning ({HOSTED_WIRING_RETAINED}): {}",
@@ -2940,6 +2898,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket_patch_core::utils::purl::purl_name_version;
 
     #[test]
     fn project_dirs_resolve_directories_and_globs() {

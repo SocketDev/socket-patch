@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vendor::state::VendorState;
@@ -1054,7 +1053,13 @@ async fn generate_vex_from_manifest_path_inner(
     calm_when_nothing: bool,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
-    let manifest_file = match read_manifest(manifest_path).await {
+    // One load of the three stores; each keeps vex's strict posture below.
+    let socket_patch_core::ledgers::LoadedLedgers {
+        manifest,
+        vendor,
+        redirect,
+    } = socket_patch_core::ledgers::LoadedLedgers::load(&common.cwd, manifest_path).await;
+    let manifest_file = match manifest {
         Ok(m) => m,
         Err(e) => {
             // Core's text ("Failed to parse manifest JSON: ...") does not
@@ -1068,8 +1073,7 @@ async fn generate_vex_from_manifest_path_inner(
     // wiring liveness gates them), so a MALFORMED one is a hard error:
     // attesting with its contents silently dropped would produce a false —
     // or silently partial — document. A missing ledger is simply empty.
-    let redirect = match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
-    {
+    let redirect = match redirect {
         Ok(state) => state,
         Err(corrupt) => {
             // Not core's Display: that text ("... so it will not be
@@ -1084,7 +1088,7 @@ async fn generate_vex_from_manifest_path_inner(
             return Err(fail(common, "redirect_ledger_corrupt", message).await);
         }
     };
-    let vendor = match socket_patch_core::vendor::load_state(&common.cwd).await {
+    let vendor = match vendor {
         Ok(state) => state,
         Err(e) => {
             let message = format!(

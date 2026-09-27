@@ -1590,6 +1590,21 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **One owner rule for the patch stores.** `list`, `vex`, `scan`'s
+  `updates[]`, `setup --check`, `rollback` and `remove` now read the
+  manifest, the vendor ledger and the hosted redirect ledger through one
+  view (`socket_patch_core::ledgers`) with one precedence: manifest, then
+  vendor ledger, then redirect ledger, by ledger key; a manifest key claims
+  every vendor entry filed under it or naming it as base purl. Visible
+  differences: when both ledgers record the same purl, `scan`'s
+  `updates[].oldUuid` now names the vendor entry's patch (was the redirect
+  record's); `vex` treats every vendor entry a manifest key claims as a
+  fallback copy of that key's record (a second variant of the same base
+  purl used to become its own candidate); `setup --check` no longer folds
+  a detached vendor entry whose base purl the manifest records. `get`'s
+  installed-version narrowing now uses `scan`'s lockfile and vendored-ledger
+  discovery, so a corrupt vendor ledger falls back to the committed
+  artifacts there too.
 - **The npm crawl skips tagged cache directories.** The walk that finds
   workspace `node_modules` trees no longer descends into a directory that
   carries a [Cache Directory Tagging](https://bford.info/cachedir/)
