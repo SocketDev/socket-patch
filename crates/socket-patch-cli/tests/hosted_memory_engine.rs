@@ -930,3 +930,41 @@ async fn result_serializes_with_the_contract_keys() {
         assert!(value["stats"].get(key).is_some(), "{key}");
     }
 }
+
+/// A vlt project: the engine has no network for the artifact preflight the
+/// disk flow runs, so every in-scope dep is judged as `--offline` judges
+/// it. vlt drives here, so the dep is withheld from every rewriter
+/// (`redirect_vlt_artifact_unverifiable`) and nothing is written. The
+/// warning quotes the artifact URL with its grant-token level redacted.
+#[tokio::test]
+async fn a_vlt_project_is_withheld_as_offline() {
+    const VLT_FIXTURE: &str = "redirect/npm/vlt/basic";
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root().join(VLT_FIXTURE).join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let files = fixture_files(&fixtures_root().join(VLT_FIXTURE).join("input"));
+
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "the vlt root is scanned");
+    assert!(project.redirected.is_empty(), "nothing is pinned");
+    assert!(project
+        .skipped
+        .iter()
+        .any(|s| s.reason == "redirect_vlt_artifact_unverifiable"));
+    let warnings = project.redirect["warnings"].as_array().unwrap();
+    let detail = warnings
+        .iter()
+        .find(|w| w["code"] == "redirect_vlt_artifact_unverifiable")
+        .and_then(|w| w["detail"].as_str())
+        .expect("the preflight warning is reported");
+    assert!(
+        detail.contains("/patch/npm/<redacted>/") && detail.contains(": offline; nothing was written"),
+        "the offline refusal quotes the redacted URL"
+    );
+    assert!(output.changed_files.is_empty());
+}

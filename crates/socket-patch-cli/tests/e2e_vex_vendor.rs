@@ -2312,3 +2312,70 @@ fn rejected_vendored_wiring_never_keeps_a_vendor_ledger_alive() {
         }
     }
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// `vex` over a vlt directory artifact: attested `(vendored)` with nothing
+/// installed, from the ledger's inventory; a tampered committed member is
+/// omitted with `vendor_hash_mismatch`.
+#[test]
+fn vex_attests_a_vlt_vendored_dir_and_omits_a_tampered_one() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    let out = root.join("vex.json");
+    let cwd = root.to_str().unwrap().to_string();
+    let out_s = out.to_str().unwrap().to_string();
+    let (code, v, stderr) = hosted::run_json(
+        root,
+        &[
+            "vex",
+            "--offline",
+            "--product",
+            "pkg:npm/app@1.0.0",
+            "--cwd",
+            &cwd,
+            "--output",
+            &out_s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    let doc = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        doc.contains(hosted::PURL) && doc.contains("(vendored)"),
+        "{doc}"
+    );
+
+    std::fs::write(
+        root.join(vlt_vendored::rel()).join("index.js"),
+        "tampered\n",
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(&out);
+    let (code, v, _) = hosted::run_json(
+        root,
+        &[
+            "vex",
+            "--offline",
+            "--product",
+            "pkg:npm/app@1.0.0",
+            "--cwd",
+            &cwd,
+            "--output",
+            &out_s,
+        ],
+        &[],
+    );
+    assert_ne!(code, 0, "{v:#}");
+    assert!(v.to_string().contains("vendor_hash_mismatch"), "{v:#}");
+    assert!(
+        !hosted::vex_attests(&out),
+        "a tampered dir is never attested"
+    );
+}

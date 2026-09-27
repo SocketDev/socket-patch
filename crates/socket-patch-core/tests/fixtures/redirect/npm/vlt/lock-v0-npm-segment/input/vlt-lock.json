@@ -1,0 +1,14 @@
+{
+  "lockfileVersion": 0,
+  "options": {
+    "registries": {}
+  },
+  "nodes": {
+    "·npm·left-pad@1.3.0": [0,"left-pad","sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
+    "·npm·ms@2.1.3": [0,"ms","sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="]
+  },
+  "edges": {
+    "file·. left-pad": "prod 1.3.0 ·npm·left-pad@1.3.0",
+    "file·. ms": "prod 2.1.3 ·npm·ms@2.1.3"
+  }
+}

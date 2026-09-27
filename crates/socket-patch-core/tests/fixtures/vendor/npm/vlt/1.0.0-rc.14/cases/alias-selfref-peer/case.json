@@ -1,0 +1,12 @@
+{
+  "project": "alias",
+  "purl": "pkg:npm/use-sync-external-store@1.2.0",
+  "uuid": "11111111-2222-4333-8444-555555555555",
+  "refusal": null,
+  "ciChurn": [
+    [
+      "    \"file·.socket§vendor§npm§11111111-2222-4333-8444-555555555555§use-sync-external-store-1.2.0§node_modules§use-sync-external-store react\": \"peer ^16.8.0 || ^17.0.0 || ^18.0.0 ·npm·react@18.2.0\"",
+      "    \"file·.socket§vendor§npm§11111111-2222-4333-8444-555555555555§use-sync-external-store-1.2.0§node_modules§use-sync-external-store react\": \"peer 18.2.0 ·npm·react@18.2.0\""
+    ]
+  ]
+}

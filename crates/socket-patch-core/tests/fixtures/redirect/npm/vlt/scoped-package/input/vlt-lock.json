@@ -1,0 +1,18 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "nodes": {
+    "··@a§b@1.0.0": [0,"@a/b","sha512-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss=="],
+    "~npm~@a+b@1.0.0": [0,"@a/b","sha512-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss==","https://registry.npmjs.org/@a/b/-/b-1.0.0.tgz"],
+    "~npm~b@1.0.0": [0,"b","sha512-tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt==","https://registry.npmjs.org/b/-/b-1.0.0.tgz"]
+  },
+  "edges": {
+    "file~_d @a/b": "prod 1.0.0 ~npm~@a+b@1.0.0",
+    "file~_d b": "prod 1.0.0 ~npm~b@1.0.0",
+    "workspace~packages+x @a/b": "prod 1.0.0 ··@a§b@1.0.0"
+  }
+}

@@ -192,7 +192,10 @@ fn remove_with_schema_invalid_manifest_emits_manifest_invalid() {
     std::fs::write(socket.join("manifest.json"), r#"{"not_patches": {}}"#).unwrap();
 
     let (code, stdout) = run_remove(tmp.path(), "pkg:npm/foo@1.0.0", &[]);
-    assert_eq!(code, 1, "schema-invalid manifest must exit 1; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "schema-invalid manifest must exit 1; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
     assert_eq!(
@@ -1036,4 +1039,34 @@ fn remove_dry_run_with_rollback_does_not_create_blobs_dir() {
         .filter(|n| n.starts_with(".socket-stage-"))
         .collect();
     assert!(litter.is_empty(), "no stage litter: {litter:?}");
+}
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// `remove --skip-rollback` of a vlt-vendored purl drops the manifest
+/// record only: the vlt wiring, the directory artifact and the ledger entry
+/// stay.
+#[test]
+fn remove_skip_rollback_keeps_a_vlt_vendored_entry_wired() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let lock = hosted::read(root, "vlt-lock.json");
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, v, stderr) = hosted::run_json(
+        root,
+        &["remove", hosted::PURL, "--skip-rollback", "--cwd", &cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(hosted::read(root, "vlt-lock.json"), lock);
+    assert!(root.join(vlt_vendored::rel()).join("index.js").is_file());
+    assert_eq!(
+        vlt_vendored::state(root)["entries"][hosted::PURL]["flavor"],
+        "vlt"
+    );
 }

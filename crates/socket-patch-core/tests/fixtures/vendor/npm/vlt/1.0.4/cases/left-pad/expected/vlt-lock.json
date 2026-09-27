@@ -1,0 +1,46 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "nodes": {
+    "~npm~@isaacs+string-locale-compare@1.1.0": [0,"@isaacs/string-locale-compare","sha512-SQ7Kzhh9+D+ZW9MA0zkYv3VXhIDNx+LzM6EJ+/65I3QY+enU6Itte7E5XX7EWrqLW2FN4n06GWzBnPoC3th2aQ==","https://registry.npmjs.org/@isaacs/string-locale-compare/-/string-locale-compare-1.1.0.tgz"],
+    "~npm~debug@4.3.4": [0,"debug","sha512-PRWFHuSU3eDtQJPvnNY7Jcket1j0t5OuOsFzPPzsekD52Zl8qUfFIPEiswXqIvHWGVHOgX+7G/vCNNhehwxfkQ==","https://registry.npmjs.org/debug/-/debug-4.3.4.tgz"],
+    "~npm~escape-string-regexp@4.0.0": [1,"escape-string-regexp","sha512-TtpcNJ3XAzx3Gq8sWRzJaVajRs0uVxA2YAkdb1jm2YkPz4G6egUFAyA3n5vtEIZefPk5Wa4UXbKuS5fKkJWdgA==","https://registry.npmjs.org/escape-string-regexp/-/escape-string-regexp-4.0.0.tgz",null,null,null,{  "engines": {    "node": ">=10"  }}],
+    "~npm~has-flag@4.0.0": [0,"has-flag","sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ==","https://registry.npmjs.org/has-flag/-/has-flag-4.0.0.tgz"],
+    "~npm~is-number@7.0.0": [2,"is-number","sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng==","https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz"],
+    "~npm~js-tokens@4.0.0": [0,"js-tokens","sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==","https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz"],
+    "~npm~loose-envify@1.4.0": [0,"loose-envify","sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==","https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",null,null,null,null,{  "loose-envify": "cli.js"}],
+    "~npm~lru-cache@6.0.0": [0,"lru-cache","sha512-Jo6dJ04CmSjuznwJSS3pUeWmd/H0ffTlkXXgwZi+eq1UCmqQwCh+eLsYOYCwY991i2Fah4h1BEMCx4qThGbsiA==","https://registry.npmjs.org/lru-cache/-/lru-cache-6.0.0.tgz"],
+    "~npm~ms@2.1.2": [0,"ms","sha512-sGkPx+VjMtmA6MX27oA4FBFELFCZZ4S4XqeGOXCv68tT+jb3vk/RyaKWP0PTKyWtmLSM0b+adUTEvbs1PEaH2w==","https://registry.npmjs.org/ms/-/ms-2.1.2.tgz"],
+    "~npm~ms@2.1.3": [0,"ms","sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==","https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"],
+    "~npm~react@18.2.0": [0,"react","sha512-/3IjMdb2L9QbBdWiW5e3P2/npwMBaU9mHCSCUzNln0ZCYbcfTsGbTJrU/kGemdH2IWmB2ioZ+zkxtmq6g09fGQ==","https://registry.npmjs.org/react/-/react-18.2.0.tgz"],
+    "~npm~semver@7.6.0": [0,"semver","sha512-EnwXhrlwXMk9gKu5/flx5sv/an57AkRplG3hTK68W7FRDN+k+OWBj65M7719OkA82XLBxrcX0KSHj+X5COhOVg==","https://registry.npmjs.org/semver/-/semver-7.6.0.tgz",null,null,null,null,{  "semver": "bin/semver.js"}],
+    "~npm~supports-color@7.2.0": [0,"supports-color","sha512-qpCAvRl9stuOHveKsn7HncJRvv501qIacKzQlO/+Lwxc9+0q2wLyv4Dfvt80/DPn2pqOBsJdDiogXGR9+OvwRw==","https://registry.npmjs.org/supports-color/-/supports-color-7.2.0.tgz"],
+    "~npm~use-sync-external-store@1.2.0": [0,"use-sync-external-store","sha512-eEgnFxGQ1Ife9bzYs6VLi8/4X6CObHMw9Qr9tPY43iKwsPw8xE8+EFsf/2cFZ5S3esXgpWgtSCtLNS41F+sKPA==","https://registry.npmjs.org/use-sync-external-store/-/use-sync-external-store-1.2.0.tgz"],
+    "~npm~yallist@4.0.0": [0,"yallist","sha512-3wdGidZyq5PB084XLES5TpOSRA3wjXAlIWMhum2kRcv/41Sn2emQ0dycQW4uZXLejwKvg6EsvbdlVL+FYEct7A==","https://registry.npmjs.org/yallist/-/yallist-4.0.0.tgz"],
+    "file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+left-pad-1.3.0+node__modules+left-pad": [0,"left-pad",null,".socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0/node_modules/left-pad"]
+  },
+  "edges": {
+    "file~_d is-number": "dev 7.0.0 ~npm~is-number@7.0.0",
+    "file~_d escape-string-regexp": "optional 4.0.0 ~npm~escape-string-regexp@4.0.0",
+    "file~_d @isaacs/string-locale-compare": "prod 1.1.0 ~npm~@isaacs+string-locale-compare@1.1.0",
+    "file~_d ms": "prod 2.1.3 ~npm~ms@2.1.3",
+    "file~_d react": "prod 18.2.0 ~npm~react@18.2.0",
+    "file~_d semver": "prod 7.6.0 ~npm~semver@7.6.0",
+    "file~_d supports-color": "prod 7.2.0 ~npm~supports-color@7.2.0",
+    "file~_d use-sync-external-store": "prod 1.2.0 ~npm~use-sync-external-store@1.2.0",
+    "file~_d left-pad": "prod file:./.socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0/node_modules/left-pad file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+left-pad-1.3.0+node__modules+left-pad",
+    "workspace~packages+a debug": "prod 4.3.4 ~npm~debug@4.3.4",
+    "workspace~packages+a left-pad": "prod file:../../.socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0/node_modules/left-pad file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+left-pad-1.3.0+node__modules+left-pad",
+    "~npm~debug@4.3.4 ms": "prod 2.1.2 ~npm~ms@2.1.2",
+    "~npm~loose-envify@1.4.0 js-tokens": "prod ^3.0.0 || ^4.0.0 ~npm~js-tokens@4.0.0",
+    "~npm~lru-cache@6.0.0 yallist": "prod ^4.0.0 ~npm~yallist@4.0.0",
+    "~npm~react@18.2.0 loose-envify": "prod ^1.1.0 ~npm~loose-envify@1.4.0",
+    "~npm~semver@7.6.0 lru-cache": "prod ^6.0.0 ~npm~lru-cache@6.0.0",
+    "~npm~supports-color@7.2.0 has-flag": "prod ^4.0.0 ~npm~has-flag@4.0.0",
+    "~npm~use-sync-external-store@1.2.0 react": "peer ^16.8.0 || ^17.0.0 || ^18.0.0 ~npm~react@18.2.0"
+  }
+}

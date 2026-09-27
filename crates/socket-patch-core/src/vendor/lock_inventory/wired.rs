@@ -25,7 +25,9 @@ use super::LockIntegrity;
 ///
 /// package-lock/shrinkwrap are parsed as JSON; the text formats (pnpm,
 /// yarn classic/berry, bun) are scanned with a bounded forward window from
-/// each reference line.
+/// each reference line. vlt yields `None`: its `file` nodes pin no
+/// integrity (slot [2] is `null`), and `vlt-lock.json` is never scanned,
+/// because the forward window would pick up a neighbouring node's sha512.
 pub async fn wired_vendor_integrity(
     project_root: &Path,
     artifact_rel: &str,

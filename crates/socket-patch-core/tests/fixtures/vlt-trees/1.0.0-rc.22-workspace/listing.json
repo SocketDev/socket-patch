@@ -1,0 +1,204 @@
+{
+ "vlt": "1.0.0-rc.22",
+ "lockfileVersion": 1,
+ "storeFiles": [
+  "vlt.json"
+ ],
+ "hoist": {
+  "debug": {
+   "link": "../~npm~debug@4.3.4/node_modules/debug"
+  },
+  "js-tokens": {
+   "link": "../~npm~js-tokens@4.0.0/node_modules/js-tokens"
+  },
+  "loose-envify": {
+   "link": "../~npm~loose-envify@1.4.0/node_modules/loose-envify"
+  },
+  "ms": {
+   "link": "../~npm~ms@2.1.3/node_modules/ms"
+  },
+  "object-assign": {
+   "link": "../~npm~object-assign@4.1.1/node_modules/object-assign"
+  },
+  "react": {
+   "link": "../~npm~react@18.2.0/node_modules/react"
+  },
+  "use-sync-external-store": {
+   "link": "../~npm~use-sync-external-store@1.2.0~peer.2/node_modules/use-sync-external-store"
+  }
+ },
+ "store": [
+  {
+   "id": "~npm~debug@4.3.4",
+   "node_modules": {
+    "debug": {
+     "pkg": {
+      "name": "debug",
+      "version": "4.3.4"
+     }
+    },
+    "ms": {
+     "link": "../../~npm~ms@2.1.2/node_modules/ms"
+    }
+   }
+  },
+  {
+   "id": "~npm~js-tokens@4.0.0",
+   "node_modules": {
+    "js-tokens": {
+     "pkg": {
+      "name": "js-tokens",
+      "version": "4.0.0"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~loose-envify@1.4.0",
+   "node_modules": {
+    "js-tokens": {
+     "link": "../../~npm~js-tokens@4.0.0/node_modules/js-tokens"
+    },
+    "loose-envify": {
+     "pkg": {
+      "name": "loose-envify",
+      "version": "1.4.0"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~ms@2.1.2",
+   "node_modules": {
+    "ms": {
+     "pkg": {
+      "name": "ms",
+      "version": "2.1.2"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~ms@2.1.3",
+   "node_modules": {
+    "ms": {
+     "pkg": {
+      "name": "ms",
+      "version": "2.1.3"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~object-assign@4.1.1",
+   "node_modules": {
+    "object-assign": {
+     "pkg": {
+      "name": "object-assign",
+      "version": "4.1.1"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~react@17.0.2",
+   "node_modules": {
+    ".bin": {
+     "dir": true
+    },
+    "loose-envify": {
+     "link": "../../~npm~loose-envify@1.4.0/node_modules/loose-envify"
+    },
+    "object-assign": {
+     "link": "../../~npm~object-assign@4.1.1/node_modules/object-assign"
+    },
+    "react": {
+     "pkg": {
+      "name": "react",
+      "version": "17.0.2"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~react@18.2.0",
+   "node_modules": {
+    ".bin": {
+     "dir": true
+    },
+    "loose-envify": {
+     "link": "../../~npm~loose-envify@1.4.0/node_modules/loose-envify"
+    },
+    "react": {
+     "pkg": {
+      "name": "react",
+      "version": "18.2.0"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~use-sync-external-store@1.2.0~peer.2",
+   "node_modules": {
+    "react": {
+     "link": "../../~npm~react@18.2.0/node_modules/react"
+    },
+    "use-sync-external-store": {
+     "pkg": {
+      "name": "use-sync-external-store",
+      "version": "1.2.0"
+     }
+    }
+   }
+  },
+  {
+   "id": "~npm~use-sync-external-store@1.2.0~peer.3",
+   "node_modules": {
+    "react": {
+     "link": "../../~npm~react@17.0.2/node_modules/react"
+    },
+    "use-sync-external-store": {
+     "pkg": {
+      "name": "use-sync-external-store",
+      "version": "1.2.0"
+     }
+    }
+   }
+  }
+ ],
+ "importers": {
+  "debug": {
+   "link": ".vlt/~npm~debug@4.3.4/node_modules/debug"
+  },
+  "ms": {
+   "link": ".vlt/~npm~ms@2.1.3/node_modules/ms"
+  }
+ },
+ "members": {
+  "packages/a": {
+   "@scope/b": {
+    "link": "../../../b"
+   },
+   "react": {
+    "link": "../../../node_modules/.vlt/~npm~react@18.2.0/node_modules/react"
+   },
+   "use-sync-external-store": {
+    "link": "../../../node_modules/.vlt/~npm~use-sync-external-store@1.2.0~peer.2/node_modules/use-sync-external-store"
+   }
+  },
+  "packages/b": {
+   "react": {
+    "link": "../../../node_modules/.vlt/~npm~react@17.0.2/node_modules/react"
+   },
+   "use-sync-external-store": {
+    "link": "../../../node_modules/.vlt/~npm~use-sync-external-store@1.2.0~peer.3/node_modules/use-sync-external-store"
+   }
+  }
+ },
+ "linkTargets": {
+  "packages/b": {
+   "name": "@scope/b",
+   "version": "1.0.0"
+  }
+ }
+}

@@ -59,6 +59,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_SKIP_ROLLBACK",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
 ];
 
 /// Drift guard: the scrub must cover every env var `GlobalArgs` binds — the

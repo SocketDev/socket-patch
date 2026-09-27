@@ -1194,3 +1194,33 @@ fn rollback_honors_manifest_path_override() {
         "stdout={stdout}"
     );
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// An unscoped `rollback` over a vlt-vendored project reverts the `file`
+/// node, its edges and package.json to the registry bytes and removes the
+/// directory artifact.
+#[test]
+fn rollback_unscoped_reverts_a_vlt_vendored_entry() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, v, stderr) = hosted::run_json(root, &["rollback", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        hosted::read(root, "vlt-lock.json"),
+        vlt_vendored::registry_lock()
+    );
+    assert_eq!(
+        hosted::read(root, "package.json"),
+        vlt_vendored::PACKAGE_JSON
+    );
+    assert!(!root
+        .join(format!(".socket/vendor/npm/{}", hosted::UUID))
+        .exists());
+}

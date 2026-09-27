@@ -276,6 +276,8 @@ fn corpus() -> Vec<CorpusEntry> {
         let name = top.file_name().unwrap().to_string_lossy().into_owned();
         match name.as_str() {
             GOLDEN_DIR => {}
+            // Tables and store listings, not projects.
+            "vlt" | "vlt-trees" | "vendor" => {}
             // Redirect cases: `<eco>/<flavor>/<case>/{input,expected}` —
             // each side is a project root (nested files included).
             "redirect" => {
@@ -475,6 +477,21 @@ mod tests {
             ),
             "cannot read <root>/a: Is a directory (os error); <root>/b (os error)"
         );
+    }
+
+    #[test]
+    fn table_fixture_dirs_are_not_corpus_projects() {
+        let corpus = corpus();
+        for skipped in ["vlt", "vlt-trees", "vendor"] {
+            let nested = format!("{skipped}/");
+            assert!(
+                corpus
+                    .iter()
+                    .all(|(name, _, _)| name != skipped && !name.starts_with(&nested)),
+                "{skipped} fixtures joined the corpus"
+            );
+        }
+        assert!(fixtures_root().join("vlt/collation-golden.json").is_file());
     }
 
     #[test]

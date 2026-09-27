@@ -1,0 +1,19 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "jsr-registries": {
+      "jsr": "https://npm.jsr.io/"
+    },
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "nodes": {
+    "~jsr~@std+path@1.0.0": [0,"@std/path","sha512-jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj==","https://npm.jsr.io/~/11/@jsr/std__path/1.0.0.tgz"],
+    "~npm~@std+path@1.0.0": [0,"@std/path","sha512-33333333333333333333333333333333333333333333333333333333333333333333333333333333333333==","https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/33333333-3333-4333-8333-333333333333/path-1.0.0.tgz"]
+  },
+  "edges": {
+    "file~_d @std/path": "prod jsr:@std/path@1.0.0 ~jsr~@std+path@1.0.0",
+    "workspace~packages+a @std/path": "prod 1.0.0 ~npm~@std+path@1.0.0"
+  }
+}

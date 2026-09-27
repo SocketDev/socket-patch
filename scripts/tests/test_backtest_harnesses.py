@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -22,6 +23,7 @@ def load_script(name):
 pipenv = load_script("backtest-pipenv")
 pdm = load_script("backtest-pdm")
 bun = load_script("backtest-bun")
+vlt = load_script("backtest-vlt")
 
 
 class BunTransportRetryTests(unittest.TestCase):
@@ -52,6 +54,13 @@ class BunTransportRetryTests(unittest.TestCase):
             evidence = root / row['networkRetryAttempts'][0]['evidence']
             self.assertEqual((evidence / 'cli.log').read_text(), 'failed request evidence')
             self.assertFalse((evidence / 'cache').exists())
+
+    def test_a_patch_api_5xx_is_a_transport_failure(self):
+        self.assertTrue(bun.has_transport_failure({'repeat': {'error': (
+            'failed to resolve patch references: API request failed with status 503: upstream '
+            'connect error or disconnect/reset before headers')}}))
+        self.assertTrue(bun.has_transport_failure(['API request failed with status 504: error code: 504']))
+        self.assertFalse(bun.has_transport_failure({'error': 'API request failed with status 404: not found'}))
 
     def test_functional_failure_is_never_retried(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -262,6 +271,478 @@ for fd in fds:
             with self.subTest(system=system), patch.dict(os.environ, {}, clear=True):
                 with patch.object(pdm.platform, "system", return_value=system):
                     self.assertNotIn("LD_PRELOAD", pdm.base_env())
+
+
+class VltOracleTests(unittest.TestCase):
+    """The oracle is the documented boundaries, never the CLI's codes."""
+
+    def test_every_mode_must_patch_the_plain_shapes_on_every_era(self):
+        for version in vlt.VERSIONS:
+            for mode in vlt.MODES:
+                with self.subTest(version=version, mode=mode):
+                    want = 'safe-refusal' if mode == 'vendored' and vlt.era_of(version) == 'A0' \
+                        else 'patched'
+                    self.assertEqual(vlt.expected_verdict(version, mode, 'direct'), want)
+
+    def test_refusals_follow_the_support_matrix(self):
+        self.assertEqual(vlt.expected_verdict('1.2.0', 'hosted', 'custom-registry'), 'safe-refusal')
+        self.assertEqual(vlt.expected_verdict('1.2.0', 'vendored', 'custom-registry'),
+                         'safe-refusal')
+        self.assertEqual(vlt.expected_verdict('1.2.0', 'agent', 'custom-registry'), 'patched')
+        self.assertEqual(vlt.expected_verdict('1.2.0', 'agent', 'lockfile-only'), 'safe-refusal')
+        self.assertEqual(vlt.expected_verdict('1.2.0', 'hosted', 'lockfile-only'), 'patched')
+        self.assertEqual(vlt.expected_verdict('0.0.0-16', 'vendored', 'direct'), 'safe-refusal')
+
+    def test_cells_a_shape_cannot_express_are_not_in_the_matrix(self):
+        self.assertIsNone(vlt.expected_verdict('1.2.0', 'hosted', 'workspace-member-vendored'))
+        self.assertIsNone(vlt.expected_verdict('1.2.0', 'hosted', 'hosted-then-vendored'))
+        self.assertIsNone(vlt.expected_verdict('1.2.0', 'vendored', 'vendored-then-hosted'))
+        self.assertIsNone(vlt.expected_verdict('0.0.0-16', 'vendored', 'hosted-then-vendored'))
+        self.assertIsNone(vlt.expected_verdict('0.0.0-12', 'hosted', 'custom-registry'))
+        for version in ('0.0.0-24', '0.0.0-29'):
+            self.assertIsNone(vlt.expected_verdict(version, 'hosted', 'optional'),
+                              'these releases write no lock for an optional-only project')
+        self.assertEqual(vlt.expected_verdict('0.0.0-30', 'hosted', 'optional'), 'patched')
+
+    def test_expected_codes_come_from_the_lock_the_cell_writes(self):
+        self.assertEqual(vlt.expected_codes('0.0.0-16', 'hosted', 'direct'),
+                         ['redirect_vlt_lockfile_version_missing'])
+        self.assertEqual(vlt.expected_codes('0.0.0-32', 'hosted', 'direct'),
+                         ['redirect_vlt_old_lockfile_ignored'])
+        self.assertEqual(vlt.expected_codes('0.0.0-20', 'hosted', 'direct'), [],
+                         'vlt.json declares "modifiers" on 0.0.0-16 … 0.0.0-24')
+        self.assertEqual(vlt.expected_codes('0.0.0-32', 'hosted', 'alias'), [],
+                         'an alias-only era-A lock has no `··` id')
+        self.assertEqual(vlt.expected_codes('1.2.0', 'hosted', 'custom-registry'),
+                         ['redirect_vlt_custom_registry_skipped'])
+        self.assertEqual(vlt.expected_codes('0.0.0-16', 'vendored', 'direct'),
+                         ['vendor_lockfile_version_unsupported'])
+        self.assertEqual(vlt.expected_codes('0.0.0-32', 'vendored', 'direct'),
+                         ['vendor_vlt_legacy_lockfile'])
+        self.assertEqual(vlt.expected_codes('0.0.0-32', 'vendored', 'alias'), [])
+        self.assertEqual(vlt.expected_codes('1.2.0', 'vendored', 'custom-registry'),
+                         ['vendor_lock_entry_unsupported'])
+        self.assertEqual(vlt.expected_codes('1.2.0', 'agent', 'lockfile-only'),
+                         ['package_not_installed'])
+        self.assertEqual(vlt.expected_codes('1.0.0-rc.14', 'hosted', 'direct'), [])
+
+    def test_the_optional_only_limitation_is_bounded(self):
+        for version, limited in (('0.0.0-23', False), ('0.0.0-30', True), ('1.0.0-rc.14', True),
+                                 ('1.0.4', True), ('1.0.5', False), ('1.2.0', False)):
+            with self.subTest(version=version):
+                self.assertEqual(bool(vlt.known_vlt_limitation(version, 'hosted', 'optional')),
+                                 limited)
+        self.assertIsNone(vlt.known_vlt_limitation('1.0.4', 'hosted', 'optional-mixed'))
+        self.assertIsNone(vlt.known_vlt_limitation('1.0.4', 'agent', 'optional'))
+
+    def row(self, **fields):
+        base = dict(expectedVerdict='patched', expectedCodes=[], codes=[], verdict='patched')
+        base.update(fields)
+        return base
+
+    def test_matches_expectation(self):
+        self.assertTrue(vlt.matches_expectation(self.row()))
+        self.assertFalse(vlt.matches_expectation(self.row(verdict='safe-refusal')),
+                         'a spurious refusal of a must-patch cell fails')
+        self.assertFalse(vlt.matches_expectation(self.row(expectedCodes=['x'])),
+                         'a missing documented code fails')
+        refused = vlt.BLOCKED_CODES
+        self.assertTrue(vlt.matches_expectation(self.row(verdict=vlt.BLOCKED,
+                                                         blockedByProbe='gzip', codes=refused)))
+        self.assertFalse(vlt.matches_expectation(self.row(verdict=vlt.BLOCKED, codes=refused)),
+                         'blocked needs the probe to have seen a content-encoding')
+        self.assertFalse(vlt.matches_expectation(self.row(
+            verdict=vlt.BLOCKED, blockedByProbe='gzip', expectedVerdict='safe-refusal',
+            codes=refused)))
+        limited = self.row(verdict='unsupported', vltLimitations=['x'], expectedLimitation='x')
+        self.assertTrue(vlt.matches_expectation(limited))
+        self.assertFalse(vlt.matches_expectation(dict(limited, expectedLimitation=None)),
+                         'only a documented limitation may leave a cell unproven')
+        self.assertFalse(vlt.matches_expectation(dict(limited, failingChecks=['freshCi'])))
+
+    def test_a_blocked_cell_needs_only_the_refusal_code(self):
+        for version, mode, shape in (('0.0.0-16', 'hosted', 'direct'),
+                                     ('0.0.0-32', 'hosted', 'direct'),
+                                     ('0.0.0-32', 'vendored', 'hosted-then-vendored')):
+            with self.subTest(version=version, mode=mode, shape=shape):
+                expected = vlt.expected_codes(version, mode, shape)
+                self.assertTrue(expected, 'the unblocked cell owes lock-level or vendored codes')
+                blocked = self.row(verdict=vlt.BLOCKED, blockedByProbe='gzip',
+                                   expectedCodes=expected,
+                                   codes=['redirect_vlt_artifact_unverifiable'])
+                self.assertTrue(vlt.matches_expectation(blocked))
+                self.assertFalse(vlt.matches_expectation(dict(blocked, codes=[])),
+                                 'the refusal code itself is still due')
+                self.assertFalse(vlt.matches_expectation(dict(
+                    blocked, verdict='patched', codes=['redirect_vlt_artifact_unverifiable'])),
+                                 'a cell that ran still owes its codes')
+
+    def test_a_warm_install_keeps_a_vendored_optional_copy_from_0_0_0_30(self):
+        for version, kept in (('0.0.0-29', False), ('0.0.0-30', True), ('1.2.0', True)):
+            with self.subTest(version=version):
+                self.assertEqual(vlt.optional_warm_kept(version, 'vendored', 'optional-mixed'),
+                                 kept)
+        self.assertFalse(vlt.optional_warm_kept('1.2.0', 'vendored', 'direct'))
+        self.assertFalse(vlt.optional_warm_kept('1.2.0', 'hosted', 'optional-mixed'))
+
+    def test_integrity_enforced(self):
+        wrong = 'error: EINTEGRITY integrity mismatch'
+        self.assertTrue(vlt.integrity_enforced('1.2.0', False, 1, wrong, False, True))
+        self.assertFalse(vlt.integrity_enforced('1.2.0', False, 1, 'ENOTFOUND', False, True))
+        self.assertFalse(vlt.integrity_enforced('1.2.0', False, 0, '', False, True),
+                         'a required dependency must fail the install')
+        self.assertTrue(vlt.integrity_enforced('1.2.0', True, 0, '', False, True),
+                        'vlt skips an optional dependency that fails to fetch')
+        self.assertFalse(vlt.integrity_enforced('1.2.0', True, 0, '', True, True))
+        self.assertFalse(vlt.integrity_enforced('1.2.0', True, 0, '', False, False),
+                         'a skip proves nothing unless the untampered lock installed the patch')
+        self.assertFalse(vlt.integrity_enforced('1.2.0', True, 0, '', False, None))
+        a0 = 'Error: Could not read package.json file'
+        self.assertTrue(vlt.integrity_enforced('0.0.0-16', True, 1, a0, False, True),
+                        '0.0.0-16 fails reading the skipped optional package.json')
+        self.assertFalse(vlt.integrity_enforced('0.0.0-32', True, 1, a0, False, True))
+        self.assertFalse(vlt.integrity_enforced('0.0.0-16', False, 1, a0, False, True))
+        self.assertFalse(vlt.integrity_enforced('0.0.0-16', True, 1, a0, False, False))
+
+    def test_observed_verdict(self):
+        self.assertEqual(vlt.observed_verdict({'error': 'x'}), 'error')
+        self.assertEqual(vlt.observed_verdict({'blocked': True}), vlt.BLOCKED)
+        self.assertEqual(vlt.observed_verdict({'safeRefusal': True}), 'safe-refusal')
+        self.assertEqual(vlt.observed_verdict({'passed': True}), 'patched')
+        self.assertEqual(vlt.observed_verdict({'vltLimitations': ['x']}), 'unsupported')
+        self.assertEqual(vlt.observed_verdict({'failingChecks': ['freshCi']}), 'unsafe')
+
+    def test_shapes_are_depscan_capture_shapes(self):
+        # The depscan audit (capture-vlt.py SHAPES) reads these rows by shape name.
+        capture_names = {'direct', 'dev', 'optional', 'optional-mixed', 'alias', 'scoped',
+                         'transitive', 'two-versions', 'workspace', 'workspace-member-vendored',
+                         'self-referencing-member-vendored', 'peer-variants', 'crlf-lock',
+                         'custom-registry', 'mirror', 'scalar-registry', 'lockfile-only',
+                         'hosted-then-vendored', 'vendored-then-hosted', 'get-uuid'}
+        self.assertLessEqual(set(vlt.SHAPES), capture_names)
+
+
+class VltConfigTests(unittest.TestCase):
+    """write_vlt_json follows the DESIGN §8.3 per-era registry table."""
+
+    def config(self, version, registry=vlt.NPM_REGISTRY, **spec):
+        text = vlt.write_vlt_json(version, spec, registry)
+        return None if text is None else json.loads(text)
+
+    def test_public_registry(self):
+        self.assertEqual(self.config('1.2.0'),
+                         {'config': {'registries': {'npm': vlt.NPM_REGISTRY}}})
+        self.assertEqual(self.config('1.0.4'), {'config': {
+            'registry': vlt.NPM_REGISTRY, 'registries': {'npm': vlt.NPM_REGISTRY}}})
+        self.assertEqual(self.config('1.0.0-rc.33'), {'config': {
+            'registry': vlt.NPM_REGISTRY, 'registries': {'npm': vlt.NPM_REGISTRY}}})
+        self.assertIsNone(self.config('1.0.0-rc.32'),
+                          'vlt strips a registry equal to its npmjs default')
+        self.assertIsNone(self.config('1.0.0-rc.14'))
+        self.assertEqual(self.config('0.0.0-20'), {'modifiers': {}})
+        self.assertIsNone(self.config('0.0.0-25'))
+        self.assertIsNone(self.config('0.0.0-1'))
+
+    def test_mirror_registry_per_era(self):
+        r = 'http://127.0.0.1:4873/'
+        self.assertEqual(self.config('0.0.0-13', r), {'registry': r}, 'flat keys ≤ 0.0.0-13')
+        self.assertEqual(self.config('0.0.0-14', r), {'config': {'registry': r}})
+        self.assertEqual(self.config('0.0.0-16', r),
+                         {'config': {'registry': r}, 'modifiers': {}})
+        self.assertEqual(self.config('1.0.0-rc.6', r), {'config': {'registry': r}})
+        for version in ('1.0.0-rc.7', '1.0.0-rc.14', '1.0.0-rc.29'):
+            self.assertEqual(self.config(version, r), {'config': {'registry': vlt.NPM_REGISTRY}},
+                             'rc.7 … rc.29 are not hermetic')
+        self.assertEqual(self.config('1.0.0-rc.30', r), {'config': {'registry': r}})
+        self.assertEqual(self.config('1.0.0-rc.33', r),
+                         {'config': {'registry': r, 'registries': {'npm': r}}})
+        self.assertEqual(self.config('1.0.5', r), {'config': {'registries': {'npm': r}}})
+
+    def test_workspaces_and_named_registries(self):
+        self.assertEqual(self.config('1.2.0', members=['packages/a'])['workspaces'], 'packages/*')
+        self.assertEqual(self.config('0.0.0-13', members=['packages/a']),
+                         {'workspaces': 'packages/*'})
+        files = vlt.project_files('0.0.0-12', vlt.SHAPES['workspace'])
+        self.assertEqual(json.loads(files['vlt-workspaces.json']), {'packages': 'packages/*'})
+        self.assertNotIn('vlt.json', files)
+        custom = self.config('1.2.0', registries={'acme': vlt.ACME_REGISTRY})
+        self.assertEqual(custom['config']['registries'],
+                         {'acme': vlt.ACME_REGISTRY, 'npm': vlt.NPM_REGISTRY})
+
+
+class VltReleaseTests(unittest.TestCase):
+    supported, excluded = vlt.release_lists()
+
+    def test_exclusions(self):
+        for version in ('0.0.0-0', '0.0.0-2', '0.0.0-10', '0.0.0-22', '1.0.0-rc.19',
+                        '1.0.0-rc.21', '0.0.1', '1.0.0', '0.0.0-0.1733957343934'):
+            with self.subTest(version=version):
+                self.assertEqual(vlt.release_status(version, self.supported, self.excluded),
+                                 'excluded')
+        for version in vlt.VERSIONS:
+            self.assertEqual(vlt.release_status(version, self.supported, self.excluded),
+                             'supported')
+        self.assertEqual(vlt.release_status('1.3.0', self.supported, self.excluded), 'unlisted')
+        self.assertEqual(vlt.unlisted_releases(['1.2.0', '0.0.0-22', '1.3.0', '0.0.0-0.17'],
+                                               self.supported, self.excluded), ['1.3.0'])
+
+    def test_main_refuses_an_excluded_release(self):
+        with self.assertRaises(SystemExit), patch('sys.stderr'):
+            vlt.main(['--cli', 'x', '--out', 'y', '--versions', '0.0.0-22'])
+        with self.assertRaises(SystemExit), patch('sys.stderr'):
+            vlt.main(['--cli', 'x', '--out', 'y', '--versions', '9.9.9'])
+
+    def test_versions_order_and_eras(self):
+        ordered = sorted(['1.2.0', '1.0.0-rc.14', '0.0.0-32', '1.0.10', '1.0.0-rc.9', '1.0.4'],
+                         key=vlt.version_key)
+        self.assertEqual(ordered, ['0.0.0-32', '1.0.0-rc.9', '1.0.0-rc.14', '1.0.4', '1.0.10',
+                                   '1.2.0'])
+        eras = {v: vlt.era_of(v) for v in ('0.0.0-18', '0.0.0-19', '1.0.0-rc.8', '1.0.0-rc.9',
+                                           '1.0.0-rc.14', '1.0.0-rc.15', '1.0.0-rc.32',
+                                           '1.0.0-rc.33', '1.0.7', '1.0.8', '1.1.1', '1.2.0')}
+        self.assertEqual(list(eras.values()),
+                         ['A0', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'E', 'E', 'F'])
+
+    def test_pinned_integrity_covers_every_supported_release(self):
+        pinned = json.loads(vlt.HISTORICAL_INTEGRITY.read_text())
+        self.assertEqual(sorted(pinned, key=vlt.version_key),
+                         sorted(self.supported, key=vlt.version_key))
+        self.assertTrue(all(v.startswith('sha512-') for v in pinned.values()))
+        self.assertEqual(pinned['1.2.0'], 'sha512-t7ONkM8YgRlY0g+6l+OU4oS2WS/dp7DK/vmFwNqxA0D+'
+                         'ehPWprNOTTH3uUYURAnCg5lr9vzJSmX9nNCcG5xGXA==')
+
+
+class VltLockHelperTests(unittest.TestCase):
+    LOCK = ('{\n  "lockfileVersion": 1,\n  "options": {},\n  "nodes": {\n'
+            '    "~npm~minimist@1.2.2": [0,"minimist","sha512-AAAA==","https://r/m.tgz"],\n'
+            '    "~npm~minimist@1.2.2~peer.1": [0,"minimist","sha512-AAAA=="],\n'
+            '    "~acme~minimist@1.2.2": [0,"minimist","sha512-BBBB=="],\n'
+            '    "~npm~minimist@1.2.8": [0,"minimist","sha512-CCCC=="],\n'
+            '    "·npm·minimist@1.2.2": [0,"minimist","sha512-DDDD=="],\n'
+            '    "··minimist@1.2.2": [0,"minimist","sha512-EEEE=="],\n'
+            '    "file~.socket+vendor": [0,"minimist",null,".socket/vendor"]\n'
+            '  },\n  "edges": {}\n}\n')
+
+    def test_split_dep_id_both_grammars(self):
+        self.assertEqual(vlt.split_dep_id('~npm~minimist@1.2.2'), ('npm', 'minimist', '1.2.2', None))
+        self.assertEqual(vlt.split_dep_id('~~minimist@1.2.2~peer.1'),
+                         ('', 'minimist', '1.2.2', 'peer.1'))
+        self.assertEqual(vlt.split_dep_id('··minimist@1.2.2'), ('', 'minimist', '1.2.2', None))
+        self.assertEqual(vlt.split_dep_id('~npm~@s+p@1.0.0'), ('npm', '@s/p', '1.0.0', None))
+        self.assertEqual(vlt.split_dep_id('·npm·@s§p@1.0.0'), ('npm', '@s/p', '1.0.0', None))
+        self.assertIsNone(vlt.split_dep_id('file~_d'))
+        self.assertIsNone(vlt.split_dep_id('file·.'))
+
+    def test_target_instances_are_default_registry_nodes(self):
+        self.assertEqual(vlt.target_instances(self.LOCK), [
+            '~npm~minimist@1.2.2', '~npm~minimist@1.2.2~peer.1', '·npm·minimist@1.2.2',
+            '··minimist@1.2.2'])
+        self.assertIn('~acme~minimist@1.2.2', vlt.target_instances(self.LOCK, any_registry=True))
+
+    def test_tamper_lock_rewrites_only_the_named_lines(self):
+        crlf = self.LOCK.replace('\n', '\r\n').encode()
+        out = vlt.tamper_lock(crlf, ['~npm~minimist@1.2.2', '·npm·minimist@1.2.2'])
+        wrong = vlt.sri_sha512(b'tampered by backtest-vlt.py')
+        lines = out.decode().split('\r\n')
+        self.assertIn(f'"~npm~minimist@1.2.2": [0,"minimist","{wrong}","https://r/m.tgz"],',
+                      lines[4])
+        self.assertIn(wrong, lines[8])
+        self.assertEqual([l for i, l in enumerate(lines) if i not in (4, 8)],
+                         [l for i, l in enumerate(crlf.decode().split('\r\n')) if i not in (4, 8)])
+
+    def test_snapshot_keeps_the_vendored_payload_and_drops_node_modules(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = f'.socket/vendor/npm/{vlt.UUID}/minimist-1.2.2/node_modules/minimist'
+            for rel in ['package.json', 'vlt-lock.json', 'vlt.json', 'node_modules/.vlt-lock.json',
+                        'packages/a/node_modules/minimist/index.js', 'packages/a/package.json',
+                        f'{payload}/package.json', f'{payload}/index.js',
+                        f'{payload}/node_modules/dep/index.js', '.socket/vendor/state.json',
+                        f'.socket/vendor/npm/{vlt.UUID}/.gitignore']:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(rel)
+            files = vlt.snapshot(root)
+            self.assertEqual(sorted(files), sorted([
+                'package.json', 'vlt-lock.json', 'vlt.json', 'packages/a/package.json',
+                f'{payload}/package.json', f'{payload}/index.js', '.socket/vendor/state.json',
+                f'.socket/vendor/npm/{vlt.UUID}/.gitignore']))
+            digests = vlt.capture_tree(root, root / 'tree-out')
+            self.assertEqual(sorted(digests), sorted([
+                'package.json', 'vlt-lock.json', 'vlt.json', 'packages/a/package.json',
+                f'{payload}/package.json', '.socket/vendor/state.json']))
+
+    def test_snapshot_skips_vlt_background_delete_dirs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = f'.socket/vendor/npm/{vlt.UUID}/minimist-1.2.2/node_modules/minimist'
+            for rel in ['package.json', '.VLT.DELETE.3.node_modules/.vlt/x/package.json',
+                        f'{payload}/index.js', f'{payload}/.VLT.DELETE.1.node_modules/d/index.js',
+                        'packages/a/.VLT.DELETE.7.node_modules/m/package.json']:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(rel)
+            self.assertEqual(sorted(vlt.snapshot(root)), sorted(['package.json', f'{payload}/index.js']))
+
+    def test_remove_node_modules_keeps_the_vendored_payload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = f'.socket/vendor/npm/{vlt.UUID}/minimist-1.2.2/node_modules/minimist'
+            for rel in ['node_modules/.vlt/x/index.js', 'packages/a/node_modules/m/index.js',
+                        f'{payload}/index.js', 'package.json']:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(rel)
+            vlt.remove_node_modules(root)
+            left = sorted(p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file())
+            self.assertEqual(left, [f'{payload}/index.js', 'package.json'])
+
+    @unittest.skipIf(os.name == 'nt', 'symlinks need privileges on Windows')
+    def test_snapshot_never_follows_a_link(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'p'
+            outside = Path(temp) / 'outside'
+            outside.mkdir()
+            (outside / 'secret.json').write_text('{}')
+            root.mkdir()
+            (root / 'package.json').write_text('{}')
+            (root / 'linked').symlink_to(outside, target_is_directory=True)
+            self.assertEqual(list(vlt.snapshot(root)), ['package.json'])
+
+
+class VltRetryTests(unittest.TestCase):
+    def test_only_transport_failures_retry(self):
+        self.assertFalse(vlt.transient({'matchesExpectation': True, 'serveProbe': {'curlExit': 7}}))
+        self.assertTrue(vlt.transient({'serveProbe': {'curlExit': 7}}))
+        self.assertTrue(vlt.transient({'serveProbe': {'curlExit': 0, 'status': 503}}))
+        self.assertTrue(vlt.transient({'error': 'error sending request for url (https://x)'}))
+        self.assertTrue(vlt.transient({'cliStderrTail': 'Error: Failed to resolve patch references: API '
+                                                        'request failed with status 504: error code: 504'}))
+        self.assertFalse(vlt.transient({'cliStderrTail': 'API request failed with status 404: not found'}))
+        self.assertFalse(vlt.transient({'serveProbe': {'curlExit': 0, 'status': 200},
+                                        'failingChecks': ['freshCi']}))
+
+    def test_a_transport_failure_reruns_from_scratch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rows = [{'cell': 'c', 'error': 'error sending request for url (https://x)'},
+                    {'cell': 'c', 'matchesExpectation': True}]
+
+            class Fake:
+                case = Path(temp)
+
+                def __init__(self, *_):
+                    pass
+
+                def run_cell(self):
+                    return rows.pop(0)
+
+            with patch.object(vlt.time, 'sleep'), patch('sys.stdout'):
+                row = vlt.run_with_retries(Fake, ('1.2.0', 'hosted', 'direct'))
+            self.assertTrue(row['matchesExpectation'])
+            self.assertEqual(len(row['transportRetries']), 1)
+            self.assertTrue((Path(temp) / 'result.json').is_file())
+
+
+class VltBlockedRefusalTests(unittest.TestCase):
+    """`blocked-by-server-encoding` needs the cell's own probe to have seen a
+    content-encoded 200 and the CLI to have refused cleanly."""
+
+    DETAIL = ('vlt would fail to verify https://patch.socket.dev/x.tgz: content-encoding gzip; '
+              'nothing was written for pkg:npm/minimist@1.2.2')
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cell = vlt.Cell({'out': Path(self.temp.name), 'record': {}}, '1.2.0', 'hosted',
+                             'direct')
+        self.cell.project.mkdir(parents=True)
+        (self.cell.project / 'vlt-lock.json').write_text('{"nodes":{}}\n', encoding='utf-8')
+        (self.cell.project / 'package.json').write_text('{}\n', encoding='utf-8')
+        self.reference = vlt.snapshot(self.cell.project)
+
+    def row(self, encoding='gzip', status=200, expected='patched'):
+        return dict(serveProbe={'status': status, 'contentEncoding': encoding},
+                    expectedVerdict=expected, expectedCodes=['redirect_vlt_old_lockfile_ignored'],
+                    codes=[], checks={'serveEncodingIdentity': False})
+
+    def envelope(self, detail=DETAIL):
+        return {'redirect': {'warnings': [{'code': 'redirect_vlt_artifact_unverifiable',
+                                           'detail': detail}]}}
+
+    def test_a_clean_refusal_of_an_encoded_artifact_is_blocked(self):
+        row = self.row()
+        self.assertTrue(self.cell.blocked_refusal(row, [self.envelope()], self.reference))
+        self.assertTrue(row['blocked'])
+        self.assertEqual(row['blockedByProbe'], 'gzip')
+        self.assertEqual(row['expectedCodes'], vlt.BLOCKED_CODES)
+        self.assertEqual(row['expectedCodesUnblocked'], ['redirect_vlt_old_lockfile_ignored'])
+        self.assertNotIn('serveEncodingIdentity', row['checks'])
+        self.assertEqual(sorted(row['manifestSha256']), ['package.json', 'vlt-lock.json'])
+
+    def test_an_identity_probe_is_never_blocked(self):
+        for encoding in (None, '', 'identity'):
+            with self.subTest(encoding=encoding):
+                row = self.row(encoding=encoding)
+                self.assertFalse(self.cell.blocked_refusal(row, [self.envelope()],
+                                                           self.reference))
+                self.assertNotIn('blocked', row)
+
+    def test_a_changed_project_is_not_a_clean_refusal(self):
+        (self.cell.project / 'vlt-lock.json').write_text('{"nodes":{"x":[]}}\n',
+                                                         encoding='utf-8')
+        row = self.row()
+        self.assertFalse(self.cell.blocked_refusal(row, [self.envelope()], self.reference))
+        self.assertNotIn('blocked', row)
+
+    def test_a_non_200_probe_or_a_must_refuse_cell_is_not_blocked(self):
+        for row in (self.row(status=503), self.row(status=None),
+                    self.row(expected='safe-refusal')):
+            with self.subTest(row=row):
+                self.assertFalse(self.cell.blocked_refusal(row, [self.envelope()],
+                                                           self.reference))
+                self.assertNotIn('blocked', row)
+
+    def test_the_refusal_must_name_the_encoding_and_write_nothing(self):
+        for envelope in (self.envelope('vlt would fail to verify x: sha512 mismatch; '
+                                       'nothing was written'),
+                         self.envelope('content-encoding gzip'),
+                         {'redirect': {'warnings': [{'code': 'redirect_vlt_lock_unsupported',
+                                                     'detail': self.DETAIL}]}}):
+            with self.subTest(envelope=envelope):
+                row = self.row()
+                self.assertFalse(self.cell.blocked_refusal(row, [envelope], self.reference))
+                self.assertNotIn('blocked', row)
+
+
+class VltProbeTests(unittest.TestCase):
+    def test_header_blocks_take_the_last_response(self):
+        dump = ('HTTP/1.1 302 Found\r\nLocation: /x\r\n\r\n'
+                'HTTP/2 200\r\ncontent-encoding: gzip\r\ncache-control: public\r\n\r\n')
+        self.assertEqual(vlt.parse_header_blocks(dump),
+                         (200, {'content-encoding': 'gzip', 'cache-control': 'public'}))
+        self.assertEqual(vlt.parse_header_blocks(''), (None, {}))
+
+    def test_identity_encodings(self):
+        for value in (None, '', ' ', 'identity', 'IDENTITY'):
+            self.assertTrue(vlt.encoding_is_identity(value), value)
+        for value in ('gzip', 'br', 'gzip, identity'):
+            self.assertFalse(vlt.encoding_is_identity(value), value)
+
+    def test_grant_selection_fails_closed(self):
+        ok = {'results': {vlt.UUID: {'status': 'reused', 'url': 'u', 'artifacts': [
+            {'kind': 'yarn-berry-zip', 'url': 'z', 'integrity': {'sha512': None}},
+            {'kind': 'tarball', 'url': 't', 'integrity': {'sha512': 'sha512-x'}}]}}}
+        self.assertEqual(vlt.select_tarball(ok), ('t', 'sha512-x'))
+        for broken in ({'results': {}},
+                       {'results': {vlt.UUID: {'status': 'withdrawn'}}},
+                       {'results': {vlt.UUID: {'status': 'granted', 'artifacts': [
+                           {'kind': 'tarball', 'integrity': {}}]}}}):
+            with self.assertRaises(RuntimeError):
+                vlt.select_tarball(broken)
+
+    def test_envelope_codes_read_every_channel(self):
+        envelope = {'redirect': {'warnings': [{'code': 'a'}],
+                                 'skipped': [{'reason': 'redirect_vlt_artifact_unverifiable'}]},
+                    'vendor': {'events': [{'errorCode': 'b', 'reason': 'prose with spaces'}]}}
+        self.assertEqual(sorted(vlt.envelope_codes(envelope)),
+                         ['a', 'b', 'redirect_vlt_artifact_unverifiable'])
 
 
 if __name__ == "__main__":

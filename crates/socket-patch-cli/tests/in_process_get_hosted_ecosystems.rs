@@ -26,6 +26,8 @@ use std::path::Path;
 mod vex_e2e_common;
 #[path = "vex_pipenv_pip_steps/mod.rs"]
 mod vex_pipenv_pip_steps;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
 
 use serial_test::serial;
 use socket_patch_cli::commands::get::GetArgs;
@@ -955,5 +957,65 @@ async fn deno_hosted_grant_lands_nothing() {
         })
         .await
         .unwrap();
+    }
+}
+
+/// vlt: `get <uuid> --mode hosted` over a lock-only vlt project pins the
+/// node (UUID identifiers skip installed narrowing), preflights the
+/// artifact, heals a warm store and emits the reinstall advisory.
+#[tokio::test]
+async fn vlt_hosted_get_pins_the_node_heals_and_emits_the_advisory() {
+    use vlt_hosted_common as vlt;
+    let server = MockServer::start().await;
+    vlt::mock_all(&server).await;
+    for warm in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        vlt::write_package_json(root);
+        std::fs::write(
+            root.join("vlt-lock.json"),
+            vlt::vlt_lock(vlt::Era::V1, &[vlt::registry_node(vlt::TILDE_ID)]),
+        )
+        .unwrap();
+        if warm {
+            vlt::install_store(root, vlt::TILDE_ID, vlt::PRISTINE);
+            vlt::write_hidden_lock(root, &[vlt::registry_node(vlt::TILDE_ID)]);
+        }
+        let cwd = root.to_str().unwrap().to_string();
+        let uri = server.uri();
+
+        let (code, doc, stderr) = vlt::run_json(
+            root,
+            &[
+                "get",
+                vlt::UUID,
+                "--mode",
+                "hosted",
+                "--yes",
+                "--cwd",
+                &cwd,
+                "--api-url",
+                &uri,
+                "--org",
+                vlt::ORG,
+                "--api-token",
+                "fake",
+            ],
+            &[],
+        );
+
+        assert_eq!(code, 0, "{doc:#}\n{stderr}");
+        assert_eq!(vlt::redirected(&doc), 1, "{doc:#}");
+        assert_eq!(
+            vlt::read(root, "vlt-lock.json"),
+            vlt::vlt_lock(vlt::Era::V1, &[vlt::pinned_node(vlt::TILDE_ID, &server)])
+        );
+        let expected = if warm {
+            vlt::advisory_invalidated(1)
+        } else {
+            vlt::ADVISORY_NOTHING_STALE.to_string()
+        };
+        assert_eq!(vlt::warning_detail(&doc, vlt::ADVISORY), expected);
+        assert!(!vlt::store_dir(root, vlt::TILDE_ID).exists());
     }
 }

@@ -234,3 +234,40 @@ fn remove_dry_run_layout() {
         "{stdout:?}"
     );
 }
+
+#[test]
+fn vlt_preview_shows_the_npx_hook_and_the_advisory_on_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        &tmp.path().join("package.json"),
+        "{\n  \"name\": \"root\"\n}\n",
+    );
+    write(
+        &tmp.path().join("vlt-lock.json"),
+        "{\"lockfileVersion\":0,\"nodes\":{},\"edges\":{}}\n",
+    );
+    let empty_path = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["setup", "--dry-run"],
+        &[
+            ("SOCKET_TELEMETRY_DISABLED", "1"),
+            ("PATH", empty_path.path().to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stdout.contains(
+            "  + package.json\n    -> postinstall: \"npx @socketsecurity/socket-patch apply \
+             --silent --ecosystems npm\"\n"
+        ),
+        "{stdout:?}"
+    );
+    assert_eq!(
+        stderr,
+        "Warning (vlt_root_scripts_not_run): vlt before 1.0.0-rc.13 does not run the root \
+         postinstall hook; upgrade vlt or run `socket-patch apply` after `vlt ci` \
+         (vlt-lock.json has lockfileVersion 0, so this project may be installed by such a \
+         vlt)\n"
+    );
+}

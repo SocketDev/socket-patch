@@ -84,6 +84,51 @@ async fn npm_lock_entry_fragment_recovers_sri_and_url() {
 }
 
 #[tokio::test]
+async fn vlt_lock_node_original_recovers_sri_and_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = |tuple: &str| {
+        entry(
+            "npm",
+            "pkg:npm/%40scope/x@1.2.3",
+            vec![rec(
+                "vlt_lock_node",
+                serde_json::Value::String(format!("\"~npm~@scope+x@1.2.3\": {tuple}")),
+            )],
+        )
+    };
+    let got = recover_lock_entry(
+        tmp.path(),
+        &node(
+            r#"[0,"@scope/x","sha512-AAAA","https://registry.npmjs.org/@scope/x/-/x-1.2.3.tgz"]"#,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (got.name.as_str(), got.version.as_str()),
+        ("@scope/x", "1.2.3")
+    );
+    assert_eq!(
+        got.resolved.as_deref(),
+        Some("https://registry.npmjs.org/@scope/x/-/x-1.2.3.tgz")
+    );
+    assert_eq!(got.integrity, LockIntegrity::Sri("sha512-AAAA".into()));
+
+    let got = recover_lock_entry(tmp.path(), &node(r#"[0,"@scope/x","sha512-AAAA"]"#))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.resolved, None,
+        "a 3-tuple leaves the URL to the fetcher"
+    );
+    assert!(
+        recover_lock_entry(tmp.path(), &node(r#"[0,"@scope/x",null,"file:x"]"#))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn bun_binary_snapshot_recovers_registry_metadata_and_checks_coordinates() {
     let tmp = tempfile::tempdir().unwrap();
     let original = serde_json::json!({

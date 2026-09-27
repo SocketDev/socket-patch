@@ -1,0 +1,18 @@
+[
+  {
+    "path": "vlt-lock.json",
+    "kind": "redirect_vlt_lock_node",
+    "action": "rewritten",
+    "key": "semver@7.6.0",
+    "original": "\"~npm~semver@7.6.0\": [0,\"semver\",\"sha512-EnwXhrlwXMk9gKu5/flx5sv/an57AkRplG3hTK68W7FRDN+k+OWBj65M7719OkA82XLBxrcX0KSHj+X5COhOVg==\",null,null,null,null,null,{  \"semver\": \"bin/semver.js\"}]",
+    "new": "\"~npm~semver@7.6.0\": [0,\"semver\",\"sha512-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF==\",\"https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/ffffffff-ffff-4fff-8fff-ffffffffffff/semver-7.6.0.tgz\",null,null,null,null,{  \"semver\": \"bin/semver.js\"}]"
+  },
+  {
+    "path": "vlt-lock.json",
+    "kind": "redirect_vlt_lock_node",
+    "action": "rewritten",
+    "key": "fsevents@2.3.3",
+    "original": "\"~npm~fsevents@2.3.3\": [1,\"fsevents\",\"sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==\",null,null,null,null,{  \"engines\": {    \"node\": \"^8.16.0 || ^10.6.0 || >=11.0.0\"  },  \"os\": [    \"darwin\"  ]}]",
+    "new": "\"~npm~fsevents@2.3.3\": [1,\"fsevents\",\"sha512-00000000000000000000000000000000000000000000000000000000000000000000000000000000000000==\",\"https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/00000000-0000-4000-8000-000000000000/fsevents-2.3.3.tgz\",null,null,null,{  \"engines\": {    \"node\": \"^8.16.0 || ^10.6.0 || >=11.0.0\"  },  \"os\": [    \"darwin\"  ]}]"
+  }
+]

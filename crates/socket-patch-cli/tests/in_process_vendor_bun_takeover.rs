@@ -1,4 +1,5 @@
-//! Hermetic bun mode-takeover contract tests through the built binary.
+//! Hermetic npm-family mode-takeover contract tests through the built
+//! binary: bun below, vlt in `in_process_vendor_bun_takeover/vlt.rs`.
 //!
 //! Twin of the yarn legs in `mode_migration_npm.rs` and the pnpm
 //! `hosted_to_vendor_conversion` module in `in_process_vendor.rs`, for the
@@ -45,6 +46,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "vex_e2e_common/bun.rs"]
 mod bun_vex;
+#[path = "in_process_vendor_bun_takeover/vlt.rs"]
+mod vlt;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
 
 const ORG: &str = "test-org";
 const NAME: &str = "left-pad";

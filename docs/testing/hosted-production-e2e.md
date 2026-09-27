@@ -70,7 +70,7 @@ failure instead of N confusing ones that look like CLI regressions.
 
 | Ecosystem | Hosted mode | Free patches in production | Suite coverage |
 |-----------|-------------|----------------------------|----------------|
-| npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun |
+| npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun; vlt probe-driven (see [vlt](#vlt-the-serve-encoding-gate)) |
 | PyPI | ✅ (requirements.txt, uv.lock, Pipfile.lock) | ✅ many | ✅ requirements.txt, uv.lock, Pipfile.lock |
 | RubyGems | ✅ | ✅ (this suite pins one purl/UUID: `activestorage@6.0.3`; the 2026-08-18 republish covers more versions) | ✅ full bundler install proof |
 | Cargo | ✅ | ❌ **none** (tier emptied 2026-08-28) | canary only |
@@ -120,6 +120,28 @@ Two supported hosted shapes are deliberately **not** covered here:
   (the lock rewrite fires, but PnP's `.yarn/cache` resolution is not exercised).
   The berry leg here pins `nodeLinker: node-modules`, matching the documented
   support boundary.
+
+## vlt: the serve-encoding gate
+
+`vlt_pinned_matrix_production_hosted_install_proof` pins the public minimist
+patch in a vlt 1.2.0 project (`vlt.json` with `registries.npm`). vlt hashes the
+wire body of a tarball and sends `accept-encoding: gzip;q=1.0, identity;q=0.5`,
+so it fails `EINTEGRITY` whenever patch.socket.dev (or its CDN) serves the
+artifact content-encoded. The leg therefore probes the artifact the way vlt
+does (the core `fetch_artifact_probe`) and branches on what it sees:
+
+| Probe | Asserted |
+|---|---|
+| `Content-Encoding` other than identity | the clean refusal: `redirect_vlt_artifact_unverifiable` naming the encoding, `vlt-lock.json` byte-identical, no redirect ledger. With `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` the encoded response is itself a failure. |
+| identity | the full proof: slot [2] is the served sha512, and a fresh checkout's `vlt ci` installs the patched minimist |
+
+So the leg neither breaks nor goes vacuous when the serve fix
+(`Cache-Control: no-transform`) deploys. As of 2026-09-26 production still
+re-gzips the artifact and the leg runs the refusal branch. Under
+`SOCKET_PATCH_HOSTED_E2E_STRICT=1` a missing `SOCKET_PATCH_VLT_E2E_JS` fails
+instead of skipping, and CI runs the leg's output through
+`scripts/check-vlt-legs.py`. `.github/workflows/vlt-serve-watchdog.yml` probes
+the same artifact every 6 hours; see [vlt compatibility](vlt-compatibility.md).
 
 ## Known issues this suite surfaced
 
@@ -205,10 +227,12 @@ runs only where it is explicitly asked for.
 |----------|--------|
 | `SOCKET_PATCH_HOSTED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. **CI sets this** — a required check must never report green on an unexercised leg. |
 | `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when cargo/maven/nuget/composer gain their first free published patch. |
+| `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | The vlt release the vlt leg runs (`node <vlt.js>`, exact `--version`); CI installs 1.2.0 with `scripts/install-vlt.sh`. |
+| `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` | Fail the vlt leg while the artifact is served content-encoded. Unset until the serve fix is verified in production. |
 
 ### Toolchains
 
-`npm`, `corepack` (pnpm + yarn classic + yarn berry), `bun`, `uv`,
+`npm`, `corepack` (pnpm + yarn classic + yarn berry), `bun`, `vlt` (Node ≥ 22.22), `uv`,
 `ruby` + `bundle` (**≥ 2.6** — `bundle lock --add-checksums` emits the CHECKSUMS
 section the gem rewrite pins into), `go`.
 
@@ -238,6 +262,15 @@ today). Lock-era coverage — version-0 and version-1 locks, native `bun.lockb`
 rewrites, the 1.3.10 digest boundary — lives in `ci.yml`'s hermetic
 `e2e_redirect_bun_build` legs and in `bun-compatibility.yml`; see
 [Bun compatibility](bun-compatibility.md).
+
+The job also installs vlt 1.2.0 (`scripts/install-vlt.sh`: `npm pack`, the
+tarball's sha512 checked against the registry and
+`scripts/vlt-historical-integrity.json`), exports `SOCKET_PATCH_VLT_E2E_JS`,
+`_VERSION` and `_REQUIRED=1`, checks the passing attempt's vlt leg with
+`scripts/check-vlt-legs.py`, and then runs the vendored vlt proof
+(`e2e_vendored_production -- --include-ignored vlt_pinned_matrix`) with the
+same retries. Release-era coverage lives in `ci.yml`'s `e2e` vlt rows and in
+`vlt-compatibility.yml`; see [vlt compatibility](vlt-compatibility.md).
 
 ### Escape hatch — production is down and this is blocking merges
 

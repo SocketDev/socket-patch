@@ -26,6 +26,10 @@ use std::path::Path;
 mod vex_e2e_common;
 #[path = "vex_pipenv_pip_steps/mod.rs"]
 mod vex_pipenv_pip_steps;
+#[path = "in_process_rollback_hosted/vlt.rs"]
+mod vlt;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
 
 use serde_json::Value;
 use serial_test::serial;
@@ -850,6 +854,168 @@ async fn scoped_unsupported_ecosystem_fails_closed() {
         std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
         gem_before,
         "the refused gem wiring must be untouched"
+    );
+}
+
+/// A ledger written by a newer socket-patch carries a hosted edit kind this
+/// release has no revert for (`redirect_future_lock_entry`). A scoped
+/// rollback of the purl it names must refuse with nothing written, and an
+/// unscoped one must keep the record while that edit survives.
+async fn write_unknown_kind_ledger_fixture(root: &Path, with_gem: bool) -> String {
+    let future_new = format!("left-pad@1.2.3 {LP_HOSTED_URL}");
+    let future_lock = format!("{future_new}\n");
+    std::fs::write(root.join("future.lock"), &future_lock).unwrap();
+    std::fs::write(
+        root.join("yarn.lock"),
+        yarn_lock_content(&yarn_redirected_block()),
+    )
+    .unwrap();
+    let mut records = vec![(LP_PURL, patch_record(LP_UUID, "GHSA-lpad-aaaa-bbbb"))];
+    let mut edits = vec![yarn_classic_edit()];
+    if with_gem {
+        std::fs::write(
+            root.join("Gemfile.lock"),
+            gemfile_lock_content(GEM_PATCH_REMOTE),
+        )
+        .unwrap();
+        records.push((GEM_PURL, patch_record(GEM_UUID, "GHSA-gems-cccc-dddd")));
+        edits.push(gem_source_edit());
+    }
+    edits.push(FileEdit {
+        path: "future.lock".to_string(),
+        kind: "redirect_future_lock_entry".to_string(),
+        action: "rewritten".to_string(),
+        key: Some("left-pad@1.2.3".to_string()),
+        original: Some(Value::String(
+            "left-pad@1.2.3 sha512-UPSTREAMupstream==".to_string(),
+        )),
+        new: Some(Value::String(future_new)),
+    });
+    write_hosted_ledger(root, records, edits).await;
+    future_lock
+}
+
+fn ledger_edit_kinds(root: &Path) -> Vec<String> {
+    let ledger: Value = serde_json::from_slice(&std::fs::read(ledger_path(root)).unwrap()).unwrap();
+    ledger["edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_rollback_refuses_a_purl_named_by_an_unknown_edit_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), true).await;
+    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    let yarn_before = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[LP_PURL]);
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    assert_eq!(
+        envelope["hosted"]["reverted"],
+        serde_json::json!([]),
+        "{envelope}"
+    );
+    let failed = envelope["hosted"]["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{envelope}");
+    assert_eq!(failed[0]["purl"], LP_PURL);
+    assert!(
+        failed[0]["error"].as_str().unwrap().contains(
+            "redirect_future_lock_entry edit this socket-patch release does not understand"
+        ),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(tmp.path())).unwrap(),
+        ledger_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
+        future_lock
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn unscoped_rollback_holds_the_record_beside_an_unknown_edit_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), true).await;
+
+    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
+    assert_eq!(
+        code, 1,
+        "an unknown edit kind must fail the rollback closed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
+        future_lock
+    );
+    let ledger: Value =
+        serde_json::from_slice(&std::fs::read(ledger_path(tmp.path())).unwrap()).unwrap();
+    assert!(ledger["records"].get(LP_PURL).is_some(), "{ledger}");
+    assert!(ledger["records"].get(GEM_PURL).is_some(), "{ledger}");
+    // The groups this release understands still unwind on disk; their
+    // records wait for the unknown group to clear.
+    assert_eq!(
+        ledger_edit_kinds(tmp.path()),
+        ["redirect_future_lock_entry"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&yarn_original_block())
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
+        gemfile_lock_content(GEM_UPSTREAM_REMOTE)
+    );
+}
+
+/// With the purl as the only hosted record the scope covers the whole
+/// ledger: the per-purl claim refuses, then the replay still unwinds
+/// yarn.lock but holds the record and the unknown edit.
+#[tokio::test]
+#[serial]
+async fn scoped_rollback_of_the_only_record_holds_it_beside_an_unknown_edit_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), false).await;
+
+    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[LP_PURL]);
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(
+        envelope["hosted"]["reverted"],
+        serde_json::json!([]),
+        "{envelope}"
+    );
+    let failed: Vec<&str> = envelope["hosted"]["failed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["purl"].as_str().unwrap())
+        .collect();
+    assert_eq!(failed, [LP_PURL, "group:unknown"], "{envelope}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
+        future_lock
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&yarn_original_block())
+    );
+    let ledger: Value =
+        serde_json::from_slice(&std::fs::read(ledger_path(tmp.path())).unwrap()).unwrap();
+    assert!(ledger["records"].get(LP_PURL).is_some(), "{ledger}");
+    assert_eq!(
+        ledger_edit_kinds(tmp.path()),
+        ["redirect_future_lock_entry"]
     );
 }
 

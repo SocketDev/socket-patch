@@ -104,6 +104,7 @@ struct Candidate {
 /// The Python locks the root LISTS (`pylock*.toml`, `*.py.lock` + script)
 /// and the requirements `-r` include tree are appended at scan time.
 const WIRING_FILES: &[&str] = &[
+    "vlt-lock.json",
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
@@ -155,6 +156,7 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
         .iter()
         .map(|file| (*file).to_string())
         .collect();
+    files.extend(vendor::vlt_lock::vlt_importer_package_jsons(project_root).await);
     if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {
         for path in paths {
             if let Some(script) =
@@ -245,7 +247,7 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
 /// backend's unwired-revert guard probes ITS OWN lockfile — a
 /// pnpm-reconstructed entry left at flavor-None would be guarded against
 /// package-lock.json instead of pnpm-lock.yaml. Locks are checked in the
-/// vendor router's own precedence order (bun > pnpm > yarn > npm) for the
+/// vendor router's own precedence order (vlt > bun > pnpm > yarn > npm) for the
 /// pathological multi-lock case; content sniffs mirror
 /// `detect_npm_lock_flavor` (crate-private to core, so re-derived here).
 /// `None` when genuinely unknowable — no recognizable lock carries the
@@ -286,6 +288,11 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     let read = |name: &'static str| async move {
         read_regular_to_string(&project_root.join(name)).await.ok()
     };
+    if let Some(text) = read("vlt-lock.json").await {
+        if text.contains(&needle) {
+            return vendor::vlt_lock::vlt_lock_sniff_ok(&text).then(|| "vlt".to_string());
+        }
+    }
     if read("bun.lock").await.is_some_and(|t| t.contains(&needle)) {
         return Some("bun".to_string());
     }
@@ -401,7 +408,7 @@ fn report_no_local_source(
                 env,
                 common,
                 &c.purl,
-                &c.entry.artifact.path,
+                &c.entry,
                 "its patch content has no local source to rebuild from",
             );
             *rebuilt += 1;
@@ -463,14 +470,52 @@ fn rebuild_reason_label(code: &str) -> &str {
 /// fingerprint — the legacy member-only state pass 1 keeps warning about
 /// (`vendor_inventory_missing` for gems) — and the gap is surfaced, instead
 /// of either failing the repair or canonizing the unverifiable live tree.
+/// The npm-family lockfiles and the vlt importers' package.json files as
+/// they are now, for the unverified-source rebuild's put-back. Read through
+/// the FIFO-safe opener: a FIFO or device at one of these paths is left out
+/// of the snapshot at once instead of blocking the repair in open(2), like
+/// any other file that cannot be read.
+async fn snapshot_npm_wiring_files(cwd: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut names: Vec<String> = [
+        "vlt-lock.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+    ]
+    .iter()
+    .map(|n| (*n).to_string())
+    .collect();
+    names.extend(vendor::vlt_lock::vlt_importer_package_jsons(cwd).await);
+    let mut snap = Vec::new();
+    for name in names {
+        let p = cwd.join(name);
+        if let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&p).await {
+            snap.push((p, Some(bytes)));
+        }
+    }
+    snap
+}
+
 /// The entry itself was already persisted by the pre-rebuild restore.
 fn soft_restore_without_fingerprint(
     env: &mut Envelope,
     common: &GlobalArgs,
     purl: &str,
-    artifact_path: &str,
+    entry: &VendorEntry,
     why: &str,
 ) {
+    let artifact_path = entry.artifact.path.as_str();
+    // A vlt lock rewired to the vendored dir keeps no registry resolution,
+    // so `vendor` alone has no pristine copy to re-vendor from.
+    let remedy = if entry.flavor.as_deref() == Some(vendor::vlt_lock::FLAVOR) {
+        "restore the registry version spec in the package.json files that name the vendored \
+         dir, run `vlt install`, then run `socket-patch vendor` to re-vendor and record one"
+    } else {
+        "run `socket-patch vendor` to re-vendor and record one"
+    };
     record_warning(
         env,
         purl,
@@ -479,8 +524,7 @@ fn soft_restore_without_fingerprint(
             format!(
                 "the ledger entry was reconstructed but its artifact has no independent \
                  integrity anchor and {why}; the entry was restored without a whole-file \
-                 fingerprint (only the patched members were verified) — run `socket-patch \
-                 vendor` to re-vendor and record one"
+                 fingerprint (only the patched members were verified) — {remedy}"
             ),
         ),
         common,
@@ -821,6 +865,26 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
         }
         match health {
             ArtifactHealth::Healthy => {
+                // vlt's `<uuid>/.gitignore` and `.gitattributes` are not
+                // part of the artifact: a missing or edited one is simply
+                // rewritten (DESIGN §4.8).
+                if entry.ecosystem == "npm"
+                    && entry.flavor.as_deref() == Some(vendor::vlt_lock::FLAVOR)
+                    && !common.dry_run
+                {
+                    if let Err(e) =
+                        vendor::vlt_lock::restore_vlt_uuid_metadata(&entry, &common.cwd).await
+                    {
+                        fail(
+                            env,
+                            common.json,
+                            purl,
+                            "vendor_artifact_unrepairable",
+                            format!("cannot restore the vendored dir's .gitignore: {e}"),
+                        );
+                        continue;
+                    }
+                }
                 // Dir-shaped artifacts from pre-inventory vendors: the
                 // health check above could only verify the PATCHED members
                 // — unpatched-file drift is invisible until a re-vendor
@@ -922,6 +986,22 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     purl,
                     "vendor_artifact_unrepairable",
                     format!("the ledger entry cannot be verified ({reason}); fix state.json"),
+                );
+            }
+            ArtifactHealth::UnknownFlavor { flavor } => {
+                record_warning(
+                    env,
+                    purl,
+                    &VendorWarning::new(
+                        "vendor_wiring_unknown_revert_blocked",
+                        format!(
+                            "{} was vendored for the npm flavor `{flavor}`, which this \
+                             socket-patch release does not understand; left untouched — \
+                             upgrade socket-patch",
+                            normalize_purl(purl)
+                        ),
+                    ),
+                    common,
                 );
             }
             health @ (ArtifactHealth::Missing | ArtifactHealth::Corrupt { .. }) => {
@@ -1295,6 +1375,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     // The rollback variant fans each base path back out to every qualified
     // caller purl — the same fix `vendor_records` carries.
     let mut all_packages = find_packages_for_rollback(&partitioned, &crawler_options, quiet).await;
+    crate::commands::vendor::drop_vendored_installs(&common.cwd, &mut all_packages);
     let inventory = lock_inventory::inventory_project(&common.cwd).await;
     let client = registry_fetch::build_registry_client();
     let mut holders: Vec<registry_fetch::FetchedPackage> = Vec::new();
@@ -1331,7 +1412,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     env,
                     common,
                     &c.purl,
-                    &c.entry.artifact.path,
+                    &c.entry,
                     "the package is not installed and --offline prevents fetching a \
                      pristine copy to rebuild from",
                 );
@@ -1379,7 +1460,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                                 env,
                                 common,
                                 &c.purl,
-                                &c.entry.artifact.path,
+                                &c.entry,
                                 &format!("the pristine fetch failed ({detail})"),
                             );
                             rebuilt += 1;
@@ -1440,7 +1521,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         env,
                         common,
                         &c.purl,
-                        &c.entry.artifact.path,
+                        &c.entry,
                         "no verifiable pristine source exists to rebuild from (the package \
                          is not installed, the lockfile is rewired to the vendored artifact, \
                          and the reconstructed entry records no recoverable registry \
@@ -1478,7 +1559,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         env,
                         common,
                         &c.purl,
-                        &c.entry.artifact.path,
+                        &c.entry,
                         &format!("the pristine fetch failed ({detail})"),
                     );
                     rebuilt += 1;
@@ -1546,20 +1627,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         continue;
                     }
                 };
-                for name in [
-                    "package-lock.json",
-                    "npm-shrinkwrap.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                    "bun.lock",
-                    "bun.lockb",
-                    "package.json",
-                ] {
-                    let p = common.cwd.join(name);
-                    if let Ok(bytes) = tokio::fs::read(&p).await {
-                        snap.push((p, Some(bytes)));
-                    }
-                }
+                snap.extend(snapshot_npm_wiring_files(&common.cwd).await);
                 Some(snap)
             } else {
                 None
@@ -1620,6 +1688,11 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 // condemned bytes now (post-verify failures below keep
                 // their existing nothing-kept contract).
                 if let Some((_, kept)) = &aside {
+                    if let Some(w) =
+                        vendor::vlt_lock::keep_vlt_links(&c.entry, kept, &common.cwd).await
+                    {
+                        record_warning(env, &c.purl, &w, common);
+                    }
                     let _ = remove_tree(kept).await;
                 }
                 for w in &warnings {
@@ -1739,7 +1812,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     let abs = common
                         .cwd
                         .join(check_entry.artifact.path.replace('\\', "/"));
-                    if let Ok(inv) = compute_dir_inventory(&abs).await {
+                    if let Ok(inv) = artifact_dir_inventory(&check_entry, &abs).await {
                         check_entry.artifact.file_inventory = Some(inv);
                         health =
                             check_vendored_artifact(&common.cwd, &check_entry, &c.record).await;
@@ -1832,7 +1905,7 @@ async fn fill_artifact_fingerprint(project_root: &Path, entry: &mut VendorEntry)
     let norm = entry.artifact.path.replace('\\', "/");
     let abs = project_root.join(&norm);
     if !artifact_is_file_shaped(&norm) {
-        entry.artifact.file_inventory = compute_dir_inventory(&abs).await.ok();
+        entry.artifact.file_inventory = artifact_dir_inventory(entry, &abs).await.ok();
         return;
     }
     if let Some(hex) = file_sha256_hex(&abs).await {
@@ -1840,6 +1913,19 @@ async fn fill_artifact_fingerprint(project_root: &Path, entry: &mut VendorEntry)
     }
     if let Ok(meta) = tokio::fs::metadata(&abs).await {
         entry.artifact.size = Some(meta.len());
+    }
+}
+
+/// A dir artifact's inventory: an npm dir (vlt's package dir) leaves out
+/// its `node_modules/`, which holds vlt's links and is never part of it.
+async fn artifact_dir_inventory(
+    entry: &VendorEntry,
+    abs: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    if entry.ecosystem == "npm" {
+        vendor::compute_package_dir_inventory(abs).await
+    } else {
+        compute_dir_inventory(abs).await
     }
 }
 
@@ -1928,6 +2014,49 @@ fn npm_coords(base_purl: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unverified-rebuild snapshot reads vlt-lock.json and the other
+    /// npm-family locks through the FIFO-safe opener: a FIFO at any of them
+    /// is left out of the snapshot at once instead of blocking the repair
+    /// in open(2), and the regular files are still captured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wiring_snapshot_skips_fifo_locks_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let fifos = [root.join("vlt-lock.json"), root.join("package-lock.json")];
+        for fifo in &fifos {
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: plain libc call on a valid C string.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        }
+        std::fs::write(root.join("pnpm-lock.yaml"), b"lockfileVersion: '9.0'\n").unwrap();
+
+        let snap = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            snapshot_npm_wiring_files(root),
+        )
+        .await
+        {
+            Ok(snap) => snap,
+            Err(_) => {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                for fifo in &fifos {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(fifo);
+                }
+                panic!("the wiring snapshot must fail fast on FIFO locks");
+            }
+        };
+        let names: Vec<String> = snap
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["pnpm-lock.yaml"]);
+        assert_eq!(snap[0].1.as_deref(), Some(&b"lockfileVersion: '9.0'\n"[..]));
+    }
 
     /// Build a local native binary resolution through the public binary
     /// rewrite entry point, which shares the codec with vendor's backend.
@@ -2104,6 +2233,57 @@ mod tests {
             refs,
             vec![("pypi".to_string(), uuid.to_string(), path)],
             "{refs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_recovers_vlt_lock_and_workspace_package_json_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let in_lock = "11111111-1111-4111-8111-111111111111";
+        let in_member = "22222222-2222-4222-8222-222222222222";
+        let lock_path =
+            format!(".socket/vendor/npm/{in_lock}/left-pad-1.3.0/node_modules/left-pad");
+        let member_path = format!(".socket/vendor/npm/{in_member}/debug-4.3.4/node_modules/debug");
+        let node_id = format!(
+            "file~{}",
+            lock_path
+                .replace('/', "+")
+                .replace("node_modules", "node__modules")
+        );
+        tokio::fs::write(
+            root.join("vlt-lock.json"),
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    \
+                 \"{node_id}\": [0,\"left-pad\",null,\"{lock_path}\"],\n    \
+                 \"~npm~debug@4.3.4\": [0,\"debug\",\"sha512-D==\"]\n  }},\n  \"edges\": {{\n    \
+                 \"file~_d left-pad\": \"prod file:./{lock_path} {node_id}\",\n    \
+                 \"workspace~packages+a debug\": \"prod 4.3.4 ~npm~debug@4.3.4\"\n  }}\n}}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("package.json"),
+            "{\"dependencies\":{\"left-pad\":\"1.3.0\"}}",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join("packages/a"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("packages/a/package.json"),
+            format!("{{\"dependencies\":{{\"debug\":\"file:../../{member_path}\"}}}}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scan_vendor_references(root).await,
+            vec![
+                ("npm".to_string(), in_lock.to_string(), lock_path),
+                ("npm".to_string(), in_member.to_string(), member_path),
+            ]
         );
     }
 
@@ -2337,6 +2517,41 @@ mod tests {
         )
         .await;
         case(vec![("bun.lock", mention.clone())], Some("bun")).await;
+        let vlt_lock = |version: &str| {
+            format!(
+                "{{\n  \"lockfileVersion\": {version},\n  \"nodes\": {{\n    \"file~x\": \
+                 [0,\"left-pad\",null,\".socket/vendor/npm/{uuid}/left-pad-1.3.0/node_modules/\
+                 left-pad\"]\n  }}\n}}\n"
+            )
+        };
+        case(vec![("vlt-lock.json", vlt_lock("1"))], Some("vlt")).await;
+        case(vec![("vlt-lock.json", vlt_lock("0"))], Some("vlt")).await;
+        // vlt precedes every other lock, and an unreadable one is unknowable.
+        case(
+            vec![
+                ("vlt-lock.json", vlt_lock("1")),
+                ("bun.lock", mention.clone()),
+                ("package-lock.json", mention.clone()),
+            ],
+            Some("vlt"),
+        )
+        .await;
+        case(
+            vec![
+                ("vlt-lock.json", vlt_lock("2")),
+                ("package-lock.json", mention.clone()),
+            ],
+            None,
+        )
+        .await;
+        case(
+            vec![
+                ("vlt-lock.json", "{}".to_string()),
+                ("package-lock.json", mention.clone()),
+            ],
+            Some("package-lock"),
+        )
+        .await;
 
         // Unknowable stays None: unrecognized grammars, or no referencing
         // lock at all (an unreferenced lock must not claim the entry).

@@ -116,6 +116,14 @@ async fn preflight_pairs(
     if !pairs.iter().any(|(purl, _)| purl.starts_with("pkg:npm/")) {
         return None;
     }
+    // vlt wins the router (DESIGN D2): a Bun lock beside `vlt-lock.json`
+    // is never the one vendoring rewires.
+    if socket_patch_core::vendor::npm_flavor::vlt_routes(cwd)
+        .await
+        .is_some()
+    {
+        return None;
+    }
     let (code, detail) = socket_patch_core::vendor::bun_lock::preflight_vendor(cwd)
         .await
         .err()?;
@@ -320,6 +328,23 @@ mod tests {
         assert_eq!(refusal.code, "vendor_state_unreadable");
         assert_eq!(refusal.detail, "corrupt state.json: synthetic");
         assert!(refusal.applies_to(PURL));
+    }
+
+    /// vlt wins the router: a Bun lock beside `vlt-lock.json`, readable or
+    /// not, is never judged by the Bun preflight.
+    #[tokio::test]
+    async fn a_vlt_lock_takes_the_project_out_of_bun_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
+        let npm = vec![sel(UUID, PURL)];
+        assert!(bun_vendor_preflight(tmp.path(), &npm).await.is_some());
+        for vlt in ["{\n  \"lockfileVersion\": 1\n}\n", "\u{feff}{}"] {
+            std::fs::write(tmp.path().join("vlt-lock.json"), vlt).unwrap();
+            assert!(
+                bun_vendor_preflight(tmp.path(), &npm).await.is_none(),
+                "{vlt:?}"
+            );
+        }
     }
 
     /// The lock-derived exemption: on a pre-v2 workspace lock whose every

@@ -1,10 +1,11 @@
-//! Coverage-gap integration tests for `patch::apply`: the pnpm
-//! peer-variant copy FAILURE aggregation in `apply_package_patch`.
+//! Coverage-gap integration tests for `patch::apply`: the pnpm and vlt
+//! peer-variant copy FAILURE aggregation in `apply_package_patch`, and the
+//! copy-on-write guard for hardlinked store files.
 //!
 //! The success half (patching/healing every twin) lives in
 //! `crawler_npm_e2e.rs`; these exercise the fail-closed branch — a copy
 //! that cannot be patched must flip the whole result to failure with a
-//! "pnpm store copy ... failed to patch: ..." note, never report the CVE
+//! "store copy ... failed to patch: ..." note, never report the CVE
 //! fixed while a physical twin stays divergent.
 
 use std::collections::HashMap;
@@ -17,7 +18,7 @@ use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, Patch
 const ORIGINAL: &[u8] = b"module.exports = 'vulnerable';\n";
 const PATCHED: &[u8] = b"module.exports = 'fixed';\n";
 
-/// Stage one pnpm store entry `.pnpm/<entry>/node_modules/foo` holding a
+/// Stage one store entry `<store>/<entry>/node_modules/foo` holding a
 /// package.json and, when `index_content` is `Some`, an `index.js`.
 /// Returns the staged package root.
 async fn stage_store_entry(store: &Path, entry: &str, index_content: Option<&[u8]>) -> PathBuf {
@@ -30,23 +31,24 @@ async fn stage_store_entry(store: &Path, entry: &str, index_content: Option<&[u8
     .await
     .unwrap();
     if let Some(content) = index_content {
-        tokio::fs::write(pkg.join("index.js"), content).await.unwrap();
+        tokio::fs::write(pkg.join("index.js"), content)
+            .await
+            .unwrap();
     }
     pkg
 }
 
 /// Shared apply invocation: blob-only sources staged under `root`, one
 /// patched file `package/index.js` (ORIGINAL → PATCHED), Warn policy.
-async fn apply_foo(
-    root: &Path,
-    primary: &Path,
-) -> socket_patch_core::patch::apply::ApplyResult {
+async fn apply_foo(root: &Path, primary: &Path) -> socket_patch_core::patch::apply::ApplyResult {
     let before_hash = compute_git_sha256_from_bytes(ORIGINAL);
     let after_hash = compute_git_sha256_from_bytes(PATCHED);
 
     let blobs = root.join("blobs");
     tokio::fs::create_dir_all(&blobs).await.unwrap();
-    tokio::fs::write(blobs.join(&after_hash), PATCHED).await.unwrap();
+    tokio::fs::write(blobs.join(&after_hash), PATCHED)
+        .await
+        .unwrap();
 
     let mut files = HashMap::new();
     files.insert(
@@ -77,7 +79,7 @@ async fn apply_foo(
 /// Fail-closed invariant: after the primary store copy patches cleanly, a
 /// peer-variant twin whose pre-existing file is MISSING (a hard error
 /// under Warn) must flip the whole result to failure and surface the
-/// aggregated "pnpm store copy ... failed to patch" note — never claim
+/// aggregated "store copy ... failed to patch" note — never claim
 /// the CVE fixed with a divergent twin left behind.
 #[tokio::test]
 #[serial_test::parallel]
@@ -99,7 +101,7 @@ async fn pnpm_twin_copy_failure_fails_whole_apply_fail_closed() {
     );
     let err = result.error.as_deref().expect("aggregated error present");
     assert!(
-        err.contains("pnpm store copy"),
+        err.contains("store copy"),
         "error must carry the store-copy note: {err}"
     );
     assert!(
@@ -128,7 +130,7 @@ async fn pnpm_twin_copy_failure_fails_whole_apply_fail_closed() {
 }
 
 /// Two failing twins: the second note must be CONCATENATED onto the first
-/// (`"...; pnpm store copy ..."`), naming both twin paths.
+/// (`"...; store copy ..."`), naming both twin paths.
 #[tokio::test]
 #[serial_test::parallel]
 async fn pnpm_multiple_twin_copy_failures_aggregate_with_semicolon() {
@@ -144,7 +146,7 @@ async fn pnpm_multiple_twin_copy_failures_aggregate_with_semicolon() {
     assert!(!result.success, "two failed twins must fail the apply");
     let err = result.error.as_deref().expect("aggregated error present");
     assert!(
-        err.contains("; pnpm store copy"),
+        err.contains("; store copy"),
         "second failure must be joined onto the first with '; ': {err}"
     );
     assert!(
@@ -156,4 +158,90 @@ async fn pnpm_multiple_twin_copy_failures_aggregate_with_semicolon() {
         tokio::fs::read(primary.join("index.js")).await.unwrap(),
         PATCHED
     );
+}
+
+/// The vlt twin of the fail-closed invariant: a `~peer.3` copy that cannot
+/// be patched fails the whole apply, naming that copy.
+#[tokio::test]
+#[serial_test::parallel]
+async fn vlt_twin_copy_failure_fails_whole_apply_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+
+    let primary = stage_store_entry(&store, "~npm~foo@1.0.0~peer.2", Some(ORIGINAL)).await;
+    let twin = stage_store_entry(&store, "~npm~foo@1.0.0~peer.3", None).await;
+
+    let result = apply_foo(tmp.path(), &primary).await;
+
+    assert!(!result.success, "error: {:?}", result.error);
+    let err = result.error.as_deref().expect("aggregated error present");
+    assert!(
+        err.starts_with("store copy ") && err.contains("~peer.3"),
+        "the note names the failing vlt copy: {err}"
+    );
+    assert_eq!(
+        tokio::fs::read(primary.join("index.js")).await.unwrap(),
+        PATCHED
+    );
+    assert!(!twin.join("index.js").exists());
+}
+
+/// Copy-on-write security invariant (vlt 1.2.0 hardlinks store files from
+/// `<cache>/store/v1/<hex>/` on Linux): patching a target that shares its
+/// inode with the machine-wide cache must replace the target's directory
+/// entry and never write through the shared inode. The cache link keeps
+/// its bytes and its inode; the target ends up on a private inode. Any
+/// in-place write (open for write, truncate, append, chmod before the
+/// rename) fails this test.
+#[tokio::test]
+#[serial_test::parallel]
+async fn apply_breaks_hardlink_to_shared_store_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+    let primary = stage_store_entry(&store, "~npm~foo@1.0.0", None).await;
+    let cache = tmp.path().join("cache/store/v1/0a1b2c/index.js");
+    tokio::fs::create_dir_all(cache.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&cache, ORIGINAL).await.unwrap();
+    std::fs::hard_link(&cache, primary.join("index.js")).unwrap();
+    #[cfg(unix)]
+    let (cache_ino, cache_mode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(&cache).unwrap();
+        assert_eq!(meta.nlink(), 2, "precondition: the target is a hardlink");
+        (meta.ino(), meta.mode())
+    };
+
+    let result = apply_foo(tmp.path(), &primary).await;
+    assert!(result.success, "{:?}", result.error);
+
+    assert_eq!(
+        tokio::fs::read(primary.join("index.js")).await.unwrap(),
+        PATCHED
+    );
+    assert_eq!(
+        tokio::fs::read(&cache).await.unwrap(),
+        ORIGINAL,
+        "the shared store file must never be written through"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let cache_meta = std::fs::metadata(&cache).unwrap();
+        let target_meta = std::fs::metadata(primary.join("index.js")).unwrap();
+        assert_eq!(cache_meta.ino(), cache_ino, "the cache keeps its inode");
+        assert_eq!(cache_meta.mode(), cache_mode, "the cache keeps its mode");
+        assert_eq!(
+            cache_meta.nlink(),
+            1,
+            "the target no longer links the cache"
+        );
+        assert_ne!(
+            target_meta.ino(),
+            cache_ino,
+            "the target is a private inode"
+        );
+        assert_eq!(target_meta.nlink(), 1);
+    }
 }

@@ -1,0 +1,14 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "registries": {
+      "npm": "https://mirror.example.com/npm/"
+    }
+  },
+  "nodes": {
+    "~npm~left-pad@1.3.0": [0,"left-pad","sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==","https://mirror.example.com/npm/left-pad/-/left-pad-1.3.0.tgz"]
+  },
+  "edges": {
+    "file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0"
+  }
+}

@@ -22,7 +22,7 @@
 # Inputs (environment, all SM_*-prefixed):
 #   SM_ID                stable case id (for the JSON result)
 #   SM_ECOSYSTEM         npm|pypi|cargo|gem|golang|maven|composer|nuget|deno
-#   SM_PM                npm|yarn|pnpm|bun|pip|uv|poetry|pdm|hatch|cargo|
+#   SM_PM                npm|yarn|pnpm|bun|vlt|pip|uv|poetry|pdm|hatch|cargo|
 #                        bundler|go|mvn|composer|dotnet|deno
 #   SM_SCENARIO          scenario id (echoed back)
 #   SM_PATCHSET          primary|alt|empty|wrong
@@ -249,6 +249,15 @@ scaffold_project() {
 { "name": "sm-proj", "version": "0.0.0", "private": true, "dependencies": { "$SM_PACKAGE": "$SM_VERSION" } }
 EOF
       printf "lockfileVersion: '9.0'\n" > pnpm-lock.yaml ;;
+    vlt)
+      # vlt runs the root postinstall on every install that changes the
+      # graph (vlt >= 1.0.0-rc.13), so the dependency is declared up front
+      # like pnpm's. vlt.json is the vlt marker `setup` detects, and it
+      # carries the registry config vlt >= 1.0.0-rc.33 needs to install.
+      cat > package.json <<EOF
+{ "name": "sm-proj", "version": "0.0.0", "private": true, "dependencies": { "$SM_PACKAGE": "$SM_VERSION" } }
+EOF
+      vlt_json > vlt.json ;;
     deno)
       cat > package.json <<EOF
 { "name": "sm-proj", "version": "0.0.0", "private": true, "dependencies": { "$SM_PACKAGE": "$SM_VERSION" } }
@@ -389,6 +398,12 @@ pth_trigger() { # $1=venv dir
   PATH="$PWD/$venv/bin:$PATH" "$venv/bin/python" -c "pass" >/dev/null 2>&1 || true
 }
 
+# vlt.json with the public registry configured every way vlt eras read it;
+# $1 = an optional `"workspaces": ...,` member to prepend.
+vlt_json() {
+  printf '{ %s"config": { "registry": "https://registry.npmjs.org/", "registries": { "npm": "https://registry.npmjs.org/" } } }\n' "${1:-}"
+}
+
 # --- per-PM native install (the hook, if configured, fires here) ------
 run_install() {
   case "$SM_PM" in
@@ -396,6 +411,7 @@ run_install() {
     yarn)  yarn add --silent "$SM_PACKAGE@$SM_VERSION" ;;
     pnpm)  pnpm install --no-frozen-lockfile ;;
     bun)   bun add "$SM_PACKAGE@$SM_VERSION" ;;
+    vlt)   vlt install ;;
     deno)  deno install --allow-scripts ;;
     pip)
       python3 -m venv venv
@@ -490,6 +506,15 @@ EOF
       ws_member_js packages/group/nested "@sm/nested"
       mkdir -p packages/util
       printf '{ "name": "@sm/util", "version": "0.0.0", "private": true }\n' > packages/util/package.json ;;
+    vlt)
+      # vlt reads workspaces only from vlt.json; `setup` wires the root alone.
+      printf '{ "name": "sm-root", "version": "0.0.0", "private": true }\n' > package.json
+      vlt_json '"workspaces": ["packages/*", "packages/group/*"], ' > vlt.json
+      ws_member_js packages/app "@sm/app"
+      ws_member_js packages/lib "@sm/lib"
+      ws_member_js packages/group/nested "@sm/nested"
+      mkdir -p packages/util
+      printf '{ "name": "@sm/util", "version": "0.0.0", "private": true }\n' > packages/util/package.json ;;
     uv)
       # uv workspace: virtual root + members; the shared dep is installed
       # into one root .venv by `uv sync`.
@@ -533,6 +558,7 @@ run_install_workspace() {
     npm)  npm install --silent --no-audit --no-fund ;;
     yarn) yarn install --silent ;;
     pnpm) pnpm install --no-frozen-lockfile ;;
+    vlt)  vlt install ;;
     uv)   uv sync ;;
     pip)  python3 -m venv venv && ./venv/bin/pip install --disable-pip-version-check --quiet --no-cache-dir -r requirements.txt ;;
   esac
@@ -668,7 +694,7 @@ verify_applied() {
 # npm-family is the surface `setup` actually configures today — the only place
 # the behavioral check/remove round-trip is expected to do real work.
 is_npm_family() {
-  [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun)$ ]] || [ "$SM_LAYOUT" = monorepo ]
+  [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun|vlt)$ ]] || [ "$SM_LAYOUT" = monorepo ]
 }
 
 # ============================ main ====================================
@@ -691,7 +717,7 @@ build_fixture
 # npm-family (incl. deno-via-npm and the monorepo's npm slice) need the
 # runner shim so the hook's `npx`/`pnpm dlx @socketsecurity/socket-patch`
 # resolves to $SP_BIN instead of the npm registry.
-if [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun|deno)$ ]] || [ "$SM_LAYOUT" = monorepo ]; then
+if [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun|vlt|deno)$ ]] || [ "$SM_LAYOUT" = monorepo ]; then
   SHIM_DIR="$PROJ/.sp-shims"
   write_shims "$SHIM_DIR"
   export SETUP_MATRIX_SHIM_DIR="$SHIM_DIR"
@@ -704,7 +730,7 @@ fi
 # `--force` flag (unlike its siblings) has no boolish value parser, so
 # SOCKET_FORCE=1 is rejected with "invalid value '1' for '--force'".
 export SOCKET_OFFLINE=true SOCKET_FORCE=true SOCKET_API_TOKEN=fake SOCKET_ORG_SLUG=test-org
-export SOCKET_TELEMETRY_DISABLED=1
+export SOCKET_TELEMETRY_DISABLED=1 VLT_TELEMETRY=0
 # Isolate the pypi `.pth` hook's change-detection stamp per case so runs
 # don't bleed into each other (the stamp lives under XDG_CACHE_HOME).
 export XDG_CACHE_HOME="$WORKDIR/.cache"

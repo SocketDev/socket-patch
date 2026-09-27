@@ -1,0 +1,14 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "nodes": {
+    "~npm~left-pad@1.3.0": [0,"left-pad","sha512-OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO==","https://patch.socket.dev/patch/npm/22222222-2222-2222-2222-222222222222/66666666-6666-4666-8666-666666666666/left-pad-1.3.0.tgz"]
+  },
+  "edges": {
+    "file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0"
+  }
+}

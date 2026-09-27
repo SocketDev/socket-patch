@@ -684,3 +684,51 @@ fn unmatched_purl_exit_semantics_are_pinned() {
     );
     assert_eq!(v2["status"], "partialFailure", "{v2}");
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// A vlt-vendored purl: `apply` yields it to the vendor ledger (the
+/// committed dir artifact is what vlt installs), leaves `.socket/`
+/// byte-identical and patches nothing in place.
+#[test]
+fn apply_yields_a_vlt_vendored_purl_and_leaves_socket_untouched() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let before = snapshot_dir(&root.join(".socket"));
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, v, stderr) = hosted::run_json(root, &["apply", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert!(v.to_string().contains("vendored"), "{v:#}");
+    assert_eq!(snapshot_dir(&root.join(".socket")), before);
+    assert_eq!(
+        std::fs::read(root.join("node_modules/left-pad/index.js")).unwrap(),
+        hosted::PRISTINE
+    );
+}
+
+fn snapshot_dir(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                let rel = e
+                    .path()
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                out.insert(rel, std::fs::read(e.path()).unwrap());
+            }
+        }
+    }
+    out
+}

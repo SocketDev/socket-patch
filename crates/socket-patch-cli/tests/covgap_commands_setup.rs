@@ -681,9 +681,8 @@ mod pty {
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let reader_handle = crate::pty_io::PtyOutput::spawn(
-            pair.master.try_clone_reader().expect("clone reader"),
-        );
+        let reader_handle =
+            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -1738,7 +1737,14 @@ fn setup_does_not_persist_an_unmatched_exclude() {
 
     let (code, stdout, stderr) = run(
         cwd,
-        &["setup", "--yes", "--exclude", "nope", "--exclude", "packages/a"],
+        &[
+            "setup",
+            "--yes",
+            "--exclude",
+            "nope",
+            "--exclude",
+            "packages/a",
+        ],
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert_eq!(
@@ -1848,4 +1854,125 @@ fn check_reports_an_unreadable_vendor_ledger_instead_of_configured() {
         b"not json",
         "--check never rewrites or quarantines the ledger"
     );
+}
+
+// ---------------------------------------------------------------------------
+// vlt: the human advisory line, its muting, scope gating, and the byte-exact
+// remove round trip of the npx hook.
+// ---------------------------------------------------------------------------
+
+/// A PATH directory whose only tool is a `vlt` reporting `version`.
+fn old_vlt_path(version: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("PATH dir");
+    if cfg!(windows) {
+        write(
+            &dir.path().join("vlt.cmd"),
+            &format!("@echo off\r\necho {version}\r\n"),
+        );
+    } else {
+        let shim = dir.path().join("vlt");
+        write(&shim, &format!("#!/bin/sh\necho {version}\n"));
+        #[cfg(unix)]
+        chmod(&shim, 0o755);
+    }
+    dir
+}
+
+const VLT_PACKAGE_JSON: &str = "{\n  \"name\": \"covgap\",\n  \"version\": \"1.0.0\"\n}\n";
+
+fn vlt_fixture(cwd: &Path) {
+    write(&cwd.join("package.json"), VLT_PACKAGE_JSON);
+    write(&cwd.join("vlt.json"), "{}\n");
+}
+
+const VLT_ADVISORY_LINE: &str = "Warning (vlt_root_scripts_not_run): vlt before 1.0.0-rc.13 does \
+                                 not run the root postinstall hook; upgrade vlt or run \
+                                 `socket-patch apply` after `vlt ci` (`vlt --version` reports \
+                                 0.0.0-32)";
+
+#[test]
+fn setup_vlt_advisory_prints_on_stderr_in_human_mode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    vlt_fixture(tmp.path());
+    let path = old_vlt_path("0.0.0-32");
+    let path_env = [("PATH", path.path().to_str().unwrap())];
+    for args in [
+        &["setup", "--dry-run"][..],
+        &["setup", "--yes"],
+        &["setup", "--yes"],
+    ] {
+        let (code, stdout, stderr) = run_env(tmp.path(), args, &path_env);
+        assert_eq!(code, 0, "{args:?}: stdout=\n{stdout}\nstderr=\n{stderr}");
+        assert_eq!(
+            stderr.matches(VLT_ADVISORY_LINE).count(),
+            1,
+            "{args:?}: stderr=\n{stderr}"
+        );
+        assert!(!stdout.contains("vlt_root_scripts_not_run"), "{stdout}");
+    }
+
+    let (code, stdout, stderr) = run_env(tmp.path(), &["setup", "--yes", "--silent"], &path_env);
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty() && stderr.is_empty(), "{stdout}{stderr}");
+
+    let (code, stdout, stderr) = run_env(tmp.path(), &["setup", "--yes", "--json"], &path_env);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.is_empty(),
+        "--json keeps it in the envelope: {stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "already_configured", "{v}");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+    assert_eq!(
+        v["warnings"][0].as_str().unwrap(),
+        VLT_ADVISORY_LINE
+            .strip_prefix("Warning (vlt_root_scripts_not_run): ")
+            .map(|d| format!("vlt_root_scripts_not_run: {d}"))
+            .unwrap()
+    );
+}
+
+#[test]
+fn setup_vlt_advisory_needs_npm_in_scope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    vlt_fixture(tmp.path());
+    write(&tmp.path().join("requirements.txt"), REQUIREMENTS_NO_HOOK);
+    let path = old_vlt_path("0.0.0-32");
+    let (code, stdout, stderr) = run_env(
+        tmp.path(),
+        &["setup", "--yes", "--json", "-e", "pypi"],
+        &[("PATH", path.path().to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(entries_of(&v, "package_json").is_empty(), "{v}");
+    assert!(v.get("warnings").is_none(), "{v}");
+    assert_eq!(read(&tmp.path().join("package.json")), VLT_PACKAGE_JSON);
+}
+
+#[test]
+fn setup_vlt_check_and_remove_round_trip_byte_exact() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    vlt_fixture(cwd);
+    let path = old_vlt_path("1.2.0");
+    let path_env = [("PATH", path.path().to_str().unwrap())];
+
+    let (code, ..) = run_env(cwd, &["setup", "--check"], &path_env);
+    assert_eq!(code, 1);
+    let (code, stdout, stderr) = run_env(cwd, &["setup", "--yes", "--json"], &path_env);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+    assert!(v.get("warnings").is_none(), "vlt 1.2.0 runs the hook: {v}");
+    assert!(read(&cwd.join("package.json")).contains(
+        "\"postinstall\": \"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\""
+    ));
+    let (code, ..) = run_env(cwd, &["setup", "--check"], &path_env);
+    assert_eq!(code, 0);
+    let (code, stdout, stderr) = run_env(cwd, &["setup", "--remove", "--yes"], &path_env);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert_eq!(read(&cwd.join("package.json")), VLT_PACKAGE_JSON);
+    assert_eq!(read(&cwd.join("vlt.json")), "{}\n");
 }
