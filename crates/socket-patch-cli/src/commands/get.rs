@@ -4295,30 +4295,28 @@ mod tests {
     }
 
     #[test]
-    fn select_prefers_a_higher_severity_patch_over_the_merged_one() {
-        // The exception. A merged patch must not shadow a worse
-        // vulnerability: `z_critical` addresses a CRITICAL the merged patch
-        // does not cover, so it wins despite being older, single-advisory,
-        // and last by uuid.
+    fn select_prefers_the_merged_patch_over_a_higher_severity_one() {
+        // A merged patch is the cumulative fix, so it wins even against a
+        // newer single-advisory CRITICAL.
         let patches = vec![
-            mk_patch_multi(
-                "a_merged",
+            mk_patch_sev(
+                "a_critical",
                 "pkg:npm/foo@1.0",
                 "free",
                 "2026-06-01",
-                &["high", "high"],
+                "critical",
             ),
-            mk_patch_sev(
-                "z_critical",
+            mk_patch_multi(
+                "z_merged",
                 "pkg:npm/foo@1.0",
                 "free",
                 "2020-01-01",
-                "critical",
+                &["high", "high"],
             ),
         ];
         let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].uuid, "z_critical");
+        assert_eq!(out[0].uuid, "z_merged");
     }
 
     #[test]
