@@ -1,0 +1,19 @@
+{
+  "name": "@socketsecurity/socket-patch-node",
+  "version": "4.0.0",
+  "private": true,
+  "description": "In-process Node addon for the socket-patch hosted redirect engine",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "scripts": {
+    "build:addon": "node scripts/build-addon.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

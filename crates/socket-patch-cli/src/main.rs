@@ -107,6 +107,7 @@ async fn main() {
         Commands::Remove(args) => commands::remove::run(args).await,
         Commands::Repair(args) => commands::repair::run(args).await,
         Commands::SelfUpdate(args) => commands::update::run(args).await,
+        Commands::HostedBundle(args) => commands::hosted_bundle::run(args).await,
     };
 
     // Never delays exit beyond its 500 ms grace budget; never changes the

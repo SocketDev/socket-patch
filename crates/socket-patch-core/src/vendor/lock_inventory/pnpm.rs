@@ -11,6 +11,7 @@ use crate::patch::redirect::pnpm;
 use crate::utils::fs::read_regular_to_string;
 use crate::vendor::path::parse_vendor_path;
 
+use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry};
 
 // ── entry model ──
@@ -190,8 +191,22 @@ pub(crate) async fn rush_lock_rels(root: &Path) -> Vec<String> {
 
 // ── registry view ──
 
+#[cfg(test)]
 pub(super) async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
-    inventory_pnpm_lock_at(&root.join(PNPM_LOCK)).await
+    inventory_pnpm_lock_in(&ProjectView::Disk(root)).await
+}
+
+pub(super) async fn inventory_pnpm_lock_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
+    inventory_pnpm_lock_rel_in(view, PNPM_LOCK).await
+}
+
+/// [`inventory_pnpm_lock_at`] for a project-relative lock path.
+pub(super) async fn inventory_pnpm_lock_rel_in(
+    view: &ProjectView<'_>,
+    rel: &str,
+) -> Option<Vec<LockfileEntry>> {
+    let text = view.read_text(rel).await.ok()?;
+    pnpm_lock_text_inventory(&text)
 }
 
 /// Inventory a specific `pnpm-lock.yaml` (path given explicitly so the Rush
@@ -203,6 +218,10 @@ pub(super) async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry
 /// the lock has no `packages:` section.
 pub(super) async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(lock_path).await.ok()?;
+    pnpm_lock_text_inventory(&text)
+}
+
+fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
     if !text
         .lines()
         .any(|l| l.trim_end_matches('\r') == "packages:")
@@ -210,7 +229,7 @@ pub(super) async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<Lockf
         return None;
     }
     let mut out = Vec::new();
-    for package in pnpm_packages(&text) {
+    for package in pnpm_packages(text) {
         // Only plain registry versions: `file:`/`link:`/`https:`/git specs
         // are not registry-resolvable.
         let Some((name, version)) = pnpm_registry_key(package.key) else {
@@ -248,7 +267,31 @@ pub(super) async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<Lockf
 /// subspace directory is read sorted for deterministic output. Missing
 /// files/dirs are skipped fail-soft; the caller drops the whole result when
 /// it comes back empty.
-pub(super) async fn inventory_rush_pnpm_locks(project_root: &Path) -> Vec<LockfileEntry> {
+pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
+    let project = match view {
+        ProjectView::Disk(project_root) => return inventory_rush_pnpm_locks(project_root).await,
+        ProjectView::Memory(project) => *project,
+    };
+    if !project.contains("rush.json") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(entries) = inventory_pnpm_lock_rel_in(view, RUSH_COMMON_LOCK_REL).await {
+        out.extend(entries);
+    }
+    for (name, is_dir) in project.children(RUSH_SUBSPACES_DIR) {
+        if !is_dir {
+            continue;
+        }
+        let rel = format!("{RUSH_SUBSPACES_DIR}/{name}/{PNPM_LOCK}");
+        if let Some(entries) = inventory_pnpm_lock_rel_in(view, &rel).await {
+            out.extend(entries);
+        }
+    }
+    out
+}
+
+async fn inventory_rush_pnpm_locks(project_root: &Path) -> Vec<LockfileEntry> {
     if tokio::fs::metadata(project_root.join("rush.json"))
         .await
         .is_err()
