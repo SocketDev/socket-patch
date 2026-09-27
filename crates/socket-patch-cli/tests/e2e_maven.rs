@@ -179,8 +179,7 @@ async fn scan_discovers_maven_artifacts() {
     // Must NOT have hit the empty-crawl path — that line *also* contains
     // the word "packages".
     assert!(
-        !combined.contains("No packages found")
-            && !combined.contains("No packages found"),
+        !combined.contains("No packages found") && !combined.contains("No packages found"),
         "scan reported zero packages — Maven discovery did not run:\n{combined}"
     );
     assert!(

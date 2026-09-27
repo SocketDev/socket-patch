@@ -402,9 +402,9 @@ impl GlobalArgs {
     /// empty). The names are validated at parse time, so this is an exact
     /// match.
     pub(crate) fn ecosystem_selected(&self, eco: Ecosystem) -> bool {
-        self.ecosystems.as_ref().is_none_or(|list| {
-            list.is_empty() || list.iter().any(|name| name == eco.cli_name())
-        })
+        self.ecosystems
+            .as_ref()
+            .is_none_or(|list| list.is_empty() || list.iter().any(|name| name == eco.cli_name()))
     }
 
     /// [`Self::ecosystem_selected`] for the ecosystem of `purl`; a purl of

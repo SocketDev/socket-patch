@@ -11614,11 +11614,19 @@ mod tests {
         let redacted = format!(
             "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
         );
-        assert_eq!(redact_grant_token(&url, &url, uuid), redacted, "the URL alone");
+        assert_eq!(
+            redact_grant_token(&url, &url, uuid),
+            redacted,
+            "the URL alone"
+        );
         let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
-        let want = format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
+        let want =
+            format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
         assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
-        assert!(!redact_grant_token(&text, &url, uuid).contains(token), "no token left");
+        assert!(
+            !redact_grant_token(&text, &url, uuid).contains(token),
+            "no token left"
+        );
         let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
         assert_eq!(
             redact_grant_token(&registry, &registry, uuid),

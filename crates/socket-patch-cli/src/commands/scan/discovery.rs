@@ -1010,7 +1010,8 @@ mod tests {
         let empty = socket_patch_core::patch::redirect::RedirectState::new();
         let empty_vendor = VendorState::new();
         assert!(
-            merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor), &[]).is_none()
+            merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor), &[])
+                .is_none()
         );
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
@@ -1924,7 +1925,11 @@ mod tests {
                 "pkg:npm/lockonly@1.0.0",
                 std::path::PathBuf::from("/nonexistent"),
             ),
-            crawled_pkg("alpha", "pkg:npm/alpha@1.0.0", installed("alpha", "alpha.js")),
+            crawled_pkg(
+                "alpha",
+                "pkg:npm/alpha@1.0.0",
+                installed("alpha", "alpha.js"),
+            ),
             crawled_pkg(
                 "embedded",
                 "pkg:npm/embedded@1.0.0",

@@ -6,14 +6,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use socket_patch_core::constants::npm_family::{
-    VLT_HIDDEN_LOCK_REL, VLT_LOCK,
-};
+use socket_patch_core::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_LOCK};
+use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::redirect::vlt_heal::{
     self, classify_target, read_install_state, Expected, LedgerTarget, Target, TargetState,
 };
-use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
 use socket_patch_core::patch::redirect::vlt_preflight;
 use socket_patch_core::patch::redirect::{vlt, DepOverride};
 use socket_patch_core::vendor::lock_inventory::ProjectView;

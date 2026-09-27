@@ -45,7 +45,10 @@ fn read(path: &Path) -> String {
 fn write_pm_shim(bin_dir: &Path, name: &str, log: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(bin_dir).expect("create shim dir");
-    let body = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n", log.display());
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+        log.display()
+    );
     let p = bin_dir.join(name);
     std::fs::write(&p, body).expect("write shim");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod shim");
@@ -80,11 +83,7 @@ fn assert_no_pm_spawned(project: &Path, context: &str) {
 /// through the shared hermetic runner (the seed-then-scrub of the ambient
 /// `SOCKET_*` surface is load-bearing: SOCKET_DRY_RUN=true would fake every
 /// edit, SOCKET_ECOSYSTEMS=npm would hide the Python branch entirely).
-fn run_setup_with_shims(
-    cwd: &Path,
-    bin_dir: &Path,
-    extra: &[&str],
-) -> (i32, serde_json::Value) {
+fn run_setup_with_shims(cwd: &Path, bin_dir: &Path, extra: &[&str]) -> (i32, serde_json::Value) {
     let path_env = format!(
         "{}:{}",
         bin_dir.display(),

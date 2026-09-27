@@ -155,9 +155,7 @@ pub fn pnpm_lock_carries_hosted_redirect(
 pub fn npm_lock_url_needles(artifact_url: &str) -> Vec<String> {
     let mut needles: Vec<String> =
         crate::patch::redirect::artifact_url_spellings(artifact_url).into();
-    needles.push(crate::utils::uri::encode_uri_component(
-        artifact_url,
-    ));
+    needles.push(crate::utils::uri::encode_uri_component(artifact_url));
     needles
 }
 
@@ -311,11 +309,7 @@ fn npm_allow_remote_preamble(hosts: &[&str]) -> String {
 
 /// The auto-config variant: `allow-remote=all` was (or, on `--dry-run`,
 /// would be) written to the project `.npmrc`, so installs need no flags.
-pub fn npm_allow_remote_configured_detail(
-    hosts: &[&str],
-    created: bool,
-    dry_run: bool,
-) -> String {
+pub fn npm_allow_remote_configured_detail(hosts: &[&str], created: bool, dry_run: bool) -> String {
     let how = match (created, dry_run) {
         (true, false) => "`allow-remote=all` was written to a new",
         (false, false) => "`allow-remote=all` was appended to the existing",

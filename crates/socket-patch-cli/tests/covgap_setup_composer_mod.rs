@@ -126,7 +126,10 @@ fn remove_malformed_composer_json_errors_not_silent_noop() {
     write(&cwd.join("composer.json"), MALFORMED_COMPOSER_JSON);
 
     let (code, v) = run_json(cwd, &["setup", "--remove", "--yes", "--json"]);
-    assert_eq!(code, 1, "remove on a malformed composer.json must fail: {v}");
+    assert_eq!(
+        code, 1,
+        "remove on a malformed composer.json must fail: {v}"
+    );
     assert_eq!(v["status"], "error", "{v}");
     assert_eq!(v["removed"], 0, "{v}");
     assert_eq!(v["errors"], 1, "{v}");

@@ -157,7 +157,11 @@ fn cancelled_message(current: &semver::Version, target: &semver::Version) -> &'s
 
 /// The result line after a successful install, naming the same action as
 /// [`confirm_prompt`].
-fn installed_message(current: &semver::Version, target: &semver::Version, path: &std::path::Path) -> String {
+fn installed_message(
+    current: &semver::Version,
+    target: &semver::Version,
+    path: &std::path::Path,
+) -> String {
     let path = path.display();
     if target < current {
         format!("Downgraded socket-patch {current} \u{2192} {target} ({path})")
@@ -498,9 +502,18 @@ mod tests {
 
     #[test]
     fn cancel_and_result_lines_match_the_prompt() {
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("9.9.9")), "Update cancelled.");
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("3.0.0")), "Downgrade cancelled.");
-        assert_eq!(cancelled_message(&v("4.0.0"), &v("4.0.0")), "Reinstall cancelled.");
+        assert_eq!(
+            cancelled_message(&v("4.0.0"), &v("9.9.9")),
+            "Update cancelled."
+        );
+        assert_eq!(
+            cancelled_message(&v("4.0.0"), &v("3.0.0")),
+            "Downgrade cancelled."
+        );
+        assert_eq!(
+            cancelled_message(&v("4.0.0"), &v("4.0.0")),
+            "Reinstall cancelled."
+        );
         let p = std::path::Path::new("/opt/sp/socket-patch");
         assert_eq!(
             installed_message(&v("4.0.0"), &v("9.9.9"), p),

@@ -335,11 +335,15 @@ async fn scan_redirect_vlt_artifact_fetch_error() {
     let detail = warning_detail(&doc, UNVERIFIABLE);
     let redacted = url.replace(&format!("/{TOKEN}/"), "/<redacted>/");
     assert!(
-        detail.starts_with(&format!("vlt would fail to verify {redacted}: fetch error "))
-            && detail.ends_with(&format!("; nothing was written for {PURL}")),
+        detail.starts_with(&format!(
+            "vlt would fail to verify {redacted}: fetch error "
+        )) && detail.ends_with(&format!("; nothing was written for {PURL}")),
         "the fetch-error refusal quotes the redacted URL"
     );
-    assert!(!detail.contains(TOKEN), "the grant token never reaches the warning");
+    assert!(
+        !detail.contains(TOKEN),
+        "the grant token never reaches the warning"
+    );
 }
 
 async fn redirect_chain(hops: usize) -> (Value, tempfile::TempDir) {

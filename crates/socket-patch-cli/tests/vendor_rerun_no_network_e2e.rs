@@ -1173,8 +1173,7 @@ fn a_package_absent_from_the_lock_keeps_the_not_installed_skip() {
             b"after\n",
         );
         let home = cargo_home.to_string_lossy().into_owned();
-        let (_code, v, stderr) =
-            run_vendor(&root, &dead, &[], &[("CARGO_HOME", home.as_str())]);
+        let (_code, v, stderr) = run_vendor(&root, &dead, &[], &[("CARGO_HOME", home.as_str())]);
         assert_eq!(
             purl_events(&v, purl),
             vec![("skipped", "package_not_installed")],
@@ -1221,7 +1220,10 @@ fn a_stale_prestage_tree_is_swept_by_the_next_wet_run_only() {
 
     let (_code, v, stderr) = run_vendor(root, &dead, &["--dry-run"], &[]);
     for dir in &litter {
-        assert!(root.join(dir).exists(), "a dry run deletes nothing: {dir}\n{v:#}\n{stderr}");
+        assert!(
+            root.join(dir).exists(),
+            "a dry run deletes nothing: {dir}\n{v:#}\n{stderr}"
+        );
     }
     assert!(
         !v.to_string().contains("socket-prestage"),
@@ -1231,7 +1233,10 @@ fn a_stale_prestage_tree_is_swept_by_the_next_wet_run_only() {
     for extra in [&["--offline"][..], &[][..]] {
         let (_code, v, stderr) = run_vendor(root, &dead, extra, &[]);
         for dir in &litter {
-            assert!(!root.join(dir).exists(), "{extra:?} sweeps {dir}\n{v:#}\n{stderr}");
+            assert!(
+                !root.join(dir).exists(),
+                "{extra:?} sweeps {dir}\n{v:#}\n{stderr}"
+            );
         }
         assert!(
             !root.join(format!(".socket/vendor/composer/{OLD}")).exists(),

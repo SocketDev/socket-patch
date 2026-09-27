@@ -61,7 +61,11 @@ fn every_help_page_has_no_developer_notes() {
     names.extend(cmd.get_subcommands().map(|s| s.get_name().to_string()));
     let mut failures = Vec::new();
     for name in &names {
-        let path: Vec<&str> = if name.is_empty() { vec![] } else { vec![name.as_str()] };
+        let path: Vec<&str> = if name.is_empty() {
+            vec![]
+        } else {
+            vec![name.as_str()]
+        };
         let text = long_help(&path);
         let found = leaks(&text);
         if !found.is_empty() {
@@ -147,7 +151,9 @@ fn vex_product_list_renders_one_item_per_line() {
 fn root_command_list_uses_the_verb_form() {
     let text = long_help(&[]);
     assert!(
-        text.contains("Undo patches: restore original files and unwind hosted or vendored lockfile wiring"),
+        text.contains(
+            "Undo patches: restore original files and unwind hosted or vendored lockfile wiring"
+        ),
         "{text}"
     );
     assert!(!text.contains("Rollback patches"), "{text}");

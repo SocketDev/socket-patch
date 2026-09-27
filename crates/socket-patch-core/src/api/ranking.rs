@@ -364,12 +364,7 @@ mod tests {
                     "2020-01-01T00:00:00Z",
                     &["critical", "high"]
                 ),
-                search_multi(
-                    "z_new_low",
-                    "free",
-                    "2026-08-01T00:00:00Z",
-                    &["low", "low"]
-                ),
+                search_multi("z_new_low", "free", "2026-08-01T00:00:00Z", &["low", "low"]),
             ]),
             "z_new_low"
         );

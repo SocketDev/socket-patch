@@ -555,7 +555,10 @@ mod tests {
             let original = serde_json::to_string(&value).unwrap();
             // A live lock (Pipfile beside it): conflicts veto the siblings.
             let files = BTreeMap::from([
-                ("Pipfile".to_string(), "[packages]\nurllib3 = \"*\"\n".to_string()),
+                (
+                    "Pipfile".to_string(),
+                    "[packages]\nurllib3 = \"*\"\n".to_string(),
+                ),
                 ("Pipfile.lock".to_string(), original),
             ]);
             let mut result = RewriteResult::default();
@@ -595,20 +598,30 @@ mod tests {
         for stale in &stale_locks {
             let files = BTreeMap::from([
                 ("Pipfile.lock".to_string(), stale.clone()),
-                ("requirements.txt".to_string(), "urllib3==1.26.18\n".to_string()),
+                (
+                    "requirements.txt".to_string(),
+                    "urllib3==1.26.18\n".to_string(),
+                ),
             ]);
-            let result = super::super::rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
+            let result =
+                super::super::rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
             assert!(
                 !result.refused_pipenv_uuids.contains("patch-one"),
                 "a non-conflict must not veto: {stale}"
             );
             assert!(
-                result.warnings.iter().any(|w| w.code == "redirect_pipenv_skipped"),
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_pipenv_skipped"),
                 "{:?}",
                 result.warnings
             );
             assert!(
-                result.files.get("requirements.txt").is_some_and(|t| t.contains("patch.socket.dev")),
+                result
+                    .files
+                    .get("requirements.txt")
+                    .is_some_and(|t| t.contains("patch.socket.dev")),
                 "requirements.txt must still be redirected past a stale Pipfile.lock: {result:?}"
             );
             assert!(!result.files.contains_key("Pipfile.lock"));
@@ -693,10 +706,18 @@ mod tests {
         );
         let foreign = redirected.replacen(
             redirected_entry,
-            &format_entry(&json!({"file": "https://example.org/fork.whl"}), &redirected, 0).unwrap(),
+            &format_entry(
+                &json!({"file": "https://example.org/fork.whl"}),
+                &redirected,
+                0,
+            )
+            .unwrap(),
             1,
         );
-        assert!(restore(&foreign, &edits[0]).is_err(), "a foreign reference is drift");
+        assert!(
+            restore(&foreign, &edits[0]).is_err(),
+            "a foreign reference is drift"
+        );
 
         // Re-scan after the relock, then roll back newest-first.
         let (again, second) = plan(&relocked, &dep, None).unwrap();
@@ -714,7 +735,10 @@ mod tests {
         let files = |text: &str| BTreeMap::from([("Pipfile.lock".to_string(), text.to_string())]);
         assert!(lock_targets(&files(&lock()), std::slice::from_ref(&dep)));
         assert!(!lock_targets(&files(&lock()), std::slice::from_ref(&other)));
-        assert!(!lock_targets(&files("{ not json"), std::slice::from_ref(&dep)));
+        assert!(!lock_targets(
+            &files("{ not json"),
+            std::slice::from_ref(&dep)
+        ));
         assert!(!lock_targets(&BTreeMap::new(), std::slice::from_ref(&dep)));
         let mut npm = dep.clone();
         npm.ecosystem = "npm".into();
@@ -739,7 +763,10 @@ mod tests {
         let entry: Value = serde_json::from_str(&fixed).unwrap();
         assert!(entry["default"]["urllib3"].get("version").is_none());
         assert!(entry["default"]["urllib3"].get("index").is_none());
-        assert!(entry["default"]["urllib3"]["file"].as_str().unwrap().contains("patch-one"));
+        assert!(entry["default"]["urllib3"]["file"]
+            .as_str()
+            .unwrap()
+            .contains("patch-one"));
 
         value["default"]["urllib3"]["version"] = json!("==2.0.0");
         let conflicting = serde_json::to_string(&value).unwrap();
@@ -760,7 +787,10 @@ mod tests {
         assert!(owned_url(public, &dep));
         assert!(!owned_url("https://example.org/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl", &dep));
         dep.artifact_url = "https://patches.internal.example:8443/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl".into();
-        assert!(owned_url(&dep.artifact_url, &dep), "the grant's own origin is ours");
+        assert!(
+            owned_url(&dep.artifact_url, &dep),
+            "the grant's own origin is ours"
+        );
         assert!(owned_url(public, &dep), "and so is the public service");
         assert!(!owned_url("https://patches.internal.example:8443/patch/pypi/urllib3/1.26.19/tok/patch-one/urllib3-1.26.19-py3-none-any.whl", &dep), "another version is not");
         // Rotation on the custom origin restores through the chain.
@@ -779,7 +809,12 @@ mod tests {
     fn restore_refuses_a_non_object_ledger_original() {
         let dep = dependency("urllib3", "1.26.18", "patch-one");
         let (text, edits) = plan(&lock(), &dep, None).unwrap();
-        for bad in ["\"just a string\"", "[1, 2]", "not json at all", "{\"a\": 1}, \"injected\": {}"] {
+        for bad in [
+            "\"just a string\"",
+            "[1, 2]",
+            "not json at all",
+            "{\"a\": 1}, \"injected\": {}",
+        ] {
             let mut edit = edits[0].clone();
             edit.original = Some(Value::String(bad.to_string()));
             assert!(restore(&text, &edit).is_err(), "{bad}");
@@ -813,18 +848,28 @@ mod tests {
         for edit in &first_edits {
             let replacement = edit.new.as_ref().unwrap().as_str().unwrap();
             // A tampered reference (its `#sha256=` pin) is drift…
-            let drift = two.replacen(replacement, &replacement.replace("#sha256=", "#sha256=0"), 1);
+            let drift = two.replacen(
+                replacement,
+                &replacement.replace("#sha256=", "#sha256=0"),
+                1,
+            );
             assert!(restore(&drift, edit).is_err());
             // …while a re-serialized entry that kept our reference (Pipenv
             // 2023+ relocking a marker-excluded entry restores the registry
             // `hashes` and `version` next to it) is still ours and restores.
             let mut value: Value = serde_json::from_str(&two).unwrap();
-            let section: &str = serde_json::from_str::<[String; 2]>(edit.key.as_deref().unwrap()).unwrap()[0].clone().leak();
+            let section: &str = serde_json::from_str::<[String; 2]>(edit.key.as_deref().unwrap())
+                .unwrap()[0]
+                .clone()
+                .leak();
             value[section]["urllib3"]["hashes"] = json!(["sha256:upstream-a", "sha256:upstream-b"]);
             value[section]["urllib3"]["version"] = json!("==1.26.18");
             let kept = serde_json::to_string_pretty(&value).unwrap();
             let restored: Value = serde_json::from_str(&restore(&kept, edit).unwrap()).unwrap();
-            assert!(restored[section]["urllib3"].get("file").is_none(), "{restored}");
+            assert!(
+                restored[section]["urllib3"].get("file").is_none(),
+                "{restored}"
+            );
             let mut unsafe_edit = edit.clone();
             unsafe_edit.path = "../Pipfile.lock".into();
             assert!(restore(&two, &unsafe_edit).is_err());
@@ -883,7 +928,10 @@ mod compatibility_tests {
         assert!(!result.refused_pipenv_uuids.contains("patch-one"));
         assert!(result.files["requirements.txt"].contains("patch.socket.dev"));
         assert!(!result.files.contains_key("Pipfile.lock"));
-        assert!(result.warnings.iter().any(|w| w.code == "redirect_pipenv_refused" && w.detail.contains("no Pipfile")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_pipenv_refused" && w.detail.contains("no Pipfile")));
     }
 
     /// Rollback survives what git and Pipenv do to the lock between the
@@ -915,11 +963,17 @@ mod compatibility_tests {
         value["default"]["urllib3"]["version"] = json!("==1.26.18");
         value["default"]["urllib3"]["index"] = json!("pypi");
         let hybrid = serde_json::to_string_pretty(&value).unwrap();
-        let default_edit = edits.iter().find(|e| e.key.as_deref() == Some(r#"["default","urllib3"]"#)).unwrap();
+        let default_edit = edits
+            .iter()
+            .find(|e| e.key.as_deref() == Some(r#"["default","urllib3"]"#))
+            .unwrap();
         let restored = restore(&hybrid, default_edit).unwrap();
         let value: Value = serde_json::from_str(&restored).unwrap();
         assert_eq!(value["default"]["urllib3"]["version"], json!("==1.26.18"));
-        assert!(value["default"]["urllib3"].get("file").is_none(), "{restored}");
+        assert!(
+            value["default"]["urllib3"].get("file").is_none(),
+            "{restored}"
+        );
         // Dropped entry (`pipenv uninstall`): nothing to unwind, retires.
         let mut value: Value = serde_json::from_str(&redirected).unwrap();
         value["default"].as_object_mut().unwrap().remove("urllib3");

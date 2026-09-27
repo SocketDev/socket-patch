@@ -1817,7 +1817,8 @@ async fn report_only_scan_json_redirect_state_splits_records_from_live_proof() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run"]);
+    let (code, stdout, stderr) =
+        run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let state = &v["redirectState"];
@@ -2027,7 +2028,8 @@ async fn silent_gates_scan_malformed_ledger_warning() {
     std::fs::write(vendor_dir.join("redirect-state.json"), "{ torn ledger").unwrap();
 
     // Control: without --silent the corruption is surfaced on stderr.
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run"]);
+    let (code, stdout, stderr) =
+        run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         stderr.contains("malformed"),
@@ -2040,7 +2042,11 @@ async fn silent_gates_scan_malformed_ledger_warning() {
     );
 
     // --silent mutes the advisory warning; the run is otherwise identical.
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run", "--silent"]);
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--silent"],
+    );
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
         !stderr.contains("malformed"),
@@ -2072,7 +2078,11 @@ async fn ecosystems_filter_keeps_records_but_not_wiring_live() {
         /*with_record=*/ true,
     );
 
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run", "--ecosystems", "pypi"]);
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--ecosystems", "pypi"],
+    );
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let state = &v["redirectState"];

@@ -247,8 +247,7 @@ async fn hooked_vlt_members(found: &PackageJsonFindResult) -> Vec<PathBuf> {
     }
     let mut hooked = Vec::new();
     for loc in found.files.iter().filter(|loc| !loc.is_root) {
-        if let Ok(content) = socket_patch_core::utils::fs::read_regular_to_string(&loc.path).await
-        {
+        if let Ok(content) = socket_patch_core::utils::fs::read_regular_to_string(&loc.path).await {
             let status = is_setup_configured_str(&content);
             if status.postinstall_configured || status.dependencies_configured {
                 hooked.push(loc.path.clone());

@@ -2951,7 +2951,10 @@ mod tests {
                     "uv.lock",
                 ],
             ),
-            ("cargo", &[".cargo/config", ".cargo/config.toml", "Cargo.toml"]),
+            (
+                "cargo",
+                &[".cargo/config", ".cargo/config.toml", "Cargo.toml"],
+            ),
             ("golang", &["go.mod"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),

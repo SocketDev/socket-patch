@@ -726,7 +726,10 @@ mod tests {
 
     #[test]
     fn report_only_hint_names_agent_mode() {
-        assert_eq!(report_only_hint()[0], "To apply these patches in place, run:");
+        assert_eq!(
+            report_only_hint()[0],
+            "To apply these patches in place, run:"
+        );
         assert!(report_only_hint()[1].contains("--mode agent"));
     }
 

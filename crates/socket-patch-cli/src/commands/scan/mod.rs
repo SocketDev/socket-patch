@@ -241,9 +241,7 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         // stays report-only (neither has a project lockfile to rewire).
         args.mode = Some(ScanMode::Hosted);
     }
-    if args.mode == Some(ScanMode::Hosted)
-        && args.common.is_global()
-    {
+    if args.mode == Some(ScanMode::Hosted) && args.common.is_global() {
         // Global installs have no project lockfile to repoint: the hosted
         // flow would "redirect 0 packages" and exit 0, a silent no-op.
         return Err(format!(
@@ -357,11 +355,7 @@ pub struct ScanArgs {
     /// `requests`), or a purl with or without its version
     /// (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`). Repeat the flag or
     /// separate with commas
-    #[arg(
-        long = "package",
-        env = "SOCKET_SCAN_PACKAGES",
-        value_delimiter = ','
-    )]
+    #[arg(long = "package", env = "SOCKET_SCAN_PACKAGES", value_delimiter = ',')]
     pub packages: Vec<String>,
 
     /// On a successful scan, also generate an OpenVEX 0.2.0 document.
@@ -397,7 +391,8 @@ pub(crate) fn package_spec_matches(spec: &str, purl: &str) -> bool {
         None => name_version,
     };
     if let Some(spec_rest) = spec.strip_prefix("pkg:") {
-        let spec_purl = normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase();
+        let spec_purl =
+            normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase();
         let spec_rest = &spec_purl[4..];
         let has_version = spec_rest
             .split_once('/')
@@ -405,7 +400,9 @@ pub(crate) fn package_spec_matches(spec: &str, purl: &str) -> bool {
         return if has_version {
             decoded == spec_purl
         } else {
-            decoded.strip_prefix(&spec_purl).is_some_and(|tail| tail.starts_with('@'))
+            decoded
+                .strip_prefix(&spec_purl)
+                .is_some_and(|tail| tail.starts_with('@'))
         };
     }
     let spec = spec.replace(':', "/");
@@ -1530,7 +1527,8 @@ fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
         let joined = cwd.join(raw);
         if raw.contains(['*', '?', '[']) {
             let pattern = joined.to_string_lossy().into_owned();
-            let matches = glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
+            let matches =
+                glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
             let before = dirs.len();
             dirs.extend(matches.filter_map(Result::ok).filter(|p| p.is_dir()));
             if dirs.len() == before {
@@ -1752,8 +1750,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         .filter(|pkg| args.common.purl_ecosystem_selected(&pkg.purl))
         .collect();
 
-    let package_specs: Vec<&String> =
-        args.packages.iter().filter(|s| !s.trim().is_empty()).collect();
+    let package_specs: Vec<&String> = args
+        .packages
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
     let filtered_crawled: Vec<_> = if package_specs.is_empty() {
         filtered_crawled
     } else {
@@ -2172,18 +2173,17 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     };
     // The hosted pins the lockfiles wire count too: the lockfile is the
     // record of a hosted redirect even where no ledger was committed.
-    let hosted_pins: Vec<(String, String)> =
-        if args.common.is_global() {
-            Vec::new()
-        } else {
-            crate::commands::discover_wiring(&args.common, &args.common.cwd)
-                .await
-                .refs
-                .into_iter()
-                .filter(|r| r.mode == socket_patch_core::vex::discover::WiringMode::Hosted)
-                .map(|r| (r.purl, r.uuid))
-                .collect()
-        };
+    let hosted_pins: Vec<(String, String)> = if args.common.is_global() {
+        Vec::new()
+    } else {
+        crate::commands::discover_wiring(&args.common, &args.common.cwd)
+            .await
+            .refs
+            .into_iter()
+            .filter(|r| r.mode == socket_patch_core::vex::discover::WiringMode::Hosted)
+            .map(|r| (r.purl, r.uuid))
+            .collect()
+    };
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
         redirect_state.as_ref(),
@@ -2950,11 +2950,19 @@ mod tests {
         std::fs::write(tmp.path().join("apps/README"), "").unwrap();
         let rel = |dirs: Vec<PathBuf>| -> Vec<String> {
             dirs.iter()
-                .map(|d| d.strip_prefix(tmp.path()).unwrap().to_string_lossy().replace('\\', "/"))
+                .map(|d| {
+                    d.strip_prefix(tmp.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
                 .collect()
         };
-        let got = project_dirs(tmp.path(), &["apps/*".into(), "libs/core".into(), "apps/web".into()])
-            .unwrap();
+        let got = project_dirs(
+            tmp.path(),
+            &["apps/*".into(), "libs/core".into(), "apps/web".into()],
+        )
+        .unwrap();
         assert_eq!(rel(got), ["apps/api", "apps/web", "libs/core"]);
         assert!(project_dirs(tmp.path(), &["apps/README".into()])
             .unwrap_err()
@@ -3272,7 +3280,10 @@ mod tests {
             },
         ] {
             let picked = selection_args(&common);
-            assert!(!picked.json && picked.yes, "scan always takes the top patch");
+            assert!(
+                !picked.json && picked.yes,
+                "scan always takes the top patch"
+            );
         }
     }
 

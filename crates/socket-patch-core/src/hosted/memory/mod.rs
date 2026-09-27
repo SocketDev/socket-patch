@@ -434,7 +434,9 @@ async fn engine(
         }
         let (entries, unsupported) =
             inventory_project_diagnosed_in(&ProjectView::Memory(project)).await;
-        for (code, detail) in crate::vendor::lock_inventory::unsupported_layout_warnings(&unsupported) {
+        for (code, detail) in
+            crate::vendor::lock_inventory::unsupported_layout_warnings(&unsupported)
+        {
             warnings.push(EngineWarning::new(code, detail, Some(&state.root)));
         }
         unsupported_ecosystem_warnings(&state.root, project, ecosystems, &mut warnings);

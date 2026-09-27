@@ -234,12 +234,9 @@ async fn repair_keeps_healthy_soft_artifact_when_rebuild_dispatch_fails() {
     let gemfile_wired = std::fs::read(tmp.path().join("Gemfile")).unwrap();
 
     std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_file(
-        tmp.path()
-            .join(format!(
-                "vendor/bundle/ruby/3.4.0/gems/{GEM_NAME}-{GEM_VERSION}/lib/padlock.rb"
-            )),
-    )
+    std::fs::remove_file(tmp.path().join(format!(
+        "vendor/bundle/ruby/3.4.0/gems/{GEM_NAME}-{GEM_VERSION}/lib/padlock.rb"
+    )))
     .unwrap();
 
     mount_blob(&mock).await;
@@ -280,7 +277,10 @@ async fn repair_keeps_healthy_soft_artifact_when_rebuild_dispatch_fails() {
         &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(state["entries"][GEM_PURL]["uuid"], GEM_UUID, "state={state}");
+    assert_eq!(
+        state["entries"][GEM_PURL]["uuid"], GEM_UUID,
+        "state={state}"
+    );
     assert_eq!(
         std::fs::read(tmp.path().join("Gemfile")).unwrap(),
         gemfile_wired,

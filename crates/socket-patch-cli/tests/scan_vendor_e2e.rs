@@ -3075,7 +3075,11 @@ snapshots:
             "{v}"
         );
         assert!(events_for(&v, CARGO_SCOPE[0].0).is_empty(), "{v}");
-        assert_eq!(record_for(dl, CARGO_SCOPE[1].0)["action"], "downloaded", "{v}");
+        assert_eq!(
+            record_for(dl, CARGO_SCOPE[1].0)["action"],
+            "downloaded",
+            "{v}"
+        );
         assert_eq!(
             events_for(&v, CARGO_SCOPE[1].0),
             vec![("skipped", "package_not_installed")],
