@@ -5907,6 +5907,7 @@ mod tests {
             ecosystems: None,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
+            patch_server_url: None,
         }
     }
 

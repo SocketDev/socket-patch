@@ -26,6 +26,7 @@ use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
+use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
 use socket_patch_core::utils::group_commit::GroupCommit;
@@ -656,6 +657,14 @@ pub async fn run(args: VendorArgs) -> i32 {
     // vendored` projects have `.socket/` but never a manifest. Nothing is
     // locked or written on this path.
     if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
+        // A hosted project (no manifest, hosted pins in its lockfiles)
+        // ejects: its patch set is the lockfiles' hosted pins.
+        if !args.common.is_global() {
+            let pins = hosted_pins_in_scope(&args.common).await;
+            if !pins.is_empty() {
+                return run_eject(&args, pins).await;
+            }
+        }
         // A requested `--vex` still attests what the `.socket/vendor`
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
@@ -843,6 +852,180 @@ pub async fn run(args: VendorArgs) -> i32 {
         .await;
     }
 
+    exit
+}
+
+/// The lockfiles' hosted pins whose ecosystem `--ecosystems` selects.
+async fn hosted_pins_in_scope(common: &GlobalArgs) -> Vec<HostedPin> {
+    HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
+        .into_iter()
+        .filter(|pin| {
+            socket_patch_core::utils::purl::purl_parts(&pin.purl)
+                .is_some_and(|(eco, _, _)| ecosystem_in_scope(common, &eco))
+        })
+        .collect()
+}
+
+/// Standalone `vendor` in a hosted project — no manifest, hosted pins in the
+/// lockfiles: EJECT. The patch set is the pins themselves (purl + the uuid
+/// in each hosted URL); each record is fetched from the API, vendored into
+/// `.socket/vendor/` exactly like `scan --mode vendored`, and the lock is
+/// rewired from hosted to vendored (the engine's takeover restores each
+/// pin's upstream registry entry first, so `vendor --revert` later returns
+/// the project to upstream, not to hosted).
+async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
+    let common = &args.common;
+    let (client, use_public_proxy) =
+        get_api_client_with_overrides(common.api_client_overrides()).await;
+    let (api_token, org_slug) = (client.api_token().cloned(), client.org_slug().cloned());
+    if !common.json && !common.silent {
+        println!(
+            "{} {} into .socket/vendor/...",
+            if common.dry_run { "Would eject" } else { "Ejecting" },
+            plural(pins.len(), "hosted package", "hosted packages")
+        );
+    }
+
+    // One view per distinct uuid, fetched concurrently and consumed in pin
+    // order; the views' blobs seed the in-memory staging.
+    let mut records: HashMap<String, PatchRecord> = HashMap::new();
+    let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut fetch_failures: Vec<(String, String)> = Vec::new();
+    let mut views = std::pin::pin!(ordered_concurrent(
+        pins.iter(),
+        socket_patch_core::utils::concurrent::api_concurrency_for(
+            client.uses_public_proxy(),
+            pins.len(),
+        ),
+        |pin| {
+            let client = &client;
+            async move { client.fetch_patch(&pin.uuid).await }
+        },
+    ));
+    for pin in &pins {
+        let Some(view) = views.next().await else {
+            break;
+        };
+        match view {
+            Ok(Some(patch)) => {
+                for info in patch.files.values() {
+                    let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
+                        continue;
+                    };
+                    if !socket_patch_core::patch::apply::is_valid_blob_hash(hash)
+                        || blobs.contains_key(hash)
+                    {
+                        continue;
+                    }
+                    if let Ok(bytes) = crate::commands::get::base64_decode(b64) {
+                        blobs.insert(hash.clone(), bytes);
+                    }
+                }
+                let (_, record) = crate::commands::get::record_from_patch_response(&patch);
+                records.insert(pin.purl.clone(), record);
+            }
+            Ok(None) => fetch_failures.push((
+                pin.purl.clone(),
+                format!("patch {} was not found on the API", pin.uuid),
+            )),
+            Err(e) => fetch_failures.push((
+                pin.purl.clone(),
+                format!("could not fetch patch {}: {e}", pin.uuid),
+            )),
+        }
+    }
+    drop(views);
+    for (purl, detail) in &fetch_failures {
+        report_vendor_failure(common, purl, detail);
+    }
+
+    let step = crate::commands::scan::boxed_scan_vendor_step(
+        common,
+        records,
+        blobs,
+        client.clone(),
+        use_public_proxy,
+    )
+    .await;
+    let (mut exit, mut env) = match step {
+        Ok((has_errors, env)) => (i32::from(has_errors), env),
+        Err((code, message, env)) => {
+            let mut env = env.map(|e| *e).unwrap_or_else(|| {
+                let mut env = Envelope::new(Command::Vendor);
+                env.dry_run = common.dry_run;
+                env
+            });
+            env.mark_error(EnvelopeError::new(code, message.clone()));
+            if !common.json {
+                eprintln!(
+                    "{}",
+                    crate::commands::scan::vendor_flow::format_vendor_step_error(code, &message)
+                );
+            }
+            (1, env)
+        }
+    };
+    if !fetch_failures.is_empty() {
+        for (purl, detail) in fetch_failures {
+            env.record(
+                PatchEvent::new(PatchAction::Failed, purl).with_error("patch_fetch_failed", detail),
+            );
+        }
+        env.mark_partial_failure();
+        exit = 1;
+    }
+
+    // Embedded VEX: same contract as the manifest-driven arm — only on
+    // success, never on a dry run, and a requested-but-failed VEX flips the
+    // exit code. The ejected project has no manifest.
+    if exit == 0 {
+        if let Some(vex_path) = args.vex.vex.as_ref() {
+            if common.dry_run {
+                if !common.json && !common.silent {
+                    println!("{}", crate::commands::vex::format_vex_dry_run_skip("vendored"));
+                }
+            } else {
+                let params = args.vex.to_build_params();
+                let manifest_path = common.resolved_manifest_path();
+                match generate_vex_without_manifest(common, &params, &manifest_path).await {
+                    ManifestlessVex::Written(summary) => {
+                        env.vex = Some(VexSummary {
+                            path: vex_path.display().to_string(),
+                            statements: summary.statements,
+                            format: "openvex-0.2.0".to_string(),
+                            warnings: summary.warnings,
+                        });
+                    }
+                    ManifestlessVex::NothingToAttest(warnings) => {
+                        env.warnings.extend(warnings);
+                        if !common.json && !common.silent {
+                            println!("{}", crate::commands::vex::format_vex_nothing_to_attest());
+                        }
+                    }
+                    ManifestlessVex::Failed(e) => {
+                        env.warnings.extend(e.embedded_warnings());
+                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                        if !common.json {
+                            e.print_embedded(common);
+                        }
+                        exit = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    track_outcomes_for_vendor(
+        exit != 0,
+        &env,
+        common.dry_run,
+        api_token.as_deref(),
+        org_slug.as_deref(),
+    )
+    .await;
     exit
 }
 
@@ -1578,9 +1761,7 @@ async fn plan_service_downloads(
             if bun_refusal.is_some_and(|r| r.applies_to(candidate)) {
                 continue;
             }
-            if socket_patch_core::patch::redirect::redirect_revert_supported(candidate)
-                && takeover_blocked(candidate)
-            {
+            if takeover_blocked(candidate) {
                 continue;
             }
             // The npm backends re-wire a committed artifact the ledger
@@ -2402,9 +2583,7 @@ pub(crate) async fn vendor_records_reusing(
             // vendor detach the PRISTINE registry entry to record. A purl
             // whose upstream entry cannot be restored is REFUSED; the cargo
             // backend's `hosted_redirect_live` guard backstops the rest.
-            let hosted_pin = hosted_pin_of(candidate)
-                .filter(|_| socket_patch_core::patch::redirect::redirect_revert_supported(candidate));
-            if let Some(pin) = hosted_pin {
+            if let Some(pin) = hosted_pin_of(candidate) {
                 // The refusal the berry backend would raise after the
                 // restore, raised HERE instead — the same `failed` event,
                 // code and detail, in the dry run and the wet run alike —
