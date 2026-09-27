@@ -378,6 +378,54 @@ fn fail(env: &mut Envelope, json: bool, purl: &str, code: &str, detail: String) 
     env.mark_partial_failure();
 }
 
+/// Report every candidate whose patch content this run could not obtain:
+/// a soft one is restored without a fingerprint (counted as rebuilt), any
+/// other fails with its own reason code. Shared by the two staging arms —
+/// "nothing could be staged" (the whole pass ends here) and "these purls
+/// could not, while others staged fine" (the pass continues without them).
+/// `unrebuildable` names candidates that already failed earlier and must
+/// not be reported twice.
+fn report_no_local_source(
+    env: &mut Envelope,
+    common: &GlobalArgs,
+    candidates: &[Candidate],
+    unrebuildable: &HashSet<String>,
+    rebuilt: &mut usize,
+) {
+    for c in candidates {
+        if unrebuildable.contains(&c.purl) {
+            continue;
+        }
+        if c.soft {
+            soft_restore_without_fingerprint(
+                env,
+                common,
+                &c.purl,
+                &c.entry.artifact.path,
+                "its patch content has no local source to rebuild from",
+            );
+            *rebuilt += 1;
+            continue;
+        }
+        fail(
+            env,
+            common.json,
+            &c.purl,
+            c.reason,
+            format!(
+                "the vendored artifact at {} is broken and its patch content has \
+                 no local source ({})",
+                c.entry.artifact.path,
+                if common.offline {
+                    "--offline prevents fetching it"
+                } else {
+                    "download failed"
+                }
+            ),
+        );
+    }
+}
+
 /// `Error: Cannot repair vendored artifact for <purl>: <detail>`.
 fn format_repair_failure(purl: &str, detail: &str) -> String {
     format!(
@@ -1210,41 +1258,23 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     {
         MemStageOutcome::Ready(s) => s,
         MemStageOutcome::Unavailable => {
-            for c in &candidates {
-                if unrebuildable.contains(&c.purl) {
-                    continue;
-                }
-                if c.soft {
-                    soft_restore_without_fingerprint(
-                        env,
-                        common,
-                        &c.purl,
-                        &c.entry.artifact.path,
-                        "its patch content has no local source to rebuild from",
-                    );
-                    rebuilt += 1;
-                    continue;
-                }
-                fail(
-                    env,
-                    common.json,
-                    &c.purl,
-                    c.reason,
-                    format!(
-                        "the vendored artifact at {} is broken and its patch content has \
-                         no local source ({})",
-                        c.entry.artifact.path,
-                        if common.offline {
-                            "--offline prevents fetching it"
-                        } else {
-                            "download failed"
-                        }
-                    ),
-                );
-            }
+            report_no_local_source(env, common, &candidates, &unrebuildable, &mut rebuilt);
             return rebuilt;
         }
     };
+    // Staging could obtain SOME candidates' content but not others'. The
+    // ones it could not get the same report the all-unavailable arm above
+    // gives, and leave the pass; the rest are still rebuilt.
+    if !staged.unavailable().is_empty() {
+        let (stuck, rest): (Vec<Candidate>, Vec<Candidate>) = candidates
+            .into_iter()
+            .partition(|c| staged.unavailable().iter().any(|(purl, _)| purl == &c.purl));
+        report_no_local_source(env, common, &stuck, &unrebuildable, &mut rebuilt);
+        candidates = rest;
+        if candidates.is_empty() {
+            return rebuilt;
+        }
+    }
     let sources = staged.as_patch_sources();
 
     // ── Pristine package sources ─────────────────────────────────────────

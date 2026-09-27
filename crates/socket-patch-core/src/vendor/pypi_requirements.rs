@@ -574,7 +574,11 @@ async fn plan_requirements(
 
 /// The committed vendor line. `transitive` adds the `(transitive)` note so a
 /// reader knows the line was appended (no pin was replaced).
-fn vendor_line(
+///
+/// Visible to the rest of `vendor` so the lockfile inventory's round-trip
+/// test can read back exactly what this writes (the two grammars — the one
+/// that writes a vendored line and the one that reads it — must agree).
+pub(in crate::vendor) fn vendor_line(
     rel_wheel: &str,
     sha256_hex: &str,
     canon_name: &str,
