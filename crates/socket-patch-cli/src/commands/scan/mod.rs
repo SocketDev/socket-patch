@@ -21,7 +21,7 @@ use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
 };
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
-use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
@@ -687,19 +687,6 @@ async fn fetch_patch_details(
     (results, failures)
 }
 
-/// The human hosted arm's stand-in for the lenient loader's advisory: a
-/// malformed redirect ledger the engine would report as a hard error, on a
-/// run that returned BEFORE the engine (empty discovery, nothing
-/// downloadable, a detail-fetch failure). Read-only —
-/// the file is never moved; `--silent` mutes it like every advisory.
-fn warn_unreported_corrupt_ledger(common: &crate::args::GlobalArgs, corrupt: Option<&str>) {
-    if let Some(corrupt) = corrupt {
-        if !common.silent {
-            eprintln!("Warning: {corrupt}");
-        }
-    }
-}
-
 /// Fold a [`discover_selected`] failure into a JSON caller's `result` and
 /// print it. The discovery counts already in `result` stay — they were
 /// computed from the (successful) batch phase — while `status`/`error`
@@ -816,32 +803,28 @@ fn download_run<'a>(args: &ScanArgs, api_client: &'a ApiClient) -> DownloadRun<'
 }
 
 // ---------------------------------------------------------------------------
-// Cross-mode ledger takeover detection (hosted ⇄ vendored)
+// Cross-mode takeover detection (hosted over vendored)
 // ---------------------------------------------------------------------------
 //
-// Hosted mode writes `.socket/vendor/redirect-state.json`; vendored mode
-// writes `.socket/vendor/state.json` (+ committed tarballs). Switching a
-// project's mode rewires the lockfile but leaves the OLD mode's ledger on
-// disk asserting wiring that is no longer live, which misleads anything
-// auditing a ledger (including `vex`). Detect the overlap so each flow can
-// warn. The VENDORED flows clean the superseded redirect-ledger halves
-// themselves (always announced); the HOSTED direction stays warn-only
-// (removing a vendored entry deletes committed artifacts — `remove
-// <purl>`'s job).
+// Vendored mode writes `.socket/vendor/state.json` (+ committed tarballs);
+// hosted mode keeps no ledger — its lockfile pins are the only record.
+// Redirecting a vendored package to the hosted patch server rewires the
+// lockfile but leaves the vendored ledger entry on disk asserting wiring that
+// is no longer live, which misleads anything auditing the ledger (including
+// `vex`). Detect the overlap so the hosted flow can warn (removing a vendored
+// entry deletes committed artifacts — `remove <purl>`'s job). The reverse
+// direction needs no advisory: once the lock routes a package to
+// `.socket/vendor/`, no hosted state is left to go stale.
 //
-// The overlap only proves BOTH ledgers name the package, not which won. The
-// takeover DIRECTION comes from the current lockfile wiring per package
-// (`classify_overlap_takeover`), never from which command is running;
-// remediation points at the ledger that does NOT match the live lock, and a
-// package the lock proves neither way stays silent.
+// The overlap only proves the vendored ledger and a hosted pin both name the
+// package, not which won. The takeover DIRECTION comes from the current
+// lockfile wiring per package (`classify_overlap_takeover`), never from
+// which command is running, and a package the lock proves neither way stays
+// silent.
 
 /// Warning code emitted by the HOSTED flow when it just redirected package(s)
 /// a committed vendored ledger still claims (its tarballs are now orphaned).
 pub(super) const REDIRECT_SUPERSEDES_VENDORED: &str = "redirect_supersedes_vendored";
-
-/// Warning code emitted by the VENDORED flow when it just vendored package(s)
-/// a committed hosted redirect ledger still claims.
-pub(super) const VENDOR_SUPERSEDES_REDIRECT: &str = "vendor_supersedes_redirect";
 
 /// Warning code + detail emitted when `--prune` is combined with
 /// `--mode hosted`: the hosted flow runs no GC, so the flag would otherwise
@@ -854,12 +837,12 @@ pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
      runs no GC sweep of `.socket/` state; run `scan --mode agent --prune` or \
      `scan --mode vendored --prune` to garbage-collect";
 
-/// The PURLs claimed by BOTH the hosted redirect ledger
-/// (`.socket/vendor/redirect-state.json`) and the vendored state ledger
-/// (`.socket/vendor/state.json`), sorted, over already-loaded ledgers. A
-/// non-empty result means exactly one of the two ledgers is stale for each
-/// PURL (a lockfile entry can point only one way). `None`, an empty vendor
-/// ledger, or disjoint ledgers (a legitimate split) yield no overlap.
+/// The PURLs claimed by BOTH a hosted pin (`redirect`, the lockfiles'
+/// hosted state — see [`crate::commands::hosted_state_from_lockfiles`]) and
+/// the vendored state ledger (`.socket/vendor/state.json`), sorted. A
+/// non-empty result means one of the two is stale for each PURL (a
+/// lockfile entry can point only one way). `None`, an empty vendor ledger,
+/// or disjoint states (a legitimate split) yield no overlap.
 fn overlap_from_states(
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: &VendorState,
@@ -867,54 +850,23 @@ fn overlap_from_states(
     let Some(redirect) = redirect else {
         return Vec::new();
     };
-    if vendor.entries.is_empty() {
+    if vendor.entries.is_empty() || redirect.records.is_empty() {
         return Vec::new();
     }
-    // Canonicalize both sides (drop qualifiers, percent-decode) so the API
-    // purl form the redirect records carry matches the vendor entry's base
-    // purl — mirrors `vendored_ledger_supplement`.
+    // Canonicalize both sides (drop qualifiers, percent-decode) so the
+    // hosted pin's purl matches the vendor entry's base purl — mirrors
+    // `vendored_ledger_supplement`.
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let mut vendor_purls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (key, entry) in &vendor.entries {
         vendor_purls.insert(canon(key));
         vendor_purls.insert(canon(&entry.base_purl));
     }
-    if !redirect.records.is_empty() {
-        let redirect_purls: std::collections::BTreeSet<String> =
-            redirect.records.keys().map(|p| canon(p)).collect();
-        return redirect_purls
-            .intersection(&vendor_purls)
-            .cloned()
-            .collect();
-    }
-    // The records map can be EMPTY while the ledger still asserts stale lock
-    // wiring (every per-uuid record fetch failed: `record_fetch_failed`), so
-    // fall back to matching the vendored purls against the recorded edit
-    // keys — npm `node_modules/<name>` (possibly nested), pnpm/yarn/cargo/uv
-    // `<name>@<version>` (vlt `<name>@<version>~<extra>`), bun
-    // `<prefix>/<name>`, gem/composer/pypi bare `<name>`. Name-level matching
-    // can over-claim across versions, but `classify_overlap_takeover` still
-    // requires the live lock to prove one side before anything is reported.
-    if redirect.edits.is_empty() {
-        return Vec::new();
-    }
-    vendor_purls
-        .into_iter()
-        .filter(|purl| {
-            let Some((name, version)) = purl_name_version(strip_purl_qualifiers(purl)) else {
-                return false;
-            };
-            redirect
-                .edits
-                .iter()
-                .filter_map(|e| e.key.as_deref())
-                .any(|key| {
-                    key == name
-                        || key == format!("{name}@{version}")
-                        || key.starts_with(&format!("{name}@{version}~"))
-                        || key.ends_with(&format!("/{name}"))
-                })
-        })
+    let redirect_purls: std::collections::BTreeSet<String> =
+        redirect.records.keys().map(|p| canon(p)).collect();
+    redirect_purls
+        .intersection(&vendor_purls)
+        .cloned()
         .collect()
 }
 
@@ -926,7 +878,7 @@ fn overlap_from_states(
 /// / `Discovery::vendor_entry_live`). `redirect` holds the overlap PURLs the
 /// lock routes to the hosted patch server (the vendored ledger entry is
 /// stale); `vendored` holds those it routes to a committed
-/// `.socket/vendor/<eco>/<uuid>` artifact (the redirect record is stale).
+/// `.socket/vendor/<eco>/<uuid>` artifact.
 ///
 /// A PURL the lock proves NEITHER way — a dry-run/no-op that did not rewire it,
 /// a half-migrated lock naming both, or an ecosystem whose live spec we cannot
@@ -936,27 +888,25 @@ fn overlap_from_states(
 pub(super) struct OverlapTakeover {
     /// Overlap PURLs whose vendored ledger is stale (lock points hosted).
     pub redirect: Vec<String>,
-    /// Overlap PURLs whose redirect ledger is stale (lock points vendored).
+    /// Overlap PURLs the lock routes to the vendored artifact.
     pub vendored: Vec<String>,
 }
 
+/// [`classify_overlap_takeover_with`] over the on-disk state: the
+/// lockfiles' hosted pins and the committed vendored ledger.
+#[cfg(test)]
 pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -> OverlapTakeover {
-    // Both ledgers loaded ONCE here. A malformed ledger classifies like a
-    // missing one, matching `overlap_from_states` (this path only
-    // feeds takeover warnings; corruption is a hard error on the
+    // A malformed vendor ledger classifies like a missing one (this path
+    // only feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
-    let redirect = socket_patch_core::patch::redirect::load_redirect_state(cwd)
-        .await
-        .ok()
-        .flatten();
+    let redirect = crate::commands::hosted_state_from_lockfiles(common, cwd).await;
     let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(common, cwd, redirect.as_ref(), vendor.as_ref()).await
+    classify_overlap_takeover_with(common, cwd, Some(&redirect), vendor.as_ref()).await
 }
 
-/// [`classify_overlap_takeover`] over already-loaded ledgers (the hosted
-/// engine must classify against its in-memory post-merge / post-takeover
-/// copies, never a pre-takeover snapshot); still reads the LIVE lockfiles
-/// in `cwd`. `None` for either ledger yields no overlap.
+/// [`classify_overlap_takeover`] over already-loaded state (the hosted
+/// engine classifies against its post-takeover vendor ledger); still reads
+/// the LIVE lockfiles in `cwd`. `None` for either yields no overlap.
 pub(super) async fn classify_overlap_takeover_with(
     common: &GlobalArgs,
     cwd: &Path,
@@ -984,10 +934,8 @@ pub(super) async fn classify_overlap_takeover_with(
             .entry(canon(&entry.base_purl))
             .or_insert(entry);
     }
-    // The hosted proof needs the redirect ledger too: each record's patch
-    // uuid (embedded in every hosted artifact URL, whatever the host) and
-    // the lockfiles the redirect actually edited. A non-empty overlap
-    // proves the ledger is `Some`.
+    // Each hosted pin's patch uuid (embedded in every hosted artifact URL,
+    // whatever the host). A non-empty overlap proves `redirect` is `Some`.
     let mut redirect_uuid_by_purl: std::collections::HashMap<String, &str> =
         std::collections::HashMap::new();
     for (key, record) in redirect.iter().flat_map(|r| &r.records) {
@@ -996,12 +944,10 @@ pub(super) async fn classify_overlap_takeover_with(
             .or_insert(record.uuid.as_str());
     }
     let discovery = crate::commands::discover_wiring(common, cwd).await;
-    let mut liveness = LedgerLiveness::new(cwd, &discovery, redirect);
+    let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
     for purl in overlap {
         let hosted_live = match redirect_uuid_by_purl.get(&purl) {
             Some(uuid) => liveness.redirect_record(&purl, uuid).await,
-            // An edits-only ledger (every record fetch failed) names no
-            // uuid: the lock's own hosted wiring of the package decides.
             None => discovery.wires_package(&purl, WiringMode::Hosted),
         };
         let vendored_live = match vendor_by_purl.get(&purl) {
@@ -1021,157 +967,40 @@ pub(super) async fn classify_overlap_takeover_with(
     out
 }
 
-/// Human-readable detail for a mode-takeover warning naming the displaced
-/// package(s). `current_is_hosted` selects the direction: `true` when a
-/// hosted redirect displaced a vendored ledger, `false` when a vendored run
-/// displaced a hosted redirect ledger.
+/// Human-readable detail for the hosted-over-vendored takeover warning
+/// ([`REDIRECT_SUPERSEDES_VENDORED`]) naming the displaced package(s).
 ///
 /// The warning fires PER PACKAGE, so the remediation is per-package and
-/// non-destructive: never delete a whole ledger file or a whole
-/// `.socket/vendor/<eco>/` tree, which may still carry LIVE data for
-/// packages this takeover did not touch (other records VEX reads, the
-/// pre-redirect originals that are the only revert data, other vendored
-/// uuid dirs).
-///
-/// It must also be COMPLETE per package, or it does not converge:
-///
-/// * The vendored direction names the package's `edits` entry alongside its
-///   `records` entry: `overlap_from_states` falls back to edit KEYS once
-///   `records` is empty, so a records-only cleanup keeps this warning firing.
-/// * The hosted direction states `socket-patch remove`'s full blast radius,
-///   including the package's `.socket/manifest.json` entry.
-pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: bool) -> String {
+/// non-destructive: never delete a whole `.socket/vendor/<eco>/` tree, which
+/// may still carry LIVE data for packages this takeover did not touch. It
+/// states `socket-patch remove`'s full blast radius, including the
+/// package's `.socket/manifest.json` entry.
+pub(super) fn mode_takeover_detail(superseded: &[String]) -> String {
     let list = superseded.join(", ");
-    if current_is_hosted {
-        // NEVER offer deleting the `.socket/vendor/<eco>/` tree here: for
-        // cargo the leftover `[patch.crates-io]` entry still points at that
-        // tree, and deleting it hard-fails every cargo invocation ("failed to
-        // load source for dependency"). Nor `vendor --revert`, which unwinds
-        // EVERY vendored package including the ones still live in the
-        // lockfile — `remove <purl>` is the per-package equivalent.
-        format!(
-            "hosted redirect superseded the vendored ledger for: {list}. \
-             `.socket/vendor/state.json` still claims these package(s) and their \
-             committed artifacts under `.socket/vendor/` are now orphaned — the \
-             lockfile points at the hosted patch server, not the vendored files. \
-             Clean up per package: run `socket-patch remove <purl>` for each \
-             package listed above, so audits and VEX do not read superseded \
-             wiring. It drops that package's vendored ledger entry and its own \
-             `.socket/vendor/<eco>/<uuid>/` artifact directory, AND deletes that \
-             package's now-superseded `.socket/manifest.json` entry — that entry \
-             describes the vendored delivery, while the live hosted patch is \
-             recorded in `.socket/vendor/redirect-state.json`, which `remove` \
-             never touches. In-place file rollback is skipped for vendor-owned \
-             package(s), so the installed tree is left as the lockfile wires it; \
-             preview with `--dry-run` first. Do not delete the whole \
-             `.socket/vendor/<eco>/` tree and do not run `vendor --revert`: \
-             other vendored package(s) may still be live in the lockfile and \
-             would break or be mass-reverted."
-        )
-    } else {
-        // NEVER advise deleting the redirect ledger by hand: it may hold the
-        // only revert data (FileEdit originals) and VEX records for OTHER
-        // packages that are still hosted-redirected.
-        format!(
-            "vendored artifacts superseded the hosted redirect ledger for: {list}. \
-             `.socket/vendor/redirect-state.json` still records a hosted redirect for \
-             these package(s), but the lockfile now points at the committed \
-             `.socket/vendor/` files. The vendored flows (`socket-patch vendor`, \
-             `scan --mode vendored`) reconcile npm-family and cargo package(s) \
-             automatically on their next non-dry run, dropping both halves of \
-             each superseded entry — the `records` entry AND its matching \
-             `edits` (cargo additionally reverts the stale hosted edits on disk \
-             first). For other package(s), or if the automatic reconciliation \
-             could not run, clean up by hand: delete only these package(s)' \
-             entries under `records` AND their matching entries under `edits`, \
-             so audits and VEX do not read superseded wiring. \
-             Both halves matter: the leftover `edits` are that package's stale \
-             pre-redirect originals, which a later redirect revert would replay \
-             over the live vendored wiring — and an `edits` entry left behind \
-             still names the package, so a ledger whose last record you just \
-             deleted keeps reading as superseded and this warning keeps firing. \
-             Do not delete the ledger file itself: it may still hold live \
-             redirect records for other package(s), plus the recorded \
-             pre-redirect lockfile originals (`edits`) a future revert needs \
-             for them."
-        )
-    }
-}
-
-/// Detail for the vendored-direction takeover warning on the run that
-/// RECONCILED the ledger in place (non-dry-run, npm-family): past tense,
-/// stating what was dropped and where the revert data now lives. The code
-/// stays `vendor_supersedes_redirect` (codes are stable; only the detail
-/// differs), and it fires once — the reconciled ledger no longer overlaps.
-pub(super) fn mode_takeover_reconciled_detail(
-    reconciled: &[String],
-    npmrc_unwound: bool,
-) -> String {
-    let list = reconciled.join(", ");
-    // Only a run that actually unwound the hosted npm allow-remote
-    // auto-config says so (with its npm >= 12 caveat).
-    let npmrc = if npmrc_unwound {
-        " The hosted redirect's `.npmrc` `allow-remote=all` auto-config was \
-         unwound too (a redirect-created file deleted, an appended line \
-         removed): the vendored `file:` specs do not need it. If you later \
-         restore the hosted lock wiring with `vendor --revert`, npm >=12 \
-         refuses it (EALLOWREMOTE) until `allow-remote=all` is back — re-run \
-         `scan --mode hosted` afterwards to re-establish it and its ledger \
-         record."
-    } else {
-        ""
-    };
+    // NEVER offer deleting the `.socket/vendor/<eco>/` tree here: for cargo
+    // the leftover `[patch.crates-io]` entry still points at that tree, and
+    // deleting it hard-fails every cargo invocation ("failed to load source
+    // for dependency"). Nor `vendor --revert`, which unwinds EVERY vendored
+    // package including the ones still live in the lockfile — `remove
+    // <purl>` is the per-package equivalent.
     format!(
-        "vendored artifacts superseded the hosted redirect ledger for: {list}; \
-         reconciled automatically. Both halves of each superseded entry — the \
-         package's `records` entry AND its matching `edits` — were dropped \
-         from `.socket/vendor/redirect-state.json` (an emptied ledger is \
-         deleted). The lockfile points at the committed `.socket/vendor/` \
-         files, and the pre-vendor lock values (including the hosted-spliced \
-         fragment) are preserved as the vendor ledger's wiring originals, so \
-         `vendor --revert` still restores the hosted lock wiring \
-         byte-for-byte.{npmrc} Ledger data for other, still-redirected \
-         package(s) was left untouched. No action needed."
+        "hosted redirect superseded the vendored ledger for: {list}. \
+         `.socket/vendor/state.json` still claims these package(s) and their \
+         committed artifacts under `.socket/vendor/` are now orphaned — the \
+         lockfile points at the hosted patch server, not the vendored files. \
+         Clean up per package: run `socket-patch remove <purl>` for each \
+         package listed above, so audits and VEX do not read superseded \
+         wiring. It drops that package's vendored ledger entry and its own \
+         `.socket/vendor/<eco>/<uuid>/` artifact directory, AND deletes that \
+         package's now-superseded `.socket/manifest.json` entry — that entry \
+         describes the vendored delivery, while the live hosted patch is \
+         recorded in the lockfile itself. In-place file rollback is skipped \
+         for vendor-owned package(s), so the installed tree is left as the \
+         lockfile wires it; preview with `--dry-run` first. Do not delete the \
+         whole `.socket/vendor/<eco>/` tree and do not run `vendor --revert`: \
+         other vendored package(s) may still be live in the lockfile and \
+         would break or be mass-reverted."
     )
-}
-
-/// Drop the superseded purls' `records` + `edits` from the redirect ledger
-/// and persist it (atomic write; an emptied ledger is deleted). Called ONLY
-/// with purls [`classify_overlap_takeover`] proved vendored-live AND
-/// hosted-dead: that gate makes the drop lossless (the vendor ledger's
-/// wiring `original` embeds the hosted-spliced fragment, so `vendor
-/// --revert` needs nothing from these records). `Ok(Some(npmrc))`:
-/// reconciled, with the `.npmrc` allow-remote unwind outcome; `Ok(None)`:
-/// nothing matched (caller falls back to the manual advisory); `Err`: the
-/// ledger could not be read or persisted (fail closed: on-disk ledger
-/// untouched or fully pre-drop).
-async fn reconcile_superseded_redirect(
-    cwd: &Path,
-    purls: &[String],
-) -> Result<Option<socket_patch_core::patch::redirect::npmrc::NpmrcStandaloneUnwind>, String> {
-    let mut state = match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
-        Ok(Some(state)) => state,
-        Ok(None) => return Ok(None),
-        Err(corrupt) => return Err(corrupt.to_string()),
-    };
-    let mut dropped = false;
-    for purl in purls {
-        dropped |= socket_patch_core::patch::redirect::drop_superseded_purl(&mut state, purl);
-    }
-    if !dropped {
-        return Ok(None);
-    }
-    // The dropped npm purls may have been the last entries the hosted
-    // `.npmrc` `allow-remote=all` auto-config served: unwind it before
-    // persisting, so a hosted→vendored migration leaves no loosened install
-    // policy behind (vendored `file:` specs are gated by `allow-file`).
-    let npmrc =
-        socket_patch_core::patch::redirect::npmrc::unwind_unneeded_npmrc(cwd, &mut state, false)
-            .await?;
-    socket_patch_core::patch::redirect::persist_redirect_state(cwd, &state)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(Some(npmrc))
 }
 
 /// Record a run-level advisory: stderr `Warning (code): detail` in human
@@ -1191,82 +1020,6 @@ pub(super) fn push_run_warning(
         code: code.to_string(),
         detail,
     });
-}
-
-/// Cross-mode takeover advisory shared by every VENDORED flow (`vendor`,
-/// `scan --mode vendored`): when this ledger and a committed hosted redirect
-/// ledger both claim package(s) AND the live lockfile proves vendored won,
-/// the redirect ledger records for those package(s) are stale. Warn once at
-/// the envelope level (JSON `warnings[]` and stderr) — and, for npm-family
-/// package(s) on a non-dry run, reconcile the ledger in place (cargo
-/// reverts + drops BEFORE vendoring in `vendor.rs`; npm-family needs no
-/// on-disk revert, since vendoring already overwrote the hosted splice and
-/// recorded it as the wiring `original`). The reverse direction
-/// (`redirect_supersedes_vendored`) is deliberately untouched.
-pub(super) async fn note_vendor_supersedes_redirect(
-    env: &mut crate::json_envelope::Envelope,
-    cwd: &Path,
-    common: &GlobalArgs,
-) {
-    // Only the package(s) the LIVE lockfile routes to `.socket/vendor/`.
-    let superseded = classify_overlap_takeover(common, cwd).await.vendored;
-    if superseded.is_empty() {
-        return;
-    }
-    // Reconciliation is gated, each fail-closed to the manual advisory:
-    // never under --dry-run; only npm-family purls (cargo reverts in
-    // vendor.rs, and other ecosystems' vendor wiring is not verified to
-    // embed the hosted originals); only purls classified above.
-    let (reconcilable, manual): (Vec<String>, Vec<String>) = if common.dry_run {
-        (Vec::new(), superseded)
-    } else {
-        superseded
-            .into_iter()
-            .partition(|purl| purl.starts_with("pkg:npm/"))
-    };
-    if !manual.is_empty() {
-        push_run_warning(
-            env,
-            common,
-            VENDOR_SUPERSEDES_REDIRECT,
-            mode_takeover_detail(&manual, /*current_is_hosted=*/ false),
-        );
-    }
-    if reconcilable.is_empty() {
-        return;
-    }
-    match reconcile_superseded_redirect(cwd, &reconcilable).await {
-        Ok(Some(npmrc)) => {
-            push_run_warning(
-                env,
-                common,
-                VENDOR_SUPERSEDES_REDIRECT,
-                mode_takeover_reconciled_detail(&reconcilable, npmrc.file_changed),
-            );
-            for (code, detail) in npmrc.warnings {
-                push_run_warning(env, common, &code, detail);
-            }
-        }
-        // Nothing matched to drop — do not claim a reconciliation that did
-        // not happen; hand out the manual remediation instead.
-        Ok(None) => push_run_warning(
-            env,
-            common,
-            VENDOR_SUPERSEDES_REDIRECT,
-            mode_takeover_detail(&reconcilable, /*current_is_hosted=*/ false),
-        ),
-        Err(e) => push_run_warning(
-            env,
-            common,
-            VENDOR_SUPERSEDES_REDIRECT,
-            format!(
-                "{} Automatic reconciliation failed ({e}); the ledger was left \
-                 as it was, so this warning will fire again until the cleanup \
-                 above succeeds.",
-                mode_takeover_detail(&reconcilable, /*current_is_hosted=*/ false)
-            ),
-        ),
-    }
 }
 
 /// Top-level `warnings[]` JSON for scan's envelope from `(code, detail)`
@@ -1366,7 +1119,7 @@ pub(super) async fn hosted_wiring_retained_purls(
     }
     let cwd = &common.cwd;
     let discovery = crate::commands::discover_wiring(common, cwd).await;
-    let mut liveness = LedgerLiveness::new(cwd, &discovery, Some(redirect));
+    let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
     let mut out = Vec::new();
     for (purl, uuid) in candidates {
         if liveness.redirect_record(&purl, uuid).await {
@@ -1379,28 +1132,20 @@ pub(super) async fn hosted_wiring_retained_purls(
 }
 
 /// Detail for [`HOSTED_WIRING_RETAINED`]. Names the package(s) and the
-/// real options — stay hosted, migrate via the vendored flow (which
-/// reconciles the superseded ledger entries per package), or unwind via
-/// `rollback`. It must never advise hand-deleting the redirect ledger
-/// (the only store of the pre-redirect originals plus the records VEX
-/// reads).
+/// real options — stay hosted, migrate via the vendored flow, or restore
+/// the upstream registry entries via `rollback`.
 pub(super) fn hosted_wiring_retained_detail(retained: &[String]) -> String {
     let list = retained.join(", ");
     format!(
         "agent-mode scan left the hosted redirect wiring live for: {list}. \
          The lockfile still resolves these package(s) to the hosted patch \
-         server and `.socket/vendor/redirect-state.json` still records the \
-         redirect — an agent run patches installed files in place but does \
+         server — an agent run patches installed files in place but does \
          NOT unwind hosted lockfile wiring, so installs keep fetching \
          these package(s) from the patch server. Either keep the project \
          in hosted mode (`scan --mode hosted`), migrate to committed \
          artifacts with `scan --mode vendored` (which takes these \
-         package(s) over in the lockfile and reconciles the superseded \
-         redirect ledger entries), or unwind the redirects with \
-         `socket-patch rollback`. Do not delete \
-         `.socket/vendor/redirect-state.json` by hand: it holds the \
-         recorded pre-redirect lockfile originals (the only revert data) \
-         and the redirect records VEX reads."
+         package(s) over in the lockfile), or restore their upstream \
+         registry entries with `socket-patch rollback`."
     )
 }
 
@@ -1429,22 +1174,19 @@ pub(super) fn vendored_ownership_retained_detail(purls: &[String]) -> String {
 }
 
 /// Additive top-level `redirectState` block for the scan `--json` envelope:
-/// the hosted redirect ledger's records — project STATE, so a descriptive
-/// block rather than a warning — plus the scanned purls whose hosted
-/// lockfile wiring the live lock still proves.
+/// the hosted pins the lockfiles wire — project STATE, so a descriptive
+/// block rather than a warning — plus the scanned purls among them.
 ///
-/// `None` (key omitted, additive contract) when the ledger is absent or its
-/// `records` are empty — an edits-only ledger asserts no patches.
+/// `None` (key omitted, additive contract) when no lockfile pins a hosted
+/// patch.
 ///
-/// Shape: `{ mode, ledger, records: [{purl, ledgerKey, uuid}], wiringLive:
-/// [purl] }`. `mode` is the constant [`crate::commands::HOSTED_MODE_LABEL`],
-/// never the ledger's own `mode` string (older ledgers carry `"redirect"`).
-/// Each record's `purl` is canonicalized (qualifiers stripped,
-/// percent-decoded) to the spelling `wiringLive` carries; `ledgerKey` is the
-/// ledger's verbatim key. `wiring_live` is the caller's
-/// [`hosted_wiring_retained_purls`] result, computed once per run. A record
-/// with no proof means the wiring was unwound, the lock is unreadable, or
-/// the purl was not crawled this run — never "still live".
+/// Shape: `{ mode, records: [{purl, uuid}], wiringLive: [purl] }`. `mode`
+/// is the constant [`crate::commands::HOSTED_MODE_LABEL`]. Each record's
+/// `purl` is canonicalized (qualifiers stripped, percent-decoded) to the
+/// spelling `wiringLive` carries. `wiring_live` is the caller's
+/// [`hosted_wiring_retained_purls`] result, computed once per run: the pins
+/// this run crawled (a pin whose package was not crawled is still wired,
+/// just not covered by this run).
 pub(super) fn redirect_state_json(
     redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
     wiring_live: &[String],
@@ -1460,14 +1202,12 @@ pub(super) fn redirect_state_json(
         .map(|(key, record)| {
             serde_json::json!({
                 "purl": canon(key),
-                "ledgerKey": key,
                 "uuid": record.uuid,
             })
         })
         .collect();
     Some(serde_json::json!({
         "mode": crate::commands::HOSTED_MODE_LABEL,
-        "ledger": socket_patch_core::patch::redirect::REDIRECT_STATE_REL,
         "records": records,
         "wiringLive": wiring_live,
     }))
@@ -1881,11 +1621,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 // `redirectState` rides the empty-discovery envelope too
                 // (same rule as the ≥1-package path). `wiringLive` is empty
                 // by construction: this run covered zero packages.
-                let redirect_state = crate::commands::load_redirect_state_lenient(
-                    &args.common.cwd,
-                    args.common.silent,
-                )
-                .await;
+                let redirect_state = (!args.common.is_global()).then_some(
+                    crate::commands::hosted_state_from_lockfiles(
+                        &args.common,
+                        &args.common.cwd,
+                    )
+                    .await,
+                );
                 if let Some(state) = redirect_state_json(redirect_state.as_ref(), &[]) {
                     result["redirectState"] = state;
                 }
@@ -2143,50 +1885,26 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 
     // Read existing manifest once for update detection.
     let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
-    // Hosted and vendored modes record their patches ONLY in their ledgers,
-    // so both ledgers' purl→uuid records are folded into update detection
-    // (otherwise their `updates[]` would stay empty). A malformed redirect
-    // ledger is only warned about here (--silent mutes it). A HOSTED run
-    // does not warn: its engine loads the ledger strictly and reports the
-    // corruption once as a hard error; the human hosted arm's returns
-    // BEFORE the engine (empty discovery, nothing downloadable, a
-    // detail-fetch failure) print it via `warn_unreported_corrupt_ledger`.
-    let (redirect_state, hosted_corrupt_ledger) = if hosted {
-        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
-            Ok(state) => (state, None),
-            Err(corrupt) => (None, Some(corrupt.to_string())),
-        }
-    } else {
-        // `load_redirect_state_lenient`, with the scan event flushed before
-        // its warning (possibly this run's first write since the event).
-        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
-            Ok(state) => (state, None),
-            Err(corrupt) => {
-                if !args.common.silent {
-                    telemetry.flush().await;
-                    eprintln!("Warning: {corrupt}");
-                }
-                (None, None)
-            }
-        }
-    };
-    // The hosted pins the lockfiles wire count too: the lockfile is the
-    // record of a hosted redirect even where no ledger was committed.
-    let hosted_pins: Vec<(String, String)> =
+    // Hosted mode records its patches ONLY in the lockfiles (v5 keeps no
+    // hosted ledger) and vendored mode ONLY in its ledger, so the hosted
+    // pins and the vendor ledger's purl→uuid records are folded into update
+    // detection (otherwise their `updates[]` would stay empty).
+    let hosted_pin_list: Vec<socket_patch_core::patch::redirect::upstream::HostedPin> =
         if args.common.is_global() {
             Vec::new()
         } else {
-            crate::commands::discover_wiring(&args.common, &args.common.cwd)
-                .await
-                .refs
-                .into_iter()
-                .filter(|r| r.mode == socket_patch_core::vex::discover::WiringMode::Hosted)
-                .map(|r| (r.purl, r.uuid))
-                .collect()
+            socket_patch_core::patch::redirect::upstream::HostedPin::all(
+                &crate::commands::discover_wiring(&args.common, &args.common.cwd).await,
+            )
         };
+    let redirect_state = (!args.common.is_global())
+        .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
+    let hosted_pins: Vec<(String, String)> = hosted_pin_list
+        .iter()
+        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
+        .collect();
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
-        redirect_state.as_ref(),
         vendor_state.as_ref().ok(),
         &hosted_pins,
     );
@@ -2477,7 +2195,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         if !silent {
             println!("\nNo patches available for installed packages.");
         }
-        warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
         return finish_human(0).await;
     }
 
@@ -2620,7 +2337,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         if !silent {
             println!("\nNo downloadable patches (paid subscription required).");
         }
-        warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
         return finish_human(0).await;
     }
 
@@ -2644,7 +2360,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             Ok(s) => s,
             // `discover_selected` already printed the failure to stderr.
             Err((code, _)) => {
-                warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
                 return code;
             }
         };

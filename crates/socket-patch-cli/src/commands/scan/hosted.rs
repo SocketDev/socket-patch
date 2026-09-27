@@ -2996,23 +2996,23 @@ pub(crate) async fn run_redirect_selected(
     };
 
     // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)
-    // may still claim package(s) this project also has a hosted redirect ledger
-    // for — their tarballs would then be orphaned and that ledger stale. But the
-    // overlap alone does NOT prove hosted won: only warn for the package(s) the
-    // LIVE lockfile actually routes to the hosted patch server (see
-    // `classify_overlap_takeover`), so a dry-run / no-op over a lock that still
-    // points at the vendored files stays silent instead of pointing cleanup at
-    // the live vendored ledger. The takeover pre-revert above already
-    // reconciled what it could; this only warns (JSON `warnings[]` and
-    // stderr) about any overlap left, WITHOUT deleting the other ledger.
-    // Classified over this run's in-memory ledgers — the redirect ledger as
-    // merged and persisted above, the vendored ledger as the takeover left
-    // it — so a non-dry-run reflects this run without re-reading either file.
+    // may still claim package(s) the lockfiles now pin hosted — their
+    // tarballs would then be orphaned and that ledger stale. But the overlap
+    // alone does NOT prove hosted won: only warn for the package(s) the LIVE
+    // lockfile actually routes to the hosted patch server (see
+    // `classify_overlap_takeover`), so a dry-run / no-op over a lock that
+    // still points at the vendored files stays silent instead of pointing
+    // cleanup at the live vendored ledger. The takeover pre-revert above
+    // already reconciled what it could; this only warns (JSON `warnings[]`
+    // and stderr) about any overlap left, WITHOUT deleting the other ledger.
+    // Classified over the lockfiles as this run left them and the vendored
+    // ledger as the takeover left it.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
+    let hosted_now = crate::commands::hosted_state_from_lockfiles(common, &common.cwd).await;
     let superseded = super::classify_overlap_takeover_with(
         common,
         &common.cwd,
-        Some(&ledger),
+        Some(&hosted_now),
         vendor_state.as_ref().ok(),
     )
     .await
@@ -3020,7 +3020,7 @@ pub(crate) async fn run_redirect_selected(
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
-            "detail": super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ true),
+            "detail": super::mode_takeover_detail(&superseded),
         }));
     }
 

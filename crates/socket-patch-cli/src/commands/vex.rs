@@ -1064,24 +1064,30 @@ async fn generate_vex_from_manifest_path_inner(
         }
     };
     let had_manifest_file = manifest_file.is_some();
-    // Both ledgers are attestation inputs (records, and the entries whose
-    // wiring liveness gates them), so a MALFORMED one is a hard error:
-    // attesting with its contents silently dropped would produce a false —
-    // or silently partial — document. A missing ledger is simply empty.
+    // The vendor ledger is an attestation input (records, and the entries
+    // whose wiring liveness gates them), so a MALFORMED one is a hard error
+    // (below). v5 hosted mode keeps no ledger: hosted references come from
+    // the lockfiles, their records from the API. A pre-v5 redirect ledger
+    // is read (never written) only as an extra local record source for the
+    // pins it still describes, so a malformed one is an advisory: its
+    // records are simply not consulted.
     let redirect = match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
     {
         Ok(state) => state,
         Err(corrupt) => {
-            // Not core's Display: that text ("... so it will not be
-            // overwritten") is written for the hosted `scan` writer, and
-            // `vex` only reads the ledger.
-            let message = format!(
-                "The redirect ledger {} is malformed ({}); cannot attest redirected patches. \
-                 Repair its JSON or restore it from version control, then re-run.",
-                corrupt.path.display(),
-                corrupt.detail
+            note_warning(
+                warnings,
+                common,
+                "redirect_ledger_corrupt",
+                format!(
+                    "the pre-v5 redirect ledger {} is malformed ({}); its records were not \
+                     consulted. socket-patch v5 no longer uses it: delete it, or restore it \
+                     from version control.",
+                    corrupt.path.display(),
+                    corrupt.detail
+                ),
             );
-            return Err(fail(common, "redirect_ledger_corrupt", message).await);
+            None
         }
     };
     let vendor = match socket_patch_core::vendor::load_state(&common.cwd).await {

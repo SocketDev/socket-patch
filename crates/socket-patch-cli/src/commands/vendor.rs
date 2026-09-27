@@ -823,13 +823,9 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
 
     note_classic_migration_risk(&mut env, &args.common.cwd, &args.common);
-    // Same cross-mode takeover advisory the scan-driven vendored flow emits:
-    // surface a redirect ledger that this run (or an earlier one) superseded.
-    super::scan::note_vendor_supersedes_redirect(&mut env, &args.common.cwd, &args.common).await;
 
-    // That advisory may persist the redirect ledger, so it ran under the
-    // lock; everything below is output and telemetry, so release the lock
-    // before the telemetry round-trip.
+    // Everything below is output and telemetry, so release the lock before
+    // the telemetry round-trip.
     drop(lock);
 
     if args.common.json {

@@ -98,6 +98,7 @@ async fn rollback_in_process(cwd: &Path, targets: Vec<String>, preserve_state: b
             json: true,
             yes: true,
             silent: true,
+            patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         one_off: false,
@@ -108,6 +109,46 @@ async fn rollback_in_process(cwd: &Path, targets: Vec<String>, preserve_state: b
     // nothing unsets it; scrub so a later in-process `scan`/`get` in this
     // `#[serial]` process isn't silently forced offline.
     std::env::remove_var("SOCKET_OFFLINE");
+    code
+}
+
+/// Serve the npm registry's version document for the real-flow fixture's
+/// package, so the upstream restore can re-resolve its pristine entry.
+async fn mock_npm_registry(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": NAME,
+            "version": VERSION,
+            "dist": {
+                "tarball": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                "integrity": "sha512-UPSTREAMupstream==",
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Bare in-process rollback that may reach the (mocked) npm registry: the
+/// upstream restore re-resolves each hosted pin's registry entry.
+async fn rollback_online(cwd: &Path, server: &MockServer) -> i32 {
+    std::env::set_var("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
+    let args = RollbackArgs {
+        targets: Vec::new(),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            json: true,
+            yes: true,
+            silent: true,
+            patch_server_url: Some("http://patch.test".to_string()),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        one_off: false,
+        preserve_state: false,
+    };
+    let code = rollback_run(args).await;
+    std::env::remove_var("SOCKET_NPM_REGISTRY");
     code
 }
 
@@ -501,11 +542,12 @@ async fn npm_hosted_round_trip() {
     );
     assert_ne!(wired, pristine, "wiring must actually change the lock");
     assert!(
-        ledger_path(tmp.path()).is_file(),
-        "scan --mode hosted must write the redirect ledger"
+        !ledger_path(tmp.path()).exists(),
+        "scan --mode hosted keeps no redirect ledger: the lockfile is the record"
     );
 
-    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
+    mock_npm_registry(&server).await;
+    let code = rollback_online(tmp.path(), &server).await;
     assert_eq!(code, 0, "bare rollback over hosted wiring should exit 0");
 
     let restored = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
