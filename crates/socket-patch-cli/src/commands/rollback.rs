@@ -1210,6 +1210,42 @@ pub async fn run(args: RollbackArgs) -> i32 {
         HostedPin::all(&crate::commands::discover_wiring(&args.common, &cwd).await);
 
     if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
+        // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
+        // so there is nothing to restore — retire the stale file (a wet run
+        // only) instead of failing on the missing manifest.
+        let legacy = cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+        if tokio::fs::symlink_metadata(&legacy).await.is_ok() {
+            let warning = retire_legacy_redirect_ledger(&args.common).await;
+            if args.common.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "success",
+                        "rolledBack": 0,
+                        "alreadyOriginal": 0,
+                        "failed": 0,
+                        "dryRun": args.common.dry_run,
+                        "warnings": warning
+                            .iter()
+                            .map(|(code, detail)| serde_json::json!({
+                                "code": code, "detail": detail,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "legacyRedirectLedgerRemoved": warning.is_none() && !args.common.dry_run,
+                    }))
+                    .expect("serializing an in-memory JSON value cannot fail")
+                );
+            } else if let Some((code, detail)) = &warning {
+                eprintln!("Warning ({code}): {}", capitalize_first(detail));
+            } else if !args.common.silent {
+                println!(
+                    "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
+                    if args.common.dry_run { "Would remove" } else { "Removed" },
+                    socket_patch_core::patch::redirect::REDIRECT_STATE_REL
+                );
+            }
+            return 0;
+        }
         // Ledger-less but still wired? (a deleted/uncommitted state.json
         // with lockfiles still consuming `.socket/vendor/` artifacts is a
         // supported recovery state — `repair` reconstructs the ledger.)

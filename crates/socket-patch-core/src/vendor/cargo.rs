@@ -4201,12 +4201,12 @@ mod tests {
         );
     }
 
-    /// FAIL CLOSED: vendoring over a LIVE hosted redirect with no ledger to
-    /// revert it must refuse — proceeding would record the hosted registry
+    /// FAIL CLOSED: vendoring over a LIVE hosted redirect the upstream
+    /// restore did not undo must refuse — proceeding would record the hosted registry
     /// values as the entry's "originals" and leave Cargo.toml pinned to the
     /// hosted registry (unbuildable in both modes) while reporting success.
     #[tokio::test]
-    async fn test_refuses_live_hosted_redirect_without_ledger() {
+    async fn test_refuses_live_hosted_redirect_left_unrestored() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let index = "sparse+http://127.0.0.1:5555/index/";
@@ -4243,7 +4243,12 @@ mod tests {
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
             "hosted_redirect_live",
         );
-        assert!(detail.contains("redirect-state.json"), "{detail}");
+        assert!(
+            detail.contains("socket-patch rollback")
+                && detail.contains("git checkout -- Cargo.toml Cargo.lock"),
+            "the refusal names the restore remedies: {detail}"
+        );
+        assert!(!detail.contains("redirect-state.json"), "{detail}");
         // Nothing was half-vendored.
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
 
