@@ -547,9 +547,10 @@ conservative setting. An unset, empty or non-numeric value leaves the defaults i
 A throttled patch API is retried, within bounds. An HTTP `429` or `503` answer to any
 patch-API query (batch search, patch lists, patch views, VEX record fetches, hosted
 package references) is retried up to 3 times, waiting as long as the server's
-`Retry-After` asks (seconds or an HTTP date, at most 30 s per wait) or, without one,
-0.5 s, 1 s, 2 s with jitter. All waits in one run share a 60 s budget, so a heavily
-throttled run gives up quickly instead of hanging. `SOCKET_API_MAX_RETRIES=<n>` changes
+`Retry-After` asks (seconds or an HTTP date; a request asked to wait more than 30 s gives
+up at once) or, without one, 0.5 s, 1 s, 2 s with jitter. All retries in one run must
+finish within 60 s of the run's first retry (wall-clock: requests waiting in parallel
+don't add up), so a heavily throttled run gives up instead of hanging. `SOCKET_API_MAX_RETRIES=<n>` changes
 the per-request count (`0`-`10`; `0` turns retries off). Other errors are never retried.
 A query still throttled after its retries is reported, never dropped: a failed batch
 prints `Warning: API batch <n> of <total> failed: …` (under `--json`, a top-level
