@@ -27,6 +27,8 @@ use crate::vex::discover::{Discovery, PatchedRef, WiringMode};
 
 mod cargo;
 mod client;
+mod composer;
+mod gem;
 mod golang;
 mod npm;
 
@@ -261,6 +263,8 @@ enum Format {
     BunLock,
     Cargo,
     Golang,
+    Gem,
+    Composer,
     Unsupported,
 }
 
@@ -273,6 +277,8 @@ fn format_of(rel: &str) -> Format {
         "bun.lock" => Format::BunLock,
         "Cargo.toml" | "Cargo.lock" | "config.toml" | "config" => Format::Cargo,
         "go.mod" | "go.sum" | "go.work" => Format::Golang,
+        "Gemfile.lock" | "gems.locked" | "Gemfile" | "gems.rb" => Format::Gem,
+        "composer.lock" => Format::Composer,
         _ => Format::Unsupported,
     }
 }
@@ -387,6 +393,8 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::BunLock => npm::restore_bun_locks(view, &pins, &files, ctx).await,
             Format::Cargo => cargo::restore(view, &pins, &files, ctx).await,
             Format::Golang => golang::restore(view, &pins, &files, ctx).await,
+            Format::Gem => gem::restore(view, &pins, &files, ctx).await,
+            Format::Composer => composer::restore(view, &pins, &files, ctx).await,
             Format::Unsupported => {
                 let mut r = FormatResult::default();
                 for pin in &pins {

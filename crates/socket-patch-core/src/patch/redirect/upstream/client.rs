@@ -52,6 +52,79 @@ fn crates_index_path(name: &str) -> String {
     }
 }
 
+/// The RubyGems compact index root; override with `SOCKET_RUBYGEMS_URL`.
+pub(crate) const DEFAULT_RUBYGEMS: &str = "https://rubygems.org";
+
+fn rubygems_base() -> String {
+    std::env::var("SOCKET_RUBYGEMS_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_RUBYGEMS.to_string())
+}
+
+/// Packagist's composer v2 metadata repository; override with
+/// `SOCKET_PACKAGIST_URL`.
+pub(crate) const DEFAULT_PACKAGIST: &str = "https://repo.packagist.org";
+
+fn packagist_base() -> String {
+    std::env::var("SOCKET_PACKAGIST_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_PACKAGIST.to_string())
+}
+
+/// The `checksum:` (sha256 hex of the `.gem`) a compact-index `info/<name>`
+/// file records for the ruby-platform `version` — the value bundler writes
+/// into `CHECKSUMS`. Lines are `<version>[-<platform>] <deps>|<reqs>`, the
+/// requirement list carrying `checksum:<hex>`.
+pub(crate) fn compact_index_checksum(info: &str, version: &str) -> Option<String> {
+    info.lines().find_map(|line| {
+        let (head, reqs) = line.split_once('|')?;
+        let token = head.split(' ').next()?;
+        if token != version {
+            return None;
+        }
+        reqs.split(',')
+            .find_map(|r| r.trim().strip_prefix("checksum:"))
+            .and_then(crate::utils::digest::sha256_hex)
+    })
+}
+
+/// Expand a packagist `p2` version list. `minified: composer/2.0` documents
+/// (composer's `MetadataMinifier`) list each version as the DIFF against the
+/// previous expanded one: every key it carries replaces the inherited value,
+/// and the string `"__unset"` removes the key.
+pub(crate) fn expand_packagist_versions(versions: &[Value], minified: bool) -> Vec<Value> {
+    if !minified {
+        return versions.to_vec();
+    }
+    let mut out = Vec::with_capacity(versions.len());
+    let mut current: Option<serde_json::Map<String, Value>> = None;
+    for v in versions {
+        let Some(obj) = v.as_object() else {
+            continue;
+        };
+        let next = match current.take() {
+            None => obj.clone(),
+            Some(mut prev) => {
+                for (k, val) in obj {
+                    if val.as_str() == Some("__unset") {
+                        prev.remove(k);
+                    } else {
+                        prev.insert(k.clone(), val.clone());
+                    }
+                }
+                prev
+            }
+        };
+        out.push(Value::Object(next.clone()));
+        current = Some(next);
+    }
+    out
+}
+
 /// The offline refusal every lookup returns under `--offline`.
 pub(crate) const OFFLINE: &str =
     "the upstream entry must be re-resolved from the registry, and this run is offline";
@@ -67,6 +140,8 @@ pub(crate) struct UpstreamClient {
     npm_tarballs: Cache<Vec<u8>>,
     cargo: Cache<String>,
     go: Cache<GoSums>,
+    rubygems: Cache<String>,
+    packagist: Cache<Vec<Value>>,
 }
 
 impl UpstreamClient {
@@ -78,6 +153,8 @@ impl UpstreamClient {
             npm_tarballs: Mutex::default(),
             cargo: Mutex::default(),
             go: Mutex::default(),
+            rubygems: Mutex::default(),
+            packagist: Mutex::default(),
         }
     }
 
@@ -244,6 +321,68 @@ impl UpstreamClient {
         self.go.lock().await.insert(key, result.clone());
         result
     }
+
+    /// The rubygems.org sha256 of the ruby-platform `name-version.gem`,
+    /// from the compact index bundler itself reads (`info/<name>`).
+    pub(crate) async fn rubygems_sha256(&self, name: &str, version: &str) -> Result<String, String> {
+        let key = (name.to_string(), version.to_string());
+        if let Some(hit) = self.rubygems.lock().await.get(&key) {
+            return hit.clone();
+        }
+        let result = async {
+            if self.offline {
+                return Err(OFFLINE.to_string());
+            }
+            if !crate::vendor::gemfile_lock::is_plain_gem_token(name) {
+                return Err(format!("{name:?} is not a plain gem name"));
+            }
+            let url = format!("{}/info/{name}", rubygems_base());
+            let text = self.get_text(&url).await?;
+            compact_index_checksum(&text, version)
+                .ok_or_else(|| format!("{url} lists no ruby-platform {version} with a checksum"))
+        }
+        .await;
+        self.rubygems.lock().await.insert(key, result.clone());
+        result
+    }
+
+    /// Every version packagist serves for the composer package `name`
+    /// (lowercase `vendor/package`), expanded: the stable `p2/<name>.json`
+    /// list, or the `~dev` one when `dev` (composer splits branches out).
+    pub(crate) async fn packagist_versions(&self, name: &str, dev: bool) -> Result<Vec<Value>, String> {
+        let key = (name.to_string(), if dev { "~dev" } else { "" }.to_string());
+        if let Some(hit) = self.packagist.lock().await.get(&key) {
+            return hit.clone();
+        }
+        let result = async {
+            if self.offline {
+                return Err(OFFLINE.to_string());
+            }
+            let safe = name.split('/').count() == 2
+                && name.split('/').all(|p| {
+                    !p.is_empty()
+                        && !p.starts_with('.')
+                        && p.bytes().all(|b| {
+                            b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)
+                        })
+                });
+            if !safe {
+                return Err(format!("{name:?} is not a packagist package name"));
+            }
+            let url = format!("{}/p2/{name}{}.json", packagist_base(), key.1);
+            let doc = self.get_json(&url).await?;
+            let versions = doc
+                .get("packages")
+                .and_then(|p| p.get(name))
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{url} lists no versions of {name}"))?;
+            let minified = doc.get("minified").and_then(Value::as_str) == Some("composer/2.0");
+            Ok(expand_packagist_versions(versions, minified))
+        }
+        .await;
+        self.packagist.lock().await.insert(key, result.clone());
+        result
+    }
 }
 
 /// Go's checksum database, `sum.golang.org`; `SOCKET_GOSUMDB_URL` names
@@ -296,6 +435,37 @@ mod tests {
         assert_eq!(crates_index_path("ab"), "2/ab");
         assert_eq!(crates_index_path("abc"), "3/a/abc");
         assert_eq!(crates_index_path("Serde"), "se/rd/serde");
+    }
+
+    #[test]
+    fn compact_index_checksum_picks_the_ruby_platform_line() {
+        let sha = "a".repeat(64);
+        let other = "b".repeat(64);
+        let info = format!(
+            "---\n1.0.0 |checksum:{other}\n1.1.0 dep:>= 0|checksum:{sha},ruby:>= 2.7\n\
+             1.1.0-java |checksum:{other}\n"
+        );
+        assert_eq!(compact_index_checksum(&info, "1.1.0"), Some(sha));
+        assert_eq!(compact_index_checksum(&info, "2.0.0"), None);
+        assert_eq!(compact_index_checksum("1.0.0 |ruby:>= 2", "1.0.0"), None);
+    }
+
+    #[test]
+    fn packagist_minified_versions_inherit_and_unset() {
+        let versions = serde_json::json!([
+            {"name": "a/b", "version": "2.0.0", "source": {"type": "git"}, "dist": {"url": "x"}},
+            {"version": "1.0.0", "source": "__unset"},
+            {"version": "0.9.0", "dist": {"url": "y"}}
+        ]);
+        let expanded = expand_packagist_versions(versions.as_array().unwrap(), true);
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded[1]["name"], "a/b");
+        assert!(expanded[1].get("source").is_none());
+        assert_eq!(expanded[1]["dist"]["url"], "x");
+        assert!(expanded[2].get("source").is_none());
+        assert_eq!(expanded[2]["dist"]["url"], "y");
+        let raw = expand_packagist_versions(versions.as_array().unwrap(), false);
+        assert!(raw[1].get("name").is_none());
     }
 
     #[test]
