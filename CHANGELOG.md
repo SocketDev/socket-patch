@@ -22,8 +22,10 @@ into the new version's section — see docs/releasing.md.
 > manifest-free, moves vendored cargo wiring from `.cargo/config*` into
 > `Cargo.toml`, tags vendored cargo copies' versions with `+socket.<uuid>`
 > (visible to the patched crate as `CARGO_PKG_VERSION`), turns a plain
-> non-TTY `scan` report-only, and makes `vex`
-> refuse to attest stale ledger records and corrupt vendor ledgers — all
+> non-TTY `scan` report-only, makes `vex`
+> refuse to attest stale ledger records and corrupt vendor ledgers, and
+> retries a throttled patch API (new error text, added waiting, a throttled
+> package failing its legacy-proxy batch) — all
 > MAJOR per CLI_CONTRACT.md's semver policy — so it ships as the next major
 > release (v5.0).
 
@@ -261,7 +263,50 @@ into the new version's section — see docs/releasing.md.
   (`wiring_conflict`), and when the lockfile wires a package to patch U, a
   manifest or ledger record for it under another uuid is superseded.
 
+- **A throttled patch API is retried with a bounded backoff.** An HTTP
+  429 or 503 from the patch API made the affected batch (or patch-list
+  query) fail on the first answer — likelier now that up to 32 requests are
+  in flight. Now every patch-API JSON call (batch search, per-package patch
+  lists, patch views and VEX record fetches, hosted package references)
+  retries a 429 / 503 up to 3 times: it waits as long as `Retry-After` asks
+  (delta-seconds or HTTP-date; one over 30 s is not waited out — the answer
+  is final at once — and one under the jittered first step, such as `0` or a
+  past date, waits that step), otherwise 0.5 s, 1 s, 2 s (steps capped at
+  8 s, jittered into their upper half). All retries in a run must end
+  within a 60 s wall-clock window opened by the run's first retry, so a
+  throttled run adds at most about a minute however many requests it makes
+  (requests waiting in parallel each keep their retries).
+  `SOCKET_API_MAX_RETRIES=<n>` (0-10) changes the count; `0` restores the
+  old single attempt. Nothing else is retried: 401/403 still trigger the
+  proxy fallback at once, and the public proxy's permanent `503 "Patch API
+  is not configured"` is never retried on any path (the batch still
+  degrades to per-package lookups at once; a per-package lookup answering
+  it is still skipped). Output folds in request order exactly as an
+  unthrottled run's. What breaks: a throttled run now takes longer before
+  it fails (up to ~60 s of added waiting); the error text changes — it
+  names why retrying stopped (`Rate limit exceeded (HTTP 429, gave up after
+  3 retries). Please try again later.`, `API request failed with status
+  503: <body> (gave up after 3 retries)`, `(Retry-After 120 s exceeds the
+  30 s retry cap)`, `(the run's 60 s retry window has closed)`); and on
+  the token-less legacy per-package proxy path (a proxy without `POST
+  /patch/batch`) a package still throttled after its retries now fails its
+  whole batch query — every package in that batch goes unchecked and the
+  batch is reported as failed (warning, or the all-failed error when it was
+  the only batch) — instead of that one package being skipped silently.
+
 ### Added
+
+- **`--json` reports a failed patch-API query as a warning.** Under
+  `--json`, a batch query that failed (after the bounded retry above) while
+  others succeeded vanished from the envelope without a trace, exit 0, and
+  the agent / hosted / vendored flows' failed per-package patch-list
+  queries did the same; the human run already warned on stderr. Each is now
+  a run-level `warnings[]` entry carrying the human line's text:
+  `{code: "api_batch_failed", detail: "API batch <n> of <total> failed:
+  <error>"}` (in batch order) and `{code: "patch_details_failed", detail:
+  "could not fetch details for <purl>: <error>"}`. Additive: `status` and
+  the exit code are unchanged while some query succeeded, and the
+  all-failed error envelope and exit 1 still apply when none did.
 
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
@@ -1265,32 +1310,6 @@ into the new version's section — see docs/releasing.md.
   on top of it. Output is unchanged — every window folds its
   answers in request order — but a large monorepo's hosted scan at 100 ms of
   latency drops from ~20 s to ~9 s.
-
-- **Behavior change: a throttled patch API is retried, and a batch that
-  still fails is reported under `--json`.** An HTTP 429 or 503 from the
-  patch API made the affected batch (or patch-list query) fail on the first
-  answer; under `--json` a failed batch among successful ones then vanished
-  from the envelope without a trace, exit 0 — likelier now that up to 32
-  requests are in flight. Now every patch-API JSON call (batch search,
-  per-package patch lists, patch views and VEX record fetches, hosted
-  package references) retries a 429 / 503 up to 3 times: it waits as long
-  as `Retry-After` asks (delta-seconds or HTTP-date, at most 30 s per
-  wait), otherwise 0.5 s, 1 s, 2 s (steps capped at 8 s, jittered into
-  their upper half), and every wait in the run draws from one 60 s budget
-  so a throttled run cannot hang. `SOCKET_API_MAX_RETRIES=<n>` (0-10)
-  changes the count; `0` restores the old single attempt. Nothing else is
-  retried (401/403 still trigger the proxy fallback at once), and output
-  folds in request order exactly as an unthrottled run's. A query still
-  throttled after that is a failure where its siblings already report
-  theirs: the human `Warning: API batch <n> of <total> failed: …` /
-  `Warning: could not fetch details for <purl>: …` lines, and — new — the
-  same text as run-level `warnings[]` entries (`api_batch_failed`,
-  `patch_details_failed`) in the `--json` envelope (additive; status and
-  exit code unchanged while some query succeeded, the all-failed error
-  and exit 1 when none did). The error text names the retries (`Rate
-  limit exceeded (HTTP 429, gave up after 3 retries). Please try again
-  later.`). On the token-less legacy per-package proxy path a package
-  still throttled now fails its batch instead of being skipped silently.
 
 - **The crawl's directory walks run on 4 threads by default.** The walk
   pool behind the `node_modules` walk and the Maven repository walk (and its
