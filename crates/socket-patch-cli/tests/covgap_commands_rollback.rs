@@ -149,6 +149,11 @@ struct PatchedFixture {
     purl: &'static str,
     before: &'static [u8],
     after: &'static [u8],
+    // Read only by the macOS immutable-flag tests.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    before_hash: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    after_hash: String,
 }
 
 fn patched_fixture() -> PatchedFixture {
@@ -177,6 +182,8 @@ fn patched_fixture() -> PatchedFixture {
         purl,
         before,
         after,
+        before_hash,
+        after_hash,
     }
 }
 
