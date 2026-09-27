@@ -103,6 +103,46 @@ patch-UI review.
   `../depscan` (grep for `socket-patch`, `vendor-source`, `npm_pack`,
   `hosted-bundle`, napi usage) before deleting anything; if used, keep it as
   a library path.
+- **Depscan check (done 2026-09-27, SocketDev/depscan master 784013d6):**
+  depscan does **not** use the CLI's local rebuild/pack path.
+  - Server-side prebuilt packages (what patch.socket.dev and the CLI's
+    `--vendor-source service|auto` download) are built by depscan's own
+    TypeScript **patch-package-converter** (`workspaces/patches/src/repack/`:
+    per-ecosystem repackers, upstream downloaders, `berry-cache-zip.ts` — a
+    TS port of `berry_zip.rs`, not a call into it). It re-downloads the
+    upstream archive, verifies `before_sha` + the registry digest, applies
+    the patched bytes and repacks. No spawn/exec of `socket-patch`, no napi.
+  - The `socket-patch` binary appears in depscan only as: the
+    `submodules/socket-patch` build for the autotester image and dev tools
+    (`tools/validate-patch.ts`, `tools/patch-mode-smoke.ts`) — both drive
+    `apply`/`scan`; `pnpm dlx @socketsecurity/socket-patch apply` postinstall
+    snippets; the `@socketsecurity/socket-patch/schema` manifest-schema
+    re-export; and the api-v0 e2e suites (`89`–`94_socket-patch-vendor-*`,
+    `82_…telemetry-coverage` runs `repair` on an empty manifest) that drive
+    the real CLI against the live API. `hosted-bundle`, `vendor-source`,
+    `npm_pack` and `socket-patch-node` have no production references.
+  - Consequence: `npm_pack.rs`, `pypi_wheel.rs`, `berry_zip.rs`,
+    `registry_fetch.rs`, `prestage.rs` are **CLI-internal**. They stay for
+    now anyway: they are the CLI's own `--vendor-source build` / `auto`
+    fallback (offline and service-outage vendoring) and `prestage.rs` +
+    `registry_fetch::artifact_matches_integrity` also serve the service
+    path. Dropping the local build is a separate product decision (it
+    would make vendoring service-only), not part of WS5.
+  - Side note for WS1: `workspaces/app/src/autopatch-pr/github-patch-pr-hosted.ts`
+    still writes `.socket/vendor/redirect-state.json` into hosted PRs so a
+    post-install `socket-patch vex` can attest them; WS1's "never write the
+    ledger" needs a depscan follow-up (or vex keeps reading it).
+- **Done in WS5:** `commands/vendored_backend.rs` owns `VendoredBackend {
+  apply, revert, repair }`. `vendor`, `scan --mode vendored` (JSON and
+  interactive arms) and `get --mode vendored` all go through `apply`
+  (in-memory staging → `vendor_records_reusing` → per-package ledger
+  persist); `vendor --revert`, `rollback`'s vendored leg and both of
+  `remove`'s paths go through `revert`; `repair` goes through `repair`,
+  which health-checks ledger entries and re-vendors broken ones through the
+  same `apply` engine (patch.socket.dev prebuilt first under the default
+  `--vendor-source auto`, local build as the fallback). Lockfile references
+  with no ledger entry are reported (`vendor_ledger_missing`), never
+  re-synthesized.
 
 ### WS6 — Unified ledgers/context  *(branch `v5/project-context`)*
 - After WS1 only two stores remain (manifest for agent mode, vendor
