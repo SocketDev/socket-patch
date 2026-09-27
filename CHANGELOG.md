@@ -50,7 +50,11 @@ into the new version's section — see docs/releasing.md.
   `download.failed` rises by the number of such packages, and the vendor
   envelope no longer carries their `failed` events (`vendor.summary.failed`
   drops by the same number) nor, for lockfile-only packages, their
-  `vendor_fetched_missing` events. Exit code and `status` are unchanged.
+  `vendor_fetched_missing` events. Exit code and the top-level `status`
+  are unchanged; the nested `vendor.status` becomes `success` when those
+  refusals were the vendor step's only failures (and when every selected
+  package is refused this way, the human arm prints `Nothing was
+  vendored: N patches failed (see above).`).
   (The interactive human `scan --vendor` arm still fetches the views its
   pre-prompt baseline check verifies.) Purls the hosted redirect ledger
   claims keep the vendor loop's refusal. Because no view is fetched, the
