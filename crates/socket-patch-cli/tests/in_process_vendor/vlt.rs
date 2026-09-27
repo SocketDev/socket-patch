@@ -576,11 +576,13 @@ fn vendor_vlt_refuses_multi_field_declaration() {
 
 #[test]
 fn vendor_vlt_out_of_sync() {
-    refused_with(
+    let detail = refused_with(
         &direct_lock().render(),
         &ROOT_PKG.replace("\"1.3.0\"", "\"^1.3.0\""),
         "vendor_vlt_lock_out_of_sync",
     );
+    assert!(detail.contains("but vlt-lock.json locks"), "{detail}");
+    assert!(detail.contains("run `vlt install` first"), "{detail}");
 }
 
 #[test]
