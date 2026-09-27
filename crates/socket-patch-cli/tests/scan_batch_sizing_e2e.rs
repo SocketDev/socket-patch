@@ -1,8 +1,10 @@
 //! How `scan` sizes its batch requests: unset, `--batch-size` follows the
 //! endpoint (500 purls per POST on the authenticated API — the server's own
 //! per-request maximum — and 100 on the public proxy); a given size
-//! (`--batch-size` or `SOCKET_BATCH_SIZE`) wins on either; and a chunk whose
-//! body would exceed 256 KiB is split into consecutive smaller chunks.
+//! (`--batch-size` or `SOCKET_BATCH_SIZE`) wins on either; a chunk whose
+//! body would exceed 256 KiB is split into consecutive smaller chunks; and a
+//! mid-run downgrade to the proxy keeps the chunk boundaries the run started
+//! with.
 //!
 //! Subprocess runs scrub the `SOCKET_*` environment (the
 //! `scan_ordered_concurrency_e2e.rs::scrubbed_cli` pattern) so ambient
@@ -211,4 +213,71 @@ async fn an_oversize_chunk_is_split_at_the_body_cap() {
     all.sort();
     all.dedup();
     assert_eq!(all.len(), 1300);
+}
+
+/// A 401 from the authenticated batch endpoint downgrades the run to the
+/// public proxy, which then gets the SAME 500-purl chunks: the failed chunk
+/// retried as-is, the rest as cut. The downgrade does not re-chunk at the
+/// proxy's own 100-purl default (every chunk is within the proxy's body cap
+/// by construction), it warns once, and the run still succeeds.
+#[tokio::test]
+async fn a_mid_run_downgrade_keeps_the_500_purl_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path(), 1001, 12);
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(AUTH_BATCH_ROUTE))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(PROXY_BATCH_ROUTE))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [], "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = scrubbed_cli();
+    cmd.arg("scan")
+        .args(["--json", "--cwd", tmp.path().to_str().unwrap()])
+        .args(["--api-url", &server.uri(), "--proxy-url", &server.uri()])
+        .args(["--api-token", "fake-token-for-test", "--org", ORG])
+        .env("SOCKET_NO_CONFIG", "1");
+    let out = cmd.output().expect("run socket-patch scan");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("scan --json envelope");
+    assert_eq!(v["status"], "success", "{stdout}");
+
+    let auth = batch_bodies(&server, AUTH_BATCH_ROUTE).await;
+    assert_eq!(
+        sizes(&auth),
+        vec![500],
+        "the first chunk goes alone, then downgrades"
+    );
+    let proxy = batch_bodies(&server, PROXY_BATCH_ROUTE).await;
+    assert_eq!(
+        sizes(&proxy),
+        vec![500, 500, 1],
+        "the proxy gets the run's own chunks, not a 100-purl re-chunk"
+    );
+    assert_eq!(
+        components(&auth[0]),
+        components(&proxy[0]),
+        "the failed chunk is retried as-is, first"
+    );
+    assert_eq!(
+        stderr
+            .matches("falling back to public patch API proxy")
+            .count(),
+        1,
+        "{stderr}"
+    );
 }
