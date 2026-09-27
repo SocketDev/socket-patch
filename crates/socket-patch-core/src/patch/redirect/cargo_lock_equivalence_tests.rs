@@ -5,7 +5,7 @@
 //! `next_lock_block`) is a function of the bound alone, so equality at every
 //! body offset of every lock shape is equality of the rewriter.
 
-use super::*;
+use crate::formats::cargo::hosted::{lock_block_end, lock_block_end_unbounded, next_lock_block};
 
 /// Deterministic xorshift64* — no `rand` dev-dependency.
 struct Rng(u64);

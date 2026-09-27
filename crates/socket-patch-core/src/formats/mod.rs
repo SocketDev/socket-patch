@@ -23,6 +23,7 @@
 //! [`registry()`] is the one table of which project files carry a lock or
 //! its wiring, and in which roles.
 
+pub mod cargo;
 pub mod pnpm;
 pub mod registry;
 
