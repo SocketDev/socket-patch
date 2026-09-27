@@ -147,14 +147,41 @@ fn vex_product_list_renders_one_item_per_line() {
 fn root_command_list_uses_the_verb_form() {
     let text = long_help(&[]);
     assert!(
-        text.contains("Roll back patches to restore original files"),
+        text.contains("Undo patches: restore original files and unwind hosted or vendored lockfile wiring"),
         "{text}"
     );
     assert!(!text.contains("Rollback patches"), "{text}");
     assert!(
-        text.contains("Wire install hooks (npm, Python, Bundler, Composer)"),
+        text.contains("Agent mode: wire install hooks (npm, Python, Bundler, Composer)"),
         "{text}"
     );
+}
+
+/// v5 leads with scan, vex, vendor and list; the agent-mode commands follow.
+#[test]
+fn root_command_list_leads_with_the_v5_workflow() {
+    let text = long_help(&[]);
+    let order: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("  "))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| {
+            [
+                "scan", "vex", "vendor", "list", "get", "apply", "setup", "rollback", "remove",
+                "repair",
+            ]
+            .contains(w)
+        })
+        .collect();
+    assert_eq!(
+        &order[..10],
+        [
+            "scan", "vex", "vendor", "list", "get", "apply", "setup", "rollback", "remove",
+            "repair"
+        ],
+        "{text}"
+    );
+    assert!(text.contains("Typical workflow:"), "{text}");
 }
 
 #[test]
@@ -167,17 +194,15 @@ fn vendor_and_repair_summaries_read_as_one_line() {
     );
     assert!(
         text.lines().any(|l| l
-            == "  repair    Download missing patch artifacts and clean up unused ones [aliases: gc]"),
+            == "  repair    Agent mode: download missing patch artifacts and clean up unused ones [aliases: gc]"),
         "{text}"
     );
     let repair = long_help(&["repair"]);
     assert!(
         repair.starts_with(
-            "Download missing patch artifacts and clean up unused ones\n\n\
+            "Agent mode: download missing patch artifacts and clean up unused ones\n\n\
              Restores missing blobs and diff/package archives, rebuilds missing or corrupt \
-             vendored artifacts, then deletes the artifacts nothing references. It needs no \
-             scan; for the combined workflow (discover, apply, clean up) use \
-             `scan --sync --json --yes`.\n"
+             vendored artifacts, then deletes the artifacts nothing references.\n"
         ),
         "{repair}"
     );

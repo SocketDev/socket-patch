@@ -23,9 +23,15 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "socket-patch",
-    about = "CLI tool for applying security patches to dependencies",
+    about = "Patch vulnerable dependencies with Socket's security patches",
     version,
-    propagate_version = true
+    propagate_version = true,
+    after_help = "Typical workflow:\n  \
+        socket-patch scan      Patch dependencies (rewrites lockfiles to Socket-hosted patched packages)\n  \
+        socket-patch vex       Emit an OpenVEX document for your vulnerability scanner\n  \
+        socket-patch vendor    Eject the patches into .socket/vendor/ for offline installs\n  \
+        socket-patch list      Show the patches in this project\n\n\
+        get, apply, setup, rollback, remove and repair are the older agent-mode commands."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -50,14 +56,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Scan installed packages for available security patches
+    /// Find patches for installed packages and apply them by rewriting
+    /// lockfiles to Socket-hosted patched packages
     Scan(commands::scan::ScanArgs),
 
-    /// Apply security patches to dependencies
-    Apply(commands::apply::ApplyArgs),
-
-    /// Generate an OpenVEX 0.2.0 attestation describing the
-    /// vulnerabilities mitigated by the applied patches.
+    /// Generate an OpenVEX 0.2.0 document for the vulnerabilities the
+    /// project's patches fix
     Vex(commands::vex::VexArgs),
 
     /// Eject patched dependencies into committable `.socket/vendor/` and
@@ -67,29 +71,34 @@ pub enum Commands {
     /// Socket API needed.
     Vendor(commands::vendor::VendorArgs),
 
-    /// Wire install hooks (npm, Python, Bundler, Composer) that re-apply
-    /// patches after install
-    Setup(commands::setup::SetupArgs),
+    /// List the patches in this project: hosted and vendored lockfile
+    /// references plus any agent-mode manifest entries
+    List(commands::list::ListArgs),
 
-    /// Roll back patches to restore original files
-    Rollback(commands::rollback::RollbackArgs),
-
-    /// Get security patches from the Socket API and apply them
+    /// Agent mode: get a patch from the Socket API and apply it
     #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
-    /// List all patches in the local manifest
-    List(commands::list::ListArgs),
+    /// Agent mode: apply the patches in `.socket/manifest.json` in place
+    Apply(commands::apply::ApplyArgs),
 
-    /// Remove a patch from the manifest by PURL or UUID (rolls back files first)
+    /// Agent mode: wire install hooks (npm, Python, Bundler, Composer) that
+    /// re-apply patches after install
+    Setup(commands::setup::SetupArgs),
+
+    /// Undo patches: restore original files and unwind hosted or vendored
+    /// lockfile wiring
+    Rollback(commands::rollback::RollbackArgs),
+
+    /// Agent mode: remove a patch from the manifest by PURL or UUID (rolls
+    /// back files first)
     Remove(commands::remove::RemoveArgs),
 
-    /// Download missing patch artifacts and clean up unused ones
+    /// Agent mode: download missing patch artifacts and clean up unused ones
     ///
     /// Restores missing blobs and diff/package archives, rebuilds missing
     /// or corrupt vendored artifacts, then deletes the artifacts nothing
-    /// references. It needs no scan; for the combined workflow (discover,
-    /// apply, clean up) use `scan --sync --json --yes`.
+    /// references.
     #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
 
