@@ -1037,6 +1037,43 @@ async fn npm_berry_vendor_frozen_install_chain() {
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
 }
 
+/// The npm image carries vlt 1.2.0 for the setup-matrix `pm: vlt` cases
+/// (a non-gating extra: the gating vlt assertions are the real-vlt
+/// capstones).
+#[test]
+fn npm_image_vlt_smoke() {
+    let out = if host_mode() {
+        Command::new("vlt").arg("--version").output()
+    } else {
+        if skip_if_no_docker_image() {
+            return;
+        }
+        Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "socket-patch-test-npm:latest",
+                "bash",
+                "-c",
+                "VLT_TELEMETRY=0 vlt --version",
+            ])
+            .output()
+    };
+    let Ok(out) = out else {
+        eprintln!("skipping: vlt is not on PATH");
+        return;
+    };
+    assert!(
+        out.status.success(),
+        "vlt --version failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let version = String::from_utf8_lossy(&out.stdout);
+    if !host_mode() {
+        assert_eq!(version.trim(), "1.2.0", "the image pins vlt 1.2.0");
+    }
+}
+
 /// Smoke test: verify the test infrastructure starts up correctly. This
 /// runs even without Docker so the test binary itself compiles + the
 /// wiremock listener path works.

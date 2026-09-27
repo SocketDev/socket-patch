@@ -871,3 +871,55 @@ async fn repair_telemetry_attributed_to_env_credentials() {
         "repair telemetry must use the env-resolved token/org (org-scoped endpoint)"
     );
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// vlt lifecycle in-process: `repair` rebuilds a deleted directory artifact
+/// offline from the installed copy (the `<uuid>/.gitignore` with it), and
+/// `remove` then reverts the vlt wiring and deletes the artifact.
+#[tokio::test]
+#[serial]
+async fn vlt_repair_rebuilds_the_dir_then_remove_reverts_it() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let uuid_dir = root.join(format!(".socket/vendor/npm/{}", hosted::UUID));
+    std::fs::remove_dir_all(&uuid_dir).unwrap();
+
+    let mut args = make_repair_args(root, "diff");
+    args.common.offline = true;
+    assert_eq!(repair_run(args).await, 0);
+    assert_eq!(
+        std::fs::read(root.join(vlt_vendored::rel()).join("index.js")).unwrap(),
+        hosted::PATCHED
+    );
+    assert!(uuid_dir.join(".gitignore").is_file());
+
+    let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            json: true,
+            offline: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        identifier: hosted::PURL.to_string(),
+        skip_rollback: false,
+        preserve_state: false,
+    };
+    assert_eq!(remove_run(args).await, 0);
+    assert_eq!(
+        hosted::read(root, "vlt-lock.json"),
+        vlt_vendored::registry_lock()
+    );
+    assert_eq!(
+        hosted::read(root, "package.json"),
+        vlt_vendored::PACKAGE_JSON
+    );
+    assert!(!uuid_dir.exists());
+}

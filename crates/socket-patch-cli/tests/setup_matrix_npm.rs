@@ -1,4 +1,4 @@
-//! setup-matrix: npm ecosystem (npm / yarn / pnpm / bun).
+//! setup-matrix: npm ecosystem (npm / yarn / pnpm / bun / vlt).
 //!
 //! These are the ecosystems `socket-patch setup` actually supports
 //! today (it writes a package.json postinstall hook), so the
@@ -36,11 +36,17 @@ fn bun() {
     smc::run_pm("npm", "bun");
 }
 
+#[test]
+#[serial_test::serial]
+fn vlt() {
+    smc::run_pm("npm", "vlt");
+}
+
 // ── Nested-workspace layouts ──────────────────────────────────────────
 // A root + several members (incl. a deeply-nested one and a member with
 // no dependency on the patched package). Exercises `setup`'s workspace
-// handling (npm/yarn write the hook to every member; pnpm only to the
-// root) plus the cross-workspace apply on the root install. These should
+// handling (npm/yarn write the hook to every member; pnpm and vlt only to
+// the root) plus the cross-workspace apply on the root install. These should
 // PASS — they're real regression guards, not gap documentation.
 
 #[test]
@@ -59,6 +65,12 @@ fn pnpm_workspace() {
 #[serial_test::serial]
 fn yarn_workspace() {
     smc::run_workspace_pm("npm", "yarn");
+}
+
+#[test]
+#[serial_test::serial]
+fn vlt_workspace() {
+    smc::run_workspace_pm("npm", "vlt");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

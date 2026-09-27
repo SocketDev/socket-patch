@@ -17,6 +17,7 @@ pub mod vendor;
 pub mod vex;
 pub(crate) mod vex_consumed;
 pub(crate) mod vex_sources;
+pub(crate) mod vlt_preflight;
 
 use std::path::Path;
 

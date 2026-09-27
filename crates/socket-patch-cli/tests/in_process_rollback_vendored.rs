@@ -707,3 +707,59 @@ async fn rollbacks_stop_manifest_less_attestation() {
         }
     }
 }
+
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;
+
+/// vlt: `rollback --preserve-state` unwires the lock and package.json but
+/// keeps the directory artifact and the ledger entry; a re-vendor re-wires
+/// from the live registry lock; an unscoped rollback then removes it all.
+#[test]
+fn vlt_preserve_state_rollback_then_revendor_then_rollback() {
+    use vlt_hosted_common as hosted;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vlt_vendored::vendored_project(root, true);
+    let wired = hosted::read(root, "vlt-lock.json");
+    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+    let cwd = root.to_str().unwrap().to_string();
+    let (code, v, stderr) = hosted::run_json(
+        root,
+        &["rollback", "--preserve-state", "--offline", "--cwd", &cwd],
+        &[],
+    );
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        hosted::read(root, "vlt-lock.json"),
+        vlt_vendored::registry_lock()
+    );
+    assert_eq!(
+        hosted::read(root, "package.json"),
+        vlt_vendored::PACKAGE_JSON
+    );
+    assert!(root.join(vlt_vendored::rel()).join("index.js").is_file());
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state
+    );
+
+    let (code, v, stderr) = hosted::run_json(root, &["vendor", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        hosted::read(root, "vlt-lock.json"),
+        wired,
+        "re-wired from the live lock"
+    );
+
+    let (code, v, stderr) = hosted::run_json(root, &["rollback", "--offline", "--cwd", &cwd], &[]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        hosted::read(root, "vlt-lock.json"),
+        vlt_vendored::registry_lock()
+    );
+    assert!(!root
+        .join(format!(".socket/vendor/npm/{}", hosted::UUID))
+        .exists());
+}

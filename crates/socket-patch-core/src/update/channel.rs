@@ -118,12 +118,44 @@ pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
 /// nvm-windows' `%APPDATA%\nvm\v20.11.0\node_modules`), where
 /// `npm update -g` is right, or a project dependency
 /// (`<project>/node_modules`), where `-g` would update some other copy and
-/// leave this one alone.
+/// leave this one alone. A project that vlt installed (its root holds
+/// `vlt-lock.json`) upgrades through vlt, and vlx's cache dir (a project
+/// whose `package.json` is named `vlx`, under `$XDG_DATA_HOME/vlt/vlx/`)
+/// is refreshed by running vlx with `@latest`.
 pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'static str {
     if channel == InstallChannel::Npm && !is_global_npm_install(canonical_exe) {
+        let holder = outermost_node_modules_holder(canonical_exe);
+        if holder.is_some_and(is_vlx_cache_dir) {
+            return "vlx -y -- @socketsecurity/socket-patch@latest …";
+        }
+        if holder.is_some_and(|dir| dir.join(crate::constants::npm_family::VLT_LOCK).is_file()) {
+            return "vlt install @socketsecurity/socket-patch@latest";
+        }
         return "npm install @socketsecurity/socket-patch@latest";
     }
     upgrade_hint(channel)
+}
+
+/// vlx installs each package into its own project dir whose generated
+/// `package.json` is named `vlx`.
+fn is_vlx_cache_dir(dir: &Path) -> bool {
+    crate::utils::fs::read_regular_to_string_sync(&dir.join("package.json"))
+        .ok()
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(crate::package_json::detect::strip_bom(&text))
+                .ok()
+        })
+        .is_some_and(|pkg| pkg.get("name").and_then(|n| n.as_str()) == Some("vlx"))
+}
+
+/// The directory holding the outermost `node_modules` of `path`, keeping
+/// the path's own prefix (drive, root). `ancestors` walks innermost-first,
+/// so the LAST `node_modules` is the outermost one.
+fn outermost_node_modules_holder(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .filter(|a| a.file_name().is_some_and(|n| n == "node_modules"))
+        .last()
+        .and_then(Path::parent)
 }
 
 /// Whether the outermost `node_modules` of `path` belongs to a global
@@ -153,14 +185,7 @@ fn is_global_npm_install(path: &Path) -> bool {
     {
         return true;
     }
-    // `ancestors` walks innermost-first, so the LAST `node_modules` is the
-    // outermost one; its parent keeps the path's own prefix (drive, root).
-    let holder = path
-        .ancestors()
-        .filter(|a| a.file_name().is_some_and(|n| n == "node_modules"))
-        .last()
-        .and_then(Path::parent);
-    match holder {
+    match outermost_node_modules_holder(path) {
         Some(dir) => !dir.join("package.json").is_file(),
         None => true,
     }
@@ -543,6 +568,75 @@ mod tests {
         assert_eq!(
             upgrade_hint_for(InstallChannel::Pypi, Path::new("/work/app/node_modules/x")),
             upgrade_hint(InstallChannel::Pypi)
+        );
+    }
+
+    /// A vlt project install lives in the project's own store
+    /// (`node_modules/.vlt/<DepID>/node_modules/…`), so the outermost
+    /// `node_modules` holder is the project root and its `vlt-lock.json`
+    /// routes the hint to vlt. vlx's cache dir is also a vlt project (it
+    /// carries a lock too) whose generated `package.json` is named `vlx`;
+    /// re-running vlx with `@latest` is what refreshes it.
+    #[test]
+    fn vlt_project_and_vlx_cache_hints() {
+        let bin = "node_modules/.vlt/~npm~@socketsecurity+socket-patch-linux-x64@2.0.0/\
+                   node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch";
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let exe = project.path().join(bin);
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &exe),
+            "npm install @socketsecurity/socket-patch@latest",
+            "no vlt-lock.json: an npm project"
+        );
+        std::fs::write(project.path().join("vlt-lock.json"), "{}").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &exe),
+            "vlt install @socketsecurity/socket-patch@latest"
+        );
+        // A lock in a nested dir between the holder and the binary is not
+        // the holder's.
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::write(nested.path().join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(nested.path().join("node_modules/.vlt")).unwrap();
+        std::fs::write(nested.path().join("node_modules/.vlt/vlt-lock.json"), "{}").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &nested.path().join(bin)),
+            "npm install @socketsecurity/socket-patch@latest"
+        );
+
+        let data = tempfile::tempdir().unwrap();
+        let vlx = data
+            .path()
+            .join("vlt/vlx/@socketsecurity+socket-patch-b040b66d");
+        std::fs::create_dir_all(&vlx).unwrap();
+        std::fs::write(
+            vlx.join("package.json"),
+            "\u{feff}{\"name\":\"vlx\",\"dependencies\":{}}",
+        )
+        .unwrap();
+        std::fs::write(vlx.join("vlt-lock.json"), "{}").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &vlx.join(bin)),
+            "vlx -y -- @socketsecurity/socket-patch@latest …"
+        );
+        // A project merely named like vlx's dir but with another name is a
+        // vlt project, not the vlx cache.
+        std::fs::write(vlx.join("package.json"), r#"{"name":"vlxx"}"#).unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &vlx.join(bin)),
+            "vlt install @socketsecurity/socket-patch@latest"
+        );
+        // Global installs keep the global hint whatever vlt files exist.
+        assert_eq!(
+            upgrade_hint_for(
+                InstallChannel::Npm,
+                Path::new(
+                    "/usr/local/lib/node_modules/@socketsecurity/socket-patch/bin/socket-patch"
+                )
+            ),
+            "npm update -g @socketsecurity/socket-patch"
         );
     }
 

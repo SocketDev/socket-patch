@@ -1,0 +1,14 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "nodes": {
+    "file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+left-pad-1.3.0.tgz": [0,"left-pad",null,".socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0.tgz"]
+  },
+  "edges": {
+    "file~_d left-pad": "prod file:./.socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0.tgz file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+left-pad-1.3.0.tgz"
+  }
+}

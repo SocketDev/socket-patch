@@ -1,0 +1,10 @@
+[
+  {
+    "path": "vlt-lock.json",
+    "kind": "redirect_vlt_lock_node",
+    "action": "rewritten",
+    "key": "@std/path@1.0.0",
+    "original": "\"~npm~@std+path@1.0.0\": [0,\"@std/path\",\"sha512-jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj==\",\"https://registry.npmjs.org/@std/path/-/path-1.0.0.tgz\"]",
+    "new": "\"~npm~@std+path@1.0.0\": [0,\"@std/path\",\"sha512-33333333333333333333333333333333333333333333333333333333333333333333333333333333333333==\",\"https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/33333333-3333-4333-8333-333333333333/path-1.0.0.tgz\"]"
+  }
+]

@@ -27,6 +27,10 @@ mod vex_e2e_common;
 #[allow(clippy::duplicate_mod)]
 #[path = "vex_e2e_common/bun.rs"]
 mod bun_vex;
+#[path = "in_process_redirect/vlt.rs"]
+mod vlt;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
 
 const ORG: &str = "test-org";
 const NAME: &str = "in-proc-redirect";

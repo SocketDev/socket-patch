@@ -179,8 +179,12 @@ reuses these same per-ecosystem images. Where `docker_e2e_*` drives
 setup` and then a *native install* to check whether the configured
 install hook applies the patch on its own — the thing `setup` is meant
 to enable. It also adds the npm-family package managers (pnpm/yarn via
-corepack) and the Python ones (uv/poetry/pdm/hatch), which is why
-`Dockerfile.npm` and `Dockerfile.pypi` install those tools. See
+corepack, and vlt 1.2.0 via `npm install -g`) and the Python ones
+(uv/poetry/pdm/hatch), which is why `Dockerfile.npm` and `Dockerfile.pypi`
+install those tools. `Dockerfile.npm` is on Node 22 (>= 22.22, vlt 1.2.0's
+engine floor) and sets `VLT_TELEMETRY=0`. The vlt cases are non-gating
+extras: the gating vlt `setup` assertions run against real vlt releases in
+`crates/socket-patch-cli/tests/e2e_vlt.rs`. See
 `tests/setup_matrix/README.md` for details and the
 `scripts/setup-matrix.sh` runner. That suite's CI job (`setup-matrix`)
 is **non-blocking** (`continue-on-error: true`) and is expected to fail

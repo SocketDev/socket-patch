@@ -5,12 +5,13 @@
 //! store-enumeration output. Test-only; never compiled into the binary.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{
-    build_npm_purl, decode_pnpm_store_entry_name, is_legacy_pnpm_store_dir_name,
-    is_safe_npm_component, parse_package_name, read_package_json, NpmCrawler, Target,
-    NESTED_STORE_MAX_DEPTH, NESTED_STORE_MAX_DIRS, SKIP_DIRS,
+    build_npm_purl, is_legacy_pnpm_store_dir_name,
+    is_safe_npm_component, parse_package_name, read_package_json, NpmCrawler, StoreEntry,
+    Target, NESTED_STORE_MAX_DEPTH, NESTED_STORE_MAX_DIRS, SKIP_DIRS, VLT_STORE_NAME,
 };
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::fs::is_dir;
@@ -20,15 +21,16 @@ use crate::utils::fs::is_dir;
 #[derive(Clone, Copy)]
 enum ScanPolicy<'a> {
     /// An importer's or package's `node_modules`: symlinked entries are
-    /// recorded (pnpm links direct deps; `npm link` targets) but never
-    /// traversed into, and a `.pnpm` child is the virtual store, scanned
-    /// in a deferred pass.
+    /// recorded (pnpm and vlt link direct deps; `npm link` targets) but
+    /// never traversed into, and a `.pnpm` or `.vlt` child is the virtual
+    /// store, scanned in a deferred pass.
     Importer,
-    /// One pnpm virtual-store entry's `node_modules`: only REAL
-    /// directories are inventoried — a symlinked entry here is the
-    /// package's dependency pointing at a sibling `.pnpm` store entry,
-    /// which is inventoried via that entry; following it would record the
-    /// same package under a path owned by a different store entry.
+    /// One pnpm or vlt store entry's `node_modules`: only REAL
+    /// directories are inventoried — a symlinked (or, on Windows,
+    /// junctioned) entry here is the package's dependency pointing at a
+    /// sibling store entry, which is inventoried via that entry; following
+    /// it would record the same package under a path owned by a different
+    /// store entry.
     /// `identity_seen` optionally carries the entry's own package name
     /// (what the store dir name decodes to) when its name@version is
     /// already inventoried — the importer pass wins the `seen` dedup for
@@ -38,6 +40,35 @@ enum ScanPolicy<'a> {
 }
 
 pub(super) struct LegacyNpmCrawler;
+
+/// Whether every component of `dir_key` (`name` or `@scope/name`) below
+/// `nm_path` is a real directory: links and junctions do not count.
+async fn is_real_package_dir(nm_path: &Path, dir_key: &str) -> bool {
+    let mut path = nm_path.to_path_buf();
+    for component in dir_key.split('/') {
+        path.push(component);
+        let real = tokio::fs::symlink_metadata(&path)
+            .await
+            .is_ok_and(|m| m.is_dir());
+        if !real {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `pkg_path` is the physical dir one of `copies` resolves to.
+async fn resolves_to_any(pkg_path: &Path, copies: &[CrawledPackage]) -> bool {
+    let Ok(canon) = tokio::fs::canonicalize(pkg_path).await else {
+        return false;
+    };
+    for copy in copies {
+        if tokio::fs::canonicalize(&copy.path).await.ok().as_ref() == Some(&canon) {
+            return true;
+        }
+    }
+    false
+}
 
 impl LegacyNpmCrawler {
     /// The old `NpmCrawler::crawl_all`: global roots come from the (shared,
@@ -155,10 +186,16 @@ impl LegacyNpmCrawler {
         if pending.is_empty() {
             return pending;
         }
-        let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
-        while let Some(nm_path) = queue.pop_front() {
+        let mut queue: VecDeque<(PathBuf, bool)> =
+            VecDeque::from([(node_modules_path.to_path_buf(), false)]);
+        while let Some((nm_path, store_entry)) = queue.pop_front() {
             for target in &pending {
                 let pkg_path = nm_path.join(&target.dir_key);
+                // Inside a store entry a link is a dependency edge into a
+                // sibling entry, whose own probe records that copy.
+                if store_entry && !is_real_package_dir(&nm_path, &target.dir_key).await {
+                    continue;
+                }
                 let pkg_json_path = pkg_path.join("package.json");
 
                 match read_package_json(&pkg_json_path).await {
@@ -173,8 +210,11 @@ impl LegacyNpmCrawler {
                         let copies = result.entry(target.purl.clone()).or_default();
                         // Record each physical copy once — a path reached
                         // twice (defensive against overlapping walks) is not
-                        // double-counted.
-                        if !copies.iter().any(|c| c.path == pkg_path) {
+                        // double-counted, and a store copy an importer link
+                        // already resolves to keeps the importer path.
+                        let recorded = copies.iter().any(|c| c.path == pkg_path)
+                            || (store_entry && resolves_to_any(&pkg_path, copies).await);
+                        if !recorded {
                             copies.push(CrawledPackage {
                                 name: target.name.clone(),
                                 version: found_version,
@@ -208,7 +248,8 @@ impl LegacyNpmCrawler {
     }
 
     /// Append the `node_modules` dirs living one level below `nm_path`
-    /// (inside each of its package dirs, scoped or not) to `queue`.
+    /// (inside each of its package dirs, scoped or not) to `queue`, each
+    /// tagged `true` when it is a store entry's (see `ScanPolicy::StoreEntry`).
     /// Mirrors `scan_node_modules`' traversal policy: hidden entries are
     /// skipped and symlinked packages are never traversed — a symlink here
     /// points into pnpm's content-addressed store or an `npm link` target
@@ -220,7 +261,7 @@ impl LegacyNpmCrawler {
     async fn collect_nested_node_modules(
         nm_path: &Path,
         pending_names: Option<&HashSet<&str>>,
-        queue: &mut VecDeque<PathBuf>,
+        queue: &mut VecDeque<(PathBuf, bool)>,
     ) {
         for entry in crate::utils::fs::list_dir_entries(nm_path).await {
             let name = entry.file_name();
@@ -246,7 +287,25 @@ impl LegacyNpmCrawler {
                 }
                 let store_path = nm_path.join(&name);
                 let entries = Self::list_pnpm_store_entries(&store_path).await;
-                Self::enqueue_pending_store_entries(entries, pending_names, queue);
+                Self::enqueue_pending_store_entries(
+                    StoreEntry::pnpm(entries),
+                    pending_names,
+                    queue,
+                );
+                continue;
+            }
+            // vlt's store has the same transitive-only-home property: every
+            // package lives at `.vlt/<DepID>/node_modules/<name>` and the
+            // importer holds only links into it.
+            if name_str == VLT_STORE_NAME {
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let entries = Self::list_vlt_store_entries(&nm_path.join(&name)).await;
+                Self::enqueue_pending_store_entries(StoreEntry::vlt(entries), pending_names, queue);
                 continue;
             }
             // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
@@ -264,7 +323,11 @@ impl LegacyNpmCrawler {
                 }
                 let mut entries = Vec::new();
                 Self::collect_nested_store_entries(&nm_path.join(&name), &mut entries).await;
-                Self::enqueue_pending_store_entries(entries, pending_names, queue);
+                Self::enqueue_pending_store_entries(
+                    StoreEntry::pnpm(entries),
+                    pending_names,
+                    queue,
+                );
                 continue;
             }
             if name_str.starts_with('.') || name_str == "node_modules" {
@@ -292,13 +355,13 @@ impl LegacyNpmCrawler {
                     }
                     let nested = entry_path.join(&scoped_name).join("node_modules");
                     if is_dir(&nested).await {
-                        queue.push_back(nested);
+                        queue.push_back((nested, false));
                     }
                 }
             } else {
                 let nested = entry_path.join("node_modules");
                 if is_dir(&nested).await {
-                    queue.push_back(nested);
+                    queue.push_back((nested, false));
                 }
             }
         }
@@ -322,19 +385,18 @@ impl LegacyNpmCrawler {
     /// entry for exactly those. Both enumerators only yield entries whose
     /// `node_modules` exists, so no re-stat here.
     fn enqueue_pending_store_entries(
-        entries: Vec<(String, PathBuf)>,
+        entries: Vec<StoreEntry>,
         pending_names: Option<&HashSet<&str>>,
-        queue: &mut VecDeque<PathBuf>,
+        queue: &mut VecDeque<(PathBuf, bool)>,
     ) {
-        for (entry_name, entry_nm) in entries {
-            if let Some(filter) = pending_names {
-                if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
-                    if !filter.contains(entry_pkg.as_str()) {
-                        continue;
-                    }
+        for entry in entries {
+            if let (Some(filter), Some((entry_pkg, _version))) = (pending_names, &entry.advertised)
+            {
+                if !filter.contains(entry_pkg.as_str()) {
+                    continue;
                 }
             }
-            queue.push_back(entry_nm);
+            queue.push_back((entry.node_modules, true));
         }
     }
 
@@ -412,6 +474,7 @@ impl LegacyNpmCrawler {
         Box::pin(async move {
             let mut results = Vec::new();
             let mut pnpm_store: Option<PathBuf> = None;
+            let mut vlt_store: Option<PathBuf> = None;
             let mut legacy_stores: Vec<PathBuf> = Vec::new();
             let (store_entry, identity_seen) = match policy {
                 ScanPolicy::Importer => (false, None),
@@ -438,6 +501,18 @@ impl LegacyNpmCrawler {
                     };
                     if file_type.is_dir() {
                         pnpm_store = Some(node_modules_path.join(&name_str));
+                    }
+                    continue;
+                }
+
+                // vlt's store, deferred for the same reason: importer links
+                // win the `seen` dedup at their importer-root paths.
+                if !store_entry && name_str == VLT_STORE_NAME {
+                    let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        vlt_store = Some(node_modules_path.join(&name_str));
                     }
                     continue;
                 }
@@ -515,12 +590,16 @@ impl LegacyNpmCrawler {
 
             if let Some(store_path) = pnpm_store {
                 let entries = Self::list_pnpm_store_entries(&store_path).await;
-                results.extend(Self::scan_store_entries(entries, seen).await);
+                results.extend(Self::scan_store_entries(StoreEntry::pnpm(entries), seen).await);
             }
             for store_path in legacy_stores {
                 let mut entries = Vec::new();
                 Self::collect_nested_store_entries(&store_path, &mut entries).await;
-                results.extend(Self::scan_store_entries(entries, seen).await);
+                results.extend(Self::scan_store_entries(StoreEntry::pnpm(entries), seen).await);
+            }
+            if let Some(store_path) = vlt_store {
+                let entries = Self::list_vlt_store_entries(&store_path).await;
+                results.extend(Self::scan_store_entries(StoreEntry::vlt(entries), seen).await);
             }
 
             results
@@ -562,6 +641,38 @@ impl LegacyNpmCrawler {
                 entries.push((name_str.into_owned(), entry_nm));
             } else {
                 Self::collect_nested_store_entries(&entry_path, &mut entries).await;
+            }
+        }
+        entries
+    }
+
+    /// Enumerate vlt's store (`node_modules/.vlt`), yielding the lossless
+    /// entry name and `<entry>/node_modules` for every REAL entry dir whose
+    /// `node_modules` is a real dir. Skipped: dot-names (store metadata and
+    /// the `.VLT.DELETE.<key>.<DepID>` rollback staging that lingers on
+    /// Windows), the `node_modules` child (vlt's internal hoist dir: links
+    /// plus real `@scope` dirs holding links), files (`vlt.json`) and links.
+    /// The store is always flat; every entry holds exactly one real package
+    /// dir named after the package (never the alias).
+    pub(super) async fn list_vlt_store_entries(store_path: &Path) -> Vec<(OsString, PathBuf)> {
+        let mut entries = Vec::new();
+        for entry in crate::utils::fs::list_dir_entries(store_path).await {
+            let name = entry.file_name();
+            if name.as_encoded_bytes().starts_with(b".") || name == "node_modules" {
+                continue;
+            }
+            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let entry_nm = store_path.join(&name).join("node_modules");
+            let real_nm = tokio::fs::symlink_metadata(&entry_nm)
+                .await
+                .is_ok_and(|m| m.is_dir());
+            if real_nm {
+                entries.push((name, entry_nm));
             }
         }
         entries
@@ -641,21 +752,25 @@ impl LegacyNpmCrawler {
     }
 
     /// Inventory the packages under each virtual-store entry's
-    /// `node_modules` (entries come from `list_pnpm_store_entries` or
-    /// `collect_nested_store_entries`). An entry whose name decodes to a
-    /// name@version the importer pass already inventoried (every
-    /// root-linked direct dep) skips the redundant package.json re-read
-    /// via `identity_seen` — the entry is still walked, because
-    /// bundled/injected dependencies are real dirs that physically live
-    /// only inside the store entry.
+    /// `node_modules` (entries come from `list_pnpm_store_entries`,
+    /// `collect_nested_store_entries` or `list_vlt_store_entries`). An
+    /// entry whose name decodes to a name@version the importer pass already
+    /// inventoried (every root-linked direct dep) skips the redundant
+    /// package.json re-read via `identity_seen` — the entry is still
+    /// walked, because bundled/injected dependencies are real dirs that
+    /// physically live only inside the store entry.
     async fn scan_store_entries(
-        entries: Vec<(String, PathBuf)>,
+        entries: Vec<StoreEntry>,
         seen: &mut HashSet<String>,
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        for (entry_name, entry_nm) in entries {
-            let identity_seen = decode_pnpm_store_entry_name(&entry_name)
+        for StoreEntry {
+            advertised,
+            node_modules: entry_nm,
+        } in entries
+        {
+            let identity_seen = advertised
                 .filter(|(full_name, version)| {
                     let (ns, bare) = parse_package_name(full_name);
                     seen.contains(&build_npm_purl(ns.as_deref(), &bare, version))
@@ -999,6 +1114,10 @@ mod tests {
             if store_ok && self.chance(15) {
                 self.legacy_store(&nm.join(".registry.npmjs.org"), depth);
             }
+            if store_ok && self.chance(20) {
+                let vlt_pkgs = self.vlt_store(&nm.join(".vlt"), depth);
+                store_pkgs.extend(vlt_pkgs);
+            }
             let n = self.below(6);
             for _ in 0..n {
                 match self.below(100) {
@@ -1078,6 +1197,64 @@ mod tests {
             if self.chance(3) {
                 self.plan_lock(nm, 0o000);
             }
+        }
+
+        /// A `.vlt` store; returns `(name, package dir)` of the entries'
+        /// own packages (importer link targets). DepIDs of every era and
+        /// shape, with the store's hoist dir, rollback staging, metadata
+        /// file, dependency links and a linked `node_modules` mixed in.
+        fn vlt_store(&mut self, store: &Path, depth: usize) -> Vec<(String, PathBuf)> {
+            let _ = std::fs::create_dir_all(store);
+            let _ = std::fs::write(store.join("vlt.json"), "{}");
+            let mut own = Vec::new();
+            for _ in 0..1 + self.below(6) {
+                let name = self.pick(NAMES).to_string();
+                let version = self.pick(VERSIONS).to_string();
+                let escaped = name.replace('/', "+");
+                let id = match self.below(10) {
+                    0 => format!("~npm~{escaped}@{version}~peer.{}", self.uniq()),
+                    1 => format!("··{}@{version}", name.replace('/', "§")),
+                    2 => format!("·npm·{}@{version}", name.replace('/', "§")),
+                    3 => format!("git~github_cu+r~v{}", self.uniq()),
+                    4 => format!(".VLT.DELETE.{}.~npm~{escaped}@{version}", self.uniq()),
+                    5 => "node_modules".to_string(),
+                    _ => format!("~npm~{escaped}@{version}"),
+                };
+                let entry = store.join(&id);
+                if entry.symlink_metadata().is_ok() {
+                    continue;
+                }
+                let entry_nm = entry.join("node_modules");
+                if self.chance(5) {
+                    let _ = std::fs::create_dir_all(&entry);
+                    let id = self.uniq();
+                    let elsewhere = self.scratch.join(format!("vlt-nm{id}"));
+                    self.package_json(&elsewhere.join(&name), &name, &version);
+                    Self::symlink(&elsewhere, &entry_nm);
+                    continue;
+                }
+                let pkg_name = if self.chance(90) {
+                    name.clone()
+                } else {
+                    self.pick(NAMES).to_string()
+                };
+                let pkg = entry_nm.join(&name);
+                self.package_json(&pkg, &pkg_name, &version);
+                self.pkg_dirs.push(pkg.clone());
+                own.push((name.clone(), pkg.clone()));
+                for _ in 0..self.below(3) {
+                    if let Some((dep, target)) = own.first().cloned() {
+                        Self::symlink(&target, &entry_nm.join(&dep));
+                    }
+                }
+                if depth < 2 && self.chance(25) {
+                    self.node_modules(&pkg.join("node_modules"), depth + 1, false);
+                }
+                if self.chance(4) {
+                    self.plan_lock(&entry_nm, 0o000);
+                }
+            }
+            own
         }
 
         fn store_entry_name(&mut self, name: &str, version: &str) -> String {
@@ -1326,6 +1503,13 @@ mod tests {
                 LegacyNpmCrawler::list_pnpm_store_entries(&store).await,
                 "{label}: store entries differ under {}",
                 store.display()
+            );
+            let vlt = nm.join(".vlt");
+            assert_eq!(
+                NpmCrawler::list_vlt_store_entries(&vlt).await,
+                LegacyNpmCrawler::list_vlt_store_entries(&vlt).await,
+                "{label}: vlt store entries differ under {}",
+                vlt.display()
             );
             let legacy = nm.join(".registry.npmjs.org");
             let mut new_nested = Vec::new();

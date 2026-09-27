@@ -41,6 +41,9 @@ build/Release
 # Dependency directories
 node_modules/
 jspm_packages/
+# vlt golden inputs carry an install-state sentinel (commit with `git add -f`)
+!crates/socket-patch-core/tests/fixtures/redirect/**/node_modules/
+!crates/socket-patch-core/tests/fixtures/redirect/**/node_modules/.vlt-lock.json
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/

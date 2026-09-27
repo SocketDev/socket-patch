@@ -30,6 +30,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
 
 const ORG: &str = "test-org";
 const CODE: &str = "redirect_symlinked_file_unsupported";
@@ -166,7 +168,9 @@ fn build_wheel(name: &str, version: &str) -> (Vec<u8>, String) {
             .start_file(format!("{name}-{version}.dist-info/METADATA"), opts)
             .unwrap();
         writer
-            .write_all(format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n").as_bytes())
+            .write_all(
+                format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n").as_bytes(),
+            )
             .unwrap();
         writer.finish().unwrap();
     }
@@ -257,7 +261,10 @@ fn symlink_away(root: &Path, shared: &Path, name: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(shared).unwrap();
     let target = shared.join(name);
     std::fs::rename(root.join(name), &target).unwrap();
-    let rel = format!("../{}/{name}", shared.file_name().unwrap().to_str().unwrap());
+    let rel = format!(
+        "../{}/{name}",
+        shared.file_name().unwrap().to_str().unwrap()
+    );
     std::os::unix::fs::symlink(&rel, root.join(name)).unwrap();
     assert!(is_symlink(&root.join(name)) && root.join(name).exists());
     target
@@ -317,7 +324,10 @@ fn assert_refused_untouched(
     target: &Path,
     target_before: &[u8],
 ) {
-    assert_eq!(code, 1, "a symlinked rewrite target must fail the run: {doc:#}");
+    assert_eq!(
+        code, 1,
+        "a symlinked rewrite target must fail the run: {doc:#}"
+    );
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert_eq!(doc["errorCode"], CODE, "{doc:#}");
     let message = doc["error"].as_str().unwrap_or_else(|| panic!("{doc:#}"));
@@ -459,11 +469,9 @@ async fn hosted_rewrites_the_same_lock_once_it_is_a_regular_file() {
     let (code, doc, stderr) = scan_hosted_json(&root, &server.uri());
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
     assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
-    assert!(
-        std::fs::read_to_string(root.join("package-lock.json"))
-            .unwrap()
-            .contains(NPM_HOSTED_URL)
-    );
+    assert!(std::fs::read_to_string(root.join("package-lock.json"))
+        .unwrap()
+        .contains(NPM_HOSTED_URL));
     assert!(root.join(LEDGER_REL).exists());
 }
 
@@ -540,4 +548,61 @@ async fn hosted_scan_returns_with_fifo_candidate() {
         std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()),
         "the FIFO must not be replaced by a rewrite"
     );
+}
+
+/// vlt: `vlt-lock.json` is in the rewrite set, so a symlinked lock is
+/// refused by the same guard, before the ledger and before any write.
+#[tokio::test]
+async fn hosted_refuses_symlinked_vlt_lock_before_ledger_write() {
+    use vlt_hosted_common as vlt;
+    let server = MockServer::start().await;
+    vlt::mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    vlt::write_vlt_project(&root, vlt::Era::V1);
+    let target = symlink_away(&root, &tmp.path().join("shared"), "vlt-lock.json");
+    let lock_before = std::fs::read(&target).unwrap();
+
+    let (code, doc, _stderr) = scan_hosted_json(&root, &server.uri());
+
+    assert_refused_untouched(code, &doc, &root, "vlt-lock.json", &target, &lock_before);
+}
+
+/// A FIFO planted as `vlt-lock.json` is skipped by the preflight read and
+/// the candidate read alike: the scan returns and never probes an artifact.
+#[tokio::test]
+async fn hosted_scan_returns_with_fifo_vlt_lock() {
+    use vlt_hosted_common as vlt;
+    let server = MockServer::start().await;
+    vlt::mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    vlt::write_vlt_project(&root, vlt::Era::V1);
+    let fifo = root.join("vlt-lock.json");
+    std::fs::remove_file(&fifo).unwrap();
+    mkfifo(&fifo);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let api = server.uri();
+    let run_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(scan_hosted(&run_root, &api, &["--json"]));
+    });
+    let deadline = std::time::Duration::from_secs(90);
+    let Ok((code, stdout, stderr)) = rx.recv_timeout(deadline) else {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo);
+        panic!("scan --mode hosted wedged on a FIFO vlt-lock.json for {deadline:?}");
+    };
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert_eq!(vlt::artifact_requests(&server).await, 0);
+    let meta = std::fs::symlink_metadata(&fifo).unwrap();
+    assert!(std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()));
 }

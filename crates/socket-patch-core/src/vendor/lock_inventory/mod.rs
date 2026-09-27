@@ -65,6 +65,7 @@ pub(crate) mod npm_family;
 pub(crate) mod pnpm;
 pub(crate) mod pypi;
 pub(crate) mod recover;
+pub(crate) mod vlt;
 pub mod view;
 pub(crate) mod wired;
 pub(crate) mod yarn;
@@ -100,6 +101,7 @@ use self::{
     pnpm::{inventory_pnpm_lock, inventory_pnpm_lock_at},
     pypi::{is_public_pypi_url, python_lock_inventory, socket_reference_coords},
     recover::pure_wheel_from_uv_unit,
+    vlt::inventory_vlt,
     yarn::{inventory_yarn_berry, inventory_yarn_classic},
 };
 #[cfg(test)]
@@ -453,6 +455,7 @@ mod architecture_tests {
             "pnpm.rs",
             "yarn.rs",
             "bun.rs",
+            "vlt.rs",
             "cargo.rs",
             "golang.rs",
             "composer.rs",

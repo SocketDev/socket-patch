@@ -59,6 +59,9 @@ mod rewrite_oracle_support;
 mod staged;
 mod state;
 mod takeover;
+pub mod vlt;
+pub mod vlt_heal;
+pub mod vlt_preflight;
 pub use replay::{revert_remaining_redirect_edits, GroupRefusal, ReplayOutcome};
 pub use state::{
     drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
@@ -66,7 +69,7 @@ pub use state::{
 };
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
-pub(crate) use takeover::hosted_url_version;
+pub(crate) use takeover::{hosted_url_names, hosted_url_version};
 pub use takeover::{
     redirect_revert_supported, revert_cargo_redirect_purl, revert_golang_redirect_purl,
     revert_npm_redirect_purl, revert_redirect_purl, RedirectRevert,
@@ -236,6 +239,20 @@ pub struct RewriteResult {
     pub hatch_uuids: std::collections::BTreeSet<String>,
     pub confirmed_hatch_uuids: std::collections::BTreeSet<String>,
     pub confirmed_requirements_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids every default-registry vlt instance of which carries the
+    /// patched slots, written by this run or already in place. When vlt
+    /// drives, npm confirmation keys off this set alone.
+    pub confirmed_vlt_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the vlt rewriter refused (no sha512, an instance outside
+    /// the node grammar, a failed residual gate). Never confirmed, whichever
+    /// lock drives.
+    pub refused_vlt_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids with a same-`name@version` vlt node under a named alias,
+    /// a scoped registry or jsr, which hosted mode leaves unpatched.
+    pub vlt_foreign_uuids: std::collections::BTreeSet<String>,
+    /// [`vlt::vlt_drives`] over the rewriter's input files and the
+    /// caller's `bun_lockb_present`.
+    pub vlt_drives: bool,
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -280,7 +297,7 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
 ) -> RewriteResult {
-    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None)
+    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None, false)
 }
 
 /// Whether any pypi override targets an entry of `files["Pipfile.lock"]` —
@@ -331,11 +348,37 @@ fn withhold<'a>(
     }
 }
 
+/// `bun_lockb_present` reports a `bun.lockb` in the project that `files`
+/// leaves out because the caller rewrites its bytes itself; vlt counts it
+/// as a sibling lock.
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
+) -> RewriteResult {
+    rewrite_registry_redirect_withholding_vlt(
+        files,
+        overrides,
+        python_metadata,
+        pipenv_major,
+        bun_lockb_present,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// [`rewrite_registry_redirect_with_pipenv_version`] with the patch uuids
+/// in `vlt_withheld` kept out of the vlt rewrite only: their artifact
+/// failed vlt's preflight while another npm-family lock may be the one the
+/// project installs from.
+pub fn rewrite_registry_redirect_withholding_vlt(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    python_metadata: &BTreeMap<String, String>,
+    pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
+    vlt_withheld: &std::collections::BTreeSet<String>,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     // pdm runs FIRST, but only when `pdm.lock` is the project's PyPI install
@@ -351,8 +394,17 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     // rewriters too (see `pipenv::rewrite`).
     pipenv::rewrite(files, &overrides, pipenv_major, &mut result);
     let overrides = withhold(&overrides, &result.refused_pipenv_uuids);
-    let groups = rewriter_groups(files, &overrides, python_metadata);
-    rewrite_groups_parallel(result, &groups)
+    let vlt_overrides = withhold(&overrides, vlt_withheld);
+    let groups = rewriter_groups(
+        files,
+        &overrides,
+        &vlt_overrides,
+        bun_lockb_present,
+        python_metadata,
+    );
+    let mut result = rewrite_groups_parallel(result, &groups);
+    result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
+    result
 }
 
 /// One rewriter group: rewriters that must run in this order on one result.
@@ -365,10 +417,13 @@ type RewriterGroup<'a> = Box<dyn Fn(&mut RewriteResult) + Send + Sync + 'a>;
 /// rewriter's confirmations, `rewrite_uv_lock` the python lock sets and a
 /// metadata file an earlier python rewriter may have written) or the
 /// withholding prefix's. Every group sees the full withheld override slice,
-/// exactly as the serial chain did.
+/// exactly as the serial chain did; the vlt rewriter sees `vlt_overrides`,
+/// that slice minus the vlt-withheld uuids.
 fn rewriter_groups<'a>(
     files: &'a BTreeMap<String, String>,
     overrides: &'a [DepOverride],
+    vlt_overrides: &'a [DepOverride],
+    bun_lockb_present: bool,
     python_metadata: &'a BTreeMap<String, String>,
 ) -> Vec<RewriterGroup<'a>> {
     vec![
@@ -378,6 +433,9 @@ fn rewriter_groups<'a>(
             rewrite_yarn_classic(files, overrides, result);
             rewrite_yarn_berry(files, overrides, result);
             rewrite_bun_lock(files, overrides, result);
+        }),
+        Box::new(move |result| {
+            vlt::rewrite_vlt_lock(files, vlt_overrides, bun_lockb_present, result)
         }),
         Box::new(move |result| {
             requirements::rewrite(files, overrides, result);
@@ -458,6 +516,10 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
         hatch_uuids,
         confirmed_hatch_uuids,
         confirmed_requirements_uuids,
+        confirmed_vlt_uuids,
+        refused_vlt_uuids,
+        vlt_foreign_uuids,
+        vlt_drives: _,
     } = delta;
     result.files.extend(files);
     result.binary_files.extend(binary_files);
@@ -485,6 +547,9 @@ fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
     result
         .confirmed_requirements_uuids
         .extend(confirmed_requirements_uuids);
+    result.confirmed_vlt_uuids.extend(confirmed_vlt_uuids);
+    result.refused_vlt_uuids.extend(refused_vlt_uuids);
+    result.vlt_foreign_uuids.extend(vlt_foreign_uuids);
 }
 
 /// [`rewrite_groups_serial`], with the groups run concurrently under
@@ -697,12 +762,13 @@ fn rewrite_npm_lock(
         .filter(|f| files.contains_key(*f))
         .collect();
     if present.is_empty() {
-        // Another npm-family lock (pnpm — root or nested Rush —, yarn, bun)
-        // owns the redirect for these deps and its rewriter emits its own
-        // per-dep diagnostics; warning "no package-lock.json" on every
+        // Another npm-family lock (pnpm — root or nested Rush —, yarn, bun,
+        // vlt) owns the redirect for these deps and its rewriter emits its
+        // own per-dep diagnostics; warning "no package-lock.json" on every
         // successful pnpm/yarn/bun/Rush run is pure noise that trains users
         // to ignore the warnings channel. Only warn when NO npm-family
-        // lockfile exists at all.
+        // lockfile exists at all. A vlt project without its lock gets
+        // `redirect_vlt_no_lockfile` from the vlt rewriter instead.
         let sibling_lock_present = files.keys().any(|k| {
             k == "yarn.lock"
                 || k == "bun.lock"
@@ -711,6 +777,9 @@ fn rewrite_npm_lock(
                 || k.ends_with("/pnpm-lock.yaml")
                 || k == "shrinkwrap.yaml"
                 || k.ends_with("/shrinkwrap.yaml")
+                || k == crate::constants::npm_family::VLT_LOCK
+                || k == crate::constants::npm_family::VLT_CONFIG
+                || k == crate::constants::npm_family::VLT_HIDDEN_LOCK_REL
         });
         if !sibling_lock_present {
             // Without a lock, the installer-state marker still identifies
@@ -5458,6 +5527,27 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
         .or_else(|| path.strip_suffix(&format!("/{patch_uuid}")))?;
     let token = before.rsplit('/').next().unwrap_or("");
     (!token.is_empty()).then(|| token.to_string())
+}
+
+/// What [`redact_grant_token`] puts where a hosted URL's grant token was.
+pub const REDACTED_GRANT_TOKEN: &str = "<redacted>";
+
+/// `text` with every `/<token>/<patch_uuid>` pair of `url` spelled
+/// `/<redacted>/<patch_uuid>`: the grant token is the path level just
+/// before the patch-uuid level ([`grant_token_path_segment`]), and it
+/// authorizes the org's download, so a warning, detail or log line that
+/// quotes a hosted artifact URL (the URL itself, or an error that echoes
+/// it) keeps the host, every other path level, the uuid, the leaf and any
+/// query, and loses only the token. `text` comes back unchanged when `url`
+/// has no uuid level or nothing precedes it.
+pub fn redact_grant_token(text: &str, url: &str, patch_uuid: &str) -> String {
+    match grant_token_path_segment(url, patch_uuid) {
+        Some(token) => text.replace(
+            &format!("/{token}/{patch_uuid}"),
+            &format!("/{REDACTED_GRANT_TOKEN}/{patch_uuid}"),
+        ),
+        None => text.to_string(),
+    }
 }
 
 /// Public host of Socket's patch server: the origin every production hosted
@@ -11489,6 +11579,48 @@ mod tests {
             !warning.detail.contains("vendor --revert"),
             "a user path: dep is not socket wiring: {}",
             warning.detail
+        );
+    }
+
+    /// `redact_grant_token` replaces only the token level before the patch
+    /// uuid, in the URL and in any text quoting it (an error echoing the
+    /// URL included), keeping host, uuid, leaf and query; a URL with no
+    /// token level leaves the text as it was.
+    #[test]
+    fn redact_grant_token_hides_only_the_token_level() {
+        let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        let token = "0f1e2d3c-4b5a-4968-8776-655443322110";
+        let url = format!(
+            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/{token}/{uuid}/left-pad-1.3.0.tgz?x=1"
+        );
+        let redacted = format!(
+            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/<redacted>/{uuid}/left-pad-1.3.0.tgz?x=1"
+        );
+        assert_eq!(redact_grant_token(&url, &url, uuid), redacted, "the URL alone");
+        let text = format!("vlt would fail to verify {url}: fetch error GET {url}: reset");
+        let want = format!("vlt would fail to verify {redacted}: fetch error GET {redacted}: reset");
+        assert_eq!(redact_grant_token(&text, &url, uuid), want, "every quote");
+        assert!(!redact_grant_token(&text, &url, uuid).contains(token), "no token left");
+        let registry = format!("https://patch.socket.dev/patch-registry/npm/{token}/{uuid}");
+        assert_eq!(
+            redact_grant_token(&registry, &registry, uuid),
+            format!("https://patch.socket.dev/patch-registry/npm/<redacted>/{uuid}"),
+            "a trailing uuid level"
+        );
+        for untouched in [
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".to_string(),
+            format!("https://patch.socket.dev/{uuid}/left-pad-1.3.0.tgz"),
+        ] {
+            assert_eq!(
+                redact_grant_token(&untouched, &untouched, uuid),
+                untouched,
+                "no token level"
+            );
+        }
+        assert_eq!(
+            redact_grant_token(&url, &url, ""),
+            url,
+            "no uuid, nothing to anchor on"
         );
     }
 

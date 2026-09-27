@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 0,
+  "options": {
+    "registry": "http://127.0.0.1:4873/",
+    "registries": {
+      "acme": "http://127.0.0.1:4873/"
+    }
+  },
+  "nodes": {
+    "·acme·left-pad@1.3.0": [0,"left-pad","sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="]
+  },
+  "edges": {
+    "file·. left-pad": "prod 1.3.0 ·acme·left-pad@1.3.0"
+  }
+}

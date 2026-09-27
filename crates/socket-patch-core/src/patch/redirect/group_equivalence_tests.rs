@@ -12,6 +12,7 @@ fn serial_oracle(
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     if pdm_drives(files) {
@@ -26,6 +27,8 @@ fn serial_oracle(
     rewrite_yarn_classic(files, overrides, &mut result);
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
+    vlt::rewrite_vlt_lock(files, overrides, bun_lockb_present, &mut result);
+    result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
     requirements::rewrite(files, overrides, &mut result);
     rewrite_hatch(files, overrides, &mut result);
     rewrite_uv_lock(files, overrides, python_metadata, &mut result);
@@ -90,13 +93,25 @@ fn assert_same_with_metadata(
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
 ) {
-    for pipenv_major in [None, Some(2023), Some(2026)] {
-        let want = serial_oracle(files, overrides, python_metadata, pipenv_major);
+    for (pipenv_major, bun_lockb_present) in [
+        (None, false),
+        (Some(2023), false),
+        (Some(2026), false),
+        (None, true),
+    ] {
+        let want = serial_oracle(
+            files,
+            overrides,
+            python_metadata,
+            pipenv_major,
+            bun_lockb_present,
+        );
         let got = rewrite_registry_redirect_with_pipenv_version(
             files,
             overrides,
             python_metadata,
             pipenv_major,
+            bun_lockb_present,
         );
         assert_eq!(got, want, "{label} (pipenv {pipenv_major:?})");
 
@@ -109,8 +124,18 @@ fn assert_same_with_metadata(
         let overrides = withhold(overrides, &prefix.refused_pdm_uuids);
         pipenv::rewrite(files, &overrides, pipenv_major, &mut prefix);
         let overrides = withhold(&overrides, &prefix.refused_pipenv_uuids);
-        let groups = rewriter_groups(files, &overrides, python_metadata);
-        let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups));
+        let groups = rewriter_groups(
+            files,
+            &overrides,
+            &overrides,
+            bun_lockb_present,
+            python_metadata,
+        );
+        let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups))
+            .map(|mut merged| {
+                merged.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
+                merged
+            });
         assert_eq!(
             merged.as_ref(),
             Some(&want),

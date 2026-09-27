@@ -10,6 +10,7 @@ use super::walk_pool::{par_map, run_walk};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
+use crate::vendor::vlt_lock_text::decode_vlt_dep_id;
 
 #[cfg(test)]
 mod oracle;
@@ -207,6 +208,49 @@ fn is_legacy_pnpm_store_dir_name(name: &str) -> bool {
     name.starts_with(".registry.")
 }
 
+/// The `node_modules` child that is vlt's per-project package store.
+const VLT_STORE_NAME: &str = ".vlt";
+
+/// `(name, version)` a `.vlt/<DepID>` entry name advertises: the vlt store
+/// decoder over the lossless name, `None` for git/file/remote/workspace
+/// ids and for anything undecodable (which stays probeable). The pnpm
+/// decoder must never see these names: it reads `··foo@1.0.0` as a package
+/// named `··foo`, so the pending-name filter would skip the real `foo`.
+fn decode_vlt_store_entry_name(entry_name: &OsStr) -> Option<(String, String)> {
+    entry_name.to_str().and_then(decode_vlt_dep_id)
+}
+
+/// One virtual-store entry (pnpm or vlt): the `node_modules` holding its
+/// package, and the `(name, version)` its dir name advertises. The
+/// advertisement is advisory (the package.json probe is the authority), and
+/// `None` means "unknowable from the name", never "empty".
+struct StoreEntry {
+    advertised: Option<(String, String)>,
+    node_modules: PathBuf,
+}
+
+impl StoreEntry {
+    fn pnpm(entries: Vec<(String, PathBuf)>) -> Vec<StoreEntry> {
+        entries
+            .into_iter()
+            .map(|(name, node_modules)| StoreEntry {
+                advertised: decode_pnpm_store_entry_name(&name),
+                node_modules,
+            })
+            .collect()
+    }
+
+    fn vlt(entries: Vec<(OsString, PathBuf)>) -> Vec<StoreEntry> {
+        entries
+            .into_iter()
+            .map(|(name, node_modules)| StoreEntry {
+                advertised: decode_vlt_store_entry_name(&name),
+                node_modules,
+            })
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Blocking-pool walk primitives
 // ---------------------------------------------------------------------------
@@ -374,6 +418,8 @@ impl ProbeFilter {
 /// every dir of a BFS level carries one of these at once.
 struct ResolverVisit {
     nm_path: PathBuf,
+    /// `nm_path` is a pnpm or vlt store entry's `node_modules`.
+    store_entry: bool,
     matched: Vec<usize>,
     nested: Vec<NestedNodeModules>,
 }
@@ -383,7 +429,7 @@ struct ResolverVisit {
 /// the pending-name filter when the visit is replayed.
 enum NestedNodeModules {
     Dir(PathBuf),
-    StoreEntries(Vec<(String, PathBuf)>),
+    StoreEntries(Vec<StoreEntry>),
 }
 
 /// What the blocking-pool scan of one `node_modules` tree records, in the
@@ -410,11 +456,14 @@ enum ScanEvent {
 }
 
 /// A virtual-store entry found by
-/// [`NpmCrawler::list_pnpm_store_entries_sync`]: its flat (or synthesized
-/// nested) name, its `node_modules`, and — when the caller asked for
-/// listings and the dir opened — that `node_modules`' listing.
+/// [`NpmCrawler::list_pnpm_store_entries_sync`] or
+/// [`NpmCrawler::vlt_store_entry_dirs`]: its flat (or synthesized nested)
+/// name, what that name advertises under its store layout, its
+/// `node_modules`, and — when the caller asked for listings and the dir
+/// opened — that `node_modules`' listing.
 struct StoreEntryDir {
     name: String,
+    advertised: Option<(String, String)>,
     node_modules: PathBuf,
     listing: Option<Listing>,
 }
@@ -714,10 +763,10 @@ impl NpmCrawler {
     /// that only need one representative (`vendor`, `vex`, `setup`) can take
     /// the first and preserve the old root-preference.
     ///
-    /// pnpm's virtual-store peer-variant copies are deliberately NOT
+    /// pnpm's and vlt's store peer-variant copies are deliberately NOT
     /// enumerated here for a copy already found in an importer tree (a
     /// symlinked direct dep): those are handled by the apply engine's
-    /// [`find_pnpm_peer_variant_copies`] fan-out. A transitive-only package
+    /// [`find_store_peer_variant_copies`] fan-out. A transitive-only package
     /// that lives ONLY in the store is still resolved (its store copies are
     /// probed because no importer-tree copy was found).
     pub async fn find_by_purls(
@@ -834,11 +883,14 @@ impl NpmCrawler {
         if pending.is_empty() {
             return pending;
         }
-        let mut level: Vec<PathBuf> = vec![node_modules_path.to_path_buf()];
+        // Each dir is tagged `true` when it is a pnpm or vlt store entry's
+        // `node_modules`.
+        let mut level: Vec<(PathBuf, bool)> = vec![(node_modules_path.to_path_buf(), false)];
         while !level.is_empty() {
-            let visits: Vec<ResolverVisit> =
-                par_map(level, |nm_path| Self::visit_resolver_dir(nm_path, &pending));
-            let mut next_level: Vec<PathBuf> = Vec::new();
+            let visits: Vec<ResolverVisit> = par_map(level, |(nm_path, store_entry)| {
+                Self::visit_resolver_dir(nm_path, store_entry, &pending)
+            });
+            let mut next_level: Vec<(PathBuf, bool)> = Vec::new();
             for visit in visits {
                 let nm_path = visit.nm_path;
                 for index in visit.matched {
@@ -847,8 +899,11 @@ impl NpmCrawler {
                     let copies = result.entry(target.purl.clone()).or_default();
                     // Record each physical copy once — a path reached twice
                     // (defensive against overlapping walks) is not
-                    // double-counted.
-                    if !copies.iter().any(|c| c.path == pkg_path) {
+                    // double-counted, and a store copy an importer link
+                    // already resolves to keeps the importer path.
+                    let recorded = copies.iter().any(|c| c.path == pkg_path)
+                        || (visit.store_entry && resolves_to_any_sync(&pkg_path, copies));
+                    if !recorded {
                         copies.push(CrawledPackage {
                             name: target.name.clone(),
                             // The probe matched it verbatim (see
@@ -875,10 +930,12 @@ impl NpmCrawler {
                 let filter = filter_store_entries.then_some(&unmatched_names);
                 for nested in visit.nested {
                     match nested {
-                        NestedNodeModules::Dir(dir) => next_level.push(dir),
-                        NestedNodeModules::StoreEntries(entries) => {
-                            next_level.extend(Self::pending_store_entries(entries, filter))
-                        }
+                        NestedNodeModules::Dir(dir) => next_level.push((dir, false)),
+                        NestedNodeModules::StoreEntries(entries) => next_level.extend(
+                            Self::pending_store_entries(entries, filter)
+                                .into_iter()
+                                .map(|dir| (dir, true)),
+                        ),
                     }
                 }
             }
@@ -900,7 +957,11 @@ impl NpmCrawler {
     /// slots made the resolver's peak memory
     /// `level_dirs × pending_targets` — hundreds of megabytes on a big
     /// pnpm store probed by pass 2, which enqueues every entry.
-    fn visit_resolver_dir(nm_path: PathBuf, pending: &[Target]) -> ResolverVisit {
+    ///
+    /// Inside a store entry (`store_entry`) a link is a dependency edge into
+    /// a sibling entry, whose own visit records that copy, so only a real
+    /// directory there matches.
+    fn visit_resolver_dir(nm_path: PathBuf, store_entry: bool, pending: &[Target]) -> ResolverVisit {
         let listing = list_dir_sync(&nm_path);
         let probe_filter = ProbeFilter::new(&listing);
         let matched = pending
@@ -909,6 +970,9 @@ impl NpmCrawler {
             .filter(|(_, target)| {
                 let first_component = target.namespace.as_deref().unwrap_or(&target.name);
                 if !probe_filter.may_resolve(first_component) {
+                    return false;
+                }
+                if store_entry && !is_real_package_dir_sync(&nm_path, &target.dir_key) {
                     return false;
                 }
                 // The on-disk *name* must match too: an alias install
@@ -925,6 +989,7 @@ impl NpmCrawler {
         let nested = Self::collect_nested_node_modules(&nm_path, listing);
         ResolverVisit {
             nm_path,
+            store_entry,
             matched,
             nested,
         }
@@ -971,9 +1036,22 @@ impl NpmCrawler {
             }
             let entries = Self::list_pnpm_store_entries_sync(&nm_path.join(&entry.name), false)
                 .into_iter()
-                .map(|e| (e.name, e.node_modules))
+                .map(|e| StoreEntry {
+                    advertised: e.advertised,
+                    node_modules: e.node_modules,
+                })
                 .collect();
             return vec![NestedNodeModules::StoreEntries(entries)];
+        }
+        // vlt's store has the same transitive-only-home property: every
+        // package lives at `.vlt/<DepID>/node_modules/<name>` and the
+        // importer holds only links into it.
+        if name_str == VLT_STORE_NAME {
+            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                return Vec::new();
+            }
+            let entries = Self::list_vlt_store_entries_sync(&nm_path.join(&entry.name));
+            return vec![NestedNodeModules::StoreEntries(StoreEntry::vlt(entries))];
         }
         // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
         // (there is no `.pnpm` at all) with the same
@@ -986,7 +1064,7 @@ impl NpmCrawler {
                 return Vec::new();
             }
             let entries = Self::collect_nested_store_entries_sync(&nm_path.join(&entry.name));
-            return vec![NestedNodeModules::StoreEntries(entries)];
+            return vec![NestedNodeModules::StoreEntries(StoreEntry::pnpm(entries))];
         }
         if name_str.starts_with('.') || name_str == "node_modules" {
             return Vec::new();
@@ -1036,19 +1114,18 @@ impl NpmCrawler {
     /// entry for exactly those. Both enumerators only yield entries whose
     /// `node_modules` exists, so no re-stat here.
     fn pending_store_entries(
-        entries: Vec<(String, PathBuf)>,
+        entries: Vec<StoreEntry>,
         pending_names: Option<&HashSet<&str>>,
     ) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        for (entry_name, entry_nm) in entries {
-            if let Some(filter) = pending_names {
-                if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
-                    if !filter.contains(entry_pkg.as_str()) {
-                        continue;
-                    }
+        for entry in entries {
+            if let (Some(filter), Some((entry_pkg, _version))) = (pending_names, &entry.advertised)
+            {
+                if !filter.contains(entry_pkg.as_str()) {
+                    continue;
                 }
             }
-            out.push(entry_nm);
+            out.push(entry.node_modules);
         }
         out
     }
@@ -1240,17 +1317,19 @@ impl NpmCrawler {
     /// Gather one `node_modules` directory's scan into [`ScanEvent`]s, in
     /// the exact order the sequential walk visits it: the directory's own
     /// entries (each package followed by its nested `node_modules`), then
-    /// the deferred pnpm virtual store(s). `listing` is the directory's
+    /// the deferred pnpm and vlt store(s). `listing` is the directory's
     /// listing when the caller already read it. `store_entry` selects the
     /// one policy bit distinguishing an importer/package tree from a pnpm
-    /// virtual-store entry's `node_modules`:
-    /// - importer trees accept both directories and symlinks (pnpm links
-    ///   direct deps; `npm link` targets) but never traverse a symlink, and
-    ///   a `.pnpm` (or pnpm <=3 `.<registry-host>`) child is the virtual
-    ///   store, walked after the loop;
-    /// - a store entry accepts REAL directories only — a symlinked entry
-    ///   there is the package's dependency pointing at a sibling store
-    ///   entry, inventoried via that entry — and its direct children carry
+    /// or vlt store entry's `node_modules`:
+    /// - importer trees accept both directories and symlinks (pnpm and vlt
+    ///   link direct deps; `npm link` targets) but never traverse a symlink,
+    ///   and a `.pnpm` (or pnpm <=3 `.<registry-host>`) or `.vlt` child is
+    ///   the virtual store, walked after the loop;
+    /// - a store entry accepts REAL directories only — a symlinked (or, on
+    ///   Windows, junctioned) entry there is the package's dependency
+    ///   pointing at a sibling store entry, inventoried via that entry, and
+    ///   following it would record the same package under a path owned by a
+    ///   different store entry — and its direct children carry
     ///   their package key so the merge can apply the entry's
     ///   `identity_seen` skip.
     ///
@@ -1263,6 +1342,7 @@ impl NpmCrawler {
     ) -> Vec<ScanEvent> {
         let listing = listing.unwrap_or_else(|| list_dir_sync(node_modules_path));
         let mut pnpm_store: Option<PathBuf> = None;
+        let mut vlt_store: Option<PathBuf> = None;
         let mut legacy_stores: Vec<PathBuf> = Vec::new();
         let mut children: Vec<(PathBuf, String, FileType)> = Vec::new();
 
@@ -1282,6 +1362,15 @@ impl NpmCrawler {
             if !store_entry && name_str == ".pnpm" {
                 if entry.file_type.is_some_and(|ft| ft.is_dir()) {
                     pnpm_store = Some(node_modules_path.join(&name_str));
+                }
+                continue;
+            }
+
+            // vlt's store, deferred for the same reason: importer links
+            // win the `seen` dedup at their importer-root paths.
+            if !store_entry && name_str == VLT_STORE_NAME {
+                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                    vlt_store = Some(node_modules_path.join(&name_str));
                 }
                 continue;
             }
@@ -1338,11 +1427,16 @@ impl NpmCrawler {
             let entries = Self::collect_nested_store_entries_sync(&store_path)
                 .into_iter()
                 .map(|(name, node_modules)| StoreEntryDir {
+                    advertised: decode_pnpm_store_entry_name(&name),
                     name,
                     node_modules,
                     listing: None,
                 })
                 .collect();
+            events.extend(Self::gather_store_entries(entries));
+        }
+        if let Some(store_path) = vlt_store {
+            let entries = Self::vlt_store_entry_dirs(&store_path);
             events.extend(Self::gather_store_entries(entries));
         }
 
@@ -1432,7 +1526,7 @@ impl NpmCrawler {
     /// policy, in parallel, preserving entry order.
     fn gather_store_entries(entries: Vec<StoreEntryDir>) -> Vec<ScanEvent> {
         par_map(entries, |entry| ScanEvent::StoreEntry {
-            decoded: decode_pnpm_store_entry_name(&entry.name),
+            decoded: entry.advertised,
             events: Self::gather_node_modules(&entry.node_modules, entry.listing, true),
         })
     }
@@ -1532,6 +1626,7 @@ impl NpmCrawler {
             if read_listings {
                 if let Some((entries, complete)) = read_dir_entries_sync(&entry_nm) {
                     return vec![StoreEntryDir {
+                        advertised: decode_pnpm_store_entry_name(&entry.name_str),
                         name: entry.name_str,
                         node_modules: entry_nm,
                         listing: Some(Listing::from_entries(entries, complete)),
@@ -1540,6 +1635,7 @@ impl NpmCrawler {
             }
             if is_dir_sync(&entry_nm) {
                 vec![StoreEntryDir {
+                    advertised: decode_pnpm_store_entry_name(&entry.name_str),
                     name: entry.name_str,
                     node_modules: entry_nm,
                     listing: None,
@@ -1548,6 +1644,7 @@ impl NpmCrawler {
                 Self::collect_nested_store_entries_sync(&entry_path)
                     .into_iter()
                     .map(|(name, node_modules)| StoreEntryDir {
+                        advertised: decode_pnpm_store_entry_name(&name),
                         name,
                         node_modules,
                         listing: None,
@@ -1571,6 +1668,56 @@ impl NpmCrawler {
                 .collect()
         })
         .await
+    }
+
+    /// Enumerate vlt's store (`node_modules/.vlt`), yielding the lossless
+    /// entry name and `<entry>/node_modules` for every REAL entry dir whose
+    /// `node_modules` is a real dir. Skipped: dot-names (store metadata and
+    /// the `.VLT.DELETE.<key>.<DepID>` rollback staging that lingers on
+    /// Windows), the `node_modules` child (vlt's internal hoist dir: links
+    /// plus real `@scope` dirs holding links), files (`vlt.json`) and links.
+    /// The store is always flat; every entry holds exactly one real package
+    /// dir named after the package (never the alias). Entries are probed in
+    /// parallel and yielded in listing order.
+    fn list_vlt_store_entries_sync(store_path: &Path) -> Vec<(OsString, PathBuf)> {
+        let candidates: Vec<ListedEntry> = list_dir_sync(store_path)
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                !(entry.name.as_encoded_bytes().starts_with(b".") || entry.name == "node_modules")
+                    && entry.file_type.is_some_and(|ft| ft.is_dir())
+            })
+            .collect();
+        par_map(candidates, |entry| {
+            let entry_nm = store_path.join(&entry.name).join("node_modules");
+            std::fs::symlink_metadata(&entry_nm)
+                .is_ok_and(|m| m.is_dir())
+                .then_some((entry.name, entry_nm))
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// [`Self::list_vlt_store_entries_sync`] as the scan's
+    /// [`StoreEntryDir`]s, each with its `node_modules`' listing (the scan
+    /// lists every entry's `node_modules` next anyway).
+    fn vlt_store_entry_dirs(store_path: &Path) -> Vec<StoreEntryDir> {
+        par_map(
+            Self::list_vlt_store_entries_sync(store_path),
+            |(name, node_modules)| StoreEntryDir {
+                advertised: decode_vlt_store_entry_name(&name),
+                name: name.to_string_lossy().into_owned(),
+                listing: Some(list_dir_sync(&node_modules)),
+                node_modules,
+            },
+        )
+    }
+
+    /// Async view of [`Self::list_vlt_store_entries_sync`].
+    async fn list_vlt_store_entries(store_path: &Path) -> Vec<(OsString, PathBuf)> {
+        let store_path = store_path.to_path_buf();
+        run_walk(move || Self::list_vlt_store_entries_sync(&store_path)).await
     }
 
     /// Descend a *nested* virtual-store host dir, yielding
@@ -1711,15 +1858,24 @@ impl Default for NpmCrawler {
 }
 
 // ---------------------------------------------------------------------------
-// pnpm peer-variant duplicate discovery (used by the apply engine)
+// Store peer-variant duplicate discovery (used by the apply engine)
 // ---------------------------------------------------------------------------
 
+/// Which store layout a candidate store directory uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreLayout {
+    Pnpm,
+    Vlt,
+}
+
 /// Find every OTHER physical copy of the package installed at `pkg_path`
-/// inside the pnpm virtual store(s) reachable from it.
+/// inside the pnpm or vlt store(s) reachable from it.
 ///
-/// pnpm materializes one store copy PER PEER COMBINATION:
-/// `.pnpm/foo@1.0.0(react@17…)/` and `.pnpm/foo@1.0.0(react@18…)/` are
-/// both real directories holding the same `foo@1.0.0`, and each is
+/// Both managers materialize one store copy PER PEER (or modifier)
+/// COMBINATION: `.pnpm/foo@1.0.0(react@17…)/` and `…(react@18…)/`, or
+/// `.vlt/~npm~foo@1.0.0~peer.2/` and `~peer.3/` (plus vlt's modifier
+/// `~_croot…` extras and the legacy `··foo@1.0.0` / `·npm·foo@1.0.0` pair),
+/// are all real directories holding the same `foo@1.0.0`, each
 /// runtime-loaded by whichever importer resolves to it. The purl-keyed
 /// resolver hands apply exactly ONE primary path (root-install-wins), so
 /// the apply engine calls this to fan every write out to the remaining
@@ -1728,48 +1884,64 @@ impl Default for NpmCrawler {
 ///
 /// Discovery, all bounded and read-only:
 /// 1. Candidate stores come from the ancestor chains of `pkg_path` AND of
-///    its canonicalized form (the root-linked primary is a symlink into
-///    the store, and in a workspace the store lives beside the ROOT
+///    its canonicalized form (the root-linked primary is a link into the
+///    store, and in a workspace the store lives beside the ROOT
 ///    `node_modules`, on the canonical chain only): any ancestor named
-///    `.pnpm`, plus any `node_modules` ancestor's `.pnpm` child. Non-pnpm
-///    layouts (npm/yarn trees, cargo/go/vendor dirs) have neither and
-///    return early — this is the cheap common case. pnpm <=3 legacy
-///    stores are keyed by plain `name/version` and cannot hold
+///    `.pnpm` or `.vlt`, plus any `node_modules` ancestor's `.pnpm` and
+///    `.vlt` children. Other layouts (npm/yarn trees, cargo/go/vendor dirs)
+///    have neither and return early — the cheap common case. pnpm <=3
+///    legacy stores are keyed by plain `name/version` and cannot hold
 ///    peer-variant duplicates, so they are deliberately not probed.
-/// 2. Store entries are enumerated with the shared layout walker
+/// 2. pnpm entries come from the shared layout walker
 ///    (`list_pnpm_store_entries`, flat + nested); an entry whose name
-///    decodes to a DIFFERENT name@version is skipped, an undecodable name
-///    stays probeable (decode is advisory), and the package.json probe is
-///    the authority — exactly the resolver's contract.
-/// 3. Only REAL directories count (a symlink inside a store entry is
-///    another entry's copy, already yielded via that entry), the copy
-///    `pkg_path` itself canonicalizes to is excluded, and results are
-///    deduped by canonical path.
+///    decodes to a DIFFERENT name@version is skipped and an undecodable
+///    name stays probeable. vlt entries come from `list_vlt_store_entries`
+///    and must decode to exactly the primary's name@version: an
+///    undecodable vlt id (git, remote, `file:`) is never a peer variant.
+///    A matching copy inside one is still installed, and
+///    `NpmCrawler::find_by_purls` returns it as a primary of its own (it
+///    probes every undecodable entry), so it is patched like any other.
+///    The package.json probe is the authority either way.
+/// 3. Only REAL directories count (a link inside a store entry is another
+///    entry's copy, already yielded via that entry), the copy `pkg_path`
+///    itself canonicalizes to is excluded, and results are deduped by
+///    canonical path (both sides canonicalized, so Windows `\\?\` paths
+///    compare consistently).
 ///
 /// The returned paths are the copies' package roots (each in its own
 /// store entry). Callers write through the hardened per-file pipeline,
 /// which breaks content-store hardlinks per copy — CoW safety holds for
 /// every copy independently.
-pub async fn find_pnpm_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
+pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
     // 1. Candidate stores from both ancestor chains (cheap stats only —
     //    no file reads until a store is actually found).
     let canonical_pkg = tokio::fs::canonicalize(pkg_path).await.ok();
-    let mut stores: Vec<PathBuf> = Vec::new();
+    let mut stores: Vec<(StoreLayout, PathBuf)> = Vec::new();
     let mut seen_stores: HashSet<PathBuf> = HashSet::new();
     let chains = [Some(pkg_path), canonical_pkg.as_deref()];
     for start in chains.into_iter().flatten() {
         let mut cur = start.parent();
         while let Some(dir) = cur {
-            match dir.file_name().map(|n| n.to_string_lossy()) {
-                Some(name) if name == ".pnpm" => {
+            match dir.file_name().and_then(OsStr::to_str) {
+                Some(".pnpm") => {
                     if seen_stores.insert(dir.to_path_buf()) {
-                        stores.push(dir.to_path_buf());
+                        stores.push((StoreLayout::Pnpm, dir.to_path_buf()));
                     }
                 }
-                Some(name) if name == "node_modules" => {
-                    let store = dir.join(".pnpm");
-                    if is_dir(&store).await && seen_stores.insert(store.clone()) {
-                        stores.push(store);
+                Some(VLT_STORE_NAME) => {
+                    if seen_stores.insert(dir.to_path_buf()) {
+                        stores.push((StoreLayout::Vlt, dir.to_path_buf()));
+                    }
+                }
+                Some("node_modules") => {
+                    for (child, layout) in [
+                        (".pnpm", StoreLayout::Pnpm),
+                        (VLT_STORE_NAME, StoreLayout::Vlt),
+                    ] {
+                        let store = dir.join(child);
+                        if is_dir(&store).await && seen_stores.insert(store.clone()) {
+                            stores.push((layout, store));
+                        }
                     }
                 }
                 _ => {}
@@ -1791,18 +1963,29 @@ pub async fn find_pnpm_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
 
     let mut copies: Vec<PathBuf> = Vec::new();
     let mut seen_copies: HashSet<PathBuf> = HashSet::new();
-    for store in stores {
-        for (entry_name, entry_nm) in NpmCrawler::list_pnpm_store_entries(&store).await {
-            // Fast advertisement filter; undecodable names stay probeable.
-            if let Some((n, v)) = decode_pnpm_store_entry_name(&entry_name) {
-                if n != full_name || v != version {
-                    continue;
-                }
+    for (layout, store) in stores {
+        let entries = match layout {
+            StoreLayout::Pnpm => {
+                StoreEntry::pnpm(NpmCrawler::list_pnpm_store_entries(&store).await)
+            }
+            StoreLayout::Vlt => StoreEntry::vlt(NpmCrawler::list_vlt_store_entries(&store).await),
+        };
+        for StoreEntry {
+            advertised,
+            node_modules: entry_nm,
+        } in entries
+        {
+            // Fast advertisement filter; undecodable pnpm names stay
+            // probeable, undecodable vlt ids are never variants.
+            match (advertised, layout) {
+                (Some((n, v)), _) if n != full_name || v != version => continue,
+                (None, StoreLayout::Vlt) => continue,
+                _ => {}
             }
             // `full_name` may be scoped (`@s/n`) — Path::join handles the
             // two-segment relative form.
             let candidate = entry_nm.join(&full_name);
-            // Real dirs only: a symlink here is another entry's physical
+            // Real dirs only: a link here is another entry's physical
             // copy, reached via that entry.
             let Ok(meta) = tokio::fs::symlink_metadata(&candidate).await else {
                 continue;
@@ -1831,6 +2014,29 @@ pub async fn find_pnpm_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
+
+/// Whether every component of `dir_key` (`name` or `@scope/name`) below
+/// `nm_path` is a real directory: links and junctions do not count.
+fn is_real_package_dir_sync(nm_path: &Path, dir_key: &str) -> bool {
+    let mut path = nm_path.to_path_buf();
+    for component in dir_key.split('/') {
+        path.push(component);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `pkg_path` is the physical dir one of `copies` resolves to.
+fn resolves_to_any_sync(pkg_path: &Path, copies: &[CrawledPackage]) -> bool {
+    let Ok(canon) = std::fs::canonicalize(pkg_path) else {
+        return false;
+    };
+    copies
+        .iter()
+        .any(|copy| std::fs::canonicalize(&copy.path).ok().as_ref() == Some(&canon))
+}
 
 /// Whether a PURL-derived path component is safe to join onto the
 /// `node_modules` root. An npm package's scope (`@types`) and bare name
@@ -1943,7 +2149,7 @@ mod tests {
         pending.push(target_of("present", "1.0.0"));
         let matched_index = pending.len() - 1;
 
-        let visit = NpmCrawler::visit_resolver_dir(nm, &pending);
+        let visit = NpmCrawler::visit_resolver_dir(nm, false, &pending);
         assert_eq!(visit.matched, vec![matched_index]);
     }
 
@@ -2915,6 +3121,324 @@ mod tests {
         assert!(
             found.contains(&root.join("target/debug/deps/pkg/node_modules")),
             "{found:?}"
+        );
+    }
+    /// and undecodable ids are `None` (still probed by package.json).
+    #[test]
+    fn test_decode_vlt_dep_id_table() {
+        let some = |n: &str, v: &str| Some((n.to_string(), v.to_string()));
+        let rows: &[(&str, Option<(String, String)>)] = &[
+            ("··ms@2.1.3", some("ms", "2.1.3")),
+            (
+                "·npm·@isaacs§string-locale-compare@1.1.0",
+                some("@isaacs/string-locale-compare", "1.1.0"),
+            ),
+            (
+                "··@sindresorhus§is@4.6.0",
+                some("@sindresorhus/is", "4.6.0"),
+            ),
+            ("·npm·u@1.0.0%2Bbuild.1", some("u", "1.0.0+build.1")),
+            (
+                "··ms@2.1.3·%3Aroot%20%3E%20%23debug%20%3E%20%23ms",
+                some("ms", "2.1.3"),
+            ),
+            ("·npm·x@1.0.0·%E1%B9%97%3A3", some("x", "1.0.0")),
+            ("~npm~@a+b@1.0.0", some("@a/b", "1.0.0")),
+            ("~npm~a__b@1.0.0", some("a_b", "1.0.0")),
+            ("~npm~u@1.0.0_pbuild.1", some("u", "1.0.0+build.1")),
+            (
+                "~npm~is-number@6.0.0~_croot_s_g_s#to-regex-range_s_g_s#is-number",
+                some("is-number", "6.0.0"),
+            ),
+            (
+                "~npm~react-dom@18.2.0~peer.ace93b147498ef7a",
+                some("react-dom", "18.2.0"),
+            ),
+            ("~npm~x@1.0.0~peer.2", some("x", "1.0.0")),
+            ("~npm~x@1~peer.2", None),
+            ("~acme~left-pad@1.3.0", some("left-pad", "1.3.0")),
+            ("~http_c++127.0.0.1_c4873+~x@1.0.0", some("x", "1.0.0")),
+            ("·http%3A§§127.0.0.1%3A4873§·x@1.0.0", some("x", "1.0.0")),
+            (
+                "~jsr~@jsr+std____semver@1.0.8",
+                some("@jsr/std__semver", "1.0.8"),
+            ),
+            ("git~github_cisaacs+string-locale-compare~v1.1.0", None),
+            ("git·github%3Aisaacs§string-locale-compare·v1.1.0", None),
+            ("file~vendor+ms-2.1.2.tgz", None),
+            ("file·vendor§ms-2.1.2.tgz", None),
+            (
+                "remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.2.0.tgz",
+                None,
+            ),
+            ("workspace~packages+a", None),
+            ("workspace·packages§a", None),
+            ("··m%ZZs@1.0.0", None),
+            ("·npm·ms@2.1.3·%4", None),
+            ("ms@2.1.3", None),
+            ("node_modules", None),
+        ];
+        for (id, want) in rows {
+            assert_eq!(&decode_vlt_store_entry_name(OsStr::new(id)), want, "{id}");
+        }
+    }
+
+    /// The hazard the separate decoders exist for: the pnpm decoder reads
+    /// legacy vlt names as packages named `··foo` / `·npm·@s§p`, so a vlt
+    /// entry run through it would be skipped by the pending-name filter.
+    /// vlt entries are advertised through the vlt decoder only.
+    #[test]
+    fn test_vlt_store_entries_never_reach_the_pnpm_decoder() {
+        assert_eq!(
+            decode_pnpm_store_entry_name("··foo@1.0.0"),
+            Some(("··foo".to_string(), "1.0.0".to_string()))
+        );
+        let entries = || {
+            vec![
+                (OsString::from("··foo@1.0.0"), PathBuf::from("a")),
+                (OsString::from("·npm·@s§p@2.0.0"), PathBuf::from("b")),
+                (OsString::from("~npm~@s+p@2.0.0~peer.1"), PathBuf::from("c")),
+            ]
+        };
+        let pending: HashSet<&str> = ["foo", "@s/p"].into_iter().collect();
+        assert_eq!(
+            NpmCrawler::pending_store_entries(StoreEntry::vlt(entries()), Some(&pending)),
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
+        let as_pnpm = entries()
+            .into_iter()
+            .map(|(n, p)| (n.into_string().unwrap(), p))
+            .collect();
+        assert!(
+            !NpmCrawler::pending_store_entries(StoreEntry::pnpm(as_pnpm), Some(&pending))
+                .contains(&PathBuf::from("a")),
+            "the pnpm decoder misreads the legacy name"
+        );
+    }
+
+    #[test]
+    fn test_vlt_store_is_not_a_legacy_pnpm_store() {
+        for name in [".vlt", ".vlt-lock.json", ".VLT.DELETE.1.~npm~a@1.0.0"] {
+            assert!(!is_legacy_pnpm_store_dir_name(name), "{name}");
+        }
+    }
+
+    /// `list_vlt_store_entries` yields only real entry dirs with a real
+    /// `node_modules`, keeping the raw (legacy `·`/`§`) names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_list_vlt_store_entries_skips_hoist_meta_links_and_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join(".vlt");
+        for dir in [
+            "··ms@2.1.3/node_modules/ms",
+            "~npm~a@1.0.0/node_modules/a",
+            "node_modules/@scope",
+            "node_modules/node_modules/hoist-decoy",
+            ".VLT.DELETE.9.~npm~b@1.0.0/node_modules/b",
+            "~npm~no-nm@1.0.0/no-nm",
+            "elsewhere/node_modules",
+            "~npm~nm-link@1.0.0",
+        ] {
+            std::fs::create_dir_all(store.join(dir)).unwrap();
+        }
+        std::fs::write(store.join("vlt.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(store.join("~npm~a@1.0.0"), store.join("~npm~linked@1.0.0"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            store.join("elsewhere/node_modules"),
+            store.join("~npm~nm-link@1.0.0/node_modules"),
+        )
+        .unwrap();
+
+        let mut got: Vec<(OsString, PathBuf)> = NpmCrawler::list_vlt_store_entries(&store).await;
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    OsString::from("elsewhere"),
+                    store.join("elsewhere/node_modules")
+                ),
+                (
+                    OsString::from("~npm~a@1.0.0"),
+                    store.join("~npm~a@1.0.0/node_modules")
+                ),
+                (
+                    OsString::from("··ms@2.1.3"),
+                    store.join("··ms@2.1.3/node_modules")
+                ),
+            ]
+        );
+    }
+
+    fn write_pkg(dir: &Path, name: &str, version: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// A directory link the way vlt writes it: a symlink on Unix, an
+    /// absolute-target NTFS junction on Windows (vlt >= 1.0.0-rc.22).
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J failed");
+        }
+    }
+
+    /// A small vlt tree on the host's own link kind (junctions on Windows):
+    /// the importer link resolves at the importer root, a dependency link
+    /// inside a store entry is an edge (never a second inventory entry),
+    /// the legacy `·npm·@scope§bar@2.0.0` name round-trips through the
+    /// filesystem, and the fan-out finds the peer twin from the link.
+    #[tokio::test]
+    async fn test_vlt_store_links_are_edges_on_every_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".vlt");
+        let bar = store
+            .join("·npm·@scope§bar@2.0.0")
+            .join("node_modules")
+            .join("@scope")
+            .join("bar");
+        write_pkg(&bar, "@scope/bar", "2.0.0");
+        let foo_entry = store.join("~npm~foo@1.0.0~peer.2").join("node_modules");
+        write_pkg(&foo_entry.join("foo"), "foo", "1.0.0");
+        std::fs::create_dir_all(foo_entry.join("@scope")).unwrap();
+        link_dir(&bar, &foo_entry.join("@scope").join("bar"));
+        let twin = store
+            .join("~npm~foo@1.0.0~peer.3")
+            .join("node_modules")
+            .join("foo");
+        write_pkg(&twin, "foo", "1.0.0");
+        link_dir(&foo_entry.join("foo"), &nm.join("foo"));
+
+        let options = CrawlerOptions {
+            cwd: root.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        let mut scanned: Vec<(String, PathBuf)> = NpmCrawler::new()
+            .crawl_all(&options)
+            .await
+            .into_iter()
+            .map(|p| (p.purl, p.path))
+            .collect();
+        scanned.sort();
+        assert_eq!(
+            scanned,
+            vec![
+                ("pkg:npm/@scope/bar@2.0.0".to_string(), bar.clone()),
+                ("pkg:npm/foo@1.0.0".to_string(), nm.join("foo")),
+            ]
+        );
+
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &["pkg:npm/foo@1.0.0".to_string()])
+            .await
+            .unwrap();
+        let primary = &found["pkg:npm/foo@1.0.0"][0].path;
+        assert_eq!(primary, &nm.join("foo"));
+        assert_eq!(find_store_peer_variant_copies(primary).await, vec![twin]);
+    }
+
+    /// vlt fan-out gates: every real copy whose DepID decodes to the
+    /// primary's `name@version` (peer counters, hashed peers, modifier
+    /// extras, the legacy `··`/`·npm·` pair) is returned once; the primary,
+    /// dependency links, the hoist dir, rollback staging, an imposter
+    /// package.json and git/remote/file ids (distinct artifacts, not
+    /// variants) are not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_find_store_peer_variant_copies_vlt_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        let store = nm.join(".vlt");
+        let copy = |id: &str| store.join(id).join("node_modules").join("foo");
+        let primary = copy("~npm~foo@1.0.0~peer.2");
+        let twins = [
+            copy("~npm~foo@1.0.0~peer.3"),
+            copy("~npm~foo@1.0.0~peer.dbd5ca8b03a66489"),
+            copy("~npm~foo@1.0.0~_croot_s_g_s#foo"),
+            copy("··foo@1.0.0"),
+            copy("·npm·foo@1.0.0"),
+        ];
+        for dir in std::iter::once(&primary).chain(&twins) {
+            write_pkg(dir, "foo", "1.0.0");
+        }
+        for id in [
+            "git~github_cu+foo~v1.0.0",
+            "remote~https_c++e.com+foo-1.0.0.tgz",
+            "file~vendor+foo-1.0.0.tgz",
+            ".VLT.DELETE.1.~npm~foo@1.0.0",
+        ] {
+            write_pkg(&copy(id), "foo", "1.0.0");
+        }
+        write_pkg(&copy("~npm~foo@1.0.0~peer.9"), "foo", "1.0.1");
+        write_pkg(&store.join("node_modules/foo"), "foo", "1.0.0");
+        let dependent = store.join("~npm~dep@1.0.0/node_modules");
+        write_pkg(&dependent.join("dep"), "dep", "1.0.0");
+        std::os::unix::fs::symlink(&twins[0], dependent.join("foo")).unwrap();
+        std::os::unix::fs::symlink(&primary, nm.join("foo")).unwrap();
+
+        for start in [primary.clone(), nm.join("foo")] {
+            let mut got = find_store_peer_variant_copies(&start).await;
+            got.sort();
+            let mut want = twins.to_vec();
+            want.sort();
+            assert_eq!(got, want, "from {}", start.display());
+        }
+    }
+
+    /// D19: a vendored copy's `.socket/vendor/npm/<uuid>/<leaf>/node_modules`
+    /// is never a crawl root (hidden dirs are skipped), so the only
+    /// inventory entry is the importer link that points at it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_socket_vendor_node_modules_is_never_crawled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendored = tmp.path().join(
+            ".socket/vendor/npm/0b6f8a1e-2c3d-4e5f-8a9b-0c1d2e3f4a5b/left-pad-1.3.0/node_modules/left-pad",
+        );
+        write_pkg(&vendored, "left-pad", "1.3.0");
+        write_pkg(&vendored.join("node_modules/inner"), "inner", "1.0.0");
+        let nm = tmp.path().join("node_modules");
+        std::fs::create_dir_all(nm.join(".vlt")).unwrap();
+        std::os::unix::fs::symlink(&vendored, nm.join("left-pad")).unwrap();
+        let options = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        assert_eq!(
+            NpmCrawler::new()
+                .get_node_modules_paths(&options)
+                .await
+                .unwrap(),
+            vec![nm.clone()]
+        );
+        let scanned: Vec<(String, PathBuf)> = NpmCrawler::new()
+            .crawl_all(&options)
+            .await
+            .into_iter()
+            .map(|p| (p.purl, p.path))
+            .collect();
+        assert_eq!(
+            scanned,
+            vec![("pkg:npm/left-pad@1.3.0".to_string(), nm.join("left-pad"))]
         );
     }
 }

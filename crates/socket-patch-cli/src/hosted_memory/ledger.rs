@@ -12,7 +12,7 @@ use socket_patch_core::patch::redirect::{
 };
 use socket_patch_core::vendor::lock_inventory::{MemoryEntry, MemoryProject};
 
-use crate::commands::scan::hosted::REBASE_KINDS;
+use crate::commands::scan::hosted::{rebase_vlt_edits, REBASE_KINDS};
 
 /// Load the project's ledger: `Ok(None)` when absent, `Err` (the disk
 /// message) when present but unreadable or malformed.
@@ -51,11 +51,18 @@ pub(crate) fn merge(
     files: &BTreeMap<String, String>,
 ) {
     ledger.mode = "hosted".to_string();
+    let vlt_merged = rebase_vlt_edits(
+        &mut ledger.edits,
+        edits,
+        files
+            .get(socket_patch_core::constants::npm_family::VLT_LOCK)
+            .map(String::as_str),
+    );
     let mut rebased: Vec<usize> = Vec::new();
-    for edit in edits
-        .iter()
-        .filter(|e| REBASE_KINDS.contains(&e.kind.as_str()))
-    {
+    for edit in edits.iter().filter(|e| {
+        REBASE_KINDS.contains(&e.kind.as_str())
+            && e.kind != socket_patch_core::patch::redirect::vlt::KIND
+    }) {
         let siblings: Vec<usize> = ledger
             .edits
             .iter()
@@ -94,7 +101,10 @@ pub(crate) fn merge(
         }
     }
     let recorded = ledger.edits.len();
-    for edit in edits {
+    for (i, edit) in edits.iter().enumerate() {
+        if vlt_merged[i] {
+            continue;
+        }
         let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
             && rebased.iter().any(|&t| {
                 let old = &ledger.edits[t];

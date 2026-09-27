@@ -9,7 +9,9 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS};
+use crate::constants::npm_family::{
+    BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS, VLT_LOCK,
+};
 use crate::utils::fs::{
     read_regular_to_bytes, read_regular_to_string, read_regular_to_string_sync,
 };
@@ -326,6 +328,13 @@ pub(crate) async fn detect_npm_lock_flavor_in(
     }
 
     let detected = 'flavor: {
+        if exists(VLT_LOCK) {
+            let text = read_lock(VLT_LOCK)?;
+            match crate::vendor::vlt_lock::sniff_vendor_lock(&text) {
+                Ok(_) => break 'flavor NpmLockFlavor::Vlt,
+                Err(detail) => return Err(("vendor_lockfile_version_unsupported", detail)),
+            }
+        }
         if exists(BUN_LOCK) || exists(BUN_LOCKB) {
             break 'flavor NpmLockFlavor::Bun;
         }
@@ -377,7 +386,7 @@ pub(crate) async fn detect_npm_lock_flavor_in(
         return Err((
             "vendor_lockfile_missing",
             "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, bun.lock, \
-             or bun.lockb in the project root"
+             bun.lockb, or vlt-lock.json in the project root"
                 .to_string(),
         ));
     };
@@ -477,6 +486,20 @@ mod tests {
                 .unwrap()
                 .0,
             NpmLockFlavor::Bun
+        );
+        let vlt_over_bun = project(&[
+            (
+                "vlt-lock.json",
+                text("{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {},\n  \"edges\": {}\n}\n"),
+            ),
+            ("bun.lock", text("{}")),
+        ]);
+        assert_eq!(
+            detect_npm_lock_flavor_in(&ProjectView::Memory(&vlt_over_bun))
+                .await
+                .unwrap()
+                .0,
+            NpmLockFlavor::Vlt
         );
         let pnp = project(&[(".pnp.cjs", MemoryEntry::Present), ("yarn.lock", text(""))]);
         assert_eq!(

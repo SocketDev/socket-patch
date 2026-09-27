@@ -420,6 +420,12 @@ impl ApiClient {
         self
     }
 
+    /// The User-Agent-only client for grant-tokenized artifact URLs, where
+    /// the Socket bearer must never be sent.
+    pub(crate) fn plain_http(&self) -> &reqwest::Client {
+        &self.plain
+    }
+
     /// The run-level breaker's consecutive-failure count (tests).
     #[cfg(test)]
     pub(crate) fn vendor_outage_count(&self) -> u32 {
@@ -1714,7 +1720,7 @@ fn artifact_download_result(outcome: ServeDownload, url: &str) -> Result<Vec<u8>
 
 /// Cap on a single prebuilt-archive download (defensive bound against a
 /// runaway / hostile serve response). Generous enough for any real package.
-const MAX_VENDOR_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_VENDOR_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A prebuilt vendored archive downloaded from the patch.socket.dev service,
 /// together with the service-reported integrity. The bytes are **unverified**

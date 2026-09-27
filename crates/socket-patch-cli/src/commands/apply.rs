@@ -954,10 +954,10 @@ pub(crate) async fn run_locked(
     // `yarn patch` — but only when an npm patch is actually in scope:
     // a polyglot repo's pypi/gem/go patches apply fine under PnP, and a
     // global-tree or non-npm `--ecosystems` run never crawls this
-    // checkout's node_modules at all. pnpm gets an informational note;
-    // the substantive safety is core's rename-over write
-    // (`utils::fs::atomic_write_bytes` never touches the store's shared
-    // inode).
+    // checkout's node_modules at all. pnpm, bun and vlt get an
+    // informational note; the substantive safety is core's rename-over
+    // write (`utils::fs::atomic_write_bytes` never touches the store's
+    // shared inode).
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
             if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
@@ -983,6 +983,17 @@ pub(crate) async fn run_locked(
             // Same shape as pnpm: bun hard-links from its global
             // install cache by default. The rename-over write handles the
             // safety; this is informational only.
+        }
+        NpmPkgManager::Vlt => {
+            if !args.common.json && !args.common.silent {
+                eprintln!(
+                    "Note: vlt layout detected. Copy-on-write keeps vlt's shared package store \
+                     (<vlt cache>/store/v1) untouched."
+                );
+            }
+            // vlt 1.2 hard-links store files from its machine-wide cache
+            // (the Linux default); the rename-over write gives every patched
+            // file a private inode, so this is informational only.
         }
         // Exhaustive on purpose (no `_`): a new package-manager layout must
         // make an explicit appearance here — silence is a decision, not a

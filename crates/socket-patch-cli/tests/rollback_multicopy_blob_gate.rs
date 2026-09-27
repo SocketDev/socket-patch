@@ -295,3 +295,97 @@ fn rollback_offline_succeeds_when_every_copy_already_original() {
     assert_eq!(std::fs::read(&index_a).unwrap(), original);
     assert_eq!(std::fs::read(&index_b).unwrap(), original);
 }
+
+/// A store layout: the importer copy is already original while a
+/// peer-variant store entry of the same `name@version` is still patched.
+/// The gate must probe the variant too and fetch the before-blob it needs.
+fn store_peer_variant_rollback(
+    store_dir: &str,
+    plain_id: &str,
+    variant_id: &str,
+    lock: Option<(&str, &str)>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (index_a, index_b, before_hash, original, patched) = build_diverged_two_copy_tree(root);
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    let store = |id: &str| {
+        root.join("node_modules")
+            .join(store_dir)
+            .join(id)
+            .join("node_modules/gatedup")
+    };
+    let plain = write_copy(&store(plain_id), "gatedup", "1.0.0", &original);
+    let variant = write_copy(&store(variant_id), "gatedup", "1.0.0", &patched);
+    let importer = write_copy(
+        &root.join("node_modules/gatedup"),
+        "gatedup",
+        "1.0.0",
+        &original,
+    );
+    if let Some((name, text)) = lock {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    let _ = (index_a, index_b);
+
+    let (port, seen_paths) = spawn_blob_server(before_hash.clone(), original.clone());
+    let out = rollback_cmd(root)
+        .args([
+            "--json",
+            "--ecosystems",
+            "npm",
+            "--api-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--api-token",
+            "test-token",
+            "--org",
+            "testorg",
+        ])
+        .output()
+        .expect("run socket-patch rollback");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        seen_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == &format!("/v0/orgs/testorg/patches/blob/{before_hash}")),
+        "the gate must fetch the blob the patched variant needs.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    for index in [&plain, &variant, &importer] {
+        assert_eq!(
+            std::fs::read(index).unwrap(),
+            original,
+            "{}",
+            index.display()
+        );
+    }
+}
+
+#[test]
+fn rollback_downloads_blob_needed_only_by_a_vlt_store_peer_variant() {
+    store_peer_variant_rollback(
+        ".vlt",
+        "~npm~gatedup@1.0.0",
+        "~npm~gatedup@1.0.0~peer.0df72515a50372ba",
+        Some((
+            "vlt-lock.json",
+            "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {\n    \
+             \"~npm~gatedup@1.0.0\": [0,\"gatedup\",\"sha512-G==\"],\n    \
+             \"~npm~gatedup@1.0.0~peer.0df72515a50372ba\": [0,\"gatedup\",\"sha512-G==\"]\n  \
+             },\n  \"edges\": {\n    \"file~_d gatedup\": \"prod 1.0.0 ~npm~gatedup@1.0.0\"\n  \
+             }\n}\n",
+        )),
+    );
+}
+
+#[test]
+fn rollback_downloads_blob_needed_only_by_a_pnpm_store_peer_variant() {
+    store_peer_variant_rollback(".pnpm", "gatedup@1.0.0", "gatedup@1.0.0_react@18.2.0", None);
+}

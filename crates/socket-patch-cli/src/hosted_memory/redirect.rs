@@ -10,13 +10,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use socket_patch_core::api::types::PackageVendorResult;
-use socket_patch_core::constants::npm_family::{RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR};
+use socket_patch_core::constants::npm_family::{
+    BUN_LOCK, NPM_LOCKS as NPM_LOCK_NAMES, PNPM_LOCK, RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR,
+    VLT_HIDDEN_LOCK_REL, VLT_LOCK, VLT_STORE_DIR,
+};
 use socket_patch_core::patch::redirect::npmrc::{
     plan_npmrc_allow_remote_with, NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND,
     NPMRC_REL,
 };
 use socket_patch_core::patch::redirect::{
-    rewrite_registry_redirect_with_pipenv_version, DepOverride, FileEdit, RewriteResult,
+    rewrite_registry_redirect_withholding_vlt, DepOverride, FileEdit, RewriteResult,
     RewriteWarning,
 };
 use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
@@ -167,7 +170,10 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         | "yarn.lock"
         | ".yarnrc.yml"
         | "bun.lock"
-        | "bun.lockb" => "npm",
+        | "bun.lockb"
+        | "vlt-lock.json"
+        | "vlt.json"
+        | ".vlt-lock.json" => "npm",
         "requirements.txt" | "uv.lock" | "poetry.lock" | "pdm.lock" | "Pipfile.lock"
         | "pyproject.toml" | "hatch.toml" => "pypi",
         "Cargo.toml" | "Cargo.lock" | "config.toml" | "config" => "cargo",
@@ -207,6 +213,9 @@ pub(crate) struct Planned {
     /// `(artifact url, sha256)` of every pypi wheel whose metadata a
     /// native lock rewrite needs.
     pub(crate) wheels: Vec<(String, String)>,
+    /// The vlt artifact preflight, judged offline (see
+    /// [`crate::commands::scan::hosted::vlt::offline_preflight`]).
+    pub(crate) vlt_preflight: crate::commands::scan::hosted::vlt::Preflight,
 }
 
 /// A refused project: its error and whatever was skipped before it.
@@ -297,6 +306,49 @@ fn cargo_vendored_wiring(files: &MemoryProject, name: &str, version: &str) -> bo
     manifest_wired || config_wired
 }
 
+/// Whether vlt's install state is in the file set: the hidden lock as a
+/// file, or the store as a directory (the disk `install_state_present`).
+fn vlt_install_state_present(project: &MemoryProject) -> bool {
+    matches!(
+        project.get(VLT_HIDDEN_LOCK_REL),
+        Some(MemoryEntry::Text(_) | MemoryEntry::Binary(_) | MemoryEntry::Present)
+    ) || project.is_dir(VLT_STORE_DIR)
+}
+
+/// The disk `vlt_inputs` over the file set: `vlt-lock.json` itself, and
+/// presence-only entries for the sibling locks and vlt's install state.
+/// Empty without a readable `vlt-lock.json`.
+fn vlt_inputs(project: &MemoryProject) -> BTreeMap<String, String> {
+    let mut files = BTreeMap::new();
+    let lock = match project.get(VLT_LOCK) {
+        Some(MemoryEntry::Text(text)) => text.to_string(),
+        Some(MemoryEntry::Binary(bytes)) => match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_string(),
+            Err(_) => return files,
+        },
+        _ => return files,
+    };
+    files.insert(VLT_LOCK.to_string(), lock);
+    for sibling in [
+        NPM_LOCK_NAMES[0],
+        NPM_LOCK_NAMES[1],
+        "yarn.lock",
+        PNPM_LOCK,
+        BUN_LOCK,
+    ] {
+        if matches!(
+            project.get(sibling),
+            Some(MemoryEntry::Text(_) | MemoryEntry::Binary(_) | MemoryEntry::Present)
+        ) {
+            files.insert(sibling.to_string(), String::new());
+        }
+    }
+    if vlt_install_state_present(project) {
+        files.insert(VLT_HIDDEN_LOCK_REL.to_string(), String::new());
+    }
+    files
+}
+
 /// Everything up to the wheel-metadata fetch.
 pub(crate) fn plan(
     project: MemoryProject,
@@ -311,6 +363,37 @@ pub(crate) fn plan(
         build_candidates(selected, references, &mut skipped)
     };
 
+    // The disk flow fetches each in-scope artifact the way vlt does before
+    // anything else; with no network here every one is judged offline, so
+    // the dep is withheld instead of pinned (`--offline` parity).
+    let vlt_preflight = {
+        let deps: Vec<(&str, &DepOverride)> = candidates
+            .iter()
+            .filter(|c| c.dep.ecosystem == "npm")
+            .map(|c| (c.purl.as_str(), &c.dep))
+            .collect();
+        crate::commands::scan::hosted::vlt::offline_preflight(
+            &vlt_inputs(&project),
+            &deps,
+            project.contains("bun.lockb"),
+        )
+    };
+    if !vlt_preflight.withheld_everywhere.is_empty() {
+        for (uuid, purl) in &vlt_preflight.withheld_everywhere {
+            skipped.push(SkippedPatch {
+                purl: purl.clone(),
+                uuid: uuid.clone(),
+                reason: crate::commands::scan::hosted::vlt::WITHHELD_REASON.to_string(),
+                detail: None,
+            });
+        }
+        candidates.retain(|c| {
+            !vlt_preflight
+                .withheld_everywhere
+                .contains_key(&c.dep.patch_uuid)
+        });
+    }
+
     let bun_lock_present = project.contains("bun.lock");
     if candidates.iter().any(|c| c.dep.ecosystem == "npm")
         && !bun_lock_present
@@ -324,7 +407,7 @@ pub(crate) fn plan(
         ));
     }
 
-    let mut pre_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut pre_warnings: Vec<serde_json::Value> = vlt_preflight.warnings.clone();
     let takeover_capable = |p: &str| {
         p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
     };
@@ -403,6 +486,13 @@ pub(crate) fn plan(
         };
         for name in REDIRECT_CANDIDATE_FILES {
             if *name == "bun.lockb" {
+                continue;
+            }
+            // The hidden lock is only the install-state sentinel, never read.
+            if *name == VLT_HIDDEN_LOCK_REL {
+                if vlt_install_state_present(&project) {
+                    files.insert((*name).to_string(), String::new());
+                }
                 continue;
             }
             read(name, &mut files);
@@ -499,6 +589,7 @@ pub(crate) fn plan(
         symlinked_reads,
         unreadable_reads,
         wheels,
+        vlt_preflight,
     })
 }
 
@@ -611,11 +702,13 @@ pub(crate) fn rewrite(
         .filter(|o| !(binary_content.as_ref().is_some_and(Result::is_err) && o.ecosystem == "npm"))
         .cloned()
         .collect();
-    let mut rewrite = rewrite_registry_redirect_with_pipenv_version(
+    let mut rewrite = rewrite_registry_redirect_withholding_vlt(
         files,
         &rewrite_overrides,
         &python_metadata,
         pipenv_major,
+        project.contains("bun.lockb"),
+        &planned.vlt_preflight.withheld_from_vlt,
     );
     if let Some(content) = binary_content {
         rewrite
@@ -903,16 +996,18 @@ pub(crate) fn rewrite(
 
     let pdm_inactive =
         files.contains_key("pdm.lock") && !socket_patch_core::patch::redirect::pdm_drives(files);
-    let final_texts: Vec<&String> = files
+    // A `vlt-lock.json` the vlt rewrite was withheld from may still hold an
+    // earlier run's pin: only the sibling lock this run rewrote confirms it.
+    let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .map(|(name, content)| rewrite.files.get(name).unwrap_or(content))
+        .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
                 .filter(|(name, _)| !files.contains_key(*name))
-                .map(|(_, content)| content),
+                .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();
     let confirmed: Vec<(String, String)> = candidates
@@ -920,6 +1015,13 @@ pub(crate) fn rewrite(
         .filter(|c| {
             let purl = c.purl.as_str();
             let uuid = c.dep.patch_uuid.as_str();
+            // vlt decides before the binary-bun rule, as on disk.
+            if rewrite.refused_vlt_uuids.contains(uuid) {
+                return false;
+            }
+            if rewrite.vlt_drives && purl.starts_with("pkg:npm/") {
+                return rewrite.confirmed_vlt_uuids.contains(uuid);
+            }
             if binary_bun && purl.starts_with("pkg:npm/") {
                 return rewrite.confirmed_bun_binary_uuids.contains(uuid);
             }
@@ -960,7 +1062,11 @@ pub(crate) fn rewrite(
             let suffixed_version =
                 registry.and_then(|o| o.identifiers.maven_suffixed_version.as_deref());
             let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
-            final_texts.iter().any(|text| {
+            let vlt_withheld = planned.vlt_preflight.withheld_from_vlt.contains(uuid);
+            final_texts.iter().any(|(name, text)| {
+                if vlt_withheld && *name == VLT_LOCK {
+                    return false;
+                }
                 socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
                     || text.contains(encoded.as_str())
                     || index_url.is_some_and(|iu| text.contains(iu))

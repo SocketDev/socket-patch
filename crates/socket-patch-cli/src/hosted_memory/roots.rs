@@ -13,13 +13,14 @@ use super::types::IgnoredPath;
 
 /// Lock markers that make their directory a project root, with the
 /// ecosystem each belongs to.
-pub(crate) const ROOT_LOCK_MARKERS: [(&str, &str); 18] = [
+pub(crate) const ROOT_LOCK_MARKERS: [(&str, &str); 19] = [
     ("package-lock.json", "npm"),
     ("npm-shrinkwrap.json", "npm"),
     ("pnpm-lock.yaml", "npm"),
     ("yarn.lock", "npm"),
     ("bun.lock", "npm"),
     ("bun.lockb", "npm"),
+    ("vlt-lock.json", "npm"),
     ("rush.json", "npm"),
     ("uv.lock", "pypi"),
     ("poetry.lock", "pypi"),

@@ -122,6 +122,18 @@ impl FetchedPackage {
         }
     }
 
+    /// A tree already written into `tmp` (a committed directory artifact,
+    /// copied and verified up front): nothing left to extract.
+    fn staged(dir: PathBuf, url: String, tmp: tempfile::TempDir) -> Self {
+        Self {
+            dir,
+            url,
+            extract: std::sync::Mutex::new(None),
+            extracted: tokio::sync::OnceCell::new_with(Some(Ok(()))),
+            _tmp: tmp,
+        }
+    }
+
     /// Where the package root WILL be. Pure — no I/O and no extraction, so
     /// it answers naming questions (a gem's `<name>-<version>` leaf, whether
     /// the parent is a gem home's `gems/`) without materialising anything.
@@ -1812,6 +1824,53 @@ pub async fn stage_local_artifact(
     ))
 }
 
+/// Stage a package from a committed vlt directory artifact (the
+/// fresh-clone re-vendor path): an inventory-verified copy of `dir` without
+/// its `node_modules/`. Refused when the ledger records no inventory, and
+/// on any missing, extra or modified file.
+pub async fn stage_local_dir_artifact(
+    dir: &Path,
+    inventory: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<FetchedPackage, FetchError> {
+    let Some(inventory) = inventory else {
+        return Err(FetchError::Unverifiable(
+            "the vendor ledger records no file inventory for the artifact".to_string(),
+        ));
+    };
+    let actual = super::verify::compute_package_dir_inventory(dir)
+        .await
+        .map_err(|e| FetchError::Failed(format!("{}: {e}", dir.display())))?;
+    if &actual != inventory {
+        return Err(FetchError::Failed(format!(
+            "{}: the committed dir does not match the vendor ledger's file inventory",
+            dir.display()
+        )));
+    }
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create staging tempdir: {e}")))?;
+    let staged = tmp.path().join("package");
+    crate::patch::copy_tree::fresh_copy(dir, &staged, None)
+        .await
+        .map_err(|e| FetchError::Failed(format!("cannot stage {}: {e}", dir.display())))?;
+    crate::patch::copy_tree::remove_tree(&staged.join("node_modules"))
+        .await
+        .map_err(|e| FetchError::Failed(format!("cannot stage {}: {e}", dir.display())))?;
+    let copied = super::verify::compute_package_dir_inventory(&staged)
+        .await
+        .map_err(|e| FetchError::Failed(format!("{}: {e}", dir.display())))?;
+    if &copied != inventory {
+        return Err(FetchError::Failed(format!(
+            "{}: the staged copy does not match the vendor ledger's file inventory",
+            dir.display()
+        )));
+    }
+    Ok(FetchedPackage::staged(
+        staged,
+        format!("file:{}", dir.display()),
+        tmp,
+    ))
+}
+
 /// Capped download. http(s) only; the cap is enforced on the declared
 /// Content-Length AND the actual stream (a lying server cannot blow past
 /// it).
@@ -2064,6 +2123,23 @@ pub(crate) fn extract_tgz_skipping(
         Sink::Write,
         None,
         skip_file_name,
+        /*strict=*/ false,
+    )
+    .map(|_| ())
+}
+
+/// [`extract_tgz`] that refuses the archive instead of skipping a symlink,
+/// hardlink, device or FIFO entry (a directory artifact is committed as
+/// extracted, so nothing the archive carries may be silently dropped).
+pub(crate) fn extract_tgz_strict(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    walk_tar_gz(
+        bytes,
+        dest,
+        /*strip_first=*/ true,
+        Sink::Write,
+        None,
+        None,
+        /*strict=*/ true,
     )
     .map(|_| ())
 }
@@ -2079,6 +2155,7 @@ pub(crate) fn validate_tgz(bytes: &[u8], dest: &Path, watch: Option<&str>) -> Re
         Sink::Validate,
         watch,
         None,
+        /*strict=*/ false,
     )
 }
 
@@ -2145,6 +2222,7 @@ fn walk_gem_data(
             sink,
             None,
             skip_file_name,
+            /*strict=*/ false,
         )
         .map(|_| ());
     }
@@ -2158,6 +2236,7 @@ fn walk_tar_gz(
     sink: Sink,
     watch: Option<&str>,
     skip_file_name: Option<&str>,
+    strict: bool,
 ) -> Result<bool, String> {
     use std::io::Read as _;
     let gz = flate2::read::GzDecoder::new(bytes).take(MAX_TOTAL_DECOMPRESSED_BYTES);
@@ -2183,7 +2262,21 @@ fn walk_tar_gz(
         }
         // Regular files only: symlinks/hardlinks/devices never extract
         // (a symlink could redirect later entries out of the stage).
-        if !entry.header().entry_type().is_file() {
+        let kind = entry.header().entry_type();
+        if !kind.is_file() {
+            if strict
+                && !(kind.is_dir()
+                    || kind.is_pax_global_extensions()
+                    || kind.is_pax_local_extensions())
+            {
+                return Err(format!(
+                    "tarball entry `{}` is not a regular file or directory — refusing the artifact",
+                    entry
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ));
+            }
             continue;
         }
         let raw = entry
@@ -2212,7 +2305,15 @@ fn walk_tar_gz(
             ));
         }
         if sink == Sink::Validate && shape.clashes(&rel) {
-            return walk_tar_gz(bytes, dest, strip_first, Sink::Write, watch, skip_file_name);
+            return walk_tar_gz(
+                bytes,
+                dest,
+                strip_first,
+                Sink::Write,
+                watch,
+                skip_file_name,
+                strict,
+            );
         }
         let mut target = out.open(&rel)?;
         let mode = entry.header().mode().unwrap_or(0o644);
@@ -2520,6 +2621,46 @@ mod tests {
         match stage_local_artifact(&tgz_path, "").await {
             Err(FetchError::Unverifiable(_)) => {}
             other => panic!("expected Unverifiable for empty hash, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_local_dir_artifact_verifies_the_inventory_and_drops_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("left-pad");
+        std::fs::create_dir_all(dir.join("node_modules/.bin")).unwrap();
+        std::fs::write(dir.join("package.json"), b"{}").unwrap();
+        std::fs::write(dir.join("index.js"), b"x").unwrap();
+        std::fs::write(dir.join("node_modules/.bin/tool"), b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../../elsewhere", dir.join("node_modules/dep")).unwrap();
+        let inventory = super::super::verify::compute_package_dir_inventory(&dir)
+            .await
+            .unwrap();
+        assert_eq!(inventory.len(), 2, "{inventory:?}");
+
+        let staged = stage_local_dir_artifact(&dir, Some(&inventory))
+            .await
+            .unwrap();
+        let staged_dir = staged.dir().await.unwrap();
+        assert_eq!(std::fs::read(staged_dir.join("index.js")).unwrap(), b"x");
+        assert!(!staged_dir.join("node_modules").exists());
+        assert_eq!(staged.url, format!("file:{}", dir.display()));
+
+        std::fs::write(dir.join("planted.js"), b"y").unwrap();
+        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
+            other => panic!("a planted file must fail, got {other:?}"),
+        }
+        std::fs::remove_file(dir.join("planted.js")).unwrap();
+        std::fs::write(dir.join("index.js"), b"modified").unwrap();
+        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
+            other => panic!("a modified file must fail, got {other:?}"),
+        }
+        match stage_local_dir_artifact(&dir, None).await {
+            Err(FetchError::Unverifiable(_)) => {}
+            other => panic!("no inventory is unverifiable, got {other:?}"),
         }
     }
 

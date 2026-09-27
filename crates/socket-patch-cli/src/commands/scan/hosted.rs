@@ -21,14 +21,21 @@ use crate::commands::vex::generate_vex_from_manifest_path;
 use super::{discover_selected, ScanArgs};
 
 mod python;
+pub(crate) mod vlt;
+
+pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
+pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
 
 /// Candidate lockfiles / registry configs the redirect rewriters may touch —
 /// read from the project when present and handed to `rewrite_registry_redirect`.
 /// Fragment-edit kinds whose lockfile the package manager re-lays in place
 /// (keeping the Socket source) — a re-scan REBASES their ledger edits instead
 /// of appending; see the ledger merge below.
-pub(crate) const REBASE_KINDS: &[&str] =
-    &["redirect_poetry_lock_package", "redirect_pdm_lock_package"];
+pub(crate) const REBASE_KINDS: &[&str] = &[
+    "redirect_poetry_lock_package",
+    "redirect_pdm_lock_package",
+    socket_patch_core::patch::redirect::vlt::KIND,
+];
 
 pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
@@ -43,6 +50,12 @@ pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     ".yarnrc.yml",
     "bun.lock",
     "bun.lockb",
+    // vlt: the lock is rewritten, vlt.json is read-only (the old-lockfile
+    // advisory), and the hidden lock is only stat'ed as the install-state
+    // sentinel.
+    "vlt-lock.json",
+    "vlt.json",
+    "node_modules/.vlt-lock.json",
     "requirements.txt",
     "uv.lock",
     "poetry.lock",
@@ -1128,6 +1141,9 @@ pub(super) async fn run_redirect(
 enum ProbeStep {
     Decided(bool),
     Needles(Vec<String>),
+    /// [`Self::Needles`], searched in every final text but `vlt-lock.json`
+    /// (a dep withheld from the vlt rewrite).
+    NeedlesOutsideVlt(Vec<String>),
 }
 
 /// The substrings whose presence in a final text confirms `dep`'s redirect —
@@ -1218,7 +1234,7 @@ pub(crate) async fn run_redirect_selected(
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect_with_pipenv_version, RedirectState,
+        rewrite_registry_redirect_withholding_vlt, RedirectState,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -1385,6 +1401,31 @@ pub(crate) async fn run_redirect_selected(
             );
         }
         return 1;
+    }
+
+    // vlt artifact preflight: before any takeover or rewrite (dry runs
+    // included), each in-scope artifact is fetched as vlt fetches it. A
+    // failure while vlt drives withholds the dep from every rewriter;
+    // otherwise only from the vlt rewrite.
+    let vlt_preflight = {
+        let deps: Vec<(&str, &DepOverride)> = candidates
+            .iter()
+            .filter(|c| c.dep.ecosystem == "npm")
+            .map(|c| (c.purl.as_str(), &c.dep))
+            .collect();
+        vlt::artifact_preflight(common, api_client, &deps).await
+    };
+    if !vlt_preflight.withheld_everywhere.is_empty() {
+        for (uuid, purl) in &vlt_preflight.withheld_everywhere {
+            skipped.push(serde_json::json!({
+                "purl": purl, "uuid": uuid, "reason": vlt::WITHHELD_REASON,
+            }));
+        }
+        candidates.retain(|c| {
+            !vlt_preflight
+                .withheld_everywhere
+                .contains_key(&c.dep.patch_uuid)
+        });
     }
 
     // The apply lock (see `acquire_hosted_lock`), taken only by a WET run
@@ -1602,10 +1643,39 @@ pub(crate) async fn run_redirect_selected(
         } else {
             None
         };
+        // vlt twin: the hosted rewriter's lock-level refusal must be known
+        // before a vendored vlt entry is reverted, or the revert strips the
+        // live vendored patch and the rewrite then refuses the lock.
+        let vlt_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+            entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("vlt")
+        };
+        let vlt_takeover_refusal = if takeover
+            .iter()
+            .any(|(_, entry)| entry.as_ref().is_some_and(vlt_entry))
+        {
+            match socket_patch_core::utils::fs::read_regular_to_string(
+                &common
+                    .cwd
+                    .join(socket_patch_core::constants::npm_family::VLT_LOCK),
+            )
+            .await
+            {
+                Ok(lock) => {
+                    let files = std::collections::BTreeMap::from([(
+                        socket_patch_core::constants::npm_family::VLT_LOCK.to_string(),
+                        lock,
+                    )]);
+                    socket_patch_core::patch::redirect::vlt::preflight_vlt_hosted(&files).err()
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         // The takeover refusal (if any) for one candidate: bun gates every
-        // npm purl, berry only its vendored-berry entries. A refused purl is
-        // never dispatched (see the loop), so its wiring is not a write
-        // target here.
+        // npm purl, berry and vlt only their own vendored entries. A refused
+        // purl is never dispatched (see the loop), so its wiring is not a
+        // write target here.
         let takeover_refusal =
             |c: &Candidate,
              entry: Option<&socket_patch_core::vendor::VendorEntry>|
@@ -1613,11 +1683,18 @@ pub(crate) async fn run_redirect_selected(
                 if !c.purl.starts_with("pkg:npm/") {
                     return None;
                 }
-                bun_takeover_refusal.as_ref().or_else(|| {
-                    berry_takeover_refusal
-                        .as_ref()
-                        .filter(|_| entry.is_some_and(berry_entry))
-                })
+                bun_takeover_refusal
+                    .as_ref()
+                    .or_else(|| {
+                        berry_takeover_refusal
+                            .as_ref()
+                            .filter(|_| entry.is_some_and(berry_entry))
+                    })
+                    .or_else(|| {
+                        vlt_takeover_refusal
+                            .as_ref()
+                            .filter(|_| entry.is_some_and(vlt_entry))
+                    })
             };
         // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
         // SYMLINK GUARD below, applied to the files the reverts rewrite
@@ -1748,6 +1825,15 @@ pub(crate) async fn run_redirect_selected(
                          takeover: the project is now fully hosted for this package)"
                     ),
                 }));
+                takeover_pre_warnings.extend(
+                    outcome
+                        .warnings
+                        .iter()
+                        .filter(|w| {
+                            w.code == socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED
+                        })
+                        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail })),
+                );
                 takeover_migrated.push(purl.clone());
                 takeover_files.extend(entry.wiring.iter().map(|w| w.file.clone()));
             } else {
@@ -1851,6 +1937,12 @@ pub(crate) async fn run_redirect_selected(
     if !candidates.is_empty() || !dry_run_takeover_urls.is_empty() {
         for name in REDIRECT_CANDIDATE_FILES {
             if *name == "bun.lockb" {
+                continue;
+            }
+            if *name == socket_patch_core::constants::npm_family::VLT_HIDDEN_LOCK_REL {
+                if vlt::install_state_present(&common.cwd) {
+                    files.insert((*name).to_string(), String::new());
+                }
                 continue;
             }
             if let Ok(content) = read_regular_to_string(&common.cwd.join(name)).await {
@@ -2118,12 +2210,16 @@ pub(crate) async fn run_redirect_selected(
     // Pure CPU over every lock text (the independent rewriter groups run
     // concurrently inside), so it runs on the blocking pool rather than on a
     // runtime worker; `files` comes back for the confirmation probe below.
+    let bun_lockb_present = common.cwd.join("bun.lockb").exists();
+    let withheld_from_vlt = vlt_preflight.withheld_from_vlt.clone();
     let (files, mut rewrite) = tokio::task::spawn_blocking(move || {
-        let rewrite = rewrite_registry_redirect_with_pipenv_version(
+        let rewrite = rewrite_registry_redirect_withholding_vlt(
             &files,
             &rewrite_overrides,
             &python_metadata,
             pipenv_major,
+            bun_lockb_present,
+            &withheld_from_vlt,
         );
         (files, rewrite)
     })
@@ -2585,16 +2681,20 @@ pub(crate) async fn run_redirect_selected(
     // here is always safe; `pdm.lock` only ever carries pypi URLs.
     let pdm_inactive =
         files.contains_key("pdm.lock") && !socket_patch_core::patch::redirect::pdm_drives(&files);
-    let final_texts: Vec<&String> = files
+    // Likewise a `vlt-lock.json` the vlt rewrite was withheld from (its
+    // artifact failed the preflight beside another npm-family lock) may
+    // still hold an earlier run's pin: only the sibling lock this run
+    // rewrote can confirm that dep.
+    let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .map(|(name, content)| rewrite.files.get(name).unwrap_or(content))
+        .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
             rewrite
                 .files
                 .iter()
                 .filter(|(name, _)| !files.contains_key(*name))
-                .map(|(_, content)| content),
+                .map(|(name, content)| (name.as_str(), content)),
         )
         .collect();
     // Every non-substring rule decides a candidate outright; the rest are
@@ -2608,6 +2708,14 @@ pub(crate) async fn run_redirect_selected(
         .map(|c| {
             let purl = c.purl.as_str();
             let uuid = c.dep.patch_uuid.as_str();
+            // vlt decides before the binary-bun rule, so `bun.lockb` beside
+            // a vlt-driven `vlt-lock.json` never confirms an npm purl.
+            if rewrite.refused_vlt_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
+            if rewrite.vlt_drives && purl.starts_with("pkg:npm/") {
+                return ProbeStep::Decided(rewrite.confirmed_vlt_uuids.contains(uuid));
+            }
             if binary_bun && purl.starts_with("pkg:npm/") {
                 return ProbeStep::Decided(rewrite.confirmed_bun_binary_uuids.contains(uuid));
             }
@@ -2667,25 +2775,49 @@ pub(crate) async fn run_redirect_selected(
             if purl.starts_with("pkg:golang/") {
                 return ProbeStep::Decided(rewrite.confirmed_golang_uuids.contains(uuid));
             }
-            ProbeStep::Needles(candidate_presence_needles(&c.dep))
+            let needles = candidate_presence_needles(&c.dep);
+            if vlt_preflight.withheld_from_vlt.contains(uuid) {
+                ProbeStep::NeedlesOutsideVlt(needles)
+            } else {
+                ProbeStep::Needles(needles)
+            }
         })
         .collect();
-    let groups: Vec<&[String]> = steps
-        .iter()
-        .filter_map(|step| match step {
-            ProbeStep::Needles(needles) => Some(needles.as_slice()),
-            ProbeStep::Decided(_) => None,
-        })
-        .collect();
+    let groups = |outside_vlt: bool| -> Vec<&[String]> {
+        steps
+            .iter()
+            .filter_map(|step| match step {
+                ProbeStep::Needles(needles) if !outside_vlt => Some(needles.as_slice()),
+                ProbeStep::NeedlesOutsideVlt(needles) if outside_vlt => Some(needles.as_slice()),
+                _ => None,
+            })
+            .collect()
+    };
+    let all_texts: Vec<&String> = final_texts.iter().map(|(_, text)| *text).collect();
     let mut present =
-        socket_patch_core::patch::redirect::presence::groups_present(&final_texts, &groups)
+        socket_patch_core::patch::redirect::presence::groups_present(&all_texts, &groups(false))
             .into_iter();
+    let outside_vlt_groups = groups(true);
+    let mut present_outside_vlt = if outside_vlt_groups.is_empty() {
+        Vec::new()
+    } else {
+        let texts: Vec<&String> = final_texts
+            .iter()
+            .filter(|(name, _)| *name != socket_patch_core::constants::npm_family::VLT_LOCK)
+            .map(|(_, text)| *text)
+            .collect();
+        socket_patch_core::patch::redirect::presence::groups_present(&texts, &outside_vlt_groups)
+    }
+    .into_iter();
     let confirmed: Vec<(String, String)> = candidates
         .iter()
         .zip(&steps)
         .filter(|(_, step)| match step {
             ProbeStep::Decided(keep) => *keep,
             ProbeStep::Needles(_) => present
+                .next()
+                .expect("one presence answer per needle group"),
+            ProbeStep::NeedlesOutsideVlt(_) => present_outside_vlt
                 .next()
                 .expect("one presence answer per needle group"),
         })
@@ -2818,12 +2950,18 @@ pub(crate) async fn run_redirect_selected(
             // fragment) and adopting the fresh `new` keeps the chain a single
             // invertible link: replay swaps the fragment this run wrote back to
             // the fragment the very first run found.
+            let vlt_merged = rebase_vlt_edits(
+                &mut ledger.edits,
+                &rewrite.edits,
+                files
+                    .get(socket_patch_core::constants::npm_family::VLT_LOCK)
+                    .map(String::as_str),
+            );
             let mut rebased: Vec<usize> = Vec::new();
-            for edit in rewrite
-                .edits
-                .iter()
-                .filter(|e| REBASE_KINDS.contains(&e.kind.as_str()))
-            {
+            for edit in rewrite.edits.iter().filter(|e| {
+                REBASE_KINDS.contains(&e.kind.as_str())
+                    && e.kind != socket_patch_core::patch::redirect::vlt::KIND
+            }) {
                 let siblings: Vec<usize> = ledger
                     .edits
                     .iter()
@@ -2880,7 +3018,10 @@ pub(crate) async fn run_redirect_selected(
             // them made `remove` leave the second pin (and its registry
             // block) in place while reporting success.
             let recorded = ledger.edits.len();
-            for edit in &rewrite.edits {
+            for (i, edit) in rewrite.edits.iter().enumerate() {
+                if vlt_merged[i] {
+                    continue;
+                }
                 let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
                     && rebased.iter().any(|&t| {
                         let old = &ledger.edits[t];
@@ -2985,6 +3126,33 @@ pub(crate) async fn run_redirect_selected(
         .await
     };
 
+    // vlt warm-tree heal (DESIGN §3.9): stale installed copies of the
+    // Socket-owned nodes are invalidated (classified only on a dry run or
+    // with --no-vlt-install-cleanup), and every confirmed vlt purl whose
+    // installed or next-installed bytes are not known to be patched is
+    // withheld from the in-run VEX attestation.
+    let vlt_stale = {
+        let rewrite_codes: Vec<&str> = rewrite.warnings.iter().map(|w| w.code.as_str()).collect();
+        let lock_key = socket_patch_core::constants::npm_family::VLT_LOCK;
+        vlt::heal_after_rewrite(
+            common,
+            &vlt::HealInputs {
+                final_lock: rewrite
+                    .files
+                    .get(lock_key)
+                    .or_else(|| files.get(lock_key))
+                    .map(String::as_str),
+                preflight: &vlt_preflight,
+                records: &ledger.records,
+                confirmed: &confirmed,
+                confirmed_vlt: &rewrite.confirmed_vlt_uuids,
+                foreign: &rewrite.vlt_foreign_uuids,
+                rewrite_warning_codes: &rewrite_codes,
+            },
+        )
+        .await
+    };
+
     // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)
     // may still claim package(s) this project also has a hosted redirect ledger
     // for — their tarballs would then be orphaned and that ledger stale. But the
@@ -3063,12 +3231,20 @@ pub(crate) async fn run_redirect_selected(
             .iter()
             .map(|(purl, _)| purl.clone())
             .filter(|purl| {
-                !gem_stale.stale_purls.contains(purl) && !python_stale.stale_purls.contains(purl)
+                !gem_stale.stale_purls.contains(purl)
+                    && !python_stale.stale_purls.contains(purl)
+                    && !vlt_stale.stale_purls.contains(purl)
             })
             .collect();
         // A healthy copy in another interpreter must not override a stale
-        // Python tree found by the probe, including with --vex-no-verify.
-        params.known_stale = python_stale.stale_purls.iter().cloned().collect();
+        // Python tree found by the probe, including with --vex-no-verify;
+        // likewise a vlt copy the heal could not prove patched.
+        params.known_stale = python_stale
+            .stale_purls
+            .iter()
+            .chain(&vlt_stale.stale_purls)
+            .cloned()
+            .collect();
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
             Ok(summary) => {
@@ -3095,12 +3271,14 @@ pub(crate) async fn run_redirect_selected(
             })
         })
         .collect();
+    warnings.extend(vlt_preflight.warnings.iter().cloned());
     warnings.extend(record_warnings.iter().cloned());
     warnings.extend(rush_warnings.iter().cloned());
     warnings.extend(pnpm_warnings.iter().cloned());
     warnings.extend(npm_warnings.iter().cloned());
     warnings.extend(gem_stale.warnings.iter().cloned());
     warnings.extend(python_stale.warnings.iter().cloned());
+    warnings.extend(vlt_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());
     warnings.extend(takeover_warnings.iter().cloned());
     warnings.extend(prune_warnings.iter().cloned());
@@ -3287,7 +3465,8 @@ const TAKEOVER_INFO_CODES: &[&str] = &[
 /// sentence (`pnpm >=11 rejects…` must not become `Pnpm`).
 const LOWERCASE_TOOLS: &[&str] = &[
     "npm", "pnpm", "yarn", "bun", "cargo", "pip", "pipenv", "uv", "poetry", "pdm", "hatch", "go",
-    "gem", "bundler", "bundle", "composer", "mvn", "gradle", "dotnet", "deno", "rush",
+    "gem", "bundler", "bundle", "composer", "mvn", "gradle", "dotnet", "deno", "rush", "vlt",
+    "vlx", "vlr",
 ];
 
 /// Capitalize the first letter of a message for an `Error:`/`Warning:`
@@ -3465,6 +3644,12 @@ fn describe_skip_reason(reason: &str) -> String {
         "redirect_bun_lock_unsupported" | "redirect_bun_lockb_invalid" => {
             "the Bun lockfile blocks the vendored-to-hosted migration (see the warning)".into()
         }
+        "redirect_vlt_lock_unsupported" => {
+            "vlt-lock.json blocks the vendored-to-hosted migration (see the warning)".into()
+        }
+        "redirect_vlt_artifact_unverifiable" => {
+            "vlt could not verify the hosted artifact (see the warning)".into()
+        }
         other => format!("server status `{other}`"),
     }
 }
@@ -3582,13 +3767,105 @@ fn format_next_steps(
     } else {
         crate::commands::composer_hints::hosted_reinstall_hint(files, edits).unwrap_or_default()
     };
-    vec![
+    let mut steps = vec![
         format!("Commit {} to keep the redirect.", join_names(&commit, 6)),
         format!(
             "Reinstall from the updated lockfile{hint} so the installed packages pick up the \
              patched artifacts, then run `socket-patch vex` to verify them."
         ),
-    ]
+    ];
+    if files
+        .iter()
+        .any(|f| f == socket_patch_core::constants::npm_family::VLT_LOCK)
+    {
+        steps.push("vlt: commit vlt-lock.json; CI should run `vlt ci`".to_string());
+    }
+    steps
+}
+
+/// Merge this run's vlt node edits into the recorded ones. A fresh edit
+/// for the same `key` and DepID keeps the oldest recorded `original` (the
+/// pristine registry entry), takes the fresh `new` and drops the chain's
+/// later links (a server-written ledger appends one per hosted PR). One
+/// whose recorded same-key edits all name DepIDs the pre-run lock no longer
+/// holds (a re-lock, or a new id grammar after a vlt upgrade) replaces
+/// them. So does one for another key of the same `name@version` whose
+/// vanished recorded edit's pin vlt carried to the fresh DepID (a new peer
+/// context). A replacing edit keeps the recorded pristine slots when vlt
+/// carried the pin ([`carried_pin_original`]). Returns, per fresh edit,
+/// whether it was merged (anything else is appended as usual).
+pub(crate) fn rebase_vlt_edits(
+    ledger: &mut Vec<socket_patch_core::patch::redirect::FileEdit>,
+    fresh: &[socket_patch_core::patch::redirect::FileEdit],
+    before_lock: Option<&str>,
+) -> Vec<bool> {
+    use socket_patch_core::patch::redirect::vlt::{
+        carried_pin_original, edit_dep_id, lock_node_ids, KIND,
+    };
+    use socket_patch_core::patch::redirect::FileEdit;
+    fn superseding(edit: &FileEdit, old: &FileEdit) -> FileEdit {
+        let mut next = edit.clone();
+        if let Some(original) = carried_pin_original(edit, old) {
+            next.original = Some(original);
+        }
+        next
+    }
+    fn key_base(key: &Option<String>) -> Option<&str> {
+        key.as_deref()
+            .map(|k| k.split_once('~').map_or(k, |(base, _)| base))
+    }
+    let live = before_lock.and_then(lock_node_ids).unwrap_or_default();
+    let mut merged = vec![false; fresh.len()];
+    for (i, edit) in fresh.iter().enumerate() {
+        if edit.kind != KIND {
+            continue;
+        }
+        let id = edit_dep_id(edit);
+        let same_key: Vec<usize> = ledger
+            .iter()
+            .enumerate()
+            .filter(|(_, old)| old.kind == KIND && old.path == edit.path && old.key == edit.key)
+            .map(|(j, _)| j)
+            .collect();
+        let same_dep: Vec<usize> = same_key
+            .iter()
+            .copied()
+            .filter(|&j| id.is_some() && edit_dep_id(&ledger[j]) == id)
+            .collect();
+        if let Some((&first, rest)) = same_dep.split_first() {
+            ledger[first].new = edit.new.clone();
+            ledger[first].action = edit.action.clone();
+            for &j in rest.iter().rev() {
+                ledger.remove(j);
+            }
+            merged[i] = true;
+            continue;
+        }
+        let vanished = |j: &usize| edit_dep_id(&ledger[*j]).is_none_or(|old| !live.contains(&old));
+        let gone: Vec<usize> = same_key.into_iter().filter(vanished).collect();
+        if let Some((&first, rest)) = gone.split_first() {
+            ledger[first] = superseding(edit, &ledger[first]);
+            for &j in rest.iter().rev() {
+                ledger.remove(j);
+            }
+            merged[i] = true;
+            continue;
+        }
+        let rekeyed = (0..ledger.len()).find(|j| {
+            let old = &ledger[*j];
+            old.kind == KIND
+                && old.path == edit.path
+                && old.key != edit.key
+                && key_base(&old.key) == key_base(&edit.key)
+                && vanished(j)
+                && carried_pin_original(edit, old).is_some()
+        });
+        if let Some(j) = rekeyed {
+            ledger[j] = superseding(edit, &ledger[j]);
+            merged[i] = true;
+        }
+    }
+    merged
 }
 
 /// Transient-frame boxed constructor for [`run_redirect_selected`] — the
@@ -3635,9 +3912,10 @@ mod tests {
         pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
+    use super::{rebase_vlt_edits, REBASE_KINDS};
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
-    use socket_patch_core::patch::redirect::DepOverride;
+    use socket_patch_core::patch::redirect::{DepOverride, FileEdit};
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
 
     /// The wheel window is a patch-API window, so the documented escape
@@ -4962,6 +5240,14 @@ mod tests {
             describe_skip_reason("redirect_bun_lockb_invalid"),
             describe_skip_reason("redirect_bun_lock_unsupported")
         );
+        assert_eq!(
+            describe_skip_reason("redirect_vlt_artifact_unverifiable"),
+            "vlt could not verify the hosted artifact (see the warning)"
+        );
+        assert_eq!(
+            describe_skip_reason("redirect_vlt_lock_unsupported"),
+            "vlt-lock.json blocks the vendored-to-hosted migration (see the warning)"
+        );
         assert_eq!(describe_skip_reason("mystery"), "server status `mystery`");
         for code in [
             "not_found",
@@ -5053,6 +5339,12 @@ mod tests {
             "The redirect ledger ./a is malformed"
         );
         assert_eq!(sentence_case("pnpm >=11 rejects"), "pnpm >=11 rejects");
+        for tool in ["vlt", "vlx", "vlr"] {
+            assert_eq!(
+                sentence_case(&format!("{tool} ci fails")),
+                format!("{tool} ci fails")
+            );
+        }
         assert_eq!(
             sentence_case("pnpm-lock.yaml was repointed"),
             "pnpm-lock.yaml was repointed"
@@ -5252,6 +5544,189 @@ mod tests {
             "Commit pnpm-lock.yaml and pnpm-workspace.yaml to keep the redirect."
         );
         assert!(!steps[1].contains("npm ci"), "{}", steps[1]);
+    }
+
+    #[test]
+    fn next_steps_add_the_vlt_ci_line_only_for_a_rewritten_vlt_lock() {
+        let steps = format_next_steps(&["vlt-lock.json".to_string()], &[], true, false);
+        assert_eq!(
+            steps.last().map(String::as_str),
+            Some("vlt: commit vlt-lock.json; CI should run `vlt ci`")
+        );
+        assert!(
+            !format_next_steps(&["package-lock.json".to_string()], &[], true, false)
+                .iter()
+                .any(|s| s.starts_with("vlt:"))
+        );
+    }
+
+    fn vlt_edit(key: &str, id: &str, slot2: &str, slot3: &str) -> FileEdit {
+        FileEdit {
+            path: "vlt-lock.json".into(),
+            kind: socket_patch_core::patch::redirect::vlt::KIND.into(),
+            action: "rewritten".into(),
+            key: Some(key.into()),
+            original: Some(serde_json::Value::String(format!(
+                "\"{id}\": [0,\"x\",\"sha512-reg\",null]"
+            ))),
+            new: Some(serde_json::Value::String(format!(
+                "\"{id}\": [0,\"x\",\"{slot2}\",\"{slot3}\"]"
+            ))),
+        }
+    }
+
+    fn vlt_lock_with(ids: &[&str]) -> String {
+        let nodes: Vec<String> = ids
+            .iter()
+            .map(|id| format!("    \"{id}\": [0,\"x\"]"))
+            .collect();
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n{}\n  }},\n  \"edges\": {{}}\n}}\n",
+            nodes.join(",\n")
+        )
+    }
+
+    #[test]
+    fn vlt_rerun_keeps_the_pristine_original_for_the_same_dep_id() {
+        assert!(REBASE_KINDS.contains(&socket_patch_core::patch::redirect::vlt::KIND));
+        let mut ledger = vec![vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p1", "u1")];
+        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p2", "u2");
+        fresh.original = ledger[0].new.clone();
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger[0].original,
+            vlt_edit("x@1.0.0", "~npm~x@1.0.0", "", "").original
+        );
+        assert_eq!(ledger[0].new, fresh.new);
+    }
+
+    #[test]
+    fn vlt_relocked_dep_id_supersedes_the_recorded_edits() {
+        let mut ledger = vec![
+            vlt_edit("x@1.0.0", "··x@1.0.0", "sha512-p", "u"),
+            vlt_edit("x@1.0.0", "·npm·x@1.0.0", "sha512-p", "u"),
+            vlt_edit("y@1.0.0", "·npm·y@1.0.0", "sha512-p", "u"),
+        ];
+        let fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p", "u");
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&["~npm~x@1.0.0", "·npm·y@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(
+            ledger,
+            [fresh, vlt_edit("y@1.0.0", "·npm·y@1.0.0", "sha512-p", "u")]
+        );
+    }
+
+    fn vlt_pinned_at(edit: &FileEdit, id: &str) -> Option<serde_json::Value> {
+        let new = edit.new.as_ref()?.as_str()?;
+        let (_, tuple) = new.split_once(": ")?;
+        Some(serde_json::Value::String(format!("\"{id}\": {tuple}")))
+    }
+
+    #[test]
+    fn vlt_rerun_collapses_a_server_appended_chain_into_one_link() {
+        let first = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pa", "ua");
+        let mut second = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pb", "ub");
+        second.original = first.new.clone();
+        let mut ledger = vec![first, second.clone()];
+        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-pc", "uc");
+        fresh.original = second.new.clone();
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(
+            ledger,
+            [FileEdit {
+                original: vlt_edit("x@1.0.0", "~npm~x@1.0.0", "", "").original,
+                ..fresh
+            }]
+        );
+    }
+
+    #[test]
+    fn vlt_rerun_after_a_peer_context_rekey_keeps_the_pristine_slots() {
+        let old_id = "~npm~x@1.0.0~peer.0df72515a50372ba";
+        let new_id = "~npm~x@1.0.0~peer.32643a3290c32d5d";
+        let recorded = vlt_edit("x@1.0.0~peer.0df72515a50372ba", old_id, "sha512-p1", "u1");
+        let mut ledger = vec![
+            vlt_edit("y@1.0.0", "~npm~y@1.0.0", "sha512-p", "u"),
+            recorded.clone(),
+        ];
+        let mut fresh = vlt_edit("x@1.0.0~peer.32643a3290c32d5d", new_id, "sha512-p2", "u2");
+        fresh.original = vlt_pinned_at(&recorded, new_id);
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&[new_id, "~npm~y@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger[1].key, fresh.key);
+        assert_eq!(ledger[1].new, fresh.new);
+        assert_eq!(
+            ledger[1].original,
+            Some(serde_json::Value::String(format!(
+                "\"{new_id}\": [0,\"x\",\"sha512-reg\"]"
+            )))
+        );
+
+        let mut pristine = vec![recorded.clone()];
+        let relocked = vlt_edit("x@1.0.0~peer.32643a3290c32d5d", new_id, "sha512-p2", "u2");
+        let merged = rebase_vlt_edits(
+            &mut pristine,
+            std::slice::from_ref(&relocked),
+            Some(&vlt_lock_with(&[new_id])),
+        );
+        assert_eq!(merged, [false], "a re-lock that dropped the pin appends");
+        assert_eq!(pristine, [recorded]);
+    }
+
+    #[test]
+    fn vlt_relocked_dep_id_that_kept_the_pin_keeps_the_pristine_slots() {
+        let recorded = vlt_edit("x@1.0.0", "·npm·x@1.0.0", "sha512-p1", "u1");
+        let mut ledger = vec![recorded.clone()];
+        let mut fresh = vlt_edit("x@1.0.0", "~npm~x@1.0.0", "sha512-p2", "u2");
+        fresh.original = vlt_pinned_at(&recorded, "~npm~x@1.0.0");
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&["~npm~x@1.0.0"])),
+        );
+        assert_eq!(merged, [true]);
+        assert_eq!(
+            ledger,
+            [FileEdit {
+                original: Some(serde_json::Value::String(
+                    "\"~npm~x@1.0.0\": [0,\"x\",\"sha512-reg\"]".into()
+                )),
+                ..fresh
+            }]
+        );
+    }
+
+    #[test]
+    fn vlt_edit_of_a_live_sibling_dep_id_is_appended() {
+        let mut ledger = vec![vlt_edit("x@1.0.0", "··x@1.0.0", "sha512-p", "u")];
+        let fresh = vlt_edit("x@1.0.0", "·npm·x@1.0.0", "sha512-p", "u");
+        let merged = rebase_vlt_edits(
+            &mut ledger,
+            std::slice::from_ref(&fresh),
+            Some(&vlt_lock_with(&["··x@1.0.0", "·npm·x@1.0.0"])),
+        );
+        assert_eq!(merged, [false]);
+        assert_eq!(ledger.len(), 1);
     }
 
     #[test]

@@ -789,3 +789,55 @@ fn setup_exclude_covers_manifests_nested_below_the_excluded_member() {
         "no manifest under the excluded member may appear in the envelope:\n{stdout}"
     );
 }
+
+// ===========================================================================
+// Additive contract values for vlt: the setup envelope's `packageManager`
+// and the `patch_setup` telemetry `manager` both say "vlt" for a vlt project
+// (the hook itself is npm's `npx` form).
+// ===========================================================================
+
+#[tokio::test]
+async fn setup_reports_vlt_in_the_envelope_and_telemetry() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path = tempfile::tempdir().unwrap();
+    write(
+        &tmp.path().join("package.json"),
+        "{\n  \"name\": \"vlt-proj\",\n  \"version\": \"1.0.0\"\n}\n",
+    );
+    write(&tmp.path().join("vlt.json"), "{}\n");
+
+    let mut cmd = Command::new(binary());
+    cmd.args(["setup", "--json", "--yes"])
+        .current_dir(tmp.path());
+    for (name, _) in std::env::vars() {
+        if name.starts_with("SOCKET_") || name == "VITEST" {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("HOME", home.path())
+        .env("PATH", path.path())
+        .env("SOCKET_NO_CONFIG", "1")
+        .env("SOCKET_NO_UPDATE_CHECK", "1")
+        .env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_PROXY_URL", server.uri());
+    let out = cmd.output().expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+
+    let reqs = server.received_requests().await.unwrap_or_default();
+    let events: Vec<serde_json::Value> = reqs
+        .iter()
+        .filter(|r| r.url.path() == "/patch/telemetry")
+        .map(|r| serde_json::from_slice(&r.body).expect("telemetry body is JSON"))
+        .collect();
+    assert_eq!(events.len(), 1, "one patch_setup event: {events:?}");
+    assert_eq!(events[0]["event_type"], "patch_setup", "{}", events[0]);
+    assert_eq!(events[0]["metadata"]["manager"], "vlt", "{}", events[0]);
+}

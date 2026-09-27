@@ -25,6 +25,7 @@ const RUST_IMPLEMENTED: &[&str] = &[
     "npm/yarn-classic",
     "npm/yarn-berry",
     "npm/bun",
+    "npm/vlt",
     "pypi/requirements",
     "pypi/uv",
     "cargo/cargo",
@@ -160,6 +161,29 @@ fn redirect_golden_fixtures_match() {
                     .unwrap_or_else(|e| panic!("{rel}: bad expected-warnings.json: {e}"));
             let got: Vec<String> = result.warnings.iter().map(|w| w.code.clone()).collect();
             assert_eq!(got, expected, "{rel}: warning codes mismatch");
+        }
+
+        // Confirmation sets (`expected-confirmation.json`: `confirmed` and
+        // `refused` uuid lists plus `vltDrives`), the hosted confirmation
+        // inputs the TS twin must reproduce. Required for every vlt case,
+        // optional elsewhere.
+        let confirmation_path = case.join("expected-confirmation.json");
+        if eco_flavor == "npm/vlt" {
+            assert!(
+                confirmation_path.is_file(),
+                "{rel}: vlt cases must ship expected-confirmation.json"
+            );
+        }
+        if confirmation_path.is_file() {
+            let expected: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&confirmation_path).unwrap())
+                    .unwrap_or_else(|e| panic!("{rel}: bad expected-confirmation.json: {e}"));
+            let got = serde_json::json!({
+                "confirmed": result.confirmed_vlt_uuids,
+                "refused": result.refused_vlt_uuids,
+                "vltDrives": result.vlt_drives,
+            });
+            assert_eq!(got, expected, "{rel}: confirmation mismatch");
         }
 
         // Determinism: a second run yields identical bytes.

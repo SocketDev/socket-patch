@@ -1849,6 +1849,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         "yarn.lock",
         "bun.lock",
         "shrinkwrap.yaml",
+        "vlt-lock.json",
     ];
     for name in names {
         mkfifo(&root.join(name));
@@ -1870,6 +1871,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
             inventory_yarn_classic(&root).await,
             inventory_yarn_berry(&root).await,
             inventory_bun(&root).await,
+            inventory_vlt(&root).await,
             inventory_pnpm_lock_at(&root.join("shrinkwrap.yaml")).await,
             gem_remotes(&root).await,
             wired_vendor_integrity(&root, ".socket/vendor/npm/x/x.tgz").await,
@@ -1885,8 +1887,22 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         }
         panic!("lockfile inventories must fail fast on FIFO lockfiles");
     };
-    let (cargo, go, composer, gem, pypi, npm, pnpm, yarn_c, yarn_b, bun, legacy, remotes, wired) =
-        results;
+    let (
+        cargo,
+        go,
+        composer,
+        gem,
+        pypi,
+        npm,
+        pnpm,
+        yarn_c,
+        yarn_b,
+        bun,
+        vlt,
+        legacy,
+        remotes,
+        wired,
+    ) = results;
     for (label, opt) in [
         ("cargo", cargo),
         ("go", go),
@@ -1898,6 +1914,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         ("yarn classic", yarn_c),
         ("yarn berry", yarn_b),
         ("bun", bun),
+        ("vlt", vlt),
         ("pnpm legacy", legacy),
     ] {
         assert!(
@@ -2424,4 +2441,321 @@ fn pnpm_resolution_tokens_cover_maps_the_grammar_refuses() {
     let ok = by_key("ok@1.0.0");
     assert!(ok.resolution.is_some());
     assert_eq!(ok.resolution_tokens(), vec!["integrity:", "sha512-ok"]);
+}
+
+// ── vlt ───────────────────────────────────────────────────────────────
+
+const VLT_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+fn vlt_lock(options: &str, nodes: &[&str]) -> String {
+    format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {options},\n  \"nodes\": {{\n{}\n  }},\n  \"edges\": {{}}\n}}\n",
+        nodes
+            .iter()
+            .map(|n| format!("    {n}"))
+            .collect::<Vec<_>>()
+            .join(",\n")
+    )
+}
+
+#[tokio::test]
+async fn vlt_registry_nodes_inventory_with_their_location_and_integrity() {
+    let hosted = format!("https://patch.socket.dev/patch/npm/t/{VLT_UUID}/left-pad-1.3.0.tgz");
+    let vendored = format!(".socket/vendor/npm/{VLT_UUID}/ms-2.1.3/node_modules/ms");
+    let lock = vlt_lock(
+        r#"{"registries": {"acme": "https://npm.acme.test"}}"#,
+        &[
+            &format!(r#""~npm~left-pad@1.3.0": [0,"left-pad","sha512-PATCHED==","{hosted}"]"#),
+            r#""~npm~@scope+pkg@2.0.0": [0,"@scope/pkg","sha512-scoped=="]"#,
+            r#""~acme~private@1.0.0": [0,"private","sha512-acme=="]"#,
+            r#""~ghost~lost@1.0.0": [0,"lost","sha512-lost=="]"#,
+            r#""~http_c++127.0.0.1_c4873+~u@1.0.0": [0,"u"]"#,
+            r#""~npm~alias-name@1.0.0": [0,"other"]"#,
+            &format!(
+                r#""file~.socket+vendor+npm+{VLT_UUID}+ms-2.1.3+node__modules+ms": [0,"ms",null,"{vendored}"]"#
+            ),
+            r#""git~github_cu+p~": [0,"p"]"#,
+        ],
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "vlt-lock.json", &lock).await;
+    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(flavor, NpmLockFlavor::Vlt);
+    let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["@scope/pkg", "left-pad", "lost", "private", "u"]);
+
+    let left_pad = entry(&entries, "left-pad");
+    assert_eq!(left_pad.resolved.as_deref(), Some(hosted.as_str()));
+    assert_eq!(
+        left_pad.integrity,
+        LockIntegrity::Sri("sha512-PATCHED==".into())
+    );
+    assert_eq!(
+        entry(&entries, "@scope/pkg").resolved.as_deref(),
+        Some("https://registry.npmjs.org/@scope/pkg/-/pkg-2.0.0.tgz")
+    );
+    assert_eq!(
+        entry(&entries, "private").resolved.as_deref(),
+        Some("https://npm.acme.test/private/-/private-1.0.0.tgz")
+    );
+    assert_eq!(entry(&entries, "lost").resolved, None);
+    let u = entry(&entries, "u");
+    assert_eq!(
+        u.resolved.as_deref(),
+        Some("http://127.0.0.1:4873/u/-/u-1.0.0.tgz")
+    );
+    assert_eq!(u.integrity, LockIntegrity::None);
+    assert_eq!(inventory_vlt(tmp.path()).await.unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn vlt_default_registry_base_follows_the_lock_options() {
+    for (options, want) in [
+        (r#"{"registry": "https://r.test"}"#, "https://r.test/"),
+        (
+            r#"{"registries": {"npm": "https://mirror.test/npm/"}}"#,
+            "https://mirror.test/npm/",
+        ),
+        ("{}", "https://registry.npmjs.org/"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = vlt_lock(options, &[r#""~npm~a@1.0.0": [0,"a","sha512-a=="]"#]);
+        write(tmp.path(), "vlt-lock.json", &lock).await;
+        let entries = inventory_vlt(tmp.path()).await.unwrap();
+        assert_eq!(
+            entries[0].resolved.as_deref(),
+            Some(format!("{want}a/-/a-1.0.0.tgz").as_str()),
+            "{options}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unreadable_vlt_locks_inventory_to_nothing() {
+    let good = vlt_lock("{}", &[r#""~npm~a@1.0.0": [0,"a","sha512-a=="]"#]);
+    for lock in [
+        format!("\u{feff}{good}"),
+        good.replace("\"lockfileVersion\": 1", "\"lockfileVersion\": 2"),
+        "{\"lockfileVersion\": 1,".to_string(),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "vlt-lock.json", &lock).await;
+        assert!(inventory_vlt(tmp.path()).await.is_none(), "{lock:?}");
+        assert!(inventory_project(tmp.path()).await.is_empty(), "{lock:?}");
+    }
+    // A pre-lockfileVersion lock is still read-only readable.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "vlt-lock.json",
+        &good
+            .replace("  \"lockfileVersion\": 1,\n", "")
+            .replace("~npm~", "··"),
+    )
+    .await;
+    assert_eq!(inventory_vlt(tmp.path()).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn vlt_lock_wins_the_sibling_order_behind_a_refused_pnpm_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "vlt-lock.json",
+        &vlt_lock("{}", &[r#""~npm~a@1.0.0": [0,"a","sha512-a=="]"#]),
+    )
+    .await;
+    write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
+    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(flavor, NpmLockFlavor::Vlt);
+    assert_eq!(entries.len(), 1);
+    let (flavor, entries) = super::npm_family::inventory_live_sibling_lock_in(
+        &super::view::ProjectView::Disk(tmp.path()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(flavor, NpmLockFlavor::Vlt);
+    assert_eq!(entries.len(), 1);
+}
+
+/// A requirements.txt the HOSTED redirect already rewrote must still
+/// inventory as the package it pins.
+///
+/// The rewriter turns `name==X` into the PEP 508 direct reference
+/// `name @ <patch-server url> --hash=sha256:…`, which the exact-pin rule
+/// does not match — so every redirected line dropped out of the inventory
+/// and a second hosted run over a wet requirements.txt reported ONE package
+/// with patches instead of twelve. uv.lock keeps its `[[package]]`
+/// name/version through the same rewrite; requirements.txt must too, the
+/// way Pipfile.lock's own reader already keeps a Socket-written reference
+/// (`socket_reference_coords`).
+#[tokio::test]
+async fn already_redirected_requirements_lines_stay_in_the_inventory() {
+    const GRANT: &str = "11111111-1111-1111-1111-111111111111";
+    const PATCH: &str = "33333333-3333-3333-3333-333333333333";
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "requirements.txt",
+        &format!(
+            "requests[security] @ https://patch.socket.dev/patch/pypi/requests/2.28.1/{GRANT}/{PATCH}/requests-2.28.1-py3-none-any.whl ; python_version >= \"3.7\" --hash=sha256:{sha}\n\
+             urllib3 @ https://patch.socket.dev/patch/pypi/urllib3/1.26.18/{GRANT}/{PATCH}/urllib3-1.26.18-py2.py3-none-any.whl --hash=sha256:{sha}\n\
+             flask==3.0.0\n\
+             local-thing @ file:///home/me/wheels/local_thing-1.0-py3-none-any.whl\n",
+            sha = "c".repeat(64),
+        ),
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("flask".to_string(), "3.0.0".to_string()),
+            ("requests".to_string(), "2.28.1".to_string()),
+            ("urllib3".to_string(), "1.26.18".to_string()),
+        ],
+        "a user's own file reference stays out; ours come back as the \
+         package they replace: {entries:?}"
+    );
+    // The in-memory hosted engine inventories through the same reader
+    // over a `ProjectView::Memory`: it must see the same packages.
+    let mut project = MemoryProject::new();
+    project.insert_text(
+        "requirements.txt",
+        std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap(),
+    );
+    let in_memory = super::pypi::inventory_pypi_locks_in(&ProjectView::Memory(&project))
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted_pairs(&in_memory),
+        sorted_pairs(&entries),
+        "the in-memory view reads a rewired requirements.txt the same way: {in_memory:?}"
+    );
+    // Discovery-only, exactly like the `==` pins beside them: the pinned
+    // artifact is the PATCHED one, so it must never be fetched as pristine.
+    for e in &entries {
+        assert_eq!(e.integrity, LockIntegrity::None, "{e:?}");
+        assert_eq!(e.resolved, None, "{e:?}");
+    }
+}
+
+/// The two requirements grammars — the one the hosted rewriter WRITES and
+/// the one the inventory READS — must agree: rewrite a real pin and feed
+/// the output straight back in.
+#[tokio::test]
+async fn the_hosted_rewriters_own_output_reinventories() {
+    use crate::patch::redirect::{rewrite_registry_redirect, DepOverride, Integrity};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = "requests==2.28.1 --hash=sha256:old\nflask==3.0.0\n";
+    let dep = DepOverride {
+        ecosystem: "pypi".into(),
+        name: "requests".into(),
+        namespace: None,
+        version: "2.28.1".into(),
+        token: "11111111-1111-1111-1111-111111111111".into(),
+        patch_uuid: "33333333-3333-3333-3333-333333333333".into(),
+        artifact_url: "https://patch.socket.dev/patch/pypi/requests/2.28.1/\
+                       11111111-1111-1111-1111-111111111111/\
+                       33333333-3333-3333-3333-333333333333/\
+                       requests-2.28.1-py3-none-any.whl"
+            .into(),
+        integrity: Integrity {
+            sha256: Some("c".repeat(64)),
+            ..Default::default()
+        },
+        berry_zip_url: None,
+        registry_override: None,
+    };
+    let rewritten = rewrite_registry_redirect(
+        &std::collections::BTreeMap::from([("requirements.txt".to_string(), source.to_string())]),
+        std::slice::from_ref(&dep),
+    );
+    let wet = rewritten
+        .files
+        .get("requirements.txt")
+        .expect("the rewriter must have rewritten the pin");
+    write(tmp.path(), "requirements.txt", wet).await;
+
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("flask".to_string(), "3.0.0".to_string()),
+            ("requests".to_string(), "2.28.1".to_string()),
+        ],
+        "wet requirements.txt:\n{wet}\nentries: {entries:?}"
+    );
+}
+
+/// The VENDORED requirements.txt shape must inventory too.
+///
+/// `already_redirected_requirements_lines_stay_in_the_inventory` covers the
+/// hosted `name @ <url>` half. The vendored writer emits something else
+/// entirely — a BARE path line,
+/// `./<rel wheel>[ ; marker] --hash=sha256:<hex>  # socket-patch vendor:
+/// <name>==<ver>` (`vendor::pypi_requirements::vendor_line`) — with no
+/// `name @` at all, so the direct-reference reader never sees it and the
+/// package drops out of the inventory exactly the way the hosted lines did.
+/// The `socket-patch vendor:` comment tag is the name/version the writer
+/// left for its readers; cross-check it against the path's own coordinates.
+#[tokio::test]
+async fn already_vendored_requirements_lines_stay_in_the_inventory() {
+    const UUID: &str = "33333333-3333-3333-3333-333333333333";
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "requirements.txt",
+        &format!(
+            "./.socket/vendor/pypi/{UUID}/requests-2.28.1-py3-none-any.whl \
+             --hash=sha256:{sha}  # socket-patch vendor: requests==2.28.1\n\
+             ./.socket/vendor/pypi/{UUID}/urllib3-1.26.18-py2.py3-none-any.whl ; \
+             python_version >= \"3.7\" --hash=sha256:{sha}  \
+             # socket-patch vendor: urllib3==1.26.18 (transitive)\n\
+             flask==3.0.0\n\
+             ./wheels/local_thing-1.0-py3-none-any.whl\n",
+            sha = "c".repeat(64),
+        ),
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("flask".to_string(), "3.0.0".to_string()),
+            ("requests".to_string(), "2.28.1".to_string()),
+            ("urllib3".to_string(), "1.26.18".to_string()),
+        ],
+        "a user's own wheel path stays out; ours come back as the package \
+         they replace: {entries:?}"
+    );
+    for e in &entries {
+        assert_eq!(e.integrity, LockIntegrity::None, "{e:?}");
+        assert_eq!(e.resolved, None, "{e:?}");
+    }
+}
+
+/// The vendored writer's OWN output must re-inventory: build the line with
+/// the writer's formatter and feed it straight back in.
+#[tokio::test]
+async fn the_vendored_requirements_writers_own_output_reinventories() {
+    const UUID: &str = "44444444-4444-4444-4444-444444444444";
+    let tmp = tempfile::tempdir().unwrap();
+    let line = crate::vendor::pypi_requirements::vendor_line(
+        &format!(".socket/vendor/pypi/{UUID}/requests-2.28.1-py3-none-any.whl"),
+        &"c".repeat(64),
+        "requests",
+        "2.28.1",
+        &None,
+        false,
+    );
+    write(tmp.path(), "requirements.txt", &format!("{line}\n")).await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("requests".to_string(), "2.28.1".to_string())],
+        "wet requirements.txt:\n{line}\nentries: {entries:?}"
+    );
 }

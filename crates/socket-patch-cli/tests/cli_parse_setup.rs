@@ -481,3 +481,78 @@ fn subprocess_already_configured_is_idempotent() {
         "an idempotent re-run must not rewrite package.json"
     );
 }
+
+// ---------------------------------------------------------------------------
+// vlt: `packageManager` gains the additive value "vlt", and the hook is the
+// same `npx` command npm projects get.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_vlt_project_dry_run_writes_nothing() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let original = "{\n  \"name\": \"demo\"\n}\n";
+    std::fs::write(tempdir.path().join("package.json"), original).unwrap();
+    std::fs::write(
+        tempdir.path().join("vlt-lock.json"),
+        "{\"lockfileVersion\":1}",
+    )
+    .unwrap();
+    let args = SetupArgs {
+        check: false,
+        remove: false,
+        exclude: Vec::new(),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tempdir.path().to_path_buf(),
+            dry_run: true,
+            yes: true,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+    };
+    assert_eq!(run(args).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(tempdir.path().join("package.json")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn subprocess_vlt_project_json_shape() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let empty_path = tempfile::tempdir().expect("PATH dir");
+    std::fs::write(
+        tempdir.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(tempdir.path().join("vlt.json"), "{}").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+        .arg("setup")
+        .arg("--cwd")
+        .arg(tempdir.path())
+        .arg("--json")
+        .arg("--yes")
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("PATH", empty_path.path())
+        .output()
+        .expect("spawn socket-patch");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["packageManager"], "vlt", "{v}");
+    assert_eq!(v["updated"], 1, "{v}");
+    assert!(v.get("warnings").is_none(), "{v}");
+    let pkg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tempdir.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pkg["scripts"]["postinstall"],
+        "npx @socketsecurity/socket-patch apply --silent --ecosystems npm"
+    );
+}

@@ -150,13 +150,20 @@ def save(path, data):
     path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
 
 
+# The CLI's own report of a transport failure: a request error, or a 5xx from
+# the patch API (e.g. "API request failed with status 503: upstream connect
+# error or disconnect/reset before headers").
+CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API request failed with status 5\d\d\b')
+
+
 def has_transport_failure(value):
-    """Only explicit request transport errors qualify for a fresh-cell retry."""
+    """Only explicit request transport errors (a request error or a patch API
+    5xx) qualify for a fresh-cell retry."""
     if isinstance(value, dict):
         return any(has_transport_failure(item) for item in value.values())
     if isinstance(value, list):
         return any(has_transport_failure(item) for item in value)
-    return isinstance(value, str) and 'error sending request for url (' in value
+    return isinstance(value, str) and bool(CLI_TRANSPORT_FAILURE.search(value))
 
 
 def retry_network_cell(run_case, job, root, attempts=3):

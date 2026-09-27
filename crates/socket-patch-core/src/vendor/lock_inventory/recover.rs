@@ -406,6 +406,22 @@ fn recover_npm_fragment(
             return Ok(mk(resolved, LockIntegrity::Sri(sri.to_string())));
         }
     }
+    // vlt: the original is the registry node's entry text; slot [2] is its
+    // integrity and slot [3] (from vlt 1.0.0-rc.33) its tarball URL.
+    if let Some(text) = wiring_original(entry, &["vlt_lock_node"]).and_then(Value::as_str) {
+        if let Some(node) = crate::vendor::vlt_lock_text::parse_node_entry_text(text) {
+            let slot = |i: usize| {
+                node.slot(i)
+                    .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+            };
+            if let Some(sri) = slot(2).filter(|s| is_sri_pin(s)) {
+                return Ok(mk(
+                    slot(3).and_then(|u| http_url(&u)),
+                    LockIntegrity::Sri(sri),
+                ));
+            }
+        }
+    }
     // bun: the original is the raw tuple line; the integrity is its last
     // quoted SRI string.
     if let Some(line) =

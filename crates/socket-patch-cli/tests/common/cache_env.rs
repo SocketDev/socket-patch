@@ -292,6 +292,37 @@ pub fn scrub_ambient_bun_env(cmd: &mut Command) {
     }
 }
 
+// ── Ambient-env scrub for the vlt suites ──────────────────────────────
+
+/// True for an ambient variable the real-vlt suites strip from every child
+/// (vlt and the CLI under test) before [`isolate`]:
+///
+/// * every `VLT_*` — vlt reads each config option from `VLT_<OPTION>`
+///   (`VLT_REGISTRY`, `VLT_REGISTRIES`, `VLT_CACHE`, `VLT_STORE_LINKER`);
+///   the harness re-applies its own knobs after the scrub;
+/// * `SOCKET_*` except `SOCKET_NO_CONFIG` and the harness's own
+///   `SOCKET_PATCH_VLT_E2E_*` gate variables;
+/// * `npm_config_*` case-insensitively and `VIRTUAL_ENV`, as for bun.
+pub fn is_ambient_vlt_var(name: &str) -> bool {
+    if name.starts_with("SOCKET_PATCH_VLT_E2E_") {
+        return false;
+    }
+    name.starts_with("VLT_")
+        || (name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG")
+        || name.to_ascii_lowercase().starts_with("npm_config_")
+        || name == "VIRTUAL_ENV"
+}
+
+/// Remove every [`is_ambient_vlt_var`] variable of the PARENT environment
+/// from `cmd` (call it before [`isolate`], see the module docs).
+pub fn scrub_ambient_vlt_env(cmd: &mut Command) {
+    for (k, _) in std::env::vars_os() {
+        if is_ambient_vlt_var(&k.to_string_lossy()) {
+            cmd.env_remove(&k);
+        }
+    }
+}
+
 // ── Self-tests ────────────────────────────────────────────────────────
 //
 // Integration-test crates do not get `cfg(test)`, so — exactly as in
@@ -368,6 +399,58 @@ mod cache_env_selftests {
             cmd.get_envs().all(|(_, value)| value.is_none()),
             "the scrub only removes; it seeds nothing"
         );
+    }
+
+    #[test]
+    fn ambient_vlt_scrub_covers_vlt_config_and_keeps_the_harness_gates() {
+        for name in [
+            "VLT_REGISTRY",
+            "VLT_REGISTRIES",
+            "VLT_CACHE",
+            "VLT_STORE_LINKER",
+            "VLT_TELEMETRY",
+            "npm_config_registry",
+            "NPM_CONFIG_REGISTRY",
+            "SOCKET_API_TOKEN",
+            "SOCKET_NO_VLT_INSTALL_CLEANUP",
+            "SOCKET_PATCH_BUN_E2E_JS",
+            "VIRTUAL_ENV",
+        ] {
+            assert!(is_ambient_vlt_var(name), "{name} must be scrubbed");
+        }
+        for name in [
+            "SOCKET_NO_CONFIG",
+            "SOCKET_PATCH_VLT_E2E_JS",
+            "SOCKET_PATCH_VLT_E2E_VERSION",
+            "SOCKET_PATCH_VLT_E2E_REQUIRED",
+            "SOCKET_PATCH_VLT_E2E_STORE_LINKER",
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "NODE_OPTIONS_X",
+        ] {
+            assert!(!is_ambient_vlt_var(name), "{name} must survive the scrub");
+        }
+    }
+
+    #[test]
+    fn ambient_vlt_scrub_removes_only_matching_parent_vars() {
+        let mut cmd = Command::new("true");
+        scrub_ambient_vlt_env(&mut cmd);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in &removed {
+            assert!(is_ambient_vlt_var(name), "{name} was removed");
+        }
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            if is_ambient_vlt_var(&name) {
+                assert!(removed.iter().any(|r| *r == name), "{name} kept");
+            }
+        }
     }
 
     /// The variables whose whole point is that they outrank `HOME`. A future

@@ -1,0 +1,12 @@
+{
+  "confirmed": [
+    "00000000-0000-4000-8000-000000000000",
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    "ffffffff-ffff-4fff-8fff-ffffffffffff"
+  ],
+  "refused": [],
+  "vltDrives": true
+}

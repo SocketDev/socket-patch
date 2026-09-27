@@ -115,6 +115,12 @@
       "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
       "manifest_key": "package/index.js", "apply_ecosystems": "npm"
     },
+    {
+      "ecosystem": "npm", "pm": "vlt", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
 
     {
       "ecosystem": "pypi", "pm": "pip", "image": "pypi", "hook_family": "pth",
@@ -204,8 +210,8 @@
     "several workspace members (incl. a deeply-nested one and a member that",
     "does NOT use the patched package). Models real monorepos and exercises",
     "`setup`'s workspace handling — npm/yarn write the hook to every member,",
-    "pnpm only to the root — plus the cross-workspace apply on the root",
-    "install. npm/yarn/pnpm should apply (baseline_supported true); Python",
+    "pnpm and vlt only to the root — plus the cross-workspace apply on the root",
+    "install. npm/yarn/pnpm/vlt should apply (baseline_supported true); Python",
     "workspaces (uv workspace, pip nested-requirements) are gaps."
   ],
   "workspace_scenarios": [
@@ -246,6 +252,12 @@
     },
     {
       "ecosystem": "npm", "pm": "yarn", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+    {
+      "ecosystem": "npm", "pm": "vlt", "image": "npm", "hook_family": "npm",
       "baseline_supported": true,
       "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
       "manifest_key": "package/index.js", "apply_ecosystems": "npm"

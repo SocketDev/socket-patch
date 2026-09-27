@@ -32,12 +32,15 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
-use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
+use crate::commands::fetch_stage::{
+    drop_unstageable, stage_vendor_sources_in_memory, MemStageOutcome,
+};
 use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, track_outcomes_for_vendor, vendor_records_reusing,
 };
+use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_selected};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 use crate::ui::{plural, print_json};
@@ -71,16 +74,17 @@ type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 /// Action values are part of the CLI contract: `would_vendor` (no ledger
 /// entry), `already_vendored` (entry at this uuid), `would_revendor` +
 /// `oldUuid` (entry at an older uuid), and — additive — `would_refuse` +
-/// `errorCode` + `error` for npm purls the wet run's Bun preflight
-/// ([`crate::commands::bun_preflight::BunVendorRefusal`]) would refuse
-/// before any download. The preview stays a ledger classification otherwise
-/// (engine refusals outside the preflight are not predicted), and it never
-/// flips the run's status or exit code: `would_refuse` is best-effort
-/// advice so a preview never advertises vendoring the wet run is known to
-/// refuse. The preflight reads `bun.lock`/`bun.lockb` (plus, on a refused
-/// workspace lock, the lock once more per npm purl for the exemption) —
-/// the only disk access here — and runs only when the selection holds an
-/// npm purl.
+/// `errorCode` + `error` for npm purls the wet run's Bun or vlt preflight
+/// ([`crate::commands::bun_preflight::BunVendorRefusal`],
+/// [`crate::commands::vlt_preflight`]) would refuse before any download.
+/// The preview stays a ledger classification otherwise (engine refusals
+/// outside the preflights are not predicted), and it never flips the run's
+/// status or exit code: `would_refuse` is best-effort advice so a preview
+/// never advertises vendoring the wet run is known to refuse. The
+/// preflights read `bun.lock`/`bun.lockb` (plus, on a refused workspace
+/// lock, the lock once more per npm purl for the exemption) or
+/// `vlt-lock.json` with its importer package.json files — the only disk
+/// access here — and run only when the selection holds an npm purl.
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
@@ -93,6 +97,8 @@ pub(crate) async fn preview_vendor_json(
     let state = load_state(cwd).await;
     let refusal =
         bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    let vlt_refusals =
+        vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
     let state = state.unwrap_or_default();
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
@@ -101,6 +107,13 @@ pub(crate) async fn preview_vendor_json(
             // UUID even after rollback has removed its live wiring.
             _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
                 let r = refusal.as_ref().expect("checked by the guard");
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
+                    "errorCode": r.code, "error": r.detail,
+                })
+            }
+            _ if vlt_refusal_for(&vlt_refusals, &p.purl).is_some() => {
+                let r = vlt_refusal_for(&vlt_refusals, &p.purl).expect("checked by the guard");
                 serde_json::json!({
                     "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
                     "errorCode": r.code, "error": r.detail,
@@ -283,6 +296,11 @@ async fn stage_and_vendor(
         }
     };
     let sources = staged.as_patch_sources();
+    // A record whose content this run could not obtain is an unsatisfiable
+    // PACKAGE, reported per-package and left out of the engine run — the
+    // rest of the selection still vendors (the stager reserves its
+    // whole-run `no_local_source` bail for "nothing is stageable").
+    let (records, staging_errors) = drop_unstageable(env, &manifest.patches, staged.unavailable());
     // Honor `--vendor-source` (and `--vendor-url` / `--patch-server-url`)
     // exactly as the `vendor` command does: the SAME service-config
     // assembler, over the run's one client, so `scan --mode vendored` and a
@@ -290,16 +308,17 @@ async fn stage_and_vendor(
     // service-download under `auto`) instead of scan silently building
     // locally.
     let service = common.vendor_service_config(Some(client), use_public_proxy);
-    Ok(boxed_vendor_records(
+    let engine_errors = boxed_vendor_records(
         common,
-        &manifest.patches,
+        &records,
         &sources,
         Some(&service),
         ledger,
         env,
         prior,
     )
-    .await)
+    .await;
+    Ok(staging_errors || engine_errors)
 }
 
 /// The ledger key addressable as `purl`: the exact key, else the entry
