@@ -4545,30 +4545,29 @@ mod tests {
     #[test]
     fn rollback_prompt_singular_plural_and_clauses() {
         assert_eq!(
-            rollback_prompt(1, 0, 0, 0),
+            rollback_prompt(1, 0, 0),
             "Roll back 1 patch and remove it from the local manifest?"
         );
         assert_eq!(
-            rollback_prompt(2, 0, 0, 0),
+            rollback_prompt(2, 0, 0),
             "Roll back 2 patches and remove them from the local manifest?"
         );
-        // Never "..., and unwind" after an inner "and".
+        // Never "..., and restore" after an inner "and".
         assert_eq!(
-            rollback_prompt(1, 0, 1, 0),
-            "Roll back 1 patch, remove it from the local manifest, and unwind 1 hosted \
-             redirect?"
-        );
-        assert_eq!(rollback_prompt(0, 0, 3, 0), "Unwind 3 hosted redirects?");
-        assert_eq!(
-            rollback_prompt(0, 0, 0, 1),
-            "Replay 1 leftover hosted redirect edit?"
+            rollback_prompt(1, 0, 1),
+            "Roll back 1 patch, remove it from the local manifest, and restore 1 hosted \
+             package to the upstream registry?"
         );
         assert_eq!(
-            rollback_prompt(0, 1, 0, 0),
+            rollback_prompt(0, 0, 3),
+            "Restore 3 hosted packages to the upstream registry?"
+        );
+        assert_eq!(
+            rollback_prompt(0, 1, 0),
             "Delete 1 vendored artifact and its ledger record?"
         );
         assert_eq!(
-            rollback_prompt(0, 2, 0, 0),
+            rollback_prompt(0, 2, 0),
             "Delete 2 vendored artifacts and their ledger records?"
         );
     }
