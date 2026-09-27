@@ -17,12 +17,22 @@ into the new version's section — see docs/releasing.md.
 
 ## [Unreleased]
 
+> **v5 at a glance.** The CLI is built around one workflow: `socket-patch
+> scan` patches dependencies by rewriting lockfiles so only the patched
+> packages resolve to Socket-hosted, integrity-pinned copies (hosted mode is
+> the default, and scan never prompts); `socket-patch vex` emits OpenVEX for
+> vulnerability scanners; `socket-patch vendor` ejects the patches into
+> `.socket/vendor/` for offline installs; `socket-patch list` shows them.
+> `get`, `apply`, `setup`, `rollback`, `remove` and `repair` (the agent-mode
+> commands) keep working and are listed after these.
+
 > **Semver note:** this entry changes `rollback`'s default behavior, narrows
 > the meaning of its existing `vendored: []` JSON key, makes vendored mode
 > manifest-free, moves vendored cargo wiring from `.cargo/config*` into
 > `Cargo.toml`, tags vendored cargo copies' versions with `+socket.<uuid>`
-> (visible to the patched crate as `CARGO_PKG_VERSION`), turns a plain
-> non-TTY `scan` report-only, makes `vex`
+> (visible to the patched crate as `CARGO_PKG_VERSION`), makes a bare `scan`
+> run hosted mode without prompting, changes which patch scan picks when a
+> package has several, makes `vex`
 > refuse to attest stale ledger records and corrupt vendor ledgers, and
 > retries a throttled patch API (new error text, added waiting, a throttled
 > package failing its legacy-proxy batch) — all
@@ -233,27 +243,32 @@ into the new version's section — see docs/releasing.md.
   with no manifest is a clean exit-0 no-op whose message names the missing
   manifest (and the ledger entries `repair` verifies) instead of claiming
   "No .socket folder found".
-- **A plain `scan` without a TTY is report-only.** When stdin is not a TTY,
-  `--yes` is absent, and no intent flag (`--mode`, `--apply`, `--sync`,
-  `--vendor`, `--redirect`, `--prune`) is given, human-mode `scan` prints the
-  discovery report and the "To apply a single patch, run: …" hint, downloads
-  nothing, creates no `.socket/`, and exits 0 — it no longer auto-accepts the
-  apply prompt. Any intent flag, `--yes`, or a TTY keeps the previous
-  behavior; `rollback`/`remove`/`get`'s non-TTY auto-accept is unchanged.
-  Human `scan --mode hosted` now prints the results table and update
-  detection like the other modes and confirms once ("Redirect N packages
-  to the hosted patch server?" — the same prompt as `get --mode hosted` —
-  default yes, skipped by `--yes`/`--json`/`--dry-run`; on a non-TTY stdin
-  without `--yes` it prints `Non-interactive mode detected, proceeding
-  automatically.` and proceeds), fetches patch details with the agent arm's
-  progress counter and per-package warnings, and an empty hosted discovery
-  prints `No patches available for installed packages.` and exits 0 without
-  entering the redirect engine (was `Redirected 0 package(s)`); a discovery
+- **A bare `scan` runs hosted mode and never prompts.** With no `--mode`
+  (or legacy mode flag), `scan` rewrites lockfiles so the patched
+  dependencies resolve to Socket-hosted packages, exactly like
+  `scan --mode hosted`; under `--json` its result nests under `redirect` as
+  before. Only a `--prune` or `--global` scan with no mode is still
+  report-only (neither has a project lockfile to rewire); it prints the
+  report and `To apply these patches in place, run: socket-patch scan
+  --mode agent [PATHS]`. `scan` asks nothing in any mode: the download and
+  redirect confirmations and the free-tier patch menu are gone (and with
+  them the `Non-interactive mode detected` note), so `--yes` no longer
+  changes what `scan` does. Human `scan --mode hosted` prints the results
+  table and update detection like the other modes, fetches patch details
+  with the agent arm's progress counter and per-package warnings, and an
+  empty hosted discovery prints `No patches available for installed
+  packages.` and exits 0 without entering the redirect engine; a discovery
   whose every offer is paid-tier for an org without paid access stops the
   same way with `No downloadable patches (paid subscription required).`. A
   malformed redirect ledger on a human hosted run that stops before the
   engine is reported as the read-only `Warning: the redirect ledger … is
   malformed` advisory instead of nowhere.
+- **scan picks the newest merged patch.** When a package has several
+  patches, `scan` (and `get`, and the `[UPDATE]` detection) now takes the
+  newest merged patch (one that fixes several advisories in one blob — the
+  package's cumulative fix) the account can download, whatever its
+  severity. A package with no merged patch keeps the old order: highest
+  severity, then newest.
 - **`apply.lock` never outlives a command, and hosted mode takes it.** Lock
   acquisition creates `.socket/` when missing; the lock file is unlinked
   (while still held) and an otherwise-empty `.socket/` removed when the
@@ -337,6 +352,16 @@ into the new version's section — see docs/releasing.md.
   the only batch) — instead of that one package being skipped silently.
 
 ### Added
+
+- **`scan --package <name|purl>`** (repeatable or comma-separated, env
+  `SOCKET_SCAN_PACKAGES`) scopes a scan to the named packages: a name
+  (`lodash`, `@scope/pkg`, `group:artifact`) or a purl with or without its
+  version (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`); names compare
+  case-insensitively.
+- **Hosted projects report patch updates from their lockfiles.** scan's
+  `updates[]` and `[UPDATE]` marker also see the hosted pins the lockfiles
+  wire, so a hosted project that never committed its redirect ledger still
+  reports a superseding patch.
 
 - **`apply` and `rollback` patch vlt installs in place.** A project
   installed by vlt (`node_modules/.vlt/` or `node_modules/.vlt-lock.json`)
@@ -843,8 +868,12 @@ into the new version's section — see docs/releasing.md.
   prune universe is never narrowed (`scan PATHS --prune` prunes exactly
   what an unscoped run would), lockfile-only/vendor-ledger supplements are
   excluded with a `path_scope_excluded_supplements` warning, an empty match
-  is a normal empty scan (exit 0, no GC), and PATHS is rejected with
-  `--mode hosted|vendored` (exit 2). `rollback [TARGET]...` accepts
+  is a normal empty scan (exit 0, no GC). In hosted and vendored mode
+  (so also a bare `scan`) PATHS name project directories instead: each
+  directory or directory glob (`apps/*`) is scanned on its own, as if it
+  were `--cwd`, under a `== <dir> ==` header; the exit code is the worst of
+  the runs, a PATH that is not a directory is a usage error (exit 2), and
+  `--json` takes one directory. `rollback [TARGET]...` accepts
   PURLs, UUIDs, and path globs (variadic, unioned); only path-SHAPED tokens
   (separator, glob metachar, `./` prefix, absolute) become globs, so a
   mistyped identifier stays a safe exit-1 error. A path target selecting

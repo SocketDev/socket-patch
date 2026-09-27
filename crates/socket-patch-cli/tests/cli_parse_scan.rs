@@ -623,8 +623,11 @@ fn mode_agent_is_the_source_of_truth() {
     // v5: no mode selected means hosted...
     let folded = parse_and_resolve(&[]).expect("fold ok");
     assert_eq!(folded.mode, Some(ScanMode::Hosted), "a bare scan is hosted");
-    // ...except where no lockfile can be rewired: those stay report-only.
-    for argv in [&["--prune"][..], &["packages/foo"], &["--global"]] {
+    // PATHs name hosted project directories.
+    let folded = parse_and_resolve(&["packages/foo"]).expect("fold ok");
+    assert_eq!(folded.mode, Some(ScanMode::Hosted));
+    // No project lockfile to rewire: these stay report-only.
+    for argv in [&["--prune"][..], &["--global"]] {
         let folded = parse_and_resolve(argv).expect("fold ok");
         assert_eq!(folded.mode, None, "{argv:?} stays report-only");
     }

@@ -1704,8 +1704,8 @@ async fn report_only_scan_json_surfaces_hosted_redirect_state() {
         /*with_record=*/ true,
     );
 
-    // A path-scoped scan with no mode: the read-only discovery envelope.
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["node_modules"]);
+    // `--prune` with no mode: the read-only discovery envelope.
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--prune"]);
     assert_eq!(
         code, 0,
         "report-only scan must stay exit 0; stdout={stdout}; stderr={stderr}"

@@ -213,7 +213,7 @@ async fn paths_scope_narrows_the_query() {
     let tmp = tempfile::tempdir().unwrap();
     write_two_subtree_project(tmp.path());
 
-    let (code, stdout, stderr) = run_scan(tmp.path(), &server.uri(), &["packages/app"]);
+    let (code, stdout, stderr) = run_scan(tmp.path(), &server.uri(), &["packages/app", "--mode", "agent", "--dry-run"]);
     assert_eq!(
         code, 0,
         "scoped scan must exit 0; stdout={stdout}; stderr={stderr}"
@@ -474,7 +474,7 @@ async fn supplements_excluded_with_warning() {
     // purl reaches the API.
     let scoped_server = MockServer::start().await;
     mock_batch_empty(&scoped_server).await;
-    let (code, stdout, stderr) = run_scan(tmp.path(), &scoped_server.uri(), &["packages/app"]);
+    let (code, stdout, stderr) = run_scan(tmp.path(), &scoped_server.uri(), &["packages/app", "--mode", "agent", "--dry-run"]);
     assert_eq!(
         code, 0,
         "scoped scan must exit 0; stdout={stdout}; stderr={stderr}"
@@ -540,12 +540,14 @@ async fn supplements_excluded_with_warning() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn paths_with_hosted_or_vendored_mode_exit_2() {
-    // All three refusals fire before any network I/O, so the unreachable
-    // API URL doubles as the no-network oracle (a connect attempt would
+async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
+    // Every refusal fires before any network I/O, so the unreachable API
+    // URL doubles as the no-network oracle (a connect attempt would
     // surface as a different error, not the usage message).
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("apps/a")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("apps/b")).unwrap();
 
     for mode in ["hosted", "vendored"] {
         let (code, stdout, stderr) = run_scan(
@@ -555,18 +557,27 @@ async fn paths_with_hosted_or_vendored_mode_exit_2() {
         );
         assert_eq!(
             code, 2,
-            "PATHS + --mode {mode} must be a usage error (exit 2); \
+            "a PATH that is not a directory is a usage error (exit 2) under --mode {mode}; \
              stdout={stdout}; stderr={stderr}"
         );
         assert!(
-            stderr.contains("path targeting"),
-            "--mode {mode} refusal must name path targeting; stderr={stderr}"
+            stderr.contains("`packages/app` is not a directory"),
+            "stderr={stderr}"
         );
         assert!(
             stdout.trim().is_empty(),
             "a usage error must not print a JSON envelope; stdout={stdout}"
         );
     }
+
+    // --json keeps stdout one document: one project directory only.
+    let (code, stdout, stderr) = run_scan(tmp.path(), "http://127.0.0.1:1", &["apps/*"]);
+    assert_eq!(code, 2, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stderr.contains("--json takes one project directory (2 given)"),
+        "stderr={stderr}"
+    );
+    assert!(stdout.trim().is_empty(), "stdout={stdout}");
 
     // An unparseable glob is the same exit-2 usage-error shape.
     let (code, stdout, stderr) = run_scan(tmp.path(), "http://127.0.0.1:1", &["x["]);

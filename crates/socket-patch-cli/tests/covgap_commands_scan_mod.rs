@@ -1274,15 +1274,15 @@ async fn scan_human_empty_batch_reports_no_patches_once() {
 // Non-TTY human scans: the mode-less scan is report-only, explicit intent
 // auto-proceeds
 // ---------------------------------------------------------------------------
-// v5: scan never prompts. A bare scan runs hosted mode; a path-scoped,
-// `--prune` or global scan with no mode only reports (it has no lockfile
-// to rewire), and `--mode agent` applies in place without asking.
+// v5: scan never prompts. A bare scan runs hosted mode; a `--prune` or
+// global scan with no mode only reports (it has no lockfile to rewire),
+// and `--mode agent` applies in place without asking.
 
-/// A path-scoped scan with no mode: the discovery, table and per-patch
-/// preview print (the report IS the value), then the run stops — no view
-/// fetch, no `.socket/`, the installed file untouched.
+/// `--prune` with no mode: the discovery, table and per-patch preview
+/// print (the report IS the value), then the run stops — no view fetch, no
+/// `.socket/`, the installed file untouched.
 #[tokio::test]
-async fn scan_path_scoped_human_without_a_mode_is_report_only() {
+async fn scan_prune_without_a_mode_is_report_only() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     mount_one_patch_api(&mock, purl, b"x\n").await;
@@ -1291,7 +1291,7 @@ async fn scan_path_scoped_human_without_a_mode_is_report_only() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["node_modules"]);
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--prune"]);
     assert_eq!(
         code, 0,
         "report-only is a success; stdout={stdout}; stderr={stderr}"
@@ -1477,6 +1477,35 @@ fn seed_redirect_ledger(root: &Path, purl: &str, uuid: &str) {
         serde_json::to_string_pretty(&state).unwrap(),
     )
     .unwrap();
+}
+
+/// Hosted PATHs name project directories: each runs as its own scan
+/// (its own discovery and redirect), under a `== <dir> ==` header.
+#[tokio::test]
+async fn scan_hosted_paths_run_once_per_project_directory() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+    mount_forbidden_reference(&mock, purl).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    for app in ["apps/a", "apps/b"] {
+        let dir = tmp.path().join(app);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_root_package_json(&dir);
+        write_npm_package(&dir, "minimist", "1.2.2", b"x\n");
+    }
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["apps/*"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    for app in ["apps/a", "apps/b"] {
+        let header = format!("== {} ==", std::path::Path::new(app).display());
+        assert!(stdout.contains(&header), "missing {header:?}: {stdout}");
+    }
+    assert_eq!(stdout.matches("Redirected 0 packages").count(), 2, "{stdout}");
+    let reqs = recorded(&mock).await;
+    assert_eq!(batch_bodies(&reqs).len(), 2, "one discovery per directory");
 }
 
 #[tokio::test]

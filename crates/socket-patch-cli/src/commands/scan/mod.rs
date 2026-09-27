@@ -26,7 +26,7 @@ use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
@@ -239,26 +239,10 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         args.mode = Some(ScanMode::Vendored);
     } else if args.apply || args.sync {
         args.mode = Some(ScanMode::Agent);
-    } else if args.paths.is_empty()
-        && !args.prune
-        && !args.common.global
-        && args.common.global_prefix.is_none()
-    {
-        // v5: hosted is the default. A path-scoped, `--prune` or global scan
-        // with no mode stays report-only (none of them can rewire lockfiles).
+    } else if !args.prune && !args.common.is_global() {
+        // v5: hosted is the default. A `--prune` or global scan with no mode
+        // stays report-only (neither has a project lockfile to rewire).
         args.mode = Some(ScanMode::Hosted);
-    }
-    if !args.paths.is_empty()
-        && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
-    {
-        // Hosted/vendored rewire the project's root lockfiles — whole-project
-        // by construction — so path scoping cannot mean anything coherent
-        // there. Same phrasing family as the conflicts above.
-        return Err(format!(
-            "path targeting cannot be used with --mode {}: it applies to \
-             agent-mode and read-only scans",
-            args.mode.expect("checked Some above").cli_name(),
-        ));
     }
     if args.mode == Some(ScanMode::Hosted)
         && args.common.is_global()
@@ -286,15 +270,14 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct ScanArgs {
-    /// Only scan packages installed under these path globs (e.g.
-    /// `packages/foo`, `apps/**`; a bare directory scopes its whole
-    /// subtree). `--prune` still considers the whole project, so a scoped
-    /// scan never prunes out-of-scope manifest entries. Lockfile-only
-    /// packages have no installed path and are left out (with a warning).
-    /// Not available with `--mode hosted` or `--mode vendored`, which
-    /// rewire the whole project
+    /// Only scan these directories. In hosted and vendored mode each PATH
+    /// (or glob, e.g. `apps/*`) is a project directory, scanned on its own
+    /// as if it were `--cwd`. In agent mode PATHs are globs over installed
+    /// package paths (a bare directory scopes its whole subtree; `--prune`
+    /// still considers the whole project, and lockfile-only packages are
+    /// left out with a warning)
     pub paths: Vec<String>,
 
     #[command(flatten)]
@@ -1656,6 +1639,64 @@ pub async fn run(args: ScanArgs) -> i32 {
     code
 }
 
+/// The project directories a hosted or vendored scan's PATHs name: each
+/// PATH is a directory, or a glob matching directories, relative to
+/// `--cwd`. Sorted and deduplicated.
+fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for raw in paths {
+        let joined = cwd.join(raw);
+        if raw.contains(['*', '?', '[']) {
+            let pattern = joined.to_string_lossy().into_owned();
+            let matches = glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
+            let before = dirs.len();
+            dirs.extend(matches.filter_map(Result::ok).filter(|p| p.is_dir()));
+            if dirs.len() == before {
+                return Err(format!("`{raw}` matches no directory"));
+            }
+        } else if joined.is_dir() {
+            dirs.push(joined);
+        } else {
+            return Err(format!("`{raw}` is not a directory"));
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
+}
+
+/// Run a hosted or vendored scan once per project directory its PATHs
+/// name, as if each were `--cwd`. The exit code is the worst of the runs.
+/// `--json` takes one directory, so stdout stays one document.
+async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
+    let dirs = match project_dirs(&args.common.cwd, &args.paths) {
+        Ok(dirs) => dirs,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            return 2;
+        }
+    };
+    if args.common.json && dirs.len() > 1 {
+        eprintln!(
+            "Error: --json takes one project directory ({} given); run one scan per directory",
+            dirs.len()
+        );
+        return 2;
+    }
+    let mut code = 0;
+    for dir in &dirs {
+        if dirs.len() > 1 && !args.common.silent {
+            let shown = dir.strip_prefix(&args.common.cwd).unwrap_or(dir);
+            println!("\n== {} ==", shown.display());
+        }
+        let mut child = args.clone();
+        child.paths.clear();
+        child.common.cwd = dir.clone();
+        code = code.max(Box::pin(run_scan(child, telemetry)).await);
+    }
+    code
+}
+
 async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -1671,6 +1712,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     if let Err(message) = resolve_mode_flags(&mut args) {
         eprintln!("Error: {message}");
         return 2;
+    }
+
+    // Hosted and vendored modes rewire a project's lockfiles, so their
+    // PATHs name project directories: one scan per directory.
+    if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
+        && !args.paths.is_empty()
+    {
+        return Box::pin(run_project_dirs(args, telemetry)).await;
     }
 
     // Positional PATH globs (see `ScanArgs::paths`). An unparseable glob
@@ -3225,6 +3274,32 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_dirs_resolve_directories_and_globs() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["apps/web", "apps/api", "libs/core"] {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        std::fs::write(tmp.path().join("apps/README"), "").unwrap();
+        let rel = |dirs: Vec<PathBuf>| -> Vec<String> {
+            dirs.iter()
+                .map(|d| d.strip_prefix(tmp.path()).unwrap().to_string_lossy().replace('\\', "/"))
+                .collect()
+        };
+        let got = project_dirs(tmp.path(), &["apps/*".into(), "libs/core".into(), "apps/web".into()])
+            .unwrap();
+        assert_eq!(rel(got), ["apps/api", "apps/web", "libs/core"]);
+        assert!(project_dirs(tmp.path(), &["apps/README".into()])
+            .unwrap_err()
+            .contains("is not a directory"));
+        assert!(project_dirs(tmp.path(), &["nope/*".into()])
+            .unwrap_err()
+            .contains("matches no directory"));
+        assert!(project_dirs(tmp.path(), &["x[".into()])
+            .unwrap_err()
+            .contains("invalid path pattern"));
+    }
 
     #[test]
     fn package_specs_match_names_and_purls() {
