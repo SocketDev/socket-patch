@@ -5173,11 +5173,11 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
         // A mapping already exists (e.g. a prior patched dep, or the project's
         // own): append ONLY this source's mapping — every other source is
         // already covered.
-        out = out.replacen(
-            "<packageSourceMapping>",
-            &format!("<packageSourceMapping>\n{socket_mapping}"),
-            1,
-        );
+        // After any `<clear />` in the section: NuGet drops every mapping
+        // read before one, leaving the patched id routed nowhere.
+        let open_end = out.find("<packageSourceMapping>")? + "<packageSourceMapping>".len();
+        let at = nuget_after_last_clear(&out, open_end, "</packageSourceMapping>");
+        out = format!("{}\n{socket_mapping}{}", &out[..at], &out[at..]);
     } else {
         // Creating the mapping from scratch. Once ANY <packageSourceMapping>
         // exists, NuGet requires EVERY package to match some source's pattern,
@@ -5249,7 +5249,9 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
         // through to the from-scratch branch rather than insert outside it.
         .filter(|m| !m.as_str().ends_with("/>"))
     {
-        let end = m.end();
+        // After any `<clear />`: NuGet drops every source read before one,
+        // so the mapping would point at an undefined source (NU1100).
+        let end = nuget_after_last_clear(config, m.end(), "</packageSources>");
         Some(format!(
             "{}\n{source_line}{}",
             &config[..end],
@@ -5269,6 +5271,20 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
             &config[end..]
         ))
     }
+}
+
+/// The offset just past the last `<clear />` between `from` and the next
+/// `close` tag, else `from`.
+fn nuget_after_last_clear(config: &str, from: usize, close: &str) -> usize {
+    static CLEAR_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<clear\s*/>").expect("static clear-tag regex is valid"));
+    let Some(len) = config[from..].find(close) else {
+        return from;
+    };
+    CLEAR_RE
+        .find_iter(&config[from..from + len])
+        .last()
+        .map_or(from, |m| from + m.end())
 }
 
 /// The `key` of every `<add … />` under `<packageSources>` (empty when there
@@ -8272,6 +8288,52 @@ mod tests {
             out.matches("<packageSourceMapping>").count(),
             1,
             "existing mapping element reused: {out}"
+        );
+    }
+
+    /// NuGet's `<clear />` drops every item read before it: a Socket source
+    /// or mapping inserted ahead of one vanishes and restore NU1100s.
+    #[test]
+    fn nuget_socket_entries_land_after_clear() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains(
+                "    <clear />\n    <add key=\"socket-patch-uuid\" value=\"https://patch.test/nuget/index.json\" />\n    <add key=\"nuget.org\""
+            ),
+            "socket source after <clear />, ahead of the other sources: {out}"
+        );
+    }
+
+    #[test]
+    fn nuget_existing_mapping_socket_entry_lands_after_clear() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear/>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <clear  />\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>\n  </packageSourceMapping>\n  <disabledPackageSources>\n    <clear />\n  </disabledPackageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains("    <clear/>\n    <add key=\"socket-patch-uuid\""),
+            "socket source after <clear/>: {out}"
+        );
+        assert!(
+            out.contains(
+                "    <clear  />\n    <packageSource key=\"socket-patch-uuid\">\n      <package pattern=\"Newtonsoft.Json\" />"
+            ),
+            "socket mapping after the mapping's <clear />: {out}"
+        );
+        assert!(
+            out.contains("  <disabledPackageSources>\n    <clear />\n  </disabledPackageSources>"),
+            "a <clear /> in another section is not an anchor: {out}"
         );
     }
 
