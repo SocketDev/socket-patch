@@ -946,6 +946,40 @@ into the new version's section — see docs/releasing.md.
   `flavor: "vlt"`) require the socket-patch release that adds vlt
   support.
 
+- **A patch file the patch never changes no longer blocks vendoring.** The
+  patch view serves `blobContent` only for the files a patch CHANGES, so a
+  zero-delta file (`beforeHash == afterHash`) comes back with hashes and no
+  content — and needs none: the pristine copy already carries the patched
+  bytes. The vendor stager counted such a view as a failed fetch, which made
+  any patch carrying a zero-delta file permanently unvendorable (live
+  example: `pkg:npm/tar-fs@2.1.1`).
+- **One unstageable patch no longer kills a whole vendored run.** A package
+  whose patch content cannot be obtained now gets its own `failed` event
+  with `errorCode: "no_local_source"` and the rest of the run still vendors,
+  in `vendor`, `scan`/`get --mode vendored` and `repair` alike. The event's
+  `error` names the real reason (which file the view served without content,
+  a malformed blob, or the fetch error) instead of the generic run-level
+  "patch artifacts unavailable (offline or download failure)".
+  **JSON consumers:** for a partial staging failure the vendor envelope is
+  now `status: "partialFailure"` with `error: null` and per-package events,
+  where it used to be `status: "error"` with a top-level
+  `error.code: "no_local_source"` and an empty `events[]`. The run-level
+  shape is unchanged when NOTHING in the manifest can be staged (including
+  a one-patch manifest) — `no_local_source` can therefore arrive run-level
+  or event-level, and both shapes are documented in CLI_CONTRACT.md.
+- **`get` emits its patch lists in a stable order.** The release-variant
+  narrowing drained a `HashMap`, so `download.patches`, `apply.patches` and
+  the per-patch stderr lines came out in bucket order: two identical runs of
+  the same project emitted the same records in different orders. All of them
+  are purl-ordered now, matching every sibling collection in the envelope.
+- **A requirements.txt this CLI already rewired stays in the lockfile
+  inventory.** Both shapes we write — the hosted `name @ <patch-server url>`
+  direct reference and the vendored bare `./.socket/vendor/pypi/…` wheel
+  path tagged `# socket-patch vendor: <name>==<ver>` — are read back as the
+  package they replace (discovery-only, exactly like the `==` pin they
+  replaced). A second hosted run over a wet requirements.txt reported
+  `packagesWithPatches: 1` instead of 12; a vendored one under-reported the
+  same way.
 - **`vex`'s API-fallback note no longer depends on which refusal landed
   first.** When the patch API refuses several patch records, the
   `api_auth_fallback` note quoted whichever refusal happened to answer
