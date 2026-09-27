@@ -7,7 +7,8 @@ gem patches recorded in your project's `.socket/manifest.json` applied on every
 
 > **Status: Phase 2 (scaffolding).** `socket-patch setup` currently wires the gem
 > ecosystem by committing an in-tree copy of this plugin under
-> `.socket/bundler-plugin/` and referencing it from the `Gemfile` via `git:`.
+> `.socket/bundler-plugin/` and referencing it from the `Gemfile` via a `path:`
+> source (`plugin 'socket-patch', path: File.expand_path('.socket/bundler-plugin', __dir__)`).
 > This published gem is the planned replacement; once it is published to
 > RubyGems, a follow-up switches the generated `Gemfile` directive to
 > `plugin "socket-patch-bundler", "~> <major.minor>"`.
@@ -22,10 +23,11 @@ the cargo build-time guard.
 
 Two triggers feed one idempotent applier: a load-time pass (covers cached/no-op
 installs) and an `after-install-all` hook (covers fresh installs). A digest of
-the manifest + committed `.socket/` files + `Gemfile.lock` gates the work, and a
-stamp under `Bundler.bundle_path` travels with the gems. On any patch failure it
-raises `Bundler::BundlerError` so the build fails loudly rather than shipping
-unpatched gems.
+the manifest + committed `.socket/` files + `Gemfile.lock` + the patch-target
+files gates the work; the digest is cached in `.socket/gem-plugin-stamp`
+(machine-local, safe to gitignore or delete). On a patch failure it warns
+(naming the failure and the remediation) and lets `bundle install` continue;
+set `SOCKET_PATCH_STRICT=1` to raise `Bundler::BundlerError` instead.
 
 ## License
 

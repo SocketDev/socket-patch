@@ -38,14 +38,15 @@ from the child environment.
 
 | Ecosystem | PURL | Patch UUID | Advisory | Used by |
 |-----------|------|------------|----------|---------|
-| npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h / CVE-2021-44906 | all five npm-family legs |
+| npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h / CVE-2021-44906 | every npm-family leg (npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun, vlt) |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | `de58c8b8-796c-4b6d-8a48-539b5563db76`, `26242e35-f867-4da8-8789-f0d2ea49e0f1`, `e828efa5-5c6d-43f3-9909-03f5ac232b98` | GHSA-38jv-5279-wg99, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53 | requirements.txt, uv.lock |
 | RubyGems | `pkg:gem/activestorage@6.0.3` | any of `15e960b5-f432-4b6c-b8aa-534a2b419323` (GHSA-m42x-37p3-fv5w / CVE-2020-8162), `6c4141c5-1535-4fd2-9db1-b5f8e4834bdb` (GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-08-19), `eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a` (GHSA-9xrj-h377-fr87 / CVE-2026-33195, published 2026-08-20), `c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6` (GHSA-r4mg-4433-c7g3 / CVE-2025-24293, published 2026-08-20), `9c2b4925-b413-4a3a-bb3a-9990440fb446` (GHSA-xr9x-r78c-5hrm / CVE-2026-66066, published 2026-08-21), `01019627-b481-4bae-bc09-e93b5a5e4481` (MERGED: CVE-2022-21831 + CVE-2025-24293 + CVE-2026-66066, published 2026-09-04) | see UUID column | bundler leg |
 
-urllib3 1.26.18 carries **three** distinct free patches, one per advisory. Which
-one the resolver returns is a server-side ordering detail, so the suite accepts
-any of the three rather than pinning one — pinning would go red on an unrelated
-server-side reorder.
+urllib3 1.26.18 carries **three** distinct free patches, one per advisory. The
+CLI picks one with its own ranking
+(`crates/socket-patch-core/src/api/ranking.rs`) over server-supplied severity
+and publish dates, so a newly published or re-scored patch can change the pick;
+the suite therefore accepts any of the three rather than pinning one.
 
 `preflight_required_patches_are_published` checks all three every run and fails
 first with the offending PURL named, so a withdrawn patch produces one clear
@@ -71,7 +72,7 @@ failure instead of N confusing ones that look like CLI regressions.
 | Ecosystem | Hosted mode | Free patches in production | Suite coverage |
 |-----------|-------------|----------------------------|----------------|
 | npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun; vlt probe-driven (see [vlt](#vlt-the-serve-encoding-gate)) |
-| PyPI | ✅ (requirements.txt, uv.lock, Pipfile.lock) | ✅ many | ✅ requirements.txt, uv.lock, Pipfile.lock |
+| PyPI | ✅ (requirements.txt, uv.lock, poetry.lock, pdm.lock, Pipfile.lock) | ✅ many | ✅ requirements.txt, uv.lock (poetry.lock / pdm.lock / Pipfile.lock via per-release backtests, see below) |
 | RubyGems | ✅ | ✅ (this suite pins one purl/UUID: `activestorage@6.0.3`; the 2026-08-18 republish covers more versions) | ✅ full bundler install proof |
 | Cargo | ✅ | ❌ **none** (tier emptied 2026-08-28) | canary only |
 | Maven | ✅ | ❌ **none** | canary only |
@@ -186,26 +187,13 @@ integrity rejection, peer instances, and rollback across pnpm majors 1–12.
 The production pnpm test proves installation from the public hosted service;
 it does not test the SBOM backend, dashboard badges, policies, or alert counts.
 
-### 3. `uv.lock` — the `sdist` entry is rewritten to a wheel URL (CLI, minor)
+### 3. `uv.lock` — the `sdist` entry was rewritten to a wheel URL (CLI) — FIXED
 
-The uv.lock rewriter points the `sdist` entry at the patched **wheel** and keeps
-the original sdist's `size`, producing an entry whose URL, hash and size are
-mutually inconsistent:
-
-```toml
-# pristine
-sdist  = { url = ".../urllib3-1.26.18.tar.gz",            hash = "sha256:f8ecc1bb…", size = 305687 }
-wheels = [{ url = ".../urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:34b97092…", size = 143835 }]
-
-# after scan --mode hosted
-sdist  = { url = "…patch.socket.dev/…-py2.py3-none-any.whl", hash = "sha256:ccc9a9e0…", size = 305687 }
-wheels = [{ url = "…patch.socket.dev/…-py2.py3-none-any.whl", hash = "sha256:ccc9a9e0…", size = 143835 }]
-```
-
-uv tolerates it today because it prefers the wheel, so the leg passes. It would
-bite on a `--no-binary` resolve or a platform with no matching wheel. The
-rewriter should either leave `sdist` alone or update its `size` alongside the
-URL and hash.
+The uv.lock rewriter used to point the `sdist` entry at the patched wheel while
+keeping the original sdist's `size`. It now drops the entry's existing
+`sdist` / `wheel` / `wheels` / `archive` keys and writes back only the
+redirected artifact (a wheel goes in `wheels`), pinned by the urllib3 1.26.18
+unit test in `crates/socket-patch-core/src/utils/python_lock.rs`.
 
 ## Running
 

@@ -24,8 +24,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | Composer (`composer`) | ✅ post-install script events | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
 | Deno (`deno`) | ✅ apply-only — no install hook (`setup` reports `no_files`); declare in `setup.manual` for VEX coverage | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
 
-> **Maven / NuGet sidecar caveat**: Maven and NuGet are fully enabled in every mode (the
-> old `SOCKET_EXPERIMENTAL_MAVEN` / `SOCKET_EXPERIMENTAL_NUGET` opt-ins are retired).
+> **Maven / NuGet sidecar caveat**: Maven and NuGet are fully enabled in every mode.
 > In-place (agent-mode) patching leaves the caches' own checksum sidecars stale: NuGet's
 > post-apply fixup deletes `.nupkg.metadata` and raises an advisory for the
 > signed-package `.nupkg.sha512` tamper marker it cannot honestly rewrite; Maven's
