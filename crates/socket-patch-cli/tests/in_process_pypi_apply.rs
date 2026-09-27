@@ -263,7 +263,7 @@ async fn pypi_install_scan_sync_patches_real_file() {
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         apply: false,
         prune: false,
         sync: true,
@@ -339,7 +339,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         apply: false,
         prune: false,
         sync: true,
@@ -448,7 +448,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
             dry_run: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         apply: true,
         prune: false,
         sync: false,
@@ -580,7 +580,7 @@ async fn pypi_crawler_finds_real_installed_six() {
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         apply: false,
         prune: false,
         sync: false,

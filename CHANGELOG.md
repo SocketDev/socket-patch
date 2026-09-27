@@ -1353,6 +1353,21 @@ into the new version's section — see docs/releasing.md.
   answers in request order — but a large monorepo's hosted scan at 100 ms of
   latency drops from ~20 s to ~9 s.
 
+- **`scan` queries the authenticated API 500 packages per batch, up from
+  100.** Unset, `--batch-size` / `SOCKET_BATCH_SIZE` now follows the
+  endpoint: 500 purls per `POST /v0/orgs/{org}/patches/batch` (the server's
+  own per-request maximum) and 100 per `POST {proxy}/patch/batch` on the
+  public proxy, as before. A given size still applies as-is on either
+  endpoint. A batch whose JSON body would pass 256 KiB (the public proxy's
+  body cap) is now split, deterministically, into consecutive smaller
+  batches; at the default sizes that takes purls averaging over ~500 bytes.
+  A run downgraded to the proxy mid-run keeps its chunks, so it can send
+  the proxy batches of up to 500 purls (within the proxy's 256 KiB cap and
+  its upstream's 500-purl limit). Output is unchanged; the request count
+  and shape change — a large monorepo sends 30 batch requests instead of
+  147 (depscan: 12 instead of 56), and `api_batch_failed` warnings number
+  the larger batches (`API batch 2 of 12 failed: …`).
+
 - **The crawl's directory walks run on 4 threads by default.** The walk
   pool behind the `node_modules` walk and the Maven repository walk (and its
   POM parse) used one thread per logical CPU (up to 16), but the walk is

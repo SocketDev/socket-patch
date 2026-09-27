@@ -33,7 +33,7 @@ fn default_args(cwd: &Path) -> ScanArgs {
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         apply: false,
         prune: false,
         sync: false,
@@ -790,7 +790,7 @@ async fn scan_small_batch_size_chunks_requests() {
 
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.batch_size = 1; // force 3 separate API calls
+    args.batch_size = Some(1); // force 3 separate API calls
     assert_eq!(run_scrubbed(args).await, 0);
     // The whole point of this test: batch_size=1 over 3 discovered packages
     // must produce exactly 3 separate batch requests, each carrying one
@@ -1063,7 +1063,7 @@ async fn scan_batch_size_zero_does_not_panic() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
     args.common.api_url = Some(server.uri());
-    args.batch_size = 0;
+    args.batch_size = Some(0);
 
     // No panic, and the discovered package still reaches the batch endpoint
     // (proving the loop ran rather than being skipped).

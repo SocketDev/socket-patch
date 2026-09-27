@@ -62,7 +62,78 @@ use self::vendor_flow::{
     partition_skipped_selected,
 };
 
-const DEFAULT_BATCH_SIZE: usize = 100;
+/// Packages per batch request on the authenticated API when `--batch-size`
+/// is not given: the server's own per-request maximum
+/// (`MAX_PURLS_PER_BATCH` on `POST /v0/orgs/{org}/patches/batch`).
+const DEFAULT_BATCH_SIZE: usize = 500;
+
+/// Packages per batch request on the public proxy when `--batch-size` is
+/// not given. The proxy is shared and unauthenticated, so it keeps the
+/// historical size.
+const DEFAULT_PROXY_BATCH_SIZE: usize = 100;
+
+/// Upper bound on one batch request's JSON body. A chunk whose purls would
+/// serialize past it is split, deterministically, into consecutive smaller
+/// chunks. The value is the public proxy's own body cap
+/// (`MAX_PATCH_PROXY_BODY_BYTES`, answered with a 413 past it) — the
+/// tightest limit any batch route has (the authenticated API accepts
+/// 16 MiB). A batch the fallback re-sends to the proxy therefore always
+/// fits, whichever endpoint the chunks were sized for.
+const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
+
+/// The chunk size in effect: `--batch-size` / `SOCKET_BATCH_SIZE` when
+/// given (on either endpoint), else [`DEFAULT_BATCH_SIZE`] on the
+/// authenticated API and [`DEFAULT_PROXY_BATCH_SIZE`] on the public proxy.
+/// Floored at 1: `--batch-size 0` is otherwise unvalidated and would make
+/// the chunking below panic, so it degrades to one-package batches.
+fn effective_batch_size(requested: Option<usize>, use_public_proxy: bool) -> usize {
+    requested
+        .unwrap_or(if use_public_proxy {
+            DEFAULT_PROXY_BATCH_SIZE
+        } else {
+            DEFAULT_BATCH_SIZE
+        })
+        .max(1)
+}
+
+/// Serialized length of one `{"purl":…}` component of the batch body,
+/// exactly as `serde_json` writes it (quotes and escapes included).
+fn batch_component_bytes(purl: &str) -> usize {
+    // `{"purl":` + the JSON string + `}`.
+    8 + serde_json::to_string(purl).map_or(purl.len() + 2, |s| s.len()) + 1
+}
+
+/// Split `purls` into consecutive batch chunks of at most `batch_size`
+/// purls whose request body (`{"components":[{"purl":…},…]}`) stays within
+/// `max_body_bytes`. A chunk closes at `batch_size` purls or when the next
+/// purl would push its body past the cap, so the boundaries depend only on
+/// the purls, their order and the two limits. A single purl too long for
+/// the cap on its own still goes, alone (the server judges it); nothing is
+/// ever dropped or reordered. With a cap no chunk reaches, this is exactly
+/// `purls.chunks(batch_size)`.
+fn batch_chunks(purls: &[String], batch_size: usize, max_body_bytes: usize) -> Vec<&[String]> {
+    // `{"components":[` + `]}`.
+    const ENVELOPE: usize = 15 + 2;
+    let batch_size = batch_size.max(1);
+    let mut chunks = Vec::with_capacity(purls.len().div_ceil(batch_size));
+    let mut start = 0usize;
+    let mut body = ENVELOPE;
+    for (i, purl) in purls.iter().enumerate() {
+        let count = i - start;
+        let item = batch_component_bytes(purl) + usize::from(count > 0);
+        if count > 0 && (count == batch_size || body + item > max_body_bytes) {
+            chunks.push(&purls[start..i]);
+            start = i;
+            body = ENVELOPE + batch_component_bytes(purl);
+        } else {
+            body += item;
+        }
+    }
+    if start < purls.len() {
+        chunks.push(&purls[start..]);
+    }
+    chunks
+}
 
 /// The three patch-application modes `scan` can drive, selectable via
 /// `--mode` (the documented spelling). Each variant is equivalent to one
@@ -216,9 +287,11 @@ pub struct ScanArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Number of packages to query per API request.
-    #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE", default_value_t = DEFAULT_BATCH_SIZE)]
-    pub batch_size: usize,
+    /// Number of packages to query per API request [default: 500 on the
+    /// authenticated API, 100 on the public proxy]. A batch whose request
+    /// body would exceed 256 KiB is split into smaller consecutive batches
+    #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE")]
+    pub batch_size: Option<usize>,
 
     /// Deprecated spelling of `--mode agent`. With `--json`, download and
     /// apply the selected patches without prompting (without a mode,
@@ -1585,13 +1658,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         eprintln!("Warning ({REDIRECT_PRUNE_IGNORED}): {REDIRECT_PRUNE_IGNORED_DETAIL}");
     }
 
-    // A zero batch size would panic the API-query loop below: both
-    // `all_purls.len().div_ceil(batch_size)` and `all_purls.chunks(batch_size)`
-    // abort the process on a divisor/chunk-size of 0. `--batch-size 0`
-    // (or `SOCKET_BATCH_SIZE=0`) is otherwise unvalidated, so clamp to a
-    // floor of 1 — degrade to one-package batches rather than crash.
-    let batch_size = args.batch_size.max(1);
-
     // Resolved up-front (rather than at the GC site) because the embedded
     // `--vex` side-effect reads the manifest at several terminal returns,
     // including the early "no packages" exit before the GC block.
@@ -1601,6 +1667,12 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
         get_api_client_with_overrides(overrides.clone()).await;
+    // Sized for the endpoint the run starts on (see `effective_batch_size`;
+    // a zero `--batch-size` is floored to 1 there rather than crash the
+    // chunking below). A mid-run downgrade to the proxy keeps these chunk
+    // boundaries: the failed chunk is retried as-is, and every chunk is
+    // within the proxy's body cap by construction (`BATCH_BODY_BYTE_CAP`).
+    let batch_size = effective_batch_size(args.batch_size, use_public_proxy);
     let telemetry_token = api_client.api_token().cloned();
     let telemetry_org = api_client.org_slug().cloned();
     // Tracks whether scan was downgraded from the authenticated
@@ -1955,7 +2027,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
-    let total_batches = all_purls.len().div_ceil(batch_size);
+    let chunks: Vec<&[String]> = batch_chunks(&all_purls, batch_size, BATCH_BODY_BYTE_CAP);
+    let total_batches = chunks.len();
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
     // `--json` twin of the per-batch stderr warnings: `(batch, error)` in
@@ -2018,7 +2091,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     //   discarded, and so are their `--debug` lines: each chunk's are held
     //   back until it is folded, so a chunk the window drops announces
     //   nothing the serial loop would not have announced.
-    let chunks: Vec<&[String]> = all_purls.chunks(batch_size).collect();
     let mut next = 0usize;
     'windows: while next < total_batches {
         let end = if next == 0 && !use_public_proxy {
@@ -3157,6 +3229,124 @@ mod tests {
             );
         }
         m
+    }
+
+    /// The request body `search_patches_batch` sends for `chunk`, as
+    /// `serde_json` writes it (the client's `BatchSearchBody`).
+    fn batch_body(chunk: &[String]) -> String {
+        let components: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|p| serde_json::json!({ "purl": p }))
+            .collect();
+        serde_json::json!({ "components": components }).to_string()
+    }
+
+    fn purls(n: usize, len: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let head = format!("pkg:npm/p{i}-");
+                let pad = len.saturating_sub(head.len() + 6);
+                format!("{head}{}@1.0.0", "x".repeat(pad))
+            })
+            .collect()
+    }
+
+    /// Unset, the batch size follows the endpoint: the server's 500-purl
+    /// maximum on the authenticated API, 100 on the public proxy. A given
+    /// size wins on both, and 0 is floored to 1.
+    #[test]
+    fn batch_size_defaults_per_endpoint_and_honors_an_explicit_value() {
+        assert_eq!(effective_batch_size(None, false), 500);
+        assert_eq!(effective_batch_size(None, true), 100);
+        assert_eq!(effective_batch_size(Some(7), false), 7);
+        assert_eq!(effective_batch_size(Some(7), true), 7);
+        assert_eq!(effective_batch_size(Some(0), false), 1);
+        assert_eq!(effective_batch_size(Some(0), true), 1);
+    }
+
+    /// The byte arithmetic matches `serde_json`'s output exactly, escapes
+    /// and non-ASCII included, so the cap is judged on the real body.
+    #[test]
+    fn batch_component_bytes_match_the_serialized_body() {
+        for purl in [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:npm/%40scope/name@1.0.0",
+            "pkg:pypi/we\"ird@1.0?x=\\y",
+            "pkg:cargo/caf\u{e9}@0.1.0",
+            "pkg:npm/ctl\u{1}@1.0.0",
+        ] {
+            let one = vec![purl.to_string()];
+            assert_eq!(
+                17 + batch_component_bytes(purl),
+                batch_body(&one).len(),
+                "{purl}"
+            );
+        }
+        let many = purls(9, 40);
+        let sum: usize = many.iter().map(|p| batch_component_bytes(p)).sum();
+        assert_eq!(17 + sum + (many.len() - 1), batch_body(&many).len());
+    }
+
+    /// With a cap no chunk reaches, the chunks are exactly
+    /// `purls.chunks(batch_size)`: same boundaries, same order.
+    #[test]
+    fn batch_chunks_without_cap_pressure_match_plain_chunking() {
+        for n in [0usize, 1, 99, 100, 101, 499, 500, 501, 1000, 1234] {
+            let list = purls(n, 30);
+            for size in [1usize, 3, 100, 500] {
+                let want: Vec<&[String]> = list.chunks(size).collect();
+                assert_eq!(
+                    batch_chunks(&list, size, BATCH_BODY_BYTE_CAP),
+                    want,
+                    "n={n} size={size}"
+                );
+            }
+        }
+    }
+
+    /// An oversize chunk is split greedily at the byte cap: every body fits,
+    /// every chunk is maximal (its successor's first purl would not have
+    /// fitted), nothing is dropped or reordered, and the split is the same
+    /// on every call.
+    #[test]
+    fn batch_chunks_split_an_oversize_chunk_at_the_byte_cap() {
+        let list = purls(1400, 220);
+        let chunks = batch_chunks(&list, 5000, BATCH_BODY_BYTE_CAP);
+        assert!(chunks.len() > 1, "1400 x 220-byte purls exceed 256 KiB");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(batch_body(chunk).len() <= BATCH_BODY_BYTE_CAP, "chunk {i}");
+            if let Some(next) = chunks.get(i + 1) {
+                let mut grown = chunk.to_vec();
+                grown.push(next[0].clone());
+                assert!(batch_body(&grown).len() > BATCH_BODY_BYTE_CAP, "chunk {i}");
+            }
+        }
+        assert_eq!(chunks.concat(), list);
+        assert_eq!(chunks, batch_chunks(&list, 5000, BATCH_BODY_BYTE_CAP));
+
+        // The count limit still applies inside the byte limit, and a body
+        // exactly at the cap is kept whole.
+        let small = batch_chunks(&list, 500, BATCH_BODY_BYTE_CAP);
+        assert!(small.iter().all(|c| c.len() <= 500));
+        let exact = batch_body(&list[..10]).len();
+        assert_eq!(batch_chunks(&list[..11], 500, exact)[0].len(), 10);
+    }
+
+    /// A purl too long for the cap on its own still goes, alone, between
+    /// its neighbours' chunks.
+    #[test]
+    fn batch_chunks_send_an_oversize_purl_alone() {
+        let mut list = purls(4, 30);
+        list.insert(2, format!("pkg:npm/{}@1.0.0", "y".repeat(400)));
+        let chunks = batch_chunks(&list, 100, 200);
+        assert_eq!(chunks.concat(), list);
+        let alone: Vec<&[String]> = chunks
+            .iter()
+            .copied()
+            .filter(|c| c.contains(&list[2]))
+            .collect();
+        assert_eq!(alone, vec![&list[2..3]]);
+        assert!(chunks.iter().all(|c| !c.is_empty()));
     }
 
     /// MVN-4: only a non-GC `--ecosystems` run narrows the crawl. A GC run
