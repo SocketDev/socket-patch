@@ -736,21 +736,29 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     assert_eq!(repaired["summary"]["rebuilt"], 1, "repair: {repaired}");
     fixture.frozen("repaired", &fixture.patched, "minimist");
 
-    // Recovery also discovers native binary wiring when the local ledger was
-    // lost. Save the original ledger only to continue the unrelated takeover
-    // and exact-rollback assertions after this recovery proof.
+    // A lost ledger is reported, not re-synthesized — and the reference is
+    // still discovered from the native binary lock. Save the original
+    // ledger to continue the takeover and exact-rollback assertions.
     let state_path = project.join(".socket/vendor/state.json");
     let saved_state = std::fs::read(&state_path).unwrap();
     std::fs::remove_file(&state_path).unwrap();
-    std::fs::remove_dir_all(project.join(".socket/vendor/npm")).unwrap();
-    let recovered = cli(project, &["repair", "--offline", "--yes"]);
-    assert_eq!(
-        recovered["summary"]["rebuilt"], 1,
+    let output = command(env!("CARGO_BIN_EXE_socket-patch"), project)
+        .args(["repair", "--offline", "--yes", "--cwd"])
+        .arg(project)
+        .args(["--json", "--no-telemetry"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "ledgerless repair must fail");
+    let recovered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        recovered["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["errorCode"] == "vendor_ledger_missing"),
         "ledgerless repair: {recovered}"
     );
-    let state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    assert_eq!(state["entries"][PURL]["flavor"], "bun");
-    fixture.frozen("ledgerless-repair", &fixture.patched, "minimist");
+    assert!(!state_path.exists(), "no ledger is synthesized");
     std::fs::write(&state_path, saved_state).unwrap();
 
     let before = snapshot(project);
@@ -869,18 +877,11 @@ async fn native_binary_alias_and_transitive() {
                 mirror.is_file(),
                 "workspace requires its committed tarball copy"
             );
-            for (label, corrupt, remove_ledger) in [
-                ("missing-mirror", false, false),
-                ("corrupt-mirror", true, false),
-                ("ledgerless-mirror", false, true),
-            ] {
+            for (label, corrupt) in [("missing-mirror", false), ("corrupt-mirror", true)] {
                 if corrupt {
                     std::fs::write(&mirror, b"corrupt workspace artifact").unwrap();
                 } else {
                     std::fs::remove_file(&mirror).unwrap();
-                }
-                if remove_ledger {
-                    std::fs::remove_file(&ledger).unwrap();
                 }
                 let repaired = cli(&fixture.project, &["repair", "--offline", "--yes"]);
                 assert_eq!(
@@ -889,9 +890,9 @@ async fn native_binary_alias_and_transitive() {
                 );
                 fixture.frozen(label, &fixture.patched, target);
             }
-            // The separately proven ledgerless recovery cannot recover an
-            // original registry snapshot. Restore it to exercise exact revert.
-            std::fs::write(&ledger, original_state).unwrap();
+            // Repair keeps the ledger byte-identical (the exact revert below
+            // replays its originals).
+            assert_eq!(std::fs::read(&ledger).unwrap(), original_state);
         }
         cli(&fixture.project, &["vendor", "--revert"]);
         fixture.pristine();
