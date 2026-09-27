@@ -1,6 +1,7 @@
 //! PDM lock-only wheel redirects. The manifest and unrelated lock entries stay byte-identical.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Value};
 
@@ -11,6 +12,7 @@ use super::common::{
     ensure_unchanged, item_get, lock_units_named, pep508_name, pyproject_dependency_specs, record,
     refuse_symlinked, revert_lock_fragment_splice,
 };
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::state::{PdmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
@@ -26,8 +28,8 @@ const KIND_LOCK_PACKAGE: &str = "pdm_lock_package";
 pub struct PdmProject {
     /// Verbatim pdm.lock text (the surgery substrate).
     pub lock_text: String,
-    /// Parsed lock (guard checks only — every edit is text surgery).
-    pub lock: DocumentMut,
+    /// Parsed lock, shared (guard checks only — every edit is text surgery).
+    pub lock: Arc<DocumentMut>,
     /// pyproject.toml content when present. NEVER written; read only to
     /// classify the dependency for [`PdmMeta::dep_class`] diagnostics.
     pub pyproject_text: Option<String>,
@@ -38,6 +40,12 @@ pub struct PdmProject {
     /// Non-fatal advisories raised during load (untested lock version).
     pub warnings: Vec<VendorWarning>,
 }
+
+/// The run's pdm parses — the poetry pattern, same reasoning: the lock is
+/// read-only (every edit is text surgery) and the pyproject is read only to
+/// classify the dependency. See [`ParseMemo`].
+static LOCK_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
+static PYPROJECT_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
 
 /// What the target `[[package]]` unit already looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +71,14 @@ pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, 
                 format!("cannot read {LOCK_FILE}: {e}"),
             )
         })?;
-    let lock: DocumentMut = lock_text.parse().map_err(|e| {
-        (
-            "pypi_pdm_lock_parse_failed",
-            format!("{LOCK_FILE} does not parse: {e}"),
-        )
-    })?;
+    let lock = LOCK_MEMO
+        .parse(lock_text.as_bytes(), || lock_text.parse::<DocumentMut>())
+        .map_err(|e| {
+            (
+                "pypi_pdm_lock_parse_failed",
+                format!("{LOCK_FILE} does not parse: {e}"),
+            )
+        })?;
 
     let metadata = lock.get("metadata");
     let lock_version = metadata
@@ -114,7 +124,7 @@ fn classify_dependency(p: &PdmProject, canon_name: &str) -> &'static str {
     let Some(text) = p.pyproject_text.as_deref() else {
         return "transitive";
     };
-    let Ok(doc) = text.parse::<DocumentMut>() else {
+    let Ok(doc) = PYPROJECT_MEMO.parse(text.as_bytes(), || text.parse::<DocumentMut>()) else {
         return "transitive";
     };
     let mut declared: Vec<String> = pyproject_dependency_specs(&doc)
@@ -417,7 +427,7 @@ pub async fn wire_pdm(
         ));
     }
 
-    let new_lock = crate::utils::pdm_lock::rewrite_pdm_lock(
+    let rewrite = crate::utils::pdm_lock::rewrite_pdm_lock_with_edits(
         &p.lock_text,
         canon_name,
         version,
@@ -426,14 +436,18 @@ pub async fn wire_pdm(
         wheel_sha256_hex,
     )
     .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
-    let fragments = crate::utils::pdm_lock::pdm_lock_edits(&p.lock_text, &new_lock, canon_name)
+    let fragments = rewrite
+        .edits()
         .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
+    let new_lock = rewrite.text;
     // The edit was computed from the pre-flight snapshot; a `pdm lock` /
     // editor save that landed during the wheel build must not be clobbered.
     ensure_unchanged(root, LOCK_FILE, &p.lock_text, "pypi_pdm_changed").await?;
     // Mode-preserving: the lock is a user-owned file we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
     // to umask defaults (same class as the revert leg in common.rs).
+    // Dropped before the write, so a torn one leaves nothing behind either.
+    LOCK_MEMO.invalidate();
     atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_lock.as_bytes())
         .await
         .map_err(|e| {
@@ -1096,7 +1110,7 @@ distribution = false
     async fn classify_dependency_covers_every_declaration_surface() {
         let p = |pyproject: Option<&str>| PdmProject {
             lock_text: String::new(),
-            lock: DocumentMut::new(),
+            lock: Arc::new(DocumentMut::new()),
             pyproject_text: pyproject.map(str::to_string),
             lock_version: "4.5.0".into(),
             strategy: Vec::new(),
@@ -1153,7 +1167,7 @@ distribution = false
     fn classify_dependency_degrades_on_unparseable_and_degenerate_pyproject() {
         let p = |pyproject: Option<&str>| PdmProject {
             lock_text: String::new(),
-            lock: DocumentMut::new(),
+            lock: Arc::new(DocumentMut::new()),
             pyproject_text: pyproject.map(str::to_string),
             lock_version: "4.5.0".into(),
             strategy: Vec::new(),

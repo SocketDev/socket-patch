@@ -19,13 +19,170 @@ into the new version's section — see docs/releasing.md.
 
 > **Semver note:** this entry changes `rollback`'s default behavior, narrows
 > the meaning of its existing `vendored: []` JSON key, makes vendored mode
-> manifest-free, turns a plain non-TTY `scan` report-only, and makes `vex`
-> refuse to attest stale ledger records and corrupt vendor ledgers — all
+> manifest-free, moves vendored cargo wiring from `.cargo/config*` into
+> `Cargo.toml`, tags vendored cargo copies' versions with `+socket.<uuid>`
+> (visible to the patched crate as `CARGO_PKG_VERSION`), turns a plain
+> non-TTY `scan` report-only, makes `vex`
+> refuse to attest stale ledger records and corrupt vendor ledgers, and
+> retries a throttled patch API (new error text, added waiting, a throttled
+> package failing its legacy-proxy batch) — all
 > MAJOR per CLI_CONTRACT.md's semver policy — so it ships as the next major
 > release (v5.0).
 
 ### Changed (BREAKING)
 
+- **Vendored runs refuse lock-text failures before downloading them.**
+  `scan --mode vendored` and `get --mode vendored` evaluate the vendor
+  backends' pure lock-text gates — pnpm, yarn classic and yarn berry
+  (coordinates; the lock / manifest reads and their line-ending, version,
+  `cacheKey` and `.yarnrc.yml` gates; override and `resolutions`
+  conflicts; the lock entry present and rewritable) and cargo's
+  `locked_version_mismatch` when it is the crate's first refusal — before
+  fetching patch views and pristine sources, so a package that will be
+  refused costs no network. This applies only to a package the vendor loop
+  would hand to its backend — one installed on disk, or one the lockfile
+  resolves to a verifiable registry source (the pristine fetch would
+  happen); a package absent from the lock and not installed keeps its
+  `skipped` / `package_not_installed` vendor event and its download
+  record, exactly as before. Such a package is now reported in the download
+  phase: `download.patches[]` records it as `action: "failed"` with the
+  backend's exact `errorCode` and `error`, `download.downloaded` drops and
+  `download.failed` rises by the number of such packages, and the vendor
+  envelope no longer carries their `failed` events (`vendor.summary.failed`
+  drops by the same number) nor, for lockfile-only packages, their
+  `vendor_fetched_missing` events. Exit code and the top-level `status`
+  are unchanged; the nested `vendor.status` becomes `success` when those
+  refusals were the vendor step's only failures (and when every selected
+  package is refused this way, the human arm prints `Nothing was
+  vendored: N patches failed (see above).`).
+  (The interactive human `scan --vendor` arm still fetches the views its
+  pre-prompt baseline check verifies.) Purls the hosted redirect ledger
+  claims keep the vendor loop's refusal. Because no view is fetched, the
+  lock-text refusal now takes precedence over every outcome that came
+  from the view: a package that would also have hit a paid-access 403, a
+  failed view fetch or the no-applicable-files guardrail reports the lock
+  refusal instead.
+  The manifest-driven `vendor` command keeps its `failed` events but no
+  longer fetches the pristine source of a lockfile-only package it refuses
+  this way (no `vendor_fetched_missing` event, no registry request; with an
+  unreachable registry the gate's code replaces `vendor_fetch_failed`) —
+  again only when the lockfile resolves it to a verifiable source; one the
+  lock does not resolve keeps its `package_not_installed` skip.
+  On the polyglot monorepo fixture: 80 of 560 packages (74
+  `vendor_lock_entry_not_found`, 4 `vendor_override_conflict`, 2
+  `vendor_lock_entry_unsupported`) move to the download phase, saving 80
+  view requests and 3 registry tarballs per run.
+
+- **Vendored cargo copies carry a tagged version: `<version>+socket.<uuid>`.**
+  The vendored copy's own `Cargo.toml` `[package] version` is rewritten to
+  the patch-tagged version (`1.0.4+socket.<uuid>`; a version that already
+  has build metadata keeps it: `2.0.1+zstd.1.5.2.socket.<uuid>`), and the
+  detached `Cargo.lock` entry records that tagged version with no
+  `source` / `checksum` — exactly the lock cargo itself writes when it
+  resolves the `[patch]` against the tagged copy (verified by building on
+  cargo 1.41 in docker and on current stable, and by the CI
+  `cargo-old-toolchains` leg on the 1.41 / 1.56 docker images — a local
+  run without those images only type-checks on rustup toolchains:
+  `--locked` builds, the patched bytes compile, a registry crate that
+  depends on the patched one (`^1`) resolves to the copy too, since cargo
+  ignores build metadata when matching requirements, and `cargo metadata`
+  reports the tagged version). Every lock reference that spells the old
+  version (`"cfg-if 1.0.4"`, v1's `"cfg-if 1.0.4 (registry+…)"`) is
+  rewritten to the tagged version, in lock formats v1–v4; a lock the edit
+  cannot keep consistent (a leftover reference in another spelling, a v1
+  `replace`, an entry already at the tagged version) refuses before any
+  write with `cargo_lock_untaggable`, and a copy manifest whose version
+  literal cannot be rewritten byte-exactly fails the package with
+  `cargo_copy_untaggable`. The patch uuid of the copy cargo actually
+  builds is therefore recoverable from `Cargo.lock` alone (a config-level
+  `[patch]` override pointing elsewhere changes the locked version). **The
+  patched crate sees the tag in `CARGO_PKG_VERSION`** (and in
+  `env!("CARGO_PKG_VERSION")`-derived strings such as `--version` output
+  of a vendored binary crate): requirement matching on it
+  (`semver::VersionReq::matches`) is unaffected, but string comparisons
+  AND equality / ordering on a parsed `semver::Version` see the tag
+  (`semver` 1.x compares build metadata: `1.0.4+socket.<uuid>` is not
+  `== Version::new(1, 0, 4)` and sorts above it). Re-runs are idempotent
+  (a dry run previews the tag as "would tag", and the wet run's
+  `cargo_lock_untaggable` / `cargo_copy_untaggable` refusals); a uuid bump
+  re-tags the copy and the lock; `vendor --revert` / `rollback` /
+  `remove` / GC / the hosted takeover restore the original lock byte for
+  byte (tag dropped with the `source` / `checksum`; a crate vendored
+  before any `Cargo.lock` existed has no originals, so only the tag its
+  first build locked is dropped). A user's own same-version path crate
+  that cargo later locks beside the tagged copy (an untagged sourceless
+  entry) is never mistaken for it: re-runs stay in sync, and the revert
+  restores the registry entry — spelled by its full id while the fork
+  shares its name+version, exactly as cargo writes it — without touching
+  the fork. GC keeps an entry whose lock tag is stale (another uuid) while
+  the manifest still wires this entry's copy: cargo re-locks any unlocked
+  build to the wired copy, and the next re-run retags. Projects vendored
+  before tagged versions (the pre-v5 `.cargo/config*` wiring, or an
+  untagged manifest wiring) are tagged by the next re-run or `repair`
+  (`cargo_version_tagged` note; a tag `repair` cannot write is the
+  `cargo_version_untagged` warning); a whole-tree file inventory recorded
+  for the copy is kept, and still verifies through exactly this uuid's
+  tag, so tagging never re-baselines it over unverified bytes. VEX
+  discovery treats the tagged lock version as the primary identity
+  (`pkg:cargo/<name>@<version>` is the tag stripped): a detached entry
+  tagged for a different uuid than the wiring's copy path is dead wiring
+  (not attested), and so is a copy whose own `Cargo.toml` is tagged for
+  another uuid than its path; a tagged entry no visible wiring names is
+  diagnosed unattributable; an untagged detached entry counts only beside
+  an untagged copy (the pre-tag vendored shape) — beside a tagged copy it
+  is some other crate cargo built, not attested. A patch that edits the
+  crate's own `Cargo.toml` verifies with the tag dropped — the tag being
+  this copy's own uuid, the same pin the inventory check applies, so a copy
+  tagged for another patch stays a mismatch instead of verifying clean
+  while VEX refuses it.
+- **Vendored cargo wiring moved to `Cargo.toml`.** `vendor` / `scan` /
+  `get --mode vendored` write the `[patch.crates-io]` path entry into the
+  workspace-root `Cargo.toml` (beside the `Cargo.lock` it detaches) instead
+  of `.cargo/config.toml` / `.cargo/config`, so Socket scanners can recover
+  the patch uuid from the manifest alone and single-version wiring builds
+  on cargo older than 1.56 (the floor of config-file `[patch]`; proven on
+  cargo 1.41 with no network). TWO vendored versions of one crate need
+  cargo 1.45 or newer: from 1.45 `--offline` from an empty `$CARGO_HOME` is
+  enough (without `--offline` it first tries to update the crates.io index
+  and fails when that is unreachable), while cargo before 1.45 resolves
+  every source-less lock entry for a crate through one `[patch]` path and
+  fails closed on the other — see the `cargo_multi_version_old_cargo`
+  entry under Fixed. The edit is
+  format-preserving (comments, ordering, CRLF / mixed line endings, a
+  UTF-8 BOM and the trailing-newline state survive; a revert restores the
+  manifest byte for byte and keeps a user's own `[patch]` /
+  `[patch.crates-io]` headers). The key is always the Socket-owned
+  `<name>-socket-<uuid8>` with `package = "<name>"`, never the bare crate
+  name: cargo lets a config-file `[patch]` item (project, ancestor
+  directory or `$CARGO_HOME`) replace the manifest item with the same key
+  whatever its version, so a crate-named key could be silently shadowed —
+  and two vendored versions of one crate get distinct keys instead of
+  clobbering each other (the config wiring keyed by crate name let the
+  second overwrite the first). The ledger's `cargo_patch_entry` record now
+  names `Cargo.toml` (its `key` is the TOML key). New refusals, each before
+  any write: `cargo_manifest_unreadable`, `cargo_manifest_unparseable`,
+  `cargo_manifest_symlink_unsupported` (vendor and revert),
+  `cargo_manifest_not_workspace_root` (run from a workspace member, whose
+  `[patch]` cargo ignores) and `cargo_manifest_patch_source_alias` (the
+  manifest spells crates.io by URL in `[patch."https://github.com/rust-lang/crates.io-index"]`,
+  which replaces `[patch.crates-io]` wholesale);
+  `user_authored_patch_entry` now covers user entries in `Cargo.toml` and
+  in every cargo config file cargo merges (project, ancestors,
+  `$CARGO_HOME`) and matches by crate (`package` or key), sparing a path
+  patch that is provably another version. **Old wiring migrates
+  automatically**: a re-run or `repair` moves a Socket-owned
+  `.cargo/config*` entry into `Cargo.toml` (`cargo_wiring_migrated` note; a
+  migrating vendor re-run reports the package `applied`) and cleans a
+  config file / `.cargo/` the move emptied — a legacy entry that cannot be
+  removed fails the run and unwinds it (`cargo_legacy_wiring_kept`) — while
+  `rollback` / `remove` / `vendor --revert` / GC / hosted takeover remove
+  both spellings. Projects hit by the pre-v5 multi-version overwrite (a
+  detached lock entry nothing wired) are healed by a re-run or `repair`
+  (`cargo_wiring_restored`). User config entries are never touched. VEX
+  discovery reads the manifest first (key-agnostic), skips a manifest entry
+  that cargo ignores (a same-key project-config item or a URL-spelled
+  crates.io table replaces it), and still honors pre-v5 config wiring. The
+  hosted takeover's missing-ledger guard is now per version.
 - **Binary Bun lockfiles are patched natively in place.** Hosted and vendored
   modes read and rewrite `bun.lockb` formats 1–3 directly, including mode
   changes, repair, and scoped rollback. Binary-to-text conversion, migration
@@ -148,7 +305,50 @@ into the new version's section — see docs/releasing.md.
   (`wiring_conflict`), and when the lockfile wires a package to patch U, a
   manifest or ledger record for it under another uuid is superseded.
 
+- **A throttled patch API is retried with a bounded backoff.** An HTTP
+  429 or 503 from the patch API made the affected batch (or patch-list
+  query) fail on the first answer — likelier now that up to 32 requests are
+  in flight. Now every patch-API JSON call (batch search, per-package patch
+  lists, patch views and VEX record fetches, hosted package references)
+  retries a 429 / 503 up to 3 times: it waits as long as `Retry-After` asks
+  (delta-seconds or HTTP-date; one over 30 s is not waited out — the answer
+  is final at once — and one under the jittered first step, such as `0` or a
+  past date, waits that step), otherwise 0.5 s, 1 s, 2 s (steps capped at
+  8 s, jittered into their upper half). All retries in a run must end
+  within a 60 s wall-clock window opened by the run's first retry, so a
+  throttled run adds at most about a minute however many requests it makes
+  (requests waiting in parallel each keep their retries).
+  `SOCKET_API_MAX_RETRIES=<n>` (0-10) changes the count; `0` restores the
+  old single attempt. Nothing else is retried: 401/403 still trigger the
+  proxy fallback at once, and the public proxy's permanent `503 "Patch API
+  is not configured"` is never retried on any path (the batch still
+  degrades to per-package lookups at once; a per-package lookup answering
+  it is still skipped). Output folds in request order exactly as an
+  unthrottled run's. What breaks: a throttled run now takes longer before
+  it fails (up to ~60 s of added waiting); the error text changes — it
+  names why retrying stopped (`Rate limit exceeded (HTTP 429, gave up after
+  3 retries). Please try again later.`, `API request failed with status
+  503: <body> (gave up after 3 retries)`, `(Retry-After 120 s exceeds the
+  30 s retry cap)`, `(the run's 60 s retry window has closed)`); and on
+  the token-less legacy per-package proxy path (a proxy without `POST
+  /patch/batch`) a package still throttled after its retries now fails its
+  whole batch query — every package in that batch goes unchecked and the
+  batch is reported as failed (warning, or the all-failed error when it was
+  the only batch) — instead of that one package being skipped silently.
+
 ### Added
+
+- **`--json` reports a failed patch-API query as a warning.** Under
+  `--json`, a batch query that failed (after the bounded retry above) while
+  others succeeded vanished from the envelope without a trace, exit 0, and
+  the agent / hosted / vendored flows' failed per-package patch-list
+  queries did the same; the human run already warned on stderr. Each is now
+  a run-level `warnings[]` entry carrying the human line's text:
+  `{code: "api_batch_failed", detail: "API batch <n> of <total> failed:
+  <error>"}` (in batch order) and `{code: "patch_details_failed", detail:
+  "could not fetch details for <purl>: <error>"}`. Additive: `status` and
+  the exit code are unchanged while some query succeeded, and the
+  all-failed error envelope and exit 1 still apply when none did.
 
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
@@ -511,6 +711,36 @@ into the new version's section — see docs/releasing.md.
   `hosted_revert_unsupported` before the manifest mutation), and remove's
   default GC extends from blobs-only to blobs + diff + package archives
   (parity with rollback/repair/`scan --prune`).
+- **`SOCKET_API_CONCURRENCY` paces `scan`'s patch-API requests.** `scan`
+  now keeps several patch-API requests in flight (8 authenticated, 4 on the
+  public proxy) instead of one at a time. Set this variable — clamped to
+  `1`-`32`, and on the public proxy only downward — when something in front
+  of the API caps in-flight requests per client (a self-hosted `--api-url`,
+  a corporate reverse proxy, a WAF, a CDN) and a scan starts losing
+  requests to it. `SOCKET_API_CONCURRENCY=1` restores one request at a
+  time. Unset, empty or non-numeric values keep the defaults. Results,
+  warnings and their order never depend on the setting.
+
+  Two request-count consequences an operator may see before they read the
+  code, neither of which changes any output:
+
+  - A vendored run fetches prebuilt archives ahead of the wiring loop.
+    The plan it fetches is exact — it is gated by the same pre-flight each
+    vendor backend runs before it would ask the service (an unsupported or
+    absent lockfile entry, an override conflict, a workspace gate), so a
+    package the run does not end up vendoring is never asked for: the
+    `POST /v0/orgs/<org>/patches/package` download grants, which can start
+    a server-side archive build and count against quota, are exactly the
+    one-at-a-time loop's (71 on a fresh depscan run, where an earlier
+    draft of the look-ahead issued 74). What changes is only their timing:
+    up to four are in flight at once. `SOCKET_API_CONCURRENCY=1` turns the
+    look-ahead off entirely.
+  - A token revoked *mid-run* now costs the authenticated batch endpoint
+    the requests already in flight — up to the in-flight cap instead of
+    one — before the run downgrades to the public proxy. Their answers are
+    discarded and the connections are dropped mid-response, so the
+    endpoint's access log shows them; the downgrade warning, the patches
+    and the exit code are the same as before.
 
 ### Fixed
 
@@ -548,19 +778,13 @@ into the new version's section — see docs/releasing.md.
   replaced). A second hosted run over a wet requirements.txt reported
   `packagesWithPatches: 1` instead of 12; a vendored one under-reported the
   same way.
-- **`vendor --vendor-source build` no longer downloads a gem it cannot use.**
-  A gem the lockfile resolves and verifies, with no installed copy, is
-  refused with `failed`/`gem_spec_missing` BEFORE the registry round trip:
-  the bundler path source needs the stub gemspec rubygems writes at install
-  time, which a downloaded `.gem` does not carry, so the local build refused
-  it after paying for the download on every run. The refusal names the real
-  remedy (`bundle install`, or `--vendor-source=auto`).
-  **JSON consumers:** that run no longer carries the
-  `vendor_fetched_missing` warning event it used to emit before failing.
-  Unaffected: a gem the lock cannot verify keeps its documented
-  `vendor_fetch_unverifiable` + `package_not_installed` pair, an
-  already-vendored gem still re-runs green, and `auto`/`service` still
-  fetch.
+- **`vex`'s API-fallback note no longer depends on which refusal landed
+  first.** When the patch API refuses several patch records, the
+  `api_auth_fallback` note quoted whichever refusal happened to answer
+  first — a race, so two runs of the same project could report different
+  text (`Unauthorized` or `Forbidden`) and retry the refused records in a
+  different order. Both now follow the order the records are listed in,
+  like every other note.
 - **Hosted Go redirects no longer claim patches that did not land.**
   `scan`/`get --mode hosted` counted a Go module as redirected (recorded
   it in the redirect ledger, so `vex` attested it) whenever any project
@@ -661,6 +885,46 @@ into the new version's section — see docs/releasing.md.
   `setup --remove` could not land byte-identical on the pre-setup file.
   `package.json` is now written in its own layout (BOM, indent, line ending,
   trailing-newline shape), the same helper the vendored backends use.
+- **Two vendored versions of one cargo crate are documented — and now
+  warned about — as needing cargo 1.45.** The docs said older cargo (1.41)
+  only needed a populated crates.io index. It needs more than that: cargo
+  before 1.45 resolves every source-less `Cargo.lock` entry for a crate
+  through ONE `[patch.crates-io]` path — the entry whose KEY sorts last —
+  so one of the two versions is pinned to the other's copy and `cargo build
+  --locked` fails closed with ``patch for `<crate>` … did not resolve to
+  any crates``, index or no index. The old-toolchain e2e passed only
+  because its fixture uuids happened to sort the other way; it now uses the
+  adversarial order, and the floor was measured rather than assumed — on
+  one two-version fixture in both key orders, 1.41.1, 1.42, 1.43 and 1.44
+  refuse the adversarial order while 1.45, 1.49, 1.53, 1.56 and current
+  stable resolve either order, each lock entry to its own copy. Vendoring a
+  second version of a crate warns with `cargo_multi_version_old_cargo`
+  unless the project's `rust-version` or `rust-toolchain[.toml]` promises
+  cargo 1.45 or newer (socket-patch never runs `cargo`, so those files are
+  the only signal it has). A SINGLE vendored version still builds on cargo
+  1.41, as before.
+- **A CRLF `Cargo.lock` stays CRLF, and reverts byte-for-byte.** Vendoring
+  rewrote every line of a lock committed with Windows line endings as LF
+  (`toml_edit` renders LF only), and `vendor --revert` then "restored" the
+  all-LF file — a whole-file diff on a Windows checkout and a rollback that
+  was not byte-identical. The lock edits (detach, retag, restore) now map
+  the rendering back onto the file's own line endings, the way the copy's
+  `Cargo.toml` already did, in lock formats v1–v4: a CRLF lock stays CRLF,
+  a missing trailing newline stays missing, and every line a mixed-ending
+  lock's edit leaves alone keeps its own ending.
+- **Vendored mode can patch a package whose version carries build
+  metadata.** The patches API serves canonical PURLs, so a semver build
+  metadata version arrives percent-encoded
+  (`pkg:cargo/wasi@0.11.0%2Bwasi-snapshot-preview1`). The PURL parsers
+  compared that raw spelling against the lockfile / install directory's
+  `0.11.0+wasi-snapshot-preview1`, never matched, and refused the package
+  (`vendor_fetched_missing`, then `locked_version_mismatch`) — so no cargo
+  crate with build metadata (`wasi` is in most Rust dependency graphs)
+  could be vendored at all. Every ecosystem's PURL parse now
+  percent-decodes the namespace, name and version once, after the
+  `/`-and-`@` split and before the path-safety guards, so an escaped
+  separator still cannot introduce a path segment. Hosted mode was already
+  correct.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack
@@ -861,6 +1125,41 @@ into the new version's section — see docs/releasing.md.
   vendored rewrites now follow the `[metadata]` checksum table and rewrite
   dependents' full-id references, so `cargo --locked` accepts the lock (and
   the revert stays byte-identical).
+- **Hosted cargo pins every declaration of the patched version.** Each
+  version of a multi-version crate is pinned only in the declarations whose
+  requirement selects it (a requirement matching several locked versions is
+  refused `redirect_cargo_toml_dep_unrewritable`), and workspace-member and
+  in-root path-dependency manifests are pinned beside the root, so
+  `cargo --locked` accepts the redirected lock. Member discovery never
+  follows a symbolic link, so nothing outside the project is rewritten.
+- **Hosted cargo refuses crates a pin cannot reach.** A crate another
+  `Cargo.lock` package also depends on (a crates.io or git crate, or a path
+  package outside the project) now warns
+  `redirect_cargo_transitive_dependents` and is skipped instead of being
+  reported redirected while that package compiled the unpatched copy; a
+  transitive-only crate's `redirect_cargo_toml_dep_not_found` detail now
+  says so and points to `--mode vendored`. A crate declared only with
+  requirements the patched version does not satisfy (cargo resolves those
+  declarations to another version) is refused
+  `redirect_cargo_toml_dep_unrewritable`, the Socket backend's code for the
+  same shape, instead of `redirect_cargo_toml_dep_not_found`. A project with
+  NO `Cargo.lock` has no resolved graph to ask, so a crate declared beside
+  any other dependency — anything but a path dependency on a manifest the
+  same run pins — or beside a workspace member this run did not read (a
+  glob, a member outside the project or behind a symbolic link) is refused
+  `redirect_cargo_lockless_dependents` (commit a lockfile, or use `--mode
+  vendored`); a project whose only dependency is the patched crate has
+  nothing that could pull it in and still redirects.
+- **CRLF cargo projects redirect in hosted mode.** All-CRLF `Cargo.toml`,
+  `Cargo.lock` and cargo configs are rewritten with their endings kept
+  (they were refused), and `remove` / rollback still find the recorded
+  edits after a checkout converts the line endings.
+- **Hosted cargo `remove` restores every byte, in any order.** An appended
+  registry block leaves the user's config exactly as it was (trailing blank
+  lines or a missing final newline included) and a created config is
+  deleted with the last block; v1-lock and multi-version patches, ledgers
+  written by older CLIs included, can be removed in any order; and a crate
+  declared with the same line in two sections gets both pins reverted.
 - **yarn 4.0.x checksums keep the lock's own spelling.** Vendored and hosted
   berry rewrites write bare-hex `cacheKey: 10c0` checksums when the lock
   does, so `yarn install --immutable` no longer fails with YN0028.
@@ -1054,6 +1353,217 @@ into the new version's section — see docs/releasing.md.
   has no prebuilt crate.
 
 ### Changed
+
+- **The npm crawl skips tagged cache directories.** The walk that finds
+  workspace `node_modules` trees no longer descends into a directory that
+  carries a [Cache Directory Tagging](https://bford.info/cachedir/)
+  `CACHEDIR.TAG` beginning with the standard signature (every cargo
+  `target/` does), using the directory listing it already reads. One
+  semantic change: a `node_modules` inside such a directory, or anywhere
+  below it, is no longer crawled, so its packages are no longer scanned,
+  patched or attested. Every command that looks for installed npm copies
+  walks the same trees, so the change reaches past `scan`: `scan --prune` /
+  `--sync` treat a package installed only under a tagged directory as not
+  installed and garbage-collect its manifest entry and blobs (unless a
+  lockfile still resolves it), and `apply`, `rollback`, `remove`, `repair`,
+  `vendor` and `vex` no longer find copies there — so `remove` leaves such a
+  copy's patched files in place. The scan root itself is always crawled, and a
+  `CACHEDIR.TAG` without the signature (or that is a directory or a
+  symlink) prunes nothing. On a Rust-plus-JS monorepo this skipped 57% of
+  the walked directories. See docs/ecosystems.md.
+
+- **`scan` sends up to 32 patch-API requests at once on the authenticated
+  API, up from 8.** Each step sizes its window from the requests it has to
+  make: a quarter of them, between 8 and 32 — the batch queries, the
+  per-package patch lists, the hosted and vendored record views, discovery's
+  baseline views and `get`'s views. A step with 32 or fewer requests still
+  runs 8 at once; one with 128 or more runs 32. The fixed-size windows
+  follow the new cap up to their own ceilings: `vex` / `scan --vex` record
+  fetches now run up to 10 at once (was 8), wheel metadata stays at 4 and the
+  vendored archive prefetch at 4. The public proxy stays at 4.
+  `SOCKET_API_CONCURRENCY=<n>` still overrides the adaptive cap (1-32; on
+  the proxy it can only lower it); the fixed windows keep their own ceilings
+  on top of it. Output is unchanged — every window folds its
+  answers in request order — but a large monorepo's hosted scan at 100 ms of
+  latency drops from ~20 s to ~9 s.
+
+- **`scan` queries the authenticated API 500 packages per batch, up from
+  100.** Unset, `--batch-size` / `SOCKET_BATCH_SIZE` now follows the
+  endpoint: 500 purls per `POST /v0/orgs/{org}/patches/batch` (the server's
+  own per-request maximum) and 100 per `POST {proxy}/patch/batch` on the
+  public proxy, as before. A given size still applies as-is on either
+  endpoint. A batch whose JSON body would pass 256 KiB (the public proxy's
+  body cap) is now split, deterministically, into consecutive smaller
+  batches; at the default sizes that takes purls averaging over ~500 bytes.
+  A run downgraded to the proxy mid-run keeps its chunks, so it can send
+  the proxy batches of up to 500 purls (within the proxy's 256 KiB cap and
+  its upstream's 500-purl limit). Output is unchanged; the request count
+  and shape change — a large monorepo sends 30 batch requests instead of
+  147 (depscan: 12 instead of 56), and `api_batch_failed` warnings number
+  the larger batches (`API batch 2 of 12 failed: …`).
+
+- **The crawl's directory walks run on 4 threads by default.** The walk
+  pool behind the `node_modules` walk and the Maven repository walk (and its
+  POM parse) used one thread per logical CPU (up to 16), but the walk is
+  bound by the kernel's directory cache: on a 14-core Mac and on Linux
+  ext4, 4 threads walked a large monorepo's `node_modules` as fast as or
+  faster than one per CPU, with a quarter of the system time (see
+  `walk_pool.rs` for the measurements; the Maven walk shares the pool and was
+  not measured separately). The default is now 4, or the performance-core
+  count when that is lower (`hw.perflevel0.logicalcpu` on Apple silicon).
+  `SOCKET_WALK_THREADS=<n>` overrides it, clamped to 1-16 and to the CPU
+  count. What the crawl finds, and its order, are unchanged.
+
+- **Maven discovery takes coordinates from the `~/.m2` path.** A POM at its
+  canonical `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom`
+  location is no longer opened: its groupId / artifactId / version come from
+  the directory names, which is where Maven itself writes every POM, so the
+  crawl skips reading and parsing tens of thousands of files. The path only
+  spells the right group when the scan root is the repository root, so each
+  top-level group directory (`org/`, `com/`, ...) is confirmed first: the
+  first canonical POM under it whose contents parse must agree with its
+  path, and a directory whose first such POM disagrees — every one of them
+  when `--global-prefix` / `SOCKET_GLOBAL_PREFIX` / `MAVEN_REPO_LOCAL` points
+  one level above or inside the repository — is read content-first exactly
+  as before. Other `.pom` files (timestamped SNAPSHOT POMs, hand-placed
+  extras, a dotted group directory) are parsed as before. One semantic
+  change: under a confirmed directory, a POM at a canonical path whose
+  contents disagree with its directory (hand-placed, or a legacy upstream
+  POM with mismatched coordinates) now reports the directory's coordinates
+  instead of the ones in the file.
+- **`scan --ecosystems` crawls only the named ecosystems.** Without
+  `--prune`/`--sync`, a `scan -e npm` no longer walks `~/.m2`, the cargo
+  registry, the Go module cache and the rest only to filter their packages
+  away. What the run counts, queries and shows is unchanged
+  (`scannedPackages` already counted only the selected ecosystems), with
+  one exception: `lockfileOnlyPackages` and the human "not yet installed"
+  note now count only the selected ecosystems' lockfile-only entries
+  instead of every ecosystem's. A GC run (`--prune`/`--sync`) still crawls
+  every ecosystem — the prune needs the full installed set — and reports
+  exactly what it did before.
+
+- **An already-vendored project re-runs `vendor` without the network.** A
+  vendorable purl with no installed copy (the fresh-clone case) used to have
+  its pristine artifact downloaded and verified before the backend was even
+  asked, although the backend's in-sync check answers from the committed
+  artifact alone. That download is now deferred to the backend branch that
+  actually reads the pristine tree, whenever the vendor ledger already
+  covers the purl (its entry records the record's patch uuid and the
+  committed artifact is on disk — a file artifact such as a wheel or
+  tarball only while it still hashes to the ledger's `sha256`; `--force`
+  keeps the eager fetch), and for every lockfile-only cargo crate the
+  registry could fetch and verify (a crates.io `Cargo.lock` entry with a
+  checksum, or the pre-vendor resolution the ledger recovers) while the
+  patch service is enabled (the cargo backend reads the pristine source
+  only once `cargo_service_copy` falls back to the local build). A git,
+  path or custom-registry crate is never deferred: it keeps the eager
+  ladder's `vendor_fetch_unverifiable` + `package_not_installed` refusal
+  and is not vendored from the service's crates.io build, and a committed
+  file artifact that no longer matches its pin keeps the eager ladder's
+  outcome too. Visible effects: an idempotent re-run
+  makes no registry requests and no longer reports `vendor_fetched_missing`
+  for fetches it never needed; with no network (or under `--offline`) the
+  re-run of an already-vendored pypi, cargo, go or lockfile-only gem
+  project now SUCCEEDS (`already_vendored`, exit 0) instead of failing
+  `vendor_fetch_failed` / `package_not_installed`; a cargo crate the service
+  serves is never downloaded from the registry. When a deferred fetch does
+  happen (a drifted committed copy being rebuilt locally, a service miss),
+  its `vendor_fetched_missing` warning is recorded just ahead of that
+  package's own event instead of in the up-front fetch pass, and a failed,
+  unverifiable or `--offline`-refused deferred fetch reports exactly the
+  eager ladder's outcome for the purl (`vendor_fetch_failed` /
+  `vendor_fetch_unverifiable` + `package_not_installed` /
+  `package_not_installed`), in loop order. `vendor --vendor-source build`
+  (or no service config) now refuses a not-installed gem that the lock can
+  verify and no ledger entry covers with `gem_spec_missing` BEFORE
+  downloading it: a local build can never vendor a downloaded `.gem` (no
+  eval-able stub gemspec), so the download was pure waste. The refusal
+  keeps the backend's detail text and drops the `vendor_fetched_missing`
+  warning that used to precede it; since it now comes first, a gem the
+  backend would have refused for another reason after the download (an
+  uneditable Gemfile declaration, a Gemfile.lock it cannot edit) also
+  reports `gem_spec_missing`. `--dry-run` is unchanged: it still fetches
+  the gem and previews it (`vendor_fetched_missing` + `verified`).
+
+- **The vendor ledger stores a whole-file snapshot's new text as an edit.**
+  Several backends record an entire file as a wiring record's `original` /
+  `new` (maven's `pom.xml`, nuget's config, `pylock*.toml`, PEP 723 scripts
+  and hatch's project files), so a ledger held two near-identical copies of
+  that file per vendored package. In `.socket/vendor/state.json` such a
+  record's `new` text of 1 KiB or more is now written as a line-level edit
+  of the same record's `original`: `{"snapshot": "<sha256 of the text>",
+  "ops": [[start, len] | "inserted text", …]}` (a `[start, len]` pair copies
+  that byte range of the `original`, a string inserts itself), and the
+  ledger's `"version"` is `2`. The `original` stays the plain string it
+  always was, every lockfile fragment record (poetry, composer, npm, …) is
+  untouched, and a ledger without such a record keeps its version-1 bytes.
+  Every command reads both versions: version-1 ledgers load and revert
+  exactly as before, and a version-2 edit is rebuilt and checked against its
+  hash (an edit that does not reproduce its text, has no `original` to
+  apply to, or any other `{"snapshot": …}` value, is
+  `vendor_state_unreadable`). Revert, repair, `vex`, rollback and the
+  re-vendor carry-forward see the same full texts as before. Each record is
+  self-contained, so an older socket-patch that re-saves the ledger (it
+  keeps `original` / `new` verbatim) loses nothing; reading a version-2
+  record it leaves that fragment alone with its drift warning. No consumer
+  outside socket-patch reads `state.json` wiring.
+
+- **A vendored run commits its lockfile and ledger edits once, not per
+  package.** `vendor`, `scan --mode vendored` and `get --mode vendored` used
+  to rewrite every touched lockfile / `package.json` / `pnpm-workspace.yaml`
+  / config and the whole `.socket/vendor/state.json` after EACH package. The
+  run now captures those edits in memory (every backend still reads its own
+  and its siblings' earlier edits) and writes the final state once, after
+  the loop, through a roll-forward journal
+  (`.socket/vendor/.commit-journal.json`, removed when the commit
+  completes). The packages that succeeded are committed even when others
+  failed, so a completed run leaves exactly the files per-package commits
+  left. Crash semantics move from per-package to per-run: a crash before
+  the commit leaves the project's lockfiles and ledgers as they were before
+  the run (the artifacts it wrote are orphans the next run re-vendors over);
+  a crash during the commit is finished by the next command that takes the
+  apply lock, before it reads any of those files. When a file the journal
+  covers was edited since, that file is never written over and the journal
+  is set aside (`.commit-journal.set-aside-<uuid>.json`, which keeps every
+  file's pre-commit bytes; a stderr warning names `repair`): if the edited
+  files still carry the commit's own lines the rest of the commit is
+  finished around them (so the ledger records the wiring on disk), if none
+  of them does the files the crash had already replaced are put back to
+  their pre-commit bytes, and otherwise nothing is applied. A journal that
+  would write through a symbolic link, or outside the lockfiles and
+  ledgers, is set aside unapplied. A replay that fails on I/O keeps the
+  journal and fails the command's lock acquire (`lock_io`) rather than
+  letting it work over a half-committed project. A re-vendor under a newer
+  patch uuid now removes the replaced uuid's artifact dir after the commit,
+  so its `vendor_stale_artifact_removed` event comes after the run's
+  per-package events instead of right after the package's own; a golang
+  takeover likewise deletes the `.socket/go-patches/` copy only after the
+  commit that repoints `go.mod` away from it. A commit that cannot be
+  written fails the run with the new top-level error `vendor_commit_failed`
+  (exit 1), leaving the pre-run lockfiles and ledger in place — or, when
+  putting back the files already replaced failed too, keeping the journal
+  (the message says so) for the next locked command to finish the commit.
+  `repair`, `vendor --revert` and `rollback` keep their per-entry saves.
+
+- **Vendored artifacts are no longer fsynced one by one.** The files a
+  vendored run produces under `.socket/vendor/<eco>/<uuid>/` — patched copy
+  trees, the `.tgz` / `.whl` / `.nupkg` / `.jar` + `.pom` artifacts and their
+  `.sha1` sidecars, and the marker — are still written atomically (stage +
+  rename) but without their own `fsync`/`F_FULLFSYNC`. One durability
+  barrier syncs every such file and, once per directory, their directories
+  (with a single `F_FULLFSYNC` per device on macOS) before the next durable
+  commit point — a lockfile, `go.mod`/`go.sum`, `pom.xml`, `nuget.config`,
+  `package.json`, `pnpm-workspace.yaml`, the vendor ledger or the redirect
+  ledger — is written, so nothing durable ever names an artifact that could
+  still be lost. An artifact rebuilt in place that no commit point follows
+  (a drifted committed artifact healed with the lockfiles and ledger
+  unchanged) is synced by the same barrier at the end of the vendored run's
+  commit and when the command releases the apply lock, so no command
+  returns with an unsynced artifact the committed state names; a failed
+  barrier keeps its files pending for the next one. A crash can at worst
+  lose an artifact nothing durable names yet, which the next run rebuilds
+  (see `socket_patch_core::utils::durability` for the full argument). The
+  in-place `apply` of an installed tree keeps its per-file durable writes.
 
 - **Release publishing decomposed into per-registry workflows.** The
   crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live

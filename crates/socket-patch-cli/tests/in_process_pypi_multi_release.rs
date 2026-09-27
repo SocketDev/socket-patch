@@ -306,7 +306,7 @@ fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         // Download + apply but DON'T prune/GC: the post-sync GC sweeps
         // `beforeHash` blobs (only `afterHash` blobs are kept for apply),
         // which would force the later rollback/remove to re-fetch them

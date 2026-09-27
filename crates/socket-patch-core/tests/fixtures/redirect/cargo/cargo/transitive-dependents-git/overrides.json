@@ -1,0 +1,22 @@
+[
+  {
+    "ecosystem": "cargo",
+    "name": "serde",
+    "version": "1.0.190",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "55555555-5555-5555-5555-555555555555",
+    "artifactUrl": "https://patch.socket.dev/patch/cargo/serde/1.0.190/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/serde-1.0.190.crate",
+    "registryOverride": {
+      "kind": "cargo-sparse",
+      "indexUrl": "sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/index/",
+      "identifiers": {
+        "name": "serde",
+        "version": "1.0.190",
+        "cargoCksumSha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+      }
+    },
+    "integrity": {
+      "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    }
+  }
+]

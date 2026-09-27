@@ -54,6 +54,10 @@ enum Inverse {
     /// writers record an `original` that is a substring of `new` (the
     /// Cargo.toml insert variant, the maven version suffix).
     ReplaceFragment,
+    /// Like [`Inverse::ReplaceFragment`], but `new` legitimately occurs
+    /// several times and stands for every occurrence (a cargo v1 lock's
+    /// full-id dependency reference, named by several dependents).
+    ReplaceEveryFragment,
     PipenvEntry,
     HatchDocument,
     /// action `added` with only `new` recorded: the redirect inserted the
@@ -68,6 +72,11 @@ enum Inverse {
     /// go.sum lines the redirect added (`new`, `\n`-joined): each is removed
     /// as a whole line, whatever the file's line endings.
     RemoveAddedLines,
+    /// The appended cargo `[registries.…]` block (`redirect_cargo_registry`,
+    /// action `added`): removed together with exactly the one blank
+    /// separator the rewriter put before it — see
+    /// [`remove_appended_cargo_block`].
+    RemoveAppendedCargoBlock,
     /// Cleanup of PRIOR socket wiring performed during a redirect refresh
     /// (`redirect_golang_stale_*`). The removal already moved the file
     /// toward pristine; restoring it would re-create socket wiring, so
@@ -106,10 +115,11 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
         "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
             ("cargo", Inverse::ReplaceFragment)
         }
+        super::CARGO_LOCK_REFERENCE_KIND => ("cargo", Inverse::ReplaceEveryFragment),
         "redirect_cargo_registry" => (
             "cargo",
             if action == "added" {
-                Inverse::RemoveAddedFragment
+                Inverse::RemoveAppendedCargoBlock
             } else {
                 Inverse::ReplaceFragment
             },
@@ -250,7 +260,18 @@ fn safe_rel_path(path: &str) -> bool {
 /// fragment + newline) is byte-AMBIGUOUS to invert — `"m\n\n" + "F\n"`
 /// and `"m\n" + "\nF\n"` produce identical files — so the tidy form (the
 /// one `go mod tidy` itself emits) is chosen.
-fn remove_fragment_once(content: &str, fragment: &str) -> String {
+pub(super) fn remove_fragment_once(content: &str, fragment: &str) -> String {
+    // A CRLF file (its fragments recorded CRLF too) is inverted as LF and
+    // written back CRLF, so the separator bookkeeping below sees real line
+    // breaks instead of stranding a `\r` line.
+    let crlf = content.matches("\r\n").count();
+    if crlf > 0 && crlf == content.matches('\n').count() && content.contains(fragment) {
+        return remove_fragment_once(
+            &content.replace("\r\n", "\n"),
+            &fragment.replace("\r\n", "\n"),
+        )
+        .replace('\n', "\r\n");
+    }
     let Some(pos) = content.find(fragment) else {
         return content.to_string();
     };
@@ -289,6 +310,104 @@ fn remove_fragment_once(content: &str, fragment: &str) -> String {
     format!("{}{}", &content[..start], &content[end..])
 }
 
+/// Every line break in `text` is a CRLF (and there is at least one).
+fn is_all_crlf(text: &str) -> bool {
+    let crlf = text.matches("\r\n").count();
+    crlf > 0 && crlf == text.matches('\n').count()
+}
+
+/// One fragment-edit inverse, tolerant of a line-ending conversion between
+/// the scan and the revert (git `core.autocrlf` rewrites the committed
+/// files but never the JSON-escaped fragments in the ledger).
+#[derive(Debug, PartialEq)]
+pub(super) enum FragmentRevert {
+    /// `new` was found and put back to `original` (the file's own line
+    /// endings kept).
+    Reverted(String),
+    /// `new` is gone but `original` is present: already unwound.
+    AlreadyOriginal,
+    /// Neither fragment is present.
+    Drifted,
+}
+
+/// Replace `new` with `original` in `content` — once, or at `every`
+/// occurrence — matching regardless of CRLF/LF: an all-CRLF file is
+/// matched as LF and written back CRLF; any other file is matched with the
+/// recorded fragments, then with their LF forms. `new` is looked for
+/// before `original` (an `original` may be a substring of `new`).
+pub(super) fn revert_fragment_eol(
+    content: &str,
+    new: &str,
+    original: &str,
+    every: bool,
+) -> FragmentRevert {
+    if is_all_crlf(content) {
+        return match revert_fragment_eol(
+            &content.replace("\r\n", "\n"),
+            &new.replace("\r\n", "\n"),
+            &original.replace("\r\n", "\n"),
+            every,
+        ) {
+            FragmentRevert::Reverted(lf) => FragmentRevert::Reverted(lf.replace('\n', "\r\n")),
+            other => other,
+        };
+    }
+    let (lf_new, lf_original) = (new.replace("\r\n", "\n"), original.replace("\r\n", "\n"));
+    for (n, o) in [(new, original), (lf_new.as_str(), lf_original.as_str())] {
+        if content.contains(n) {
+            return FragmentRevert::Reverted(if every {
+                content.replace(n, o)
+            } else {
+                content.replacen(n, o, 1)
+            });
+        }
+    }
+    if content.contains(original) || content.contains(&lf_original) {
+        FragmentRevert::AlreadyOriginal
+    } else {
+        FragmentRevert::Drifted
+    }
+}
+
+/// Whether `content` holds `fragment`, ignoring CRLF/LF differences.
+pub(super) fn contains_eol(content: &str, fragment: &str) -> bool {
+    content.contains(fragment)
+        || content
+            .replace("\r\n", "\n")
+            .contains(&fragment.replace("\r\n", "\n"))
+}
+
+/// Invert the cargo rewriter's append of a `[registries.…]` block: it wrote
+/// `config + "\n" + block` (just `block` into an empty config) and records
+/// `block` — or `"\n" + block` when the config lacked a final newline (the
+/// extra newline it had to add first). Removing the recorded fragment plus
+/// the one newline before it therefore restores the config's exact bytes:
+/// a missing final newline or trailing blank lines included, and anything
+/// the user appended after the block kept. An all-CRLF file is inverted as
+/// LF and written back CRLF; a fragment recorded with the other line
+/// endings (a checkout converted them) still matches. `None` when the
+/// fragment is not in the file.
+pub(super) fn remove_appended_cargo_block(content: &str, fragment: &str) -> Option<String> {
+    if is_all_crlf(content) {
+        return remove_appended_cargo_block(
+            &content.replace("\r\n", "\n"),
+            &fragment.replace("\r\n", "\n"),
+        )
+        .map(|lf| lf.replace('\n', "\r\n"));
+    }
+    let lf_fragment = fragment.replace("\r\n", "\n");
+    let (pos, len) = match content.find(fragment) {
+        Some(pos) => (pos, fragment.len()),
+        None => (content.find(&lf_fragment)?, lf_fragment.len()),
+    };
+    let before = &content[..pos];
+    let before = before
+        .strip_suffix("\r\n")
+        .or_else(|| before.strip_suffix('\n'))
+        .unwrap_or(before);
+    Some(format!("{before}{}", &content[pos + len..]))
+}
+
 /// The string payloads of an edit, or `None` when a payload is missing or
 /// not a string (a shape the inverse table said must be there).
 fn str_payload(v: &Option<Value>) -> Option<&str> {
@@ -314,6 +433,19 @@ pub async fn revert_remaining_redirect_edits(
     for (idx, edit) in state.edits.iter().enumerate() {
         let (group, _) = classify(&edit.kind, &edit.action);
         groups.entry(group).or_default().push(idx);
+    }
+
+    // Where a cargo `[registries.…]` block can still be referenced from:
+    // the root manifest and lock, plus every manifest the ledger pinned.
+    let mut cargo_probes: Vec<String> = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+    for edit in state
+        .edits
+        .iter()
+        .filter(|e| e.kind == "redirect_cargo_toml_dep")
+    {
+        if !cargo_probes.contains(&edit.path) {
+            cargo_probes.push(edit.path.clone());
+        }
     }
 
     let mut drop_indices: BTreeSet<usize> = BTreeSet::new();
@@ -439,7 +571,9 @@ pub async fn revert_remaining_redirect_edits(
                         }
                     }
                 }
-                Inverse::ReplaceFragment | Inverse::HatchDocument => {
+                Inverse::ReplaceFragment
+                | Inverse::ReplaceEveryFragment
+                | Inverse::HatchDocument => {
                     let (Some(original), Some(new)) =
                         (str_payload(&edit.original), str_payload(&edit.new))
                     else {
@@ -505,6 +639,71 @@ pub async fn revert_remaining_redirect_edits(
                     };
                     // `new` before `original`: original may be a substring
                     // of new (Cargo.toml insert, maven version suffix).
+                    // cargo: matched regardless of a CRLF/LF conversion since
+                    // the scan (a checkout's `core.autocrlf` rewrites the
+                    // files, never the ledger's escaped fragments).
+                    if *group == "cargo" {
+                        let every = inverse == Inverse::ReplaceEveryFragment;
+                        let lf = |t: &str| t.replace("\r\n", "\n");
+                        // ONE scan legitimately records identical cargo
+                        // edits (a manifest declaring the crate with the
+                        // same line in two sections), and each one unwinds
+                        // one occurrence — what `revert_cargo_redirect_purl`
+                        // does over this same ledger. So the file may hold
+                        // as many occurrences as there are identical edits
+                        // left to spend on them; only a surplus is
+                        // ambiguous.
+                        let twins = indices
+                            .iter()
+                            .filter(|&&i| {
+                                let other = &state.edits[i];
+                                !group_drops.contains(&i)
+                                    && other.path == edit.path
+                                    && other.kind == edit.kind
+                                    && other.action == edit.action
+                                    && other.key == edit.key
+                                    && other.original == edit.original
+                                    && other.new == edit.new
+                            })
+                            .count()
+                            .max(1);
+                        if !every && lf(&content).matches(&lf(new)).count() > twins {
+                            refuse(
+                                format!(
+                                    "{}: the redirected fragment appears more than once — \
+                                     ambiguous, refusing to guess",
+                                    edit.path
+                                ),
+                                &mut outcome,
+                            );
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                        match revert_fragment_eol(&content, new, original, every) {
+                            FragmentRevert::Reverted(restored) => {
+                                staged.insert(edit.path.clone(), Some(restored));
+                                group_drops.insert(idx);
+                            }
+                            // Same substring guard as below.
+                            FragmentRevert::AlreadyOriginal if !lf(new).contains(&lf(original)) => {
+                                group_drops.insert(idx);
+                            }
+                            _ => {
+                                refuse(
+                                    format!(
+                                        "{}: content matches neither the redirected nor the \
+                                         original fragment for {} — the file drifted; re-run \
+                                         `scan --mode hosted` to normalize",
+                                        edit.path, edit.kind
+                                    ),
+                                    &mut outcome,
+                                );
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                        }
+                        continue;
+                    }
                     if content.contains(new) {
                         if content.matches(new).count() > 1 {
                             refuse(
@@ -568,6 +767,58 @@ pub async fn revert_remaining_redirect_edits(
                                 refused_groups.insert(group);
                                 continue 'group;
                             }
+                        }
+                    }
+                }
+                Inverse::RemoveAppendedCargoBlock => {
+                    let Some(new) = str_payload(&edit.new) else {
+                        refuse(
+                            format!("{} edit is missing its recorded fragment", edit.kind),
+                            &mut outcome,
+                        );
+                        refused_groups.insert(group);
+                        continue 'group;
+                    };
+                    // A block something still references (a hand-pinned dep)
+                    // stays: removing it would leave that pin naming an
+                    // undefined registry. The reverse walk has already
+                    // unwound this ledger's own references.
+                    let reg = edit.key.as_deref().unwrap_or_default();
+                    let index = new.split('"').nth(1).unwrap_or_default();
+                    let mut referenced = false;
+                    for probe in &cargo_probes {
+                        if let Ok(Some(text)) = staged_read(&staged, project_root, probe).await {
+                            if (!reg.is_empty() && text.contains(reg))
+                                || (!index.is_empty() && text.contains(index))
+                            {
+                                referenced = true;
+                                break;
+                            }
+                        }
+                    }
+                    if referenced {
+                        group_drops.insert(idx);
+                        continue;
+                    }
+                    match staged_read(&staged, project_root, &edit.path).await {
+                        Ok(Some(content)) => {
+                            // Absent fragment == already clean. A config the
+                            // rewrite created ends empty and goes with it.
+                            if let Some(restored) = remove_appended_cargo_block(&content, new) {
+                                staged.insert(
+                                    edit.path.clone(),
+                                    (!restored.is_empty()).then_some(restored),
+                                );
+                            }
+                            group_drops.insert(idx);
+                        }
+                        Ok(None) => {
+                            group_drops.insert(idx);
+                        }
+                        Err(e) => {
+                            refuse(e, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
                         }
                     }
                 }
@@ -1616,6 +1867,52 @@ mod tests {
         assert_eq!(out.refusals.len(), 1, "{out:?}");
         assert!(out.refusals[0].reason.contains("drifted"));
         assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+    }
+
+    /// ONE scan records one cargo edit per OCCURRENCE, so a manifest that
+    /// declares the crate with the same line in two sections leaves two
+    /// IDENTICAL edits in the ledger. The whole-ledger replay — the
+    /// records-empty path a degraded (record-fetch-failed) run leaves
+    /// behind — must spend one edit per occurrence, exactly as the per-purl
+    /// `revert_cargo_redirect_purl` does over the same ledger. An
+    /// occurrence no edit accounts for is still ambiguous and refuses.
+    #[tokio::test]
+    async fn identical_cargo_edits_each_unwind_one_occurrence() {
+        let plain = "cfg-if = \"1\"";
+        let pinned = "cfg-if = { version = \"1\", registry = \"socket-patch-u\" }";
+        let two = |line: &str| format!("[dependencies]\n{line}\n\n[dev-dependencies]\n{line}\n");
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "Cargo.toml", &two(pinned)).await;
+        let cargo_edit = || {
+            edit(
+                "Cargo.toml",
+                "redirect_cargo_toml_dep",
+                "rewritten",
+                Some(plain),
+                Some(pinned),
+            )
+        };
+        let mut state = state_with(vec![cargo_edit(), cargo_edit()], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(read(dir.path(), "Cargo.toml").await, two(plain));
+        assert!(state.edits.is_empty(), "{:?}", state.edits);
+
+        // A THIRD occurrence with only two edits to spend: nothing says
+        // which one the ledger owns, so the group refuses byte-untouched.
+        let dir = TempDir::new().unwrap();
+        let surplus = format!("{}\n[build-dependencies]\n{pinned}\n", two(pinned));
+        write(dir.path(), "Cargo.toml", &surplus).await;
+        let mut state = state_with(vec![cargo_edit(), cargo_edit()], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(
+            out.refusals[0].reason.contains("more than once"),
+            "{:?}",
+            out.refusals[0]
+        );
+        assert_eq!(read(dir.path(), "Cargo.toml").await, surplus);
+        assert_eq!(state.edits.len(), 2);
     }
 
     #[tokio::test]
@@ -2837,6 +3134,57 @@ mod tests {
     }
 
     // ---------- remove_fragment_once unit pins ----------
+
+    #[test]
+    fn remove_fragment_once_keeps_crlf_separators_straight() {
+        assert_eq!(
+            remove_fragment_once("[net]\r\nretry = 2\r\n\r\nF\r\nG\r\n", "F\r\nG\r\n"),
+            "[net]\r\nretry = 2\r\n"
+        );
+        assert_eq!(
+            remove_fragment_once("a\r\n\r\nF\r\n\r\nb\r\n", "F\r\n"),
+            "a\r\n\r\nb\r\n"
+        );
+    }
+
+    #[test]
+    fn remove_appended_cargo_block_inverts_exactly_what_was_appended() {
+        let block = "[registries.r]\nindex = \"i\"\n";
+        for (written, fragment, want) in [
+            // Empty config: the block alone (a created file ends empty).
+            (block.to_string(), block.to_string(), ""),
+            // One separator after a config ending in newline(s).
+            (format!("a\n\n{block}"), block.to_string(), "a\n"),
+            (format!("a\n\n\n{block}"), block.to_string(), "a\n\n"),
+            // No final newline: the added newline rides in the fragment.
+            (format!("a\n\n{block}"), format!("\n{block}"), "a"),
+            // The user appended after the block: kept.
+            (
+                format!("a\n\n{block}b = 1\n"),
+                block.to_string(),
+                "a\nb = 1\n",
+            ),
+            // CRLF file, and a CRLF-recorded fragment against an LF file.
+            (
+                format!("a\r\n\r\n{}", block.replace('\n', "\r\n")),
+                block.replace('\n', "\r\n"),
+                "a\r\n",
+            ),
+            (format!("a\n\n{block}"), block.replace('\n', "\r\n"), "a\n"),
+            (
+                format!("a\r\n\r\n{}", block.replace('\n', "\r\n")),
+                block.to_string(),
+                "a\r\n",
+            ),
+        ] {
+            assert_eq!(
+                remove_appended_cargo_block(&written, &fragment).as_deref(),
+                Some(want),
+                "{written:?}"
+            );
+        }
+        assert_eq!(remove_appended_cargo_block("a\n", block), None);
+    }
 
     #[test]
     fn remove_fragment_once_absent_fragment_is_identity() {

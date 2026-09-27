@@ -1,11 +1,15 @@
-//! Read / write `<project_root>/.cargo/config.toml` for the cargo vendor
-//! backend's `[patch.crates-io]` wiring.
+//! The project cargo config (`.cargo/config.toml`, or the legacy
+//! extensionless `.cargo/config` cargo prefers): the shared `[patch.*]` /
+//! `[registries.*]` readers, and the LEGACY vendored wiring.
 //!
-//! Mirrors the contract style of [`crate::setup::pypi::edit`]: pure
-//! `fn(&str) -> Result<Option<String>, String>` transforms (`Some(new)` =
-//! changed, `None` = already in the desired state) wrapped by async
-//! read-or-create / write helpers that honour `dry_run` and preserve the
-//! user's existing formatting + comments via `toml_edit`.
+//! Before v5 the cargo vendor backend wrote its `[patch.crates-io]` path
+//! entry here; v5 writes it to the workspace-root `Cargo.toml` instead
+//! ([`super::cargo_manifest`]). This module still reads the legacy entries
+//! (liveness probes, takeover guards, lockfile discovery) and removes them
+//! on migration and revert ([`drop_legacy_patch_entries`]) — it never writes
+//! a new one. Transforms are pure `fn(&str) -> Result<Option<String>,
+//! String>` (`Some(new)` = changed) wrapped by an async edit helper that
+//! honours `dry_run` and preserves the user's formatting via `toml_edit`.
 //!
 //! ## Ownership model (no sidecar manifest)
 //! A `[patch.crates-io]` entry is *socket-owned* iff its `path` value is a
@@ -25,11 +29,28 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::fs;
-use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike};
 
+use super::parse_memo::ParseMemo;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+
+/// The run's cargo-config parse. A wet vendor run probes the `[patch]`
+/// entries and then edits them once per patched crate, against a file that
+/// grows by an entry per crate; see [`ParseMemo`]. One slot per config
+/// spelling: [`socket_registry_indexes`] reads BOTH in one pass, so a
+/// single slot would make the two evict each other on every call in the
+/// mixed/legacy state that loop exists for.
+static CONFIG_MEMO: ParseMemo<DocumentMut, 2> = ParseMemo::new();
+
+/// Parse a cargo config, reusing the run's parse while `content` is the
+/// text that produced it. Read-only callers take the shared document; the
+/// two transforms below clone it before mutating.
+fn config_doc(content: &str) -> Result<Arc<DocumentMut>, toml_edit::TomlError> {
+    CONFIG_MEMO.parse(content.as_bytes(), || content.parse::<DocumentMut>())
+}
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
@@ -56,13 +77,10 @@ pub struct PatchEntryInfo {
 
 // ── public async API ─────────────────────────────────────────────────────────
 
-/// Upsert `[patch.crates-io].<name> = { path = "<rel_path>" }`, where
-/// `rel_path` is the project-relative copy path
-/// (`.socket/vendor/cargo/<uuid>/<name>-<version>`). Idempotent. A
-/// socket-owned same-name entry is refreshed in place. Returns whether the
-/// file changed. Errors (without writing) if a same-name entry exists but is
-/// user-authored.
-pub async fn ensure_patch_entry(
+/// Upsert `[patch.crates-io].<name> = { path = "<rel_path>" }` — the pre-v5
+/// vendored wiring, kept only to seed legacy projects in migration tests.
+#[cfg(test)]
+pub(crate) async fn ensure_patch_entry(
     project_root: &Path,
     name: &str,
     rel_path: &str,
@@ -74,15 +92,134 @@ pub async fn ensure_patch_entry(
     .await
 }
 
-/// Remove a *socket-owned* `[patch.crates-io].<name>` entry, cleaning up empty
-/// `[patch.crates-io]` / `[patch]` tables. A user-authored or absent entry is a
-/// no-op. Returns whether the file changed.
-pub async fn drop_patch_entry(
+/// Remove every *socket-owned* legacy `[patch.crates-io]` entry wiring
+/// `name@version` (key-agnostic: effective crate name + a
+/// `.socket/vendor/cargo/<uuid>/<name>-<version>` path) from the config
+/// cargo reads, cleaning up emptied `[patch.crates-io]` / `[patch]` tables
+/// and deleting a config file (and `.cargo/`) the removal emptied. A
+/// user-authored or absent entry is a no-op. Returns whether the file
+/// changed.
+pub async fn drop_legacy_patch_entries(
     project_root: &Path,
     name: &str,
+    version: &str,
     dry_run: bool,
 ) -> Result<bool, String> {
-    edit_config(project_root, dry_run, |c| remove_patch_entry(c, name)).await
+    edit_config(project_root, dry_run, |c| {
+        remove_patch_entries(c, name, version)
+    })
+    .await
+}
+
+/// The legacy config's socket-owned `[patch.crates-io]` entries for crate
+/// `name` (any version), as `(key, path)`, from the config cargo reads.
+/// Read-only; a missing or malformed config yields none.
+pub async fn legacy_socket_entries(project_root: &Path, name: &str) -> Vec<(String, String)> {
+    let path = config_path(project_root).await;
+    let Ok(content) = read_regular_to_string(&path).await else {
+        return Vec::new();
+    };
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return Vec::new();
+    };
+    patch_entries(&doc)
+        .into_iter()
+        .filter(|e| e.source == "crates-io" && e.name == name)
+        .filter_map(|e| {
+            let p = e.path.filter(|p| path_is_socket_owned(p))?;
+            Some((e.key.to_string(), p.to_string()))
+        })
+        .collect()
+}
+
+/// One config file of the chain cargo merges `[patch]` tables from.
+#[derive(Debug, Clone)]
+pub struct ChainConfig {
+    /// For messages: root-relative for the project config, else absolute.
+    pub file: String,
+    /// The directory relative `[patch]` paths in this file resolve against
+    /// (the parent of the directory holding the file).
+    pub base: PathBuf,
+    /// The project's own config — the only file whose Socket-shaped paths
+    /// are this project's copies (legacy wiring). Every entry of any other
+    /// file is reported as user-authored.
+    pub project: bool,
+    /// Its crates.io `[patch]` items (`crates-io` and URL spellings).
+    pub entries: Vec<super::cargo_manifest::ManifestPatchEntry>,
+}
+
+/// Every cargo config file whose `[patch]` items cargo merges over the root
+/// manifest's when building this project: the project's own `.cargo/config*`,
+/// every ancestor directory's, and `$CARGO_HOME`'s (default `~/.cargo`), in
+/// that order (cargo lets a config item replace the manifest item with the
+/// same key, whatever its version). Read-only and fail-soft: missing /
+/// unreadable / malformed files contribute nothing.
+pub async fn read_config_chain(project_root: &Path) -> Vec<ChainConfig> {
+    let cargo_home = match std::env::var("CARGO_HOME") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => crate::utils::fs::home_dir().join(".cargo"),
+    };
+    read_config_chain_with(project_root, &cargo_home).await
+}
+
+/// [`read_config_chain`] with an explicit `$CARGO_HOME`.
+pub async fn read_config_chain_with(project_root: &Path, cargo_home: &Path) -> Vec<ChainConfig> {
+    let root = fs::canonicalize(project_root)
+        .await
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let mut dirs: Vec<(PathBuf, PathBuf, bool)> = root
+        .ancestors()
+        .map(|dir| (dir.join(".cargo"), dir.to_path_buf(), dir == root))
+        .collect();
+    let home_base = cargo_home
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cargo_home.to_path_buf());
+    dirs.push((cargo_home.to_path_buf(), home_base, false));
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out = Vec::new();
+    for (cargo_dir, base, project) in dirs {
+        let legacy = cargo_dir.join("config");
+        let file = if fs::metadata(&legacy).await.is_ok() {
+            legacy
+        } else {
+            cargo_dir.join("config.toml")
+        };
+        let key = fs::canonicalize(&file)
+            .await
+            .unwrap_or_else(|_| file.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let Ok(content) = read_regular_to_string(&file).await else {
+            continue;
+        };
+        let Ok(doc) = content.parse::<DocumentMut>() else {
+            continue;
+        };
+        let mut entries = super::cargo_manifest::crates_io_patch_entries(&doc);
+        if !project {
+            for entry in &mut entries {
+                entry.socket_owned = false;
+            }
+        }
+        if entries.is_empty() {
+            continue;
+        }
+        let file = if project {
+            effective_config_rel(project_root).await.to_string()
+        } else {
+            file.display().to_string()
+        };
+        out.push(ChainConfig {
+            file,
+            base,
+            project,
+            entries,
+        });
+    }
+    out
 }
 
 /// Read all `[patch.crates-io]` entries. Read-only; a missing or malformed
@@ -108,7 +245,7 @@ pub async fn socket_registry_indexes(project_root: &Path) -> Vec<(String, String
         let Ok(content) = read_regular_to_string(&project_root.join(file)).await else {
             continue;
         };
-        let Ok(doc) = content.parse::<DocumentMut>() else {
+        let Ok(doc) = config_doc(&content) else {
             continue;
         };
         out.extend(registry_definitions(&doc));
@@ -235,16 +372,19 @@ async fn edit_config(
                     // behind. A file with surviving user content never trims
                     // to empty, so this only fires for a config that was
                     // entirely socket's.
-                    match fs::remove_file(&path).await {
+                    match crate::utils::fs::remove_file(&path).await {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(format!("remove {}: {e}", path.display())),
                     }
+                    CONFIG_MEMO.invalidate();
                     if let Some(parent) = path.parent() {
                         // Best-effort: `remove_dir` only succeeds when the dir
                         // is empty, so a `.cargo/` holding other files (e.g.
-                        // credentials) is left intact.
-                        let _ = fs::remove_dir(parent).await;
+                        // credentials) is left intact. Inside a vendored
+                        // run's group commit the file's removal is captured,
+                        // so the directory goes once the commit is on disk.
+                        crate::utils::group_commit::remove_dir_after_commit(parent).await;
                     }
                 } else {
                     if let Some(parent) = path.parent() {
@@ -263,6 +403,7 @@ async fn edit_config(
                     atomic_write_bytes_preserving_mode(&path, new.as_bytes())
                         .await
                         .map_err(|e| format!("write {}: {e}", path.display()))?;
+                    CONFIG_MEMO.invalidate();
                 }
             }
             Ok(true)
@@ -282,7 +423,7 @@ async fn edit_config(
 /// checkout's `.socket/vendor/cargo/` (`../shared/.socket/vendor/cargo/…`,
 /// `/abs/.socket/vendor/cargo/…`, `sub/.socket/vendor/cargo/…`) is
 /// user-authored and must never be rewritten or removed.
-fn path_is_socket_owned(path: &str) -> bool {
+pub(crate) fn path_is_socket_owned(path: &str) -> bool {
     let norm = path.replace('\\', "/");
     if norm.starts_with('/') {
         return false; // absolute (also covers //unc-style prefixes)
@@ -302,6 +443,7 @@ fn path_is_socket_owned(path: &str) -> bool {
 }
 
 /// The `path` string of a `[patch]` entry (inline table or sub-table), if any.
+#[cfg(test)]
 fn entry_path(item: &Item) -> Option<&str> {
     item.as_table_like()
         .and_then(|t| t.get("path"))
@@ -314,7 +456,7 @@ fn entry_path(item: &Item) -> Option<&str> {
 /// cargo honors identically to `[patch.crates-io]` (a hand edit or another
 /// tool re-serializing this user-owned file produces it), and refusing it
 /// would strand the socket-owned entries inside. Errors on a non-table item.
-fn ensure_table_like<'a>(
+pub(crate) fn ensure_table_like<'a>(
     parent: &'a mut dyn TableLike,
     key: &str,
     implicit: bool,
@@ -332,10 +474,11 @@ fn ensure_table_like<'a>(
         .ok_or_else(|| format!("`{key}` is not a table"))
 }
 
+#[cfg(test)]
 fn upsert_patch_entry(content: &str, name: &str, rel_path: &str) -> Result<Option<String>, String> {
-    let mut doc = content
-        .parse::<DocumentMut>()
-        .map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?;
+    use toml_edit::{InlineTable, Value};
+    let mut doc =
+        (*config_doc(content).map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?).clone();
 
     let root = doc.as_table_mut();
     // `[patch]` is a parent table that only ever holds `[patch.crates-io]`, so
@@ -361,31 +504,40 @@ fn upsert_patch_entry(content: &str, name: &str, rel_path: &str) -> Result<Optio
     Ok(Some(doc.to_string()))
 }
 
-fn remove_patch_entry(content: &str, name: &str) -> Result<Option<String>, String> {
-    let mut doc = content
-        .parse::<DocumentMut>()
-        .map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?;
-
-    let mut removed = false;
-    // Table-like views (as in `entry_path`): the inline `crates-io = { … }`
-    // form is honored by cargo, and a remove blind to it would leave the
-    // entry dangling after the vendor copy it points at is deleted.
+fn remove_patch_entries(
+    content: &str,
+    name: &str,
+    version: &str,
+) -> Result<Option<String>, String> {
+    let mut doc =
+        (*config_doc(content).map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?).clone();
+    let keys: Vec<String> = patch_entries(&doc)
+        .into_iter()
+        .filter(|e| {
+            e.source == "crates-io"
+                && e.name == name
+                && e.path
+                    .is_some_and(|p| super::cargo_manifest::is_socket_copy_of(p, name, version))
+        })
+        .map(|e| e.key.to_string())
+        .collect();
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    // Table-like views: the inline `crates-io = { … }` form is honored by
+    // cargo, and a remove blind to it would leave the entry dangling after
+    // the vendor copy it points at is deleted.
     if let Some(patch) = doc.get_mut("patch").and_then(Item::as_table_like_mut) {
         let mut crates_io_empty = false;
         if let Some(crates_io) = patch.get_mut("crates-io").and_then(Item::as_table_like_mut) {
-            if matches!(crates_io.get(name).and_then(entry_path), Some(p) if path_is_socket_owned(p))
-            {
-                crates_io.remove(name);
-                removed = true;
-                crates_io_empty = crates_io.is_empty();
+            for key in &keys {
+                crates_io.remove(key);
             }
+            crates_io_empty = crates_io.is_empty();
         }
         if crates_io_empty {
             patch.remove("crates-io");
         }
-    }
-    if !removed {
-        return Ok(None);
     }
     if doc
         .get("patch")
@@ -400,7 +552,7 @@ fn remove_patch_entry(content: &str, name: &str) -> Result<Option<String>, Strin
 
 /// Every `[patch.crates-io]` item keyed by its table key ([`patch_entries`]).
 fn parse_patch_entries(content: &str) -> HashMap<String, PatchEntryInfo> {
-    let Ok(doc) = content.parse::<DocumentMut>() else {
+    let Ok(doc) = config_doc(content) else {
         return HashMap::new();
     };
     patch_entries(&doc)
@@ -478,7 +630,7 @@ mod tests {
     #[test]
     fn test_remove_foreign_socket_path_entry_is_noop() {
         let toml = "[patch.crates-io]\ncfg-if = { path = \"../other-checkout/.socket/vendor/cargo/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/cfg-if-1.0.4\" }\n";
-        let out = remove_patch_entry(toml, "cfg-if").unwrap();
+        let out = remove_patch_entries(toml, "cfg-if", "1.0.4").unwrap();
         assert!(
             out.is_none(),
             "user entry must be a no-op, but it was removed: {out:?}"
@@ -609,7 +761,9 @@ mod tests {
             "[patch.crates-io]\ncfg-if = {{ path = \"{}\" }}\n",
             vendor_path("cfg-if", "1.0.4")
         );
-        let out = remove_patch_entry(&toml, "cfg-if").unwrap().unwrap();
+        let out = remove_patch_entries(&toml, "cfg-if", "1.0.4")
+            .unwrap()
+            .unwrap();
         assert!(!out.contains("cfg-if"));
         // Empty [patch.crates-io] and [patch] are pruned.
         assert!(!out.contains("[patch"));
@@ -620,7 +774,9 @@ mod tests {
         let toml =
             "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n";
         assert!(
-            remove_patch_entry(toml, "cfg-if").unwrap().is_none(),
+            remove_patch_entries(toml, "cfg-if", "1.0.4")
+                .unwrap()
+                .is_none(),
             "a user-authored entry is never removed"
         );
     }
@@ -631,7 +787,9 @@ mod tests {
             "[patch.crates-io]\ncfg-if = {{ path = \"{}\" }}\nother = {{ git = \"https://example.com/o.git\" }}\n",
             vendor_path("cfg-if", "1.0.4")
         );
-        let out = remove_patch_entry(&toml, "cfg-if").unwrap().unwrap();
+        let out = remove_patch_entries(&toml, "cfg-if", "1.0.4")
+            .unwrap()
+            .unwrap();
         let doc = parse(&out);
         assert!(doc["patch"]["crates-io"].get("cfg-if").is_none());
         assert!(doc["patch"]["crates-io"].get("other").is_some());
@@ -640,9 +798,13 @@ mod tests {
     #[test]
     fn test_remove_user_authored_same_name_is_noop() {
         let toml = "[patch.crates-io]\ncfg-if = { git = \"https://example.com/c.git\" }\n";
-        assert!(remove_patch_entry(toml, "cfg-if").unwrap().is_none());
+        assert!(remove_patch_entries(toml, "cfg-if", "1.0.4")
+            .unwrap()
+            .is_none());
         let toml = "[patch.crates-io]\ncfg-if = { path = \"../my-fork\" }\n";
-        assert!(remove_patch_entry(toml, "cfg-if").unwrap().is_none());
+        assert!(remove_patch_entries(toml, "cfg-if", "1.0.4")
+            .unwrap()
+            .is_none());
     }
 
     /// COVERAGE 2026-09: removal twin of the inline-form blindness. A
@@ -656,7 +818,7 @@ mod tests {
             "[patch]\ncrates-io = {{ cfg-if = {{ path = \"{}\" }} }}\n",
             vendor_path("cfg-if", "1.0.4")
         );
-        let out = remove_patch_entry(&toml, "cfg-if")
+        let out = remove_patch_entries(&toml, "cfg-if", "1.0.4")
             .unwrap()
             .expect("socket-owned inline-form entry must be removed, not no-op'd");
         assert!(!out.contains("cfg-if"));
@@ -667,7 +829,7 @@ mod tests {
             "patch = {{ crates-io = {{ cfg-if = {{ path = \"{}\" }} }} }}\n",
             vendor_path("cfg-if", "1.0.4")
         );
-        let out = remove_patch_entry(&toml, "cfg-if")
+        let out = remove_patch_entries(&toml, "cfg-if", "1.0.4")
             .unwrap()
             .expect("fully-inline patch form entry must be removed");
         assert!(!out.contains("cfg-if"));
@@ -682,7 +844,9 @@ mod tests {
             "[patch]\ncrates-io = {{ cfg-if = {{ path = \"{}\" }}, other = {{ git = \"https://example.com/o.git\" }} }}\n",
             vendor_path("cfg-if", "1.0.4")
         );
-        let out = remove_patch_entry(&toml, "cfg-if").unwrap().unwrap();
+        let out = remove_patch_entries(&toml, "cfg-if", "1.0.4")
+            .unwrap()
+            .unwrap();
         let doc = parse(&out);
         assert!(doc["patch"]["crates-io"].get("cfg-if").is_none());
         assert!(doc["patch"]["crates-io"].get("other").is_some());
@@ -693,14 +857,39 @@ mod tests {
     #[test]
     fn test_remove_inline_form_user_entry_is_noop() {
         let toml = "[patch]\ncrates-io = { cfg-if = { path = \"../my-fork\" } }\n";
-        assert!(remove_patch_entry(toml, "cfg-if").unwrap().is_none());
+        assert!(remove_patch_entries(toml, "cfg-if", "1.0.4")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Legacy removal is KEY-AGNOSTIC and VERSION-SCOPED: a renamed
+    /// socket-owned entry for the crate@version goes; another version's
+    /// socket-owned entry stays.
+    #[test]
+    fn test_remove_is_key_agnostic_and_version_scoped() {
+        let toml = format!(
+            "[patch.crates-io]\nalias = {{ package = \"cfg-if\", path = \"{}\" }}\ncfg-if = {{ path = \"{}\" }}\n",
+            vendor_path("cfg-if", "1.0.4"),
+            vendor_path("cfg-if", "0.1.10")
+        );
+        let out = remove_patch_entries(&toml, "cfg-if", "1.0.4")
+            .unwrap()
+            .unwrap();
+        let doc = parse(&out);
+        assert!(doc["patch"]["crates-io"].get("alias").is_none());
+        assert!(doc["patch"]["crates-io"].get("cfg-if").is_some());
+        assert!(remove_patch_entries(&out, "cfg-if", "1.0.4")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn test_remove_absent_is_noop() {
-        assert!(remove_patch_entry("[build]\njobs = 2\n", "cfg-if")
-            .unwrap()
-            .is_none());
+        assert!(
+            remove_patch_entries("[build]\njobs = 2\n", "cfg-if", "1.0.4")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// COVERAGE 2026-09: `[patch]` exists but `crates-io` is absent or not a
@@ -716,13 +905,17 @@ mod tests {
             vendor_path("foo", "1.0.0")
         );
         assert!(
-            remove_patch_entry(&toml, "foo").unwrap().is_none(),
+            remove_patch_entries(&toml, "foo", "1.0.0")
+                .unwrap()
+                .is_none(),
             "entries under a foreign registry's patch table are not managed"
         );
         // `crates-io` present but not table-like.
         let toml = "[patch]\ncrates-io = \"oops\"\n";
         assert!(
-            remove_patch_entry(toml, "cfg-if").unwrap().is_none(),
+            remove_patch_entries(toml, "cfg-if", "1.0.4")
+                .unwrap()
+                .is_none(),
             "a non-table crates-io value must be left untouched"
         );
     }
@@ -831,7 +1024,11 @@ mod tests {
             .await
             .unwrap());
         // Drop it.
-        assert!(drop_patch_entry(dir.path(), "cfg-if", false).await.unwrap());
+        assert!(
+            drop_legacy_patch_entries(dir.path(), "cfg-if", "1.0.4", false)
+                .await
+                .unwrap()
+        );
         assert!(read_patch_entries(dir.path()).await.is_empty());
     }
 
@@ -1083,7 +1280,11 @@ mod tests {
         );
         assert!(dir.path().join(".cargo/config.toml").exists());
         // Revert empties it → both the file and the now-empty `.cargo/` go.
-        assert!(drop_patch_entry(dir.path(), "cfg-if", false).await.unwrap());
+        assert!(
+            drop_legacy_patch_entries(dir.path(), "cfg-if", "1.0.4", false)
+                .await
+                .unwrap()
+        );
         assert!(
             !dir.path().join(".cargo/config.toml").exists(),
             "an emptied socket-created config must be deleted, not left empty"
@@ -1108,7 +1309,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(drop_patch_entry(dir.path(), "cfg-if", false).await.unwrap());
+        assert!(
+            drop_legacy_patch_entries(dir.path(), "cfg-if", "1.0.4", false)
+                .await
+                .unwrap()
+        );
         // The file survives (user content remains); only our entry is gone.
         let body = fs::read_to_string(cargo_dir.join("config.toml"))
             .await
@@ -1135,7 +1340,11 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(drop_patch_entry(dir.path(), "cfg-if", false).await.unwrap());
+        assert!(
+            drop_legacy_patch_entries(dir.path(), "cfg-if", "1.0.4", false)
+                .await
+                .unwrap()
+        );
         assert!(
             !cargo_dir.join("config.toml").exists(),
             "emptied config is deleted"
@@ -1148,7 +1357,7 @@ mod tests {
 
     /// COVERAGE 2026-09: a real `remove_file` failure in the delete branch
     /// must propagate as `Err("remove {path}: …")` — a swallowed unlink error
-    /// would make `drop_patch_entry` report a successful revert while the
+    /// would make `drop_legacy_patch_entries` report a successful revert while the
     /// stale `[patch]` wiring still sits on disk.
     #[cfg(unix)]
     #[tokio::test]
@@ -1169,7 +1378,7 @@ mod tests {
         fs::set_permissions(&cargo_dir, std::fs::Permissions::from_mode(0o555))
             .await
             .unwrap();
-        let res = drop_patch_entry(dir.path(), "cfg-if", false).await;
+        let res = drop_legacy_patch_entries(dir.path(), "cfg-if", "1.0.4", false).await;
         // Restore before asserting so the tempdir always cleans up.
         fs::set_permissions(&cargo_dir, std::fs::Permissions::from_mode(0o755))
             .await

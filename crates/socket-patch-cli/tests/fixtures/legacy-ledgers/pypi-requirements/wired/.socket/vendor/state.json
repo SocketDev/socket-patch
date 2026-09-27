@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "entries": {
+    "pkg:pypi/alpha@1.0.0": {
+      "ecosystem": "pypi",
+      "basePurl": "pkg:pypi/alpha@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000001",
+      "artifact": {
+        "path": ".socket/vendor/pypi/11111111-1111-4111-8111-000000000001/alpha-1.0.0-py3-none-any.whl",
+        "sha256": "9064609f1885c0bffb2e651f3339a6833010a9d388d2dadb5ddc2a629129574d",
+        "size": 837
+      },
+      "wiring": [
+        {
+          "file": "requirements.txt",
+          "kind": "requirements_line",
+          "action": "rewritten",
+          "key": "requirements.txt:1",
+          "original": [
+            "alpha==1.0.0"
+          ],
+          "new": "./.socket/vendor/pypi/11111111-1111-4111-8111-000000000001/alpha-1.0.0-py3-none-any.whl --hash=sha256:9064609f1885c0bffb2e651f3339a6833010a9d388d2dadb5ddc2a629129574d  # socket-patch vendor: alpha==1.0.0"
+        }
+      ],
+      "flavor": "requirements",
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000001",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "alpha.py": {
+            "beforeHash": "490ce2042e030d4655a2fddaf5f85d98215f64866fe924652851388b80b32d66",
+            "afterHash": "3171463aa7c6f59eb47b7ef9c888b14739f6da2be164d5b6ebfdb6b5bdb6fb21"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    },
+    "pkg:pypi/beta@1.0.0": {
+      "ecosystem": "pypi",
+      "basePurl": "pkg:pypi/beta@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000002",
+      "artifact": {
+        "path": ".socket/vendor/pypi/11111111-1111-4111-8111-000000000002/beta-1.0.0-py3-none-any.whl",
+        "sha256": "5f2338b259764f7a63e5a9234c9b18d7ccd556bd76f6b31da48c4e2018c0e17e",
+        "size": 824
+      },
+      "wiring": [
+        {
+          "file": "requirements.txt",
+          "kind": "requirements_line",
+          "action": "rewritten",
+          "key": "requirements.txt:2",
+          "original": [
+            "beta==1.0.0"
+          ],
+          "new": "./.socket/vendor/pypi/11111111-1111-4111-8111-000000000002/beta-1.0.0-py3-none-any.whl --hash=sha256:5f2338b259764f7a63e5a9234c9b18d7ccd556bd76f6b31da48c4e2018c0e17e  # socket-patch vendor: beta==1.0.0"
+        }
+      ],
+      "flavor": "requirements",
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000002",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "beta.py": {
+            "beforeHash": "4dcafa0c7d504862a459d3a13ae317f906e0e083275ed64890c3fcdc40a88ed1",
+            "afterHash": "9b25de3f9bfcccfa6d08a5f0983bdcb83b2f3911513a4e6d9d0f6e718f46464b"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    }
+  }
+}

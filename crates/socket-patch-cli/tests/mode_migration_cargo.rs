@@ -1,5 +1,9 @@
 //! Real-cargo mode-migration e2e: vendored ⇄ hosted takeovers must leave the
-//! project FULLY in the new mode — or refuse.
+//! project FULLY in the new mode — or refuse. The vendored wiring is the
+//! root `Cargo.toml`'s `[patch.crates-io]` (v5); the hosted wiring is the
+//! `registry = "socket-patch-<uuid>"` pin in the same manifest plus the
+//! `.cargo/config.toml` registry block — so both directions edit Cargo.toml
+//! and each must leave none of the other mode's lines behind.
 //!
 //! Adapted from the audit probes that empirically proved findings C1–C7 (the
 //! cargo mode-takeover bug class): both directions used to exit 0 while
@@ -506,6 +510,21 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str) -> (PathBuf, PathBuf) {
     (fresh, home)
 }
 
+/// `version` tagged for `uuid` (the vendored copy's version).
+fn tagged(version: &str, uuid: &str) -> String {
+    socket_patch_core::vendor::cargo_tag::tag_version(version, uuid)
+}
+
+/// The dep's `Cargo.lock` entry has exactly version `want`.
+fn assert_lock_version(proj: &Path, want: &str, tag: &str) {
+    let lock = read(proj, "Cargo.lock");
+    assert_eq!(
+        locked_version(&lock, DEP).as_deref(),
+        Some(want),
+        "{tag}: the {DEP} lock entry version:\n{lock}"
+    );
+}
+
 fn read(proj: &Path, rel: &str) -> String {
     std::fs::read_to_string(proj.join(rel)).unwrap_or_default()
 }
@@ -583,14 +602,17 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     // The project is FULLY hosted: no leftover [patch.crates-io], no vendored
     // ledger claim, no committed vendor tree; the hosted wiring is present.
     let config = read(&proj, ".cargo/config.toml");
+    let toml = read(&proj, "Cargo.toml");
     assert!(
-        !config.contains("[patch.crates-io]"),
-        "leftover [patch.crates-io] breaks every --locked build (C1): {config}"
+        !config.contains("[patch.crates-io]") && !toml.contains("[patch.crates-io]"),
+        "leftover [patch.crates-io] breaks every --locked build (C1): {toml}\n{config}"
     );
     assert!(
         config.contains(&format!("[registries.socket-patch-{UUID_H}]")),
         "{config}"
     );
+    // The hosted lock entry is the registry version, the vendored tag gone.
+    assert_lock_version(&proj, &version, "vendored -> hosted");
     assert!(
         !vendor_ledger_claims(&proj, &purl),
         "the displaced vendored ledger entry must be dropped: {}",
@@ -673,6 +695,96 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     );
 }
 
+// ── no-lock vendor → first build → hosted takeover ─────────────────────────
+// Vendored before any Cargo.lock existed, the ledger records no lock
+// originals; the first build then locks the TAGGED copy. The takeover's
+// revert must drop that tag (back to the untagged sourceless entry), so the
+// redirect finds the crate by its version and the project ends fully hosted
+// and `--locked`-buildable — not a lock naming a tagged version nothing
+// provides.
+#[tokio::test(flavor = "multi_thread")]
+async fn lockless_vendor_then_first_build_then_hosted_takeover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, &orig, &patched);
+    std::fs::remove_file(proj.join("Cargo.lock")).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
+    assert!(stdout.contains("no_lockfile"), "{stdout}");
+    assert_build_ok(
+        "first build (locks the tagged copy)",
+        &cargo(&proj, &["build", "--offline"], &cargo_home),
+    );
+    assert_lock_version(&proj, &tagged(&version, UUID_V), "first build");
+
+    let server = MockServer::start().await;
+    let crate_bytes =
+        build_patched_crate(&tmp.path().join("stage"), &crate_dir, &version, &patched);
+    mount_hosted_mocks(&server, &purl, &version, &crate_bytes, &orig, &patched).await;
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &cargo_home,
+    );
+    assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    assert!(
+        stdout.contains("redirect_takeover_reverted_vendored"),
+        "takeover warning missing: {stdout}"
+    );
+    assert!(
+        !stdout.contains("redirect_cargo_lock_pkg_not_found"),
+        "the reverted lock names the crate by its version: {stdout}"
+    );
+    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_lock_version(&proj, &version, "lockless vendor -> hosted");
+    let lock_block = package_block(&read(&proj, "Cargo.lock"), DEP).unwrap_or_default();
+    assert!(
+        lock_block.contains("sparse+"),
+        "lock points hosted: {lock_block}"
+    );
+
+    let (fresh, home) = fresh_checkout(&proj, tmp.path(), "lockless");
+    assert_build_ok(
+        "cargo fetch --locked",
+        &cargo(&fresh, &["fetch", "--locked"], &home),
+    );
+    assert_build_ok(
+        "cargo build --locked",
+        &cargo(&fresh, &["build", "--locked"], &home),
+    );
+}
+
 // ── C2 / C7: hosted → vendored takeover via the plain `vendor` command ──────
 // The primary migration entry point must revert the hosted edits first (from
 // the redirect ledger), surface the takeover, leave the project PURELY
@@ -751,8 +863,13 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         "the hosted registry pin must be reverted (C2 — [patch.crates-io] \
          cannot apply over it and the project is unbuildable): {toml}"
     );
+    assert!(
+        toml.contains("[patch.crates-io]")
+            && toml.contains(&format!(".socket/vendor/cargo/{UUID_V}/")),
+        "the vendored wiring lives in Cargo.toml: {toml}"
+    );
     let config = read(&proj, ".cargo/config.toml");
-    assert!(config.contains("[patch.crates-io]"), "{config}");
+    assert!(!config.contains("[patch.crates-io]"), "{config}");
     assert!(
         !config.contains("[registries.socket-patch-"),
         "the now-unused registries block must be dropped: {config}"
@@ -767,6 +884,7 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         !lock_block.contains("source ="),
         "vendored lock entry is detached: {lock_block}"
     );
+    assert_lock_version(&proj, &tagged(&version, UUID_V), "hosted -> vendored");
 
     // C: the vendored contract — fresh checkout, EMPTY home, offline locked
     // build (pre-fix: "no matching package named cfg-if found").
@@ -809,7 +927,8 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
     );
     assert_eq!(read(&proj, "Cargo.toml"), toml_pristine);
     assert!(
-        !read(&proj, ".cargo/config.toml").contains("[patch.crates-io]"),
+        !read(&proj, ".cargo/config.toml").contains("[patch.crates-io]")
+            && !read(&proj, "Cargo.toml").contains("[patch.crates-io]"),
         "vendored wiring gone after revert"
     );
 }
@@ -908,7 +1027,9 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
         "C3: the ledger must keep the registry tarball checksum: {entry}"
     );
 
-    // The vendored contract still holds after the round trip.
+    // The vendored contract still holds after the round trip, and the lock
+    // names the vendored patch again (tagged), not the hosted one.
+    assert_lock_version(&proj, &tagged(&version, UUID_V), "A -> B -> A");
     let (fresh, home) = fresh_checkout(&proj, tmp.path(), "aba");
     assert_build_ok(
         "cargo build --locked --offline (A->B->A fresh checkout)",
@@ -947,6 +1068,10 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
     assert_eq!(read(&proj, "Cargo.toml"), toml_pristine);
     let config = read(&proj, ".cargo/config.toml");
     assert!(!config.contains("[patch.crates-io]"), "{config}");
+    assert!(
+        !proj.join(".cargo").exists(),
+        "no .cargo/ residue: {config}"
+    );
 }
 
 // ── FAIL CLOSED: vendoring over a hosted redirect with no ledger refuses ────
@@ -962,6 +1087,9 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     let purl = format!("pkg:cargo/{DEP}@{version}");
     let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
     let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    // Kept for the second arm: the pristine crates.io lock a checkout
+    // restores over the redirected one.
+    let pristine_lock = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
 
     let server = MockServer::start().await;
     let crate_bytes =
@@ -1015,5 +1143,51 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     assert_eq!(read(&proj, "Cargo.toml"), toml_before);
     assert_eq!(read(&proj, "Cargo.lock"), lock_before);
     assert!(!read(&proj, ".cargo/config.toml").contains("[patch.crates-io]"));
+    assert!(!read(&proj, "Cargo.toml").contains("[patch.crates-io]"));
+    assert!(!vendor_ledger_claims(&proj, &purl));
+
+    // The half-reverted state this guard really exists for: the lock is
+    // back on crates.io (restored from version control, or re-resolved)
+    // while the manifest pin survives — here in the TABLE form the hosted
+    // rewriter writes for a `[dependencies.<crate>]` declaration, which a
+    // `<name> = { … }` probe reads as "not redirected".
+    let registry = toml_before
+        .split("registry = \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the hosted scan pinned a socket-patch registry")
+        .to_string();
+    assert!(registry.starts_with("socket-patch-"), "{registry}");
+    std::fs::write(proj.join("Cargo.lock"), &pristine_lock).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies.{DEP}]\nversion = \"1.0\"\nregistry = \"{registry}\"\n"
+        ),
+    )
+    .unwrap();
+    let table_toml = read(&proj, "Cargo.toml");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 1,
+        "the table-form pin must fail closed too: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hosted_redirect_live"),
+        "actionable refusal code missing: {stdout}"
+    );
+    assert_eq!(read(&proj, "Cargo.toml"), table_toml);
+    assert_eq!(read(&proj, "Cargo.lock"), pristine_lock);
     assert!(!vendor_ledger_claims(&proj, &purl));
 }

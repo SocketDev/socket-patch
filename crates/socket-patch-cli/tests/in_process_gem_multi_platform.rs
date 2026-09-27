@@ -232,7 +232,7 @@ fn scan_args(cwd: &Path, api_url: String, all_releases: bool) -> ScanArgs {
             dry_run: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        batch_size: 100,
+        batch_size: Some(100),
         // apply (not sync) so the post-sync GC doesn't sweep beforeHash
         // blobs the later rollback/remove needs offline.
         apply: true,

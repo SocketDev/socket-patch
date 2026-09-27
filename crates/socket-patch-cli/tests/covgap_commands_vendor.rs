@@ -958,11 +958,15 @@ async fn reconcile_state_write_failure_reports_failed_after_removal() {
     );
 }
 
-/// A vendor run whose per-package `save_state` fails after the backend
-/// already wrote the artifact and rewired the lock: the package's
-/// `Applied` event stands, a `vendor_state_write_failed` failure rides
-/// beside it, and the run exits 1 (the crash-consistency contract of the
-/// per-package save).
+/// A vendor run whose ledger cannot be written (`.socket/vendor` refuses
+/// writes) after the backend already wrote the artifact: the run's ONE
+/// commit of the lock rewire and the ledger fails as a whole, so neither is
+/// written — the lock keeps its pre-run bytes, no ledger appears — and the
+/// run exits 1 with the top-level `vendor_commit_failed` error. The
+/// package's `Applied` event still reports what the backend did; the
+/// artifact is an orphan the next run re-vendors over. (Before the group
+/// commit this was a per-package `vendor_state_write_failed` next to an
+/// already-rewired lock.)
 #[cfg(unix)]
 #[tokio::test]
 async fn vendor_state_write_failure_reports_failed_event() {
@@ -977,22 +981,32 @@ async fn vendor_state_write_failure_reports_failed_event() {
     assert_eq!(code, 1, "{env:#}");
     let applied = find_event(&env, "applied", None);
     assert_eq!(applied["purl"], PURL, "the backend vendored: {env:#}");
-    let failed = find_event(&env, "failed", Some("vendor_state_write_failed"));
-    assert_eq!(failed["purl"], PURL, "{env:#}");
+    assert_eq!(env["error"]["code"], "vendor_commit_failed", "{env:#}");
     assert!(
         fx.tgz_path().is_file(),
         "the artifact the backend wrote is on disk"
     );
     assert!(!fx.state_path().exists(), "the ledger write failed");
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "the lock rewire is committed with the ledger or not at all"
+    );
 }
 
 /// A hosted redirect record whose revert succeeds but whose ledger update
-/// cannot be persisted (`.socket/vendor` read-only): the purl fails CLOSED
-/// with `redirect_ledger_write_failed` and is NOT vendored — a ledger
-/// still claiming reverted wiring must stop the takeover.
+/// cannot be persisted (`.socket/vendor` read-only). The takeover's revert,
+/// its redirect-ledger drop, the vendor rewire and the vendor ledger are
+/// committed together, so the failed commit leaves ALL of them as found:
+/// the lock untouched, the redirect ledger byte-identical (still claiming
+/// only wiring that is still there), no vendor ledger — never a redirect
+/// ledger claiming reverted wiring. The run exits 1 with
+/// `vendor_commit_failed`. (Before the group commit the takeover persisted
+/// the redirect ledger on its own and failed the purl closed with
+/// `redirect_ledger_write_failed` before vendoring it.)
 #[cfg(unix)]
 #[test]
-fn redirect_ledger_write_failure_fails_takeover_purl_closed() {
+fn redirect_ledger_write_failure_commits_nothing() {
     let fx = npm_fixture();
     std::fs::create_dir_all(fx.vendor_dir()).unwrap();
     let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
@@ -1011,24 +1025,27 @@ fn redirect_ledger_write_failure_fails_takeover_purl_closed() {
 
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 1, "{env:#}");
-    let failed = find_event(&env, "failed", Some("redirect_ledger_write_failed"));
-    assert_eq!(failed["purl"], PURL);
+    assert_eq!(env["error"]["code"], "vendor_commit_failed", "{env:#}");
     assert!(
-        failed["error"]
+        env["error"]["message"]
             .as_str()
-            .is_some_and(|d| d.contains("could not") && d.contains("redirect-state.json")),
+            .is_some_and(|d| d.contains("could not commit")),
         "{env:#}"
     );
     assert_eq!(
         fx.lock_bytes(),
         fx.original_lock,
-        "no vendor rewire happened"
+        "no vendor rewire is committed"
     );
-    assert!(!fx.tgz_path().exists(), "the purl must not be vendored");
+    assert!(!fx.state_path().exists(), "no vendor ledger is committed");
     assert_eq!(
         std::fs::read(fx.redirect_state_path()).unwrap(),
         ledger_bytes,
         "the unpersistable ledger is left exactly as found"
+    );
+    assert!(
+        !fx.vendor_dir().join(".commit-journal.json").exists(),
+        "the failed commit leaves no journal behind"
     );
 }
 

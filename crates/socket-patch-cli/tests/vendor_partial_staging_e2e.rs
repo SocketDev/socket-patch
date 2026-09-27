@@ -237,12 +237,17 @@ fn tgz_members(tgz: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 /// `vendor --json --vendor-source build` against the mock API, with every
 /// ambient `SOCKET_*` var scrubbed from the child.
 fn vendor_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
+    vendor_cli_with_source(root, api_url, "build")
+}
+
+/// [`vendor_cli`] under an explicit `--vendor-source`.
+fn vendor_cli_with_source(root: &Path, api_url: &str, source: &str) -> (i32, Value, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.args([
         "vendor",
         "--json",
         "--vendor-source",
-        "build",
+        source,
         "--api-url",
         api_url,
         "--api-token",
@@ -412,6 +417,137 @@ async fn a_view_whose_only_contentless_files_are_zero_delta_vendors() {
             .map(Vec::as_slice),
         Some(BAD_FIXTURE),
         "the zero-delta file is vendored from the pristine copy: {members:?}"
+    );
+}
+
+/// A package staging drops must stay out of the vendoring service's
+/// download plan as well as the loop.
+///
+/// With the service enabled the vendor loop fetches its service downloads
+/// ahead of itself, from an EXACT plan built over the records it is handed
+/// — a download grant can start a server-side build and counts against
+/// quota, so a package the run never vendors must never be granted. The
+/// staging drop hands the engine only the stageable records, so the
+/// unstageable package reaches neither the plan nor the loop's own call.
+/// Two stageable packages keep the plan attached (one download has nothing
+/// to overlap), and the service answering `not_found` sends both to the
+/// local build, so the run's outcome is the build-mode one.
+#[tokio::test]
+async fn a_dropped_package_is_never_granted_a_service_download() {
+    const THIRD_PURL: &str = "pkg:npm/is-odd@3.0.1";
+    const THIRD_UUID: &str = "3c1d5e7f-2a4b-4c6d-8e0f-1a2b3c4d5e6f";
+    const THIRD_ORIG: &[u8] = b"module.exports = n => n % 2 === 1;\n";
+    const THIRD_PATCHED: &[u8] = b"module.exports = n => Math.abs(n % 2) === 1;\n";
+
+    /// Answer every grant request `not_found`, whichever uuids it names.
+    struct NotFound;
+    impl wiremock::Respond for NotFound {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let results: serde_json::Map<String, Value> = body["uuids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|u| {
+                    (
+                        u.to_string(),
+                        json!({ "status": "not_found", "url": null, "artifacts": [] }),
+                    )
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "results": results }))
+        }
+    }
+
+    let server = MockServer::start().await;
+    mount_contentless_view(&server).await;
+    Mock::given(method("POST"))
+        .and(wm_path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(NotFound)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root);
+    // A second stageable package: installed, locked, blob staged.
+    let pkg = root.join("node_modules/is-odd");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        br#"{"name":"is-odd","version":"3.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), THIRD_ORIG).unwrap();
+    let mut lock: Value =
+        serde_json::from_slice(&std::fs::read(root.join("package-lock.json")).unwrap()).unwrap();
+    lock["packages"][""]["dependencies"]["is-odd"] = json!("^3.0.1");
+    lock["packages"]["node_modules/is-odd"] = json!({
+        "version": "3.0.1",
+        "resolved": "https://registry.npmjs.org/is-odd/-/is-odd-3.0.1.tgz",
+        "integrity": "sha512-orig3=="
+    });
+    std::fs::write(
+        root.join("package-lock.json"),
+        serde_json::to_vec_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    let manifest_path = root.join(".socket/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][THIRD_PURL] = patch_record(
+        THIRD_UUID,
+        json!({ "package/index.js": {
+            "beforeHash": git_hash(THIRD_ORIG),
+            "afterHash": git_hash(THIRD_PATCHED),
+        }}),
+    );
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".socket/blobs").join(git_hash(THIRD_PATCHED)),
+        THIRD_PATCHED,
+    )
+    .unwrap();
+
+    let (code, env, stderr) = vendor_cli_with_source(root, &server.uri(), "auto");
+
+    assert_eq!(code, 1, "{env:#}\nstderr:\n{stderr}");
+    assert_eq!(env["status"], "partialFailure", "{env:#}");
+    assert_eq!(
+        event_for(&env, BAD_PURL)["errorCode"],
+        "no_local_source",
+        "{env:#}"
+    );
+    assert_eq!(event_for(&env, GOOD_PURL)["action"], "applied", "{env:#}");
+    assert_eq!(event_for(&env, THIRD_PURL)["action"], "applied", "{env:#}");
+
+    let granted: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/patches/package"))
+        .flat_map(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+            body["uuids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|u| u.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        granted.iter().any(|u| u == GOOD_UUID) && granted.iter().any(|u| u == THIRD_UUID),
+        "the stageable packages ask the service (the test is not vacuous): {granted:?}"
+    );
+    assert!(
+        !granted.iter().any(|u| u == BAD_UUID),
+        "the dropped package must never be granted a download: {granted:?}\n{env:#}"
     );
 }
 

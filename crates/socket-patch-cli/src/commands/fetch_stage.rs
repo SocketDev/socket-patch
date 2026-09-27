@@ -11,13 +11,15 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use futures_util::StreamExt;
 use socket_patch_core::api::blob_fetcher::{
     fetch_missing_blobs, fetch_missing_sources, get_missing_archives, get_missing_blobs,
     DownloadMode, FetchMissingBlobsResult,
 };
-use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
+use socket_patch_core::api::client::{get_api_client_with_overrides, hold_back_debug, ApiClient};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, PatchSources};
+use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use tempfile::TempDir;
 
 use super::get::base64_decode;
@@ -617,6 +619,15 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         // exclusively under `!--json` — so without it a `--json` consumer
         // learned nothing about which file was contentless.
         let mut failed: Vec<(&str, String)> = Vec::new();
+        // The views are fetched concurrently (at most `api_concurrency` in
+        // flight) but consumed in `to_fetch` order, each request's `--debug`
+        // lines released at its turn, so `mem`, `failed` and every error
+        // line fold exactly as the serial loop's did.
+        let mut views = std::pin::pin!(ordered_concurrent(
+            to_fetch.iter(),
+            api_concurrency_for(client.uses_public_proxy(), to_fetch.len()),
+            |(_, uuid)| async move { (*uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
+        ));
         for (i, (purl, uuid)) in to_fetch.iter().enumerate() {
             if to_fetch.len() > 1 {
                 status.set(format!(
@@ -629,7 +640,19 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             // The record is what `covered` above judged, so it is also what
             // decides which of this view's files actually need bytes.
             let record = manifest.patches.get(*purl);
-            match client.fetch_patch(uuid).await {
+            let view = match views.next().await {
+                Some((planned, view)) if planned == *uuid => view.release(),
+                // Unreachable: the plan IS this list. Falling back to the
+                // live request keeps the staging COMPLETE if the two ever
+                // fall out of step — running dry here would otherwise
+                // return `Ready` with blobs missing and nothing in
+                // `failed`.
+                _ => {
+                    debug_assert!(false, "view prefetch plan out of step with the fetch list");
+                    client.fetch_patch(uuid).await
+                }
+            };
+            match view {
                 Ok(Some(patch)) => {
                     // Named so the per-file report is the same on every run:
                     // `patch.files` is a `HashMap`, so "the first file with

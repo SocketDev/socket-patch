@@ -1,0 +1,5 @@
+[workspace]
+members = ["a", "b"]
+
+[workspace.dependencies]
+serde = "1.0.190"

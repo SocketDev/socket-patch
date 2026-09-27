@@ -16,7 +16,7 @@
 //! recorded ([`VendorEntry::took_over_go_patches`]) so `--revert` can tell
 //! the user the redirect is NOT restored (re-run `apply` for that).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{MismatchPolicy, PatchSources};
@@ -35,66 +35,71 @@ use super::common::{
     swap_stage_into_place,
 };
 use super::path::vendor_uuid_dir_rel;
-use super::registry_fetch::extract_zip_with_prefix;
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::registry_fetch::{extract_on_blocking_pool, extract_zip_with_prefix};
+use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
-/// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
-/// `replace` directive + marker, returning the ledger entry to persist.
-///
-/// * `pristine_src` — the crawler's module-cache dir (case-encoded on disk).
-///   It is copied, never mutated.
-/// * `vendored_at` — caller-formatted RFC3339 timestamp for the marker.
-///
-/// `dry_run` writes nothing (read-only verify against `pristine_src`);
-/// `entry` is then `None`. A user-authored `replace` for the same
-/// module+version surfaces as a failed result (the engine's `go.mod` editor
-/// refuses it), not a refusal — the verify report is still useful.
-#[allow(clippy::too_many_arguments)]
-pub async fn vendor_go_module(
+/// Everything [`vendor_go_module`] decides before it can first ask the patch
+/// service: the coordinate guards, the socket-owned `replace` already in
+/// go.mod, and whether it wires an intact copy of this uuid. The download
+/// plan evaluates the same function ahead of the vendor loop
+/// ([`service_preflight`]).
+struct GoPrelude {
+    module: String,
+    version: String,
+    base_rel: String,
+    takeover: bool,
+    hosted_takeover: bool,
+    prior_target: Option<String>,
+    wired: bool,
+    wired_version_ok: bool,
+    copy_dir: PathBuf,
+    copy_was_ok: bool,
+}
+
+async fn go_prelude(
     purl: &str,
-    pristine_src: &Path,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    vendored_at: &str,
-    dry_run: bool,
-    force: bool,
-    service: Option<&VendorServiceConfig>,
-) -> VendorOutcome {
+) -> Result<GoPrelude, VendorOutcome> {
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((module, version)) = parse_golang_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a golang purl: {purl}"));
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a golang purl: {purl}"),
+        ));
     };
-    let (module, version) = (&*module, &*version);
+    let (module, version) = (module.to_string(), version.to_string());
+    let (module, version) = (module.as_str(), version.as_str());
     // SECURITY: `module`+`version` key the on-disk copy dir
     // (`.socket/vendor/golang/<uuid>/<module>@<version>/`) and the `replace`
     // target path. A `..` segment / absolute path / backslash from a tampered
     // manifest PURL would let the copy escape `.socket/vendor/` — refuse
     // before any disk access (same guard the redirect engine applies).
     if !are_safe_redirect_coords(module, version) {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!(
                 "refusing to vendor unsafe golang coordinates `{module}`/`{version}` \
                  (a `..` segment, absolute path, or separator would escape \
                  .socket/vendor/golang/)"
             ),
-        );
+        ));
     }
     // SECURITY: the uuid is a dedicated path level created here and deleted by
     // `--revert`; anything but the canonical UUID grammar is rejected.
     let Some(base_rel) = vendor_uuid_dir_rel("golang", &record.uuid) else {
-        return refused(
+        return Err(refused(
             "unsafe_coordinates",
             format!(
                 "refusing to vendor {purl}: patch uuid `{}` is not a canonical uuid",
                 record.uuid
             ),
-        );
+        ));
     };
 
     // Detect an existing socket-owned directive BEFORE the engine rewrites it:
@@ -146,6 +151,89 @@ pub async fn vendor_go_module(
     let copy_dir = copy_dir_for(project_root, &base_rel, module, version);
     let copy_was_ok =
         wired && wired_version_ok && copy_matches_after_hashes(&copy_dir, &record.files).await;
+    Ok(GoPrelude {
+        module: module.to_string(),
+        version: version.to_string(),
+        base_rel,
+        takeover,
+        hosted_takeover,
+        prior_target,
+        wired,
+        wired_version_ok,
+        copy_dir,
+        copy_was_ok,
+    })
+}
+
+/// Whether [`vendor_go_module`] — a wet run with the service enabled — asks
+/// the patch service for `record`: past its coordinate guards, not answered
+/// by the wired-and-intact hot path, and not the empty patch the service
+/// leg skips. The vendor loop's download plan consults this.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Option<crate::api::client::PlannedDownload> {
+    if record.files.is_empty() {
+        return None;
+    }
+    let prelude = go_prelude(purl, project_root, record)
+        .await
+        .ok()
+        .filter(|p| !p.copy_was_ok)?;
+    // `go_service_redirect` extracts the module zip (its literal
+    // `{module}@{version}/` prefix stripped) into the copy dir's stage.
+    let prefix = format!("{}@{}/", prelude.module, prelude.version);
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::extract(
+            project_root,
+            &prelude.copy_dir,
+            move |bytes, dest| extract_zip_with_prefix(bytes, dest, &prefix),
+        )),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
+}
+
+/// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
+/// `replace` directive + marker, returning the ledger entry to persist.
+///
+/// * `pristine_src` — the crawler's module-cache dir (case-encoded on disk).
+///   It is copied, never mutated.
+/// * `vendored_at` — caller-formatted RFC3339 timestamp for the marker.
+///
+/// `dry_run` writes nothing (read-only verify against `pristine_src`);
+/// `entry` is then `None`. A user-authored `replace` for the same
+/// module+version surfaces as a failed result (the engine's `go.mod` editor
+/// refuses it), not a refusal — the verify report is still useful.
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_go_module<'a>(
+    purl: &str,
+    pristine_src: impl Into<PackageSource<'a>>,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let pristine_src = pristine_src.into();
+    let GoPrelude {
+        module,
+        version,
+        base_rel,
+        takeover,
+        hosted_takeover,
+        prior_target,
+        wired,
+        wired_version_ok,
+        copy_dir,
+        copy_was_ok,
+    } = match go_prelude(purl, project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
+    };
+    let (module, version) = (module.as_str(), version.as_str());
 
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
@@ -210,8 +298,24 @@ pub async fn vendor_go_module(
             // patched content. The engine is shared with the in-place `apply`
             // redirect path, whose strict semantics stay unchanged.
             if !force {
-                let missing =
-                    super::missing_existing_patch_files(pristine_src, &record.files).await;
+                // The pre-check reads the pristine tree, so a lazily-fetched
+                // source materialises here; the engine's own copy below then
+                // comes from that tree rather than a second inflate.
+                let probe = match pristine_src.materialize().await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        return done(
+                            failed_result(
+                                purl,
+                                Path::new(""),
+                                format!("failed to copy pristine source: {e}"),
+                            ),
+                            None,
+                            warnings,
+                        )
+                    }
+                };
+                let missing = super::missing_existing_patch_files(probe, &record.files).await;
                 if let Some(first) = missing.first() {
                     return done(
                         failed_result(
@@ -226,8 +330,10 @@ pub async fn vendor_go_module(
             }
             // The engine does the heavy lifting: fresh copy → hardened apply
             // pipeline → `replace` upsert (refuses a user-authored same-version
-            // pin).
-            let result = apply_go_redirect(
+            // pin). The copy is a content-verified artifact, so its patched
+            // files are written without an fsync; the `go.mod` edit stays a
+            // durable commit point (see `crate::utils::durability`).
+            let result = crate::utils::durability::artifact_writes(apply_go_redirect(
                 purl,
                 module,
                 version,
@@ -239,7 +345,7 @@ pub async fn vendor_go_module(
                 Some(&record.uuid),
                 dry_run,
                 MismatchPolicy::Force,
-            )
+            ))
             .await;
             if result.success {
                 warnings.extend(super::mismatch_overwrite_warnings(&result, module, version));
@@ -305,30 +411,18 @@ pub async fn vendor_go_module(
     }
 
     if takeover {
-        // The `replace` line was already atomically repointed by the upsert;
-        // the apply backend's copy is now unreachable — delete it (built from
-        // OUR validated coordinates, never from the go.mod string). NotFound
-        // is fine (the user may have cleaned it already).
+        // The upsert repointed the `replace` line; the apply backend's copy
+        // is then unreachable — delete it (built from OUR validated
+        // coordinates, never from the go.mod string; NotFound is fine, the
+        // user may have cleaned it already) and prune the now-empty parent
+        // husks (`<go-patches>/example.com/`) up to and including the
+        // go-patches root. Inside a group commit the repoint is only
+        // captured, so the on-disk go.mod still names this copy until the
+        // commit: the deletion waits for it (and never happens if the run
+        // crashes or its commit fails).
         let stale = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
-        let _ = remove_tree(&stale).await;
-        // Prune now-empty parent husks (`<go-patches>/example.com/`) up to
-        // and including the go-patches root (`starts_with` holds for the
-        // root itself and bounds the climb). `remove_dir` is non-recursive:
-        // a parent still holding another module's copy fails and stops the
-        // prune; a level the user already removed is skipped.
-        let go_patches_root = project_root.join(GO_PATCHES_DIR);
-        let mut parent = stale.parent().map(|p| p.to_path_buf());
-        while let Some(dir) = parent {
-            if !dir.starts_with(&go_patches_root) {
-                break;
-            }
-            match tokio::fs::remove_dir(&dir).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => break, // non-empty — stop pruning
-            }
-            parent = dir.parent().map(|p| p.to_path_buf());
-        }
+        crate::utils::group_commit::remove_after_commit(&stale, &project_root.join(GO_PATCHES_DIR))
+            .await;
         warnings.push(VendorWarning::new(
             "vendor_takeover",
             format!(
@@ -468,44 +562,55 @@ async fn go_service_redirect(
         }
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
+        ServiceArtifact::Ready(mut archive) => {
             // Extract the module zip (strip its literal `{module}@{version}/`
             // prefix) into a STAGE sibling of the copy dir and swap it into
             // place only once verified — the cargo / composer / gem shape: a
             // failed re-download never destroys a pre-existing copy the
             // vendor `replace` still points at.
             let stage = stage_dir_for(copy_dir);
-            let _ = remove_tree(&stage).await; // a crashed earlier run's litter
-            if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                cleanup_failed_service_stage(
-                    &stage,
-                    project_root,
-                    base_rel,
-                    copy_dir,
-                    module,
-                    wired,
-                )
-                .await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot create {}: {e}", stage.display()),
-                );
-            }
             let prefix = format!("{module}@{version}/");
-            if let Err(e) = extract_zip_with_prefix(&archive.bytes, &stage, &prefix) {
-                cleanup_failed_service_stage(
-                    &stage,
-                    project_root,
-                    base_rel,
-                    copy_dir,
-                    module,
-                    wired,
-                )
-                .await;
-                return hard(
-                    "vendor_prebuilt_extract_failed",
-                    format!("cannot extract the prebuilt module zip: {e}"),
-                );
+            // A tree the download plan already extracted from these bytes
+            // (see `prestage`) is moved into the stage instead; otherwise —
+            // or should the move fail — extract here, as always.
+            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+                let _ = remove_tree(&stage).await; // a crashed earlier run's litter
+                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+                    cleanup_failed_service_stage(
+                        &stage,
+                        project_root,
+                        base_rel,
+                        copy_dir,
+                        module,
+                        wired,
+                    )
+                    .await;
+                    return hard(
+                        "vendor_prebuilt_write_failed",
+                        format!("cannot create {}: {e}", stage.display()),
+                    );
+                }
+                let zip_bytes = std::mem::take(&mut archive.bytes);
+                let prefix_owned = prefix.clone();
+                if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, move |b, d| {
+                    extract_zip_with_prefix(b, d, &prefix_owned)
+                })
+                .await
+                {
+                    cleanup_failed_service_stage(
+                        &stage,
+                        project_root,
+                        base_rel,
+                        copy_dir,
+                        module,
+                        wired,
+                    )
+                    .await;
+                    return hard(
+                        "vendor_prebuilt_extract_failed",
+                        format!("cannot extract the prebuilt module zip: {e}"),
+                    );
+                }
             }
             // A `replace` target needs a go.mod declaring the module path;
             // pre-modules zips may lack one — synthesize the minimal form.
@@ -706,7 +811,7 @@ pub async fn revert_go_vendor_opts(
     let Some((module, version)) = parse_golang_purl(&entry.base_purl) else {
         return RevertOutcome::failed(format!("not a golang purl: {}", entry.base_purl));
     };
-    let (module, version) = (&*module, &*version);
+    let (module, version) = (module.as_ref(), version.as_ref());
     if !are_safe_redirect_coords(module, version) {
         return RevertOutcome::failed(format!(
             "refusing to revert unsafe golang coordinates `{module}`/`{version}`"
@@ -857,6 +962,59 @@ mod tests {
         .unwrap();
 
         (dir, blobs, pristine, record_with(files))
+    }
+
+    /// The download plan's gate names exactly the modules whose vendor call
+    /// asks the patch service for a grant: none with unsafe coordinates or a
+    /// non-canonical uuid, not the empty patch (the service leg skips it),
+    /// and — once vendored and wired — not the in-sync re-run.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_modules_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            (
+                "pkg:golang/github.com/foo/../evil@v1.0.0",
+                with_uuid(&record, PLAN_UUID_C),
+            ),
+            (PURL, empty_patch(&record, PLAN_UUID_C)),
+            (
+                "pkg:golang/github.com/foo/bar@v9.9.9",
+                with_uuid(&record, PLAN_UUID_B),
+            ),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec).await.is_some() })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (pristine, sources, cfg) = (&pristine, &sources, &cfg);
+            Box::pin(async move {
+                vendor_go_module(
+                    &purl,
+                    pristine.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string(), PLAN_UUID_B.to_string()]);
     }
 
     async fn run_vendor(
@@ -1031,6 +1189,53 @@ mod tests {
             )),
             "the old replace target is recorded verbatim"
         );
+    }
+
+    /// Inside a group commit the takeover's repoint of `go.mod` is only
+    /// captured, so the `.socket/go-patches/` copy the on-disk `go.mod`
+    /// still names survives until the commit: an abandoned commit (a crash,
+    /// a failed commit) leaves a `go.mod` whose replace target exists, and
+    /// a completed one removes the copy.
+    #[tokio::test]
+    async fn test_takeover_in_a_group_commit_removes_the_copy_only_after_it() {
+        use crate::utils::group_commit::GroupCommit;
+        for commit in [false, true] {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            let sources = PatchSources::blobs_only(&blobs);
+            let pre = apply_go_redirect(
+                PURL,
+                MODULE,
+                VERSION,
+                &pristine,
+                root,
+                GO_PATCHES_DIR,
+                &record.files,
+                &sources,
+                Some(UUID),
+                false,
+                MismatchPolicy::Warn,
+            )
+            .await;
+            assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
+            let stale = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+            let go_mod_before = std::fs::read(root.join("go.mod")).unwrap();
+
+            let group = GroupCommit::begin(root);
+            let (result, ..) =
+                expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(stale.exists(), "the on-disk go.mod still names it");
+            if commit {
+                group.commit().await.unwrap();
+                assert!(!stale.exists(), "removed once the repoint is on disk");
+                assert_ne!(std::fs::read(root.join("go.mod")).unwrap(), go_mod_before);
+            } else {
+                drop(group);
+                assert!(stale.exists(), "an abandoned commit removes nothing");
+                assert_eq!(std::fs::read(root.join("go.mod")).unwrap(), go_mod_before);
+            }
+        }
     }
 
     /// Wired go.mod with a deleted committed copy: the module copy is

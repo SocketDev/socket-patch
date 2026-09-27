@@ -68,7 +68,8 @@ use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
 use super::npm_common::{
-    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+    done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
+    stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
@@ -77,6 +78,7 @@ use super::pnpm_lock::{
     revert_overrides_line, revert_pkg_record, section_bounds, split_lines, value_lines,
     vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
 };
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
     WiringRecord,
@@ -283,9 +285,9 @@ impl Ctx<'_> {
 /// present iff success and not a dry run, in-sync re-runs synthesize
 /// AlreadyPatched.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pnpm_legacy(
+pub async fn vendor_pnpm_legacy<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -294,6 +296,7 @@ pub async fn vendor_pnpm_legacy(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates ────────────────────────────────────────────────────
@@ -307,109 +310,32 @@ pub async fn vendor_pnpm_legacy(
     let override_key = format!("{name}@{version}");
 
     // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let pkg_bytes = match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!(
-                    "cannot read {PACKAGE_JSON}: {e} — the pnpm wiring edits the \
-                     package.json + pnpm-lock.yaml PAIR (a lock-only edit silently \
-                     unpatches on the next plain `pnpm install`)"
-                ),
-            );
-        }
+    let project = match read_project(project_root).await {
+        Ok(project) => project,
+        Err(outcome) => return *outcome,
     };
-    let mut pkg: Value = match serde_json::from_slice(&pkg_bytes) {
-        Ok(Value::Object(map)) => Value::Object(map),
-        Ok(_) | Err(_) => {
-            return refused(
-                "vendor_pkg_json_unsupported",
-                format!("{PACKAGE_JSON} is not a JSON object; cannot add pnpm.overrides"),
-            );
-        }
-    };
-    let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
-        Ok(text) => text,
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("cannot read {PNPM_LOCK}: {e} — run `pnpm install` first"),
-            );
-        }
-    };
-    let grammar = match sniff_lock_grammar(&lock_text) {
-        Ok(PnpmLockGrammar::V9) => {
-            // Router bug guard: v9 locks belong to the v9 backend.
-            return refused(
-                "vendor_lockfile_version_unsupported",
-                format!("{PNPM_LOCK} is a lockfileVersion 9.0 lock; not a legacy grammar"),
-            );
-        }
-        Ok(g) => g,
-        Err(detail) => return refused("vendor_lockfile_version_unsupported", detail),
-    };
-    // CRLF fails closed exactly like the v9 backend: every structural probe
-    // below is byte-exact on LF lines.
-    if lock_text.contains('\r') {
-        return refused(
-            "vendor_lockfile_crlf_unsupported",
-            format!(
-                "{PNPM_LOCK} has CRLF line endings, which this rewriter cannot edit \
-                 byte-faithfully — normalize the file to LF (re-run `pnpm install`, \
-                 or add `pnpm-lock.yaml text eol=lf` to .gitattributes and re-checkout) \
-                 and retry"
-            ),
-        );
-    }
-    let mut lines = split_lines(&lock_text);
-
-    // Legacy WORKSPACE locks nest everything under `importers:` — a shape
-    // with no captured fixtures. Fail closed with the upgrade path.
-    if section_bounds(&lines, "importers").is_some() {
-        return refused(
-            "vendor_lock_entry_unsupported",
-            format!(
-                "{PNPM_LOCK} is a {} WORKSPACE lock (importers: section); the legacy \
-                 pair surgery only supports single-package locks — upgrade to pnpm >= 9 \
-                 (its lockfileVersion 9.0 workspace grammar is supported) and re-lock",
-                grammar.describe()
-            ),
-        );
-    }
-
-    // pnpm <= 8 absolutizes file: override prefs against the project root
-    // (module doc §3), so the specifier splice needs the canonical absolute
-    // path — the same one pnpm's own process.cwd() yields. On Windows,
-    // `canonicalize` returns a VERBATIM path (`\\?\C:\...`) that pnpm never
-    // emits; `normalize_canonical_root` rewrites it to the pnpm spelling so
-    // the embedded specifier doesn't churn the lock on the next install
-    // (which would fail `--frozen-lockfile`, contradicting the
-    // `vendor_pnpm_legacy_absolute_specifier` warning below).
-    let abs_root = match std::fs::canonicalize(project_root) {
-        Ok(p) => p,
-        Err(e) => {
-            return refused(
-                "vendor_lock_entry_unsupported",
-                format!(
-                    "cannot canonicalize the project root ({e}) — the pnpm <= 8 lock \
-                     records the override specifier as an absolute path"
-                ),
-            );
-        }
-    };
-    let abs_root = normalize_canonical_root(&abs_root.display().to_string());
-    let abs_spec = format!("file:{abs_root}/{rel_tgz}");
+    let abs_spec = format!("file:{}/{rel_tgz}", project.abs_root);
 
     // ── 3. Pre-flight refusals ────────────────────────────────────────────
-    let disposition = match classify_pkg_override(&pkg, name, version, &override_key) {
-        Ok(d) => d,
-        Err(detail) => return refused("vendor_override_conflict", detail),
+    let effective_key = match preflight_package(
+        &project,
+        name,
+        version,
+        &rel_tgz,
+        &spec,
+        &abs_spec,
+        &override_key,
+    ) {
+        Ok(key) => key,
+        Err(outcome) => return *outcome,
     };
-    let effective_key = disposition.effective_key(&override_key).to_string();
-    if let Err(detail) = check_lock_override(&lines, name, version, &effective_key) {
-        return refused("vendor_override_conflict", detail);
-    }
+    let LegacyProject {
+        pkg_bytes,
+        mut pkg,
+        mut lines,
+        grammar,
+        abs_root,
+    } = project;
     let ctx = Ctx {
         grammar,
         name,
@@ -420,20 +346,6 @@ pub async fn vendor_pnpm_legacy(
         integrity: "", // filled after packing; pre-flight never reads it
         override_key: &effective_key,
     };
-    // Refs guard FIRST: a peer-suffixed packages key is also not the plain
-    // registry key, and "entry not found" would misdiagnose that shape.
-    if let Err(detail) = check_rewritable_refs(&lines, &ctx) {
-        return refused("vendor_lock_entry_unsupported", detail);
-    }
-    if !lock_has_target_package(&lines, &ctx) {
-        return refused(
-            "vendor_lock_entry_not_found",
-            format!(
-                "{PNPM_LOCK} has no packages entry for {name}@{version} — make sure the \
-                 package is installed and locked (`pnpm install`) before vendoring"
-            ),
-        );
-    }
 
     // ── 4. Stage → patch → pack ───────────────────────────────────────────
     let (staged, result) = match stage_patch_pack(
@@ -663,6 +575,214 @@ pub async fn vendor_pnpm_legacy(
     done(result, Some(entry), warnings)
 }
 
+/// The pair the legacy wiring edits, read and structurally gated before
+/// any write: `package.json` parsed, `pnpm-lock.yaml` grammar-sniffed,
+/// LF-only and single-package, split into its lines, plus the canonical
+/// project root the absolute specifier embeds. [`vendor_pnpm_legacy`]
+/// reads it per package; the vendor loop's download plan reads it once
+/// and gates every package against the same parse
+/// ([`preflight_packages`]).
+pub(super) struct LegacyProject {
+    pkg_bytes: Vec<u8>,
+    pkg: Value,
+    lines: Vec<String>,
+    grammar: PnpmLockGrammar,
+    abs_root: String,
+}
+
+/// Read the pair, refusing (before any write) a file that is missing,
+/// unreadable, a grammar this backend has no fixtures for, CRLF, or a
+/// workspace lock.
+pub(super) async fn read_project(project_root: &Path) -> Result<LegacyProject, Box<VendorOutcome>> {
+    let pkg_bytes = match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err(Box::new(refused(
+                "vendor_lockfile_missing",
+                format!(
+                    "cannot read {PACKAGE_JSON}: {e} — the pnpm wiring edits the \
+                     package.json + pnpm-lock.yaml PAIR (a lock-only edit silently \
+                     unpatches on the next plain `pnpm install`)"
+                ),
+            )));
+        }
+    };
+    let pkg: Value = match serde_json::from_slice(&pkg_bytes) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        Ok(_) | Err(_) => {
+            return Err(Box::new(refused(
+                "vendor_pkg_json_unsupported",
+                format!("{PACKAGE_JSON} is not a JSON object; cannot add pnpm.overrides"),
+            )));
+        }
+    };
+    let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
+        Ok(text) => text,
+        Err(e) => {
+            return Err(Box::new(refused(
+                "vendor_lockfile_missing",
+                format!("cannot read {PNPM_LOCK}: {e} — run `pnpm install` first"),
+            )));
+        }
+    };
+    let grammar = match sniff_lock_grammar(&lock_text) {
+        Ok(PnpmLockGrammar::V9) => {
+            // Router bug guard: v9 locks belong to the v9 backend.
+            return Err(Box::new(refused(
+                "vendor_lockfile_version_unsupported",
+                format!("{PNPM_LOCK} is a lockfileVersion 9.0 lock; not a legacy grammar"),
+            )));
+        }
+        Ok(g) => g,
+        Err(detail) => {
+            return Err(Box::new(refused(
+                "vendor_lockfile_version_unsupported",
+                detail,
+            )))
+        }
+    };
+    // CRLF fails closed exactly like the v9 backend: every structural probe
+    // below is byte-exact on LF lines.
+    if lock_text.contains('\r') {
+        return Err(Box::new(refused(
+            "vendor_lockfile_crlf_unsupported",
+            format!(
+                "{PNPM_LOCK} has CRLF line endings, which this rewriter cannot edit \
+                 byte-faithfully — normalize the file to LF (re-run `pnpm install`, \
+                 or add `pnpm-lock.yaml text eol=lf` to .gitattributes and re-checkout) \
+                 and retry"
+            ),
+        )));
+    }
+    let lines = split_lines(&lock_text);
+
+    // Legacy WORKSPACE locks nest everything under `importers:` — a shape
+    // with no captured fixtures. Fail closed with the upgrade path.
+    if section_bounds(&lines, "importers").is_some() {
+        return Err(Box::new(refused(
+            "vendor_lock_entry_unsupported",
+            format!(
+                "{PNPM_LOCK} is a {} WORKSPACE lock (importers: section); the legacy \
+                 pair surgery only supports single-package locks — upgrade to pnpm >= 9 \
+                 (its lockfileVersion 9.0 workspace grammar is supported) and re-lock",
+                grammar.describe()
+            ),
+        )));
+    }
+
+    // pnpm <= 8 absolutizes file: override prefs against the project root
+    // (module doc §3), so the specifier splice needs the canonical absolute
+    // path — the same one pnpm's own process.cwd() yields. On Windows,
+    // `canonicalize` returns a VERBATIM path (`\\?\C:\...`) that pnpm never
+    // emits; `normalize_canonical_root` rewrites it to the pnpm spelling so
+    // the embedded specifier doesn't churn the lock on the next install
+    // (which would fail `--frozen-lockfile`, contradicting the
+    // `vendor_pnpm_legacy_absolute_specifier` warning below).
+    let abs_root = match std::fs::canonicalize(project_root) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(Box::new(refused(
+                "vendor_lock_entry_unsupported",
+                format!(
+                    "cannot canonicalize the project root ({e}) — the pnpm <= 8 lock \
+                     records the override specifier as an absolute path"
+                ),
+            )));
+        }
+    };
+    let abs_root = normalize_canonical_root(&abs_root.display().to_string());
+    Ok(LegacyProject {
+        pkg_bytes,
+        pkg,
+        lines,
+        grammar,
+        abs_root,
+    })
+}
+
+/// The per-package pre-flight against an already-read project: override
+/// conflicts on both surfaces, every reference rewritable, the packages
+/// entry present. `Ok` is the override key both surfaces edit. Nothing
+/// here reads the package's source or asks the service, so the download
+/// plan evaluates it ahead of the loop.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn preflight_package(
+    project: &LegacyProject,
+    name: &str,
+    version: &str,
+    rel_tgz: &str,
+    spec: &str,
+    abs_spec: &str,
+    override_key: &str,
+) -> Result<String, Box<VendorOutcome>> {
+    let disposition = match classify_pkg_override(&project.pkg, name, version, override_key) {
+        Ok(d) => d,
+        Err(detail) => return Err(Box::new(refused("vendor_override_conflict", detail))),
+    };
+    let effective_key = disposition.effective_key(override_key).to_string();
+    if let Err(detail) = check_lock_override(&project.lines, name, version, &effective_key) {
+        return Err(Box::new(refused("vendor_override_conflict", detail)));
+    }
+    let ctx = Ctx {
+        grammar: project.grammar,
+        name,
+        version,
+        rel_tgz,
+        spec,
+        abs_spec,
+        integrity: "", // filled after packing; pre-flight never reads it
+        override_key: &effective_key,
+    };
+    // Refs guard FIRST: a peer-suffixed packages key is also not the plain
+    // registry key, and "entry not found" would misdiagnose that shape.
+    if let Err(detail) = check_rewritable_refs(&project.lines, &ctx) {
+        return Err(Box::new(refused("vendor_lock_entry_unsupported", detail)));
+    }
+    if !lock_has_target_package(&project.lines, &ctx) {
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_found",
+            format!(
+                "{PNPM_LOCK} has no packages entry for {name}@{version} — make sure the \
+                 package is installed and locked (`pnpm install`) before vendoring"
+            ),
+        )));
+    }
+    Ok(effective_key)
+}
+
+/// Which of `packages` [`vendor_pnpm_legacy`] would refuse before its
+/// first service call, from one read of the project; see
+/// [`super::npm_flavor::preflight_packages`].
+pub(crate) async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    gate_packages(
+        read_project(project_root)
+            .await
+            .map_err(|o| refusal_code(&o)),
+        packages,
+        |project, coords| {
+            let (name, version) = (coords.name.as_str(), coords.version.as_str());
+            let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
+            let spec = format!("file:{rel_tgz}");
+            let abs_spec = format!("file:{}/{rel_tgz}", project.abs_root);
+            let override_key = format!("{name}@{version}");
+            preflight_package(
+                project,
+                name,
+                version,
+                &rel_tgz,
+                &spec,
+                &abs_spec,
+                &override_key,
+            )
+            .map(drop)
+            .map_err(|o| refusal_code(&o))
+        },
+    )
+}
+
 /// Is this legacy-vendored entry still consumed by the lock? `Some(true)`
 /// when a `packages:` block is keyed by the entry's artifact path;
 /// `Some(false)` when the lock parses as a legacy grammar and carries none
@@ -759,7 +879,7 @@ fn check_rewritable_refs(lines: &[String], ctx: &Ctx<'_>) -> Result<(), String> 
                 }
             } else {
                 k += 1;
-                rest
+                rest.to_string()
             };
             if value == reg_key || value.starts_with(&key_peer_prefix) {
                 return refuse("an aliased root dependency", &value);
@@ -781,10 +901,10 @@ fn check_rewritable_refs(lines: &[String], ctx: &Ctx<'_>) -> Result<(), String> 
                     continue;
                 };
                 if rest == reg_key || rest.starts_with(&key_peer_prefix) {
-                    return refuse("an aliased dependency reference", &rest);
+                    return refuse("an aliased dependency reference", rest);
                 }
                 if dep == ctx.name && rest.starts_with(&val_peer_prefix) {
-                    return refuse("a peer-suffixed dependency reference", &rest);
+                    return refuse("a peer-suffixed dependency reference", rest);
                 }
             }
             i = block.end;
@@ -810,9 +930,9 @@ fn dep_field_lines(
         let Some((field, _repr, fval)) = parse_key_line(&lines[f], indent) else {
             break;
         };
-        match field.as_str() {
-            "specifier" => spec = Some((f, fval)),
-            "version" => ver = Some((f, fval)),
+        match field {
+            "specifier" => spec = Some((f, fval.to_string())),
+            "version" => ver = Some((f, fval.to_string())),
             _ => {}
         }
         f += 1;
@@ -838,7 +958,8 @@ fn edit_overrides(
             if let Some((key, repr, rest)) = parse_key_line(line, 2) {
                 last_entry = i;
                 if key == our_key {
-                    ours = Some((i, repr, rest));
+                    // Owned: the rewrite below splices `lines[i]`.
+                    ours = Some((i, repr.to_string(), rest.to_string()));
                     break;
                 }
             }
@@ -918,22 +1039,25 @@ fn edit_root_deps_v54(
                 hit = true; // in sync
                 continue;
             }
-            let target = rest == ctx.version || ctx.is_ours(&rest);
+            let target = rest == ctx.version || ctx.is_ours(rest);
             if !target {
                 continue;
             }
             hit = true;
-            let was_ours = ctx.is_ours(&rest);
-            let original = (!was_ours).then(|| Value::String(rest.clone()));
-            *line = format!("  {}: {}", yaml_key_like(&dep, &repr), ctx.spec);
-            wiring.push(WiringRecord {
+            let was_ours = ctx.is_ours(rest);
+            let original = (!was_ours).then(|| Value::String(rest.to_string()));
+            // Built before the splice below: `dep`/`repr` borrow `*line`.
+            let record = WiringRecord {
                 file: PNPM_LOCK.to_string(),
                 kind: KIND_LOCK_ROOT_DEP.to_string(),
                 action: WiringAction::Rewritten,
                 key: Some(format!("{section}|{dep}")),
                 original,
                 new: Some(Value::String(ctx.spec.to_string())),
-            });
+            };
+            let rewritten = format!("  {}: {}", yaml_key_like(dep, repr), ctx.spec);
+            *line = rewritten;
+            wiring.push(record);
             changed = true;
         }
     }
@@ -963,16 +1087,19 @@ fn edit_specifier_v54(
         }
         // Ours at a stale root/uuid (a moved checkout being re-vendored) has
         // no original; anything else is the user's range, recorded.
-        let original = (!ctx.is_ours(&rest)).then(|| Value::String(rest.clone()));
-        *line = format!("  {}: {}", yaml_key_like(&key, &repr), ctx.abs_spec);
-        wiring.push(WiringRecord {
+        let original = (!ctx.is_ours(rest)).then(|| Value::String(rest.to_string()));
+        // Built before the splice below: `key`/`repr` borrow `*line`.
+        let record = WiringRecord {
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_SPECIFIER.to_string(),
             action: WiringAction::Rewritten,
-            key: Some(key),
+            key: Some(key.to_string()),
             original,
             new: Some(Value::String(ctx.abs_spec.to_string())),
-        });
+        };
+        let rewritten = format!("  {}: {}", yaml_key_like(key, repr), ctx.abs_spec);
+        *line = rewritten;
+        wiring.push(record);
         return Ok(true);
     }
     Ok(false)
@@ -1012,9 +1139,8 @@ fn edit_root_deps_v60(
                         continue; // in sync
                     }
                     let was_ours = ctx.is_ours(&old_ver);
-                    lines[si] = format!("    specifier: {}", ctx.abs_spec);
-                    lines[vi] = format!("    version: {}", ctx.spec);
-                    wiring.push(WiringRecord {
+                    // Built before the splices below: `dep` borrows `lines[k]`.
+                    let record = WiringRecord {
                         file: PNPM_LOCK.to_string(),
                         kind: KIND_LOCK_ROOT_DEP_PAIR.to_string(),
                         action: WiringAction::Rewritten,
@@ -1031,7 +1157,10 @@ fn edit_root_deps_v60(
                             "specifier": ctx.abs_spec,
                             "version": ctx.spec,
                         })),
-                    });
+                    };
+                    lines[si] = format!("    specifier: {}", ctx.abs_spec);
+                    lines[vi] = format!("    version: {}", ctx.spec);
+                    wiring.push(record);
                     changed = true;
                 }
             }
@@ -1095,7 +1224,7 @@ fn edit_packages(
         let mut replaced_resolution = false;
         for line in &original_lines[1..] {
             if let Some((field, _repr, _rest)) = parse_key_line(line, 4) {
-                match field.as_str() {
+                match field {
                     "resolution" => {
                         new_lines.push(expected_resolution.clone());
                         new_lines.push(format!("    name: {}", ctx.name));
@@ -1163,8 +1292,8 @@ fn edit_pkg_dep_refs(
         let mut in_dep_map = false;
         for line in lines[block.header + 1..block.end].iter_mut() {
             if let Some((field, _repr, rest)) = parse_key_line(line, 4) {
-                in_dep_map = rest.is_empty()
-                    && matches!(field.as_str(), "dependencies" | "optionalDependencies");
+                in_dep_map =
+                    rest.is_empty() && matches!(field, "dependencies" | "optionalDependencies");
                 continue;
             }
             if !in_dep_map {
@@ -1176,13 +1305,13 @@ fn edit_pkg_dep_refs(
             if dep != ctx.name {
                 continue;
             }
-            let target = rest == ctx.version || (rest != ctx.spec && ctx.is_ours(&rest));
+            let target = rest == ctx.version || (rest != ctx.spec && ctx.is_ours(rest));
             if !target {
                 continue;
             }
-            let was_ours = ctx.is_ours(&rest);
-            *line = format!("      {}: {}", yaml_key(&dep), ctx.spec);
-            wiring.push(WiringRecord {
+            let was_ours = ctx.is_ours(rest);
+            // Built before the splice below: `dep`/`rest` borrow `*line`.
+            let record = WiringRecord {
                 file: PNPM_LOCK.to_string(),
                 kind: KIND_LOCK_PKG_DEP_REF.to_string(),
                 action: WiringAction::Rewritten,
@@ -1190,10 +1319,13 @@ fn edit_pkg_dep_refs(
                 original: if was_ours {
                     None
                 } else {
-                    Some(Value::String(rest.clone()))
+                    Some(Value::String(rest.to_string()))
                 },
                 new: Some(Value::String(ctx.spec.to_string())),
-            });
+            };
+            let rewritten = format!("      {}: {}", yaml_key(dep), ctx.spec);
+            *line = rewritten;
+            wiring.push(record);
             changed = true;
         }
         i = block.end;
@@ -1527,11 +1659,11 @@ fn revert_value_line(
         // pre-vendor original — an earlier partial revert (or the user, by
         // hand) already restored it. Not drift: stay silent so the
         // drift-skip keep gate can converge.
-        if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+        if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
             return;
         }
-        let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
-            || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+        let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
+            || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
                 "{section} entry `{dep}` was changed since vendoring ({rest}); left alone"
@@ -1545,7 +1677,7 @@ fn revert_value_line(
             )));
             return;
         };
-        *line = format!("  {}: {orig}", yaml_key_like(dep, &repr));
+        *line = format!("  {}: {orig}", yaml_key_like(dep, repr));
         *dirty = true;
         return;
     }
@@ -1676,7 +1808,7 @@ fn revert_package_block(
         }
         let live: Vec<String> = lines[block.header..block.end].to_vec();
         let key_is_ours =
-            parse_vendor_path(&new_key).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+            parse_vendor_path(new_key).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if live != new_lines && !key_is_ours {
             warnings.push(drifted(format!(
                 "packages entry `{new_key}` was changed since vendoring; left alone"
@@ -1696,7 +1828,7 @@ fn revert_package_block(
             )));
             return;
         };
-        if swap_block_sorted(lines, "packages", &new_key, &orig_key, &original).is_err() {
+        if swap_block_sorted(lines, "packages", new_key, orig_key, &original).is_err() {
             warnings.push(drifted(format!(
                 "packages entry `{new_key}` vanished mid-restore; left alone"
             )));
@@ -1753,8 +1885,8 @@ fn revert_pkg_dep_ref(
         let mut in_dep_map = false;
         for line in lines[block.header + 1..block.end].iter_mut() {
             if let Some((field, _repr, rest)) = parse_key_line(line, 4) {
-                in_dep_map = rest.is_empty()
-                    && matches!(field.as_str(), "dependencies" | "optionalDependencies");
+                in_dep_map =
+                    rest.is_empty() && matches!(field, "dependencies" | "optionalDependencies");
                 continue;
             }
             if !in_dep_map {
@@ -1769,11 +1901,11 @@ fn revert_pkg_dep_ref(
             // ALREADY CONVERGED: the live ref already equals the recorded
             // pre-vendor original — an earlier partial revert (or the
             // user, by hand) already restored it. Not drift.
-            if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+            if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
                 return;
             }
-            let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
-                || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+            let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
+                || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
             if !ours {
                 warnings.push(drifted(format!(
                     "dep ref `{key}` was re-resolved since vendoring ({rest}); left alone"
@@ -4941,5 +5073,108 @@ packages:
             1,
         )
         .await;
+    }
+
+    // ── download-plan pre-flight parity ───────────────────────────────────
+
+    /// `(the plan's verdict, the loop's own outcome)` for the fixture's
+    /// package — the pre-flight first, since a successful vendor rewrites
+    /// the project it would then read.
+    async fn preflight_then_vendor(
+        fx: &Fixture,
+    ) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let planned = preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)])
+            .await
+            .remove(0);
+        let looped = match fx.vendor(false).await {
+            VendorOutcome::Refused { code, .. } => Err(code),
+            VendorOutcome::Done { .. } => Ok(()),
+        };
+        (planned, looped)
+    }
+
+    /// The vendor loop's download plan gates each package with this
+    /// backend's own pre-flight (`preflight_packages`); see the v9 twin.
+    /// Same code wherever the loop refuses, admitted wherever it vendors.
+    #[tokio::test]
+    async fn preflight_agrees_with_the_loop_on_every_pre_service_refusal() {
+        let (planned, looped) =
+            preflight_then_vendor(&fixture_with(T_BEFORE_PKG, T8_BEFORE_LOCK).await).await;
+        assert_eq!(
+            (planned, looped),
+            (Ok(()), Ok(())),
+            "the plain fixture vendors"
+        );
+
+        let conflicting_pkg = r#"{
+  "name": "legacy-spike2",
+  "dependencies": { "left-pad": "1.3.0" },
+  "pnpm": { "overrides": { "left-pad": "^1.0.0" } }
+}
+"#;
+        let peer_suffixed =
+            T8_BEFORE_LOCK.replace("/left-pad@1.3.0:", "/left-pad@1.3.0(react@18.2.0):");
+        let aliased = T8_BEFORE_LOCK.replace(
+            "    version: /left-pad@1.2.0",
+            "    version: /left-pad@1.3.0",
+        );
+        let absent = T8_BEFORE_LOCK.replace("/left-pad@1.3.0:", "/left-pad@1.3.1:");
+        let v9 = T8_BEFORE_LOCK.replace("lockfileVersion: '6.0'", "lockfileVersion: '9.0'");
+        let workspace = "lockfileVersion: '6.0'
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+";
+        let cases: [(&str, &str, &str, &str); 6] = [
+            (
+                "peer-suffixed packages key",
+                T_BEFORE_PKG,
+                &peer_suffixed,
+                "vendor_lock_entry_unsupported",
+            ),
+            (
+                "aliased root dep",
+                T_BEFORE_PKG,
+                &aliased,
+                "vendor_lock_entry_unsupported",
+            ),
+            (
+                "user override",
+                conflicting_pkg,
+                T8_BEFORE_LOCK,
+                "vendor_override_conflict",
+            ),
+            (
+                "absent entry",
+                T_BEFORE_PKG,
+                &absent,
+                "vendor_lock_entry_not_found",
+            ),
+            (
+                "workspace lock",
+                T_BEFORE_PKG,
+                workspace,
+                "vendor_lock_entry_unsupported",
+            ),
+            (
+                "v9 lock routed here",
+                T_BEFORE_PKG,
+                &v9,
+                "vendor_lockfile_version_unsupported",
+            ),
+        ];
+        for (label, pkg, lock, code) in cases {
+            let (planned, looped) = preflight_then_vendor(&fixture_with(pkg, lock).await).await;
+            assert_eq!(looped, Err(code), "{label}: the loop's own refusal");
+            assert_eq!(
+                planned, looped,
+                "{label}: the plan must refuse as the loop does"
+            );
+        }
     }
 }

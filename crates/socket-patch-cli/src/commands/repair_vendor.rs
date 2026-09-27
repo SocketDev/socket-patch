@@ -112,7 +112,9 @@ const WIRING_FILES: &[&str] = &[
     "package.json",
     "Cargo.toml",
     "Cargo.lock",
+    // Pre-v5 vendored cargo wiring (migrated into Cargo.toml on re-run).
     ".cargo/config.toml",
+    ".cargo/config",
     "go.mod",
     "composer.json",
     "composer.lock",
@@ -715,6 +717,56 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             );
             continue;
         }
+        // Pre-v5 cargo wiring in `.cargo/config*`: move it into the root
+        // Cargo.toml (the v5 location) and record the move in the ledger —
+        // or restore the manifest entry a pre-v5 multi-version vendor lost —
+        // and tag an untagged copy + lock entry with the patch uuid.
+        let entry = if entry.ecosystem == "cargo" {
+            match vendor::cargo::migrate_legacy_wiring(&entry, &common.cwd, common.dry_run).await {
+                Ok(Some((migrated, warnings))) => {
+                    for warning in &warnings {
+                        record_warning(env, purl, warning, common);
+                    }
+                    if common.dry_run {
+                        entry
+                    } else if persist_vendor_entry(
+                        common,
+                        env,
+                        &mut state,
+                        purl,
+                        migrated.clone(),
+                        entry.detached,
+                        &record,
+                    )
+                    .await
+                    {
+                        continue;
+                    } else {
+                        migrated
+                    }
+                }
+                Ok(None) => entry,
+                Err(detail) => {
+                    record_warning(
+                        env,
+                        purl,
+                        &VendorWarning::new(
+                            "cargo_legacy_wiring_kept",
+                            format!(
+                                "the vendored wiring for {} could not be written into \
+                                 Cargo.toml ({detail}); any pre-v5 .cargo/config wiring was \
+                                 left in place",
+                                normalize_purl(purl)
+                            ),
+                        ),
+                        common,
+                    );
+                    entry
+                }
+            }
+        } else {
+            entry
+        };
         let health = check_vendored_artifact(&common.cwd, &entry, &record).await;
         if health == ArtifactHealth::Healthy || workspace_copy_issue(&health) {
             let mut healed = entry.clone();
@@ -1311,9 +1363,32 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             _ => None,
         };
         match pristine {
+            // Repair always rebuilds locally, so the pristine tree is read
+            // either way: materialise it right here, where an extraction
+            // failure is still the fetch failure it was before the write
+            // moved off the fetch.
             PristineFetch::Fetched(fetched) => {
-                all_packages.insert(c.purl.clone(), fetched.dir().to_path_buf());
-                holders.push(fetched);
+                match fetched.dir().await.map(std::path::Path::to_path_buf) {
+                    Ok(dir) => {
+                        all_packages.insert(c.purl.clone(), dir);
+                        holders.push(fetched);
+                    }
+                    Err(detail) => {
+                        if c.soft {
+                            soft_restore_without_fingerprint(
+                                env,
+                                common,
+                                &c.purl,
+                                &c.entry.artifact.path,
+                                &format!("the pristine fetch failed ({detail})"),
+                            );
+                            rebuilt += 1;
+                        } else {
+                            fail(env, common.json, &c.purl, "vendor_fetch_failed", detail);
+                        }
+                        unrebuildable.insert(c.purl.clone());
+                    }
+                }
             }
             PristineFetch::NoSource | PristineFetch::Unverifiable(_) => {
                 // Last rung (npm): the REWIRED lockfile still records the
@@ -1331,10 +1406,23 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                                 .await
                             {
                                 Ok(fetched) => {
-                                    all_packages
-                                        .insert(c.purl.clone(), fetched.dir().to_path_buf());
-                                    holders.push(fetched);
-                                    must_verify.insert(c.purl.clone(), wired);
+                                    match fetched.dir().await.map(std::path::Path::to_path_buf) {
+                                        Ok(dir) => {
+                                            all_packages.insert(c.purl.clone(), dir);
+                                            holders.push(fetched);
+                                            must_verify.insert(c.purl.clone(), wired);
+                                        }
+                                        Err(d) => {
+                                            fail(
+                                                env,
+                                                common.json,
+                                                &c.purl,
+                                                "vendor_fetch_failed",
+                                                d,
+                                            );
+                                            unrebuildable.insert(c.purl.clone());
+                                        }
+                                    }
                                     continue;
                                 }
                                 Err(registry_fetch::FetchError::Failed(d))
@@ -1405,6 +1493,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     // ── Rebuild via the normal backends ──────────────────────────────────
     let vendored_at = now_rfc3339();
     let pipenv_version = tokio::sync::OnceCell::new();
+    let installed_sites = socket_patch_core::vendor::pypi::InstalledSiteListings::default();
     for c in candidates {
         if unrebuildable.contains(&c.purl) {
             continue;
@@ -1477,7 +1566,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             };
         let outcome = dispatch_vendor_one(
             &c.purl,
-            &pkg_path,
+            pkg_path.as_path().into(),
             &common.cwd,
             &c.record,
             &sources,
@@ -1487,6 +1576,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             // Repair rebuilds locally from the recorded patch — no service.
             None,
             &pipenv_version,
+            &installed_sites,
         )
         .await;
         match outcome {
@@ -1637,8 +1727,11 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 // here would delete the rebuild, strand the wired pair on a
                 // dead dir, and deterministically re-fail every later
                 // repair — so refresh the inventory from the verified
-                // rebuild instead, loudly.
-                if !from_backend
+                // rebuild instead, loudly. A backend entry whose inventory
+                // is the repaired entry's own (carried forward — the cargo
+                // backend records none) is the same case.
+                if (!from_backend
+                    || check_entry.artifact.file_inventory == c.entry.artifact.file_inventory)
                     && !c.reconstructed
                     && matches!(&health, ArtifactHealth::Corrupt { reason }
                         if reason == "vendor_inventory_mismatch")

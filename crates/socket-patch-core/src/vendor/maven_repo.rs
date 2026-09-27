@@ -56,7 +56,7 @@
 //! artifact never leaves a dangling `<repository>`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -69,16 +69,16 @@ use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::{
-    atomic_write_bytes, atomic_write_bytes_preserving_mode, read_regular_to_bytes,
+    atomic_write_artifact, atomic_write_bytes_preserving_mode, read_regular_to_bytes,
     read_regular_to_string,
 };
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, any_live_file_references, done, failed_result,
+    already_patched_result, any_live_file_references, done, failed_result, prepare_memory_repack,
     prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
-    zip_bytes_match_after_hashes,
+    write_zip_entries, zip_bytes_match_after_hashes, MemoryRepack, Stage,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -141,6 +141,178 @@ fn group_id_to_path(group_id: &str) -> String {
     group_id.replace('.', "/")
 }
 
+/// Everything [`vendor_maven`] decides before it can first ask the patch
+/// service: the coordinate guards, the no-op of an empty patch, the project
+/// pom.xml refusals, and whether pom.xml already wires an in-sync artifact.
+/// The download plan evaluates the same function ahead of the vendor loop
+/// ([`service_preflight`]).
+struct MavenPrelude {
+    group_id: String,
+    artifact_id: String,
+    version: String,
+    uuid_dir_rel: String,
+    group_path: String,
+    leaf_rel: String,
+    jar_leaf: String,
+    pom_leaf: String,
+    jar_copy_rel: String,
+    uuid_dir: PathBuf,
+    leaf_dir: PathBuf,
+    jar_path: PathBuf,
+    repo_id: String,
+    pom_xml_path: PathBuf,
+    pom_xml_text: String,
+    /// pom.xml already carries this uuid's `<repository>`.
+    wired: bool,
+    /// ...and the committed jar/pom/sidecars are in sync (the hot path,
+    /// which never asks the service).
+    in_sync: bool,
+}
+
+async fn maven_prelude(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Result<MavenPrelude, VendorOutcome> {
+    // ── coordinates ──────────────────────────────────────────────────────
+    let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("not a maven purl: {purl}"),
+        ));
+    };
+    let (group_id, artifact_id, version) = (
+        group_id.to_string(),
+        artifact_id.to_string(),
+        version.to_string(),
+    );
+    let (group_id, artifact_id, version) =
+        (group_id.as_str(), artifact_id.as_str(), version.as_str());
+    // SECURITY: `uuid`, `group_id`, `artifact_id`, and `version` come from
+    // committed, tamper-able manifest data. They key the uuid dir vendor
+    // creates and `--revert` deletes, the nested maven2 path, the vendored
+    // filenames, and — via `pom.xml` — an XML attribute value. Reject anything
+    // that could traverse out of `.socket/vendor/maven/` fail-closed before any
+    // disk access.
+    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("maven", &record.uuid) else {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("non-canonical patch uuid {:?}", record.uuid),
+        ));
+    };
+    // Each dot-delimited groupId segment must be a safe path segment on its
+    // own (which also rejects an empty groupId and leading/trailing/double
+    // dots), as must the artifactId and version.
+    if !is_safe_maven_coordinate(group_id, artifact_id, version) {
+        return Err(refused(
+            "unsafe_coordinates",
+            format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
+        ));
+    }
+
+    let group_path = group_id_to_path(group_id);
+    let leaf_rel = format!("{uuid_dir_rel}/{group_path}/{artifact_id}/{version}");
+    let jar_leaf = format!("{artifact_id}-{version}.jar");
+    let pom_leaf = format!("{artifact_id}-{version}.pom");
+    let jar_copy_rel = format!("{leaf_rel}/{jar_leaf}");
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    let leaf_dir = project_root.join(&leaf_rel);
+    // Join the full forward-slash rel rather than `leaf_dir.join(&jar_leaf)`:
+    // the joined form puts an OS separator (`\` on Windows) before the leaf
+    // while every other reported path keeps the rel's forward slashes —
+    // `package_path` reports (and tests compare) this as a display string.
+    let jar_path = project_root.join(&jar_copy_rel);
+    let repo_id = format!("{VENDOR_REPO_ID_PREFIX}{}", record.uuid);
+
+    // A patch with no files is meaningless to vendor: no-op success, no edits.
+    if record.files.is_empty() {
+        return Err(done(
+            synthesized_result(purl, &jar_path, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        ));
+    }
+
+    // ── project pom.xml: presence + aggregator/gradle refusals ────────────
+    let pom_xml_path = project_root.join(PROJECT_POM);
+    let pom_xml_text: Option<String> = match read_regular_to_string(&pom_xml_path).await {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(refused(
+                "vendor_maven_pom_unreadable",
+                format!("unreadable {}: {e}", pom_xml_path.display()),
+            ));
+        }
+    };
+    let Some(pom_xml_text) = pom_xml_text else {
+        // No project pom.xml: a gradle-only project has no <repositories> to
+        // wire (and Gradle ignores it); anything else is not a Maven project.
+        if project_has_gradle(project_root).await {
+            return Err(refused(
+                "vendor_gradle_unsupported",
+                "this is a Gradle project (no pom.xml); vendoring wires a Maven \
+                 <repository>, which Gradle does not consume",
+            ));
+        }
+        return Err(refused(
+            "vendor_maven_pom_project_missing",
+            format!("no {PROJECT_POM} at the project root to wire a vendored <repository> into"),
+        ));
+    };
+    if declares_modules(&pom_xml_text) {
+        return Err(refused(
+            "vendor_maven_multimodule_unsupported",
+            "the root pom.xml declares <modules> (a multi-module aggregator); \
+             ${project.basedir} would resolve to each submodule, not the root, so a \
+             file:// vendored repository cannot be wired here",
+        ));
+    }
+
+    let wired = pom_xml_text.contains(&repo_id);
+    let in_sync = wired && artifact_in_sync(&leaf_dir, &jar_leaf, &pom_leaf, &record.files).await;
+    Ok(MavenPrelude {
+        group_id: group_id.to_string(),
+        artifact_id: artifact_id.to_string(),
+        version: version.to_string(),
+        uuid_dir_rel,
+        group_path,
+        leaf_rel,
+        jar_leaf,
+        pom_leaf,
+        jar_copy_rel,
+        uuid_dir,
+        leaf_dir,
+        jar_path,
+        repo_id,
+        pom_xml_path,
+        pom_xml_text,
+        wired,
+        in_sync,
+    })
+}
+
+/// Whether [`vendor_maven`] — a wet run with the service enabled — asks the
+/// patch service for `record`: past every refusal it raises first and not
+/// answered by the in-sync hot path. The vendor loop's download plan
+/// consults this.
+pub(crate) async fn service_preflight(
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Option<crate::api::client::PlannedDownload> {
+    maven_prelude(purl, project_root, record)
+        .await
+        .ok()
+        .filter(|p| !p.in_sync)?;
+    // `service_archive_copy` checks the archive's members against the
+    // afterHashes before writing it verbatim.
+    Some(crate::api::client::PlannedDownload {
+        stage: Some(super::prestage::PrestageRecipe::verify_zip(&record.files)),
+        ..crate::api::client::PlannedDownload::archive(record.uuid.clone())
+    })
+}
+
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
 /// repository at `.socket/vendor/maven/<uuid>/`, copy the real upstream pom
 /// beside it, and wire the project `pom.xml` with a `<repository>` serving it
@@ -161,90 +333,30 @@ pub async fn vendor_maven(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
-    // ── coordinates ──────────────────────────────────────────────────────
-    let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
-        return refused("unsafe_coordinates", format!("not a maven purl: {purl}"));
+    let MavenPrelude {
+        group_id,
+        artifact_id,
+        version,
+        uuid_dir_rel,
+        group_path,
+        leaf_rel,
+        jar_leaf,
+        pom_leaf,
+        jar_copy_rel,
+        uuid_dir,
+        leaf_dir,
+        jar_path,
+        repo_id,
+        pom_xml_path,
+        pom_xml_text,
+        wired,
+        in_sync,
+    } = match maven_prelude(purl, project_root, record).await {
+        Ok(prelude) => prelude,
+        Err(outcome) => return outcome,
     };
-    // SECURITY: `uuid`, `group_id`, `artifact_id`, and `version` come from
-    // committed, tamper-able manifest data. They key the uuid dir vendor
-    // creates and `--revert` deletes, the nested maven2 path, the vendored
-    // filenames, and — via `pom.xml` — an XML attribute value. Reject anything
-    // that could traverse out of `.socket/vendor/maven/` fail-closed before any
-    // disk access.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("maven", &record.uuid) else {
-        return refused(
-            "unsafe_coordinates",
-            format!("non-canonical patch uuid {:?}", record.uuid),
-        );
-    };
-    // Each dot-delimited groupId segment must be a safe path segment on its
-    // own (which also rejects an empty groupId and leading/trailing/double
-    // dots), as must the artifactId and version.
-    if !is_safe_maven_coordinate(group_id, artifact_id, version) {
-        return refused(
-            "unsafe_coordinates",
-            format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
-        );
-    }
-
-    let group_path = group_id_to_path(group_id);
-    let leaf_rel = format!("{uuid_dir_rel}/{group_path}/{artifact_id}/{version}");
-    let jar_leaf = format!("{artifact_id}-{version}.jar");
-    let pom_leaf = format!("{artifact_id}-{version}.pom");
-    let jar_copy_rel = format!("{leaf_rel}/{jar_leaf}");
-    let uuid_dir = project_root.join(&uuid_dir_rel);
-    let leaf_dir = project_root.join(&leaf_rel);
-    // Join the full forward-slash rel rather than `leaf_dir.join(&jar_leaf)`:
-    // the joined form puts an OS separator (`\` on Windows) before the leaf
-    // while every other reported path keeps the rel's forward slashes —
-    // `package_path` reports (and tests compare) this as a display string.
-    let jar_path = project_root.join(&jar_copy_rel);
-    let repo_id = format!("{VENDOR_REPO_ID_PREFIX}{}", record.uuid);
-
-    // A patch with no files is meaningless to vendor: no-op success, no edits.
-    if record.files.is_empty() {
-        return done(
-            synthesized_result(purl, &jar_path, Vec::new(), true, None),
-            None,
-            Vec::new(),
-        );
-    }
-
-    // ── project pom.xml: presence + aggregator/gradle refusals ────────────
-    let pom_xml_path = project_root.join(PROJECT_POM);
-    let pom_xml_text: Option<String> = match read_regular_to_string(&pom_xml_path).await {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return refused(
-                "vendor_maven_pom_unreadable",
-                format!("unreadable {}: {e}", pom_xml_path.display()),
-            );
-        }
-    };
-    let Some(pom_xml_text) = pom_xml_text else {
-        // No project pom.xml: a gradle-only project has no <repositories> to
-        // wire (and Gradle ignores it); anything else is not a Maven project.
-        if project_has_gradle(project_root).await {
-            return refused(
-                "vendor_gradle_unsupported",
-                "this is a Gradle project (no pom.xml); vendoring wires a Maven \
-                 <repository>, which Gradle does not consume",
-            );
-        }
-        return refused(
-            "vendor_maven_pom_project_missing",
-            format!("no {PROJECT_POM} at the project root to wire a vendored <repository> into"),
-        );
-    };
-    if declares_modules(&pom_xml_text) {
-        return refused(
-            "vendor_maven_multimodule_unsupported",
-            "the root pom.xml declares <modules> (a multi-module aggregator); \
-             ${project.basedir} would resolve to each submodule, not the root, so a \
-             file:// vendored repository cannot be wired here",
-        );
-    }
+    let (group_id, artifact_id, version) =
+        (group_id.as_str(), artifact_id.as_str(), version.as_str());
 
     // The local-cache shadow is inherent to Maven's resolution order, so the
     // advisory is emitted on every run (including dry runs and the idempotent
@@ -256,8 +368,8 @@ pub async fn vendor_maven(
     // sidecars are all in sync → touch nothing, report AlreadyPatched. `entry`
     // stays `None`: the first run's ledger entry holds the only copy of the
     // verbatim pre-vendor pom.xml, and re-recording here would clobber it.
-    if pom_xml_text.contains(&repo_id) {
-        if artifact_in_sync(&leaf_dir, &jar_leaf, &pom_leaf, &record.files).await {
+    if wired {
+        if in_sync {
             return done(
                 already_patched_result(purl, &jar_path, &record.files),
                 None,
@@ -656,9 +768,10 @@ async fn materialise_and_write(
 }
 
 /// Local rebuild: locate the cached pristine `<a>-<v>.jar` in `installed_dir`,
-/// extract it to a private stage, force-apply the patch, and re-zip
-/// deterministically. Returns `(bytes, ApplyResult)`; a failure surfaces as an
-/// un-successful `ApplyResult`, or a refusal to bubble.
+/// read it for a private stage — only the paths the apply pipeline resolves
+/// are materialised there, see [`stage_local_jar`] — force-apply the patch,
+/// and re-zip deterministically. Returns `(bytes, ApplyResult)`; a failure
+/// surfaces as an un-successful `ApplyResult`, or a refusal to bubble.
 #[allow(clippy::too_many_arguments)]
 async fn local_rebuild_jar(
     purl: &str,
@@ -686,8 +799,8 @@ async fn local_rebuild_jar(
             ),
         )));
     }
-    let stage = match extract_jar_to_stage(&src_jar).await {
-        Ok(stage) => stage,
+    let JarStage { stage, repack } = match stage_local_jar(&src_jar, &record.files).await {
+        Ok(staged) => staged,
         Err(e) => return Ok((Vec::new(), failed_result(purl, jar_path, e))),
     };
 
@@ -704,30 +817,42 @@ async fn local_rebuild_jar(
     )
     .await;
     if !result.success {
+        stage.dispose().await;
         return Ok((Vec::new(), result));
     }
 
-    // Deterministic re-zip of the patched stage (a jar is a plain zip; a
-    // dependency resolve reads the central directory, so lexicographic entry
-    // order + fixed timestamps yield stable bytes across re-runs).
-    let stage_path = stage.path().to_path_buf();
-    let rezip = tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, None)).await;
-    let jar_bytes = match rezip {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            return Ok((
-                Vec::new(),
-                failed_result(purl, jar_path, format!("jar re-zip failed: {e}")),
-            ))
+    let rebuilt = rebuild_jar_bytes(repack, stage.path()).await;
+    stage.dispose().await;
+    match rebuilt {
+        Ok(jar_bytes) => Ok((jar_bytes, result)),
+        Err(e) => Ok((Vec::new(), failed_result(purl, jar_path, e))),
+    }
+}
+
+/// Deterministic re-zip of the patched stage (a jar is a plain zip; a
+/// dependency resolve reads the central directory, so lexicographic entry
+/// order + fixed timestamps yield stable bytes across re-runs). The in-memory
+/// repack assembles the same entry list from the members it never wrote out;
+/// an archive that had to be extracted is walked as before.
+async fn rebuild_jar_bytes(repack: Option<MemoryRepack>, stage: &Path) -> Result<Vec<u8>, String> {
+    let rezip = match repack {
+        Some(repack) => {
+            let entries = repack
+                .into_entries(stage, None)
+                .await
+                .map_err(|e| format!("jar re-zip failed: {e}"))?;
+            tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await
         }
-        Err(e) => {
-            return Ok((
-                Vec::new(),
-                failed_result(purl, jar_path, format!("jar re-zip task failed: {e}")),
-            ))
+        None => {
+            let stage_path = stage.to_path_buf();
+            tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, None)).await
         }
     };
-    Ok((jar_bytes, result))
+    match rezip {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(format!("jar re-zip failed: {e}")),
+        Err(e) => Err(format!("jar re-zip task failed: {e}")),
+    }
 }
 
 /// Acquire the REAL upstream pom bytes: the cached `~/.m2` copy first (the
@@ -833,8 +958,8 @@ async fn dry_run_verify(
             ),
         );
     }
-    let stage = match extract_jar_to_stage(&src_jar).await {
-        Ok(stage) => stage,
+    let JarStage { stage, .. } = match stage_local_jar(&src_jar, &record.files).await {
+        Ok(staged) => staged,
         Err(e) => return failed_result(purl, jar_path, e),
     };
     let mut result = super::force_apply_staged(
@@ -849,24 +974,42 @@ async fn dry_run_verify(
         warnings,
     )
     .await;
+    stage.dispose().await;
     result.package_path = jar_path.display().to_string();
     result
 }
 
 // ── artifact helpers ─────────────────────────────────────────────────────────────
 
-/// Extract a jar (a plain zip; content at the archive root — no strip) into a
-/// fresh tempdir. `extract_zip` is traversal-guarded and refuses an escaping
-/// entry fail-closed. Returns the live [`tempfile::TempDir`] (the caller holds
-/// it for the stage's lifetime).
-async fn extract_jar_to_stage(src_jar: &Path) -> Result<tempfile::TempDir, String> {
+/// The stage a local jar rebuild (or its dry-run preview) applies into: the
+/// live [`Stage`] the caller holds for its lifetime, plus the in-memory
+/// members when the repack could stay off disk.
+struct JarStage {
+    stage: Stage,
+    repack: Option<MemoryRepack>,
+}
+
+/// Read a jar (a plain zip; content at the archive root — no strip) for a
+/// local rebuild. `prepare_memory_repack` keeps the members in memory and
+/// materialises only the paths the apply pipeline resolves; a jar whose entry
+/// names a filesystem could fold together or re-spell is extracted whole
+/// instead, the shape this one is defined against. Both are traversal-guarded
+/// and refuse an escaping entry fail-closed, with the same message.
+async fn stage_local_jar(
+    src_jar: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Result<JarStage, String> {
     let bytes = read_regular_to_bytes(src_jar)
         .await
         .map_err(|e| format!("cannot read {}: {e}", src_jar.display()))?;
-    let stage = tempfile::tempdir().map_err(|e| format!("cannot create stage dir: {e}"))?;
-    extract_zip(&bytes, stage.path(), /*strip_first=*/ false)
-        .map_err(|e| format!("cannot extract {}: {e}", src_jar.display()))?;
-    Ok(stage)
+    let stage = Stage::new().map_err(|e| format!("cannot create stage dir: {e}"))?;
+    let unreadable = |e| format!("cannot extract {}: {e}", src_jar.display());
+    let repack = prepare_memory_repack(&bytes, files, &[]).map_err(unreadable)?;
+    match &repack {
+        Some(repack) => repack.stage_into(stage.path()).await.map_err(unreadable)?,
+        None => extract_zip(&bytes, stage.path(), /*strip_first=*/ false).map_err(unreadable)?,
+    }
+    Ok(JarStage { stage, repack })
 }
 
 /// Write the jar + pom + their `.sha1` sidecars into the maven2 leaf dir,
@@ -883,11 +1026,11 @@ async fn write_maven_artifact(
         .map_err(|e| format!("cannot create {}: {e}", leaf_dir.display()))?;
     for (leaf, bytes) in [(jar_leaf, jar_bytes), (pom_leaf, pom_bytes)] {
         let path = leaf_dir.join(leaf);
-        atomic_write_bytes(&path, bytes)
+        atomic_write_artifact(&path, bytes)
             .await
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         let sha1_path = leaf_dir.join(format!("{leaf}.sha1"));
-        atomic_write_bytes(&sha1_path, sha1_hex(bytes).as_bytes())
+        atomic_write_artifact(&sha1_path, sha1_hex(bytes).as_bytes())
             .await
             .map_err(|e| format!("cannot write {}: {e}", sha1_path.display()))?;
     }
@@ -1343,6 +1486,44 @@ mod tests {
         zw.finish().unwrap().into_inner()
     }
 
+    /// A jar carrying every spelling the in-memory repack and the
+    /// extract-to-disk rebuild could disagree on: a zero-length member, a
+    /// STORED (uncompressed) member, an exec-bit member, a nested tree, a
+    /// member large enough to span several read buffers, and the patch
+    /// target.
+    fn make_rich_jar(notice: &[u8]) -> Vec<u8> {
+        use zip::CompressionMethod::{Deflated, Stored};
+        let big = vec![b'z'; 3 * 1024 * 1024];
+        let entries: &[(&str, &[u8], zip::CompressionMethod, u32)] = &[
+            (
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\n",
+                Deflated,
+                0o644,
+            ),
+            (JAR_FILE, notice, Deflated, 0o644),
+            ("META-INF/empty", b"", Deflated, 0o644),
+            ("META-INF/stored.bin", b"stored bytes", Stored, 0o644),
+            ("bin/run.sh", b"#!/bin/sh\nexit 0\n", Deflated, 0o755),
+            ("org/apache/commons/text/big.bin", &big, Deflated, 0o644),
+            (
+                "org/apache/commons/text/StringSubstitutor.class",
+                b"\xca\xfe\xba\xbe-fake-class",
+                Deflated,
+                0o644,
+            ),
+        ];
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, method, mode) in entries {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(*method)
+                .unix_permissions(*mode);
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
     /// A minimal project pom.xml at the root (single-module, no <modules>).
     fn project_pom() -> &'static str {
         "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
@@ -1444,6 +1625,56 @@ mod tests {
         }
     }
 
+    /// The download plan's gate names exactly the artifacts whose vendor call
+    /// asks the patch service for a grant: not a non-canonical uuid, not the
+    /// empty patch's no-op, and — once vendored — not the in-sync re-run; a
+    /// second patch uuid for the same artifact asks again.
+    #[tokio::test]
+    async fn service_preflight_names_exactly_the_artifacts_that_ask_for_a_grant() {
+        use crate::vendor::test_support::{
+            empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
+            PLAN_UUID_B, PLAN_UUID_C,
+        };
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_no_results(&server).await;
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let sources = PatchSources::blobs_only(&blobs);
+        let cases = [
+            (PURL, record.clone()),
+            (PURL, with_uuid(&record, "not-a-uuid")),
+            (PURL, empty_patch(&record, PLAN_UUID_B)),
+            (
+                "pkg:maven/org..bad/commons-text@1.10.0",
+                with_uuid(&record, PLAN_UUID_B),
+            ),
+            (PURL, with_uuid(&record, PLAN_UUID_C)),
+        ];
+        let gate = |purl: String, rec: PatchRecord| -> Borrowed<'_, bool> {
+            Box::pin(async move { service_preflight(&purl, root, &rec).await.is_some() })
+        };
+        let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
+            let (installed, sources, cfg) = (&installed, &sources, &cfg);
+            Box::pin(async move {
+                vendor_maven(
+                    &purl,
+                    installed.as_path(),
+                    root,
+                    &rec,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    Some(cfg),
+                )
+                .await
+            })
+        };
+        let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
+        assert_eq!(planned, vec![UUID.to_string(), PLAN_UUID_C.to_string()]);
+    }
+
     async fn run_vendor(
         root: &Path,
         blobs: &Path,
@@ -1472,6 +1703,97 @@ mod tests {
         let mut out = Vec::new();
         f.read_to_end(&mut out).ok()?;
         Some(out)
+    }
+
+    /// X10 equivalence: keeping the jar's members in memory must rebuild the
+    /// EXACT bytes the extract-to-disk rebuild produced — the artifact's sha1
+    /// sidecar and every downstream pin ride on them. Driven twice over one
+    /// fixture, once with the in-memory repack forced off.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn in_memory_jar_rebuild_matches_the_on_disk_rebuild_byte_for_byte() {
+        async fn rebuild(on_disk: bool) -> Vec<u8> {
+            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let before = crate::vendor::common::in_memory_repacks();
+            let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+            tokio::fs::write(
+                installed.join("commons-text-1.10.0.jar"),
+                make_rich_jar(PRISTINE),
+            )
+            .await
+            .unwrap();
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(entry.is_some(), "a successful rebuild records an entry");
+            // Without this the comparison is vacuous: a fixture name the gate
+            // later rejects would send BOTH runs to disk and the test would
+            // keep passing while asserting nothing.
+            assert_eq!(
+                crate::vendor::common::in_memory_repacks() > before,
+                !on_disk,
+                "this run took the wrong staging path (on_disk={on_disk})"
+            );
+            tokio::fs::read(dir.path().join(jar_rel())).await.unwrap()
+        }
+
+        let fast = rebuild(false).await;
+        let oracle = rebuild(true).await;
+        assert_eq!(
+            fast, oracle,
+            "the in-memory rebuild must be byte-identical to the extracted one"
+        );
+        assert_eq!(read_jar_entry(&fast, JAR_FILE).as_deref(), Some(PATCHED));
+        assert_eq!(
+            read_jar_entry(&fast, "META-INF/empty").as_deref(),
+            Some(&[][..])
+        );
+        assert_eq!(
+            read_jar_entry(&fast, "META-INF/stored.bin").as_deref(),
+            Some(&b"stored bytes"[..])
+        );
+    }
+
+    /// A jar whose entry escapes the stage must be refused the same way
+    /// whichever staging path ran — the traversal guard is the one thing both
+    /// readers have to agree on before anything is written.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn escaping_jar_entry_fails_the_same_on_both_staging_paths() {
+        async fn rebuild(on_disk: bool) -> Option<String> {
+            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zw.start_file("../evil.class", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"pwned").unwrap();
+            let evil = zw.finish().unwrap().into_inner();
+            tokio::fs::write(installed.join("commons-text-1.10.0.jar"), evil)
+                .await
+                .unwrap();
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
+            assert!(!result.success, "an escaping entry must fail the rebuild");
+            assert!(entry.is_none());
+            assert!(
+                !dir.path().join("evil.class").exists()
+                    && !dir.path().parent().unwrap().join("evil.class").exists(),
+                "nothing may be written outside the stage"
+            );
+            // Past the fixture's own tempdir path, which differs per run.
+            result.error.map(|e| {
+                e.rsplit_once(".jar: ")
+                    .map(|(_, tail)| tail.to_string())
+                    .unwrap_or(e)
+            })
+        }
+
+        let fast = rebuild(false).await;
+        assert_eq!(fast, rebuild(true).await);
+        assert_eq!(
+            fast.as_deref(),
+            Some("zip entry `../evil.class` escapes the extraction dir — refusing the artifact")
+        );
     }
 
     #[tokio::test]

@@ -90,6 +90,50 @@ pub(crate) async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Blocking twin of [`list_dir_entries`] for walkers that run whole on the
+/// blocking pool (one hop per crawl instead of one per filesystem call).
+///
+/// Same tolerate-and-truncate contract — `None` when the directory cannot
+/// be opened, and iteration stops at the first entry error — plus a
+/// `complete` flag that is `false` when such an entry error cut the
+/// listing short, so a caller that answers "is child X here?" from the
+/// listing can tell a proven absence from an unread tail.
+pub(crate) fn read_dir_entries_sync(path: &Path) -> Option<(Vec<std::fs::DirEntry>, bool)> {
+    let entries = std::fs::read_dir(path).ok()?;
+    let mut out = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => out.push(entry),
+            Err(_) => return Some((out, false)),
+        }
+    }
+    Some((out, true))
+}
+
+/// Blocking twin of [`is_dir`]: follows symlinks, and a failed stat means
+/// "not a dir".
+pub(crate) fn is_dir_sync(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Run a blocking closure on tokio's blocking pool and hand back its value.
+/// A panic inside `f` is re-raised on the awaiting task (the same outcome
+/// as when the closure's body ran inline on that task); cancellation only
+/// happens at runtime shutdown, when nothing is left to observe the value.
+pub(crate) async fn run_blocking<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(err) => match err.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("blocking crawl task cancelled: {err}"),
+        },
+    }
+}
+
 /// Check whether `path` is a regular file, following symlinks.
 ///
 /// Returns `false` if the stat fails (missing path, broken symlink,
@@ -138,6 +182,9 @@ pub(crate) async fn open_regular_file(
 /// blocking-pool hop (like tokio's own `fs::read_to_string`). `pub` so the
 /// CLI crate's raw `read_to_string` sites can share it.
 pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured.and_then(utf8);
+    }
     let path = path.to_path_buf();
     asyncify(move || read_regular_to_string_sync(&path)).await
 }
@@ -145,8 +192,38 @@ pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
 /// Read a binary regular file through the same FIFO-safe opener as text
 /// lockfiles. A malformed or non-regular lockfile never blocks discovery.
 pub async fn read_regular_to_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured;
+    }
     let path = path.to_path_buf();
     asyncify(move || read_regular_to_bytes_sync(&path)).await
+}
+
+/// Captured bytes as text, failing like `read_to_string` on invalid UTF-8.
+fn utf8(bytes: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// `remove_file` for a file the vendored run may have captured (a
+/// pnpm-workspace.yaml, `nuget.config` or `.cargo/config.toml` it created,
+/// a redirect ledger it emptied): inside an open
+/// [`super::group_commit::GroupCommit`] the removal is captured with the
+/// same `NotFound` semantics, otherwise it is a plain unlink.
+pub async fn remove_file(path: &Path) -> std::io::Result<()> {
+    match super::group_commit::capture_remove(path) {
+        Some(result) => result,
+        None => tokio::fs::remove_file(path).await,
+    }
+}
+
+/// Whether `path` exists (following symlinks) as the running command sees
+/// it: a file an open [`super::group_commit::GroupCommit`] captured answers
+/// from the capture.
+pub async fn file_exists(path: &Path) -> bool {
+    match super::group_commit::exists(path) {
+        Some(exists) => exists,
+        None => tokio::fs::metadata(path).await.is_ok(),
+    }
 }
 
 /// Run one blocking filesystem operation on tokio's blocking pool — the
@@ -184,6 +261,10 @@ pub async fn is_symlink(path: &Path) -> bool {
 pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
 
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured.and_then(utf8);
+    }
+
     let (mut file, metadata) = open_regular_file_sync(path)?;
     let mut content = String::with_capacity(metadata.len() as usize);
     file.read_to_string(&mut content)?;
@@ -199,6 +280,10 @@ pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
 /// never fails with `InvalidData`; every other error keeps its kind.
 pub fn read_regular_to_bytes_sync(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
+
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured;
+    }
 
     let (mut file, metadata) = open_regular_file_sync(path)?;
     let mut content = Vec::with_capacity(metadata.len() as usize);
@@ -340,7 +425,13 @@ pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 /// destination is replaced *as a link* by a private regular file, never
 /// written through to its target. No separate hardlink-break step is needed;
 /// the write path is CoW-safe by construction.
+///
+/// Inside an open [`super::group_commit::GroupCommit`] a commit point under
+/// its root is captured instead of written (see that module).
 pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if super::group_commit::capture_write(path, content, false) {
+        return Ok(());
+    }
     atomic_write_bytes_as(path, content, None).await
 }
 
@@ -359,6 +450,9 @@ pub async fn atomic_write_bytes_preserving_mode(
     path: &Path,
     content: &[u8],
 ) -> std::io::Result<()> {
+    if super::group_commit::capture_write(path, content, true) {
+        return Ok(());
+    }
     let perms = tokio::fs::metadata(path)
         .await
         .ok()
@@ -398,20 +492,12 @@ async fn atomic_write_bytes_as(
     content: &[u8],
     perms: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
+    // A durable commit point: every artifact written without an fsync so
+    // far is made durable first, so this file never names bytes that could
+    // still be lost (see `super::durability`).
+    super::durability::barrier().await?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    // `create_new` failing leaves no stage to clean up; every step after it
-    // does, so they share one error arm.
-    let file = create_stage(&stage, perms.as_ref()).await?;
-    if let Err(e) = commit_stage(file, content, perms, &stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
+    stage_and_rename(path, parent, content, perms, true).await?;
 
     // The rename only updated the parent directory entry; fsync the directory
     // so the rename itself survives a crash. Best-effort, Unix only.
@@ -425,16 +511,145 @@ async fn atomic_write_bytes_as(
     Ok(())
 }
 
-/// Write, flush, fsync, (re-mode) and close the stage, then rename it over
-/// `path`. Takes the handle by value so it is closed before the rename
-/// (Windows refuses to rename an open file) and before the caller's
-/// error-path unlink of the stage.
+/// Atomically write a CONTENT-VERIFIED artifact (a vendored `.tgz`, wheel,
+/// jar, marker, …) via stage + rename, without an fsync: the next durable
+/// commit point's [`super::durability::barrier`] makes it durable before
+/// anything that names it is, and every later run re-verifies its bytes
+/// (see `super::durability` for the crash-safety argument). Readers still
+/// only ever see the complete old or the complete new bytes.
+pub(crate) async fn atomic_write_artifact(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    stage_and_rename(path, parent, content, None, false).await?;
+    super::durability::record(path);
+    Ok(())
+}
+
+/// [`atomic_write_artifact`] keeping the destination's permission bits — a
+/// vendored copy's own files (the cargo copy's `Cargo.toml` the version tag
+/// rewrites) keep the mode the copy was built with.
+pub(crate) async fn atomic_write_artifact_preserving_mode(
+    path: &Path,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let perms = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    stage_and_rename(path, parent, content, perms, false).await?;
+    super::durability::record(path);
+    Ok(())
+}
+
+/// A group commit's file replacement (see [`super::group_commit`]): stage +
+/// rename like the durable writers, keeping the destination's mode when
+/// `preserve_mode`, but without the fsync — the commit's barrier syncs every
+/// replaced file at once, and its journal already holds the bytes.
+pub(crate) async fn atomic_write_unsynced(
+    path: &Path,
+    content: &[u8],
+    preserve_mode: bool,
+) -> std::io::Result<()> {
+    let perms = if preserve_mode {
+        tokio::fs::metadata(path)
+            .await
+            .ok()
+            .map(|m| m.permissions())
+    } else {
+        None
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    stage_and_rename(path, parent, content, perms, false).await
+}
+
+/// The blocking durable writer the group-commit replay runs under the apply
+/// lock: stage (with the destination's mode when `preserve_mode`) + fsync +
+/// rename + directory fsync.
+pub(crate) fn atomic_write_sync(
+    path: &Path,
+    content: &[u8],
+    preserve_mode: bool,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let perms = preserve_mode
+        .then(|| std::fs::metadata(path).ok().map(|m| m.permissions()))
+        .flatten();
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(p) = perms.as_ref() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(p.mode() & 0o777);
+    }
+    let mut file = options.open(&stage)?;
+    let written = (|| {
+        file.write_all(content)?;
+        file.sync_all()?;
+        if let Some(p) = perms {
+            file.set_permissions(p)?;
+        }
+        drop(file);
+        std::fs::rename(&stage, path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&stage);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Stage `content` next to `path` and rename it over `path`; `durable`
+/// fsyncs the stage before the rename. Off Unix every stage is fsynced here,
+/// through its own writable handle: Windows' `FlushFileBuffers` needs write
+/// access, so the barrier cannot sync the file later by reopening its path
+/// (a read-only open is refused with `ERROR_ACCESS_DENIED`, and a write open
+/// is refused for a read-only artifact) — see
+/// `super::durability::sync_all_blocking`.
+async fn stage_and_rename(
+    path: &Path,
+    parent: &Path,
+    content: &[u8],
+    perms: Option<std::fs::Permissions>,
+    durable: bool,
+) -> std::io::Result<()> {
+    let durable = durable || !super::durability::DEFERS_FILE_SYNC;
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    // `create_new` failing leaves no stage to clean up; every step after it
+    // does, so they share one error arm.
+    let file = create_stage(&stage, perms.as_ref()).await?;
+    if let Err(e) = commit_stage(file, content, perms, &stage, path, durable).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write, flush, fsync (when `durable`), (re-mode) and close the stage, then
+/// rename it over `path`. Takes the handle by value so it is closed before
+/// the rename (Windows refuses to rename an open file) and before the
+/// caller's error-path unlink of the stage.
 async fn commit_stage(
     mut file: tokio::fs::File,
     content: &[u8],
     perms: Option<std::fs::Permissions>,
     stage: &Path,
     path: &Path,
+    durable: bool,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     file.write_all(content).await?;
@@ -444,7 +659,9 @@ async fn commit_stage(
     // failed stage write (ENOSPC, EIO, quota) actually surfaces. Without
     // it the truncated stage would be renamed over the intact target.
     file.flush().await?;
-    file.sync_all().await?;
+    if durable {
+        file.sync_all().await?;
+    }
     // Set the preserved mode on the stage *before* the rename so the file
     // never appears at the destination with the wrong bits, even briefly.
     // The content is already written through the open handle, so a

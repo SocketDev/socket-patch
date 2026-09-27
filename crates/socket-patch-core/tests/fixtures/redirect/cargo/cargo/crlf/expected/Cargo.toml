@@ -1,0 +1,8 @@
+[package]
+name = "myapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.190", registry = "socket-patch-55555555-5555-5555-5555-555555555555" }
+anyhow = { version = "1.0", features = ["backtrace"] }

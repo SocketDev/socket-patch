@@ -108,6 +108,102 @@ pub(crate) async fn mount_503(server: &wiremock::MockServer) {
         .await;
 }
 
+/// Answer every package-reference POST with no result for any uuid (a
+/// non-retryable failure: `auto` warns and builds locally), so a test can
+/// count which packages a backend asked the service for.
+pub(crate) async fn mount_no_results(server: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("POST"))
+        .and(path(PACKAGE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {}
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Every uuid a download grant was requested for, in request order.
+pub(crate) async fn granted_uuids(server: &wiremock::MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == PACKAGE_PATH)
+        .flat_map(|r| {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).expect("grant body");
+            body["uuids"]
+                .as_array()
+                .expect("uuids array")
+                .iter()
+                .map(|u| u.as_str().expect("uuid string").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `record` under another uuid (a distinct patch for the same files).
+pub(crate) fn with_uuid(
+    record: &crate::manifest::schema::PatchRecord,
+    uuid: &str,
+) -> crate::manifest::schema::PatchRecord {
+    crate::manifest::schema::PatchRecord {
+        uuid: uuid.to_string(),
+        ..record.clone()
+    }
+}
+
+/// `record` under another uuid with no files (the backends' no-op).
+pub(crate) fn empty_patch(
+    record: &crate::manifest::schema::PatchRecord,
+    uuid: &str,
+) -> crate::manifest::schema::PatchRecord {
+    crate::manifest::schema::PatchRecord {
+        uuid: uuid.to_string(),
+        files: std::collections::HashMap::new(),
+        ..record.clone()
+    }
+}
+
+/// A boxed future borrowing the test's fixture (the plan tests' closures
+/// own their purl and record).
+pub(crate) type Borrowed<'e, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'e>>;
+
+/// Pin a backend's download-plan gate to the grants its vendor call really
+/// requests. The gate's verdicts for every case come first — the vendor
+/// loop's plan is built before it vendors anything — then each case is
+/// vendored in order against `server` (answering no result, so `auto` falls
+/// back to the local build). The uuids the gate named must be exactly the
+/// uuids the backend asked grants for, in order; returns them.
+pub(crate) async fn plan_matches_grants<'e>(
+    server: &wiremock::MockServer,
+    cases: &[(&str, crate::manifest::schema::PatchRecord)],
+    gate: impl Fn(String, crate::manifest::schema::PatchRecord) -> Borrowed<'e, bool>,
+    vendor: impl Fn(String, crate::manifest::schema::PatchRecord) -> Borrowed<'e, VendorOutcome>,
+) -> Vec<String> {
+    let mut planned = Vec::new();
+    for (purl, record) in cases {
+        if gate(purl.to_string(), record.clone()).await {
+            planned.push(record.uuid.clone());
+        }
+    }
+    let before = granted_uuids(server).await.len();
+    for (purl, record) in cases {
+        let _ = vendor(purl.to_string(), record.clone()).await;
+    }
+    let granted: Vec<String> = granted_uuids(server).await.split_off(before);
+    assert_eq!(
+        granted, planned,
+        "the plan must name exactly the packages the backend asks the service for"
+    );
+    planned
+}
+
+/// Distinct canonical uuids for the plan tests' extra records.
+pub(crate) const PLAN_UUID_B: &str = "b0b0b0b0-0000-4000-8000-000000000002";
+pub(crate) const PLAN_UUID_C: &str = "c0c0c0c0-0000-4000-8000-000000000003";
+
 pub(crate) async fn request_count(server: &wiremock::MockServer) -> usize {
     server.received_requests().await.unwrap_or_default().len()
 }

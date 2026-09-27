@@ -7,13 +7,14 @@
 //! its gemspec only as YAML in `metadata.gz` (the vendoring service's
 //! converter is what turns that into the Ruby form, and serves it as the
 //! `gem-stub-gemspec` second artifact). So build mode cannot vendor a
-//! fetched gem, ever — yet the auto-fetch rung downloaded the `.gem` from
-//! the registry first and only then hit the backend's `gem_spec_missing`
-//! refusal. The download is pure waste on every run.
-//!
-//! The refusal now happens BEFORE the fetch, with a message that says why
-//! and what to do. `auto` (and `service`) still fetch: the service path
-//! needs the staged dir, and that is the mode that CAN vendor this gem.
+//! fetched gem, ever — and the vendor loop refuses it `gem_spec_missing`
+//! BEFORE downloading it (the X1b deferred-fetch gate), where the
+//! auto-fetch rung used to download the `.gem` first and only then hit the
+//! backend's refusal. `vendor_rerun_no_network_e2e` pins the gate itself;
+//! this suite pins its SCOPE: `auto` still fetches, and the three runs a
+//! fetch would never have happened for (nothing resolves the gem, the lock
+//! cannot verify it, the ledger already vendors it) keep their own
+//! outcomes instead of a gemspec refusal.
 //!
 //! Hermetic: a `wiremock` stand-in for the rubygems download host, named by
 //! the lock's `remote:`, and a `.socket/blobs` entry so patch staging never
@@ -237,7 +238,9 @@ async fn build_mode_refuses_a_lockfile_only_gem_before_downloading_it() {
     );
     let detail = failed["error"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("not installed") && detail.contains("--vendor-source"),
+        detail.contains("stub gemspec")
+            && detail.contains("install the gem")
+            && detail.contains("--vendor-source"),
         "the refusal must say why and name the remedy: {detail}"
     );
     assert!(
@@ -303,8 +306,9 @@ async fn a_gem_that_resolves_from_nowhere_still_reports_not_installed() {
 //
 // The refusal must fire ONLY where the wasted download it replaces would
 // really have happened: a gem the lock resolves WITH a verifier, and that
-// the run is not already vendoring from its committed artifact. Two cases
-// where a fetch never happens on `main` must keep `main`'s outcome.
+// the run is not already vendoring from its committed artifact. The two
+// cases where no fetch ever happens keep the outcome they had before the
+// gate existed.
 
 /// A bundler < 2.6 `Gemfile.lock` (no `CHECKSUMS` section — the majority of
 /// real locks) resolves the gem but cannot VERIFY it, and
@@ -373,9 +377,8 @@ async fn an_unverifiable_lock_entry_keeps_the_documented_skip_pair() {
 /// because `bundle install` has not run yet) must re-scan green in build
 /// mode: the gem backend's idempotent hot path re-confirms the wired lock
 /// and returns `already_vendored` without ever needing a stub gemspec of
-/// its own. `fetch_pristine_package` exists precisely for this case — its
-/// ledger-recovery rung is commented "an already-vendored lock-only
-/// checkout re-scans green".
+/// its own. The ledger covers the record, so the pristine fetch is
+/// deferred and never needed: the re-run makes no registry request at all.
 #[tokio::test]
 async fn an_already_vendored_gem_re_runs_green_on_a_fresh_clone() {
     let mock = MockServer::start().await;
@@ -410,6 +413,14 @@ async fn an_already_vendored_gem_re_runs_green_on_a_fresh_clone() {
         "an in-sync re-run of an already-vendored gem is green: {v:#}\n{stderr}"
     );
     assert_eq!(v["status"], "success", "{v:#}\n{stderr}");
+    assert!(
+        mock.received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the in-sync hot path answers from the committed copy, with no \
+         registry request: {v:#}"
+    );
     let codes: Vec<(&str, &str)> = v["events"]
         .as_array()
         .expect("events array")
@@ -424,11 +435,8 @@ async fn an_already_vendored_gem_re_runs_green_on_a_fresh_clone() {
         .collect();
     assert_eq!(
         codes,
-        vec![
-            ("skipped", "vendor_fetched_missing"),
-            ("skipped", "already_vendored"),
-        ],
-        "the ledger-recovered fetch re-confirms the committed copy and the \
-         hot path reports it in sync: {v:#}"
+        vec![("skipped", "already_vendored")],
+        "the hot path reports the committed copy in sync, not a gemspec \
+         refusal: {v:#}"
     );
 }

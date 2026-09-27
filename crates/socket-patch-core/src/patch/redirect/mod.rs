@@ -29,16 +29,33 @@ use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
+#[cfg(test)]
+mod cargo_lock_equivalence_tests;
+#[cfg(test)]
+mod composer_equivalence_tests;
+#[cfg(test)]
+mod golang_equivalence_tests;
 pub mod golang_local;
+#[cfg(test)]
+mod group_equivalence_tests;
+#[cfg(test)]
+mod lock_index_equivalence_tests;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
+pub mod presence;
 // pub(crate): manifest-less VEX discovery (`vex::discover::npm`) reads
 // hosted pnpm locks with the SAME grammar this rewriter writes them in.
 pub(crate) mod pnpm;
+#[cfg(test)]
+mod pnpm_equivalence_tests;
 mod poetry;
+#[cfg(test)]
+mod python_lock_equivalence_tests;
 mod replay;
 mod requirements;
+#[cfg(test)]
+mod rewrite_oracle_support;
 mod staged;
 mod state;
 mod takeover;
@@ -166,13 +183,13 @@ pub struct FileEdit {
     pub new: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RewriteWarning {
     pub code: String,
     pub detail: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
     pub files: BTreeMap<String, String>,
@@ -334,23 +351,254 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     // rewriters too (see `pipenv::rewrite`).
     pipenv::rewrite(files, &overrides, pipenv_major, &mut result);
     let overrides = withhold(&overrides, &result.refused_pipenv_uuids);
-    let overrides: &[DepOverride] = &overrides;
-    rewrite_npm_lock(files, overrides, &mut result);
-    rewrite_pnpm_lock(files, overrides, &mut result);
-    rewrite_yarn_classic(files, overrides, &mut result);
-    rewrite_yarn_berry(files, overrides, &mut result);
-    rewrite_bun_lock(files, overrides, &mut result);
-    requirements::rewrite(files, overrides, &mut result);
-    rewrite_hatch(files, overrides, &mut result);
-    rewrite_uv_lock(files, overrides, python_metadata, &mut result);
-    poetry::rewrite_poetry(files, overrides, &mut result);
-    rewrite_cargo(files, overrides, &mut result);
-    rewrite_composer_lock(files, overrides, &mut result);
-    rewrite_nuget(files, overrides, &mut result);
-    rewrite_gem(files, overrides, &mut result);
-    rewrite_maven_pom(files, overrides, &mut result);
-    rewrite_golang(files, overrides, &mut result);
+    let groups = rewriter_groups(files, &overrides, python_metadata);
+    rewrite_groups_parallel(result, &groups)
+}
+
+/// One rewriter group: rewriters that must run in this order on one result.
+type RewriterGroup<'a> = Box<dyn Fn(&mut RewriteResult) + Send + Sync + 'a>;
+
+/// The rewriters that run after the pdm / pipenv withholding, in the serial
+/// order, split into groups that never read one another's output: each
+/// rewriter only appends to the result, and the only result fields any of
+/// them reads are its own group's (`rewrite_hatch` reads the requirements
+/// rewriter's confirmations, `rewrite_uv_lock` the python lock sets and a
+/// metadata file an earlier python rewriter may have written) or the
+/// withholding prefix's. Every group sees the full withheld override slice,
+/// exactly as the serial chain did.
+fn rewriter_groups<'a>(
+    files: &'a BTreeMap<String, String>,
+    overrides: &'a [DepOverride],
+    python_metadata: &'a BTreeMap<String, String>,
+) -> Vec<RewriterGroup<'a>> {
+    vec![
+        Box::new(move |result| {
+            rewrite_npm_lock(files, overrides, result);
+            rewrite_pnpm_lock(files, overrides, result);
+            rewrite_yarn_classic(files, overrides, result);
+            rewrite_yarn_berry(files, overrides, result);
+            rewrite_bun_lock(files, overrides, result);
+        }),
+        Box::new(move |result| {
+            requirements::rewrite(files, overrides, result);
+            rewrite_hatch(files, overrides, result);
+            rewrite_uv_lock(files, overrides, python_metadata, result);
+            poetry::rewrite_poetry(files, overrides, result);
+        }),
+        Box::new(move |result| rewrite_cargo(files, overrides, result)),
+        Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
+        Box::new(move |result| rewrite_nuget(files, overrides, result)),
+        Box::new(move |result| rewrite_gem(files, overrides, result)),
+        Box::new(move |result| rewrite_maven_pom(files, overrides, result)),
+        Box::new(move |result| rewrite_golang(files, overrides, result)),
+    ]
+}
+
+/// The serial chain: every group, in order, on one result.
+fn rewrite_groups_serial(mut result: RewriteResult, groups: &[RewriterGroup<'_>]) -> RewriteResult {
+    for group in groups {
+        group(&mut result);
+    }
     result
+}
+
+/// What one group added on top of the withholding `prefix` it started from:
+/// the appended edits and warnings, the files it wrote (new keys, or prefix
+/// keys it changed), and its set entries. `None` when the group did anything
+/// other than append (changed or dropped a prefix edit, warning or file) —
+/// the merge cannot replay that, so the caller falls back to the serial chain.
+fn group_delta(prefix: &RewriteResult, mut out: RewriteResult) -> Option<RewriteResult> {
+    fn changed_entries<V: PartialEq>(
+        prefix: &BTreeMap<String, V>,
+        out: BTreeMap<String, V>,
+    ) -> Option<BTreeMap<String, V>> {
+        if prefix.keys().any(|k| !out.contains_key(k)) {
+            return None;
+        }
+        Some(
+            out.into_iter()
+                .filter(|(k, v)| prefix.get(k) != Some(v))
+                .collect(),
+        )
+    }
+    if out.edits.len() < prefix.edits.len()
+        || out.edits[..prefix.edits.len()] != prefix.edits[..]
+        || out.warnings.len() < prefix.warnings.len()
+        || out.warnings[..prefix.warnings.len()] != prefix.warnings[..]
+    {
+        return None;
+    }
+    out.edits.drain(..prefix.edits.len());
+    out.warnings.drain(..prefix.warnings.len());
+    out.files = changed_entries(&prefix.files, out.files)?;
+    out.binary_files = changed_entries(&prefix.binary_files, out.binary_files)?;
+    Some(out)
+}
+
+/// Fold one group's delta into the running result, as the serial chain's
+/// appends would have: edits and warnings in order, files by key, sets by
+/// union (order-free).
+fn merge_group_delta(result: &mut RewriteResult, delta: RewriteResult) {
+    let RewriteResult {
+        files,
+        binary_files,
+        confirmed_bun_binary_uuids,
+        mut edits,
+        mut warnings,
+        confirmed_cargo_uuids,
+        confirmed_golang_uuids,
+        confirmed_pipenv_uuids,
+        refused_pipenv_uuids,
+        confirmed_pdm_uuids,
+        refused_pdm_uuids,
+        refused_pnpm_uuids,
+        python_lock_uuids,
+        confirmed_python_lock_uuids,
+        refused_python_lock_uuids,
+        hatch_uuids,
+        confirmed_hatch_uuids,
+        confirmed_requirements_uuids,
+    } = delta;
+    result.files.extend(files);
+    result.binary_files.extend(binary_files);
+    result.edits.append(&mut edits);
+    result.warnings.append(&mut warnings);
+    result
+        .confirmed_bun_binary_uuids
+        .extend(confirmed_bun_binary_uuids);
+    result.confirmed_cargo_uuids.extend(confirmed_cargo_uuids);
+    result.confirmed_golang_uuids.extend(confirmed_golang_uuids);
+    result.confirmed_pipenv_uuids.extend(confirmed_pipenv_uuids);
+    result.refused_pipenv_uuids.extend(refused_pipenv_uuids);
+    result.confirmed_pdm_uuids.extend(confirmed_pdm_uuids);
+    result.refused_pdm_uuids.extend(refused_pdm_uuids);
+    result.refused_pnpm_uuids.extend(refused_pnpm_uuids);
+    result.python_lock_uuids.extend(python_lock_uuids);
+    result
+        .confirmed_python_lock_uuids
+        .extend(confirmed_python_lock_uuids);
+    result
+        .refused_python_lock_uuids
+        .extend(refused_python_lock_uuids);
+    result.hatch_uuids.extend(hatch_uuids);
+    result.confirmed_hatch_uuids.extend(confirmed_hatch_uuids);
+    result
+        .confirmed_requirements_uuids
+        .extend(confirmed_requirements_uuids);
+}
+
+/// [`rewrite_groups_serial`], with the groups run concurrently under
+/// `std::thread::scope`. Each group starts from its own copy of `prefix` (the
+/// pdm / pipenv withholding result), so it sees exactly the state the serial
+/// chain showed it — no group reads another group's output (see
+/// [`rewriter_groups`]) — and the deltas are merged in serial order.
+///
+/// Byte-identical to the serial chain by construction: when a group did
+/// anything but append, or two groups wrote the same file, or a group wrote a
+/// file the prefix already carried (the serial chain's last writer would
+/// depend on the order), the parallel outputs are discarded and the serial
+/// chain runs instead. A panicking group re-raises the first panic in serial
+/// order, as the serial chain would have.
+fn rewrite_groups_parallel(prefix: RewriteResult, groups: &[RewriterGroup<'_>]) -> RewriteResult {
+    let outs = run_groups_concurrently(&prefix, groups);
+    match merge_group_outputs(&prefix, outs) {
+        Some(result) => result,
+        None => rewrite_groups_serial(prefix, groups),
+    }
+}
+
+/// Every group on its own copy of `prefix`, concurrently; outputs in group
+/// order. The first group runs on the calling thread.
+///
+/// A group whose thread the OS refuses (a pids cgroup or `RLIMIT_NPROC` cap)
+/// runs on the calling thread instead, in its place in group order — the
+/// rewrite needed no threads before the groups existed, so a thread cap must
+/// not turn it into a panic. Every group starts from its own `prefix` clone,
+/// so where it runs cannot change its output.
+fn run_groups_concurrently(
+    prefix: &RewriteResult,
+    groups: &[RewriterGroup<'_>],
+) -> Vec<RewriteResult> {
+    let run = |group: &RewriterGroup<'_>| {
+        let mut out = prefix.clone();
+        group(&mut out);
+        out
+    };
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = groups
+            .iter()
+            .skip(1)
+            .map(|group| {
+                let handle = spawn_group_thread(scope, move || run(group)).ok();
+                (group, handle)
+            })
+            .collect();
+        let first = groups.first().map(run);
+        first
+            .into_iter()
+            .chain(handles.into_iter().map(|(group, handle)| {
+                match handle {
+                    Some(handle) => handle
+                        .join()
+                        .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
+                    None => run(group),
+                }
+            }))
+            .collect()
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make every [`spawn_group_thread`] on this thread fail, as
+    /// an OS thread cap would.
+    static REFUSE_GROUP_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `Builder::spawn_scoped`, which reports a refused thread instead of
+/// panicking as `Scope::spawn` does.
+fn spawn_group_thread<'scope, 'env, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, RewriteResult>>
+where
+    F: FnOnce() -> RewriteResult + Send + 'scope,
+{
+    #[cfg(test)]
+    if REFUSE_GROUP_THREADS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("thread refused (test hook)"));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, f)
+}
+
+/// The groups' outputs merged in group order onto `prefix`, or `None` when
+/// the merge could differ from the serial chain (see
+/// [`rewrite_groups_parallel`]).
+fn merge_group_outputs(prefix: &RewriteResult, outs: Vec<RewriteResult>) -> Option<RewriteResult> {
+    let deltas: Vec<RewriteResult> = outs
+        .into_iter()
+        .map(|out| group_delta(prefix, out))
+        .collect::<Option<_>>()?;
+    let mut written: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let disjoint = deltas.iter().all(|delta| {
+        delta
+            .files
+            .keys()
+            .chain(delta.binary_files.keys())
+            .all(|k| {
+                !prefix.files.contains_key(k)
+                    && !prefix.binary_files.contains_key(k)
+                    && written.insert(k.as_str())
+            })
+    });
+    if !disjoint {
+        return None;
+    }
+    let mut result = prefix.clone();
+    for delta in deltas {
+        merge_group_delta(&mut result, delta);
+    }
+    Some(result)
 }
 
 fn rewrite_hatch(
@@ -508,6 +756,40 @@ fn rewrite_one_npm_lock(
         });
         return;
     };
+    // The (package, version) each `packages` entry stands for, by map
+    // position, computed once: the per-dep scan below compares against it
+    // instead of re-deriving it for every entry for every dep. Sound
+    // because a rewrite only ever touches an entry's `resolved`/`integrity`
+    // (never a key, `name` or `version`), so positions and identities hold.
+    let package_ids: Vec<Option<(String, Option<String>)>> = lock
+        .get("packages")
+        .and_then(Value::as_object)
+        .map(|packages| {
+            packages
+                .iter()
+                .map(|(key, entry)| {
+                    // Only `node_modules/` keys are installable dependencies:
+                    // "" is the project root and other bare keys are workspace
+                    // members — SOURCE dirs a resolved/integrity insert would
+                    // corrupt.
+                    let (_, key_name) = key.rsplit_once("node_modules/")?;
+                    // The package a lock entry stands for: the explicit `name`
+                    // field when present (npm writes it for aliases — `npm i
+                    // alias@npm:real` keys the entry by the ALIAS), else the
+                    // key's trailing path. Mirrors `vendor::npm_lock`'s
+                    // `entry_name`, so an alias install of the patched package
+                    // redirects and an entry that merely SHARES the key name
+                    // (`npm i <fname>@npm:other`) is never hijacked.
+                    let entry_nm = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(key_name);
+                    let version = entry.get("version").and_then(Value::as_str);
+                    Some((entry_nm.to_string(), version.map(str::to_string)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -520,28 +802,11 @@ fn rewrite_one_npm_lock(
         };
         let mut matched_any = false;
         if let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) {
-            for (key, entry) in packages.iter_mut() {
-                // Only `node_modules/` keys are installable dependencies:
-                // "" is the project root and other bare keys are workspace
-                // members — SOURCE dirs a resolved/integrity insert would
-                // corrupt.
-                let Some((_, key_name)) = key.rsplit_once("node_modules/") else {
+            for ((key, entry), id) in packages.iter_mut().zip(&package_ids) {
+                let Some((entry_nm, version)) = id else {
                     continue;
                 };
-                // The package a lock entry stands for: the explicit `name`
-                // field when present (npm writes it for aliases — `npm i
-                // alias@npm:real` keys the entry by the ALIAS), else the
-                // key's trailing path. Mirrors `vendor::npm_lock`'s
-                // `entry_name`, so an alias install of the patched package
-                // redirects and an entry that merely SHARES the key name
-                // (`npm i <fname>@npm:other`) is never hijacked.
-                let entry_nm = entry
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(key_name);
-                let matches_ver =
-                    entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str());
-                if entry_nm != fname || !matches_ver {
+                if *entry_nm != fname || version.as_deref() != Some(dep.version.as_str()) {
                     continue;
                 }
                 if entry.get("link").and_then(Value::as_bool) == Some(true) {
@@ -733,8 +998,53 @@ fn rewrite_cargo(
     if cargo.is_empty() {
         return;
     }
-    let mut cargo_toml = files.get("Cargo.toml").cloned();
-    let mut cargo_lock = files.get("Cargo.lock").cloned();
+    // The root manifest first, then every workspace-member manifest the
+    // caller supplied (`<dir>/Cargo.toml`): a member's own declaration of the
+    // crate resolves exactly like the root's, so it must be pinned too, or
+    // the lock's repointed entry is unsatisfiable (`--locked` fails) while
+    // the dep is reported redirected.
+    let mut manifests: Vec<(String, String)> = files
+        .iter()
+        .filter(|(k, _)| k.as_str() == "Cargo.toml")
+        .chain(
+            files
+                .iter()
+                .filter(|(k, _)| is_cargo_member_manifest_key(k)),
+        )
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    // Every planner below matches LF text. A file whose every line ends in
+    // CRLF (a Windows checkout) is planned as LF and written back — edit
+    // fragments included, so `remove` finds them — as CRLF. Mixed endings
+    // stay as they are (and refuse where the LF grammar does not match).
+    let mut crlf_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut to_lf = |path: &str, text: String| -> String {
+        match crlf_to_lf(&text) {
+            Some(lf) => {
+                crlf_paths.insert(path.to_string());
+                lf
+            }
+            None => text,
+        }
+    };
+    for (path, text) in manifests.iter_mut() {
+        *text = to_lf(path, std::mem::take(text));
+    }
+    let workspace_version = files
+        .get("Cargo.toml")
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| cargo_workspace_package_version(&doc).map(str::to_string));
+    let manifest_packages: Vec<Option<(String, String)>> = manifests
+        .iter()
+        .map(|(path, text)| cargo_manifest_package_id(text, path, workspace_version.as_deref()))
+        .collect();
+    let edits_before = result.edits.len();
+    let mut changed_manifests: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut cargo_lock = files
+        .get("Cargo.lock")
+        .cloned()
+        .map(|t| to_lf("Cargo.lock", t));
     // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
     // `config.toml` when both exist (it warns about the duplicate), so a
     // managed `[registries.…]` block written to `config.toml` there is
@@ -746,8 +1056,12 @@ fn rewrite_cargo(
     } else {
         ".cargo/config.toml"
     };
-    let mut cargo_config = files.get(cargo_config_key).cloned().unwrap_or_default();
-    let (mut toml_changed, mut lock_changed, mut config_changed) = (false, false, false);
+    let mut cargo_config = files
+        .get(cargo_config_key)
+        .cloned()
+        .map(|t| to_lf(cargo_config_key, t))
+        .unwrap_or_default();
+    let (mut lock_changed, mut config_changed) = (false, false);
 
     for dep in &cargo {
         let Some(ov) = registry_override_of_kind(dep, "cargo-sparse") else {
@@ -816,7 +1130,7 @@ fn rewrite_cargo(
         // 1. Plan the Cargo.toml pin FIRST — it is the gate for everything
         // else. Without a manifest pin nothing forces resolution through the
         // managed registry, so no other file may be touched for this dep.
-        let Some(toml_text) = cargo_toml.as_ref() else {
+        if !manifests.iter().any(|(k, _)| k == "Cargo.toml") {
             result.warnings.push(RewriteWarning {
                 code: "redirect_cargo_toml_dep_not_found".into(),
                 detail: format!(
@@ -825,40 +1139,139 @@ fn rewrite_cargo(
                 ),
             });
             continue;
-        };
-        let toml_plan = match plan_cargo_toml(toml_text, &dep.name, &reg) {
-            Ok(plan) => plan,
-            Err(CargoTomlPlanError::NotFound) => {
+        }
+        let other_versions =
+            cargo_lock_other_versions(cargo_lock.as_deref(), &dep.name, &dep.version);
+        // The root manifest's `[workspace.dependencies]` verdicts feed its
+        // members' `workspace = true` inheritors.
+        let mut root_workspace: BTreeMap<String, CargoWorkspaceEntry> = BTreeMap::new();
+        let mut toml_plans: Vec<(usize, CargoTomlPlan)> = Vec::new();
+        let mut excluded: Vec<(String, String)> = Vec::new();
+        let mut refused: Option<(String, String)> = None;
+        for (i, (path, text)) in manifests.iter().enumerate() {
+            match plan_cargo_toml(
+                text,
+                path,
+                &dep.name,
+                &dep.version,
+                &other_versions,
+                &reg,
+                &root_workspace,
+            ) {
+                Ok(plan) => {
+                    if let Err(reason) = validate_cargo_toml_pins(
+                        &plan.content,
+                        &dep.name,
+                        &dep.version,
+                        &other_versions,
+                        &reg,
+                        &plan.workspace,
+                        &root_workspace,
+                    ) {
+                        refused = Some((path.clone(), reason));
+                        break;
+                    }
+                    if path == "Cargo.toml" {
+                        root_workspace = plan.workspace.clone();
+                    }
+                    excluded.extend(plan.excluded.iter().map(|req| (path.clone(), req.clone())));
+                    if plan.found {
+                        toml_plans.push((i, plan));
+                    }
+                }
+                Err(reason) => {
+                    refused = Some((path.clone(), reason));
+                    break;
+                }
+            }
+        }
+        if let Some((path, reason)) = refused {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_toml_dep_unrewritable".into(),
+                detail: format!(
+                    "{} in {path} cannot be pinned ({reason}); dependency skipped \
+                     (nothing rewritten)",
+                    dep.name
+                ),
+            });
+            continue;
+        }
+        // Declared, but no declaration's requirement accepts the patched
+        // version: cargo resolves each to another version, so a pin cannot
+        // reach the locked one (the TS twin's requirement-coverage refusal).
+        if toml_plans.is_empty() && !excluded.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_toml_dep_unrewritable".into(),
+                detail: cargo_requirement_excludes_detail(
+                    &dep.name,
+                    &dep.version,
+                    &excluded,
+                    cargo_lock.as_deref(),
+                ),
+            });
+            continue;
+        }
+        if toml_plans.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_toml_dep_not_found".into(),
+                detail: cargo_not_declared_detail(
+                    &dep.name,
+                    &dep.version,
+                    manifests.len(),
+                    cargo_lock.as_deref(),
+                ),
+            });
+            continue;
+        }
+        // A pin reaches only the declarations it sits on: every OTHER lock
+        // package depending on the crate — a registry/git crate, or a path
+        // package whose manifest was not planned (outside the project, behind
+        // a symlink) — keeps resolving it from crates.io, so the repointed
+        // lock is unsatisfiable and that consumer compiles the unpatched copy.
+        if let Some(lock_text) = cargo_lock.as_deref() {
+            let pinned_packages: std::collections::BTreeSet<(&str, &str)> = toml_plans
+                .iter()
+                .filter_map(|(i, _)| manifest_packages[*i].as_ref())
+                .map(|(name, version)| (name.as_str(), version.as_str()))
+                .collect();
+            let blocking =
+                cargo_unpinnable_dependents(lock_text, &dep.name, &dep.version, &pinned_packages);
+            if !blocking.is_empty() {
                 result.warnings.push(RewriteWarning {
-                    code: "redirect_cargo_toml_dep_not_found".into(),
-                    detail: format!(
-                        "no [dependencies] entry for {} in Cargo.toml; dependency skipped \
-                         (nothing rewritten)",
-                        dep.name
-                    ),
+                    code: "redirect_cargo_transitive_dependents".into(),
+                    detail: cargo_transitive_dependents_detail(&dep.name, &dep.version, &blocking),
                 });
                 continue;
             }
-            Err(CargoTomlPlanError::Refused(reason)) => {
+        } else {
+            // NO Cargo.lock: the resolved graph the check above reads does
+            // not exist, so nothing here can say whether some other
+            // dependency's own graph also pulls in the crate. Any other
+            // declared dependency might, and the pin reaches only the
+            // declarations it sits on — that consumer would compile the
+            // unpatched crates.io copy while the scan reports the crate
+            // redirected and VEX attests it. Fail closed, exactly as the
+            // locked path does for a dependent it CAN see; a project whose
+            // only dependency is the patched crate has nothing that could
+            // pull it in, and still redirects.
+            let others = cargo_lockless_other_dependencies(&manifests, &dep.name);
+            if !others.is_empty() {
                 result.warnings.push(RewriteWarning {
-                    code: "redirect_cargo_toml_dep_unrewritable".into(),
-                    detail: format!(
-                        "{} in Cargo.toml cannot be pinned ({reason}); dependency skipped \
-                         (nothing rewritten)",
-                        dep.name
-                    ),
+                    code: "redirect_cargo_lockless_dependents".into(),
+                    detail: cargo_lockless_dependents_detail(&dep.name, &dep.version, &others),
                 });
                 continue;
             }
-        };
+        }
 
         // 2. Plan the Cargo.lock repoint. A lock that exists but has no
         // [[package]] for the dep means the project does not actually resolve
         // it — rewriting the manifest anyway would desync manifest and lock.
         // Skip the dep entirely (discarding the manifest plan). A project
-        // with NO lockfile is fine: the manifest pin alone forces the next
-        // resolution through the managed registry, which serves the patched
-        // checksum.
+        // with NO lockfile reaches here only when the patched crate is its
+        // one declared dependency (the dependents gate above): the manifest
+        // pin alone then forces the next resolution through the managed
+        // registry, which serves the patched checksum.
         enum LockCommit {
             Write(String, Vec<FileEdit>),
             InPlace,
@@ -908,10 +1321,12 @@ fn rewrite_cargo(
             result.edits.push(plan.edit);
             config_changed = true;
         }
-        if toml_plan.changed {
-            cargo_toml = Some(toml_plan.content);
-            result.edits.extend(toml_plan.edits);
-            toml_changed = true;
+        for (i, plan) in toml_plans {
+            if plan.changed {
+                changed_manifests.insert(manifests[i].0.clone());
+                manifests[i].1 = plan.content;
+                result.edits.extend(plan.edits);
+            }
         }
         match lock_commit {
             LockCommit::Write(content, edits) => {
@@ -924,19 +1339,397 @@ fn rewrite_cargo(
         result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
     }
 
-    if toml_changed {
-        if let Some(t) = cargo_toml {
-            result.files.insert("Cargo.toml".into(), t);
+    let restore = |path: &str, text: String| -> String {
+        if crlf_paths.contains(path) {
+            text.replace('\n', "\r\n")
+        } else {
+            text
+        }
+    };
+    for edit in &mut result.edits[edits_before..] {
+        if crlf_paths.contains(&edit.path) {
+            for fragment in [&mut edit.original, &mut edit.new] {
+                if let Some(Value::String(text)) = fragment {
+                    *text = text.replace('\n', "\r\n");
+                }
+            }
+        }
+    }
+    for (path, text) in manifests {
+        if changed_manifests.contains(&path) {
+            let text = restore(&path, text);
+            result.files.insert(path, text);
         }
     }
     if lock_changed {
         if let Some(l) = cargo_lock {
-            result.files.insert("Cargo.lock".into(), l);
+            result
+                .files
+                .insert("Cargo.lock".into(), restore("Cargo.lock", l));
         }
     }
     if config_changed {
-        result.files.insert(cargo_config_key.into(), cargo_config);
+        result.files.insert(
+            cargo_config_key.into(),
+            restore(cargo_config_key, cargo_config),
+        );
     }
+}
+
+/// `text` with every CRLF turned into LF, when every line break in it is a
+/// CRLF (and there is at least one); `None` for LF-only or mixed text.
+fn crlf_to_lf(text: &str) -> Option<String> {
+    let crlf = text.matches("\r\n").count();
+    (crlf > 0 && crlf == text.matches('\n').count()).then(|| text.replace("\r\n", "\n"))
+}
+
+/// A workspace-member manifest key the caller supplied: `<dir>/Cargo.toml`,
+/// a plain repo-relative path (never absolute, never `..`, never under the
+/// ledger's `.socket/` or a build `target/`).
+fn is_cargo_member_manifest_key(key: &str) -> bool {
+    let Some(dir) = key.strip_suffix("/Cargo.toml") else {
+        return false;
+    };
+    !dir.is_empty()
+        && !key.starts_with('/')
+        && !key.contains('\\')
+        && !key.contains(':')
+        && dir.split('/').all(|seg| {
+            !seg.is_empty() && seg != "." && seg != ".." && seg != ".socket" && seg != "target"
+        })
+}
+
+/// The not-declared warning for a crate no manifest names at the patched
+/// version. A crate Cargo.lock nonetheless resolves is a TRANSITIVE-only
+/// dependency: a `registry = "…"` pin reaches only the declaration it sits
+/// on, so hosted mode cannot redirect it at all — say so, and name the mode
+/// that can (vendored `[patch.crates-io]` applies to the whole graph).
+fn cargo_not_declared_detail(
+    crate_name: &str,
+    version: &str,
+    manifests: usize,
+    lock: Option<&str>,
+) -> String {
+    let scope = if manifests > 1 {
+        format!("any of the {manifests} workspace manifests")
+    } else {
+        "Cargo.toml".to_string()
+    };
+    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
+    let transitive = lock.is_some_and(|lock| {
+        lock.match_indices(head.as_str())
+            .any(|(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
+    });
+    if transitive {
+        format!(
+            "{crate_name}@{version} is a transitive-only dependency (Cargo.lock resolves it, \
+             but no [dependencies] entry in {scope} declares it); hosted mode can pin only \
+             direct dependencies, so it was NOT redirected and stays unpatched — patch it with \
+             `socket-patch scan --mode vendored`, or declare it directly and re-run \
+             (nothing rewritten)"
+        )
+    } else {
+        format!(
+            "no [dependencies] entry for {crate_name} in {scope}; dependency skipped \
+             (nothing rewritten)"
+        )
+    }
+}
+
+/// The refusal for a crate every declaration of which requires another
+/// version (`excluded`: each declaring manifest and its requirement).
+fn cargo_requirement_excludes_detail(
+    crate_name: &str,
+    version: &str,
+    excluded: &[(String, String)],
+    lock: Option<&str>,
+) -> String {
+    let declared = excluded
+        .iter()
+        .map(|(path, req)| format!("\"{req}\" in {path}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
+    let locked = lock.is_some_and(|lock| {
+        lock.match_indices(head.as_str())
+            .any(|(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
+    });
+    let remedy = if locked {
+        "; Cargo.lock resolves it for another package, which a pin cannot reach — patch it \
+         with `socket-patch scan --mode vendored`"
+    } else {
+        ""
+    };
+    format!(
+        "{crate_name} is declared as {declared}, which {version} does not satisfy (cargo \
+         resolves that declaration to another version){remedy}; dependency skipped (nothing \
+         rewritten)"
+    )
+}
+
+fn cargo_workspace_package_version(doc: &toml_edit::DocumentMut) -> Option<&str> {
+    doc.get("workspace")?
+        .get("package")?
+        .get("version")?
+        .as_str()
+}
+
+fn cargo_manifest_package_id(
+    text: &str,
+    path: &str,
+    workspace_version: Option<&str>,
+) -> Option<(String, String)> {
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    let package = doc.get("package")?;
+    let name = package.get("name")?.as_str()?;
+    let version = match package.get("version") {
+        None => "0.0.0",
+        Some(version) => match version.as_str() {
+            Some(version) => version,
+            None if version.get("workspace").and_then(toml_edit::Item::as_bool) == Some(true) => {
+                if doc.get("workspace").is_some() {
+                    cargo_workspace_package_version(&doc)?
+                } else {
+                    if let Some(workspace) = package.get("workspace") {
+                        let dir = path.strip_suffix("/Cargo.toml").unwrap_or("");
+                        if crate::utils::cargo_workspace::normalize_rel(dir, workspace.as_str()?)
+                            .is_none_or(|workspace| !workspace.is_empty())
+                        {
+                            return None;
+                        }
+                    }
+                    workspace_version?
+                }
+            }
+            None => return None,
+        },
+    };
+    Some((name.to_string(), version.to_string()))
+}
+
+/// The Cargo.lock packages that depend on `crate_name@version` and that a
+/// manifest pin cannot reach: any package with a `source` (a registry or
+/// git crate), and any source-less (workspace / path) package whose
+/// manifest is not among `pinned_packages`. Dependency edges are matched
+/// in every spelling — `"name"`, `"name version"` and the full
+/// `"name version (source)"` id — so a v1 lock and a twin's full id are
+/// covered alike. A lock that does not parse yields one entry saying so.
+fn cargo_unpinnable_dependents(
+    lock: &str,
+    crate_name: &str,
+    version: &str,
+    pinned_packages: &std::collections::BTreeSet<(&str, &str)>,
+) -> Vec<String> {
+    let Ok(doc) = lock.parse::<toml_edit::DocumentMut>() else {
+        return vec!["Cargo.lock (it does not parse as TOML)".to_string()];
+    };
+    let Some(packages) = doc
+        .get("package")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for package in packages.iter() {
+        let field = |key: &str| package.get(key).and_then(toml_edit::Item::as_str);
+        let (Some(name), Some(pkg_version)) = (field("name"), field("version")) else {
+            continue;
+        };
+        let depends = package
+            .get("dependencies")
+            .and_then(toml_edit::Item::as_array)
+            .is_some_and(|deps| {
+                deps.iter().filter_map(|d| d.as_str()).any(|d| {
+                    let mut parts = d.splitn(3, ' ');
+                    parts.next() == Some(crate_name) && parts.next().is_none_or(|v| v == version)
+                })
+            });
+        if !depends {
+            continue;
+        }
+        match field("source") {
+            Some(source) => {
+                let kind = if source.starts_with("git+") {
+                    "git"
+                } else {
+                    "registry"
+                };
+                out.push(format!("{name} {pkg_version} ({kind})"));
+            }
+            None if !pinned_packages.contains(&(name, pkg_version)) => {
+                out.push(format!(
+                    "{name} {pkg_version} (a path package whose Cargo.toml is outside the \
+                     project or not rewritable)"
+                ));
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Dependencies OTHER than `crate_name` declared across the manifests this
+/// rewriter can pin, as `<name> (in <manifest>)`. This is the question a
+/// Cargo.lock answers outright; without one, every such dependency is a
+/// possible second consumer of the patched crate. A path dependency on a
+/// manifest in this same list is NOT one of them — that package's own
+/// declarations are listed here too — and a `workspace = true` inheritor
+/// resolves to the root's `[workspace.dependencies]` entry, which is.
+/// A manifest that does not parse is itself blocking (fail closed).
+fn cargo_lockless_other_dependencies(
+    manifests: &[(String, String)],
+    crate_name: &str,
+) -> Vec<String> {
+    fn field<'a>(entry: &'a toml_edit::Item, key: &str) -> Option<&'a str> {
+        match entry {
+            toml_edit::Item::Table(t) => t.get(key).and_then(toml_edit::Item::as_str),
+            toml_edit::Item::Value(v) => v
+                .as_inline_table()
+                .and_then(|t| t.get(key))
+                .and_then(toml_edit::Value::as_str),
+            _ => None,
+        }
+    }
+    fn flag(entry: &toml_edit::Item, key: &str) -> bool {
+        match entry {
+            toml_edit::Item::Table(t) => t.get(key).and_then(toml_edit::Item::as_bool),
+            toml_edit::Item::Value(v) => v
+                .as_inline_table()
+                .and_then(|t| t.get(key))
+                .and_then(toml_edit::Value::as_bool),
+            _ => None,
+        }
+        .unwrap_or(false)
+    }
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let known: std::collections::BTreeSet<&str> =
+        manifests.iter().map(|(k, _)| k.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    for (path, text) in manifests {
+        let dir = path.strip_suffix("/Cargo.toml").unwrap_or("");
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            out.push(format!("{path} (it does not parse as TOML)"));
+            continue;
+        };
+        let scan = |item: Option<&toml_edit::Item>, out: &mut Vec<String>| {
+            let Some(table) = item.and_then(toml_edit::Item::as_table_like) else {
+                return;
+            };
+            for (key, entry) in table.iter() {
+                let name = field(entry, "package").unwrap_or(key);
+                if name == crate_name || flag(entry, "workspace") {
+                    continue;
+                }
+                if let Some(rel) = field(entry, "path") {
+                    let inside = crate::utils::cargo_workspace::normalize_rel(dir, rel)
+                        .is_some_and(|d| {
+                            d.is_empty() || known.contains(format!("{d}/Cargo.toml").as_str())
+                        });
+                    if inside {
+                        continue;
+                    }
+                }
+                let named = if path == "Cargo.toml" {
+                    name.to_string()
+                } else {
+                    format!("{name} (in {path})")
+                };
+                if !out.contains(&named) {
+                    out.push(named);
+                }
+            }
+        };
+        for kind in KINDS {
+            scan(doc.get(kind), &mut out);
+        }
+        if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table) {
+            for (_, target) in targets.iter() {
+                let Some(target) = target.as_table() else {
+                    continue;
+                };
+                for kind in KINDS {
+                    scan(target.get(kind), &mut out);
+                }
+            }
+        }
+        if let Some(ws) = doc.get("workspace").and_then(toml_edit::Item::as_table) {
+            scan(ws.get("dependencies"), &mut out);
+            // A member manifest this run did not read is a second consumer
+            // nothing can rule out: it may declare the crate itself (a pin
+            // never reaches it) or a dependency that pulls it in. Member
+            // discovery drops what it must not follow — a symbolic link, a
+            // path outside the project — and a glob's expansion is not
+            // visible here at all, so only a literal member whose manifest
+            // IS in this run's set is accounted for.
+            let members = ws
+                .get("members")
+                .and_then(toml_edit::Item::as_array)
+                .into_iter()
+                .flat_map(|a| a.iter().filter_map(toml_edit::Value::as_str));
+            for member in members {
+                let named = if member.contains(['*', '?']) {
+                    format!("the workspace members pattern `{member}`")
+                } else if crate::utils::cargo_workspace::normalize_rel(dir, member)
+                    .is_some_and(|d| known.contains(format!("{d}/Cargo.toml").as_str()))
+                {
+                    continue;
+                } else {
+                    format!("the workspace member `{member}`")
+                };
+                if !out.contains(&named) {
+                    out.push(named);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The refusal for a lockless project that declares other dependencies.
+fn cargo_lockless_dependents_detail(crate_name: &str, version: &str, others: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut names = others
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if others.len() > SHOWN {
+        names.push_str(&format!(" and {} more", others.len() - SHOWN));
+    }
+    format!(
+        "this project has no Cargo.lock, so nothing says whether {names} also pull in \
+         {crate_name}@{version}; a `registry = …` pin reaches only the declarations it sits \
+         on, so such a consumer would compile the unpatched crates.io copy while \
+         {crate_name} is reported redirected — commit a lockfile (`cargo generate-lockfile`) \
+         and re-run, or patch it with `socket-patch scan --mode vendored`, whose \
+         `[patch.crates-io]` covers the whole graph (nothing rewritten)"
+    )
+}
+
+/// The refusal for a crate other lock packages also depend on.
+fn cargo_transitive_dependents_detail(
+    crate_name: &str,
+    version: &str,
+    blocking: &[String],
+) -> String {
+    const SHOWN: usize = 5;
+    let mut names = blocking
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if blocking.len() > SHOWN {
+        names.push_str(&format!(" and {} more", blocking.len() - SHOWN));
+    }
+    format!(
+        "{crate_name}@{version} is also a dependency of {names} in Cargo.lock; a `registry = …` \
+         pin reaches only the declarations it sits on, so those would keep resolving \
+         {crate_name} from crates.io (a `--locked` build fails, and the unpatched copy is \
+         compiled) — it was NOT redirected and stays unpatched; patch it with \
+         `socket-patch scan --mode vendored` (nothing rewritten)"
+    )
 }
 
 /// Sparse index URLs land verbatim inside quoted TOML strings in both
@@ -983,6 +1776,219 @@ pub(crate) fn socket_patch_name_uuid_exact(name: &str, vendored: bool) -> Option
 /// superseded in place; any other registry pin is the user's and is refused.
 fn is_socket_patch_registry_name(value: &str) -> bool {
     socket_patch_name_uuid_exact(value, false).is_some()
+}
+
+/// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
+/// manifest, in EVERY declaration shape [`plan_cargo_toml`] writes: a
+/// `[…dependencies.<key>]` header table (whose pin is a standalone
+/// `registry = …` line), an inline table, a quoted key, and a rename
+/// (`package = "<crate>"` under any key). Readers that probe for a LIVE
+/// hosted redirect use this rather than a single-line regex, which saw only
+/// the inline spelling and read the other three as "not redirected".
+///
+/// The live readers use [`CargoRegistryPins`], which extracts every crate's
+/// pin in this same scan once per manifest; this per-crate scan is its
+/// equivalence oracle.
+#[cfg(test)]
+pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Option<String> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut section = CargoTomlSection::Other;
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            section = match CARGO_TOML_HEADER_RE.captures(trimmed) {
+                Some(c) => classify_cargo_section(
+                    c.get(1)
+                        .expect("header_re always captures group 1 (section name)")
+                        .as_str(),
+                ),
+                None => CargoTomlSection::Other,
+            };
+            let CargoTomlSection::DepEntry { key, .. } = section.clone() else {
+                continue;
+            };
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(idx + 1)
+                .find(|(_, l)| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |(j, _)| j);
+            let block: Vec<&str> = (idx + 1..end)
+                .map(|j| lines[j].trim_start())
+                .filter(|t| !t.is_empty() && !t.starts_with('#'))
+                .collect();
+            let value_of = |name: &str| -> Option<String> {
+                block.iter().find_map(|t| {
+                    let (k, rest) = parse_cargo_entry_key(t)?;
+                    if k != name {
+                        return None;
+                    }
+                    cargo_toml_string(rest.trim_start().strip_prefix('=')?)
+                })
+            };
+            let is_ours = match value_of("package") {
+                Some(package) => package == crate_name,
+                None => key == crate_name,
+            };
+            if is_ours {
+                if let Some(reg) = value_of("registry").filter(|v| is_socket_patch_registry_name(v))
+                {
+                    return Some(reg);
+                }
+            }
+            continue;
+        }
+        let CargoTomlSection::DepTable { .. } = section else {
+            continue;
+        };
+        let Some((key, rest)) = parse_cargo_entry_key(trimmed) else {
+            continue;
+        };
+        let rest_trim = rest.trim_start();
+        if let Some(dotted) = rest_trim.strip_prefix('.') {
+            // `<crate>.registry = "socket-patch-…"`: a spelling this rewriter
+            // refuses to write, but a hand edit can leave one behind.
+            if key == crate_name {
+                let registry = parse_cargo_entry_key(dotted)
+                    .filter(|(key, _)| key == "registry")
+                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
+                    .and_then(cargo_toml_string)
+                    .filter(|registry| is_socket_patch_registry_name(registry));
+                if registry.is_some() {
+                    return registry;
+                }
+            }
+            continue;
+        }
+        let Some(value) = rest_trim.strip_prefix('=').map(str::trim_start) else {
+            continue;
+        };
+        if !value.starts_with('{') {
+            continue;
+        }
+        let Some(close) = value.find('}') else {
+            continue;
+        };
+        let inner = &value[1..close];
+        let is_ours = match cargo_toml_inline_string(inner, "package") {
+            Some(package) => package == crate_name,
+            None => key == crate_name,
+        };
+        if is_ours {
+            if let Some(reg) = cargo_toml_inline_string(inner, "registry")
+                .filter(|registry| is_socket_patch_registry_name(registry))
+            {
+                return Some(reg);
+            }
+        }
+    }
+    None
+}
+
+/// Every Socket registry pin a manifest carries, as `(crate, registry)` in
+/// file order — [`cargo_socket_registry_pin`] for all crates at once. That
+/// scan's per-crate test is always "the declaration's owning crate (its
+/// `package` rename, else its key) equals the crate asked about", and
+/// everything else it computes is independent of the crate asked about, so
+/// the first pin recorded here for a crate is exactly the one it returns.
+pub(crate) struct CargoRegistryPins(Vec<(String, String)>);
+
+impl CargoRegistryPins {
+    pub(crate) fn of(content: &str) -> Self {
+        let lines: Vec<&str> = content.split('\n').collect();
+        let mut pins = Vec::new();
+        let mut section = CargoTomlSection::Other;
+        for (idx, raw) in lines.iter().enumerate() {
+            let trimmed = raw.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+                section = match CARGO_TOML_HEADER_RE.captures(trimmed) {
+                    Some(c) => classify_cargo_section(
+                        c.get(1)
+                            .expect("header_re always captures group 1 (section name)")
+                            .as_str(),
+                    ),
+                    None => CargoTomlSection::Other,
+                };
+                let CargoTomlSection::DepEntry { key, .. } = section.clone() else {
+                    continue;
+                };
+                let end = lines
+                    .iter()
+                    .enumerate()
+                    .skip(idx + 1)
+                    .find(|(_, l)| l.trim_start().starts_with('['))
+                    .map_or(lines.len(), |(j, _)| j);
+                let block: Vec<&str> = (idx + 1..end)
+                    .map(|j| lines[j].trim_start())
+                    .filter(|t| !t.is_empty() && !t.starts_with('#'))
+                    .collect();
+                let value_of = |name: &str| -> Option<String> {
+                    block.iter().find_map(|t| {
+                        let (k, rest) = parse_cargo_entry_key(t)?;
+                        if k != name {
+                            return None;
+                        }
+                        cargo_toml_string(rest.trim_start().strip_prefix('=')?)
+                    })
+                };
+                if let Some(reg) = value_of("registry").filter(|v| is_socket_patch_registry_name(v))
+                {
+                    pins.push((value_of("package").unwrap_or(key), reg));
+                }
+                continue;
+            }
+            let CargoTomlSection::DepTable { .. } = section else {
+                continue;
+            };
+            let Some((key, rest)) = parse_cargo_entry_key(trimmed) else {
+                continue;
+            };
+            let rest_trim = rest.trim_start();
+            if let Some(dotted) = rest_trim.strip_prefix('.') {
+                let registry = parse_cargo_entry_key(dotted)
+                    .filter(|(k, _)| k == "registry")
+                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
+                    .and_then(cargo_toml_string)
+                    .filter(|registry| is_socket_patch_registry_name(registry));
+                if let Some(reg) = registry {
+                    pins.push((key, reg));
+                }
+                continue;
+            }
+            let Some(value) = rest_trim.strip_prefix('=').map(str::trim_start) else {
+                continue;
+            };
+            if !value.starts_with('{') {
+                continue;
+            }
+            let Some(close) = value.find('}') else {
+                continue;
+            };
+            let inner = &value[1..close];
+            if let Some(reg) = cargo_toml_inline_string(inner, "registry")
+                .filter(|registry| is_socket_patch_registry_name(registry))
+            {
+                let owner = cargo_toml_inline_string(inner, "package").unwrap_or(key);
+                pins.push((owner, reg));
+            }
+        }
+        CargoRegistryPins(pins)
+    }
+
+    /// [`cargo_socket_registry_pin`]`(content, crate_name)` for the
+    /// `content` these pins were extracted from.
+    pub(crate) fn pin_for(&self, crate_name: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(owner, _)| owner == crate_name)
+            .map(|(_, reg)| reg.clone())
+    }
 }
 
 /// Split a TOML table-header path into dot segments, respecting quoted
@@ -1100,21 +2106,132 @@ fn parse_cargo_entry_key(line: &str) -> Option<(String, &str)> {
     }
 }
 
+fn cargo_toml_string(value: &str) -> Option<String> {
+    let document = format!("value = {value}")
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?;
+    document.get("value")?.as_str().map(str::to_string)
+}
+
+fn cargo_toml_inline_string(inner: &str, key: &str) -> Option<String> {
+    let document = format!("dependency = {{{inner}}}")
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?;
+    document
+        .get("dependency")?
+        .as_inline_table()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn validate_cargo_toml_pins(
+    content: &str,
+    crate_name: &str,
+    version: &str,
+    other_versions: &[String],
+    registry: &str,
+    workspace: &BTreeMap<String, CargoWorkspaceEntry>,
+    inherited: &BTreeMap<String, CargoWorkspaceEntry>,
+) -> Result<(), String> {
+    let document = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| "the planned manifest does not parse as TOML".to_string())?;
+    let unpinned = |dependencies: &dyn toml_edit::TableLike| {
+        dependencies.iter().find_map(|(key, entry)| {
+            let table = entry.as_table_like();
+            let field = |name: &str| table.and_then(|table| table.get(name));
+            if field("workspace").and_then(toml_edit::Item::as_bool) == Some(true) {
+                return match workspace.get(key).or(inherited.get(key)) {
+                    Some(
+                        CargoWorkspaceEntry::Pinned
+                        | CargoWorkspaceEntry::OtherVersion
+                        | CargoWorkspaceEntry::OtherPackage,
+                    ) => None,
+                    None if key != crate_name => None,
+                    None => Some(key.to_string()),
+                };
+            }
+            let name = field("package")
+                .and_then(toml_edit::Item::as_str)
+                .unwrap_or(key);
+            if name != crate_name {
+                return None;
+            }
+            let requirement = entry
+                .as_str()
+                .or_else(|| field("version").and_then(toml_edit::Item::as_str));
+            match cargo_req_selects(requirement, version, other_versions) {
+                CargoReqMatch::NotOurs => return None,
+                CargoReqMatch::Ambiguous => return Some(key.to_string()),
+                CargoReqMatch::Ours => {}
+            }
+            let is_pinned = field("registry").and_then(toml_edit::Item::as_str) == Some(registry)
+                && field("path").is_none()
+                && field("git").is_none()
+                && field("registry-index").is_none();
+            (!is_pinned).then(|| key.to_string())
+        })
+    };
+    let mut scopes: Vec<&dyn toml_edit::TableLike> = vec![document.as_table()];
+    if let Some(targets) = document
+        .get("target")
+        .and_then(toml_edit::Item::as_table_like)
+    {
+        scopes.extend(
+            targets
+                .iter()
+                .filter_map(|(_, target)| target.as_table_like()),
+        );
+    }
+    for scope in scopes {
+        for kind in [
+            "dependencies",
+            "dev-dependencies",
+            "build-dependencies",
+            "dev_dependencies",
+            "build_dependencies",
+        ] {
+            if let Some(key) = scope
+                .get(kind)
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(&unpinned)
+            {
+                return Err(format!("dependency declaration {key} was not pinned"));
+            }
+        }
+    }
+    if let Some(key) = document
+        .get("workspace")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(unpinned)
+    {
+        return Err(format!(
+            "workspace dependency declaration {key} was not pinned"
+        ));
+    }
+    Ok(())
+}
+
 struct CargoTomlPlan {
     content: String,
     edits: Vec<FileEdit>,
     /// `false` when every occurrence already carried our registry (idempotent
     /// re-run) — the pin is in place, nothing to write.
     changed: bool,
-}
-
-enum CargoTomlPlanError {
-    /// The crate is not declared anywhere in this manifest (rename-aware:
-    /// a key that matches but has `package = "<other>"` is NOT the crate).
-    NotFound,
-    /// At least one occurrence exists that cannot be pinned to the managed
-    /// registry — the whole dep must be skipped.
-    Refused(String),
+    /// Whether this manifest declares the crate at the patched version at
+    /// all (rename-aware: a key that matches but has `package = "<other>"`
+    /// is NOT the crate). `false` plans nothing.
+    found: bool,
+    /// This manifest's `[workspace.dependencies]` verdicts, per key — what
+    /// its members' `workspace = true` inheritors resolve against.
+    workspace: BTreeMap<String, CargoWorkspaceEntry>,
+    /// The requirements of this manifest's declarations of the crate that
+    /// do NOT accept the patched version (cargo resolves each to another
+    /// version).
+    excluded: Vec<String>,
 }
 
 /// How one occurrence of the dep will be handled.
@@ -1143,11 +2260,9 @@ enum CargoTomlAction {
 static CARGO_TOML_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\[([^\]]+)\]\s*(?:#.*)?$").expect("static section-header regex is valid")
 });
-static CARGO_TOML_PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bpackage\s*=\s*"([^"]*)""#).expect("static package-key regex is valid")
-});
 static CARGO_TOML_REGISTRY_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bregistry\s*=\s*"([^"]*)""#).expect("static registry-value regex is valid")
+    Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"[^"]*"|'[^']*')"#)
+        .expect("static registry-value regex is valid")
 });
 static CARGO_TOML_REGISTRY_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid")
@@ -1162,31 +2277,119 @@ static CARGO_TOML_PATH_GIT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(?:path|git)\s*=").expect("static path/git probe regex is valid")
 });
 
+/// Whether one declaration's version requirement selects the patched
+/// version. Cargo resolves a declaration to ONE version, so a project that
+/// locks several versions of a crate (`cfg-if = "1"` beside a renamed
+/// `cfg-if-legacy = { package = "cfg-if", version = "0.1" }`) must pin
+/// only the declaration whose requirement matches the patched version —
+/// pinning every same-named declaration to one registry leaves the other
+/// requirement unsatisfiable there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CargoReqMatch {
+    Ours,
+    NotOurs,
+    /// The requirement also matches another locked version (or cannot be
+    /// read while another version is locked): which one cargo picked for
+    /// this declaration cannot be told from the manifest.
+    Ambiguous,
+}
+
+pub(crate) fn cargo_req_selects(
+    req: Option<&str>,
+    version: &str,
+    other_versions: &[String],
+) -> CargoReqMatch {
+    let unknown = if other_versions.is_empty() {
+        CargoReqMatch::Ours
+    } else {
+        CargoReqMatch::Ambiguous
+    };
+    let (Some(req), Ok(patched)) = (req, semver::Version::parse(version)) else {
+        return unknown;
+    };
+    let Ok(req) = semver::VersionReq::parse(req.trim()) else {
+        return unknown;
+    };
+    if !req.matches(&patched) {
+        return CargoReqMatch::NotOurs;
+    }
+    let also_other = other_versions
+        .iter()
+        .any(|v| semver::Version::parse(v).is_ok_and(|v| req.matches(&v)));
+    if also_other {
+        CargoReqMatch::Ambiguous
+    } else {
+        CargoReqMatch::Ours
+    }
+}
+
+/// What a `[workspace.dependencies]` entry means for the patched version —
+/// resolved per entry KEY, since `workspace = true` inherits by key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CargoWorkspaceEntry {
+    /// The entry lands (or already carries) the pin.
+    Pinned,
+    /// The entry names the crate at another version.
+    OtherVersion,
+    OtherPackage,
+}
+
+/// Every version of `crate_name` a Cargo.lock holds other than `version`.
+fn cargo_lock_other_versions(lock: Option<&str>, crate_name: &str, version: &str) -> Vec<String> {
+    let Some(lock) = lock else {
+        return Vec::new();
+    };
+    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"");
+    let mut versions: Vec<String> = lock
+        .match_indices(head.as_str())
+        .filter(|&(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
+        .filter_map(|(at, _)| {
+            let rest = &lock[at + head.len()..];
+            rest.split_once('"').map(|(v, _)| v.to_string())
+        })
+        .filter(|v| v != version)
+        .collect();
+    versions.sort();
+    versions.dedup();
+    versions
+}
+
+/// `Err` carries the refusal reason: an occurrence exists that cannot be
+/// pinned to the managed registry, so the whole dep must be skipped.
+/// `inherited` is the workspace root's verdicts when planning a member.
 fn plan_cargo_toml(
     content: &str,
+    path: &str,
     crate_name: &str,
+    version: &str,
+    other_versions: &[String],
     reg: &str,
-) -> Result<CargoTomlPlan, CargoTomlPlanError> {
+    inherited: &BTreeMap<String, CargoWorkspaceEntry>,
+) -> Result<CargoTomlPlan, String> {
     let lines: Vec<&str> = content.split('\n').collect();
     let header_re: &Regex = &CARGO_TOML_HEADER_RE;
-    let package_re: &Regex = &CARGO_TOML_PACKAGE_RE;
     let registry_val_re: &Regex = &CARGO_TOML_REGISTRY_VAL_RE;
     let registry_key_re: &Regex = &CARGO_TOML_REGISTRY_KEY_RE;
     let registry_index_re: &Regex = &CARGO_TOML_REGISTRY_INDEX_RE;
     let workspace_key_re: &Regex = &CARGO_TOML_WORKSPACE_KEY_RE;
     let path_git_re: &Regex = &CARGO_TOML_PATH_GIT_RE;
+    let ambiguous =
+        || format!("its version requirement also matches another locked version of {crate_name}");
 
     // A pending occurrence: what was found, resolved to an action in pass 2
     // (workspace-inheriting entries need the whole file scanned first).
     enum Pending {
         Action(CargoTomlAction),
-        NeedsWorkspacePin,
+        /// `workspace = true` under this key.
+        NeedsWorkspacePin(String),
         Refuse(String),
     }
     let mut pending: Vec<Pending> = Vec::new();
-    // Whether the `[workspace.dependencies]` entry for the crate lands (or
-    // already carries) the pin — satisfies `workspace = true` inheritors.
-    let mut workspace_pinned = false;
+    // Per `[workspace.dependencies]` key naming the crate: whether that
+    // entry lands (or already carries) the pin — satisfies `workspace =
+    // true` inheritors of the same key — or names another version.
+    let mut ws_entries: BTreeMap<String, CargoWorkspaceEntry> = BTreeMap::new();
+    let mut excluded: Vec<String> = Vec::new();
 
     let mut section = CargoTomlSection::Other;
     for (idx, raw) in lines.iter().enumerate() {
@@ -1223,26 +2426,13 @@ fn plan_cargo_toml(
                             if k == key_name {
                                 let rest = rest.trim_start();
                                 if let Some(v) = rest.strip_prefix('=') {
-                                    let v = v.trim();
-                                    let v = v
-                                        .strip_prefix('"')
-                                        .and_then(|s| s.split('"').next())
-                                        .unwrap_or(v);
-                                    return Some((*j, v.to_string()));
+                                    return cargo_toml_string(v).map(|value| (*j, value));
                                 }
                             }
                         }
                     }
                     None
                 };
-                let package_val = find_value("package").map(|(_, v)| v);
-                let is_ours = match &package_val {
-                    Some(p) => p == crate_name,
-                    None => key == crate_name,
-                };
-                if !is_ours {
-                    continue;
-                }
                 let has = |name: &str| {
                     block.iter().any(|(_, t)| {
                         parse_cargo_entry_key(t).is_some_and(|(k, rest)| {
@@ -1251,7 +2441,31 @@ fn plan_cargo_toml(
                     })
                 };
                 if has("workspace") {
-                    pending.push(Pending::NeedsWorkspacePin);
+                    pending.push(Pending::NeedsWorkspacePin(key.clone()));
+                    continue;
+                }
+                let package_val = find_value("package").map(|(_, v)| v);
+                let is_ours = match &package_val {
+                    Some(p) => p == crate_name,
+                    None => key == crate_name,
+                };
+                if !is_ours {
+                    if ws {
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherPackage);
+                    }
+                    continue;
+                }
+                let req = find_value("version").map(|(_, v)| v);
+                let selects = cargo_req_selects(req.as_deref(), version, other_versions);
+                if selects == CargoReqMatch::NotOurs {
+                    excluded.extend(req);
+                    if ws {
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherVersion);
+                    }
+                    continue;
+                }
+                if selects == CargoReqMatch::Ambiguous {
+                    pending.push(Pending::Refuse(ambiguous()));
                 } else if has("path") || has("git") {
                     pending.push(Pending::Refuse(
                         "declared as a path/git dependency".to_string(),
@@ -1265,7 +2479,7 @@ fn plan_cargo_toml(
                     if value == reg {
                         pending.push(Pending::Action(CargoTomlAction::Already));
                         if ws {
-                            workspace_pinned = true;
+                            ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                         }
                     } else if is_socket_patch_registry_name(&value) {
                         let old_line = lines[line_idx];
@@ -1277,7 +2491,7 @@ fn plan_cargo_toml(
                             new_text,
                         }));
                         if ws {
-                            workspace_pinned = true;
+                            ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                         }
                     } else {
                         pending.push(Pending::Refuse(format!(
@@ -1291,7 +2505,7 @@ fn plan_cargo_toml(
                         inserted: format!("{indent}registry = \"{reg}\""),
                     }));
                     if ws {
-                        workspace_pinned = true;
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                     }
                 }
             }
@@ -1307,19 +2521,16 @@ fn plan_cargo_toml(
         if let Some(dotted) = rest_trim.strip_prefix('.') {
             // Dotted entry (`serde.workspace = true`, `serde.version = "1"`,
             // `alias.package = "serde"`, …).
-            let sub = parse_cargo_entry_key(dotted).map(|(k, _)| k);
-            if key == crate_name {
-                if sub.as_deref() == Some("workspace") {
-                    pending.push(Pending::NeedsWorkspacePin);
-                } else {
-                    pending.push(Pending::Refuse(
-                        "declared with dotted keys this rewriter does not edit".to_string(),
-                    ));
-                }
-            } else if sub.as_deref() == Some("package")
-                && package_re
-                    .captures(trimmed)
-                    .is_some_and(|c| &c[1] == crate_name)
+            let sub = parse_cargo_entry_key(dotted);
+            if sub.as_ref().is_some_and(|(key, _)| key == "workspace") {
+                pending.push(Pending::NeedsWorkspacePin(key.clone()));
+            } else if key == crate_name
+                || sub
+                    .filter(|(key, _)| key == "package")
+                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
+                    .and_then(cargo_toml_string)
+                    .as_deref()
+                    == Some(crate_name)
             {
                 pending.push(Pending::Refuse(
                     "declared with dotted keys this rewriter does not edit".to_string(),
@@ -1344,26 +2555,45 @@ fn plan_cargo_toml(
                 continue;
             };
             let inner = &value[1..close];
-            let package_val = package_re.captures(inner).map(|c| c[1].to_string());
+            if workspace_key_re.is_match(inner) {
+                pending.push(Pending::NeedsWorkspacePin(key.clone()));
+                continue;
+            }
+            let package_val = cargo_toml_inline_string(inner, "package");
             let is_ours = match &package_val {
                 Some(p) => p == crate_name,
                 None => key == crate_name,
             };
             if !is_ours {
+                if workspace {
+                    ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherPackage);
+                }
                 continue;
             }
-            if workspace_key_re.is_match(inner) {
-                pending.push(Pending::NeedsWorkspacePin);
-            } else if path_git_re.is_match(inner) {
+            let req = cargo_toml_inline_string(inner, "version");
+            match cargo_req_selects(req.as_deref(), version, other_versions) {
+                CargoReqMatch::NotOurs => {
+                    excluded.extend(req);
+                    if workspace {
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherVersion);
+                    }
+                    continue;
+                }
+                CargoReqMatch::Ambiguous => {
+                    pending.push(Pending::Refuse(ambiguous()));
+                    continue;
+                }
+                CargoReqMatch::Ours => {}
+            }
+            if path_git_re.is_match(inner) {
                 pending.push(Pending::Refuse(
                     "declared as a path/git dependency".to_string(),
                 ));
-            } else if let Some(c) = registry_val_re.captures(inner) {
-                let value = c[1].to_string();
+            } else if let Some(value) = cargo_toml_inline_string(inner, "registry") {
                 if value == reg {
                     pending.push(Pending::Action(CargoTomlAction::Already));
                     if workspace {
-                        workspace_pinned = true;
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                     }
                 } else if is_socket_patch_registry_name(&value) {
                     let new_text = registry_val_re
@@ -1374,7 +2604,7 @@ fn plan_cargo_toml(
                         new_text,
                     }));
                     if workspace {
-                        workspace_pinned = true;
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                     }
                 } else {
                     pending.push(Pending::Refuse(format!(
@@ -1406,7 +2636,7 @@ fn plan_cargo_toml(
                     new_text,
                 }));
                 if workspace {
-                    workspace_pinned = true;
+                    ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                 }
             }
         } else if value.starts_with('"') {
@@ -1428,6 +2658,24 @@ fn plan_cargo_toml(
                 ));
                 continue;
             };
+            let req = m
+                .get(2)
+                .expect("line_re always captures group 2 (version)")
+                .as_str();
+            match cargo_req_selects(Some(req), version, other_versions) {
+                CargoReqMatch::NotOurs => {
+                    excluded.push(req.to_string());
+                    if workspace {
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherVersion);
+                    }
+                    continue;
+                }
+                CargoReqMatch::Ambiguous => {
+                    pending.push(Pending::Refuse(ambiguous()));
+                    continue;
+                }
+                CargoReqMatch::Ours => {}
+            }
             let new_text = format!(
                 "{}{{ version = \"{}\", registry = \"{reg}\" }}{}",
                 m.get(1)
@@ -1445,7 +2693,7 @@ fn plan_cargo_toml(
                 new_text,
             }));
             if workspace {
-                workspace_pinned = true;
+                ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
             }
         } else if key == crate_name {
             pending.push(Pending::Refuse(
@@ -1454,8 +2702,16 @@ fn plan_cargo_toml(
         }
     }
 
+    let not_found = |ws_entries: BTreeMap<String, CargoWorkspaceEntry>| CargoTomlPlan {
+        content: content.to_string(),
+        edits: Vec::new(),
+        changed: false,
+        found: false,
+        workspace: ws_entries,
+        excluded: excluded.clone(),
+    };
     if pending.is_empty() {
-        return Err(CargoTomlPlanError::NotFound);
+        return Ok(not_found(ws_entries));
     }
     // Resolve: any refusal (including an unsatisfiable `workspace = true`
     // inheritor) refuses the WHOLE dep — no partial pin is ever applied.
@@ -1463,19 +2719,25 @@ fn plan_cargo_toml(
     for p in pending {
         match p {
             Pending::Action(a) => actions.push(a),
-            Pending::NeedsWorkspacePin => {
-                if workspace_pinned {
+            Pending::NeedsWorkspacePin(key) => match ws_entries.get(&key).or(inherited.get(&key)) {
+                Some(CargoWorkspaceEntry::Pinned) => {
                     actions.push(CargoTomlAction::InheritsWorkspace);
-                } else {
-                    return Err(CargoTomlPlanError::Refused(
-                        "inherits from [workspace.dependencies] with no rewritable entry \
-                         in this manifest"
-                            .to_string(),
-                    ));
                 }
-            }
-            Pending::Refuse(reason) => return Err(CargoTomlPlanError::Refused(reason)),
+                // Inherits another version of the crate: not this dep.
+                Some(CargoWorkspaceEntry::OtherVersion | CargoWorkspaceEntry::OtherPackage) => {}
+                None if key == crate_name => {
+                    return Err("inherits from [workspace.dependencies] with no rewritable \
+                                entry for it"
+                        .to_string());
+                }
+                None => {}
+            },
+            Pending::Refuse(reason) => return Err(reason),
         }
+    }
+    // Every occurrence named another version (inheritors included).
+    if actions.is_empty() {
+        return Ok(not_found(ws_entries));
     }
 
     // Apply bottom-up so line indices stay valid; record edits top-down.
@@ -1494,7 +2756,7 @@ fn plan_cargo_toml(
         match action {
             CargoTomlAction::ReplaceLine { new_text, .. } => {
                 edits.push(FileEdit {
-                    path: "Cargo.toml".into(),
+                    path: path.into(),
                     kind: "redirect_cargo_toml_dep".into(),
                     action: "rewritten".into(),
                     key: Some(crate_name.into()),
@@ -1504,7 +2766,7 @@ fn plan_cargo_toml(
             }
             CargoTomlAction::InsertAfterHeader { inserted, .. } => {
                 edits.push(FileEdit {
-                    path: "Cargo.toml".into(),
+                    path: path.into(),
                     kind: "redirect_cargo_toml_dep".into(),
                     action: "rewritten".into(),
                     key: Some(crate_name.into()),
@@ -1531,8 +2793,16 @@ fn plan_cargo_toml(
         content: new_lines.join("\n"),
         edits,
         changed,
+        found: true,
+        workspace: ws_entries,
+        excluded,
     })
 }
+
+/// The Cargo.lock edit kind for dependents' full-id references: `original`
+/// / `new` are the quoted `"<name> <version> (<source>)"` ids, keyed
+/// `<name>@<version>`, and the inverse replaces EVERY occurrence of `new`.
+pub(crate) const CARGO_LOCK_REFERENCE_KIND: &str = "redirect_cargo_lock_reference";
 
 static CARGO_LOCK_SOURCE_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)^source = "([^"]*)"$"#).expect("static lock source-line regex is valid")
@@ -1561,8 +2831,9 @@ static CARGO_LOCK_AFTER_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Full-id references are rewritten in any format (v2+ spells them that way
 /// when a name + version is ambiguous). Each changed fragment is its own
 /// `redirect_cargo_lock_entry` edit (unique text, so the fragment revert is
-/// unambiguous): the entry, the `[metadata]` line, and each dependent's
-/// whole `[[package]]` block.
+/// unambiguous) — the entry and the `[metadata]` line — and the dependents'
+/// references are one `redirect_cargo_lock_reference` edit holding the
+/// quoted full id, reverted at every occurrence.
 fn plan_cargo_lock(
     content: &str,
     crate_name: &str,
@@ -1666,21 +2937,47 @@ fn plan_cargo_lock(
             edits.push(edit(&line, &pinned));
         }
     }
-    // Dependents' full-id references to the OLD source.
+    // Dependents' full-id references to the OLD source, recorded as ONE
+    // `redirect_cargo_lock_reference` edit holding just the quoted id —
+    // never a dependent's whole block: a block referencing two patched
+    // packages (the root of a v1 lock) would hold two overlapping block
+    // edits, and reverting the first-applied one alone found neither of its
+    // fragments. The id names this name + version + source exactly, so its
+    // inverse puts back EVERY occurrence, independently of any other
+    // package's edits and in any removal order.
     if let Some(old) = old_source.filter(|old| old != index_url) {
         let from = format!("\"{crate_name} {version} ({old})\"");
         let to = format!("\"{crate_name} {version} ({index_url})\"");
+        let mut repointed_any = false;
+        // The oldest v1 locks keep the ROOT package in a standalone `[root]`
+        // table instead of the `[[package]]` array, with its own full-id
+        // `dependencies`. It precedes the array, so the block walk below
+        // never reaches it and the lock would keep naming a package it no
+        // longer contains (`--locked` fails; an unlocked build silently
+        // re-resolves).
+        if let Some((start, end)) = lock_root_table(&new_content) {
+            if new_content[start..end].contains(&from) {
+                let repointed = new_content[start..end].replace(&from, &to);
+                new_content.replace_range(start..end, &repointed);
+                repointed_any = true;
+            }
+        }
         let mut cursor = 0;
         while let Some((start, end)) = next_lock_block(&new_content, cursor) {
-            let block = new_content[start..end].to_string();
-            if block.contains(&from) {
-                let repointed = block.replace(&from, &to);
+            if new_content[start..end].contains(&from) {
+                let repointed = new_content[start..end].replace(&from, &to);
                 new_content.replace_range(start..end, &repointed);
-                edits.push(edit(&block, &repointed));
+                repointed_any = true;
                 cursor = start + repointed.len();
             } else {
                 cursor = end;
             }
+        }
+        if repointed_any {
+            edits.push(FileEdit {
+                kind: CARGO_LOCK_REFERENCE_KIND.into(),
+                ..edit(&from, &to)
+            });
         }
     }
     // Already redirected (re-run): every fragment is at the target values; a
@@ -1692,6 +2989,19 @@ fn plan_cargo_lock(
         content: new_content,
         edits,
     }
+}
+
+/// The v1 `[root]` table's span, when the lock has one: cargo before the
+/// `[root]` removal recorded the root package there rather than in the
+/// `[[package]]` array, and its `dependencies` spell full package ids the
+/// same way. Bounded by [`lock_block_end`], like a package block.
+fn lock_root_table(content: &str) -> Option<(usize, usize)> {
+    const HEADER: &str = "[root]\n";
+    let at = content
+        .match_indices(HEADER)
+        .map(|(at, _)| at)
+        .find(|&at| at == 0 || content.as_bytes()[at - 1] == b'\n')?;
+    Some((at, lock_block_end(content, at + HEADER.len())))
 }
 
 /// The next `[[package]]` block starting at or after `from`, as
@@ -1714,7 +3024,29 @@ fn next_lock_block(content: &str, from: usize) -> Option<(usize, usize)> {
 /// TS rewriter's `(?=\n*$)` lookahead — while the file keeps its newlines).
 fn lock_block_end(content: &str, body_start: usize) -> usize {
     // The next block, or the `[metadata]` / `[[patch.unused]]` tables that
-    // trail the packages.
+    // trail the packages. The trailing tables are searched only up to the
+    // next block: they sit after every `[[package]]` (absent entirely from
+    // v3/v4 locks), and an unbounded search per block scanned to EOF for
+    // every block of every dep. Each marker holds its only `\n` at offset 0,
+    // so a hit starting before the next block also ends by it — the bounded
+    // minimum is the unbounded one.
+    let rest = &content[body_start..];
+    let next_block = rest.find("\n[[package]]").unwrap_or(rest.len());
+    let mut end = ["\n[metadata]", "\n[[patch.unused]]", "\n[patch"]
+        .iter()
+        .filter_map(|marker| rest[..next_block].find(marker))
+        .min()
+        .map_or(body_start + next_block, |rel| body_start + rel);
+    while end > body_start && content.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+    }
+    end
+}
+
+/// The previous, unbounded [`lock_block_end`], kept as the equivalence
+/// oracle.
+#[cfg(test)]
+fn lock_block_end_unbounded(content: &str, body_start: usize) -> usize {
     let mut end = [
         "\n[[package]]",
         "\n[metadata]",
@@ -1769,7 +3101,19 @@ fn plan_cargo_config(
     let header = format!("[registries.{reg}]");
     let index_line = format!("index = \"{index_url}\"");
     let lines: Vec<&str> = config.split('\n').collect();
-    let header_idx = lines.iter().position(|l| l.trim() == header);
+    let header_idx = lines.iter().position(|line| {
+        if !line.trim_start().starts_with('[') {
+            return false;
+        }
+        let Ok(document) = line.parse::<toml_edit::DocumentMut>() else {
+            return false;
+        };
+        document
+            .get("registries")
+            .and_then(|registries| registries.get(reg))
+            .and_then(toml_edit::Item::as_table)
+            .is_some_and(|table| !table.is_implicit())
+    });
     if let Some(i) = header_idx {
         let mut end = lines.len();
         for (j, l) in lines.iter().enumerate().skip(i + 1) {
@@ -1782,7 +3126,17 @@ fn plan_cargo_config(
         while end > i + 1 && lines[end - 1].trim().is_empty() {
             end -= 1;
         }
-        let healthy = lines[i + 1..end].iter().any(|l| l.trim() == index_line);
+        let healthy = lines[i + 1..end]
+            .join("\n")
+            .parse::<toml_edit::DocumentMut>()
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("index")
+                    .and_then(toml_edit::Item::as_str)
+                    .map(|index| index == index_url)
+            })
+            .unwrap_or(false);
         if healthy {
             return None;
         }
@@ -1810,6 +3164,10 @@ fn plan_cargo_config(
         ""
     };
     let prefix = if config.is_empty() { "" } else { "\n" };
+    // The newline a config without a final one needed rides in the recorded
+    // fragment, so the revert (which also drops the one blank separator
+    // before the fragment) restores the config's exact bytes.
+    let recorded = format!("{sep}{block}");
     Some(CargoConfigPlan {
         content: format!("{config}{sep}{prefix}{block}"),
         edit: FileEdit {
@@ -1818,16 +3176,19 @@ fn plan_cargo_config(
             action: "added".into(),
             key: Some(reg.to_string()),
             original: None,
-            new: Some(Value::String(block)),
+            new: Some(Value::String(recorded)),
         },
     })
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
 
-/// Audit every matching package instance after planning edits. A malformed
-/// resolution or unsupported suffix refuses this dependency across all locks;
-/// snapshots and other versions do not participate in resolution.
+/// Test-only reference for the residual gate: every instance of this exact
+/// name@version in `content` that does not resolve to `artifact_url`.
+/// Production judges the same predicate inline, per instance, on each
+/// indexed hit's post-splice body in `rewrite_pnpm_lock`; snapshots and
+/// other versions do not participate in resolution.
+#[cfg(test)]
 fn pnpm_unrewritten_instances(
     content: &str,
     fname: &str,
@@ -1838,11 +3199,164 @@ fn pnpm_unrewritten_instances(
         .into_iter()
         .filter_map(|entry| {
             pnpm::suffix(entry.key, fname, version)?;
-            let rewritten =
-                pnpm::resolution(&entry).is_some_and(|r| r.tarball() == Some(artifact_url));
-            (!rewritten).then(|| entry.key.to_string())
+            (!pnpm_resolves_to(&entry, artifact_url)).then(|| entry.key.to_string())
         })
         .collect()
+}
+
+/// Whether `entry` resolves to exactly `artifact_url` — the per-instance
+/// residual-gate predicate.
+fn pnpm_resolves_to(entry: &pnpm::Entry<'_>, artifact_url: &str) -> bool {
+    pnpm::resolution(entry).is_some_and(|r| r.tarball() == Some(artifact_url))
+}
+
+/// One pnpm lock under rewrite. `text` is the lock as of the last
+/// materialization; `pending` holds the resolution splices committed since,
+/// in `text`'s byte coordinates, and `spliced` the entries they touch.
+///
+/// The logical (post-splice) lock is `text` with `pending` applied. Parsing
+/// once and indexing is sound because a resolution splice never changes the
+/// entry structure: the replaced range and its replacement are only
+/// resolution-field material (6-space-indented `k: v` child lines of a block
+/// resolution, or the `{…}` flow value after `    resolution:`), and no raw
+/// newline can enter a value (`Resolution::rewrite` JSON-quotes whitespace).
+/// So every column-0 line (the shrinkwrap-version sniff) and every entry
+/// boundary line survives unchanged, and an entry no pending splice touched
+/// has byte-identical key and body. An entry that WAS touched is re-read
+/// only after materializing, so a later dep with the same name@version (a
+/// duplicate override) sees the rewritten text exactly as before.
+struct PnpmLockState<'f> {
+    path: &'f String,
+    text: Cow<'f, str>,
+    early_shrinkwrap: bool,
+    /// (key span, body span) per `packages:` entry, in file order.
+    entries: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    /// Entry indices sorted by normalized (unquoted, `/`-stripped) key.
+    sorted: Vec<usize>,
+    pending: Vec<(std::ops::Range<usize>, String)>,
+    spliced: std::collections::HashSet<usize>,
+    changed: bool,
+}
+
+impl<'f> PnpmLockState<'f> {
+    fn new(path: &'f String, text: &'f str) -> Self {
+        let mut state = PnpmLockState {
+            path,
+            text: Cow::Borrowed(text),
+            early_shrinkwrap: pnpm::unsupported_early_shrinkwrap(text),
+            entries: Vec::new(),
+            sorted: Vec::new(),
+            pending: Vec::new(),
+            spliced: Default::default(),
+            changed: false,
+        };
+        state.reindex();
+        state
+    }
+
+    fn reindex(&mut self) {
+        let text: &str = &self.text;
+        let base = text.as_ptr() as usize;
+        self.entries = pnpm::entries(text)
+            .iter()
+            .map(|e| {
+                let key_start = e.key.as_ptr() as usize - base;
+                (
+                    key_start..key_start + e.key.len(),
+                    e.offset..e.offset + e.body.len(),
+                )
+            })
+            .collect();
+        let mut sorted: Vec<usize> = (0..self.entries.len()).collect();
+        sorted.sort_by(|&a, &b| self.norm_key(a).cmp(self.norm_key(b)).then(a.cmp(&b)));
+        self.sorted = sorted;
+    }
+
+    fn entry(&self, i: usize) -> pnpm::Entry<'_> {
+        let (key, body) = &self.entries[i];
+        pnpm::Entry {
+            key: &self.text[key.clone()],
+            body: &self.text[body.clone()],
+            offset: body.start,
+        }
+    }
+
+    /// The key as [`pnpm::suffix`] compares it.
+    fn norm_key(&self, i: usize) -> &str {
+        let key = pnpm::unquote(&self.text[self.entries[i].0.clone()]);
+        key.strip_prefix('/').unwrap_or(key)
+    }
+
+    /// Entries whose key names `fname@version` (any suffix), in file order —
+    /// the same set a full [`pnpm::suffix`] scan of the logical lock yields.
+    fn hits(&mut self, fname: &str, version: &str) -> Vec<usize> {
+        let hits = self.lookup(fname, version);
+        if hits.iter().any(|i| self.spliced.contains(i)) {
+            self.materialize();
+            return self.lookup(fname, version);
+        }
+        hits
+    }
+
+    fn lookup(&self, fname: &str, version: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for sep in ['@', '/'] {
+            let prefix = format!("{fname}{sep}{version}");
+            let start = self
+                .sorted
+                .partition_point(|&i| self.norm_key(i) < prefix.as_str());
+            out.extend(
+                self.sorted[start..]
+                    .iter()
+                    .take_while(|&&i| self.norm_key(i).starts_with(prefix.as_str()))
+                    .copied(),
+            );
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.retain(|&i| pnpm::suffix(self.entry(i).key, fname, version).is_some());
+        out
+    }
+
+    /// Fold `pending` into `text` and re-parse.
+    fn materialize(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        let keys_before: Vec<String> = (0..self.entries.len())
+            .map(|i| self.entry(i).key.to_string())
+            .collect();
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.sort_by_key(|(range, _)| range.start);
+        let mut out = String::with_capacity(self.text.len());
+        let mut cursor = 0usize;
+        for (range, replacement) in pending {
+            out.push_str(&self.text[cursor..range.start]);
+            out.push_str(&replacement);
+            cursor = range.end;
+        }
+        out.push_str(&self.text[cursor..]);
+        self.text = Cow::Owned(out);
+        self.spliced.clear();
+        self.reindex();
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            keys_before,
+            (0..self.entries.len())
+                .map(|i| self.entry(i).key.to_string())
+                .collect::<Vec<_>>(),
+            "a resolution splice changed the pnpm entry structure"
+        );
+    }
+
+    fn into_rewritten(mut self) -> Option<(&'f String, String)> {
+        if !self.changed {
+            return None;
+        }
+        self.materialize();
+        Some((self.path, self.text.into_owned()))
+    }
 }
 
 fn rewrite_pnpm_lock(
@@ -1867,21 +3381,23 @@ fn rewrite_pnpm_lock(
     if npm.is_empty() || lock_keys.is_empty() {
         return;
     }
-    let mut contents: Vec<(&String, String, bool)> = lock_keys
+    // Each lock is parsed and indexed ONCE; splices accumulate per lock and
+    // are applied in one pass at the end (see `PnpmLockState`).
+    let mut locks: Vec<PnpmLockState> = lock_keys
         .iter()
-        .map(|k| (*k, files[*k].clone(), false))
+        .map(|k| PnpmLockState::new(k, &files[*k]))
         .collect();
     for dep in &npm {
         let fname = full_name(dep);
-        let unsafe_locks: Vec<_> = contents
+        let hits: Vec<Vec<usize>> = locks
+            .iter_mut()
+            .map(|lock| lock.hits(&fname, &dep.version))
+            .collect();
+        let unsafe_locks: Vec<_> = locks
             .iter()
-            .filter(|(_, content, _)| {
-                pnpm::unsupported_early_shrinkwrap(content)
-                    && pnpm::entries(content)
-                        .iter()
-                        .any(|e| pnpm::suffix(e.key, &fname, &dep.version).is_some())
-            })
-            .map(|(path, _, _)| path.as_str())
+            .zip(&hits)
+            .filter(|(lock, hits)| lock.early_shrinkwrap && !hits.is_empty())
+            .map(|(lock, _)| lock.path.as_str())
             .collect();
         if !unsafe_locks.is_empty() {
             result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
@@ -1905,75 +3421,77 @@ fn rewrite_pnpm_lock(
         // residual gate below proves no instance of this dep escaped the
         // splice grammar in ANY lock — committing lock-by-lock as we go
         // would ship exactly the partial rewrite the gate exists to refuse.
-        let mut planned: Vec<(usize, String, Vec<FileEdit>)> = Vec::new();
+        type Splice = (usize, std::ops::Range<usize>, String);
+        let mut planned: Vec<(usize, Vec<Splice>, Vec<FileEdit>)> = Vec::new();
         let mut residuals: Vec<(&str, Vec<String>)> = Vec::new();
-        for (idx, (lock_key, content, _)) in contents.iter().enumerate() {
-            // (byte range to replace, replacement text) per instance, plus
-            // one FileEdit per instance keyed by the canonical instance key —
-            // per-instance edits keep the revert ledger lossless when several
-            // instances of one dep live in the same lock.
-            let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        for (idx, (lock, hits)) in locks.iter().zip(&hits).enumerate() {
+            // (entry, byte range to replace, replacement text) per instance,
+            // plus one FileEdit per instance keyed by the canonical instance
+            // key — per-instance edits keep the revert ledger lossless when
+            // several instances of one dep live in the same lock.
+            let mut splices: Vec<Splice> = Vec::new();
             let mut instance_edits: Vec<FileEdit> = Vec::new();
-            for entry in pnpm::entries(content) {
-                let Some(suffix) = pnpm::suffix(entry.key, &fname, &dep.version) else {
-                    continue;
+            // Residual gate, judged per instance on its POST-splice body:
+            // any instance of this exact name@version still resolving
+            // somewhere other than the hosted artifact — in a spelling the
+            // splice grammar cannot parse (e.g. an unbalanced peer suffix) —
+            // makes this a partial rewrite. Shipping it would confirm and
+            // VEX-attest the dep while dependents through the unmatched
+            // instance keep installing the unpatched upstream tarball, so
+            // the dep is refused instead.
+            let mut leftover: Vec<String> = Vec::new();
+            for &i in hits {
+                let entry = lock.entry(i);
+                let suffix = pnpm::suffix(entry.key, &fname, &dep.version)
+                    .expect("hits only holds entries naming this dep");
+                let resolution = if pnpm::supported_suffix(suffix) {
+                    pnpm::resolution(&entry)
+                } else {
+                    None
                 };
-                if !pnpm::supported_suffix(suffix) {
-                    continue;
-                }
-                let Some(resolution) = pnpm::resolution(&entry) else {
+                let Some(resolution) = resolution else {
+                    if !pnpm_resolves_to(&entry, &dep.artifact_url) {
+                        leftover.push(entry.key.to_string());
+                    }
                     continue;
                 };
                 matched_any = true;
-                let original = &content[resolution.range.clone()];
+                let original = &lock.text[resolution.range.clone()];
                 let rebuilt = resolution.rewrite(&sha512, &dep.artifact_url);
+                let rel =
+                    resolution.range.start - entry.offset..resolution.range.end - entry.offset;
+                let body = format!(
+                    "{}{rebuilt}{}",
+                    &entry.body[..rel.start],
+                    &entry.body[rel.end..]
+                );
+                let after = pnpm::Entry {
+                    key: entry.key,
+                    body: &body,
+                    offset: 0,
+                };
+                if !pnpm_resolves_to(&after, &dep.artifact_url) {
+                    leftover.push(entry.key.to_string());
+                }
                 if rebuilt == original {
                     continue;
                 }
-                splices.push((resolution.range, rebuilt.clone()));
                 instance_edits.push(FileEdit {
-                    path: (*lock_key).clone(),
+                    path: lock.path.clone(),
                     kind: "redirect_pnpm_resolution".into(),
                     action: "rewritten".into(),
                     key: Some(format!("{fname}@{}{suffix}", dep.version)),
                     original: Some(Value::String(original.to_string())),
-                    new: Some(Value::String(rebuilt)),
+                    new: Some(Value::String(rebuilt.clone())),
                 });
+                splices.push((i, resolution.range, rebuilt));
             }
-            // Splice by byte range (package blocks are disjoint and ordered) — a string replace could hit the wrong
-            // instance when two entries share identical surrounding bytes.
-            let candidate: Option<String> = if splices.is_empty() {
-                None
-            } else {
-                let mut out = String::with_capacity(content.len());
-                let mut cursor = 0usize;
-                for (range, replacement) in splices {
-                    out.push_str(&content[cursor..range.start]);
-                    out.push_str(&replacement);
-                    cursor = range.end;
-                }
-                out.push_str(&content[cursor..]);
-                Some(out)
-            };
-            // Residual gate, run over the POST-splice text: any instance of
-            // this exact name@version still resolving somewhere other than
-            // the hosted artifact — in a spelling the splice grammar cannot
-            // parse (e.g. an unbalanced peer suffix) — makes this a partial
-            // rewrite. Shipping it would confirm and VEX-attest the dep while
-            // dependents through the unmatched instance keep installing the
-            // unpatched upstream tarball, so the dep is refused instead.
-            let leftover = pnpm_unrewritten_instances(
-                candidate.as_deref().unwrap_or(content),
-                &fname,
-                &dep.version,
-                &dep.artifact_url,
-            );
             if !leftover.is_empty() {
-                residuals.push(((*lock_key).as_str(), leftover));
+                residuals.push((lock.path.as_str(), leftover));
                 continue;
             }
-            if let Some(out) = candidate {
-                planned.push((idx, out, instance_edits));
+            if !splices.is_empty() {
+                planned.push((idx, splices, instance_edits));
             }
         }
         // ANY residual anywhere refuses the dep across the WHOLE lock set —
@@ -1999,10 +3517,13 @@ fn rewrite_pnpm_lock(
             }
             continue;
         }
-        for (idx, out, mut instance_edits) in planned {
-            let (_, content, changed) = &mut contents[idx];
-            *content = out;
-            *changed = true;
+        for (idx, splices, mut instance_edits) in planned {
+            let lock = &mut locks[idx];
+            for (i, range, replacement) in splices {
+                lock.spliced.insert(i);
+                lock.pending.push((range, replacement));
+            }
+            lock.changed = true;
             result.edits.append(&mut instance_edits);
         }
         // The entry-not-found warning fires only when the dep matched in NO
@@ -2017,8 +3538,12 @@ fn rewrite_pnpm_lock(
         if !matched_any {
             let v9_vendored_key = format!("{fname}@file:");
             let override_key = format!("{fname}@{}", dep.version);
-            let vendored = contents.iter().any(|(_, content, _)| {
-                content.lines().any(|line| {
+            // Scanned over the post-splice text, so fold pending splices in.
+            for lock in locks.iter_mut() {
+                lock.materialize();
+            }
+            let vendored = locks.iter().any(|lock| {
+                lock.text.lines().any(|line| {
                     let t = line.trim_start();
                     let t = t.strip_prefix('\'').unwrap_or(t);
                     // v9 packages/snapshots key (leading `/` in v6 spelling).
@@ -2065,8 +3590,8 @@ fn rewrite_pnpm_lock(
             }
         }
     }
-    for (key, content, changed) in contents {
-        if changed {
+    for lock in locks {
+        if let Some((key, content)) = lock.into_rewritten() {
             result.files.insert(key.clone(), content);
         }
     }
@@ -2078,7 +3603,7 @@ fn rewrite_yarn_classic(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::yarn_classic_lock::{pattern_real_name, split_key_patterns, split_pattern};
+    use crate::vendor::yarn_classic_lock::{split_key_patterns, split_pattern};
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("yarn.lock") {
@@ -2117,6 +3642,11 @@ fn rewrite_yarn_classic(
         Regex::new(r#"\n {2}resolved "[^"]*""#).expect("static resolved-line regex is valid");
     let integrity_re =
         Regex::new(r"\n {2}integrity [^\n]*").expect("static integrity-line regex is valid");
+    // Each block's key and the one real package all its patterns stand for
+    // (see `yarn_classic_block_head`), computed once per block and redone
+    // only for a block this run rewrites — not re-split per block per dep.
+    let mut heads: Vec<Option<(String, Option<String>)>> =
+        blocks.iter().map(|b| yarn_classic_block_head(b)).collect();
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
@@ -2132,33 +3662,23 @@ fn rewrite_yarn_classic(
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
-        for block in blocks.iter_mut() {
+        for (i, block) in blocks.iter_mut().enumerate() {
             // The block's key line names its consumers; resolve every
             // comma-joined pattern to the REAL package it stands for
             // (`alias@npm:target@range` → target). A key like
             // `<fname>@npm:<other-pkg>@…` — yarn v1's fork-substitution
             // idiom — resolves to <other-pkg>, so it is NOT ours to touch:
             // matching on the alias name alone would hijack the fork.
-            let Some(key_line) = block
-                .lines()
-                .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))
-            else {
+            let Some((key, real_name)) = &heads[i] else {
                 continue;
             };
-            let Some(key) = key_line.strip_suffix(':') else {
-                continue;
-            };
-            let patterns = split_key_patterns(key);
-            if patterns.is_empty()
-                || !patterns
-                    .iter()
-                    .all(|p| pattern_real_name(p) == Some(fname.as_str()))
-            {
+            if real_name.as_deref() != Some(fname.as_str()) {
                 continue;
             }
             if !version_re.is_match(block) {
                 continue;
             }
+            let patterns = split_key_patterns(key);
             // A block reached only through `alias@npm:<fname>@range`
             // descriptors is left byte-identical (mirroring the berry
             // rewriter), but never silently: that copy keeps installing the
@@ -2226,6 +3746,7 @@ fn rewrite_yarn_classic(
                     new: Some(Value::String(edit_new)),
                 });
                 *block = rewritten;
+                heads[i] = yarn_classic_block_head(block);
                 changed = true;
             }
         }
@@ -2243,6 +3764,26 @@ fn rewrite_yarn_classic(
         }
         result.files.insert("yarn.lock".into(), out);
     }
+}
+
+/// A classic yarn.lock block's key (its first non-indented, non-comment
+/// line, minus the trailing `:`) and the real package EVERY comma-joined
+/// pattern of that key resolves to — `None` when the key has no pattern,
+/// one does not parse, or they name different packages. `None` overall
+/// when the block has no key line.
+fn yarn_classic_block_head(block: &str) -> Option<(String, Option<String>)> {
+    use crate::vendor::yarn_classic_lock::{pattern_real_name, split_key_patterns};
+    let key_line = block
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))?;
+    let key = key_line.strip_suffix(':')?;
+    let patterns = split_key_patterns(key);
+    let mut names = patterns.iter().map(|p| pattern_real_name(p));
+    let real_name = match names.next() {
+        Some(Some(first)) => names.all(|n| n == Some(first)).then(|| first.to_string()),
+        _ => None,
+    };
+    Some((key.to_string(), real_name))
 }
 
 // ── yarn.lock (berry / v2+) ──────────────────────────────────────────────────
@@ -2958,6 +4499,7 @@ struct PythonMetadataEdit {
     script: bool,
 }
 
+#[cfg(test)]
 fn plan_python_metadata(
     path: &str,
     lock: &str,
@@ -2965,9 +4507,28 @@ fn plan_python_metadata(
     dep: &DepOverride,
     result: &RewriteResult,
 ) -> Result<(Option<PythonMetadataEdit>, Option<String>), RewriteWarning> {
-    use crate::utils::python_lock::{
-        check_python_lock_source_scope, is_script_lock_name, paired_metadata_rel, ArtifactSource,
-    };
+    plan_python_metadata_with(
+        path,
+        || crate::utils::python_lock::check_python_lock_source_scope(lock, &dep.name, &dep.version),
+        files,
+        dep,
+        result,
+    )
+}
+
+/// Pair `path` with its metadata file and plan that file's rewrite.
+/// `source_scope` is the lock's [`check_python_lock_source_scope`] verdict
+/// for `dep`, asked only once the metadata file is known to be present.
+///
+/// [`check_python_lock_source_scope`]: crate::utils::python_lock::check_python_lock_source_scope
+fn plan_python_metadata_with(
+    path: &str,
+    source_scope: impl FnOnce() -> Result<(), String>,
+    files: &BTreeMap<String, String>,
+    dep: &DepOverride,
+    result: &RewriteResult,
+) -> Result<(Option<PythonMetadataEdit>, Option<String>), RewriteWarning> {
+    use crate::utils::python_lock::{is_script_lock_name, paired_metadata_rel, ArtifactSource};
     use crate::utils::python_script::{rewrite_project_metadata, rewrite_script_metadata};
 
     // A script lock always needs its script; uv.lock is edited alone in a
@@ -2999,7 +4560,7 @@ fn plan_python_metadata(
         .into(),
         detail: format!("{metadata_path}: {detail}"),
     };
-    check_python_lock_source_scope(lock, &dep.name, &dep.version).map_err(unsupported)?;
+    source_scope().map_err(unsupported)?;
     let rewritten = if script {
         rewrite_script_metadata(
             &original,
@@ -3056,15 +4617,19 @@ fn record_python_metadata_edit(
     result.files.insert(edit.path, edit.rewritten);
 }
 
+/// Each lock is parsed once ([`PythonLockSession`]) and every dep is
+/// planned, refused or applied against that one document. The lock is still
+/// rendered after every rewritten dep: each dep's FileEdit fragments are
+/// diffed against the text the previous deps left.
+///
+/// [`PythonLockSession`]: crate::utils::python_lock::PythonLockSession
 fn rewrite_uv_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
     result: &mut RewriteResult,
 ) {
-    use crate::utils::python_lock::{
-        complete_python_lock_metadata, is_python_lock_name, rewrite_python_lock, ArtifactSource,
-    };
+    use crate::utils::python_lock::{is_python_lock_name, ArtifactSource, PythonLockSession};
 
     let locks: Vec<(&String, &String)> = files
         .iter()
@@ -3089,15 +4654,11 @@ fn rewrite_uv_lock(
     }
     for (path, original) in locks {
         let mut content = original.clone();
+        let mut session = PythonLockSession::new(original);
         for &(dep, sha256) in &usable {
-            let rewritten = match rewrite_python_lock(
-                &content,
-                &dep.name,
-                &dep.version,
-                ArtifactSource::Url(&dep.artifact_url),
-                sha256,
-            ) {
-                Ok(Some(rewritten)) => rewritten,
+            let artifact = ArtifactSource::Url(&dep.artifact_url);
+            let plan = match session.plan(&content, &dep.name, &dep.version, artifact) {
+                Ok(Some(plan)) => plan,
                 Ok(None) => {
                     result.warnings.push(RewriteWarning {
                         code: "redirect_uv_entry_not_found".into(),
@@ -3116,23 +4677,30 @@ fn rewrite_uv_lock(
                     continue;
                 }
             };
-            let (metadata_edit, project) =
-                match plan_python_metadata(path, &content, files, dep, result) {
-                    Ok(plan) => plan,
-                    Err(warning) => {
-                        result
-                            .refused_python_lock_uuids
-                            .insert(dep.patch_uuid.clone());
-                        result.warnings.push(warning);
-                        continue;
-                    }
-                };
-            let rewritten = match complete_python_lock_metadata(
-                &rewritten,
-                project.as_deref(),
+            let (metadata_edit, project) = match plan_python_metadata_with(
+                path,
+                || session.source_scope(&dep.name, &dep.version),
+                files,
+                dep,
+                result,
+            ) {
+                Ok(plan) => plan,
+                Err(warning) => {
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
+                    result.warnings.push(warning);
+                    continue;
+                }
+            };
+            let rewritten = match session.rewrite(
+                &content,
+                plan,
                 &dep.name,
                 &dep.version,
-                ArtifactSource::Url(&dep.artifact_url),
+                artifact,
+                sha256,
+                project.as_deref(),
                 python_metadata.get(&dep.artifact_url).map(String::as_str),
             ) {
                 Ok(rewritten) => rewritten,
@@ -3179,28 +4747,40 @@ pub fn artifact_url_present(text: &str, artifact_url: &str) -> bool {
     text.contains(artifact_url) || text.contains(&artifact_url.replace('/', "\\/"))
 }
 
+/// The needles [`artifact_url_present`] searches for, in the same order: the
+/// raw url, then its `\/`-escaped spelling. A multi-needle probe
+/// ([`presence::groups_present`]) built from these answers exactly what
+/// `artifact_url_present` answers for every text.
+pub fn artifact_url_spellings(artifact_url: &str) -> [String; 2] {
+    [artifact_url.to_string(), artifact_url.replace('/', "\\/")]
+}
+
 /// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
 /// must be a position inside that object. Brace counting skips string literals,
 /// so a brace inside a description or URL cannot move the boundary.
+///
+/// Walks bytes, not chars: every byte it acts on is ASCII, and no byte of a
+/// multi-byte UTF-8 sequence is, so the offsets are the char walk's (an
+/// escaped multi-byte char clears `escaped` on its lead byte).
 fn json_object_end_from(text: &str, from: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    for (offset, ch) in text[from..].char_indices() {
+    for (offset, &byte) in text.as_bytes()[from..].iter().enumerate() {
         if in_string {
-            match ch {
+            match byte {
                 _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
                 _ => {}
             }
             continue;
         }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' if depth == 0 => return Some(from + offset),
-            '}' => depth -= 1,
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return Some(from + offset),
+            b'}' => depth -= 1,
             _ => {}
         }
     }
@@ -3241,13 +4821,19 @@ enum ComposerEntry {
 fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry {
     let mut mismatched: Option<String> = None;
     for (name_idx, _) in content.match_indices("\"name\": \"") {
+        // The name is the value at `name_idx` — the entry's first field —
+        // and its closing quote precedes any `}` the object walk can stop
+        // at, so test it before walking to the end of the object: most
+        // occurrences name some other package.
+        if !json_string_field(&content[name_idx..], "name")
+            .is_some_and(|n| n.eq_ignore_ascii_case(pkg))
+        {
+            continue;
+        }
         let Some(end) = json_object_end_from(content, name_idx) else {
             continue;
         };
         let entry = &content[name_idx..=end];
-        if !json_string_field(entry, "name").is_some_and(|n| n.eq_ignore_ascii_case(pkg)) {
-            continue;
-        }
         // Every package entry carries `version`; an `authors[]`/`support`
         // object that happens to have a matching `name` does not.
         let Some(locked) = json_string_field(entry, "version") else {
@@ -3450,12 +5036,9 @@ fn rewrite_composer_lock(
                 }
             };
         if rewritten != original {
-            content = format!(
-                "{}{}{}",
-                &content[..edit_start],
-                rewritten,
-                &content[dist_end + 1..]
-            );
+            // In place: a fresh whole-lock copy per edit left the allocator
+            // holding one lock-sized buffer per redirected dep.
+            content.replace_range(edit_start..=dist_end, &rewritten);
             changed = true;
             result.edits.push(FileEdit {
                 path: "composer.lock".into(),
@@ -5486,7 +7069,7 @@ fn rewrite_golang(
     result: &mut RewriteResult,
 ) {
     use crate::vendor::go_mod_edit::{self, HOSTED_GO_MODULE_PREFIX};
-    use crate::vendor::go_sum_edit;
+    use crate::vendor::go_sum_edit::{self, GoSumEditor};
 
     let golang: Vec<&DepOverride> = overrides
         .iter()
@@ -5506,7 +7089,7 @@ fn rewrite_golang(
     let mut go_mod = orig_go_mod.clone();
     // An absent go.sum starts empty: the fully-replaced original needs no
     // lines of its own, so the two socket lines alone are a complete pin.
-    let mut go_sum = files.get("go.sum").cloned().unwrap_or_default();
+    let mut go_sum = GoSumEditor::new(files.get("go.sum").cloned().unwrap_or_default());
     let (mut mod_changed, mut sum_changed) = (false, false);
 
     for dep in &golang {
@@ -5588,13 +7171,20 @@ fn rewrite_golang(
             });
             continue;
         }
+        // One walk of go.mod reads the prior directive, the required version
+        // and the upsert's refresh line / conflict for this dep.
+        let scan = go_mod_edit::scan_hosted_replace(
+            &go_mod,
+            &fname,
+            &dep.version,
+            rhs_module,
+            rhs_version,
+        );
         // Any pre-existing socket-owned directive for the module (this run is
         // a refresh, or a takeover of a local/vendored redirect): capture its
         // text — the ledger's `original` is the only pre-redirect record.
-        let prior = go_mod_edit::parse_replace_entries(&go_mod)
-            .into_iter()
-            .find(|e| e.module == fname && e.socket_owned());
-        let prior_text = prior.as_ref().map(|e| {
+        let prior = scan.prior.as_ref();
+        let prior_text = prior.map(|e| {
             let target = e.path.clone().unwrap_or_else(|| match &e.rhs_version {
                 Some(v) => format!("{} {v}", e.rhs_module.as_deref().unwrap_or_default()),
                 None => e.rhs_module.clone().unwrap_or_default(),
@@ -5614,8 +7204,7 @@ fn rewrite_golang(
         // left in place, its module path keeps confirming the dep as
         // redirected (ledger + VEX attestation) while go links the unpatched
         // version.
-        let required = go_mod_edit::parse_required_versions(&go_mod);
-        if let Some(required) = required.get(&fname) {
+        if let Some(required) = scan.required.as_ref() {
             if required != &dep.version {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_golang_version_mismatch".into(),
@@ -5625,9 +7214,8 @@ fn rewrite_golang(
                         dep.version
                     ),
                 });
-                let stale_hosted = prior
-                    .as_ref()
-                    .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
+                let stale_hosted =
+                    prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
                 if let Some(stale) = stale_hosted {
                     if let Ok(Some(new)) = go_mod_edit::remove_replace_entry(
                         &go_mod,
@@ -5646,10 +7234,7 @@ fn rewrite_golang(
                         });
                     }
                     if let Some(stale_rhs) = stale.rhs_module.as_deref() {
-                        if let Some(new) =
-                            go_sum_edit::remove_module_prefix_lines(&go_sum, stale_rhs)
-                        {
-                            go_sum = new;
+                        if go_sum.remove_module_prefix_lines(stale_rhs) {
                             sum_changed = true;
                             result.edits.push(FileEdit {
                                 path: "go.sum".into(),
@@ -5664,10 +7249,8 @@ fn rewrite_golang(
                 }
                 continue;
             }
-        } else if !go_sum_edit::has_module_version(&go_sum, &fname, &dep.version)
-            && prior
-                .as_ref()
-                .is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
+        } else if !go_sum.has_module_version(&fname, &dep.version)
+            && prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
         {
             // Not required, not in go.sum at this version, and not already
             // redirected by us: the module is outside this project's graph
@@ -5685,8 +7268,9 @@ fn rewrite_golang(
             continue;
         }
 
-        match go_mod_edit::upsert_hosted_replace_entry(
-            &go_mod,
+        match go_mod_edit::apply_hosted_replace(
+            &mut go_mod,
+            &scan,
             &fname,
             &dep.version,
             rhs_module,
@@ -5700,9 +7284,8 @@ fn rewrite_golang(
                 continue;
             }
             // Re-run over an already-redirected go.mod: nothing to record.
-            Ok(None) => {}
-            Ok(Some(new)) => {
-                go_mod = new;
+            Ok(false) => {}
+            Ok(true) => {
                 mod_changed = true;
                 result.edits.push(FileEdit {
                     path: "go.mod".into(),
@@ -5724,10 +7307,7 @@ fn rewrite_golang(
                 });
             }
         }
-        if let Some(new) =
-            go_sum_edit::upsert_module_lines(&go_sum, rhs_module, rhs_version, zip_h1, gomod_h1)
-        {
-            go_sum = new;
+        if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
             sum_changed = true;
             result.edits.push(FileEdit {
                 path: "go.sum".into(),
@@ -5745,10 +7325,7 @@ fn rewrite_golang(
         // prunes exactly these — writing the tidy-stable state up front keeps
         // the first day-2 tidy a byte-level no-op. The removed lines ride in
         // `original` so the ledger can restore them on revert.
-        if let Some((new, removed)) =
-            go_sum_edit::remove_exact_module_version_lines(&go_sum, &fname, &dep.version)
-        {
-            go_sum = new;
+        if let Some(removed) = go_sum.remove_exact_module_version_lines(&fname, &dep.version) {
             sum_changed = true;
             result.edits.push(FileEdit {
                 path: "go.sum".into(),
@@ -5766,7 +7343,7 @@ fn rewrite_golang(
         result.files.insert("go.mod".into(), go_mod);
     }
     if sum_changed {
-        result.files.insert("go.sum".into(), go_sum);
+        result.files.insert("go.sum".into(), go_sum.into_string());
     }
 }
 
@@ -7887,6 +9464,193 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
+    /// The residue probe (`vendor`'s fail-closed guard against wiring
+    /// `[patch.crates-io]` on top of a live hosted redirect) reads back
+    /// EVERY declaration shape this rewriter pins — driven through the
+    /// rewriter itself so the two can never drift apart. A single-line
+    /// `<name> = { … }` regex saw only the first of these.
+    #[test]
+    fn cargo_socket_registry_pin_reads_back_every_written_shape() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n";
+        let shapes = [
+            ("plain version", "[dependencies]\nserde = \"1.0.190\"\n"),
+            ("quoted key", "[dependencies]\n\"serde\" = \"1.0.190\"\n"),
+            (
+                "inline table",
+                "[dependencies]\nserde = { version = \"1.0.190\" }\n",
+            ),
+            (
+                "renamed inline table",
+                "[dependencies]\nlegacy = { package = \"serde\", version = \"1.0.190\" }\n",
+            ),
+            (
+                "table form",
+                "[dependencies.serde]\nversion = \"1.0.190\"\n",
+            ),
+            (
+                "renamed table form",
+                "[dependencies.legacy]\npackage = \"serde\"\nversion = \"1.0.190\"\n",
+            ),
+            (
+                "dev-dependency table form",
+                "[dev-dependencies.serde]\nversion = \"1.0.190\"\n",
+            ),
+            (
+                "target table",
+                "[target.'cfg(unix)'.dependencies]\nserde = \"1.0.190\"\n",
+            ),
+            (
+                "workspace dependencies table form",
+                "[workspace.dependencies.serde]\nversion = \"1.0.190\"\n",
+            ),
+        ];
+        for (shape, body) in shapes {
+            let pristine = format!("{head}{body}");
+            assert_eq!(
+                cargo_socket_registry_pin(&pristine, "serde"),
+                None,
+                "{shape}: an unpinned manifest is not residue"
+            );
+            let r = rewrite_registry_redirect(&cargo_files(&pristine), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "{shape}: {:?}", r.warnings);
+            let written = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+            assert_eq!(
+                cargo_socket_registry_pin(written, "serde").as_deref(),
+                Some(cargo_reg().as_str()),
+                "{shape}: the probe must read back what the rewriter wrote: {written}"
+            );
+        }
+        // Another crate's pin, and a registry that is not ours, are not this
+        // crate's residue.
+        let other = format!(
+            "{head}[dependencies]\nother = {{ version = \"1\", registry = \"{}\" }}\n\
+             serde = {{ version = \"1.0.190\", registry = \"corp-mirror\" }}\n",
+            cargo_reg()
+        );
+        assert_eq!(cargo_socket_registry_pin(&other, "serde"), None);
+        // A renamed key declaring ANOTHER crate never answers for `serde`.
+        let renamed_other = format!(
+            "{head}[dependencies]\nserde = {{ package = \"serde_json\", version = \"1\", \
+             registry = \"{}\" }}\n",
+            cargo_reg()
+        );
+        assert_eq!(cargo_socket_registry_pin(&renamed_other, "serde"), None);
+    }
+
+    /// NO Cargo.lock: the transitive-dependents refusal reads the resolved
+    /// graph, and without one nothing says whether another dependency also
+    /// pulls in the patched crate — a pin reaches only the declarations it
+    /// sits on, so that consumer would compile the unpatched crates.io copy
+    /// while the scan reported the crate redirected and VEX attested it.
+    /// Every OTHER declared dependency is therefore blocking; a path
+    /// dependency on a manifest this run pins is not (its own declarations
+    /// are pinned too), and neither is a `workspace = true` inheritor of the
+    /// root table this run scans.
+    #[test]
+    fn cargo_lockless_other_dependencies_are_refused() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n";
+        let refused = |files: BTreeMap<String, String>| {
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(r.files.is_empty(), "nothing rewritten: {:?}", r.files);
+            assert!(r.edits.is_empty(), "{:?}", r.edits);
+            assert!(r.confirmed_cargo_uuids.is_empty(), "never confirmed");
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_cargo_lockless_dependents"]
+            );
+            r.warnings[0].detail.clone()
+        };
+        let one = |toml: &str| {
+            let mut files = BTreeMap::new();
+            files.insert("Cargo.toml".to_string(), toml.to_string());
+            files
+        };
+
+        // A registry dependency beside the patched crate.
+        let detail = refused(one(&format!(
+            "{head}[dependencies]\nserde = \"1.0.190\"\ntokio = \"1\"\n"
+        )));
+        assert!(detail.contains("tokio"), "{detail}");
+        assert!(detail.contains("cargo generate-lockfile"), "{detail}");
+        assert!(detail.contains("--mode vendored"), "{detail}");
+        // A dev-dependency counts (it is linked into the test build too).
+        refused(one(&format!(
+            "{head}[dependencies]\nserde = \"1.0.190\"\n\n\
+             [dev-dependencies]\ntokio = \"1\"\n"
+        )));
+        // A path dependency this run cannot pin (outside the project).
+        let detail = refused(one(&format!(
+            "{head}[dependencies]\nserde = \"1.0.190\"\n\
+             shared = {{ path = \"../shared\" }}\n"
+        )));
+        assert!(detail.contains("shared"), "{detail}");
+        // A member's own other dependency blocks as well.
+        let mut files = one(&format!(
+            "[workspace]\nmembers = [\"b\"]\n\n{head}\
+             [dependencies]\nserde = \"1.0.190\"\n"
+        ));
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nrand = \"0.8\"\n"
+                .to_string(),
+        );
+        let detail = refused(files);
+        assert!(detail.contains("rand (in b/Cargo.toml)"), "{detail}");
+
+        // A member manifest this run did NOT read — dropped by member
+        // discovery (a symbolic link, a path outside the project) or hidden
+        // behind a glob it cannot expand — may declare the crate itself or
+        // pull it in, and nothing here can tell.
+        let detail = refused(one(
+            "[workspace]\nmembers = [\"b\"]\n\n[package]\nname = \"app\"\n\
+             version = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        ));
+        assert!(detail.contains("the workspace member `b`"), "{detail}");
+        let detail = refused(one(
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[package]\nname = \"app\"\n\
+             version = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        ));
+        assert!(
+            detail.contains("the workspace members pattern `crates/*`"),
+            "{detail}"
+        );
+    }
+
+    /// The lockless shapes that stay redirectable: the patched crate alone,
+    /// the same crate declared again by a member this run pins, and a path
+    /// dependency on that member (whose own declarations are pinned too).
+    #[test]
+    fn cargo_lockless_self_contained_workspace_still_redirects() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[workspace]\nmembers = [\"b\"]\n\n\
+             [package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\nb = { path = \"b\" }\n"
+                .to_string(),
+        );
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        for key in ["Cargo.toml", "b/Cargo.toml"] {
+            assert!(
+                r.files
+                    .get(key)
+                    .is_some_and(|t| t.contains(&format!("registry = \"{}\"", cargo_reg()))),
+                "{key} must be pinned: {:?}",
+                r.files.get(key)
+            );
+        }
+        assert!(!r.files.contains_key("Cargo.lock"));
+    }
+
     fn cargo_lock_with(name: &str, version: &str) -> String {
         format!(
             "# This file is automatically @generated by Cargo.\n\
@@ -8017,6 +9781,163 @@ mod tests {
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    #[test]
+    fn cargo_root_dependency_forms_cannot_leave_partial_redirect() {
+        for dependency in [
+            "dependencies.serde = \"1.0.190\"",
+            "dependencies = { serde = \"1.0.190\" }",
+            "dependencies = { serde = { version = \"1.0.190\" } }",
+            "target.'cfg(unix)'.dependencies.serde = \"1.0.190\"",
+            "workspace.dependencies.serde = \"1.0.190\"",
+            "workspace = { dependencies = { serde = \"1.0.190\" } }",
+        ] {
+            let manifest = format!(
+                "{dependency}\n\n[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [dev-dependencies]\nserde = \"1.0.190\"\n"
+            );
+            assert!(manifest.parse::<toml_edit::DocumentMut>().is_ok());
+            let result =
+                rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(result.files.is_empty(), "{manifest}: {:?}", result.files);
+            assert!(result.edits.is_empty(), "{manifest}");
+            assert!(result.confirmed_cargo_uuids.is_empty(), "{manifest}");
+            assert!(result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "redirect_cargo_toml_dep_unrewritable"));
+        }
+    }
+
+    #[test]
+    fn cargo_semantic_pin_guard_preserves_other_version_declarations() {
+        let manifest = "dependencies.serde = \"0.9\"\n\n\
+                        [package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dev-dependencies]\nserde = \"1.0.190\"\n";
+        let mut files = cargo_files(manifest);
+        files.get_mut("Cargo.lock").unwrap().push_str(&format!(
+            "\n[[package]]\nname = \"serde\"\nversion = \"0.9.15\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"{}\"\n",
+            "a".repeat(64)
+        ));
+        let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        let document = result.files["Cargo.toml"]
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(document["dependencies"]["serde"].as_str(), Some("0.9"));
+        assert_eq!(
+            document["dev-dependencies"]["serde"]["registry"].as_str(),
+            Some(cargo_reg().as_str())
+        );
+    }
+
+    #[test]
+    fn cargo_semantic_pin_guard_checks_unchanged_members() {
+        let mut files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [workspace]\nmembers = [\"member\"]\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n",
+        );
+        files.insert(
+            "member/Cargo.toml".to_string(),
+            "dependencies = { serde = \"1.0.190\" }\n\n\
+             [package]\nname = \"member\"\nversion = \"0.1.0\"\n"
+                .to_string(),
+        );
+        files.get_mut("Cargo.lock").unwrap().push_str(
+            "\n[[package]]\nname = \"member\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"serde\"]\n",
+        );
+        let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(result.files.is_empty());
+        assert!(result.edits.is_empty());
+        assert!(result.confirmed_cargo_uuids.is_empty());
+        assert!(result.warnings.iter().any(|warning| {
+            warning.code == "redirect_cargo_toml_dep_unrewritable"
+                && warning.detail.contains("member/Cargo.toml")
+                && warning.detail.contains("was not pinned")
+        }));
+    }
+
+    #[test]
+    fn cargo_dotted_literal_renames_refuse_every_declaration() {
+        for alias in ["alias", "\"alias\"", "'alias'"] {
+            for package_key in ["package", "\"package\"", "'package'"] {
+                let manifest = format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                     [dependencies]\nserde = \"1.0.190\"\n\
+                     {alias}.{package_key} = 'serde'\n{alias}.version = '1.0.190'\n"
+                );
+                assert!(manifest.parse::<toml_edit::DocumentMut>().is_ok());
+                let result =
+                    rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+                assert!(result.files.is_empty(), "{manifest}");
+                assert!(result.edits.is_empty(), "{manifest}");
+                assert!(result.confirmed_cargo_uuids.is_empty(), "{manifest}");
+                assert!(result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "redirect_cargo_toml_dep_unrewritable"));
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_literal_renames_pin_inline_and_table_forms() {
+        for declaration in [
+            "[dependencies]\nalias = { package = 'serde', version = '1.0.190' }\n",
+            "[dependencies.alias]\npackage = 'serde'\nversion = '1.0.190'\n",
+            "[dependencies]\nalias = { 'package' = 'serde', 'version' = '1.0.190' }\n",
+            "[dependencies.'alias']\n'package' = 'serde'\n'version' = '1.0.190'\n",
+        ] {
+            let manifest =
+                format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{declaration}");
+            let files = cargo_files(&manifest);
+            let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+            let updated = &result.files["Cargo.toml"];
+            let document = updated.parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(
+                document["dependencies"]["alias"]["registry"].as_str(),
+                Some(cargo_reg().as_str())
+            );
+            assert_eq!(
+                cargo_socket_registry_pin(updated, "serde"),
+                Some(cargo_reg())
+            );
+            let mut rerun_files = files;
+            rerun_files.extend(result.files);
+            let rerun = rewrite_registry_redirect(&rerun_files, &[cargo_sparse_override()]);
+            assert!(rerun.files.is_empty());
+            assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+            assert!(rerun.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
+    }
+
+    #[test]
+    fn cargo_literal_registry_pins_are_superseded() {
+        let previous = "socket-patch-11111111-1111-1111-1111-111111111111";
+        for declaration in [
+            format!("[dependencies]\nalias = {{ package = 'serde', version = '1.0.190', registry = '{previous}' }}\n"),
+            format!("[dependencies.alias]\npackage = 'serde'\nversion = '1.0.190'\nregistry = '{previous}' # previous pin\n"),
+            format!("[dependencies.alias]\npackage = 'serde'\nversion = '1.0.190'\n'registry' = '{previous}'\n"),
+        ] {
+            let manifest = format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{declaration}"
+            );
+            let result = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            let updated = &result.files["Cargo.toml"];
+            let document = updated.parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(document["dependencies"]["alias"]["registry"].as_str(), Some(cargo_reg().as_str()));
+            assert_eq!(cargo_socket_registry_pin(updated, "serde"), Some(cargo_reg()));
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
     }
 
     /// AUDIT A5(a) alone: when the ONLY key match renames a different crate,
@@ -8275,6 +10196,54 @@ mod tests {
         assert!(second.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
+    #[test]
+    fn cargo_config_quoted_commented_headers_are_reused() {
+        for header in [
+            format!("[registries.{}] # managed registry", cargo_reg()),
+            format!("[registries.\"{}\"]", cargo_reg()),
+            format!("['registries'.'{}'] # managed registry", cargo_reg()),
+            format!("[ \"registries\" . '{}' ]", cargo_reg()),
+        ] {
+            for index in [
+                format!("index = \"{}\" # current", cargo_index_url()),
+                format!("index = '{}'", cargo_index_url()),
+                format!("'index' = '{}' # current", cargo_index_url()),
+            ] {
+                let config = format!("{header}\n{index}\n\n[build]\njobs = 4\n");
+                assert!(config.parse::<toml_edit::DocumentMut>().is_ok());
+                assert!(
+                    plan_cargo_config(
+                        &config,
+                        ".cargo/config.toml",
+                        &cargo_reg(),
+                        &cargo_index_url()
+                    )
+                    .is_none(),
+                    "{config}"
+                );
+            }
+            let config =
+                format!("{header}\nindex = 'sparse+https://old.example/'\n\n[build]\njobs = 4\n");
+            let plan = plan_cargo_config(
+                &config,
+                ".cargo/config.toml",
+                &cargo_reg(),
+                &cargo_index_url(),
+            )
+            .expect("stale registry repaired");
+            let document = plan
+                .content
+                .parse::<toml_edit::DocumentMut>()
+                .expect("no duplicate tables");
+            assert_eq!(
+                document["registries"][&cargo_reg()]["index"].as_str(),
+                Some(cargo_index_url().as_str())
+            );
+            assert_eq!(document["build"]["jobs"].as_integer(), Some(4));
+            assert_eq!(plan.edit.action, "rewritten");
+        }
+    }
+
     /// A degraded managed block (header intact, index line commented or
     /// stale) is regenerated in place rather than trusted.
     #[test]
@@ -8477,6 +10446,512 @@ mod tests {
             .iter()
             .any(|w| w.code == "redirect_cargo_toml_dep_unrewritable"));
         assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A second patched version of the crate, uuid distinct from
+    /// [`CARGO_UUID`].
+    const CARGO_UUID_2: &str = "3c5d7e9f-2a4b-4c6d-8e0f-1a3b5c7d9e1f";
+
+    fn cfg_if_override(version: &str, uuid: &str) -> DepOverride {
+        let mut dep = cargo_sparse_override();
+        dep.name = "cfg-if".into();
+        dep.version = version.into();
+        dep.patch_uuid = uuid.into();
+        let ov = dep.registry_override.as_mut().expect("fixture override");
+        ov.index_url = format!("sparse+https://patch.test/cargo/{uuid}/index/");
+        ov.identifiers.name = "cfg-if".into();
+        ov.identifiers.version = version.into();
+        dep
+    }
+
+    /// Both cfg-if versions locked from crates.io (the `multi-version` shape).
+    fn cfg_if_multi_files(manifest_deps: &str) -> BTreeMap<String, String> {
+        let block = |v: &str| {
+            format!(
+                "[[package]]\nname = \"cfg-if\"\nversion = \"{v}\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{}\"\n",
+                "1".repeat(64)
+            )
+        };
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{manifest_deps}"),
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            format!("version = 3\n\n{}\n{}", block("0.1.10"), block("1.0.4")),
+        );
+        files
+    }
+
+    const CFG_IF_MULTI_DEPS: &str = "[dependencies]\ncfg-if = \"1.0.4\"\n\
+         cfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n";
+
+    /// Bug B: the manifest pin matched the crate NAME only, so every
+    /// same-named declaration — `cfg-if-legacy = { package = "cfg-if",
+    /// version = "0.1.10" }` too — was pinned to the one patched version's
+    /// registry, where `^0.1.10` cannot resolve. Each declaration is pinned
+    /// only by the patch its version requirement selects.
+    #[test]
+    fn cargo_multi_version_pins_only_the_declaration_the_version_selects() {
+        let files = cfg_if_multi_files(CFG_IF_MULTI_DEPS);
+        let reg1 = format!("socket-patch-{CARGO_UUID}");
+        let reg2 = format!("socket-patch-{CARGO_UUID_2}");
+
+        let r = rewrite_registry_redirect(&files, &[cfg_if_override("1.0.4", CARGO_UUID)]);
+        let toml = r.files.get("Cargo.toml").expect("manifest pinned");
+        assert!(
+            toml.contains(&format!(
+                "cfg-if = {{ version = \"1.0.4\", registry = \"{reg1}\" }}\n"
+            )),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("cfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n"),
+            "the 0.1.10 declaration is not the patched version's: {toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        let r = rewrite_registry_redirect(&files, &[cfg_if_override("0.1.10", CARGO_UUID_2)]);
+        let toml = r.files.get("Cargo.toml").expect("manifest pinned");
+        assert!(toml.contains("cfg-if = \"1.0.4\"\n"), "{toml}");
+        assert!(
+            toml.contains(&format!(
+                "cfg-if-legacy = {{ package = \"cfg-if\", version = \"0.1.10\", registry = \"{reg2}\" }}"
+            )),
+            "{toml}"
+        );
+        let lock = r.files.get("Cargo.lock").expect("lock repointed");
+        assert!(
+            lock.contains(&format!(
+                "version = \"0.1.10\"\nsource = \"sparse+https://patch.test/cargo/{CARGO_UUID_2}/index/\""
+            )) && lock.contains(
+                "version = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+            ),
+            "only the 0.1.10 entry moves: {lock}"
+        );
+
+        let r = rewrite_registry_redirect(
+            &files,
+            &[
+                cfg_if_override("1.0.4", CARGO_UUID),
+                cfg_if_override("0.1.10", CARGO_UUID_2),
+            ],
+        );
+        let toml = r.files.get("Cargo.toml").expect("manifest pinned");
+        assert!(
+            toml.contains(&format!("version = \"1.0.4\", registry = \"{reg1}\""))
+                && toml.contains(&format!("version = \"0.1.10\", registry = \"{reg2}\"")),
+            "{toml}"
+        );
+        assert_eq!(r.confirmed_cargo_uuids.len(), 2);
+    }
+
+    /// A requirement that also matches another locked version cannot be
+    /// attributed to the patched one — refuse the dep, write nothing.
+    #[test]
+    fn cargo_requirement_matching_several_locked_versions_refuses() {
+        let files = cfg_if_multi_files(
+            "[dependencies]\ncfg-if = \">=0.1\"\n\
+             cfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cfg_if_override("1.0.4", CARGO_UUID)]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A declaration whose requirement excludes the patched version is not
+    /// the patched crate, and a pin there cannot reach the locked one: the
+    /// requirement-coverage refusal (the TS twin's code), nothing written.
+    #[test]
+    fn cargo_requirement_excluding_the_patched_version_is_unrewritable() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"2\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        assert!(
+            r.warnings[0].detail.contains("\"2\" in Cargo.toml"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A `workspace = true` inheritor of the entry that names ANOTHER
+    /// version is not this dep (and does not refuse it).
+    #[test]
+    fn cargo_workspace_inheritor_of_another_version_is_skipped() {
+        let files = cfg_if_multi_files(
+            "[workspace.dependencies]\ncfg-if = \"1.0.4\"\n\
+             cfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n\n\
+             [dependencies]\ncfg-if = { workspace = true }\n\
+             cfg-if-legacy = { workspace = true }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cfg_if_override("0.1.10", CARGO_UUID_2)]);
+        let toml = r.files.get("Cargo.toml").expect("workspace entry pinned");
+        assert!(
+            toml.contains(&format!(
+                "cfg-if-legacy = {{ package = \"cfg-if\", version = \"0.1.10\", registry = \"socket-patch-{CARGO_UUID_2}\" }}"
+            )) && toml.contains("[workspace.dependencies]\ncfg-if = \"1.0.4\"\n"),
+            "{toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID_2));
+    }
+
+    /// A project the name-only matcher already damaged (the 0.1.10
+    /// declaration pinned to the 1.0.4 patch's registry) is repaired: the
+    /// 0.1.10 patch supersedes its own declaration's socket pin, and the
+    /// 1.0.4 patch leaves it alone.
+    #[test]
+    fn cargo_mispinned_other_version_declaration_is_repaired() {
+        let reg1 = format!("socket-patch-{CARGO_UUID}");
+        let reg2 = format!("socket-patch-{CARGO_UUID_2}");
+        let files = cfg_if_multi_files(&format!(
+            "[dependencies]\ncfg-if = {{ version = \"1.0.4\", registry = \"{reg1}\" }}\n\
+             cfg-if-legacy = {{ package = \"cfg-if\", version = \"0.1.10\", registry = \"{reg1}\" }}\n"
+        ));
+        let r = rewrite_registry_redirect(
+            &files,
+            &[
+                cfg_if_override("1.0.4", CARGO_UUID),
+                cfg_if_override("0.1.10", CARGO_UUID_2),
+            ],
+        );
+        let toml = r.files.get("Cargo.toml").expect("legacy pin superseded");
+        assert!(
+            toml.contains(&format!("version = \"1.0.4\", registry = \"{reg1}\""))
+                && toml.contains(&format!("version = \"0.1.10\", registry = \"{reg2}\"")),
+            "{toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// A virtual workspace: the root pins `[workspace.dependencies]`, member
+    /// `a` inherits, member `b` declares serde itself.
+    fn cargo_workspace_files(b_manifest: &str) -> BTreeMap<String, String> {
+        let mut files = cargo_files(
+            "[workspace]\nmembers = [\"a\", \"b\"]\n\n\
+             [workspace.dependencies]\nserde = \"1.0.190\"\n",
+        );
+        files.insert(
+            "a/Cargo.toml".to_string(),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde.workspace = true\n"
+                .to_string(),
+        );
+        files.insert("b/Cargo.toml".to_string(), b_manifest.to_string());
+        files
+    }
+
+    /// Bug F: only the root's `[workspace.dependencies]` was pinned; member
+    /// `b`'s own `serde = "1.0.190"` stayed on crates.io, so `--locked`
+    /// failed against the repointed lock while the dep was reported
+    /// redirected. Every member manifest the caller supplies is planned in
+    /// the same transaction; inheritors are satisfied by the root's pin.
+    #[test]
+    fn cargo_workspace_member_direct_declaration_is_pinned() {
+        let files = cargo_workspace_files(
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let pin = format!(
+            "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        );
+        assert!(r.files["Cargo.toml"].contains(&pin), "{:?}", r.files);
+        assert!(r.files["b/Cargo.toml"].contains(&pin), "{:?}", r.files);
+        assert!(
+            !r.files.contains_key("a/Cargo.toml"),
+            "the inheriting member needs no edit"
+        );
+        assert!(r
+            .edits
+            .iter()
+            .any(|e| e.path == "b/Cargo.toml" && e.kind == "redirect_cargo_toml_dep"));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    #[test]
+    fn cargo_workspace_member_inherits_renamed_dependency() {
+        for workspace_entry in [
+            "[workspace.dependencies]\nserial = { package = \"serde\", version = \"=1.0.190\", features = [\"std\"] }\n",
+            "[workspace.dependencies.serial]\npackage = \"serde\"\nversion = \"=1.0.190\"\nfeatures = [\"std\"]\n",
+        ] {
+            for declaration in [
+                "[dependencies]\nserial.workspace = true\n",
+                "[dependencies]\nserial = { workspace = true, features = [\"derive\"] }\n",
+                "[dependencies.serial]\nworkspace = true\n",
+                "[dev-dependencies]\nserial.workspace = true\n",
+                "[build-dependencies]\nserial = { workspace = true }\n",
+                "[target.'cfg(unix)'.dependencies.serial]\nworkspace = true\n",
+            ] {
+                let mut files = cargo_files(&format!(
+                    "[workspace]\nmembers = [\"consumer\"]\n\n{workspace_entry}"
+                ));
+                files.insert(
+                    "consumer/Cargo.toml".into(),
+                    format!(
+                        "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n{declaration}"
+                    ),
+                );
+                files.get_mut("Cargo.lock").unwrap().push_str(
+                    "\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n",
+                );
+
+                let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+                assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+                assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+                assert!(result.files["Cargo.toml"]
+                    .contains(&format!("registry = \"{}\"", cargo_reg())));
+                assert!(!result.files.contains_key("consumer/Cargo.toml"));
+                assert!(result.files["Cargo.lock"].contains(&cargo_index_url()));
+
+                files.extend(result.files);
+                let repeated = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+                assert!(repeated.warnings.is_empty(), "{:?}", repeated.warnings);
+                assert!(repeated.edits.is_empty() && repeated.files.is_empty());
+                assert!(repeated.confirmed_cargo_uuids.contains(CARGO_UUID));
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_root_inherits_renamed_dependency_before_workspace_declaration() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserial.workspace = true\n\n\
+             [workspace.dependencies]\nserial = { package = \"serde\", version = \"=1.0.190\" }\n",
+        );
+        let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        assert!(result.files["Cargo.toml"].contains("serial.workspace = true"));
+        assert!(result.files["Cargo.toml"].contains(&format!(
+            "serial = {{ package = \"serde\", version = \"=1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        )));
+    }
+
+    #[test]
+    fn cargo_workspace_inherited_key_renaming_another_package_is_ignored() {
+        for other_entry in [
+            "[workspace.dependencies]\nserde = { package = \"unrelated\", version = \"1\" }\n",
+            "[workspace.dependencies.serde]\npackage = \"unrelated\"\nversion = \"1\"\n",
+        ] {
+            let root = format!(
+                "[workspace]\nmembers = [\"consumer\"]\n\n\
+                 {other_entry}\n\
+                 [workspace.dependencies.serial]\npackage = \"serde\"\nversion = \"=1.0.190\"\n"
+            );
+            let mut files = cargo_files(&root);
+            files.insert(
+                "consumer/Cargo.toml".into(),
+                "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\nserde.workspace = true\nserial.workspace = true\n"
+                    .into(),
+            );
+            files.get_mut("Cargo.lock").unwrap().push_str(
+                "\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n",
+            );
+            let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+            assert!(result.files["Cargo.toml"].contains(other_entry));
+            assert!(!result.files.contains_key("consumer/Cargo.toml"));
+        }
+    }
+
+    /// A member that cannot be pinned (a path dependency here) refuses the
+    /// WHOLE dep: the root stays untouched too.
+    #[test]
+    fn cargo_workspace_member_refusal_refuses_every_manifest() {
+        let files = cargo_workspace_files(
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde = { path = \"../serde\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        assert!(
+            r.warnings[0].detail.contains("b/Cargo.toml"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// Only a member declares the crate (the root has no workspace entry):
+    /// that member is pinned, and a member inheriting an entry the root
+    /// does not have refuses.
+    #[test]
+    fn cargo_member_only_declaration_and_unsatisfied_inheritor() {
+        let mut files = cargo_files("[workspace]\nmembers = [\"b\"]\n");
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert_eq!(
+            r.files.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![".cargo/config.toml", "Cargo.lock", "b/Cargo.toml"]
+        );
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde = { workspace = true }\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+    }
+
+    /// Manifest keys outside a plain repo-relative `<dir>/Cargo.toml` are
+    /// never treated as members.
+    #[test]
+    fn cargo_member_manifest_keys() {
+        for ok in ["a/Cargo.toml", "crates/x-y/Cargo.toml"] {
+            assert!(is_cargo_member_manifest_key(ok), "{ok}");
+        }
+        for bad in [
+            "Cargo.toml",
+            "/abs/Cargo.toml",
+            "../up/Cargo.toml",
+            "a/../b/Cargo.toml",
+            "./a/Cargo.toml",
+            ".socket/vendor/cargo/x/Cargo.toml",
+            "target/generated/Cargo.toml",
+            "crates/a/target/gen/Cargo.toml",
+            "a//Cargo.toml",
+            "a/Cargo.toml.orig",
+        ] {
+            assert!(!is_cargo_member_manifest_key(bad), "{bad}");
+        }
+    }
+
+    /// Bug K: CRLF manifests and locks (Windows checkouts) were refused —
+    /// every planner matched LF text only. A CRLF-only file is now planned
+    /// as LF and written back CRLF, recorded fragments included, and a
+    /// re-run over the output is a silent no-op.
+    #[test]
+    fn cargo_crlf_files_are_rewritten_with_crlf_kept() {
+        let lf = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let crlf: BTreeMap<String, String> = lf
+            .iter()
+            .map(|(k, v)| (k.clone(), v.replace('\n', "\r\n")))
+            .collect();
+        let want = rewrite_registry_redirect(&lf, &[cargo_sparse_override()]);
+        let got = rewrite_registry_redirect(&crlf, &[cargo_sparse_override()]);
+        assert!(got.warnings.is_empty(), "{:?}", got.warnings);
+        assert!(got.confirmed_cargo_uuids.contains(CARGO_UUID));
+        for key in ["Cargo.toml", "Cargo.lock"] {
+            assert_eq!(
+                got.files[key],
+                want.files[key].replace('\n', "\r\n"),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            got.files[".cargo/config.toml"], want.files[".cargo/config.toml"],
+            "a created config stays LF"
+        );
+        let lock_edit = got
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_cargo_lock_entry")
+            .unwrap();
+        let (Some(Value::String(orig)), Some(Value::String(new))) =
+            (&lock_edit.original, &lock_edit.new)
+        else {
+            panic!("lock edit fragments");
+        };
+        assert!(crlf["Cargo.lock"].contains(orig.as_str()));
+        assert!(got.files["Cargo.lock"].contains(new.as_str()));
+
+        let mut again = crlf.clone();
+        again.extend(got.files.clone());
+        let rerun = rewrite_registry_redirect(&again, &[cargo_sparse_override()]);
+        assert!(
+            rerun.files.is_empty() && rerun.edits.is_empty() && rerun.warnings.is_empty(),
+            "{:?} {:?}",
+            rerun.files.keys(),
+            rerun.warnings
+        );
+    }
+
+    /// Mixed line endings are not normalized: the LF grammar still refuses
+    /// what it cannot match, writing nothing.
+    #[test]
+    fn cargo_mixed_line_endings_still_refuse() {
+        let mut files = cargo_files(
+            "[package]\r\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\r\nserde = \"1.0.190\"\r\n",
+        );
+        files.insert(
+            "Cargo.lock".into(),
+            files["Cargo.lock"].replace('\n', "\r\n"),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+    }
+
+    /// Bug J (kept a refusal): a crate only reached transitively cannot be
+    /// pinned by a manifest `registry` key. Nothing is written or
+    /// confirmed, and the warning says it is transitive-only, unpatched, and
+    /// which mode can patch it.
+    #[test]
+    fn cargo_transitive_only_crate_is_refused_loudly() {
+        let mut files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nother = \"1\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert_eq!(warning_codes(&r), vec!["redirect_cargo_toml_dep_not_found"]);
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("transitive-only")
+                && detail.contains("NOT redirected")
+                && detail.contains("--mode vendored"),
+            "{detail}"
+        );
+        // Not in the lock either: the plain not-declared wording.
+        files.remove("Cargo.lock");
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.warnings[0]
+                .detail
+                .starts_with("no [dependencies] entry for serde"),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// A cargo dep whose override kind is not `cargo-sparse` warns (the TS
@@ -11261,6 +13736,114 @@ packages:
         );
     }
 
+    /// The same boundaries, judged by the PRODUCTION inline residual gate
+    /// (`rewrite_pnpm_lock` over indexed hits), not the reference probe: an
+    /// instance already on the hosted artifact, a longer version sharing
+    /// the prefix, a different quoted scoped package and resolution-less
+    /// `snapshots:` keys never count as residuals, v6 nested-paren and v5
+    /// `_` instances are repointed rather than refused, and the one
+    /// instance whose suffix the grammar cannot parse is the only key the
+    /// refusal names.
+    #[test]
+    fn pnpm_residual_gate_respects_version_and_section_boundaries() {
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let residual_warnings = |r: &RewriteResult| -> Vec<String> {
+            r.warnings
+                .iter()
+                .filter(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+                .map(|w| w.detail.clone())
+                .collect()
+        };
+        let boundaries = format!(
+            "lockfileVersion: '9.0'
+
+packages:
+  left-pad@1.3.0:
+    resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}
+  left-pad@1.3.01:
+    resolution: {{integrity: sha512-OTHERVERSION==}}
+  '@scope/left-pad@1.3.0':
+    resolution: {{integrity: sha512-OTHERPACKAGE==}}
+
+snapshots:
+  left-pad@1.3.0(react@18.2.0):
+    dependencies:
+      react: 18.2.0
+"
+        );
+        let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), boundaries.clone())]);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            residual_warnings(&r).is_empty() && r.refused_pnpm_uuids.is_empty(),
+            "rewritten instances, other versions/packages, and resolution-less \
+             snapshots keys must not count: {:?}",
+            r.warnings
+        );
+        let out = r.files.get("pnpm-lock.yaml").unwrap_or(&boundaries);
+        assert!(
+            out.contains("sha512-OTHERVERSION==") && out.contains("sha512-OTHERPACKAGE=="),
+            "{out}"
+        );
+
+        for lock in [
+            "lockfileVersion: '6.0'
+
+packages:
+
+  /left-pad@1.3.0(react@18.2.0(scheduler@0.23.2)):
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+",
+            "lockfileVersion: 5.4
+
+packages:
+
+  /left-pad/1.3.0_react@18.2.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+",
+        ] {
+            let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), lock.to_string())]);
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(
+                residual_warnings(&r).is_empty() && r.refused_pnpm_uuids.is_empty(),
+                "a spliceable suffixed instance is repointed, not refused: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.files["pnpm-lock.yaml"].contains(url) && r.edits.len() == 1,
+                "{:?}",
+                r.edits
+            );
+        }
+
+        let with_unparseable = boundaries.replace(
+            "\nsnapshots:",
+            "  left-pad@1.3.0(react@18.2.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+snapshots:",
+        );
+        assert_ne!(with_unparseable, boundaries);
+        let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), with_unparseable)]);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            r.refused_pnpm_uuids.len(),
+            1,
+            "the dep is refused: {:?}",
+            r.warnings
+        );
+        let details = residual_warnings(&r);
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert!(
+            details[0].contains("cannot repoint: left-pad@1.3.0(react@18.2.0 in pnpm-lock.yaml;"),
+            "only the unparseable instance is named: {}",
+            details[0]
+        );
+    }
+
     /// A dist block with no `url` has nothing to redirect: pinning a shasum
     /// onto it would claim a redirect that cannot happen.
     #[test]
@@ -13399,8 +15982,7 @@ packages:
         let lock = format!(
             "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
              \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
-             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\
-             dependencies = [\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
              [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\n\
              [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
              \"checksum serde 1.0.190 ({CRATES_IO})\" = \"{b}\"\n",
@@ -13416,8 +15998,7 @@ packages:
         let want = format!(
             "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
              \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({idx})\",\n]\n\n\
-             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\
-             dependencies = [\n \"serde 1.0.190 ({idx})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
              [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{idx}\"\n\n\
              [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
              \"checksum serde 1.0.190 ({idx})\" = \"{cksum}\"\n",
@@ -13426,15 +16007,19 @@ packages:
         assert_eq!(out, &want, "v1 lock stays v1, fully repointed");
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
 
-        // Four fragment edits (entry, metadata line, two dependents), each
-        // unique in the rewritten file, and reverting them newest-first (the
-        // replay order) restores the original byte-for-byte.
+        // Three fragment edits (entry, metadata line, the dependent's
+        // reference), each unique in the rewritten file, and reverting them
+        // newest-first (the replay order) restores the original
+        // byte-for-byte.
         let edits: Vec<&FileEdit> = r
             .edits
             .iter()
-            .filter(|e| e.kind == "redirect_cargo_lock_entry")
+            .filter(|e| {
+                e.kind == "redirect_cargo_lock_entry" || e.kind == CARGO_LOCK_REFERENCE_KIND
+            })
             .collect();
-        assert_eq!(edits.len(), 4, "{edits:#?}");
+        assert_eq!(edits.len(), 3, "{edits:#?}");
+        assert_eq!(edits[2].kind, CARGO_LOCK_REFERENCE_KIND, "{edits:#?}");
         let mut reverted = out.clone();
         for e in edits.iter().rev() {
             assert_eq!(e.key.as_deref(), Some("serde@1.0.190"));
@@ -13457,12 +16042,313 @@ packages:
         );
         let again = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(
-            !again
-                .edits
-                .iter()
-                .any(|e| e.kind == "redirect_cargo_lock_entry"),
+            !again.edits.iter().any(|e| e.path == "Cargo.lock"),
             "{:?}",
             again.edits
+        );
+    }
+
+    /// The OLDEST v1 locks (cargo before the `[root]` removal) record the
+    /// root package in a standalone `[root]` table — not in the
+    /// `[[package]]` array — and its `dependencies` spell full package ids
+    /// the same way. REGRESSION: the reference walk searched `[[package]]`
+    /// blocks only, so `[root]` kept naming the crates.io id of a package
+    /// the repointed lock no longer contained: `cargo build --locked` fails
+    /// and an unlocked build silently discards the lock, while the scan
+    /// reports the crate redirected. The vendored twin has handled this
+    /// table since `dependency_tables_mut`.
+    #[test]
+    fn cargo_lock_v1_root_table_references_are_repointed() {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\nlog = \"0.4\"\n";
+        let cksum = "e".repeat(64);
+        let lock = format!(
+            "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
+             \"checksum serde 1.0.190 ({CRATES_IO})\" = \"{b}\"\n",
+            a = "a".repeat(64),
+            b = "b".repeat(64),
+        );
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.clone());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let out = r.files.get("Cargo.lock").expect("lock rewritten");
+        let idx = cargo_index_url();
+        let want = format!(
+            "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({idx})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{idx}\"\n\n\
+             [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
+             \"checksum serde 1.0.190 ({idx})\" = \"{cksum}\"\n",
+            a = "a".repeat(64),
+        );
+        assert_eq!(out, &want, "the [root] table is repointed with the rest");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // The reference edit's inverse puts back EVERY occurrence, so the
+        // recorded fragments restore the lock byte for byte whether the id
+        // sat in `[root]`, in a package block, or in both.
+        let mut reverted = out.clone();
+        for e in r
+            .edits
+            .iter()
+            .filter(|e| {
+                e.kind == "redirect_cargo_lock_entry" || e.kind == CARGO_LOCK_REFERENCE_KIND
+            })
+            .rev()
+        {
+            let new = e.new.as_ref().and_then(Value::as_str).unwrap();
+            let orig = e.original.as_ref().and_then(Value::as_str).unwrap();
+            reverted = if e.kind == CARGO_LOCK_REFERENCE_KIND {
+                reverted.replace(new, orig)
+            } else {
+                reverted.replacen(new, orig, 1)
+            };
+        }
+        assert_eq!(reverted, lock);
+    }
+
+    /// Both places at once: a `[root]` table AND a package block reference
+    /// the patched crate by full id, and one reference edit repoints both.
+    #[test]
+    fn cargo_lock_v1_root_and_package_references_share_one_edit() {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+        let lock = format!(
+            "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum serde 1.0.190 ({CRATES_IO})\" = \"{b}\"\n",
+            b = "b".repeat(64),
+        );
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.clone());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        // `helper` is a source-less path package that no manifest pins, so
+        // the dependents refusal owns this shape: nothing is rewritten.
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_transitive_dependents"]
+        );
+        assert!(r.files.is_empty(), "{:?}", r.files);
+    }
+
+    /// A lock of `app` (source-less, declares serde + `extra`) where `extra`
+    /// resolves from `extra_source` and depends on serde via `edge`.
+    fn cargo_shared_dependency_files(
+        extra: &str,
+        extra_source: Option<&str>,
+        edge: &str,
+    ) -> BTreeMap<String, String> {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let source = extra_source.map_or(String::new(), |s| format!("source = \"{s}\"\n"));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde = \"1.0.190\"\n{extra} = {{ path = \"../{extra}\" }}\n"
+            ),
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            format!(
+                "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"{extra}\",\n \"serde\",\n]\n\n\
+                 [[package]]\nname = \"{extra}\"\nversion = \"0.2.0\"\n{source}\
+                 dependencies = [\n \"{edge}\",\n]\n\n\
+                 [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\
+                 checksum = \"{}\"\n",
+                "1".repeat(64)
+            ),
+        );
+        files
+    }
+
+    /// A crate that is BOTH a direct dependency and a dependency of another
+    /// crate (cfg-if, libc, serde…) cannot be hosted-redirected: the pin
+    /// reaches only the root's declaration, the other crate keeps resolving
+    /// it from crates.io, so the repointed lock fails `--locked` and the
+    /// unpatched copy is compiled. REGRESSION: it was pinned, repointed and
+    /// confirmed (reported redirected, attested by VEX).
+    #[test]
+    fn cargo_crate_another_lock_package_depends_on_is_refused() {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let git = "git+https://example.test/extra#0123456789abcdef";
+        for (source, edge, kind) in [
+            (Some(CRATES_IO), "serde".to_string(), "registry"),
+            (Some(CRATES_IO), "serde 1.0.190".to_string(), "registry"),
+            (
+                Some(CRATES_IO),
+                format!("serde 1.0.190 ({CRATES_IO})"),
+                "registry",
+            ),
+            (Some(git), "serde".to_string(), "git"),
+            // A source-less path package whose manifest was never supplied
+            // (outside the project root, or behind a symlink).
+            (None, "serde".to_string(), "a path package"),
+        ] {
+            let files = cargo_shared_dependency_files("extra", source, &edge);
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(r.files.is_empty(), "{edge}: {:?}", r.files.keys());
+            assert!(r.edits.is_empty(), "{edge}: {:?}", r.edits);
+            assert!(r.confirmed_cargo_uuids.is_empty(), "{edge}");
+            let [w] = r.warnings.as_slice() else {
+                panic!("{edge}: one warning: {:?}", r.warnings);
+            };
+            assert_eq!(w.code, "redirect_cargo_transitive_dependents", "{edge}");
+            assert!(
+                w.detail.contains(&format!("extra 0.2.0 ({kind}")),
+                "{edge}: {}",
+                w.detail
+            );
+            assert!(w.detail.contains("--mode vendored"), "{}", w.detail);
+        }
+    }
+
+    /// The dependent check is edge-exact: another VERSION of the crate is
+    /// not ours, and a source-less dependent whose manifest is planned (and
+    /// pinned) resolves through the pin.
+    #[test]
+    fn cargo_dependents_that_the_pin_reaches_or_another_version_do_not_refuse() {
+        let files = cargo_shared_dependency_files(
+            "extra",
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+            "serde 1.0.100",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        let mut files = cargo_shared_dependency_files("extra", None, "serde");
+        files.insert(
+            "extra/Cargo.toml".to_string(),
+            "[package]\nname = \"extra\"\nversion = \"0.2.0\"\n\n[dependencies]\nserde = \"1\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        assert!(
+            r.files["extra/Cargo.toml"].contains(&format!("registry = \"{}\"", cargo_reg())),
+            "{:?}",
+            r.files
+        );
+    }
+
+    #[test]
+    fn cargo_source_less_dependents_match_both_name_and_version() {
+        let root = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                    [dependencies]\ninside = { package = \"foo\", path = \"inside\" }\n\
+                    outside = { package = \"foo\", path = \"../outside\" }\n";
+        let mut files = cargo_files(root);
+        files.insert(
+            "inside/Cargo.toml".into(),
+            "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n"
+                .into(),
+        );
+        files.get_mut("Cargo.lock").unwrap().push_str(
+            "\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"foo 0.1.0\", \"foo 0.2.0\"]\n\n\
+             [[package]]\nname = \"foo\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n\n\
+             [[package]]\nname = \"foo\"\nversion = \"0.2.0\"\ndependencies = [\"serde\"]\n",
+        );
+        let refused = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(refused.files.is_empty() && refused.edits.is_empty());
+        assert!(refused.confirmed_cargo_uuids.is_empty());
+        assert_eq!(
+            warning_codes(&refused),
+            vec!["redirect_cargo_transitive_dependents"]
+        );
+        assert!(refused.warnings[0]
+            .detail
+            .contains("foo 0.2.0 (a path package"));
+
+        files.insert("Cargo.toml".into(), root.replace("../outside", "outside"));
+        files.insert(
+            "outside/Cargo.toml".into(),
+            "[package]\nname = \"foo\"\nversion = \"0.2.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n"
+                .into(),
+        );
+        let accepted = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(accepted.warnings.is_empty(), "{:?}", accepted.warnings);
+        assert!(accepted.confirmed_cargo_uuids.contains(CARGO_UUID));
+        assert!(accepted.files.contains_key("inside/Cargo.toml"));
+        assert!(accepted.files.contains_key("outside/Cargo.toml"));
+    }
+
+    #[test]
+    fn cargo_source_less_dependents_resolve_workspace_and_default_versions() {
+        for (version_field, locked_version) in [
+            ("version.workspace = true\n", "0.2.0"),
+            ("version = { workspace = true }\n", "0.2.0"),
+            ("version.workspace = true\nworkspace = \"..\"\n", "0.2.0"),
+            ("", "0.0.0"),
+        ] {
+            let mut files = cargo_files(
+                "[workspace]\nmembers = [\"consumer\"]\n\n\
+                 [workspace.package]\nversion = \"0.2.0\"\n",
+            );
+            files.insert(
+                "consumer/Cargo.toml".into(),
+                format!(
+                    "[package]\nname = \"consumer\"\n{version_field}\n\
+                     [dependencies]\nserde = \"1.0.190\"\n"
+                ),
+            );
+            files.get_mut("Cargo.lock").unwrap().push_str(&format!(
+                "\n[[package]]\nname = \"consumer\"\nversion = \"{locked_version}\"\n\
+                 dependencies = [\"serde\"]\n"
+            ));
+            let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(
+                result.warnings.is_empty(),
+                "{version_field}: {:?}",
+                result.warnings
+            );
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
+    }
+
+    #[test]
+    fn cargo_package_identity_keeps_workspace_version_ownership() {
+        let manifest = "[package]\nname = \"consumer\"\nversion.workspace = true\n";
+        assert_eq!(
+            cargo_manifest_package_id(
+                &format!("{manifest}\n[workspace.package]\nversion = \"0.3.0\"\n"),
+                "consumer/Cargo.toml",
+                Some("0.2.0"),
+            ),
+            Some(("consumer".into(), "0.3.0".into())),
+        );
+        assert_eq!(
+            cargo_manifest_package_id(
+                &format!("{manifest}\n[workspace]\n"),
+                "consumer/Cargo.toml",
+                Some("0.2.0"),
+            ),
+            None,
+        );
+        assert_eq!(
+            cargo_manifest_package_id(
+                &format!("{manifest}workspace = \"../../other\"\n"),
+                "consumer/Cargo.toml",
+                Some("0.2.0"),
+            ),
+            None,
         );
     }
 
@@ -14550,13 +17436,8 @@ packages:
     // tolerance legs, workspace-inheritance satisfaction, and the remaining
     // diagnosis spellings.
 
-    /// Malformed Cargo.toml section headers (unbalanced quote in a segment,
-    /// an unclosed `[dependencies`) must classify as non-dependency sections
-    /// — their entries stay byte-identical — and garbage lines inside the
-    /// real [dependencies] table are skipped while the real entry still
-    /// gains the pin.
     #[test]
-    fn cargo_malformed_headers_and_table_lines_are_skipped_not_fatal() {
+    fn cargo_malformed_manifest_headers_and_lines_refuse_redirect() {
         let files = cargo_files(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [target.'cfg(unix).dependencies]\nserde = \"9.9.9\"\n\n\
@@ -14564,50 +17445,29 @@ packages:
              [dependencies]\n= \"junk\"\njunk\nserde = \"1.0.190\"\n",
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
-        assert!(
-            r.warnings.is_empty(),
-            "garbage headers/lines are skipped, not refused: {:?}",
-            r.warnings
-        );
-        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
-        let pinned = format!(
-            "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
-            cargo_reg()
-        );
-        assert_eq!(
-            toml.matches(&pinned).count(),
-            1,
-            "only the real [dependencies] entry is pinned: {toml}"
-        );
-        assert!(
-            toml.contains("serde = \"9.9.9\"") && toml.contains("serde = \"8.8.8\""),
-            "entries under malformed headers stay byte-identical: {toml}"
-        );
-        assert!(
-            toml.contains("= \"junk\"\njunk\n"),
-            "garbage table lines survive untouched: {toml}"
-        );
+        assert!(r.files.is_empty());
+        assert!(r.edits.is_empty());
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert!(r.warnings.iter().any(|warning| {
+            warning.code == "redirect_cargo_toml_dep_unrewritable"
+                && warning.detail.contains("does not parse as TOML")
+        }));
     }
 
-    /// Unparseable lines INSIDE a `[dependencies.<key>]` table block (a bare
-    /// `= …`, a key token with no `=`) are skipped by the block scanner while
-    /// the block still gains its `registry` pin right after the header.
     #[test]
-    fn cargo_dep_entry_block_garbage_lines_are_skipped() {
+    fn cargo_malformed_dep_entry_block_refuses_redirect() {
         let files = cargo_files(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [dependencies.serde]\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"\n",
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
-        assert!(
-            toml.contains(&format!(
-                "[dependencies.serde]\nregistry = \"{}\"\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"",
-                cargo_reg()
-            )),
-            "registry pin inserted after the header, garbage lines untouched: {toml}"
-        );
+        assert!(r.files.is_empty());
+        assert!(r.edits.is_empty());
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert!(r.warnings.iter().any(|warning| {
+            warning.code == "redirect_cargo_toml_dep_unrewritable"
+                && warning.detail.contains("does not parse as TOML")
+        }));
     }
 
     /// A `[workspace.dependencies]` entry ALREADY pinned to the managed

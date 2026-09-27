@@ -1455,8 +1455,44 @@ jobs:
           SOCKET_PATCH_CARGO_E2E_LOCK_VERSION: ${{ matrix.lock }}
         run: |
           set -euo pipefail
-          cargo test -p socket-patch-cli --test e2e_redirect_cargo_build --test e2e_vendor_cargo_build --test mode_migration_cargo
+          cargo test -p socket-patch-cli --test e2e_redirect_cargo_build --test e2e_redirect_cargo_shapes --test e2e_vendor_cargo_build --test mode_migration_cargo
           cargo test -p socket-patch-cli --test e2e_safety_cargo_build -- --ignored
+
+  # Manifest `[patch]` + the tagged detached lock (the v5 vendored cargo
+  # wiring) on cargo 1.41 and 1.56 — below / at the 1.56 floor of
+  # config-file `[patch]`. The old-toolchain tests prefer the local
+  # `rust:1.41-slim` / `rust:1.56-slim` docker images (run `--network none`;
+  # they build AND run the consumer) and skip when no old cargo is
+  # available; this leg pulls both images and requires them.
+  cargo-old-toolchains:
+    name: cargo old toolchains (manifest [patch])
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show
+      - name: Pull the old cargos under test
+        run: |
+          docker pull rust:1.41-slim
+          docker pull rust:1.56-slim
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: cargo-old-toolchains
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Vendored manifest [patch] on old cargo
+        shell: bash
+        env:
+          SOCKET_PATCH_CARGO_E2E_REQUIRED: '1'
+          SOCKET_PATCH_CARGO_OLD_TOOLCHAINS_REQUIRED: '1'
+        run: |
+          set -euo pipefail
+          cargo test -p socket-patch-cli --test e2e_vendor_cargo_build -- old_toolchain --nocapture
 
   # ----------------------------------------------------------------------
   # Experimental `setup`-flow matrix (NON-BLOCKING).

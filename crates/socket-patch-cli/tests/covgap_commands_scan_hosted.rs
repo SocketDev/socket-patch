@@ -1127,13 +1127,108 @@ async fn hosted_human_paid_only_discovery_stops_with_the_paid_hint() {
 
 // ───────────── cargo wiring-without-ledger refusal (1104-1114) ─────────────
 
-/// A cargo purl with SOCKET-OWNED `[patch.crates-io]` wiring in
-/// .cargo/config.toml but NO vendored ledger must be refused: the originals
-/// needed to revert are unrecoverable, so redirecting on top would wedge the
-/// project. The refusal happens before any rewrite — config and lock stay
-/// byte-identical.
+/// A cargo purl with SOCKET-OWNED `[patch.crates-io]` wiring — pre-v5 in
+/// .cargo/config.toml, or v5 in the root Cargo.toml — but NO vendored ledger
+/// must be refused: the originals needed to revert are unrecoverable, so
+/// redirecting on top would wedge the project. The refusal happens before
+/// any rewrite — manifest, config and lock stay byte-identical.
 #[tokio::test]
 async fn cargo_socket_owned_wiring_without_ledger_refuses_the_redirect() {
+    ledgerless_cargo_wiring_refuses(false).await;
+}
+
+#[tokio::test]
+async fn cargo_socket_owned_manifest_wiring_without_ledger_refuses_the_redirect() {
+    ledgerless_cargo_wiring_refuses(true).await;
+}
+
+/// The missing-ledger probe is version-scoped: Socket-owned wiring for
+/// ANOTHER version of the crate (vendored alongside, with its own ledger
+/// entry) must not refuse redirecting this one.
+#[tokio::test]
+async fn cargo_other_version_vendored_wiring_does_not_refuse_the_redirect() {
+    const CNAME: &str = "covgap-cargo-dep";
+    const CPURL: &str = "pkg:cargo/covgap-cargo-dep@1.0.0";
+    const CUUID: &str = "44444444-4444-4444-8444-444444444444";
+    let server = MockServer::start().await;
+    mock_discovery(&server, CPURL, CUUID).await;
+    let hosted_url = format!(
+        "{}/patch/cargo/{CNAME}/1.0.0/55555555-5555-4555-8555-555555555555/{CUUID}/{CNAME}-1.0.0.crate",
+        server.uri()
+    );
+    let cksum = "a".repeat(64);
+    mock_reference_results(
+        &server,
+        json!({
+            CUUID: {
+                "status": "granted",
+                "url": hosted_url,
+                "purl": CPURL,
+                "artifacts": [{
+                    "kind": "tarball",
+                    "url": hosted_url,
+                    "integrity": { "sha256": cksum }
+                }],
+                "registryOverride": {
+                    "kind": "cargo-sparse",
+                    "indexUrl": format!("sparse+{}/index/", server.uri()),
+                    "identifiers": {
+                        "name": CNAME,
+                        "version": "1.0.0",
+                        "cargoCksumSha256": cksum,
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\n{CNAME} = \"1.0.0\"\n\n[patch.crates-io]\n\
+             {CNAME}-socket-66666666 = {{ package = \"{CNAME}\", path = \
+             \".socket/vendor/cargo/66666666-6666-4666-8666-666666666666/{CNAME}-0.9.0\" }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.lock"),
+        format!(
+            "version = 3\n\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\ndependencies = [\n \"{CNAME}\",\n]\n\n[[package]]\nname = \"{CNAME}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{cksum}\"\n"
+        ),
+    )
+    .unwrap();
+    let cargo_home = root.join("cargo-home");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    let cargo_home_s = cargo_home.to_str().unwrap().to_string();
+    let (_, doc) = scan_hosted_json(
+        root,
+        &server.uri(),
+        &[],
+        &[("CARGO_HOME", cargo_home_s.as_str())],
+    );
+    let codes: Vec<&str> = doc["redirect"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"redirect_vendored_revert_failed"),
+        "another version's wiring is not this version's lost ledger: {doc:#}"
+    );
+    assert!(
+        !doc["redirect"]["skipped"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|e| e["reason"] == "vendored_revert_failed")),
+        "{doc:#}"
+    );
+}
+
+async fn ledgerless_cargo_wiring_refuses(manifest_wiring: bool) {
     const CNAME: &str = "covgap-cargo-dep";
     const CPURL: &str = "pkg:cargo/covgap-cargo-dep@1.0.0";
     const CUUID: &str = "44444444-4444-4444-8444-444444444444";
@@ -1172,10 +1267,14 @@ async fn cargo_socket_owned_wiring_without_ledger_refuses_the_redirect() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    let patch = format!(
+        "[patch.crates-io]\n{CNAME} = {{ path = \".socket/vendor/cargo/{CUUID}/{CNAME}-1.0.0\" }}\n"
+    );
     std::fs::write(
         root.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{CNAME} = \"1.0.0\"\n"
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{CNAME} = \"1.0.0\"\n{}",
+            if manifest_wiring { format!("\n{patch}") } else { String::new() }
         ),
     )
     .unwrap();
@@ -1187,15 +1286,11 @@ async fn cargo_socket_owned_wiring_without_ledger_refuses_the_redirect() {
     )
     .unwrap();
     // Socket-owned [patch.crates-io] wiring — but NO .socket/vendor/state.json.
-    std::fs::create_dir_all(root.join(".cargo")).unwrap();
-    std::fs::write(
-        root.join(".cargo/config.toml"),
-        format!(
-            "[patch.crates-io]\n{CNAME} = {{ path = \".socket/vendor/cargo/{CUUID}/{CNAME}-1.0.0\" }}\n"
-        ),
-    )
-    .unwrap();
-    let config_before = std::fs::read(root.join(".cargo/config.toml")).unwrap();
+    if !manifest_wiring {
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(root.join(".cargo/config.toml"), &patch).unwrap();
+    }
+    let config_before = std::fs::read(root.join(".cargo/config.toml")).ok();
     let lock_before = std::fs::read(root.join("Cargo.lock")).unwrap();
     let manifest_before = std::fs::read(root.join("Cargo.toml")).unwrap();
 
@@ -1225,7 +1320,7 @@ async fn cargo_socket_owned_wiring_without_ledger_refuses_the_redirect() {
     );
     assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
     assert_eq!(
-        std::fs::read(root.join(".cargo/config.toml")).unwrap(),
+        std::fs::read(root.join(".cargo/config.toml")).ok(),
         config_before,
         "the socket-owned wiring must be left for manual recovery"
     );

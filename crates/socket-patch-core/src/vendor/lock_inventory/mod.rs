@@ -351,8 +351,8 @@ fn http_url(raw: &str) -> Option<String> {
 /// import the models without bypassing its recognizing ctx reads. The same
 /// rule covers the other readers discovery imports: `vendor::maven_pom`,
 /// `vendor::nuget_config`'s reader half, and the `// ── pure reader ──`
-/// regions of the writer-owned `go_mod_edit`, `go_sum_edit` and
-/// `cargo_config`.
+/// regions of the writer-owned `go_mod_edit`, `go_sum_edit`,
+/// `cargo_config` and `cargo_manifest`.
 #[cfg(test)]
 mod architecture_tests {
     use std::path::Path;
@@ -456,6 +456,7 @@ mod architecture_tests {
             "vendor/go_mod_edit.rs",
             "vendor/go_sum_edit.rs",
             "vendor/cargo_config.rs",
+            "vendor/cargo_manifest.rs",
             "vendor/nuget_config.rs",
             "vendor/maven_pom.rs",
         ] {

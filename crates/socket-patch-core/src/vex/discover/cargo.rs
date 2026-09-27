@@ -54,18 +54,41 @@
 //! entry (no exact version, or a lock that routes the crate elsewhere) →
 //! [`DIAG_REF_UNATTRIBUTABLE`].
 //!
-//! ## Vendored (`vendor`, `vendor::cargo` + `vendor::cargo_config`)
+//! ## Vendored (`vendor`, `vendor::cargo` + `vendor::cargo_manifest`)
 //!
-//! NOT visible in `Cargo.lock` beyond the entry losing `source` + `checksum`
-//! (`vendor::cargo_lock::detach_lock_entry`). The identity is the config's
-//! `[patch.crates-io] <name> = { path = ".socket/vendor/cargo/<uuid>/<name>-<version>" }`
-//! (inline, sub-table, or `[patch] crates-io = { … }` forms). Read from the
-//! effective config and, for hand-edit tolerance, the root `Cargo.toml`'s
-//! own `[patch.*]` tables (cargo honors both); any `[patch.<source>]` table
-//! counts. The path must be root-anchored ([`vendor_ref`]: a `../` or
-//! absolute spelling consumes some OTHER checkout's copy), the leaf a single
-//! `<name>-<version>` directory for the entry's crate (`package = "…"` when
-//! renamed, else the key). Same liveness truth source as
+//! `Cargo.lock` is the PRIMARY identity signal: the detached entry loses
+//! `source` + `checksum` and its version is the copy's TAGGED version
+//! `<version>+socket.<uuid>` (`vendor::cargo_lock::detach_lock_entry`,
+//! `vendor::cargo_tag`) — what cargo locks for the tagged copy it builds.
+//! The purl version is the tag stripped (`pkg:cargo/<name>@<version>`), and
+//! the tag's uuid must be the uuid of the wiring's copy path: a sourceless
+//! entry tagged for ANOTHER uuid means the copy cargo builds is not the one
+//! this wiring names (a config override elsewhere, or a stale `[patch]`) →
+//! no ref ([`DIAG_REF_INVALID`]). A tagged entry that no visible wiring
+//! names (the `[patch]` lives in a config discovery does not read, or was
+//! removed) is [`DIAG_REF_UNATTRIBUTABLE`]. The entry tagged for the path
+//! uuid decides whenever one exists (a same-version untagged sibling — the
+//! user's own path fork, which cargo locks beside the tagged copy — does
+//! not matter); failing that, a tagged sibling for another uuid rejects it.
+//! An UNTAGGED sourceless entry alone is a copy vendored before tagged
+//! versions and counts only while the copy's own `Cargo.toml` is untagged
+//! too: cargo locks a tagged copy at its tagged version, so beside a tagged
+//! copy an untagged entry is some OTHER crate cargo built (a `[patch]`
+//! override in a config discovery does not read, a path dependency) → no
+//! ref ([`DIAG_REF_INVALID`]). A copy whose `Cargo.toml` is tagged for
+//! another uuid than its path is no ref either. The wiring is a
+//! `[patch.crates-io]` path entry
+//! `<key> = { path = ".socket/vendor/cargo/<uuid>/<name>-<version>" }` —
+//! PRIMARILY in the root `Cargo.toml` (what v5+ `vendor` writes; `<key>` is
+//! the Socket-owned `<name>-socket-<uuid8>` with `package = "<name>"`),
+//! and for projects vendored by an older release in the effective project
+//! config (pre-v5 wiring; cargo honors both). Matching is KEY-AGNOSTIC:
+//! the entry's crate is `package = "…"` when renamed, else the key, and any
+//! `[patch.<source>]` table counts (inline, sub-table, or
+//! `[patch] crates-io = { … }` forms). The path must be root-anchored
+//! ([`vendor_ref`]: a `../` or absolute spelling consumes some OTHER
+//! checkout's copy), the leaf a single `<name>-<version>` directory for the
+//! entry's crate. Same liveness truth source as
 //! `vendor::cargo::vendored_entry_in_use`: when a `Cargo.lock` parses, it
 //! must hold a SOURCELESS `[[package]]` for that name + version — an entry
 //! with a registry source (re-resolved, or a hosted takeover) or none at
@@ -74,7 +97,13 @@
 //! a `[patch]` left out of the graph — e.g. by the user's path dependency,
 //! whose lock entry is sourceless too), so no ref ([`DIAG_REF_INVALID`]).
 //! No lock (first build pending) or an unparseable one (cargo refuses to
-//! build) keeps the ref, like `vendored_entry_in_use`.
+//! build) keeps the ref, like `vendored_entry_in_use`. A manifest entry
+//! cargo ignores is no ref ([`DIAG_REF_INVALID`]) either: cargo lets a
+//! project-config `[patch]` item with the same key replace it (unless that
+//! item wires the same path — the half-migrated shape, attested through the
+//! config), and a `[patch."<crates.io URL>"]` table in the manifest
+//! replaces `[patch.crates-io]` wholesale — both leave the lock looking
+//! exactly like live Socket wiring.
 //! A `.socket/cargo-patches/` path (the retired redirect backend) carries no
 //! uuid and is not a ref. Socket-shaped entries in a `.cargo/config.toml`
 //! that cargo ignores (because `.cargo/config` exists) are diagnosed, never
@@ -86,16 +115,19 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 use super::{
     names_vendor_dir, simple_purl, socket_patch_name_uuid, toml_or_diag, vendor_ref, DiscoverCtx,
-    Discovery, PatchedRef, TomlDiag, UnlockedPin, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    Discovery, PatchedRef, TomlDiag, UnlockedPin, VendorRef, DIAG_REF_INVALID,
+    DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
-    effective_config_rel, patch_entries, registry_definitions, CONFIG_LEGACY, CONFIG_TOML,
-    SOCKET_REGISTRY_PREFIX,
+    effective_config_rel, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
+    CONFIG_TOML, SOCKET_REGISTRY_PREFIX,
 };
 use crate::vendor::cargo_lock::{
-    locked_packages, unused_patches, vendored_copy_consumed, LockedPackage,
+    locked_packages, unused_patches, vendored_copy_claim, CopyClaim, LockedPackage,
 };
+use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
+use crate::vendor::cargo_tag;
 use crate::vendor::lock_inventory::LockIntegrity;
 
 const CARGO_LOCK: &str = "Cargo.lock";
@@ -150,11 +182,88 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if let (Some(decls), Some(doc)) = (&decls, &manifest) {
         unresolved_manifest_pins(ctx, &lock, decls, doc, &definitions, out);
     }
-    if let Some((file, doc)) = &config {
-        vendored_from_patches(file, doc, &lock, out);
-    }
     if let Some(doc) = &manifest {
-        vendored_from_patches(CARGO_TOML, doc, &lock, out);
+        // Cargo drops a manifest crates.io `[patch]` item that the project
+        // config redefines under the same key (any version), and a
+        // `[patch."<crates.io URL>"]` table replaces `[patch.crates-io]`
+        // wholesale — a Socket entry there is dead wiring, never attested.
+        let config_keys: Vec<(&str, String, Option<String>)> = config
+            .iter()
+            .flat_map(|(file, doc)| {
+                patch_entries(doc)
+                    .into_iter()
+                    .filter(|e| is_crates_io_source(e.source))
+                    .map(move |e| (*file, e.key.to_string(), e.path.map(same_path_key)))
+            })
+            .collect();
+        let aliases = crates_io_url_alias_tables(doc);
+        let shadowed = |entry: &CargoPatchEntry<'_>| -> Option<String> {
+            if !is_crates_io_source(entry.source) {
+                return None;
+            }
+            if let (true, Some(alias)) = (entry.source == "crates-io", aliases.first()) {
+                return Some(format!(
+                    "the `[patch.\"{alias}\"]` table replaces `[patch.crates-io]` in cargo"
+                ));
+            }
+            // The same key wiring the same copy (a half-migrated project)
+            // is not a shadow: the config's own ref carries it.
+            let own = entry.path.map(same_path_key);
+            config_keys
+                .iter()
+                .find(|(_, key, path)| key == entry.key && *path != own)
+                .map(|(file, key, _)| {
+                    format!("{file} redefines `[patch]` key `{key}`, which replaces it in cargo")
+                })
+        };
+        vendored_from_patches(ctx, CARGO_TOML, doc, &lock, &shadowed, out).await;
+    }
+    if let Some((file, doc)) = &config {
+        vendored_from_patches(ctx, file, doc, &lock, &|_| None, out).await;
+    }
+    let wired: Vec<VendorRef> = manifest
+        .iter()
+        .chain(config.iter().map(|(_, doc)| doc))
+        .flat_map(socket_copies)
+        .collect();
+    unattributed_tags(&lock, &wired, out);
+}
+
+/// Every Socket copy a file's `[patch]` tables point at.
+fn socket_copies(doc: &DocumentMut) -> Vec<VendorRef> {
+    patch_entries(doc)
+        .into_iter()
+        .filter_map(|e| e.path.and_then(vendor_ref))
+        .filter(|v| v.eco == "cargo")
+        .collect()
+}
+
+/// Diagnose Socket-tagged sourceless lock entries that no visible
+/// `[patch]` wiring names (`.socket/vendor/cargo/<uuid>/<name>-<version>`):
+/// the lock records a vendored copy the files discovery reads cannot
+/// attribute, so it is not attested.
+fn unattributed_tags(lock: &Lock, wired: &[VendorRef], out: &mut Discovery) {
+    for pkg in lock.packages() {
+        if pkg.source.is_some() {
+            continue;
+        }
+        let Some((version, uuid)) = cargo_tag::split_tag(&pkg.version) else {
+            continue;
+        };
+        let leaf = format!("{}-{version}", pkg.name);
+        if wired.iter().any(|v| v.uuid == uuid && v.leaf == leaf) {
+            continue;
+        }
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            CARGO_LOCK,
+            format!(
+                "{CARGO_LOCK}: {} {} is a Socket-vendored copy (patch {uuid}), but no \
+                 [patch] entry in {CARGO_TOML} or the project cargo config points at \
+                 .socket/vendor/cargo/{uuid}/{leaf}; not counted",
+                pkg.name, pkg.version
+            ),
+        );
     }
 }
 
@@ -521,7 +630,55 @@ fn unresolved_manifest_pins(
 
 // ── vendored ─────────────────────────────────────────────────────────────
 
-fn vendored_from_patches(file: &str, doc: &DocumentMut, lock: &Lock, out: &mut Discovery) {
+/// A `[patch]` path spelled for comparison (separators, `./` segments and
+/// a trailing slash ignored).
+fn same_path_key(path: &str) -> String {
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The Socket version tag of a wired copy's own `Cargo.toml`.
+enum CopyTag {
+    /// No copy manifest on disk (the copy is missing: verification says so).
+    Absent,
+    /// Untagged: a copy vendored before tagged versions.
+    Untagged,
+    Tagged(String),
+    /// Present but unreadable: treated as tagged (fail-closed — an untagged
+    /// lock entry then never counts).
+    Unreadable,
+}
+
+/// Read the tag of the copy at root-relative `artifact_rel` (the only
+/// identity its manifest can mention is the uuid its `[patch]` path already
+/// names).
+async fn copy_tag(ctx: &DiscoverCtx<'_>, artifact_rel: &str, out: &mut Discovery) -> CopyTag {
+    let rel = format!("{artifact_rel}/{CARGO_TOML}");
+    if !ctx.exists(&rel).await {
+        return CopyTag::Absent;
+    }
+    match ctx.read_text(&rel, out).await {
+        Some(text) => match cargo_tag::manifest_tag_uuid(&text) {
+            Some(uuid) => CopyTag::Tagged(uuid),
+            None => CopyTag::Untagged,
+        },
+        None => CopyTag::Unreadable,
+    }
+}
+
+/// Vendored refs from one file's `[patch]` tables. `shadowed` names why
+/// cargo ignores an entry (a higher-precedence item replaces it), if so.
+async fn vendored_from_patches(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    doc: &DocumentMut,
+    lock: &Lock,
+    shadowed: &dyn Fn(&CargoPatchEntry<'_>) -> Option<String>,
+    out: &mut Discovery,
+) {
     for entry in patch_entries(doc) {
         let Some(path) = entry.path else {
             continue; // a git / registry patch
@@ -530,6 +687,18 @@ fn vendored_from_patches(file: &str, doc: &DocumentMut, lock: &Lock, out: &mut D
             continue; // a user path, or the uuid-less `.socket/cargo-patches/`
         }
         let name = entry.name;
+        if let Some(why) = shadowed(&entry) {
+            out.diag(
+                DIAG_REF_INVALID,
+                file,
+                format!(
+                    "{file}: [patch] entry `{}` for {name} points at {path:?}, but {why}; \
+                     not counted",
+                    entry.key
+                ),
+            );
+            continue;
+        }
         let Some(vref) = vendor_ref(path).filter(|v| v.eco == "cargo") else {
             out.diag(
                 DIAG_REF_INVALID,
@@ -560,15 +729,48 @@ fn vendored_from_patches(file: &str, doc: &DocumentMut, lock: &Lock, out: &mut D
             );
             continue;
         };
-        if let Lock::Parsed { pkgs, unused } = lock {
-            if !vendored_copy_consumed(pkgs, unused, name, version) {
+        let tag = copy_tag(ctx, &vref.artifact_rel, out).await;
+        if let CopyTag::Tagged(t) = &tag {
+            if *t != vref.uuid {
+                // Cargo builds this copy as `<version>+socket.<t>`: not the
+                // patch its path names.
                 out.diag(
                     DIAG_REF_INVALID,
                     file,
                     format!(
-                        "{file}: [patch] entry for {name} points at {}, but {CARGO_LOCK} \
-                         does not build {name}@{version} from it (an unused patch, or the \
-                         lock resolves it from a registry); not counted",
+                        "{file}: [patch] entry for {name} points at {}, but that copy's \
+                         {CARGO_TOML} is tagged for patch {t}; not counted",
+                        vref.artifact_rel
+                    ),
+                );
+                continue;
+            }
+        }
+        let copy_tagged = matches!(tag, CopyTag::Tagged(_) | CopyTag::Unreadable);
+        if let Lock::Parsed { pkgs, unused } = lock {
+            let why =
+                match vendored_copy_claim(pkgs, unused, name, version, &vref.uuid, copy_tagged) {
+                    CopyClaim::Consumed => None,
+                    CopyClaim::OtherTag(other) => Some(format!(
+                        "{CARGO_LOCK} builds the copy tagged for patch {other} ({name} {})",
+                        cargo_tag::tag_version(version, other)
+                    )),
+                    CopyClaim::UntaggedOverride => Some(format!(
+                        "{CARGO_LOCK} builds an untagged {name} {version}, not the copy (which \
+                     cargo would lock as {}): another [patch] or path dependency overrides it",
+                        cargo_tag::tag_version(version, &vref.uuid)
+                    )),
+                    CopyClaim::NotConsumed => Some(format!(
+                        "{CARGO_LOCK} does not build {name}@{version} from it (an unused patch, \
+                     or the lock resolves it from a registry)"
+                    )),
+                };
+            if let Some(why) = why {
+                out.diag(
+                    DIAG_REF_INVALID,
+                    file,
+                    format!(
+                        "{file}: [patch] entry for {name} points at {}, but {why}; not counted",
                         vref.artifact_rel
                     ),
                 );
@@ -1400,6 +1602,150 @@ mod tests {
         );
     }
 
+    /// The v5 `vendor` output: the root manifest's `[patch.crates-io]`,
+    /// including a SECOND vendored version of the same crate under the
+    /// Socket-owned `<name>-socket-<uuid8>` key with `package =` — both
+    /// attest, key-agnostically, with no project config at all.
+    #[tokio::test]
+    async fn v5_manifest_wiring_with_two_versions_attests_both() {
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "{}\n[patch.crates-io]\ncfg-if = {{ path = \"{}\" }}\n\
+                 cfg-if-socket-0a1b2c3d = {{ package = \"cfg-if\", path = \"{}\" }}\n",
+                manifest("cfg-if = \"1\"\nold = { package = \"cfg-if\", version = \"0.1\" }"),
+                vendor_path(UUID_A, "cfg-if-1.0.4"),
+                vendor_path(UUID_B, "cfg-if-0.1.10"),
+            ),
+        );
+        p.write(
+            "Cargo.lock",
+            lock(&[
+                ("cfg-if", "0.1.10", None, None),
+                ("cfg-if", "1.0.4", None, None),
+            ]),
+        );
+        let out = run(&p).await;
+        let mut want = vec![
+            ("pkg:cargo/cfg-if@0.1.10", UUID_B, WiringMode::Vendored),
+            ("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored),
+        ];
+        want.sort();
+        assert_refs(&out, &want);
+        assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+        assert!(out
+            .refs
+            .iter()
+            .all(|r| r.source_file == std::path::Path::new("Cargo.toml")));
+    }
+
+    /// Half-migrated (the legacy config entry could not be removed): the
+    /// manifest and the pre-v5 config wire the SAME copy — one package,
+    /// one patch, no conflict.
+    #[tokio::test]
+    async fn half_migrated_manifest_and_legacy_config_agree() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        for key in ["cfg-if-socket-aaaaaaaa", "cfg-if"] {
+            let p = Project::new();
+            p.write(
+                "Cargo.toml",
+                format!(
+                    "{}\n[patch.crates-io]\n{key} = {{ package = \"cfg-if\", path = \"{rel}\" }}\n",
+                    manifest("cfg-if = \"1\"")
+                ),
+            );
+            p.write(".cargo/config.toml", patch_config(&[("cfg-if", &rel)]));
+            p.write("Cargo.lock", lock(&[("cfg-if", "1.0.4", None, None)]));
+            let out = p.discover().await;
+            let triples = ref_triples(&out);
+            assert!(
+                triples
+                    .iter()
+                    .all(|t| t.0 == "pkg:cargo/cfg-if@1.0.4" && t.1 == UUID_A),
+                "{triples:?}"
+            );
+            assert!(!triples.is_empty());
+            assert!(out.diagnostics.is_empty(), "{key}: {:#?}", out.diagnostics);
+        }
+    }
+
+    /// Cargo lets a config `[patch]` item replace the manifest item with the
+    /// same key: a Socket manifest entry whose key a user config entry
+    /// redefines is dead wiring (the user's path builds, and the lock looks
+    /// identical), so it is never attested.
+    #[tokio::test]
+    async fn manifest_entry_shadowed_by_a_same_key_config_entry_is_not_a_ref() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "{}\n[patch.crates-io]\ncfg-if-socket-aaaaaaaa = {{ package = \"cfg-if\", path = \"{rel}\" }}\n",
+                manifest("cfg-if = \"1\"")
+            ),
+        );
+        p.write(
+            ".cargo/config.toml",
+            "[patch.crates-io]\ncfg-if-socket-aaaaaaaa = { package = \"cfg-if\", path = \"../cfg-if\" }\n",
+        );
+        p.write("Cargo.lock", lock(&[("cfg-if", "1.0.4", None, None)]));
+        let out = p.discover().await;
+        assert!(ref_triples(&out).is_empty(), "{:?}", ref_triples(&out));
+        assert!(
+            out.diagnostics.iter().any(|d| d
+                .detail
+                .contains("redefines `[patch]` key `cfg-if-socket-aaaaaaaa`")),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// A `[patch."<crates.io URL>"]` table replaces `[patch.crates-io]`
+    /// wholesale in cargo: the Socket entry under `crates-io` is dead.
+    #[tokio::test]
+    async fn manifest_entry_under_a_url_replaced_crates_io_table_is_not_a_ref() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "{}\n[patch.crates-io]\ncfg-if-socket-aaaaaaaa = {{ package = \"cfg-if\", path = \"{rel}\" }}\n\n\
+                 [patch.\"https://github.com/rust-lang/crates.io-index\"]\nitoa = {{ path = \"../itoa\" }}\n",
+                manifest("cfg-if = \"1\"")
+            ),
+        );
+        p.write("Cargo.lock", lock(&[("cfg-if", "1.0.4", None, None)]));
+        let out = p.discover().await;
+        assert!(ref_triples(&out).is_empty(), "{:?}", ref_triples(&out));
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.detail.contains("replaces `[patch.crates-io]`")),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// A Socket-shaped key whose `package` names ANOTHER crate than the
+    /// copy leaf is not a reference (the leaf must be `<package>-<ver>`).
+    #[tokio::test]
+    async fn v5_socket_key_with_a_mismatched_package_is_not_a_ref() {
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "{}\n[patch.crates-io]\ncfg-if-socket-7c8d9e0f = {{ package = \"libc\", path = \"{}\" }}\n",
+                manifest("cfg-if = \"1\""),
+                vendor_path(UUID_A, "cfg-if-1.0.4"),
+            ),
+        );
+        p.write("Cargo.lock", lock(&[("cfg-if", "1.0.4", None, None)]));
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
+    }
+
     /// The lock is the liveness truth source: a registry-sourced entry
     /// (re-resolved / hosted takeover) or a missing one (`[[patch.unused]]`)
     /// means the copy is not built.
@@ -1558,5 +1904,197 @@ mod tests {
             out.diagnostics
         );
         assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    // ── tagged vendored versions ─────────────────────────────────────
+
+    fn socket_manifest(rel: &str) -> String {
+        format!(
+            "{}\n[patch.crates-io]\ncfg-if-socket-aaaaaaaa = {{ package = \"cfg-if\", path = \"{rel}\" }}\n",
+            manifest("cfg-if = \"1\"")
+        )
+    }
+
+    /// The v5 shape: the lock's detached entry carries the copy's tagged
+    /// version. The purl is the tag stripped; a pre-release and a version
+    /// with its own build metadata read the same way.
+    #[tokio::test]
+    async fn tagged_lock_version_is_the_identity() {
+        for version in ["1.0.4", "1.0.0-rc.1", "2.0.1+zstd.1.5.2"] {
+            let rel = vendor_path(UUID_A, &format!("cfg-if-{version}"));
+            let tagged = crate::vendor::cargo_tag::tag_version(version, UUID_A);
+            let p = Project::new();
+            p.write("Cargo.toml", socket_manifest(&rel));
+            p.write("Cargo.lock", lock(&[("cfg-if", &tagged, None, None)]));
+            let out = run(&p).await;
+            let purl = format!("pkg:cargo/cfg-if@{version}");
+            assert_refs(&out, &[(purl.as_str(), UUID_A, WiringMode::Vendored)]);
+            assert!(
+                out.diagnostics.is_empty(),
+                "{version}: {:#?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// A detached entry tagged for ANOTHER uuid: cargo builds a different
+    /// copy than the wiring names — no ref, and the ledger entry for the
+    /// named copy is dead.
+    #[tokio::test]
+    async fn lock_tag_for_another_uuid_is_dead_wiring() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let p = Project::new();
+        p.write("Cargo.toml", socket_manifest(&rel));
+        p.write(
+            "Cargo.lock",
+            lock(&[("cfg-if", &format!("1.0.4+socket.{UUID_B}"), None, None)]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(
+            diag_codes(&out),
+            vec![DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE],
+            "{:#?}",
+            out.diagnostics
+        );
+        assert!(out.diagnostics.iter().any(|d| d.detail.contains(UUID_B)));
+        assert_eq!(
+            out.vendored_claim("pkg:cargo/cfg-if@1.0.4", UUID_A, &rel),
+            Some(false)
+        );
+    }
+
+    /// A tagged lock entry no visible wiring points at is diagnosed, never
+    /// attested from the lock alone.
+    #[tokio::test]
+    async fn tagged_lock_entry_without_wiring_is_unattributable() {
+        let p = Project::new();
+        p.write("Cargo.toml", manifest("cfg-if = \"1\""));
+        p.write(
+            "Cargo.lock",
+            lock(&[("cfg-if", &format!("1.0.4+socket.{UUID_A}"), None, None)]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
+    }
+
+    /// The copy's own `Cargo.toml` tag decides an UNTAGGED sourceless lock
+    /// entry: it is the pre-tag vendored shape only beside an untagged (or
+    /// missing — verification reports that) copy; beside a tagged or
+    /// unreadable copy it is some other crate cargo built. A copy tagged for
+    /// another uuid than its path is dead wiring whatever the lock says.
+    #[tokio::test]
+    async fn copy_manifest_tag_decides_an_untagged_lock_entry() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let copy_toml = format!("{rel}/Cargo.toml");
+        let at = |v: &str| format!("[package]\nname = \"cfg-if\"\nversion = \"{v}\"\n");
+        let tag = |u: &str| crate::vendor::cargo_tag::tag_version("1.0.4", u);
+        let purl = "pkg:cargo/cfg-if@1.0.4";
+        let untagged_lock = lock(&[("cfg-if", "1.0.4", None, None)]);
+        let tagged_lock = lock(&[("cfg-if", &tag(UUID_A), None, None)]);
+
+        for (what, copy, lock_text, attests) in [
+            ("no copy manifest", None, &untagged_lock, true),
+            ("untagged copy", Some(at("1.0.4")), &untagged_lock, true),
+            (
+                "tagged copy, untagged lock",
+                Some(at(&tag(UUID_A))),
+                &untagged_lock,
+                false,
+            ),
+            (
+                "tagged copy, tagged lock",
+                Some(at(&tag(UUID_A))),
+                &tagged_lock,
+                true,
+            ),
+            (
+                "copy tagged for another uuid",
+                Some(at(&tag(UUID_B))),
+                &tagged_lock,
+                false,
+            ),
+            (
+                "copy tagged for another uuid, untagged lock",
+                Some(at(&tag(UUID_B))),
+                &untagged_lock,
+                false,
+            ),
+        ] {
+            let p = Project::new();
+            p.write("Cargo.toml", socket_manifest(&rel));
+            p.write("Cargo.lock", lock_text);
+            if let Some(copy) = copy {
+                p.write(&copy_toml, copy);
+            }
+            let out = run(&p).await;
+            if attests {
+                assert_refs(&out, &[(purl, UUID_A, WiringMode::Vendored)]);
+                assert!(out.diagnostics.is_empty(), "{what}: {:#?}", out.diagnostics);
+            } else {
+                assert_refs(&out, &[]);
+                assert!(
+                    diag_codes(&out).contains(&DIAG_REF_INVALID),
+                    "{what}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+
+        // Unreadable (a directory where the manifest should be): fail
+        // closed — the untagged entry never counts.
+        let p = Project::new();
+        p.write("Cargo.toml", socket_manifest(&rel));
+        p.write("Cargo.lock", &untagged_lock);
+        std::fs::create_dir_all(p.root().join(&copy_toml)).unwrap();
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert!(
+            diag_codes(&out).contains(&DIAG_REF_INVALID),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// A user's same-version path fork locked beside the tagged copy (real
+    /// cargo 1.97 sorts the untagged entry first) does not hide the copy;
+    /// beside another uuid's tagged entry the wiring is still dead.
+    #[tokio::test]
+    async fn a_same_version_fork_beside_the_tagged_copy_is_ignored() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let tag = |u: &str| crate::vendor::cargo_tag::tag_version("1.0.4", u);
+        for (tagged_for, attests) in [(UUID_A, true), (UUID_B, false)] {
+            let p = Project::new();
+            p.write("Cargo.toml", socket_manifest(&rel));
+            p.write(
+                &format!("{rel}/Cargo.toml"),
+                format!(
+                    "[package]\nname = \"cfg-if\"\nversion = \"{}\"\n",
+                    tag(UUID_A)
+                ),
+            );
+            p.write(
+                "Cargo.lock",
+                lock(&[
+                    ("cfg-if", "1.0.4", None, None),
+                    ("cfg-if", &tag(tagged_for), None, None),
+                ]),
+            );
+            let out = run(&p).await;
+            if attests {
+                assert_refs(
+                    &out,
+                    &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+                );
+            } else {
+                assert_refs(&out, &[]);
+                assert!(
+                    diag_codes(&out).contains(&DIAG_REF_INVALID),
+                    "{:#?}",
+                    out.diagnostics
+                );
+            }
+        }
     }
 }

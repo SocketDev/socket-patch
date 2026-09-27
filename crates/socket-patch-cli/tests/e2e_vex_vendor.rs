@@ -116,13 +116,17 @@ fn make_record(
     }
 }
 
+/// The consumer manifest the cargo fixtures wire their `[patch]` into.
+const CARGO_MANIFEST_HEAD: &str =
+    "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\nserde = \"1\"\n\n";
+
 /// The serde artifact every cargo-shaped fixture below vendors.
 fn serde_artifact_rel() -> String {
     format!(".socket/vendor/cargo/{UUID}/serde-1.0.0")
 }
 
 /// Wire the vendored serde crate the way `vendor`'s cargo backend does
-/// (`.cargo/config.toml` `[patch.crates-io]`) and return the ledger's
+/// (the root `Cargo.toml`'s `[patch.crates-io]`) and return the ledger's
 /// record of that edit.
 ///
 /// Every vendor-ledger fixture carries live wiring because `vex` now only
@@ -131,18 +135,16 @@ fn serde_artifact_rel() -> String {
 /// with the artifact and ledger left behind) is omitted as
 /// `vendor_unwired` — see `unwired_vendor_ledger_entry_is_not_attested`.
 fn write_cargo_wiring(cwd: &Path) -> WiringRecord {
-    let dir = cwd.join(".cargo");
-    std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("config.toml"),
+        cwd.join("Cargo.toml"),
         format!(
-            "[patch.crates-io]\nserde = {{ path = \"{}\" }}\n",
+            "{CARGO_MANIFEST_HEAD}[patch.crates-io]\nserde = {{ path = \"{}\" }}\n",
             serde_artifact_rel()
         ),
     )
     .unwrap();
     WiringRecord {
-        file: ".cargo/config.toml".to_string(),
+        file: "Cargo.toml".to_string(),
         kind: "cargo_patch_entry".to_string(),
         action: WiringAction::Added,
         key: Some("serde".to_string()),
@@ -153,7 +155,7 @@ fn write_cargo_wiring(cwd: &Path) -> WiringRecord {
 
 /// Write a `.socket/vendor/state.json` ledger with one cargo-style
 /// (dir-shaped) entry for `purl` whose artifact lives at `rel_path`, plus
-/// the entry's live `.cargo/config.toml` wiring.
+/// the entry's live root `Cargo.toml` wiring.
 fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
     let wiring = write_cargo_wiring(cwd);
     let mut state = VendorState::new();
@@ -606,7 +608,7 @@ fn golang_go_patches_redirect_attested_without_module_cache() {
 
 /// Ledger writer for the detached shape: `detached: true` plus the
 /// embedded record that replaces the manifest as verification source, and
-/// the entry's live `.cargo/config.toml` wiring.
+/// the entry's live root `Cargo.toml` wiring.
 fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: PatchRecord) {
     let wiring = write_cargo_wiring(cwd);
     let mut state = VendorState::new();
@@ -890,9 +892,9 @@ fn write_matrix_wiring(cwd: &Path, eco: &str, uuid: &str, rel: &str) -> WiringRe
             .to_string(),
         ),
         "cargo" => (
-            ".cargo/config.toml",
+            "Cargo.toml",
             "cargo_patch_entry",
-            format!("[patch.crates-io]\nserde = {{ path = \"{rel}\" }}\n"),
+            format!("{CARGO_MANIFEST_HEAD}[patch.crates-io]\nserde = {{ path = \"{rel}\" }}\n"),
         ),
         "golang" => (
             "go.mod",
@@ -1770,7 +1772,7 @@ fn unwired_vendor_ledger_entry_is_not_attested() {
     write_manifest(cwd, &manifest, true);
     // The lockfile/config wiring is reverted by hand; the artifact and the
     // ledger entry stay behind.
-    std::fs::remove_file(cwd.join(".cargo/config.toml")).unwrap();
+    std::fs::write(cwd.join("Cargo.toml"), CARGO_MANIFEST_HEAD).unwrap();
 
     for extra in [&[][..], &["--no-verify"][..]] {
         let (code, env) = vex_json(cwd, extra);
@@ -2232,18 +2234,22 @@ fn rejected_vendored_wiring_never_keeps_a_vendor_ledger_alive() {
             uuid: cargo_uuid,
             rel: cargo_rel.clone(),
             member: "src/lib.rs",
-            wiring: vec![".cargo/config.toml", "Cargo.lock"],
+            wiring: vec!["Cargo.toml", "Cargo.lock"],
             stale: vec![
                 (
-                    ".cargo/config.toml",
-                    format!("[patch.crates-io]\nserde = {{ path = \"{cargo_rel}\" }}\n"),
+                    "Cargo.toml",
+                    format!(
+                        "{CARGO_MANIFEST_HEAD}[patch.crates-io]\nserde = {{ path = \"{cargo_rel}\" }}\n"
+                    ),
                 ),
                 ("Cargo.lock", cargo_lock(&crates_io)),
             ],
             live: vec![
                 (
-                    ".cargo/config.toml",
-                    format!("[patch.crates-io]\nserde = {{ path = \"{cargo_rel}\" }}\n"),
+                    "Cargo.toml",
+                    format!(
+                        "{CARGO_MANIFEST_HEAD}[patch.crates-io]\nserde = {{ path = \"{cargo_rel}\" }}\n"
+                    ),
                 ),
                 ("Cargo.lock", cargo_lock("")),
             ],
