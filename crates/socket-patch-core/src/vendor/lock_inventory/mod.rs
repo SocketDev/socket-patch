@@ -65,8 +65,8 @@ pub(crate) mod npm_family;
 pub(crate) mod pnpm;
 pub(crate) mod pypi;
 pub(crate) mod recover;
-pub mod view;
 pub(crate) mod vlt;
+pub mod view;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
@@ -210,7 +210,9 @@ pub struct UnsupportedNpmLayout {
 /// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
 /// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
 /// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
-pub fn unsupported_layout_warnings(unsupported: &[UnsupportedNpmLayout]) -> Vec<(String, String)> {
+pub fn unsupported_layout_warnings(
+    unsupported: &[UnsupportedNpmLayout],
+) -> Vec<(String, String)> {
     unsupported
         .iter()
         .map(|diag| match diag.code {

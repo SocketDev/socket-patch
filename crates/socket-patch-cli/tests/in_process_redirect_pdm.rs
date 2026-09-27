@@ -110,9 +110,7 @@ async fn mock_api(server: &MockServer) {
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG}/patches/by-package/.+$"
-        )))
+        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": RECORD_PURL,
@@ -340,10 +338,8 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
         PYPROJECT,
         "pyproject untouched"
     );
-    let ledger: serde_json::Value = serde_json::from_str(&read(
-        &tmp.path().join(".socket/vendor/redirect-state.json"),
-    ))
-    .unwrap();
+    let ledger: serde_json::Value =
+        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json"))).unwrap();
     assert!(
         ledger["records"][RECORD_PURL].is_object(),
         "ledger keyed by the artifact-qualified purl: {ledger}"
@@ -368,11 +364,7 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
     // 2. Idempotent re-scan: no further edits, lock byte-identical.
     let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0);
-    assert_eq!(
-        read(&lock_path),
-        redirected,
-        "re-scan must not touch the lock"
-    );
+    assert_eq!(read(&lock_path), redirected, "re-scan must not touch the lock");
 
     // 3. The committed state, manifest-less, attests (and only while wired).
     assert_manifestless_vex(tmp.path(), LOCK);
@@ -431,10 +423,8 @@ async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
         pyproject,
         "pyproject untouched"
     );
-    let ledger: serde_json::Value = serde_json::from_str(&read(
-        &tmp.path().join(".socket/vendor/redirect-state.json"),
-    ))
-    .unwrap();
+    let ledger: serde_json::Value =
+        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json"))).unwrap();
     assert!(
         ledger["records"][RECORD_PURL].is_object(),
         "the pdm redirect must be confirmed and recorded despite the hatch backend: {ledger}"
@@ -454,11 +444,7 @@ async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
     })
     .await;
     assert_eq!(code, 0, "rollback must succeed");
-    assert_eq!(
-        read(&lock_path),
-        LOCK,
-        "rollback must restore the pristine lock"
-    );
+    assert_eq!(read(&lock_path), LOCK, "rollback must restore the pristine lock");
 }
 
 /// The legacy `[metadata.files]` lock (lock_version 2) redirects the package
@@ -476,10 +462,8 @@ async fn legacy_metadata_files_lock_redirects_both_fragments_and_warns() {
     assert_eq!(code, 0);
     let redirected = read(&lock_path);
     assert!(redirected.contains(HOSTED_URL), "{redirected}");
-    let ledger: serde_json::Value = serde_json::from_str(&read(
-        &tmp.path().join(".socket/vendor/redirect-state.json"),
-    ))
-    .unwrap();
+    let ledger: serde_json::Value =
+        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json"))).unwrap();
     assert_eq!(
         ledger["edits"].as_array().unwrap().len(),
         2,

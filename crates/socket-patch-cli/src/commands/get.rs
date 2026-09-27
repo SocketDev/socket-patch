@@ -14,7 +14,9 @@ use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 pub(crate) use socket_patch_core::manifest::records::record_from_patch_response;
 use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
-use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::{
+    PatchFileInfo, PatchManifest, PatchRecord,
+};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
@@ -387,6 +389,7 @@ fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInf
     }
     files
 }
+
 
 #[derive(Args)]
 pub struct GetArgs {
@@ -2598,13 +2601,11 @@ pub async fn run(args: GetArgs) -> i32 {
     // entry) and global installs (no project lockfile) mean agent mode.
     // Conflicts use get's exit-1 report_error style (scan's self-enforced
     // conflicts exit 2 — documented carve-out in CLI_CONTRACT.md).
-    let mode = args
-        .mode
-        .unwrap_or(if args.save_only || args.common.is_global() {
-            super::scan::ScanMode::Agent
-        } else {
-            super::scan::ScanMode::Hosted
-        });
+    let mode = args.mode.unwrap_or(if args.save_only || args.common.is_global() {
+        super::scan::ScanMode::Agent
+    } else {
+        super::scan::ScanMode::Hosted
+    });
     if args.save_only && mode != super::scan::ScanMode::Agent {
         report_error(
             args.common.json,
@@ -2866,7 +2867,8 @@ pub async fn run(args: GetArgs) -> i32 {
         }
         IdentifierType::Package => {
             status.set("Enumerating packages...");
-            let (all_packages, _, _) = crawl_all_ecosystems(&args.common.crawler_options()).await;
+            let (all_packages, _, _) =
+                crawl_all_ecosystems(&args.common.crawler_options()).await;
 
             if all_packages.is_empty() {
                 status.finish();
@@ -7173,11 +7175,8 @@ mod tests {
         let installed = |name: &str, body: &[u8]| {
             let dist = site.path().join(format!("{name}-1.0.0.dist-info"));
             std::fs::create_dir_all(&dist).unwrap();
-            std::fs::write(
-                dist.join("METADATA"),
-                format!("Name: {name}\nVersion: 1.0.0\n"),
-            )
-            .unwrap();
+            std::fs::write(dist.join("METADATA"), format!("Name: {name}\nVersion: 1.0.0\n"))
+                .unwrap();
             std::fs::write(site.path().join(format!("{name}.py")), body).unwrap();
             compute_git_sha256_from_bytes(body)
         };
@@ -7221,10 +7220,7 @@ mod tests {
         mount(uuid("bs"), "beta_sdist.py".into(), "0".repeat(64), 0).await;
         for n in ["gw", "gs"] {
             Mock::given(method("GET"))
-                .and(wm_path(format!(
-                    "/v0/orgs/test-org/patches/view/{}",
-                    uuid(n)
-                )))
+                .and(wm_path(format!("/v0/orgs/test-org/patches/view/{}", uuid(n))))
                 .respond_with(ResponseTemplate::new(500))
                 .expect(0)
                 .mount(&server)

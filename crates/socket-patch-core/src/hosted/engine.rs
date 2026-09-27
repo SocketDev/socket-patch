@@ -24,9 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
-use crate::constants::npm_family::{
-    RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
-};
+use crate::constants::npm_family::{RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK};
 use crate::patch::redirect::npmrc::{
     plan_npmrc_allow_remote_with, NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND,
     NPMRC_REL,
@@ -46,9 +44,9 @@ use super::guidance::{
     npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
     pnpm_lock_may_need_store_flag, pnpm_lock_version_major, pnpm_trust_configured_detail,
     pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_policy_preamble,
-    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
-    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote,
+    read_workspace_for_trust, url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION,
+    PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -171,8 +169,7 @@ impl SkippedPatch {
 
     /// The `skipped[]` JSON entry (`{purl, uuid, reason[, detail]}`).
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::to_value(self)
-            .expect("SkippedPatch is plain strings: serialization cannot fail")
+        serde_json::to_value(self).expect("SkippedPatch is plain strings: serialization cannot fail")
     }
 }
 
@@ -293,7 +290,9 @@ pub fn build_candidates(
         let token = reference
             .registry_override
             .as_ref()
-            .and_then(|o| crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid))
+            .and_then(|o| {
+                crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid)
+            })
             .or_else(|| crate::patch::redirect::grant_token_path_segment(&url, sel_uuid))
             .unwrap_or_default();
         candidates.push(Candidate {
@@ -413,9 +412,7 @@ impl CandidateFiles {
 /// The root-level Python lock names (sorted).
 async fn python_lock_paths(view: &ProjectView<'_>) -> Vec<String> {
     match view {
-        ProjectView::Disk(cwd) => {
-            crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default()
-        }
+        ProjectView::Disk(cwd) => crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default(),
         ProjectView::Memory(project) => project
             .children("")
             .into_iter()
@@ -646,10 +643,7 @@ pub struct Rewritten {
 /// symbolic link (absent to the planner, refused by [`guard`]).
 fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, bool) {
     match view {
-        ProjectView::Disk(cwd) => (
-            read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
-            false,
-        ),
+        ProjectView::Disk(cwd) => (read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)), false),
         ProjectView::Memory(project) => match project.get(PNPM_WORKSPACE_REL) {
             None => (Ok(None), false),
             Some(MemoryEntry::Text(text)) => (Ok(Some(text.to_string())), false),
@@ -866,22 +860,10 @@ pub async fn rewrite(
         }));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
-        view,
-        &files,
-        &rewrite,
-        &overrides,
-        takeover_previews,
-        &options,
-    );
-    let (npm_warnings, npmrc_config_write) = npm_allow_remote(
-        view,
-        &files,
-        &rewrite,
-        &overrides,
-        takeover_previews,
-        &options,
-    );
+    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) =
+        pnpm_trust(view, &files, &rewrite, &overrides, takeover_previews, &options);
+    let (npm_warnings, npmrc_config_write) =
+        npm_allow_remote(view, &files, &rewrite, &overrides, takeover_previews, &options);
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last: `--revert` walks edits in reverse, so the trust key
@@ -1005,12 +987,7 @@ fn pnpm_trust(
         pnpm_lock_texts.push(text);
     }
     if pnpm_lock_texts.is_empty() {
-        return (
-            pnpm_warnings,
-            trust_config_write,
-            pnpm_rerun_only,
-            workspace_symlinked,
-        );
+        return (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked);
     }
     // Name only the hosts whose artifact URL actually landed in a touched
     // pnpm lock's final text (spliced this run, or the already-redirected
@@ -1133,12 +1110,7 @@ fn pnpm_trust(
             detail.trim_end_matches('.')
         ),
     }));
-    (
-        pnpm_warnings,
-        trust_config_write,
-        pnpm_rerun_only,
-        workspace_symlinked,
-    )
+    (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked)
 }
 
 /// npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every
@@ -1216,28 +1188,26 @@ fn npm_allow_remote(
     let detail = match read_npmrc(view) {
         // Opt-out still reports an explicit / already-set value truthfully;
         // only the WRITE is suppressed.
-        Ok(existing) => {
-            match plan_npmrc_allow_remote_with(existing.as_deref(), &(options.npm_outer)()) {
-                NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
-                NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
-                NpmrcPlan::EnvSet { var, value } => {
-                    npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
-                }
-                NpmrcPlan::OuterSet { layer, path, value } => {
-                    npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
-                }
-                NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
-                _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
-                NpmrcPlan::Create(text) => {
-                    npmrc_config_write = Some((text, edit("created")));
-                    npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
-                }
-                NpmrcPlan::Append(text) => {
-                    npmrc_config_write = Some((text, edit("added")));
-                    npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
-                }
+        Ok(existing) => match plan_npmrc_allow_remote_with(existing.as_deref(), &(options.npm_outer)()) {
+            NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
+            NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
+            NpmrcPlan::EnvSet { var, value } => {
+                npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
             }
-        }
+            NpmrcPlan::OuterSet { layer, path, value } => {
+                npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
+            }
+            NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
+            _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
+            NpmrcPlan::Create(text) => {
+                npmrc_config_write = Some((text, edit("created")));
+                npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
+            }
+            NpmrcPlan::Append(text) => {
+                npmrc_config_write = Some((text, edit("added")));
+                npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
+            }
+        },
         Err(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
     };
     npm_warnings.push(serde_json::json!({
@@ -1449,11 +1419,7 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
 /// In memory, additionally: a candidate file read through a link (its bytes
 /// are unknown) or present without content, when a candidate of its
 /// ecosystem could rewrite it.
-pub fn guard(
-    view: &ProjectView<'_>,
-    done: &Rewritten,
-    candidates: &[Candidate],
-) -> Option<Refusal> {
+pub fn guard(view: &ProjectView<'_>, done: &Rewritten, candidates: &[Candidate]) -> Option<Refusal> {
     if done.workspace_symlinked {
         return Some(symlink_refusal(PNPM_WORKSPACE_REL));
     }

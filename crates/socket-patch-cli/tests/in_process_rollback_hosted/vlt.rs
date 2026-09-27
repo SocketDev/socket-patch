@@ -509,10 +509,8 @@ async fn vlt_heal_follows_the_vlt_group_when_another_group_refuses() {
     let (_, doc) = scan_hosted(root, &server, &["--no-npm-allow-remote-config"], &[]);
     assert_eq!(redirected(&doc), 1, "the scan redirects both locks");
     vlt_install_patched(root, &server);
-    let drifted = read(root, "package-lock.json").replace(
-        &artifact_url(&server),
-        "https://example.invalid/left-pad-1.3.0.tgz",
-    );
+    let drifted = read(root, "package-lock.json")
+        .replace(&artifact_url(&server), "https://example.invalid/left-pad-1.3.0.tgz");
     std::fs::write(root.join("package-lock.json"), &drifted).unwrap();
 
     let cwd = root.to_str().unwrap().to_string();
@@ -528,18 +526,10 @@ async fn vlt_heal_follows_the_vlt_group_when_another_group_refuses() {
         vlt_lock(Era::V1, &[registry_node(TILDE_ID)]),
         "the vlt group restored the registry pins"
     );
-    assert_eq!(
-        read(root, "package-lock.json"),
-        drifted,
-        "the refused group wrote nothing"
-    );
+    assert_eq!(read(root, "package-lock.json"), drifted, "the refused group wrote nothing");
     assert!(
         !store_dir(root, TILDE_ID).exists(),
         "the patched store copy is removed for the restored pins"
     );
-    assert_eq!(
-        advisory_details(&doc),
-        [RESTORED],
-        "the heal advisory is reported"
-    );
+    assert_eq!(advisory_details(&doc), [RESTORED], "the heal advisory is reported");
 }

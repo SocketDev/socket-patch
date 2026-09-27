@@ -21,6 +21,7 @@ pub const REBASE_KINDS: &[&str] = &[
     crate::patch::redirect::vlt::KIND,
 ];
 
+
 /// Merge this run's vlt node edits into the recorded ones. A fresh edit
 /// for the same `key` and DepID keeps the oldest recorded `original` (the
 /// pristine registry entry), takes the fresh `new` and drops the chain's
@@ -37,7 +38,9 @@ pub fn rebase_vlt_edits(
     fresh: &[crate::patch::redirect::FileEdit],
     before_lock: Option<&str>,
 ) -> Vec<bool> {
-    use crate::patch::redirect::vlt::{carried_pin_original, edit_dep_id, lock_node_ids, KIND};
+    use crate::patch::redirect::vlt::{
+        carried_pin_original, edit_dep_id, lock_node_ids, KIND,
+    };
     use crate::patch::redirect::FileEdit;
     fn superseding(edit: &FileEdit, old: &FileEdit) -> FileEdit {
         let mut next = edit.clone();

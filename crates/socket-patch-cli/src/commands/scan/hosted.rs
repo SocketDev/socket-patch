@@ -35,8 +35,8 @@ pub(crate) use socket_patch_core::hosted::guidance::{
     npm_allow_remote_user_set_detail, plan_workspace_trust, pnpm_heal_root,
     pnpm_lock_carries_hosted_redirect, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
     pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    TrustPlan,
+    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote,
+    read_workspace_for_trust, TrustPlan,
 };
 #[cfg(test)]
 pub(crate) use socket_patch_core::hosted::ledger::{rebase_vlt_edits, REBASE_KINDS};
@@ -667,11 +667,7 @@ pub(crate) async fn run_redirect_selected(
     // (the takeover reverts rewrite locks in place, never create or remove
     // one, so the lock-presence probe holds for the rewrite below too).
     if engine::bun_lockb_symlinked(&view, &candidates) {
-        return refuse(
-            common,
-            scan_result.take(),
-            &engine::bun_lockb_symlink_refusal(),
-        );
+        return refuse(common, scan_result.take(), &engine::bun_lockb_symlink_refusal());
     }
 
     // vlt artifact preflight: before any takeover or rewrite (dry runs
@@ -2146,6 +2142,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
 
 #[cfg(test)]
 mod tests {
+    use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use super::{
         build_redirect_json_envelope, gem_stale_cache_warning, gem_stale_install_warning,
         gem_stale_install_warnings, installed_stale_positive_evidence,
@@ -2167,7 +2164,6 @@ mod tests {
     use super::{rebase_vlt_edits, REBASE_KINDS};
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
-    use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use socket_patch_core::patch::redirect::{DepOverride, FileEdit};
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
 

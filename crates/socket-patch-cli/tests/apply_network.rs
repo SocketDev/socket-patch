@@ -1069,7 +1069,10 @@ async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
         v["summary"]["applied"], 1,
         "the drifted nested copy must be warn-overwritten.\nstdout={v:#}"
     );
-    assert_eq!(v["summary"]["failed"], 0, "no copy may fail.\nstdout={v:#}");
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "no copy may fail.\nstdout={v:#}"
+    );
 
     // The nested copy's blob was fetched on demand…
     let requests = mock.received_requests().await.unwrap();

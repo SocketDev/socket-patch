@@ -205,7 +205,8 @@ async fn scan_discovers_fake_registry_crates() {
         "Expected human scan to report exactly 'Found 2 packages (2 cargo)', got:\n{combined}"
     );
     assert!(
-        !combined.contains("No packages found") && !combined.contains("No packages found"),
+        !combined.contains("No packages found")
+            && !combined.contains("No packages found"),
         "scan reported no packages despite a populated registry:\n{combined}"
     );
 
@@ -262,7 +263,8 @@ async fn scan_discovers_vendor_crates() {
         "Expected human scan to report exactly 'Found 1 package (1 cargo)', got:\n{combined}"
     );
     assert!(
-        !combined.contains("No packages found") && !combined.contains("No packages found"),
+        !combined.contains("No packages found")
+            && !combined.contains("No packages found"),
         "scan reported no packages despite a populated vendor dir:\n{combined}"
     );
 
