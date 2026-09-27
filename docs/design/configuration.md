@@ -91,13 +91,13 @@ UX policy and are ignored.
 ## Deferred (designated homes, no implementation yet)
 
 - **Project-level behavioral defaults** (`ecosystems`, `downloadMode`,
-  `vendorSource`): if demand materializes, they go in the manifest `setup`
-  block (`setup.defaults`, camelCase) — the manifest already controls what
-  gets patched, so behavioral defaults there grant no new capability, and
-  the serde struct simply has no fields for URLs/credentials/interlocks.
+  `vendorSource`): if demand materializes, they go in a manifest
+  `defaults` block (camelCase) — the manifest already controls what gets
+  patched, so behavioral defaults there grant no new capability, and the
+  serde struct simply has no fields for URLs/credentials/interlocks.
   Requires teaching the TS zod twin
-  (`npm/socket-patch/src/schema/manifest-schema.ts`) to model `setup`.
-  Precedence would be flag > env > `setup.defaults` > default.
+  (`npm/socket-patch/src/schema/manifest-schema.ts`) to model it.
+  Precedence would be flag > env > manifest `defaults` > default.
 - **Env cleanup sweep**: core's direct env readers (`SOCKET_OFFLINE` in
   `utils/env_compat.rs`, `SOCKET_TELEMETRY_DISABLED` in `telemetry.rs`)
   still match only `1|true`, unlike `parse_bool_flag`'s vocabulary (the CLI

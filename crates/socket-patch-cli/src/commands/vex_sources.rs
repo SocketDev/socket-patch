@@ -141,8 +141,8 @@ impl Sources {
 
 /// The resolved attestation inputs.
 pub(crate) struct Plan {
-    /// purl → record for every candidate that passed the gates (with the
-    /// manifest file's `setup` block, which property 7 reads).
+    /// purl → record for every candidate that passed the gates (carrying
+    /// the manifest file's legacy `setup` block through unchanged).
     pub view: PatchManifest,
     /// Vendored-basis entries, keyed by view purl — the verification
     /// routing for `applied_patches_with_vendor`.

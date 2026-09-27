@@ -951,8 +951,8 @@ async fn crawl_all_discovers_deeply_nested_transitive_deps() {
     // patchable — exactly like a direct dependency (apply is path-agnostic). The
     // other nested tests stage only 2 levels; this pins 4, so a regression that
     // capped recursion depth (or stopped descending after the first nested
-    // node_modules) would surface here. See CLI_CONTRACT "Setup command contract"
-    // → "Monorepo / multi-project discovery model".
+    // node_modules) would surface here. See CLI_CONTRACT "Monorepo /
+    // multi-project discovery model".
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
 

@@ -31,7 +31,7 @@ use clap::{Parser, Subcommand};
         socket-patch vex       Emit an OpenVEX document for your vulnerability scanner\n  \
         socket-patch vendor    Eject the patches into .socket/vendor/ for offline installs\n  \
         socket-patch list      Show the patches in this project\n\n\
-        get, apply, setup, rollback, remove and repair are the older agent-mode commands."
+        get, apply, rollback, remove and repair are the older agent-mode commands."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -81,10 +81,6 @@ pub enum Commands {
 
     /// Agent mode: apply the patches in `.socket/manifest.json` in place
     Apply(commands::apply::ApplyArgs),
-
-    /// Agent mode: wire install hooks (npm, Python, Bundler, Composer) that
-    /// re-apply patches after install
-    Setup(commands::setup::SetupArgs),
 
     /// Undo patches: restore original files and unwind hosted or vendored
     /// lockfile wiring
@@ -136,7 +132,6 @@ impl Commands {
             Commands::Apply(a) => &a.common,
             Commands::Vex(a) => &a.common,
             Commands::Vendor(a) => &a.common,
-            Commands::Setup(a) => &a.common,
             Commands::Rollback(a) => &a.common,
             Commands::Get(a) => &a.common,
             Commands::List(a) => &a.common,

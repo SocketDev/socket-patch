@@ -1416,13 +1416,6 @@ fn nuget_apply_vex_attests_but_agent_mode_needs_the_manifest() {
     put(&pkg, "newtonsoft.json.nuspec", b"<package/>");
     put(&pkg, NUGET_FILE_KEY, NUGET_PRISTINE);
     fx.stage_manifest(NUGET_PURL, NUGET_HOSTED_UUID, &nuget_files());
-    // nuget has no install hook: agent-mode statements need the ecosystem
-    // declared `setup.manual` (property 7) — the hosted/vendored cells
-    // above never do, their wiring IS the persistence.
-    let manifest = fx.cwd.join(".socket/manifest.json");
-    let mut m: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
-    m["setup"] = serde_json::json!({ "manual": ["nuget"] });
-    fx.put(".socket/manifest.json", m.to_string());
     let embedded = fx.cwd.join("embedded.vex.json");
     let (code, env, stderr) = fx.run(&[
         "apply",

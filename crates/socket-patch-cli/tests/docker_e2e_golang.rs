@@ -172,13 +172,10 @@ fi
 # handles it but we pre-chmod for robustness.
 chmod u+w "$GIN_GO" || true
 
-# Pre-seed setup.manual so the agent-mode VEX leg keeps the golang patch
-# through property 7 (golang has no auto-install setup hook; agent patches are
-# applied by hand/CI — exactly what `manual` declares). scan --sync merges the
-# downloaded patch into this manifest and preserves the setup block.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["golang"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # scan --sync writes manifest + blob; the go crawler with --global probes

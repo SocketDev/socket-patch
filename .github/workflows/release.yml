@@ -41,9 +41,8 @@ name: Release
 #   - npm:           OIDC via `npm stage publish`; staged versions require
 #                    manual 2FA approval (see the npm run's step summary).
 #   - PyPI:          OIDC trusted publishing; environment `pypi`.
-#   - RubyGems:      OIDC trusted publishing; environment `rubygems`. One
-#                    repo+workflow publisher per gem (`socket-patch` and
-#                    `socket-patch-bundler`), both satisfied by one exchange.
+#   - RubyGems:      OIDC trusted publishing; environment `rubygems`
+#                    (the `socket-patch` launcher gem).
 # Every registry's trusted publisher is keyed on the repo + the publish
 # workflow's own filename (see each publish-*.yml header), NOT release.yml.
 

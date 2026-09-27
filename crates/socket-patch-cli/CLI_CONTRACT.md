@@ -14,12 +14,13 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `list` | — | Print patches in the local manifest, plus the vendor ledger's (v5.0) and the hosted redirect ledger's records (labeled; see the `manifest_not_found` row and the action matrix) |
 | `get` | `download` | Agent mode by default (`--mode` selects hosted/vendored): fetch + apply a patch; requires positional `identifier` |
 | `apply` | — | Agent mode: apply patches from the local manifest |
-| `setup` | — | Agent mode: wire automatic-patching install hooks (npm/pypi/gem/composer) |
 | `rollback` | — | **Full-state rollback (v5.0, MAJOR)**: restore original files AND unwind vendored/hosted lockfile wiring, remove the rolled-back entries from the manifest, and GC their blobs/archives; takes optional variadic positional `targets` (PURL \| UUID \| path glob). See [Rollback command contract](#rollback-command-contract-v50) |
 | `remove` | — | Agent mode: remove a patch from manifest (rolls back first); requires positional `identifier` |
 | `repair` | `gc` | Agent mode: download missing blobs, rebuild missing/corrupt vendored artifacts, and clean up unused ones (refuses with `lock_held` when a live process holds the lock; see "Lock lifecycle" below) |
 
 Rows are in `--help` order (v5.0): the hosted/vendored workflow (`scan` → `vex` → `vendor`, with `list` to inspect), then the agent-mode (in-place patching) commands.
+
+**Removed in v5.0:** the `setup` subcommand (see [Agent mode in CI](#agent-mode-in-ci-v50-setup-removed)).
 
 **Removed in v4.0:** the `unlock` subcommand (a leftover lock from a crashed run never blocks acquisition — the OS releases a dead holder's advisory lock — so there is no stale-lock state to inspect or clear before a mutating command; `repair` briefly owned lock-file cleanup in v4.x, and since v5.0 every lock-taking command removes its own lock file on exit).
 
@@ -93,7 +94,6 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `rollback` | optional variadic positional `targets` (PURL \| UUID \| path glob); `--one-off`; `--preserve-state` (v5.0) | `SOCKET_ONE_OFF`, `SOCKET_PRESERVE_STATE` | Rollback scope. Multiple targets union. A token becomes a path glob ONLY when it is path-SHAPED — contains a separator (`/` or `\`) or a glob metacharacter (`*?[`), or starts with `./`, or is absolute; a `pkg:` prefix is a PURL and every other bare word keeps identifier (PURL/UUID) semantics, so a mistyped identifier or truncated UUID stays a safe exit-1 "No patch found matching identifier: X" (with a hint suggesting `./X` or `X/**` for directory targeting) instead of silently becoming a path scope. An unparseable glob is a usage error (exit 2) |
 | `vex` | `--output` / `-O`, `--product`, `--no-verify`, `--doc-id`, `--compact` | `SOCKET_VEX_OUTPUT`, `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | OpenVEX 0.2.0 document generation; see "vex output channels" below |
 | `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`; combining them is a usage error, exit 2) |
-| `setup` | `--check`, `--remove` (mutually exclusive); `--exclude` (CSV member paths); honors global `--ecosystems` | `SOCKET_SETUP_EXCLUDE`, `SOCKET_ECOSYSTEMS` | Wire / verify / revert the automatic-patching install hooks. `--exclude` skips + persists workspace members (property 9). See [Setup command contract](#setup-command-contract) |
 
 **pnpm hosted-mode contract**: `scan --mode hosted` handles block and flow resolutions in legacy `shrinkwrap.yaml` and lockfileVersion 5.x, 6.0, and 9.0. The [pinned compatibility matrix](../../docs/testing/pnpm-compatibility.md) samples pnpm majors 1–12. Early shrinkwrapVersion 3 without a positive minor version is refused with `redirect_pnpm_legacy_lockfile_unsupported`: pnpm 1.0.0 discards hosted URLs even on frozen installs. Upgrade to a tested release (1.43.1 or newer) and regenerate the lock, or use agent mode.
 
@@ -186,7 +186,7 @@ Contract details:
 * **Fail-the-command**: if `--vex` was requested but generation fails (product PURL undetectable, nothing to attest in the manifest / ledgers / lockfiles, all patches omitted, a corrupt ledger, unwritable path), the command exits non-zero **even when the apply/scan itself succeeded**. In `--json` mode the failure surfaces in the envelope's `error` (`apply`) / top-level `error` (`scan`), with a stable code (`product_undetected`, `no_applicable_patches`, `write_failed`, …).
 * **Built from the post-run state** — the manifest, both `.socket/vendor` ledgers and the project's lockfile references (see "Manifest-less VEX" below) — and verified against on-disk state (unless `--vex-no-verify`; the wiring gates apply either way). Generated for real applies and read-only `scan` alike; `--dry-run` skips generation on every host command (nothing was changed, and a preview must not write an attestation — `scan --json` marks it `vex: {skipped: true, reason: "dry_run"}`).
 * **JSON success surface**: `apply` adds a top-level `vex` object to its envelope; `scan` adds a top-level `vex` key to its result. Both carry `{ path, statements, format: "openvex-0.2.0" }`.
-* `apply`'s no-manifest early exit (the `noManifest` success no-op; v5.0: its human line is `No patch manifest found; nothing to apply.` — it names the missing `.socket/manifest.json`, not the folder, since `.socket/` may legitimately hold setup files or vendored state) and `vendor`'s (`No manifest found, nothing to vendor.`) still generate the document from the lockfiles and `.socket/vendor` ledgers (manifest-less VEX: hosted / vendored checkouts carry no manifest). Nothing referenced anywhere keeps the calm exit 0 (a stale document at the path is removed; `--json` carries any discovery diagnostics in `warnings[]`); any other VEX failure fails the command with exit 1 — including a run whose only candidates are omitted `record_unavailable` (an `--offline` run over a lockfile-wired checkout with no local records), so an ambient `SOCKET_VEX` there fails the install. `--dry-run` skips generation on both, and so does `apply --check` — it stays read-only and offline-safe, leaving the output path untouched. `scan` has no such early exit: with no manifest and nothing wired anywhere its `--vex` fails with `manifest_not_found`.
+* `apply`'s no-manifest early exit (the `noManifest` success no-op; v5.0: its human line is `No patch manifest found; nothing to apply.` — it names the missing `.socket/manifest.json`, not the folder, since `.socket/` may legitimately hold vendored state) and `vendor`'s (`No manifest found, nothing to vendor.`) still generate the document from the lockfiles and `.socket/vendor` ledgers (manifest-less VEX: hosted / vendored checkouts carry no manifest). Nothing referenced anywhere keeps the calm exit 0 (a stale document at the path is removed; `--json` carries any discovery diagnostics in `warnings[]`); any other VEX failure fails the command with exit 1 — including a run whose only candidates are omitted `record_unavailable` (an `--offline` run over a lockfile-wired checkout with no local records), so an ambient `SOCKET_VEX` there fails the install. `--dry-run` skips generation on both, and so does `apply --check` — it stays read-only and offline-safe, leaving the output path untouched. `scan` has no such early exit: with no manifest and nothing wired anywhere its `--vex` fails with `manifest_not_found`.
 * **Stale-doc removal (v3.5)**: a run that ends in a VEX error removes a recognizably-OpenVEX file (JSON whose `@context` names openvex.dev) already sitting at the output path — a pipeline reusing one path can never ship yesterday's attestation for a now-unpatched tree. Unrelated files at the path are never touched; a mid-write partial that no longer parses as JSON is left for downstream parsers to reject loudly.
 * **Additive warnings (v3.5)**: `product_not_iri` (the `--product`/`--vex-product` override is neither a `pkg:` purl nor an absolute IRI; honored verbatim, warned) and `vendored_tree_out_of_sync` (a healthy vendored attestation stands on the committed artifact + lock wiring while the PRESENT installed tree hash-mismatches the patched bytes — run the package manager's install; the attestation itself is unchanged). Both ride stderr in human mode and `warnings[]` in the standalone `vex --json` envelope. Same channel for `product_multiple_manifests` (auto-detect found several project manifests and names the one it used), `vex_stale_doc_removed` (the stale-doc removal above happened), the manifest-less plan's advisories — `vex_wiring_conflict` (the lockfiles wire a package to different patches: which files, which uuids, how to fix it), `vex_record_superseded` (a recorded patch replaced by the lockfile-wired one), `vex_claim_unwired` (a ledger claim whose patch the lockfiles still mention, but not as wiring), `vex_record_offline` / `vex_record_not_found` / `vex_record_fetch_failed` (why a lockfile-wired patch has no record — the detail behind a `record_unavailable` skip) and `api_auth_fallback` (the authenticated API refused the credentials and the public proxy served free patches only; `get` / `scan`'s warning text) — and, standalone only, `org_looks_like_path` (`-o`/`--org` given a file-shaped value — `-O` is `--output`). The standalone error envelope carries `warnings[]` too. An embedded `--vex` that fails also folds each omitted patch into the host command's `warnings[]` as `vex_omitted` (`<purl>: <why> (<errorCode>)` — standalone `vex` lists them as `skipped` events), and `--silent` lists them as `omitted: <purl> (<errorCode>)` lines under the error. A corrupt `.socket/vendor/state.json` or `redirect-state.json` is no longer degraded with a warning: every form of vex fails with `vendor_ledger_corrupt` / `redirect_ledger_corrupt` (see the error-code table).
 
@@ -242,7 +242,7 @@ Recognition rules that hold for every ecosystem:
 
 **Record resolution.** A candidate's record must carry the patch uuid the lockfile actually **wires**. It is taken from the first source that has one: the manifest (matched qualifier-insensitively), the redirect ledger's `records`, then the vendor ledger's embedded records. If none has it and the run is online, `vex` fetches the patch view by uuid from the patch API. The fetch uses `get`'s API client: the public proxy when no token is configured, and a one-shot 401/403 fallback to the proxy (free patches only). At most 10 fetches run concurrently. Fetched records stay in memory: `vex` never writes the manifest. A candidate still has no record under `--offline`, after a transport error or a 404, or when the patch is refused (paid without an entitled token); it is then omitted as `record_unavailable`, and the run is not aborted. A record whose uuid or package disagrees with the wiring is omitted as `record_mismatch`. The informational `socket-patch.vendor.json` marker is never a record source. When the lockfile wires a package to patch U, a manifest or ledger record for that package under another uuid is superseded, and a human-mode `Note:` says so.
 
-**Verification basis.** `(vendored)` and `(redirected)` patches bypass the Property 7 ecosystem filter, because their wiring is the persistence. With no manifest there is no `setup.manual`, and none is needed.
+**Verification basis.**
 
 | Wiring | Evidence (verify mode) | Marker |
 |---|---|---|
@@ -272,136 +272,37 @@ Human mode also prints `Note:` lines: superseded records, fetch failures, `--off
 
 **Output.** A manifest-less run honors every `vex` output convention: `--output -` (or `-O -`) prints the document to stdout; `--dry-run` still discovers, fetches records and verifies, but writes nothing and leaves a previous document at the path alone (`[dry-run] Would write …`, `dryRun: true`); an embedded `--vex` under `--dry-run` skips generation with the shared `Skipping VEX generation (--dry-run: nothing was …).` line.
 
-## Setup command contract
+## Agent mode in CI (v5.0: `setup` removed)
 
-`setup` wires a repository for **automatic patching**: after the ecosystem's own install/build step
-runs, locally-installed dependencies are re-patched to match the Socket manifest (`.socket/manifest.json`)
-with no further human action. It does this by installing an ecosystem-native hook (see the support
-matrix below). `setup --check` verifies that state; `setup --remove` reverts it.
+**Removed in v5.0 (MAJOR):** the `setup` subcommand and every install hook it wired (npm
+`postinstall`/`dependencies` scripts, the `socket-patch[hook]` Python `.pth` wheel, the Bundler
+plugin under `.socket/bundler-plugin/`, the Composer script hook). `socket-patch setup` is now an
+unknown subcommand (clap usage error, exit `2`). Hooks a previous release committed keep calling
+`socket-patch apply`, which still exists, so they keep working until you delete them; remove them by
+hand (the `postinstall`/`dependencies` entries, the `socket-patch[hook]` dependency, the managed
+`plugin "socket-patch"` Gemfile block + `.socket/bundler-plugin/`, the composer
+`post-install-cmd`/`post-update-cmd` entries). The `socket-patch-hook` wheel and the
+`socket-patch-bundler` gem are no longer published.
 
-The properties below are the public contract. Each is backed by a test under
-`crates/socket-patch-cli/tests/setup_*.rs` (`setup_contract_gaps.rs` holds the guards for the
-properties that shipped after the contract was written; a failure there is a regression). Changing
-any property below is governed by the [semver policy](#semver-policy).
+Prefer hosted or vendored mode: their lockfile (and `.socket/vendor/`) edits are the persistence, so
+no install step exists. Agent mode (`scan --mode agent`, `get`, `apply`) patches the installed tree
+in place, which the next package-manager install reverts; wire it into CI yourself:
 
-1. **Idempotent.** Re-running `setup` on an already-configured repo changes nothing: status
-   `already_configured`, `updated: 0`, every manifest byte-identical. *(Implemented.)*
+```sh
+socket-patch scan --mode agent     # once, locally: record patches in .socket/manifest.json (commit it)
+# in CI, after every dependency install:
+socket-patch apply                 # re-apply the committed manifest
+```
 
-2. **Ecosystem-scoped.** `setup`, `setup --check`, and `setup --remove` honor the global
-   `--ecosystems` filter and act on only the named ecosystems; with no filter they act on every
-   detected ecosystem. *(Implemented — `eco_in_scope` gates the npm, Python, Bundler and Composer
-   legs on `--ecosystems`.)*
+`vex` attests an agent-mode patch whenever verification finds it applied (v5.0: the old "Property 7"
+filter, which dropped patches for ecosystems with no configured install hook unless declared in
+`setup.manual`, is gone together with `setup`; the `ecosystem_not_setup` omission code is retired). A
+manifest's legacy `setup` object (`manual`, `exclude`) still parses and round-trips but is ignored.
 
-3. **Consistency after install.** Once an ecosystem is set up, its locally-installed dependencies are
-   re-patched to match the manifest after **any** of: a dependency added, updated, or removed; **or** a
-   new patch added to the manifest. The re-patch is carried by the ecosystem's install hook (npm
-   `postinstall`/`dependencies`, the Python `.pth` startup hook, the gem Bundler plugin, the Composer
-   `post-install-cmd`/`post-update-cmd` scripts) which runs
-   `socket-patch apply` after the ecosystem's installer finishes, so patch state always reconverges with
-   the manifest. *(Implemented for npm/pypi/gem/composer via the support matrix. Cargo and Go have no `setup`
-   hook — see "Cargo and Go: apply-only, no setup" below.)*
+### Cargo and Go in agent mode
 
-4. **`check` proves a correctly-patched state.** `setup --check` reports `configured` only when the
-   in-scope ecosystems are *actually in a correctly patched state* — install hooks present **and**
-   on-disk patch consistency verified (the `apply --check` invariant: every manifest file's hash matches
-   `afterHash`). *(Implemented — `run_check` appends a `patch` entry per installed-but-drifted PURL via
-   `append_patch_consistency_entries`; uninstalled packages and zero-file records are not drift.
-   v5.0: vendored patches are consulted from the vendor ledger's embedded `record`s and verified
-   against the committed artifact — a manifest-less vendored project is checked the same way.)*
-
-5. **In-repo and committable.** `setup` writes only inside the working tree: `package.json`,
-   `pyproject.toml`/`requirements.txt`, `composer.json` (the `post-install-cmd`/`post-update-cmd`
-   hooks), the `Gemfile` + the generated `.socket/bundler-plugin/{plugins.rb,socket-patch.gemspec}`
-   and `.socket/.gitignore` (one line ignoring the machine-local stamp), and `.socket/manifest.json`
-   only when `--exclude` persists an exclusion (property 9). Every artifact is git-committable.
-   `setup --check` writes nothing, and an already-configured `setup` writes nothing unless
-   `--exclude` is passed explicitly. The `--exclude` persistence (v5.0) runs AFTER discovery and
-   the confirm prompt, as a read-modify-write under `<.socket>/apply.lock` (`setup` joins the
-   `--lock-timeout` contenders): a held or unopenable lock, or a manifest that cannot be read or
-   written, is reported as a `not persisting --exclude: <reason> — <hint>` warning — never exit 1 —
-   and a byte-identical exclude list neither locks nor rewrites. `--check` (property 4) reads the
-   vendor ledger even without a manifest; a ledger it cannot read or parse is surfaced as a
-   `Warning: Unreadable vendor state (…)` line (muted by `--silent`) plus a `vendor_ledger` `files[]`
-   entry with `status: error` — verdict `error`, exit 1 — never as a `configured` verdict. It never writes outside
-   `--cwd` — no `$HOME`, no global `site-packages` (the Python `.pth` wheel is installed later by the
-   user's package manager, not by `setup`; the gem patch stamp is written by the plugin at
-   `bundle install` time, not by `setup`, at `.socket/gem-plugin-stamp` — machine-local, hence the
-   `.gitignore` line; the legacy stamp under `Bundler.bundle_path` is deleted by the plugin). These
-   files are **setup-owned residue**: `rollback`/`remove` never undo `setup`, so `.socket/.gitignore`,
-   `.socket/bundler-plugin/` and `gem-plugin-stamp` survive a full reversal (see the residue rule
-   under the rollback contract). *(Implemented — `crates/socket-patch-core/src/setup/gem/mod.rs`.)*
-
-6. **Clone-portable.** Because all setup state is committed files, a fresh checkout on another host —
-   CI, a deploy, a teammate's machine — inherits the setup state unchanged; `setup --check` passes on
-   the clone with no re-run required. *(Implemented; a consequence of properties 5 + 1.)*
-
-7. **Reflected in VEX.** A patch contributes a `not_affected` statement to the repo's OpenVEX document
-   only for ecosystems that are **actually set up** — or explicitly declared **manual** (below) — or
-   **vendored** (a `socket-patch vendor`ed package needs no install hook by construction: the package
-   manager itself installs the patched artifact, so its purls bypass this filter) — or **hosted** (a
-   live lockfile redirect is likewise its own persistence; manifest-less lockfile references are always
-   vendored or hosted, so they never need `setup.manual`). Patches for an
-   ecosystem that is neither set up, declared manual, vendored, nor hosted produce no VEX statement. *(Implemented —
-   `generate_vex` filters `applied` to ecosystems returned by `commands/setup::configured_ecosystems`
-   (on-disk hook presence) ∪ the manifest's `setup.manual`, in addition to the existing `--ecosystems`
-   filter and on-disk verification. Applies in both verify and `--no-verify` modes.)*
-   - **Manual declaration.** Users who run `socket-patch apply` by hand (e.g. in a CI step) declare an
-     ecosystem as `manual` so VEX still attests its patches even though the auto-install hook is
-     intentionally not wired. This is the normal path for **cargo** and **golang** (apply-only, no
-     `setup` hook). Home: the `setup.manual` array (a list of ecosystem `cli_name`s — `pypi`, `cargo`,
-     `golang`, …) in `.socket/manifest.json`. *(Implemented for the read/attest path; a `setup` flag to
-     populate it is a future nicety — today it's hand-authored in the manifest.)*
-
-8. **Graceful, exact remove.** `setup --remove` (optionally per-ecosystem via `--ecosystems`) restores
-   the repo to its exact pre-setup state: manifests byte-for-byte, sibling scripts/dependencies
-   preserved, keys that became empty dropped. Afterward `setup --check` reports needs-configuration
-   again. For gem projects it also removes the plugin dir, the stamp and its `.gitignore` line, and
-   (v5.0) prunes an emptied `.socket/` (non-recursive `remove_dir` — a `.socket/` still holding a
-   manifest, blobs, vendored state or a user-authored `.gitignore` is kept), so a project that never
-   ran `apply` is back to its pre-setup tree. *(Implemented for the manifest edits — npm
-   `package.json` and Python deps round-trip byte-for-byte. `package.json` is re-serialized in its
-   own layout — BOM, indent, line ending and trailing-newline shape (v5.0) — so a Windows manifest
-   (yarn berry pretty-prints it with CRLF) keeps CRLF through `setup` and `setup --remove`.)*
-
-9. **Nested workspaces, with exclude.** Setup applies to every subproject below the repo root: npm /
-   yarn / pnpm / bun workspace members are all discovered and configured (pnpm is root-package-only by
-   design, because workspace-member `postinstall` scripts fail under pnpm's strict module isolation).
-   Selected paths may be **excluded**, and the exclusion is **persisted in `.socket/manifest.json`** so
-   `check`, `apply`, and any clone all honor it. *(Implemented — nested-workspace discovery plus the
-   `--exclude` flag, persisted as the `setup.exclude` array in `.socket/manifest.json` and honored by
-   discovery + `check` (a fresh clone inherits it without re-passing the flag). Excludes apply to npm
-   workspace members; the repo root is never excludable.)*
-   - **Nested workspaces (implemented).** A workspace member that is itself a workspace root is recursed
-     into and has its own members configured. `collect_workspace_members`
-     (`socket-patch-core/src/package_json/find.rs`) re-reads each discovered member's own
-     `workspaces` field (bounded depth). Guarded by the nested-workspace pins in
-     `tests/setup_invariants.rs`.
-
-### Per-ecosystem setup support
-
-`setup` installs an automatic-repatch hook for the four ecosystems with a usable post-install /
-startup hook (npm, pypi, gem, composer — every ecosystem is built in unconditionally; there are no
-ecosystem feature gates). The remaining ecosystems are **apply-only**: `socket-patch apply` patches them on demand, but
-there is no hook for `setup` to install, so `setup` is a `no_files` no-op for them. These are exactly
-the ecosystems for which property 7's **manual** declaration is intended (so their hand-applied patches
-still show up in VEX).
-
-| Ecosystem | Hook `setup` installs | Repatch trigger | Notes |
-|---|---|---|---|
-| npm / yarn / pnpm / bun / vlt | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`); vlt: every install that changes the graph (`vlt install`, `install <pkg>`, `vlt ci`), never a no-op install | pnpm and vlt: root package only. vlt gets npm's `npx` hook (never `vlx`) and is detected by `vlt-lock.json`, `vlt.json`, `node_modules/.vlt-lock.json` or a `node_modules/.vlt/` directory in `--cwd` (before the pnpm markers; an ancestor `vlt.json` is ignored). vlt < 1.0.0-rc.13 never runs a root `postinstall`: `setup` still wires it and warns `vlt_root_scripts_not_run`. A failing hook aborts and rolls back the whole `vlt install`, so `apply --silent` exits 0 when there is nothing to do (no manifest); a manifest whose only patch targets a package that is not installed exits 1 and aborts the install, as it fails `npm install` |
-| pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
-| gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | the plugin is `path:`-sourced (a `git:` dir source is uncloneable — the generated dir is not a git repo — and fails `bundle install`); the dir must be committed so clones/CI have it; CLI must be on `PATH`. Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
-| composer | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH` |
-| cargo · golang | **none** (apply-only) | — | see "Cargo and Go: apply-only, no setup" below; candidates for the **manual** declaration |
-| nuget · maven · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
-
-#### Cargo and Go: apply-only, no setup
-
-Cargo and Go have **no `setup` hook** — a one-click, auto-repatch-on-build setup isn't possible for
-them, so `setup` skips both (it makes no manifest edits for either as a *setup* action; the `go.mod`
-`replace` that local-mode `apply` writes is an *apply*-time redirect, not setup state). Patch them
-with `socket-patch apply` directly (manually or from a per-project install script), and declare them
-in `setup.manual` for VEX attestation.
+Hosted and vendored mode need no per-install step for any ecosystem. In agent mode, cargo and Go
+are patched by `socket-patch apply` like every other ecosystem:
 
 - **cargo** — `apply` patches the crate **in place** wherever the crawler finds it: the project
   `vendor/` directory or the shared registry cache (`$CARGO_HOME/registry/src/...`). The
@@ -412,26 +313,25 @@ in `setup.manual` for VEX attestation.
 - **golang** — `apply` writes a project-local **patched copy** under `.socket/go-patches/<module>@<ver>/`
   and a `go.mod` `replace` directive pointing at it; `go build` links the copy (the module cache is
   `go.sum`-verified, so in-place patching can't build). Commit `go.mod` + `.socket/go-patches/` + your
-  `.socket/` patches so a clone builds the patched bytes with no further setup. `socket-patch apply
+  `.socket/` patches so a clone builds the patched bytes with no further step. `socket-patch apply
   --check` is a read-only audit of the committed redirect.
 
 ### Monorepo / multi-project discovery model
 
-How `setup` (and the underlying `scan`/`apply` crawlers) find subprojects differs by ecosystem, and
+How the `scan`/`apply` crawlers find subprojects differs by ecosystem, and
 the model is **not uniform** today:
 
 - **Workspace-aware (walk members):** npm / yarn / pnpm / bun / vlt (`workspaces` / `pnpm-workspace.yaml` /
   vlt.json `workspaces` — a glob, a list, or named groups of either — or vlt <= 0.0.0-12's
   `vlt-workspaces.json`; vlt's declaration wins over the others and vlt never reads package.json
-  `workspaces`). One repo-root invocation discovers and configures every member (pnpm and vlt: the
-  root package only — vlt runs the root hook once per install, even one started from a member; `setup --remove` also clears a vlt member that still carries a hook, as releases before vlt workspace support wired every member). A member that is itself a workspace root is recursed into
-  (bounded depth; see property 9).
+  `workspaces`). One repo-root invocation discovers every member. A member that is itself a
+  workspace root is recursed into (bounded depth).
 - **cwd-only (single project):** gem, pypi, composer. The crawler inspects only the project
   rooted at `--cwd` (pypi looks at `$VIRTUAL_ENV`, `<cwd>/.venv` / `venv`, then a Poetry project's out-of-tree virtualenv(s) under Poetry's `virtualenvs.path`; composer at the vendor tree); it does **not**
   descend into sibling subprojects. A monorepo with several independent lockfiles in subdirectories
   (`backend/Gemfile.lock` + `frontend/Gemfile.lock`, multiple `.venv`, multiple `go.mod` /
   `composer.json`) is handled by invoking the tool **once per subproject** (`--cwd` each), as a
-  per-directory install hook would.
+  per-directory CI step would.
 
   *Gem install roots (a refinement of "cwd-only", not an exception to the one-project model):* the
   crawler probes the project's Bundler install roots in **bundler's own precedence order** — the app
@@ -452,7 +352,7 @@ the model is **not uniform** today:
   **coexisting physical copies of one `gem@version`** (bundler-2's scoped store beside bundler-1's
   flat store), `apply`/`rollback` patch/restore **every copy** — one summary event per copy,
   mirroring npm's multi-copy fan-out — while single-representative consumers (`get`, `vendor`,
-  `setup`, `vex`) use the highest-precedence copy.
+  `vex`) use the highest-precedence copy.
 
   *Copy classes (additive to the multi-copy vocabulary):* a copy under a **bundle-path store**
   (config/env/default root) is PRIMARY — a variant mismatch or write failure there fails the run,
@@ -481,75 +381,6 @@ is patched identically to a direct one. Both halves are pinned in
 `find_by_purls_resolves_nested_only_install` (`find_by_purls` probes the tree root first, then falls
 back breadth-first into nested `node_modules` for still-unresolved PURLs; a root-level install always
 wins, pinned by `find_by_purls_prefers_root_copy_over_nested_duplicate`).
-
-### JSON output shapes (`setup`, `setup --check`, `setup --remove`)
-
-`setup` predates the v3.0 unified envelope and emits its own three shapes. They are stable as of v3.0;
-consumers may rely on these keys. All three share a `files[*]` entry shape; `kind` is one of
-`package_json`, `pth`, `gemfile`, `gem_plugin`, `composer`, `patch` (`--check` property 4: a manifest
-or ledger patch not applied on disk, `needs_configuration`), `vendor_ledger` (`--check`: a
-`.socket/vendor/state.json` that cannot be read or parsed, `error`), `gem_plugin_registration` (the last is
-`setup --remove`-only: clearing bundler's machine-local `.bundle/plugin` registration of the wired
-plugin — emitted only when a registration existed; `status: error` carries the
-`bundler plugin uninstall socket-patch` remedy when it could not be cleared safely).
-
-**`setup`:**
-
-```jsonc
-{
-  "status": "success" | "already_configured" | "dry_run" | "partial_failure" | "error" | "no_files",
-  "updated":            0,
-  "alreadyConfigured":  0,
-  "errors":             0,
-  "packageManager":      "npm" | "pnpm" | "vlt",         // always emitted; defaults to "npm", only meaningful when npm files were found ("vlt" is additive)
-  "pythonPackageManager":"pip" | "uv" | "poetry" | "pdm" | "hatch",  // present only when Python detected
-  "dryRun":   true,                                      // only on status=dry_run
-  "wouldUpdate": 0,                                      // only on status=dry_run
-  "warnings": [ "..." ],                                 // only when non-empty (e.g. lockfile refresh; "vlt_root_scripts_not_run: <detail>")
-  "files": [
-    { "kind": "package_json", "path": "...", "status": "updated" | "already_configured" | "error",
-      "error": null | "..." }
-  ]
-}
-```
-
-**`setup --check`** (read-only; never writes — exit `0` only when all in-scope manifests are configured
-and none errored):
-
-```jsonc
-{
-  "status": "configured" | "needs_configuration" | "error" | "no_files",
-  "configured":          0,
-  "needsConfiguration":  0,
-  "errors":              0,
-  "files": [
-    { "kind": "...", "path": "...", "status": "configured" | "needs_configuration" | "error",
-      "error": null | "..." }
-  ]
-}
-```
-
-**`setup --remove`:**
-
-```jsonc
-{
-  "status": "success" | "not_configured" | "dry_run" | "partial_failure" | "error" | "no_files",
-  "removed":        0,
-  "notConfigured":  0,
-  "errors":         0,
-  "dryRun":   true,            // only on status=dry_run
-  "wouldRemove": 0,            // only on status=dry_run
-  "warnings": [ "..." ],       // only when non-empty
-  "files": [
-    { "kind": "...", "path": "...", "status": "removed" | "not_configured" | "error",
-      "error": null | "..." }
-  ]
-}
-```
-
-**Exit codes** (all three): `0` when nothing errored and the operation was satisfiable (including
-`no_files` and `not_configured`); `1` on any per-file error, partial failure, or — for `--check` — any
-manifest that needs configuration. `setup --check --remove` is a clap usage error (exit `2`).
 
 ## Vendor command contract
 
@@ -783,8 +614,8 @@ worse, lets a warm cache silently serve unpatched bytes):
   same committed-file trust class as the manifest; artifact verification still re-hashes against
   its afterHashes and the uuid-in-path cross-checks); standalone `vendor` fed by an agent-mode
   manifest embeds `record` too, as a fallback copy, but never `detached` — the manifest record stays
-  authoritative while the manifest covers the entry (ledger key or base purl); `vex`, `list` and
-  `setup --check` read the fallback copy only when it does not, `repair` only with no manifest at all.
+  authoritative while the manifest covers the entry (ledger key or base purl); `vex` and `list`
+  read the fallback copy only when it does not, `repair` only with no manifest at all.
 * **Re-vendor carries originals forward**: re-vendoring under a newer patch uuid rewrites the
   previous run's own wiring (`original: None` from the backend — it must never record a dangling
   `.socket/vendor/` pointer as pre-vendor state); the engine merges the TRUE pre-vendor originals
@@ -1058,7 +889,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_VERBOSE` | `--verbose` / `-v` | `false` | — |
 | `SOCKET_SILENT` | `--silent` / `-s` | `false` | — |
 | `SOCKET_DRY_RUN` | `--dry-run` | `false` | — |
-| `SOCKET_YES` | `--yes` / `-y` | `false` | Skips the prompts of `get`, `rollback`, `remove`, `setup` and `--update`; `scan` never prompts, so it has no effect there. |
+| `SOCKET_YES` | `--yes` / `-y` | `false` | Skips the prompts of `get`, `rollback`, `remove` and `--update`; `scan` never prompts, so it has no effect there. |
 | `SOCKET_LOCK_TIMEOUT` | `--lock-timeout` | (none) | Seconds to wait for `apply.lock` on the lock-taking subcommands (incl. hosted/vendored `scan`/`get`); unset/`0` = single non-blocking try. |
 | `SOCKET_DEBUG` | `--debug` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_DEBUG`). |
 | `SOCKET_TELEMETRY_DISABLED` | `--no-telemetry` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_TELEMETRY_DISABLED`). |
@@ -1076,7 +907,6 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_PRESERVE_STATE` | `rollback --preserve-state` / `remove --preserve-state` | `false` | (v5.0) Shared by `rollback`/`remove` (boolish, empty-tolerant parse like the other bool flags): restore the system but keep the local patch state — manifest entries, vendored artifacts + ledger entries — and skip all GC. On `remove`, combining it with `--skip-rollback` is a usage error (exit 2) **whether either side is flag- or env-sourced** (`SOCKET_PRESERVE_STATE=true remove --skip-rollback` exits 2 too). |
 | `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
 | `SOCKET_VENDOR_REVERT` | `vendor --revert` | `false` | Local to `vendor`. |
-| `SOCKET_SETUP_EXCLUDE` | `setup --exclude` | (none) | Local to `setup`; comma-separated workspace-member paths, persisted to `setup.exclude`. |
 | `SOCKET_VEX` | `apply --vex` / `scan --vex` / `vendor --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on the host commands they bind to `--vex-product` etc. |
 | `SOCKET_VEX_OUTPUT` | `vex --output` / `-O` | (none) | Local to the standalone `vex`: document output path (required with `--json`). |
 
@@ -1161,7 +991,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 ```jsonc
 {
-  "command":  "scan" | "apply" | "vex" | "vendor" | "setup" | "rollback" | "get" | "list" | "remove" | "repair",
+  "command":  "scan" | "apply" | "vex" | "vendor" | "rollback" | "get" | "list" | "remove" | "repair",
   "status":   "success" | "partialFailure" | "error" | "noManifest" | "paidRequired" | "notFound",
   "dryRun":   false,
   "events":   [ <PatchEvent>, ... ],
@@ -1260,7 +1090,6 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |
 | `revert_failed`           | `failed`         | vendor --revert: a recorded entry could not be reverted. |
 | `vendor_wiring_unknown_revert_blocked` | `skipped` (beside the `failed`/`revert_failed` event) | vendor --revert: the ledger entry was reconstructed by `repair` without wiring records and the live lockfile still resolves through the artifact — the revert refuses (fail-closed) instead of deleting a tarball the lock points at. Recovery: `socket-patch repair`, then restore the pre-vendor lock (or re-lock without the override) and re-run the revert. repair: an npm ledger entry whose `flavor` this release does not know (written by a newer socket-patch) is skipped, never health-checked or rebuilt, and the artifact, wiring and ledger stay as found (a lone `skipped` event; the run's exit is unaffected). Recovery: upgrade socket-patch. |
-| `ecosystem_not_setup`     | `skipped`        | vex: the patch is applied and byte-verified but its ecosystem has no install hook configured and is not declared in the manifest's `setup.manual`, so it is omitted from the document (Property 7). |
 | `stale_install`           | `skipped`        | vex (in-run `scan --mode hosted --vex`): a hosted stale-install probe found positively unpatched installed bytes, so the purl is omitted even under `--vex-no-verify` (see the gem / Python stale-install guards). |
 | `record_unavailable`      | `skipped`        | vex (manifest-less): a lockfile-wired patch has no local record (manifest, redirect ledger, vendor ledger) and none could be fetched — `--offline`, transport error, 404, or a refused (paid) patch. Omitted, never attested from the `socket-patch.vendor.json` marker. |
 | `record_mismatch`         | `skipped`        | vex (manifest-less): the record found for a wired patch names another package or another patch uuid than the wiring. |
@@ -1342,7 +1171,6 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `redirect_vlt_no_lockfile` | `redirect.warnings[]` (warning) | scan/get `--mode hosted` (vlt): `vlt.json` or vlt's install state is present without `vlt-lock.json`; replaces `redirect_npm_no_lockfile` for vlt projects. |
 | `redirect_vlt_artifact_unverifiable` | `redirect.warnings[]` (warning), `redirect.skipped[].reason` | scan/get `--mode hosted` (vlt): before any takeover or rewrite (dry runs included), each granted artifact with a default-registry instance in `vlt-lock.json` (or, for a purl a `flavor: "vlt"` vendored entry claims, its vendored node, probed before the takeover reverts it) is fetched once as vlt fetches it (`accept-encoding: gzip;q=1.0, identity;q=0.5`, no `Authorization`, up to 10 redirects) and must return 200 with no content encoding (or `identity`) and the granted sha512. On failure (`content-encoding <v>`, `sha512 mismatch`, `http <status>`, `fetch error <e>`, `offline`) the dep is withheld from every rewriter when vlt drives or it is vlt-vendored (which also keeps it vendored), and from the vlt rewrite only otherwise (detail "…; vlt-lock.json was not changed for {purl}"; only the sibling lock this run rewrote can confirm it). A lock already pinned by an earlier run is left pinned, and neither confirmed nor attested. Projects without `vlt-lock.json` make no such request. The detail quotes the artifact URL (and any fetch error that echoes it) with its grant-token path level, the one just before the patch uuid, spelled `<redacted>`; host, uuid and leaf stay. The in-memory hosted engine (`hosted-bundle`, the Node addon) has no network for this fetch, so it judges every in-scope artifact as `--offline` does (withheld, never pinned; the vendored takeover it refuses anyway). Exit 0. |
 | `redirect_vlt_reinstall_required` | `redirect.warnings[]` (advisory); rollback/remove `warnings[]` (+ human stderr) | vlt: `vlt-lock.json` pins (or, after rollback/remove, no longer pins) Socket-patched packages, and vlt never refreshes an installed copy. The heal removes `node_modules/.vlt-lock.json` and each stale `node_modules/.vlt/<DepID>` of a Socket-owned node (never a link's target, never outside the project, never a copy it cannot judge) unless `--no-vlt-install-cleanup` or `--dry-run`. It never removes an optional node's copy (lock flags 1 or 3, or flags it cannot read): `vlt install` does not put a removed optional dependency back (its link dangles) unless the same install also reinstalls a non-optional node, so such a copy is left stale and the detail says to run `vlt ci` (or delete `node_modules` and run `vlt install`); vlt 0.0.0-30 … 1.0.4 install no optional dependency from the lock of a project that declares only optional dependencies, so there both commands remove the installed copy and the detail says to upgrade vlt to 1.0.5 or later first. The detail says whether copies were removed, left stale by a skipped cleanup, could not be checked, or none were stale, and adds how many optional copies were kept whenever there are any. The kept optional copies are named by what they are: `unpatched copies of optional dependencies` after `scan`/`get`, `patched copies of optional dependencies` after `rollback`/`remove`, and `installed copies of the vendored optional dependencies` after a hosted → vendored takeover (the copy the hosted pin left installed, which may still be the registry bytes). Stale or unchecked copies are not attested by the run's `--vex`, nor is a confirmed vlt pin the heal did not check (a URL on a host other than patch.socket.dev and the configured `--patch-server-url`/`--api-url`). A hidden lock that cannot be removed keeps every store entry. Invalidation failures only warn. |
-| `vlt_root_scripts_not_run` | setup `warnings[]` entry `vlt_root_scripts_not_run: <detail>` (advisory; human: `Warning (vlt_root_scripts_not_run): <detail>` on stderr, muted by `--silent`) | setup (vlt project, npm in scope, every non-`no_files` run incl. `--dry-run` and already-configured): vlt before 1.0.0-rc.13 never runs a root `postinstall`, so the wired hook would not fire. Definite when the `vlt` on `PATH` (absolute entries only; spawned with `VLT_TELEMETRY=0`, 5 s budget) reports a semver below 1.0.0-rc.13 (the detail ends in "(`vlt --version` reports <v>)"); an unparseable `--version` never warns. Otherwise it is a "may" when `vlt-lock.json` has `lockfileVersion` `0` or none, a lock the reported `vlt` would not write: always without a usable `vlt` (absent, non-zero exit, timeout); with one at or above 1.0.0-rc.13, for a lock with no `lockfileVersion`, and for a `0` lock when it reports 1.0.0-rc.15 or later (which refuses a v0 lock, so another vlt installs the project). Remedy: upgrade vlt or run `socket-patch apply` after `vlt ci`. The hook is still written. |
 | `vendor_prebuilt_stub_invalid` | `failed` / `skipped` (warning) | vendor (gem, `--vendor-source`): the served stub gemspec fails the rubygems `summary`/`authors` bar, so bundler would refuse the vendored path source at install time. `service`: refusal naming the missing attributes; `auto`: loud warning + local-build fallback — or, when the gem is also not installed locally (no stub to derive), a refusal naming the served defect and the install-the-gem remedy. |
 | `gem_spec_invalid` | `failed` | vendor (gem): the LOCAL `specifications/` stub gemspec fails the same rubygems `summary`/`authors` bar (a corrupted or hand-edited gem home); the refusal names the file — reinstall the gem (`gem pristine <name>` / fresh `bundle install`). |
 | `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
@@ -1387,7 +1215,6 @@ The remaining commands still emit their pre-v3.0 ad-hoc JSON shapes and will mig
 - ⏳ `scan` — still emits the discovery + `apply.patches[*]` + `gc.*` shape documented in earlier drafts of this file.
 - ⏳ `get` — still emits per-patch action arrays.
 - ⏳ `rollback` — still emits per-package result records. Additive (v3.5): a manifest entry with no matching installed package appears in `results[]` as a marker record `{ "purl", "path": null, "skipped": "package_not_installed" }` — no `success`/`error` keys, never counted in `rolledBack`/`failed`, never flips the status or exit code (rollback's job is "make the tree unpatched"; a not-installed package already satisfies that end state, deliberately asymmetric with apply's exit-1-on-unmatched). v5.0 keeps that legacy shape and adds the ALWAYS-PRESENT keys `warnings[]` (`{code, detail}` objects, now populated), `vendored` (meaning narrowed — MAJOR), `vendoredReverted`, `vendoredPreserved`, `vendoredKept` (`{purl, reason}`), `hosted` (`{reverted, failed: [{purl, error}], unsupported, editedFiles}`), `manifest` (`{removedEntries, preserved}`), `gc` (`{skipped: true}` \| `{removedBlobs, removedDiffArchives, removedPackageArchives, bytesFreed}`), and `paths` — full key semantics and exit rules in the [Rollback command contract](#rollback-command-contract-v50).
-- ⏳ `setup` — still emits its own `{ status, updated, alreadyConfigured, errors, files }` shape (and the `--check` / `--remove` variants), now documented in full under [Setup command contract](#setup-command-contract).
 
 One command is **intentionally not** plain-envelope and will stay that way (not migration debt):
 
@@ -1596,7 +1423,7 @@ socket-patch apply --json | jq '
 Exit `0` when `status` is `success`, `noManifest`, or `notFound`-with-zero-failed.
 Exit `1` when `status` is `partialFailure` (any `events[*].action == "failed"`) or `error`.
 
-`apply` with no manifest at all is a clean exit-0 no-op (`status: "noManifest"`), and an **empty** manifest (zero patches) is a plain `success` exit 0 — this is load-bearing for the install hooks, which run `apply` on every install. A fully rolled-back agent project therefore keeps `.socket/manifest.json` at `{"patches": {}}` (+ its `setup` block): the v5.0 residue rule never deletes a zero-patch manifest, precisely so these hook exits (and `list`'s 0-vs-1 below) never flip. Pinned by `tests/in_process_edge_cases.rs` and `tests/cli_dry_run_paths_e2e.rs`. **One carve-out**: a yarn-berry Plug'n'Play layout (`.pnp.*` loader at `--cwd`) refuses with the loud `yarn_pnp_unsupported` error (exit 1) even when no manifest exists — `scan` cannot discover PnP packages (they live inside `.yarn/cache/*.zip`, no `node_modules/`) and therefore never writes a manifest, so without the carve-out the documented refusal was unreachable and a PnP project's only signal was the calm noManifest exit. Pinned by `tests/e2e_safety_yarn_pnp.rs`.
+`apply` with no manifest at all is a clean exit-0 no-op (`status: "noManifest"`), and an **empty** manifest (zero patches) is a plain `success` exit 0 — this is load-bearing for CI steps that run `apply` after every install. A fully rolled-back agent project therefore keeps `.socket/manifest.json` at `{"patches": {}}`: the v5.0 residue rule never deletes a zero-patch manifest, precisely so these CI exits (and `list`'s 0-vs-1 below) never flip. Pinned by `tests/in_process_edge_cases.rs` and `tests/cli_dry_run_paths_e2e.rs`. **One carve-out**: a yarn-berry Plug'n'Play layout (`.pnp.*` loader at `--cwd`) refuses with the loud `yarn_pnp_unsupported` error (exit 1) even when no manifest exists — `scan` cannot discover PnP packages (they live inside `.yarn/cache/*.zip`, no `node_modules/`) and therefore never writes a manifest, so without the carve-out the documented refusal was unreachable and a PnP project's only signal was the calm noManifest exit. Pinned by `tests/e2e_safety_yarn_pnp.rs`.
 
 ## Exit codes
 
@@ -1604,7 +1431,7 @@ Exit `1` when `status` is `partialFailure` (any `events[*].action == "failed"`) 
 |---|---|
 | `0` | Success |
 | `1` | Error (missing/invalid manifest, fetch failed, apply failed, selection cancelled in non-JSON mode, etc.) |
-| `2` | Usage error: clap parse failures (unknown flag/value, missing required arg — including the clap-enforced `setup --check --remove` conflict) and the conflicts the commands enforce themselves — `scan`'s cross-mode conflicts (`--mode` combined with a DIFFERENT mode's boolean spelling, rejected in `resolve_mode_flags`), `--detached` without vendored mode and `--mode hosted` with `--global`/`--global-prefix` (same enforcement point); in hosted/vendored `scan` (bare `scan` included), a PATH that is not a directory, a PATH glob matching no directory, and `--json` with more than one project directory (`run_project_dirs`); `remove --preserve-state --skip-rollback` (the no-op quadrant; flag- or env-sourced alike), an unparseable path glob on `scan`/`rollback`, `repair --offline --download-only`. `vex` also exits `2` on hard errors before document generation (see its tri-state table below). **Carve-out**: `get`'s self-enforced conflicts have always exited `1` via its error envelope (`--id`/`--cve`/`--ghsa`/`--package` multi-select, `--one-off --save-only`) and the v3.6 `--mode hosted\|vendored --save-only` conflict deliberately follows that get-internal precedent — changing the existing ones to `2` would be a MAJOR exit-code change |
+| `2` | Usage error: clap parse failures (unknown flag/value, missing required arg, an unknown subcommand such as the removed `setup`) and the conflicts the commands enforce themselves — `scan`'s cross-mode conflicts (`--mode` combined with a DIFFERENT mode's boolean spelling, rejected in `resolve_mode_flags`), `--detached` without vendored mode and `--mode hosted` with `--global`/`--global-prefix` (same enforcement point); in hosted/vendored `scan` (bare `scan` included), a PATH that is not a directory, a PATH glob matching no directory, and `--json` with more than one project directory (`run_project_dirs`); `remove --preserve-state --skip-rollback` (the no-op quadrant; flag- or env-sourced alike), an unparseable path glob on `scan`/`rollback`, `repair --offline --download-only`. `vex` also exits `2` on hard errors before document generation (see its tri-state table below). **Carve-out**: `get`'s self-enforced conflicts have always exited `1` via its error envelope (`--id`/`--cve`/`--ghsa`/`--package` multi-select, `--one-off --save-only`) and the v3.6 `--mode hosted\|vendored --save-only` conflict deliberately follows that get-internal precedent — changing the existing ones to `2` would be a MAJOR exit-code change |
 
 `list` returns **`0`** for an empty manifest and **`1`** for a missing manifest — these are distinct and load-bearing (a manifest-less project whose vendor or redirect ledger holds records is NOT "missing": `list` reads all three stores and exits 0 — see the `manifest_not_found` row). Every lock-taking subcommand — including `scan`/`get --mode hosted` as of v5.0 — returns **`1`** with `errorCode: lock_held` when another live socket-patch process holds `<.socket>/apply.lock`.
 
@@ -1613,7 +1440,7 @@ Exit `1` when `status` is `partialFailure` (any `events[*].action == "failed"`) 
 | Code | Meaning |
 |---|---|
 | `0` | A non-empty OpenVEX document was produced |
-| `1` | Nothing attested: `no_applicable_patches` (every candidate was omitted — by verification, a wiring gate, a missing record, or Property 7; the omissions ride `skipped` events) or `no_patches` (an empty manifest file and nothing wired anywhere) |
+| `1` | Nothing attested: `no_applicable_patches` (every candidate was omitted — by verification, a wiring gate, or a missing record; the omissions ride `skipped` events) or `no_patches` (an empty manifest file and nothing wired anywhere) |
 | `2` | Hard error: `manifest_not_found` (no manifest AND no ledger record / lockfile reference anywhere), `manifest_unreadable`, `redirect_ledger_corrupt`, `vendor_ledger_corrupt`, `json_requires_output`, `product_undetected`, `serialize_failed`, `write_failed` |
 
 A missing manifest alone is not an error: a hosted or vendored checkout attests from its lockfiles (see "Manifest-less VEX"). Embedded `--vex` maps every failure to the host command's exit `1`.
@@ -1669,8 +1496,7 @@ This syncs the workspace package version into:
 
 - `npm/socket-patch/package.json` (and its `optionalDependencies`)
 - every per-platform `npm/socket-patch-*/package.json`
-- `pypi/socket-patch/pyproject.toml` and `pypi/socket-patch-hook/pyproject.toml`
-- `gem/socket-patch-bundler/socket-patch-bundler.gemspec` (the Bundler plugin gem)
+- `pypi/socket-patch/pyproject.toml`
 - `gem/socket-patch/socket-patch.gemspec` + its launcher `VERSION` (the RubyGems CLI launcher)
 
 All ecosystem publishing fans out from the single
@@ -1689,6 +1515,6 @@ Every item in this document is locked in by at least one of:
 
 - **clap parser snapshots** in `crates/socket-patch-cli/tests/cli_parse_*.rs` — assert flag names, short forms, defaults, aliases, and CSV delimiters by calling `socket_patch_cli::Cli::try_parse_from(...)`.
 - **Helper unit tests** in `crates/socket-patch-cli/src/**` (`#[cfg(test)] mod tests` blocks) — cover `looks_like_uuid`, `parse_argv_with_shortcuts`, `detect_identifier_type`, `select_patches`, `find_patches_to_rollback`, `partition_purls`, the JSON serializers, and the terminal UI in `src/ui/` (`StatusLine` redraw/clear/`println` byte streams, `confirm_with` answers and non-interactive notes, `select_one`'s JSON/empty guards, `plural`, `truncate`, the `color_enabled` truth table, `paint`/`severity`, and `pad`/`strip_ansi` alignment).
-- **Async `run()` integration tests** in `tests/cli_parse_list.rs`, `tests/cli_parse_remove.rs`, `tests/cli_parse_setup.rs` — exercise the no-network error paths and assert JSON shape via `serde_json::from_str::<Value>` + per-key assertions.
+- **Async `run()` integration tests** in `tests/cli_parse_list.rs`, `tests/cli_parse_remove.rs` — exercise the no-network error paths and assert JSON shape via `serde_json::from_str::<Value>` + per-key assertions.
 
 If you add a new flag/subcommand/JSON key, add a test here that locks the new surface in the same PR.

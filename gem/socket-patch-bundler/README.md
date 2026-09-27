@@ -1,5 +1,10 @@
 # socket-patch-bundler
 
+> **Deprecated — no longer published.** `socket-patch setup` (which wired this
+> plugin) was removed in socket-patch v5, and this gem is no longer built or
+> published. In agent mode, run `socket-patch apply` in CI after
+> `bundle install` instead. The source is kept for reference only.
+
 A [Bundler plugin](https://bundler.io/guides/bundler_plugins.html) that keeps the
 gem patches recorded in your project's `.socket/manifest.json` applied on every
 `bundle install` — cached **and** fresh — by re-running the

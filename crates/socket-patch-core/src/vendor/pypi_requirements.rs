@@ -450,8 +450,8 @@ async fn plan_requirements(
                     "pypi_extras_unsupported",
                     format!(
                         "{}: the {canon_name} pin declares extras, which a vendored wheel path \
-                         line cannot express; remove the extras or use the `socket-patch setup` \
-                         .pth install hook instead",
+                         line cannot express; remove the extras or use agent mode \
+                         (`scan --mode agent` + `socket-patch apply`) instead",
                         file.rel
                     ),
                 ));
@@ -461,7 +461,7 @@ async fn plan_requirements(
                     "pypi_requirement_not_pinned",
                     format!(
                         "{}: {canon_name} is not pinned to =={version}; pin it exactly or use \
-                         the `socket-patch setup` .pth install hook instead",
+                         agent mode (`scan --mode agent` + `socket-patch apply`) instead",
                         file.rel
                     ),
                 ));
@@ -477,8 +477,8 @@ async fn plan_requirements(
                 "pypi_requirements_outside_root",
                 format!(
                     "{}: {canon_name} is pinned in a requirements include outside the project \
-                     root, which vendor cannot edit; inline it or use the `socket-patch setup` \
-                     .pth install hook instead",
+                     root, which vendor cannot edit; inline it or use agent mode \
+                     (`scan --mode agent` + `socket-patch apply`) instead",
                     file.rel
                 ),
             ));

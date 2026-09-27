@@ -37,7 +37,7 @@ use std::path::Path;
 // git reads a BOM'd `.git/config`, but serde_json and the line scanners all
 // reject it — without this, files the user's own toolchain accepts yield no
 // PURL.
-use crate::package_json::detect::strip_bom;
+use crate::utils::serde::strip_bom;
 
 /// Version-extracting parser for one manifest flavor, keyed by file name in
 /// the priority table inside [`detect_product`].

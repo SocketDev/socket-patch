@@ -272,7 +272,7 @@ fn yarn_pnp_refuses_in_human_mode() {
 /// the yarn-PnP refusal is an error exit, so it must still print the
 /// refusal to stderr under `--silent`. Without this, `apply --silent`
 /// on a PnP checkout exits 1 with zero output — undiagnosable in CI
-/// logs (the same contract violation class fixed in `setup`/`scan`).
+/// logs (the same contract violation class fixed in `scan`).
 #[test]
 fn yarn_pnp_refusal_still_prints_error_under_silent() {
     let dir = tempfile::tempdir().unwrap();
