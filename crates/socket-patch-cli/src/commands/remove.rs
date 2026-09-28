@@ -3,9 +3,7 @@ use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::manifest::cleanup_blobs::format_bytes;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::patch::redirect::{
-    load_redirect_state, persist_redirect_state, RedirectState, REDIRECT_STATE_REL,
-};
+use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
 use socket_patch_core::utils::purl::patch_matches;
 use socket_patch_core::vendor::{
@@ -38,15 +36,15 @@ fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String
     matches
 }
 
-/// Hosted redirect records matching a remove identifier, sorted.
-fn hosted_records_matching(state: &RedirectState, identifier: &str) -> Vec<String> {
-    let mut matches: Vec<String> = state
-        .records
+/// The lockfiles' hosted pins matching a remove identifier (by purl or
+/// patch uuid), sorted by purl.
+fn hosted_pins_matching(pins: &[HostedPin], identifier: &str) -> Vec<HostedPin> {
+    let mut matches: Vec<HostedPin> = pins
         .iter()
-        .filter(|(purl, rec)| patch_matches(purl, &rec.uuid, identifier))
-        .map(|(purl, _)| purl.clone())
+        .filter(|pin| patch_matches(&pin.purl, &pin.uuid, identifier))
+        .cloned()
         .collect();
-    matches.sort();
+    matches.sort_by(|a, b| a.purl.cmp(&b.purl));
     matches
 }
 
@@ -340,22 +338,33 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let cwd = &args.common.cwd;
 
     // ── state discovery ─────────────────────────────────────────────────
-    // A ledger-only project (vendored mode keeps its records in the vendor
-    // ledger, hosted mode in the redirect ledger — neither writes a
-    // manifest) proceeds manifest-less: `remove` is the per-purl exit path
-    // for those entries. Only cheap EXISTENCE probes run before the lock —
-    // they decide the truly-empty error path, which never locks (a bare
-    // project must not see `.socket/` created and pruned again). The
-    // stores themselves are loaded under the lock below.
+    // A manifest-less project (vendored mode keeps its records in the
+    // vendor ledger; hosted mode keeps none — its lockfile pins are the
+    // record) proceeds manifest-less: `remove` is the per-purl exit path
+    // for those entries. Only cheap probes run before the lock — they
+    // decide the truly-empty error path, which never locks (a bare project
+    // must not see `.socket/` created and pruned again). The vendor ledger
+    // is loaded under the lock below; the hosted pins come from read-only
+    // lockfile discovery (the restore re-reads every file under the lock).
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    let hosted_inventory = crate::commands::hosted_inventory(&args.common, cwd).await;
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
     if manifest_missing {
         let vendor_ledger_exists = tokio::fs::metadata(cwd.join(VENDOR_STATE_REL))
             .await
             .is_ok();
-        let redirect_ledger_exists = tokio::fs::metadata(cwd.join(REDIRECT_STATE_REL))
-            .await
-            .is_ok();
-        if !vendor_ledger_exists && !redirect_ledger_exists {
+        if !vendor_ledger_exists && hosted_pins.is_empty() {
+            // Contested hosted wiring is still hosted state: name it
+            // instead of reporting a bare project.
+            if let Some(refusal) = hosted_inventory.contested_refusal() {
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    "hosted_wiring_contested",
+                    refusal,
+                );
+                return 1;
+            }
             emit_error_envelope(
                 args.common.json,
                 args.common.dry_run,
@@ -453,23 +462,18 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
         }
 
-        // Hosted-only patches likewise have no manifest entry — the
-        // redirect ledger is their only persistence, and `remove` is
-        // their per-purl exit path (the unwind IS the removal). An
-        // unreadable ledger falls through to `not_found`: nothing is
-        // mutated on that path.
-        if let Ok(Some(redirect_state)) = load_redirect_state(cwd).await {
-            let hosted_matches = hosted_records_matching(&redirect_state, &args.identifier);
-            if !hosted_matches.is_empty() {
-                return remove_hosted_only(
-                    &args,
-                    hosted_matches,
-                    redirect_state,
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
-            }
+        // Hosted-only patches likewise have no manifest entry — their
+        // lockfile pins are their only persistence, and `remove` is their
+        // per-purl exit path (restoring the upstream entry IS the removal).
+        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier);
+        if !hosted_matches.is_empty() {
+            return remove_hosted_only(
+                &args,
+                hosted_matches,
+                api_token.as_deref(),
+                org_slug.as_deref(),
+            )
+            .await;
         }
 
         emit_not_found(
@@ -516,8 +520,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // `--dry-run` previews without mutating, so there is nothing to
     // confirm — skip the prompt (matching the global contract row:
     // "Preview, no mutations"). The prompt names every leg the removal
-    // will touch: the redirect ledger is probed read-only here (the legs
-    // below re-load it and decide for real).
+    // will touch: the hosted pins come from the read-only discovery above
+    // (the legs below decide for real).
     if !args.common.dry_run {
         let (vendored, hosted) = if args.skip_rollback {
             (0, 0)
@@ -526,12 +530,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 .as_ref()
                 .map(|st| vendor_entries_matching(st, &args.identifier).len())
                 .unwrap_or(0);
-            let hosted = load_redirect_state(cwd)
-                .await
-                .ok()
-                .flatten()
-                .map(|st| hosted_records_matching(&st, &args.identifier).len())
-                .unwrap_or(0);
+            let hosted = hosted_pins_matching(&hosted_pins, &args.identifier).len();
             (vendored, hosted)
         };
         let prompt = remove_prompt(
@@ -745,75 +744,50 @@ pub async fn run(args: RemoveArgs) -> i32 {
     }
 
     // ── hosted leg ──────────────────────────────────────────────────────
-    // An identifier can also (or only) match hosted records in the
-    // redirect ledger. Supported ecosystems (cargo, npm-family, golang) unwind
-    // per-purl; when the identifier covers EVERY record the whole-ledger
-    // replay serves the rest; otherwise unsupported targets fail closed
-    // BEFORE the manifest mutation. A corrupt ledger skips the leg with a
-    // warning (the identifier may still match other stores).
+    // An identifier can also (or only) match hosted pins in the lockfiles.
+    // Each is restored to its default upstream registry entry; a pin that
+    // cannot be fails closed BEFORE the manifest mutation.
     // `--skip-rollback` leaves hosted wiring untouched, like the vendor
-    // wiring above; `--preserve-state` still unwinds — hosted has no
+    // wiring above; `--preserve-state` still restores — hosted has no
     // preservable local state.
     let mut hosted_reverted_events: Vec<PatchEvent> = Vec::new();
-    // The hosted leg's run-level advisories (e.g.
-    // `redirect_npmrc_allow_remote_modified`): printed as they arrive,
+    // The hosted leg's run-level advisories: printed as they arrive,
     // carried into the success envelope's `warnings[]`.
     let mut hosted_leg_warnings: Vec<(String, String)> = Vec::new();
     if !args.skip_rollback {
-        match load_redirect_state(cwd).await {
-            Err(e) => {
-                if loud {
-                    eprintln!(
-                        "Warning: cannot read the hosted redirect ledger ({e}); hosted \
-                         redirects were not examined"
-                    );
+        let hosted_matches = hosted_pins_matching(&hosted_pins, &args.identifier);
+        if !hosted_matches.is_empty() {
+            let leg = match unwind_hosted(&args.common, &hosted_matches).await {
+                Ok(leg) => {
+                    hosted_leg_warnings.extend(leg.warnings.iter().cloned());
+                    leg
                 }
+                Err(err) => {
+                    let (code, msg) = hosted_unwind_error(err, true);
+                    emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+                    return 1;
+                }
+            };
+            if args.preserve_state && !leg.reverted.is_empty() && loud {
+                eprintln!(
+                    "Note: hosted wiring has no preservable local state; its lockfile pins \
+                     now resolve upstream."
+                );
             }
-            Ok(None) => {}
-            Ok(Some(mut redirect_state)) => {
-                let hosted_matches = hosted_records_matching(&redirect_state, &args.identifier);
-                if !hosted_matches.is_empty() {
-                    let leg =
-                        match unwind_hosted(&args.common, &hosted_matches, &mut redirect_state)
-                            .await
-                        {
-                            Ok(leg) => {
-                                hosted_leg_warnings.extend(leg.warnings.iter().cloned());
-                                leg
-                            }
-                            Err(err) => {
-                                let (code, msg) = hosted_unwind_error(err, true);
-                                emit_error_envelope(
-                                    args.common.json,
-                                    args.common.dry_run,
-                                    code,
-                                    msg,
-                                );
-                                return 1;
-                            }
-                        };
-                    if args.preserve_state && !leg.reverted.is_empty() && loud {
-                        eprintln!(
-                            "Note: hosted redirects have no preservable local state; \
-                             their ledger records were dropped with the unwound wiring."
-                        );
-                    }
-                    // `run_hosted_leg` printed one line per unwound purl.
-                    printed_progress |= loud && !leg.reverted.is_empty();
-                    let hosted_action = if args.common.dry_run {
-                        PatchAction::Verified
-                    } else {
-                        PatchAction::Removed
-                    };
-                    for purl in &leg.reverted {
-                        hosted_reverted_events.push(
-                            PatchEvent::new(hosted_action, purl.clone()).with_reason(
-                                "hosted_reverted",
-                                "hosted lockfile redirect unwound on remove",
-                            ),
-                        );
-                    }
-                }
+            // `run_hosted_leg` printed one line per restored purl.
+            printed_progress |= loud && !leg.reverted.is_empty();
+            let hosted_action = if args.common.dry_run {
+                PatchAction::Verified
+            } else {
+                PatchAction::Removed
+            };
+            for purl in &leg.reverted {
+                hosted_reverted_events.push(
+                    PatchEvent::new(hosted_action, purl.clone()).with_reason(
+                        "hosted_reverted",
+                        "hosted lockfile pin restored to the upstream registry on remove",
+                    ),
+                );
             }
         }
     }
@@ -1299,86 +1273,52 @@ async fn revert_vendored_matches(
     Ok(leg)
 }
 
-/// Why a hosted unwind stopped. Each caller renders its own message (the
+/// Why a hosted unwind stopped: a pin the upstream restore refused (or a
+/// write failure). Each caller renders its own message (the
 /// manifest-backed path adds that the manifest was not touched).
-enum HostedUnwindError {
-    /// The ledger could not be persisted after the reverts flushed.
-    Persist(String),
-    /// Scoped targets whose ecosystem has no per-purl hosted revert.
-    Unsupported(Vec<String>),
-    /// A per-purl revert (or the whole-ledger replay) refused.
-    Failed { what: String, why: String },
+struct HostedUnwindError {
+    why: String,
 }
 
-/// Unwind the hosted redirect records in `hosted_matches` and persist the
-/// ledger — FIRST, failure or not: the per-purl reverts flush lockfile
-/// writes as they go, so an early error return without persisting would
-/// strand already-reverted purls' records in the on-disk ledger (lockfiles
-/// and ledger desynced; `list`/VEX attest dead wiring). When the matches
-/// cover EVERY record the whole-ledger replay serves the ecosystems without
-/// a per-purl revert. Shared by the manifest-backed and hosted-only remove
-/// paths.
+/// Restore the hosted pins in `hosted_matches` to their upstream registry
+/// entries. Nothing is written unless every pin resolved (the restore is
+/// all-or-nothing per pin, and a refused pin fails the remove). Shared by
+/// the manifest-backed and hosted-only remove paths.
 async fn unwind_hosted(
     common: &GlobalArgs,
-    hosted_matches: &[String],
-    state: &mut RedirectState,
+    hosted_matches: &[HostedPin],
 ) -> Result<HostedLegOutcome, HostedUnwindError> {
-    let replay_eligible = state.records.keys().all(|p| hosted_matches.contains(p));
-    let before = (state.edits.len(), state.records.len());
-    let leg = run_hosted_leg(common, hosted_matches, state, replay_eligible).await;
+    let leg = run_hosted_leg(common, hosted_matches).await;
     // Printed as soon as the leg returns, so a human run that then fails
     // still says what it did to the files.
     print_hosted_leg_warnings(common, &leg.warnings);
-    if !common.dry_run && (state.edits.len(), state.records.len()) != before {
-        if let Err(e) = persist_redirect_state(&common.cwd, state).await {
-            return Err(HostedUnwindError::Persist(e.to_string()));
-        }
+    if let Some((_, why)) = leg.failed.first().cloned() {
+        return Err(HostedUnwindError { why });
     }
-    if !leg.unsupported.is_empty() {
-        return Err(HostedUnwindError::Unsupported(leg.unsupported));
-    }
-    if let Some((what, why)) = leg.failed.first().cloned() {
-        return Err(HostedUnwindError::Failed { what, why });
+    if let Some(warning) = super::rollback::retire_legacy_redirect_ledger(common).await {
+        print_hosted_leg_warnings(common, std::slice::from_ref(&warning));
     }
     Ok(leg)
 }
 
 /// Error code + message for a stopped hosted unwind.
 fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'static str, String) {
-    let note = if manifest_backed {
-        " The manifest was not modified."
-    } else {
-        ""
-    };
-    match err {
-        HostedUnwindError::Persist(e) => (
-            "hosted_revert_failed",
-            format!("failed to persist the hosted redirect ledger: {e}"),
-        ),
-        HostedUnwindError::Unsupported(purls) => (
-            "hosted_revert_unsupported",
-            format!(
-                "no per-purl hosted-redirect revert exists for: {}. Run an unscoped \
-                 `socket-patch rollback` to unwind ALL hosted redirects, or re-run \
-                 `scan --mode hosted` to normalize.{note}",
-                purls.join(", ")
-            ),
-        ),
-        HostedUnwindError::Failed { what, why } => (
-            "hosted_revert_failed",
-            if manifest_backed {
-                format!("could not unwind hosted redirect for {what}: {why}.{note}")
-            } else {
-                format!("could not unwind hosted redirect for {what}: {why}")
-            },
-        ),
-    }
+    // `why` already names the pin (the restore's refusal) or the write
+    // that failed, with its remedy.
+    let HostedUnwindError { why } = err;
+    (
+        "hosted_revert_failed",
+        if manifest_backed {
+            format!("{why}. The manifest was not modified.")
+        } else {
+            why
+        },
+    )
 }
 
-/// Remove path for identifiers that match ONLY hosted redirect records
-/// (no manifest entry, no vendor-ledger entry): confirm, unwind each
-/// record's lockfile wiring, drop it from the redirect ledger, and report
-/// `Removed`/`hosted_reverted` events. Like the ledger-only vendored path,
+/// Remove path for identifiers that match ONLY hosted lockfile pins (no
+/// manifest entry, no vendor-ledger entry): confirm, restore each pin's
+/// upstream registry entry, and report `Removed`/`hosted_reverted` events. Like the ledger-only vendored path,
 /// the unwind IS the removal, so events go through `env.record` and bump
 /// `summary.removed`. `--skip-rollback` is refused (with no manifest
 /// entry to delete, removing a hosted patch can only mean unwinding its
@@ -1386,8 +1326,7 @@ fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'stat
 /// preservable local state.
 async fn remove_hosted_only(
     args: &RemoveArgs,
-    hosted_matches: Vec<String>,
-    mut redirect_state: RedirectState,
+    hosted_matches: Vec<HostedPin>,
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) -> i32 {
@@ -1398,8 +1337,8 @@ async fn remove_hosted_only(
             args.common.dry_run,
             "hosted_state_retained",
             format!(
-                "{} matches only hosted redirect records; removing one means unwinding \
-                 its lockfile redirect, which --skip-rollback prevents",
+                "{} matches only hosted lockfile pins; removing one means restoring its \
+                 upstream registry entry, which --skip-rollback prevents",
                 args.identifier
             ),
         );
@@ -1420,8 +1359,8 @@ async fn remove_hosted_only(
                 "will be"
             }
         );
-        for purl in &hosted_matches {
-            eprintln!("  - {purl}");
+        for pin in &hosted_matches {
+            eprintln!("  - {}", pin.purl);
         }
         eprintln!();
     }
@@ -1442,24 +1381,10 @@ async fn remove_hosted_only(
         return 0;
     }
 
-    let leg = match unwind_hosted(&args.common, &hosted_matches, &mut redirect_state).await {
+    let leg = match unwind_hosted(&args.common, &hosted_matches).await {
         Ok(leg) => leg,
         Err(err) => {
-            match &err {
-                HostedUnwindError::Unsupported(_) => {
-                    track_patch_remove_failed(
-                        "hosted redirect revert unsupported",
-                        api_token,
-                        org_slug,
-                    )
-                    .await;
-                }
-                HostedUnwindError::Failed { .. } => {
-                    track_patch_remove_failed("hosted redirect revert failed", api_token, org_slug)
-                        .await;
-                }
-                HostedUnwindError::Persist(_) => {}
-            }
+            track_patch_remove_failed("hosted redirect revert failed", api_token, org_slug).await;
             let (code, msg) = hosted_unwind_error(err, false);
             emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
             return 1;
@@ -1482,7 +1407,7 @@ async fn remove_hosted_only(
     for purl in &leg.reverted {
         env.record(PatchEvent::new(action, purl.clone()).with_reason(
             "hosted_reverted",
-            "hosted lockfile redirect unwound on remove",
+            "hosted lockfile pin restored to the upstream registry on remove",
         ));
     }
     if args.common.json {

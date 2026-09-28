@@ -33,7 +33,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import traceback
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,8 +288,12 @@ def main():
 
     def record_hashes(project, mode):
         if mode == "hosted":
-            ledger = json.loads((project / ".socket/vendor/redirect-state.json").read_text())
-            recs = ledger["records"]
+            # v5 hosted mode keeps no ledger: the lock pin names the patch
+            # uuid and the record is the public API's.
+            uuid = hosted_uuid((project / "poetry.lock").read_text())
+            if uuid is None:
+                raise RuntimeError("the hosted lock pins no patch.socket.dev uuid")
+            recs = {PURL_BASE: published_record(uuid)}
         elif mode == "vendored":
             # Vendored mode never writes `.socket/manifest.json`: the ledger
             # entry embeds the patch record.
@@ -302,11 +308,33 @@ def main():
             rec.get("uuid"),
         )
 
+    def hosted_uuid(text):
+        """The patch uuid of the first patch.socket.dev URL in `text` (the
+        LAST uuid-shaped path segment: an earlier one may be a grant token)."""
+        m = re.search(r"https://patch\.socket\.dev/[^\s\"'#]+", text)
+        if not m:
+            return None
+        uuids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", m[0])
+        return uuids[-1] if uuids else None
+
+    def published_record(uuid):
+        """`GET https://patches-api.socket.dev/patch/view/<uuid>` (the public proxy)."""
+        url = f"https://patches-api.socket.dev/patch/view/{uuid}"
+        for attempt in range(1, 6):
+            try:
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SocketPatchCLI-backtest/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt == 5:
+                    raise
+                time.sleep(10 * attempt)
+
     def manifestless_vex(case, fresh, mode, uuid, pristine_lock, check, info):
         """Steps (1)-(4) of the manifest-less VEX matrix over `fresh` (an
         installed clone of the committed state, `.socket/` included)."""
         marker = "(redirected)" if mode == "hosted" else "(vendored)"
-        unwired = "redirect_unwired" if mode == "hosted" else "vendor_unwired"
+        unwired = "vendor_unwired"
         runs = []
 
         def vex(*extra):
@@ -340,12 +368,14 @@ def main():
         def skipped(envelope, code):
             return any(e.get("action") == "skipped" and e.get("errorCode") == code for e in envelope.get("events", []))
 
-        # (1) manifest deleted: online, and offline from the committed ledger.
+        # (1) manifest deleted: online, and (vendored) offline from the
+        # committed vendor ledger. v5 hosted keeps no ledger: no local record.
         (fresh / ".socket/manifest.json").unlink(missing_ok=True)
         rc, _, d = vex()
         check("vexManifestDeleted", attests(rc, d), runs[-1])
-        rc, _, d = vex("--offline")
-        check("vexLedgerOffline", attests(rc, d), runs[-1])
+        if mode != "hosted":
+            rc, _, d = vex("--offline")
+            check("vexLedgerOffline", attests(rc, d), runs[-1])
         # (2) ledgers deleted too: lockfile discovery + the patch API.
         ledgers = {}
         for rel in (".socket/vendor/state.json", ".socket/vendor/redirect-state.json"):
@@ -354,7 +384,7 @@ def main():
                 ledgers[path] = path.read_bytes()
                 path.unlink()
         rc, _, d = vex()
-        check("vexLedgersDeleted", bool(ledgers) and attests(rc, d), runs[-1])
+        check("vexLedgersDeleted", bool(ledgers) == (mode != "hosted") and attests(rc, d), runs[-1])
         # (3) offline without ledgers: nothing to attest from, no network.
         rc, e, d = vex("--offline")
         check("vexOfflineRecordUnavailable", rc == 1 and d is None and skipped(e, "record_unavailable"), runs[-1])
@@ -366,7 +396,11 @@ def main():
         ok = True
         for extra in ((), ("--no-verify",), ("--offline", "--no-verify")):
             rc, e, d = vex(*extra)
-            ok = ok and rc == 1 and d is None and skipped(e, unwired)
+            if mode == "hosted":
+                # No ledger and no wiring: nothing names the patch any more.
+                ok = ok and rc == 2 and d is None and (e.get("error") or {}).get("code") == "manifest_not_found"
+            else:
+                ok = ok and rc == 1 and d is None and skipped(e, unwired)
         check("vexRevertedUnwired", ok, runs[-3:])
         (fresh / "poetry.lock").write_bytes(committed_lock)
         info["manifestlessVex"] = runs
@@ -603,6 +637,7 @@ def main():
             check("lockHasFileSource", b'type = "file"' in lock_after)
         if mode == "hosted":
             check("lockHasUrlSource", b'type = "url"' in lock_after and b"patch.socket.dev" in lock_after)
+            check("noLedger", not (project / ".socket/vendor/redirect-state.json").exists())
 
         # idempotent re-scan
         r2 = Run(cli_cmd(project, "scan", "--mode", mode), project, env, case / "rescan.log")
@@ -691,14 +726,16 @@ def main():
             else:
                 (project / "poetry.lock").write_bytes(lock_after)
 
-        # Rollback restores every byte and clears the ledgers.
+        # Rollback restores every byte (hosted: the upstream PyPI entry,
+        # re-resolved from the registry) and clears the ledgers.
         rb = Run(cli_cmd(project, "rollback"), project, env, case / "rollback.log")
         erb = rb.json_or_empty()
         check("rollbackExit0", rb.ok(), (rb.out + rb.err)[-600:] if not rb.ok() else None)
         check("rollbackRestoresLockBytes", (project / "poetry.lock").read_bytes() == pristine_lock)
         check("rollbackKeepsPyproject", (project / "pyproject.toml").read_bytes() == pristine_pyproject)
         if mode == "hosted":
-            check("rollbackClearsRedirectLedger", not (project / ".socket/vendor/redirect-state.json").exists() or not json.loads((project / ".socket/vendor/redirect-state.json").read_text()).get("records"))
+            check("rollbackNoRedirectLedger", not (project / ".socket/vendor/redirect-state.json").exists())
+            check("rollbackRestoredUpstream", PURL_BASE in ((erb.get("hosted") or {}).get("reverted") or []), erb.get("hosted"))
         if mode == "vendored":
             check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists())
         if mode == "agent":

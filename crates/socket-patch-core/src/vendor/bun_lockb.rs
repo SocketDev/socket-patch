@@ -20,6 +20,19 @@ const HEADER: &[u8] = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
 const TOTAL_AT: usize = HEADER.len() + 4 + 32;
 const PACKAGES_AT: usize = TOTAL_AT + 8;
 const INTEGRITY_LEN: usize = 65;
+/// Written by this codec in the last eight bytes of the root package's
+/// resolution (its value union, which a root resolution never reads — early
+/// writers leave uninitialized bytes there, and every supported reader
+/// ignores them) when an edit had to normalize the lock: seven magic bytes,
+/// then a [`NORMALIZED_FORMAT_1`] / [`NORMALIZED_WORKSPACE`] flag byte. v5
+/// hosted mode keeps no ledger, so this is how a later upstream restore knows
+/// the lock's pre-rewrite bytes differ from its registry form.
+const NORMALIZED_MAGIC: &[u8; 7] = b"sktpnrm";
+/// The lock was promoted from binary format 1 ([`BunLockb::demote_legacy_format`]
+/// inverts it exactly).
+pub(crate) const NORMALIZED_FORMAT_1: u8 = 1;
+/// Workspace dependency behaviors were normalized (not invertible).
+pub(crate) const NORMALIZED_WORKSPACE: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BinaryPackage {
@@ -341,16 +354,152 @@ impl BunLockb {
         } else {
             target.strip_prefix("file:").unwrap_or(target)
         };
+        if remote && old_tag == 80 {
+            // Re-pinning a hosted record: its superseded URL leaves the pool
+            // tail instead of accumulating there.
+            let replaced = self.data[at + 8..at + 16].to_vec();
+            self.data[at + 8..at + 16].fill(0);
+            self.drop_tail_string(&replaced)?;
+        }
         let pointer = self.intern(target)?;
         // Tarball variants have distinct cache identities. Keeping npm tag 2
         // would allow Bun to reuse an already-cached, unpatched name@version.
-        self.data[at..at + self.resolution_size].fill(0);
+        // A remote (hosted) tarball keeps the registry record's bytes the
+        // tarball variant never reads (padding, semver): v5 hosted mode keeps
+        // no ledger, and they let `set_registry_package` rebuild the exact
+        // registry record — including a writer's uninitialized padding.
+        if !remote {
+            self.data[at..at + self.resolution_size].fill(0);
+        }
         self.data[at] = if remote { 80 } else { 8 };
         self.data[at + 8..at + 16].copy_from_slice(&pointer);
         let integrity_at = self.integrity_at(id);
         self.data[integrity_at..integrity_at + INTEGRITY_LEN].copy_from_slice(&digest);
         self.normalize_production_pool()?;
         self.update_hash(style)?;
+        Ok(())
+    }
+
+    /// Rebuild package `id` (a tarball record) as Bun's npm registry record
+    /// for `version` (resolution tag 2) resolving `url` with `integrity` —
+    /// the inverse of [`Self::set_package`] when no snapshot of the original
+    /// record survives (v5 hosted mode keeps no ledger).
+    ///
+    /// When the record still carries the registry record's inactive bytes
+    /// (a hosted rewrite by `set_package` retains them) and they spell
+    /// `version`, they are kept verbatim — padding, semver and prerelease
+    /// tags included — so the rebuild is byte-exact. Otherwise the record is
+    /// built the way Bun writes one: zero padding, the semver triple and
+    /// empty prerelease/build tags; a prerelease or build version is then
+    /// refused, since its tags carry Bun's own string hashes.
+    ///
+    /// The URL is interned, so a registry URL the pool still holds is
+    /// re-used at its original offset, and the string the replaced record
+    /// pointed at is trimmed from the pool tail when nothing else references
+    /// it: a lock whose tarball string the hosted rewrite appended gets its
+    /// pre-rewrite pool back.
+    pub(crate) fn set_registry_package(
+        &mut self,
+        id: usize,
+        version: &str,
+        url: &str,
+        integrity: &str,
+    ) -> Result<(), String> {
+        let mut candidate = self.clone();
+        candidate.set_registry_package_inner(id, version, url, integrity)?;
+        let rebuilt = candidate.package(id)?;
+        if rebuilt.version.as_deref() != Some(version) || rebuilt.resolution != url {
+            return Err("bun.lockb: rebuilt registry record does not read back".into());
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn set_registry_package_inner(
+        &mut self,
+        id: usize,
+        version: &str,
+        url: &str,
+        integrity: &str,
+    ) -> Result<(), String> {
+        self.check_id(id)?;
+        self.check_editable()?;
+        let style = self.hash_style()?;
+        if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains('\0') {
+            return Err("bun.lockb: the registry tarball URL is not an http(s) URL".into());
+        }
+        let digest = encode_integrity(integrity)?;
+        let at = self.resolution_at(id);
+        if !matches!(self.data[at], 8 | 80) {
+            return Err("bun.lockb: only tarball packages can be restored to the registry".into());
+        }
+        // Format 1 has no URL column; the hosted rewrite promoted it already.
+        self.promote_legacy_format()?;
+        self.normalize_workspace_behaviors()?;
+        let at = self.resolution_at(id);
+        let replaced = self.data[at + 8..at + 16].to_vec();
+        // The registry record's inactive bytes the hosted rewrite retained
+        // (see `set_package`), when they still spell `version`.
+        let mut record = self.data[at..at + self.resolution_size].to_vec();
+        let retained = self.version_at(at + 16).is_ok_and(|v| v == version);
+        if !retained {
+            let triple: Vec<u64> = version
+                .split('.')
+                .map(|part| {
+                    (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| part.parse::<u64>().ok())
+                        .flatten()
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|parts| parts.len() == 3)
+                .ok_or_else(|| {
+                    format!(
+                        "bun.lockb: cannot rebuild the registry record of version {version} \
+                         (only plain major.minor.patch versions are supported)"
+                    )
+                })?;
+            record.fill(0);
+            for (i, number) in triple.into_iter().enumerate() {
+                if self.format == 3 {
+                    record[16 + i * 8..24 + i * 8].copy_from_slice(&number.to_le_bytes());
+                } else {
+                    let number = u32::try_from(number)
+                        .map_err(|_| "bun.lockb: version exceeds this binary format")?;
+                    record[16 + i * 4..20 + i * 4].copy_from_slice(&number.to_le_bytes());
+                }
+            }
+        }
+        // Unlink the replaced record first, so its string (appended by the
+        // rewrite) can leave the pool tail before the registry URL interns.
+        self.data[at..at + self.resolution_size].fill(0);
+        self.drop_tail_string(&replaced)?;
+        let pointer = self.intern(url)?;
+        let at = self.resolution_at(id);
+        record[0] = 2;
+        record[8..16].copy_from_slice(&pointer);
+        self.data[at..at + self.resolution_size].copy_from_slice(&record);
+        let integrity_at = self.integrity_at(id);
+        self.data[integrity_at..integrity_at + INTEGRITY_LEN].copy_from_slice(&digest);
+        self.normalize_production_pool()?;
+        self.update_hash(style)?;
+        Ok(())
+    }
+
+    /// Trim the out-of-line string `pointer` names from the pool when it is
+    /// the pool's (8-byte padded) tail and nothing references it any more.
+    fn drop_tail_string(&mut self, pointer: &[u8]) -> Result<(), String> {
+        if pointer.len() != 8 || pointer[7] & 0x80 == 0 {
+            return Ok(());
+        }
+        let start = u32::from_le_bytes(pointer[..4].try_into().unwrap()) as usize;
+        let len = (u32::from_le_bytes(pointer[4..].try_into().unwrap()) & 0x7fff_ffff) as usize;
+        let end = len
+            .checked_add(7)
+            .map(|n| n & !7)
+            .and_then(|n| start.checked_add(n));
+        if end == Some(self.strings.data.len()) {
+            self.trim_unreferenced_tail(start)?;
+        }
         Ok(())
     }
 
@@ -556,17 +705,24 @@ impl BunLockb {
     // Some writers also persist the unexpanded workspace:* literal while their
     // binary loader expects its resolved path. Canonical path literals (used by
     // older writers) compare correctly in every supported binary reader.
+    // Either change is lossy, so the lock is marked NORMALIZED_WORKSPACE: an
+    // upstream restore then refuses instead of returning a non-exact lock.
     fn normalize_workspace_behaviors(&mut self) -> Result<(), String> {
         let changes = self.workspace_literal_changes()?;
         let dependencies = self.dependency_array()?;
+        let mut changed = !changes.is_empty();
         for dep in self.data[dependencies.data].chunks_exact_mut(26) {
             if dep[16] & 0x20 != 0 && dep[16] & 0x1e != 0 {
                 dep[16] &= !0x20;
+                changed = true;
             }
         }
         for (at, path) in changes {
             let pointer = self.intern(&path)?;
             self.data[at..at + 8].copy_from_slice(&pointer);
+        }
+        if changed {
+            self.mark_normalized(NORMALIZED_WORKSPACE)?;
         }
         Ok(())
     }
@@ -841,7 +997,103 @@ impl BunLockb {
             let at = self.resolution_at(id);
             self.data[at + 8..at + 16].copy_from_slice(&pointer);
         }
+        // The root's last eight resolution bytes are new here (format 1 has
+        // 56), so the mark overwrites nothing the original lock held.
+        self.mark_normalized(NORMALIZED_FORMAT_1)
+    }
+
+    /// Where [`NORMALIZED_MAGIC`] lives: the root package's (id 0, tag 1)
+    /// last eight resolution bytes.
+    fn normalized_mark_at(&self) -> Option<usize> {
+        (self.count > 0 && self.data[self.resolution_at(0)] == 1)
+            .then(|| self.resolution_at(0) + self.resolution_size - 8)
+    }
+
+    fn mark_normalized(&mut self, flag: u8) -> Result<(), String> {
+        let at = self
+            .normalized_mark_at()
+            .ok_or("bun.lockb: the lock has no root package record")?;
+        let flags = self.normalized_flags() | flag;
+        self.data[at..at + 7].copy_from_slice(NORMALIZED_MAGIC);
+        self.data[at + 7] = flags;
         Ok(())
+    }
+
+    /// The [`NORMALIZED_FORMAT_1`] / [`NORMALIZED_WORKSPACE`] flags a
+    /// previous edit by this codec recorded (0 for a lock Bun wrote).
+    pub(crate) fn normalized_flags(&self) -> u8 {
+        match self.normalized_mark_at() {
+            Some(at) if &self.data[at..at + 7] == NORMALIZED_MAGIC => self.data[at + 7],
+            _ => 0,
+        }
+    }
+
+    /// The exact format-1 lock [`Self::promote_legacy_format`] made this one
+    /// from, or `None` when this lock was not promoted by it. Verified: the
+    /// result promotes back to exactly these bytes, so any other edit since
+    /// (a record still hosted, Bun re-saving the lock) is an error rather
+    /// than a guess.
+    pub(crate) fn demote_legacy_format(&self) -> Result<Option<Self>, String> {
+        let flags = self.normalized_flags();
+        if self.format != 2 || flags & NORMALIZED_FORMAT_1 == 0 {
+            return Ok(None);
+        }
+        let not_exact = || "bun.lockb: the lock's original binary format-1 bytes cannot be rebuilt";
+        if flags != NORMALIZED_FORMAT_1 {
+            return Err(not_exact().into());
+        }
+        self.check_editable()?;
+        let resolution_start = self.package_start + self.count * 16;
+        let resolution_end = resolution_start + self.count * 64;
+        let package_end =
+            self.package_start + self.count * (204 + if self.fields == 8 { 49 } else { 0 });
+        let delta = self.count * 8;
+        let mut arrays = Vec::new();
+        let mut pos = package_end;
+        for _ in 0..6 {
+            let array = read_array(&self.data, pos, self.total)?;
+            pos = array.data.end;
+            arrays.push(array);
+        }
+        let mut data = Vec::with_capacity(self.data.len() - delta);
+        data.extend_from_slice(&self.data[..resolution_start]);
+        let mut url_offsets = Vec::new();
+        for id in 0..self.count {
+            let record = &self.data[resolution_start + id * 64..resolution_start + (id + 1) * 64];
+            if record[0] == 2 {
+                if record[15] & 0x80 != 0 {
+                    url_offsets.push(u32_at(record, 8)? as usize);
+                }
+                data.extend_from_slice(&record[..8]);
+                data.extend_from_slice(&record[16..]);
+            } else {
+                data.extend_from_slice(&record[..56]);
+            }
+        }
+        data.extend_from_slice(&self.data[resolution_end..]);
+        data[HEADER.len()..HEADER.len() + 4].copy_from_slice(&1u32.to_le_bytes());
+        put_u64(&mut data, PACKAGES_AT + 32, package_end - delta);
+        for array in arrays.iter().chain(self.extensions.iter()) {
+            let at = array.descriptor - delta;
+            put_u64(&mut data, at, array.data.start - delta);
+            put_u64(&mut data, at + 8, array.data.end - delta);
+        }
+        put_u64(&mut data, TOTAL_AT, self.total - delta);
+        let demoted = Self::parse(&data).map_err(|_| not_exact())?;
+        // The promotion appended the registry URLs it interned to the pool;
+        // try each place their run can start (the earliest first).
+        url_offsets.sort_unstable();
+        url_offsets.dedup();
+        let pool = demoted.strings.data.len();
+        for start in url_offsets.into_iter().filter(|s| *s <= pool).chain([pool]) {
+            let mut candidate = demoted.clone();
+            candidate.resize_pool(start, &[])?;
+            let mut promoted = candidate.clone();
+            if promoted.promote_legacy_format().is_ok() && promoted.data == self.data {
+                return Ok(Some(candidate));
+            }
+        }
+        Err(not_exact().into())
     }
 
     fn update_hash(&mut self, style: (bool, bool)) -> Result<(), String> {
@@ -1503,6 +1755,114 @@ mod tests {
                 lock.bytes().len(),
                 original.len()
             );
+        }
+    }
+
+    const HOSTED: &str = "https://patch.socket.dev/patch/npm/11111111-1111-4111-8111-111111111111/77777777-7777-4777-8777-777777777777/minimist-1.2.2.tgz";
+
+    #[test]
+    fn registry_rebuild_inverts_a_hosted_rewrite_without_a_snapshot() {
+        for version in VERSIONS.iter().copied().chain(["0.5.9", "two-versions"]) {
+            let original = fixture(version);
+            let mut lock = BunLockb::parse(&original).unwrap();
+            let package = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == "minimist" && p.version.as_deref() == Some("1.2.2"))
+                .unwrap();
+            lock.set_package(package.id, HOSTED, &digest()).unwrap();
+            // A re-pin (a later grant's URL) drops the superseded URL.
+            let first = lock.bytes();
+            let token = "11111111-1111-4111-8111-111111111111";
+            let repin = HOSTED.replace(token, "33333333-3333-4333-8333-333333333333");
+            lock.set_package(package.id, &repin, &digest()).unwrap();
+            assert_eq!(lock.bytes().len(), first.len(), "{version}");
+            assert!(
+                !lock.bytes().windows(token.len()).any(|w| w == token.as_bytes()),
+                "{version}: the superseded URL is gone"
+            );
+            // A remote tarball keeps the registry record's inactive bytes; a
+            // local (vendored) one does not.
+            let at = lock.resolution_at(package.id);
+            assert_eq!(lock.data[at], 80, "{version}");
+            if BunLockb::parse(&original).unwrap().format != 1 {
+                assert_eq!(
+                    lock.data[at + 16..at + lock.resolution_size],
+                    original[at + 16..at + lock.resolution_size],
+                    "{version}"
+                );
+            }
+            lock.set_registry_package(
+                package.id,
+                "1.2.2",
+                &package.resolution,
+                package.integrity.as_deref().unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("{version}: {e}"));
+            lock.validate_mutation().unwrap();
+            let restored = lock.package(package.id).unwrap();
+            assert_eq!(restored.version.as_deref(), Some("1.2.2"), "{version}");
+            assert_eq!(restored.resolution, package.resolution, "{version}");
+            assert_eq!(restored.integrity, package.integrity, "{version}");
+            // Format 1 stays promoted to format 2 (marked so), and demotes
+            // back to its exact bytes; every other writer's come back as is.
+            if matches!(version, "0.1.1" | "0.1.6") {
+                assert_eq!(lock.normalized_flags(), NORMALIZED_FORMAT_1, "{version}");
+                let demoted = lock.demote_legacy_format().unwrap().expect("promoted");
+                assert!(demoted.bytes() == original, "exact demotion: {version}");
+            } else {
+                assert_eq!(lock.normalized_flags(), 0, "{version}");
+                assert!(lock.demote_legacy_format().unwrap().is_none(), "{version}");
+                assert!(lock.bytes() == original, "exact rebuild: {version}");
+            }
+        }
+        let mut local = BunLockb::parse(&fixture("0.8.1")).unwrap();
+        local
+            .set_package(1, ".socket/vendor/npm/x/minimist-1.2.2.tgz", &digest())
+            .unwrap();
+        let at = local.resolution_at(1);
+        assert!(local.data[at + 16..at + local.resolution_size].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn registry_rebuild_from_a_zeroed_hosted_record() {
+        // A hosted record whose registry bytes are gone (an older rewrite, or
+        // Bun re-saving the record) is rebuilt the way Bun writes one.
+        for version in ["0.8.1", "1.0.0", "1.1.38", "1.2.0", "1.2.23", "1.4.2"] {
+            let original = fixture(version);
+            let mut lock = BunLockb::parse(&original).unwrap();
+            let package = lock.package(1).unwrap();
+            assert_eq!(package.name, "minimist", "{version}");
+            lock.set_package(1, HOSTED, &digest()).unwrap();
+            let at = lock.resolution_at(1);
+            let size = lock.resolution_size;
+            lock.data[at + 1..at + 8].fill(0);
+            lock.data[at + 16..at + size].fill(0);
+            lock.validate_mutation().unwrap();
+            let hosted = lock.bytes();
+            let err = lock
+                .set_registry_package(1, "1.2.2-beta.1", &package.resolution, &digest())
+                .unwrap_err();
+            assert!(err.contains("major.minor.patch"), "{version}: {err}");
+            assert!(lock.bytes() == hosted, "{version}: transactional");
+            lock.set_registry_package(
+                1,
+                "1.2.2",
+                &package.resolution,
+                package.integrity.as_deref().unwrap(),
+            )
+            .unwrap();
+            lock.validate_mutation().unwrap();
+            assert_eq!(lock.package(1).unwrap().version.as_deref(), Some("1.2.2"));
+            // Writers that zero their padding get their exact bytes back.
+            if version != "0.8.1" {
+                assert!(lock.bytes() == original, "{version}");
+            }
+            // A registry record is not a tarball record to restore.
+            assert!(lock
+                .set_registry_package(1, "1.2.2", &package.resolution, &digest())
+                .is_err());
         }
     }
 

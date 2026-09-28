@@ -34,8 +34,8 @@
 //! Both end in the manifest-less VEX tail
 //! ([`golang_e2e_matrix::manifestless_vex`]): a fresh checkout on a fresh
 //! machine (real `go run`, patched module in its cache) attests the patch
-//! `(redirected)` from go.mod/go.sum + the patch API alone — with and
-//! without the redirect ledger, never offline without a record, never once
+//! `(redirected)` from go.mod/go.sum + the patch API alone (v5 hosted mode
+//! writes no redirect ledger), never offline without a record, never once
 //! the replace is reverted. The Go release is whatever `go` is on `PATH`
 //! (see `golang_e2e_matrix` for the version matrix knobs).
 
@@ -547,8 +547,8 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
 /// onto the gopatch module path, plus BOTH go.sum `h1:` lines (the goproxy
 /// integrity pair is all-or-nothing; the grant carries it on the override's
 /// identifiers) — and a fresh day-2 machine must build the PATCHED module
-/// from the committed files alone. Hosted persistence is the redirect ledger
-/// ONLY: no manifest, no blobs.
+/// from the committed files alone. Hosted persistence is the go.mod/go.sum
+/// rewrite ONLY: no manifest, no blobs, no ledger (v5).
 // multi_thread: the CLI subprocess blocks a worker thread while wiremock
 // keeps serving the view + reference routes on the others.
 // #[serial]: see the sibling test's note — env mutation vs env iteration.
@@ -564,7 +564,7 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
     let purl = format!("pkg:golang/{UMOD}@{UVER}");
     let artifact_url = format!("{}/{}/@v/{SVER}.zip", fx.proxy_url, fx.smod);
 
-    // API mocks: `view/{uuid}` (the record the redirect ledger embeds for
+    // API mocks: `view/{uuid}` (the record the hosted run fetches for its
     // VEX) + the reference grant whose goproxy override carries the module
     // path/version and the gopatch-flavor hash pair the rewriter pins.
     let server = MockServer::start().await;
@@ -694,17 +694,13 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
         "go.sum must pin the served-.mod hash.\nwant: {want_mod}\ngot:\n{gosum}"
     );
 
-    // Hosted persistence contract: the ledger IS the persistence.
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(fx.consumer.join(".socket/vendor/redirect-state.json"))
-            .expect("redirect ledger must be written"),
-    )
-    .unwrap();
-    assert_eq!(ledger["mode"], "hosted", "ledger: {ledger}");
-    assert_eq!(
-        ledger["records"][purl.as_str()]["uuid"],
-        UUID,
-        "the ledger must embed the patch record for VEX: {ledger}"
+    // Hosted persistence contract (v5): the go.mod/go.sum rewrite IS the
+    // persistence — no ledger.
+    assert!(
+        !fx.consumer
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "hosted mode must NOT write a redirect ledger ({purl})"
     );
     assert!(
         !fx.consumer.join(".socket/manifest.json").exists(),
@@ -753,7 +749,7 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
         String::from_utf8_lossy(&patched.stdout)
     );
 
-    // ── manifest-less VEX over the committed state (ledger included) ─────
+    // ── manifest-less VEX over the committed state (no ledger) ───────────
     // The API stand-in owns its own runtime, so the tail runs off this
     // test's async runtime.
     std::thread::scope(|scope| {
