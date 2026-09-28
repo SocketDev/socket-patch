@@ -66,8 +66,8 @@ use crate::commands::scan::rollout::{
 use discover::Provider;
 use redirect::{Planned, Refused, Rewritten, StageOptions};
 use socket_patch_core::policy::{
-    patch_severity_order, FilterReason, MemoryPolicyFs, Root, RootFile, SelectionPolicy, PATCHES_DISABLED,
-    POLICY_FILE_NAMES,
+    patch_severity_order, FilterReason, MemoryPolicyFs, PolicyError, PolicySource, Root, RootFile,
+    SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
 
 use crate::commands::scan::policy::{policy_block, FilteredEntry};
@@ -331,6 +331,7 @@ fn unrooted_unsupported_warnings<'a>(
     paths: impl Iterator<Item = &'a str>,
     roots: &[String],
     ecosystems: Option<&[String]>,
+    policy: &SelectionPolicy,
     out: &mut Vec<EngineWarning>,
 ) {
     let root_set: BTreeSet<&str> = roots.iter().map(String::as_str).collect();
@@ -348,7 +349,13 @@ fn unrooted_unsupported_warnings<'a>(
             || dir
                 .split('/')
                 .any(|seg| roots::EXCLUDED_ROOT_SEGMENTS.contains(&seg))
-            || roots::default_ignored_dir(dir)
+            || policy
+                .admits_root(&Root {
+                    rel_dir: dir,
+                    markers: &[base.to_string()],
+                    explicit: false,
+                })
+                .is_err()
         {
             continue;
         }
@@ -452,6 +459,25 @@ async fn engine(
                 return Ok(policy_error_output(&error, warnings, files_input, bytes_input));
             }
         };
+    // Path selection chose which files to send by the policy it read; a
+    // different policy here would judge roots it never fetched.
+    let read = match policy.source() {
+        PolicySource::File { path, sha256 } => Some((path.as_str(), sha256.as_str())),
+        PolicySource::None | PolicySource::Bypassed => None,
+    };
+    // Selection returns no digest when it bypassed the file, so a digest
+    // with a bypassed session means the two sides disagree.
+    let expected = if options.policy_overrides.bypass { None } else { read.map(|(_, sha)| sha) };
+    if expected != options.policy_sha256.as_deref() {
+        let error = PolicyError::Invalid {
+            file: read.map_or(POLICY_FILE_NAMES[0], |(path, _)| path).to_string(),
+            key: String::new(),
+            message: "the policy content differs from the one path selection read: pass \
+                      selectHostedScanPaths' policySha256 and stream the same text"
+                .to_string(),
+        };
+        return Ok(policy_error_output(&error, warnings, files_input, bytes_input));
+    }
     for w in policy_warnings {
         warnings.push(EngineWarning::new(w.code, w.detail, None));
     }
@@ -466,7 +492,7 @@ async fn engine(
 
     let root_list: Vec<String> = match &options.project_roots {
         Some(roots) => roots.clone(),
-        None => roots::detect_roots_with(files.keys().map(String::as_str), ecosystems, false).0,
+        None => roots::detect_roots(files.keys().map(String::as_str), ecosystems).0,
     };
     // The full policy (paths from the file too) judges every root before
     // the project limit; roots named in `projectRoots` are explicit.
@@ -509,6 +535,7 @@ async fn engine(
         files.keys().map(String::as_str),
         &detected_roots,
         ecosystems,
+        &policy,
         &mut warnings,
     );
     let mut states: Vec<RootState> = root_list
@@ -1453,7 +1480,13 @@ mod tests {
             "src/Main.java",
         ];
         let mut out = Vec::new();
-        unrooted_unsupported_warnings(paths.into_iter(), &["web".to_string()], None, &mut out);
+        unrooted_unsupported_warnings(
+            paths.into_iter(),
+            &["web".to_string()],
+            None,
+            socket_patch_core::policy::builtin_defaults(),
+            &mut out,
+        );
         assert_eq!(out.len(), 2);
         assert!(out
             .iter()
@@ -1473,6 +1506,7 @@ mod tests {
             paths.into_iter(),
             &[],
             Some(&["npm".to_string()]),
+            socket_patch_core::policy::builtin_defaults(),
             &mut filtered,
         );
         assert!(filtered.is_empty());

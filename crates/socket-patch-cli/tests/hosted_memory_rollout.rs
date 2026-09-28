@@ -229,6 +229,55 @@ async fn memory(
     run_engine(server, build_input(files, &[], o)).await
 }
 
+/// [`memory`] through two-phase path selection, as a host with a root
+/// socket.yml runs it: select with the policy text, fetch what selection
+/// asks for, then pass its `policyPaths` / `policySha256` to the session.
+async fn memory_selected(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    mut o: HostedScanOptions,
+) -> HostedScanOutput {
+    use socket_patch_cli::hosted_memory::{select_paths, PolicyFileInput, SelectOptions, TreeEntryInput};
+    let entries: Vec<TreeEntryInput> = files
+        .iter()
+        .map(|(p, bytes)| TreeEntryInput {
+            path: p.clone(),
+            mode: "100644".into(),
+            kind: "blob".into(),
+            size: Some(bytes.len() as u64),
+        })
+        .collect();
+    let policy_files: Vec<PolicyFileInput> = ["socket.yml", "socket.yaml"]
+        .iter()
+        .filter_map(|name| {
+            files.get(*name).map(|bytes| PolicyFileInput {
+                path: name.to_string(),
+                text: Some(String::from_utf8(bytes.clone()).unwrap()),
+                missing: None,
+            })
+        })
+        .collect();
+    let selection = select_paths(
+        &entries,
+        &SelectOptions {
+            policy_files: Some(policy_files),
+            no_socket_yml: o.no_socket_yml,
+            ..SelectOptions::default()
+        },
+    );
+    assert!(selection.policy_error.is_none(), "{:?}", selection.policy_error);
+    let fetched: BTreeMap<String, Vec<u8>> = selection
+        .fetch_text
+        .iter()
+        .chain(selection.fetch_binary.iter())
+        .map(|p| (p.clone(), files[p].clone()))
+        .collect();
+    let present: Vec<&str> = selection.present_only.iter().map(String::as_str).collect();
+    o.policy_paths = Some(selection.policy_paths.clone());
+    o.policy_sha256 = selection.policy_sha256.clone();
+    run_engine(server, build_input(&fetched, &present, o)).await
+}
+
 /// `files` with the engine's changed files applied: the next run's input.
 fn apply(files: &BTreeMap<String, Vec<u8>>, out: &HostedScanOutput) -> BTreeMap<String, Vec<u8>> {
     let mut next = files.clone();
@@ -393,7 +442,7 @@ async fn socket_yml_policy_and_cap_converge_on_disk_and_in_memory() {
     let mut mem_files = files.clone();
     let mut disk_files = files.clone();
     for (run, want) in expected.iter().enumerate() {
-        let mem = memory(&server, &mem_files, options(None)).await;
+        let mem = memory_selected(&server, &mem_files, options(None)).await;
         assert_eq!(
             mem.rollout["maxNewPatches"],
             json!({ "value": 2, "source": "file" }),
@@ -437,7 +486,7 @@ async fn socket_yml_policy_and_cap_converge_on_disk_and_in_memory() {
     // Memory ranks every root in one queue: legacy's critical e goes first.
     let mut o = options(Some(1));
     o.no_socket_yml = Some(true);
-    let mem = memory(&server, &mem_files, o).await;
+    let mem = memory_selected(&server, &mem_files, o).await;
     assert_eq!(
         mem.rollout["maxNewPatches"],
         json!({ "value": 1, "source": "flag" })

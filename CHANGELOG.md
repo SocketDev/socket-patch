@@ -573,8 +573,7 @@ into the new version's section — see docs/releasing.md.
   detected roots (which used to skip them through a hard-coded, case-
   sensitive segment list). A directory you name (`--cwd`, a literal PATH,
   `projectRoots`) is not affected; `ignorePaths: ["!/e2e/tests/"]`
-  re-includes one (in memory only when the host streamed that root's
-  files: `selectHostedScanPaths` applies the defaults).
+  re-includes one, in memory too.
 - **An invalid socket.yml fails scan.** An unparseable file, a misspelled
   top-level `patches` key (`Patches`, `patchs`), a top-level merge or
   aliased key, an invalid `patches` block (unknown key, wrong type, bad glob, `patches`
@@ -624,9 +623,12 @@ into the new version's section — see docs/releasing.md.
   top-level `policy` block (`source`, `sha256`, `minSeverity`, `filtered[]`,
   `retained[]`) and the human output a `Policy (socket.yml): …` line that
   names every skipped project and every critical/high patch the severity
-  floor held back. The in-memory engine takes
-  `noSocketYml` / `minSeverity` / `policyPaths`, `selectHostedScanPaths`
-  returns `policyPaths`, and the result carries `policy` or `policyError`.
+  floor held back. In memory, selection is two-phase:
+  `selectHostedScanPaths` takes the root policy files' text
+  (`policyFiles`) and `noSocketYml`, applies the full path policy and
+  returns `policyPaths`, `policySha256` and `policyError`; the session
+  takes `noSocketYml` / `minSeverity` / `policyPaths` / `policySha256` and
+  its result carries `policy` or `policyError`.
   `get` ignores the policy and warns `policy_bypassed`.
 
 - **`scan --package <name|purl>`** (repeatable or comma-separated, env

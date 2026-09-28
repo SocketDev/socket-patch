@@ -54,21 +54,8 @@ pub(crate) const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
 /// Directory names whose subtrees never hold a project root: installed
 /// trees, VCS and tool state, and vendored dependencies. Structural, so no
 /// policy can negate them. (Test and fixture trees are the socket.yml
-/// policy's overridable built-in ignores: [`default_ignored_dir`].)
+/// policy's overridable built-in ignores.)
 pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 5] = ["node_modules", ".git", ".socket", ".yarn", "vendor"];
-
-/// Whether `dir` (repo-relative) is under a built-in default ignore of the
-/// socket.yml policy (`test/`, `tests/`, `fixtures/`, …, any case).
-pub(crate) fn default_ignored_dir(dir: &str) -> bool {
-    !dir.is_empty()
-        && socket_patch_core::policy::builtin_defaults()
-            .admits_root(&socket_patch_core::policy::Root {
-                rel_dir: dir,
-                markers: &[],
-                explicit: false,
-            })
-            .is_err()
-}
 
 /// The marker basenames of `root` among `paths` (the files the policy's
 /// path filters test for that root).
@@ -124,23 +111,12 @@ fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
     ecosystems.is_none_or(|list| list.iter().any(|e| e == eco))
 }
 
-/// The detected roots (sorted) and the marker paths that did not make one,
-/// with the policy's built-in default ignores applied (path selection,
-/// which cannot see socket.yml's content).
+/// The detected roots (sorted) and the marker paths that did not make one.
+/// The socket.yml path policy (built-in default ignores included) is the
+/// caller's to apply.
 pub(crate) fn detect_roots<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     ecosystems: Option<&[String]>,
-) -> (Vec<String>, Vec<IgnoredPath>) {
-    detect_roots_with(paths, ecosystems, true)
-}
-
-/// [`detect_roots`]; `apply_defaults: false` leaves the built-in default
-/// ignores to the caller (the session applies the full policy, whose
-/// negations can re-include a default-ignored root).
-pub(crate) fn detect_roots_with<'a>(
-    paths: impl IntoIterator<Item = &'a str>,
-    ecosystems: Option<&[String]>,
-    apply_defaults: bool,
 ) -> (Vec<String>, Vec<IgnoredPath>) {
     let mut ignored: Vec<IgnoredPath> = Vec::new();
     let mut markers: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
@@ -185,20 +161,6 @@ pub(crate) fn detect_roots_with<'a>(
         .collect();
     let mut roots: Vec<String> = Vec::new();
     for dir in markers.keys() {
-        let marker_names: Vec<String> = marker_paths
-            .get(dir)
-            .into_iter()
-            .flatten()
-            .map(|p| split_path(p).1.to_string())
-            .collect();
-        let default_ignored = apply_defaults
-            && socket_patch_core::policy::builtin_defaults()
-            .admits_root(&socket_patch_core::policy::Root {
-                rel_dir: dir,
-                markers: &marker_names,
-                explicit: false,
-            })
-            .is_err();
         let rush_internal = rush_roots.iter().any(|r| {
             let internal = |sub: &str| join_root(r, sub);
             *dir == internal("common/config/rush")
@@ -206,23 +168,15 @@ pub(crate) fn detect_roots_with<'a>(
                 || *dir == internal("common/temp")
                 || dir.starts_with(&format!("{}/", internal("common/temp")))
         });
-        let reason = if default_ignored {
-            Some("policy_path_excluded")
-        } else if rush_internal {
-            Some("rush_internal")
-        } else {
-            None
-        };
-        match reason {
-            Some(reason) => {
-                for path in marker_paths.get(dir).into_iter().flatten() {
-                    ignored.push(IgnoredPath {
-                        path: path.clone(),
-                        reason: reason.to_string(),
-                    });
-                }
+        if rush_internal {
+            for path in marker_paths.get(dir).into_iter().flatten() {
+                ignored.push(IgnoredPath {
+                    path: path.clone(),
+                    reason: "rush_internal".to_string(),
+                });
             }
-            None => roots.push(dir.clone()),
+        } else {
+            roots.push(dir.clone());
         }
     }
     roots.sort();
@@ -265,26 +219,14 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(found, vec!["docs"]);
-        assert_eq!(ignored.len(), 4);
-        let reason = |path: &str| ignored.iter().find(|i| i.path == path).unwrap().reason.clone();
-        assert_eq!(reason("node_modules/x/package-lock.json"), "excluded_dir");
-        assert_eq!(reason("a/vendor/b/composer.lock"), "excluded_dir");
-        assert_eq!(reason(".socket/vendor/npm/package-lock.json"), "excluded_dir");
-        // Test/fixture trees are the policy's overridable built-in ignores.
-        assert_eq!(reason("test/fixtures/yarn.lock"), "policy_path_excluded");
+        // Test and fixture trees are left to the socket.yml path policy.
+        assert_eq!(found, vec!["docs", "test/fixtures"]);
+        assert_eq!(ignored.len(), 3);
+        assert!(ignored.iter().all(|i| i.reason == "excluded_dir"));
     }
 
     #[test]
-    fn default_ignores_are_case_insensitive_and_marker_based() {
-        let (found, _) = detect_roots(
-            ["Tests/app/yarn.lock", "e2e/testdata/go.mod", "apps/testing/package-lock.json"],
-            None,
-        );
-        assert_eq!(found, vec!["apps/testing"]);
-        assert!(default_ignored_dir("a/__fixtures__"));
-        assert!(!default_ignored_dir(""));
-        assert!(!default_ignored_dir("apps/testing"));
+    fn root_markers_name_every_marker_of_the_root_only() {
         assert_eq!(
             root_markers("a", ["a/yarn.lock", "a/package.json", "a/b/yarn.lock", "a/pom.xml"]),
             vec!["pom.xml".to_string(), "yarn.lock".to_string()]

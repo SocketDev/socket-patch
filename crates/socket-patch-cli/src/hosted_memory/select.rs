@@ -14,10 +14,18 @@ use socket_patch_core::constants::npm_family::{
 use socket_patch_core::patch::redirect::npmrc::NPMRC_REL;
 use socket_patch_core::utils::python_lock::is_python_lock_name;
 
-use super::roots::{
-    detect_roots, split_path, strip_root, EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS,
+use socket_patch_core::policy::{
+    MemoryPolicyFs, PolicyOverrides, PolicySource, Root, RootFile, SelectionPolicy, POLICY_FILE_NAMES,
+    SOCKET_YML_INVALID,
 };
-use super::types::{IgnoredPath, PathSelection, SelectOptions, TreeEntryInput};
+
+use super::roots::{
+    detect_roots, join_root, root_markers, split_path, strip_root, EXCLUDED_ROOT_SEGMENTS,
+    UNSUPPORTED_MARKERS,
+};
+use super::types::{
+    IgnoredPath, PathSelection, PolicyErrorInfo, PolicyFileInput, SelectOptions, TreeEntryInput,
+};
 use crate::commands::scan::hosted::{PNPM_WORKSPACE_REL, REDIRECT_CANDIDATE_FILES};
 
 /// Most entries [`PathSelection::ignored_sample`] carries.
@@ -166,9 +174,60 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
     None
 }
 
+/// The listed root policy files with the text the caller fetched first. A
+/// listed file with no text (not passed, `missing`, or a symlink) is present
+/// without content, so loading it fails closed.
+fn selection_policy_fs(blobs: &BTreeMap<String, bool>, supplied: &[PolicyFileInput]) -> MemoryPolicyFs {
+    let mut fs = MemoryPolicyFs::default();
+    for name in POLICY_FILE_NAMES {
+        let Some(&symlink) = blobs.get(name) else {
+            continue;
+        };
+        let text = supplied
+            .iter()
+            .find(|f| f.path == name && !f.missing.unwrap_or(false))
+            .and_then(|f| f.text.as_ref());
+        let file = match text {
+            Some(text) if !symlink => RootFile::Present(text.as_bytes().to_vec()),
+            _ => RootFile::PresentWithoutContent,
+        };
+        fs.files.insert(name.to_string(), file);
+        fs.root_names.push(name.to_string());
+    }
+    fs
+}
+
+/// The policy path selection applies, or why it cannot be honored.
+fn selection_policy(
+    blobs: &BTreeMap<String, bool>,
+    options: &SelectOptions,
+) -> Result<SelectionPolicy, PolicyErrorInfo> {
+    let supplied = options.policy_files.as_deref().unwrap_or_default();
+    if let Some(bad) = supplied.iter().find(|f| !POLICY_FILE_NAMES.contains(&f.path.as_str())) {
+        return Err(PolicyErrorInfo {
+            code: SOCKET_YML_INVALID.to_string(),
+            detail: format!(
+                "policyFiles entry `{}` is not a root socket.yml or socket.yaml",
+                socket_patch_core::policy::sanitize(&bad.path)
+            ),
+        });
+    }
+    let overrides = PolicyOverrides {
+        bypass: options.no_socket_yml.unwrap_or(false),
+        min_severity: None,
+    };
+    SelectionPolicy::load(&selection_policy_fs(blobs, supplied), &overrides)
+        .map(|(policy, _)| policy)
+        .map_err(|e| PolicyErrorInfo {
+            code: e.code().to_string(),
+            detail: e.detail(),
+        })
+}
+
 /// `selectHostedScanPaths`: roots (detected, or `options.projectRoots`)
-/// plus the files to stream for them. Only `blob` entries are files; mode
-/// `120000` is a symbolic link and is reported, never fetched.
+/// that the repo's socket.yml path policy admits, plus the files to stream
+/// for them. Only `blob` entries are files; mode `120000` is a symbolic link
+/// and is reported, never fetched.
 pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> PathSelection {
     let mut ignored: Vec<IgnoredPath> = Vec::new();
     let mut blobs: BTreeMap<String, bool> = BTreeMap::new();
@@ -187,7 +246,27 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         }
     }
 
-    let roots: Vec<String> = match &options.project_roots {
+    let policy_paths: Vec<String> = POLICY_FILE_NAMES
+        .iter()
+        .filter(|name| blobs.contains_key(**name))
+        .map(|name| name.to_string())
+        .collect();
+    let policy = match selection_policy(&blobs, options) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return PathSelection {
+                policy_paths,
+                policy_error: Some(error),
+                ..PathSelection::default()
+            }
+        }
+    };
+    let policy_sha256 = match policy.source() {
+        PolicySource::File { sha256, .. } => Some(sha256.clone()),
+        PolicySource::None | PolicySource::Bypassed => None,
+    };
+
+    let candidate_roots: Vec<String> = match &options.project_roots {
         Some(requested) => {
             let mut out: BTreeSet<String> = BTreeSet::new();
             for root in requested {
@@ -212,6 +291,35 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
             found
         }
     };
+    // The same root filter the session applies, so a socket.yml negation
+    // of a built-in ignore brings that tree's files in here too. An
+    // excluded root is reported here, not streamed: its markers would
+    // count against the session's file limit.
+    let explicit = options.project_roots.is_some();
+    let mut roots: Vec<String> = Vec::with_capacity(candidate_roots.len());
+    for root in candidate_roots {
+        let markers = root_markers(&root, blobs.keys().map(String::as_str));
+        match policy.admits_root(&Root {
+            rel_dir: &root,
+            markers: &markers,
+            explicit,
+        }) {
+            Ok(()) => roots.push(root),
+            Err(reason) => {
+                let paths: Vec<String> = if markers.is_empty() {
+                    vec![root.clone()]
+                } else {
+                    markers.iter().map(|m| join_root(&root, m)).collect()
+                };
+                for path in paths {
+                    ignored.push(IgnoredPath {
+                        path,
+                        reason: reason.code().to_string(),
+                    });
+                }
+            }
+        }
+    }
     let root_set: BTreeSet<&str> = roots.iter().map(String::as_str).collect();
 
     let mut per_root: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -239,7 +347,7 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
             let Some(need) = classify(rel, files) else {
                 continue;
             };
-            let full = super::roots::join_root(root, rel);
+            let full = join_root(root, rel);
             let slot = needs.entry(full).or_insert(need);
             *slot = (*slot).min(need);
         }
@@ -259,26 +367,28 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
                 && !dir
                     .split('/')
                     .any(|seg| EXCLUDED_ROOT_SEGMENTS.contains(&seg))
-                && !super::roots::default_ignored_dir(dir)
+                && policy
+                    .admits_root(&Root {
+                        rel_dir: dir,
+                        markers: &[base.to_string()],
+                        explicit: false,
+                    })
+                    .is_ok()
         });
         if let Some(path) = first {
             needs.entry(path.clone()).or_insert(Need::Present);
         }
     }
 
-    // The repo-root policy files: always streamed when listed (a symlinked
-    // one lands in `symlinks`, and the session then fails closed on it).
-    let mut policy_paths: Vec<String> = Vec::new();
-    for name in socket_patch_core::policy::POLICY_FILE_NAMES {
-        if blobs.contains_key(name) {
-            needs.entry(name.to_string()).or_insert(Need::Text);
-            policy_paths.push(name.to_string());
-        }
+    // The session reads the same policy text again.
+    for name in &policy_paths {
+        needs.entry(name.clone()).or_insert(Need::Text);
     }
 
     let mut selection = PathSelection {
         roots,
         policy_paths,
+        policy_sha256,
         ..PathSelection::default()
     };
     for (path, need) in needs {
@@ -441,6 +551,7 @@ mod tests {
             &SelectOptions {
                 project_roots: None,
                 ecosystems: Some(vec!["npm".into()]),
+                ..SelectOptions::default()
             },
         );
         assert!(s.present_only.is_empty());
@@ -454,6 +565,7 @@ mod tests {
             &SelectOptions {
                 project_roots: Some(vec!["b/".into(), "../x".into()]),
                 ecosystems: None,
+                ..SelectOptions::default()
             },
         );
         assert_eq!(s.roots, vec!["b"]);

@@ -34,6 +34,7 @@ pub(crate) struct ResolvedOptions {
     pub(crate) in_flight: std::collections::BTreeSet<String>,
     pub(crate) policy_overrides: socket_patch_core::policy::PolicyOverrides,
     pub(crate) policy_paths: Vec<String>,
+    pub(crate) policy_sha256: Option<String>,
 }
 
 impl ResolvedOptions {
@@ -156,6 +157,7 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
             .collect(),
         policy_overrides,
         policy_paths,
+        policy_sha256: options.policy_sha256.clone(),
     })
 }
 

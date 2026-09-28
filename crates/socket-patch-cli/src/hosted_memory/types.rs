@@ -111,6 +111,10 @@ pub struct HostedScanOptions {
     /// content, or the session fails with `policyError`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_paths: Option<Vec<String>>,
+    /// The `policySha256` path selection returned: the session fails with
+    /// `policyError` when the policy it reads differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_sha256: Option<String>,
     /// The run-wide cap on NEW patches (`scan --max-new-patches`); absent
     /// or `"none"` is unlimited, 0 admits upgrades only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -410,6 +414,24 @@ pub struct SelectOptions {
     pub project_roots: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ecosystems: Option<Vec<String>>,
+    /// One entry per root socket.yml / socket.yaml the listing holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_files: Option<Vec<PolicyFileInput>>,
+    /// Must match the session's `noSocketYml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_socket_yml: Option<bool>,
+}
+
+/// `SelectOptions.policyFiles` entry: the root policy file's text, or
+/// `missing: true` when the host could not fetch it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyFileInput {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +457,13 @@ pub struct PathSelection {
     /// the session's `policyPaths`).
     #[serde(default)]
     pub policy_paths: Vec<String>,
+    /// The policy file the selection applied (`null` without one): pass it
+    /// back as the session's `policySha256`.
+    #[serde(default)]
+    pub policy_sha256: Option<String>,
+    /// A socket.yml that cannot be honored: nothing is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_error: Option<PolicyErrorInfo>,
 }
 
 /// Engine failure (`finish()` rejection codes).

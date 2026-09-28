@@ -10,8 +10,13 @@ export interface PathSelection {
   ignoredCount: number
   ignoredSample: { path: string; reason: string }[]   // ≤100
   policyPaths: string[]        // root socket.yml / socket.yaml the tree lists (also in fetchText or symlinks); pass back as the session's policyPaths
+  policySha256: string | null  // the policy file selection applied (null: none, empty, or noSocketYml); pass back as the session's policySha256
+  policyError?: { code: 'socket_yml_invalid' | 'socket_yml_ambiguous'; detail: string }   // nothing selected
 }
-export function selectHostedScanPaths(entries: TreeEntryInput[], options?: { projectRoots?: string[]; ecosystems?: Ecosystem[] }): PathSelection
+// Fetch every root socket.yml / socket.yaml the listing holds first and pass it in policyFiles: selection applies the full socket.yml path policy.
+// text must decode losslessly (buffer.toString('utf8'); TextDecoder drops a BOM and the session then sees different content). Excluded roots are reported in ignoredSample, not streamed.
+export type PolicyFileInput = { path: string; text: string } | { path: string; missing: true }
+export function selectHostedScanPaths(entries: TreeEntryInput[], options?: { projectRoots?: string[]; ecosystems?: Ecosystem[]; policyFiles?: PolicyFileInput[]; noSocketYml?: boolean }): PathSelection
 export function hostedScanCandidateFiles(): string[]    // debug listing only
 export function engineVersion(): string                  // "<crate version>+<git sha or 'unknown'>"
 
@@ -55,6 +60,7 @@ export interface HostedScanSessionOptions {
   noSocketYml?: boolean            // ignore the repo's socket.yml (built-in test/fixture ignores still apply); default false
   minSeverity?: 'critical' | 'high' | 'medium' | 'moderate' | 'low' | 'none'   // beats socket.yml patches.minSeverity
   policyPaths?: string[]           // selectHostedScanPaths' policyPaths; each must be streamed with content or the session returns policyError
+  policySha256?: string            // selectHostedScanPaths' policySha256; a policy file that differs (or arrives without it) is a policyError
 }
 export class HostedScanSession {
   constructor(options: HostedScanSessionOptions, provider: PatchProvider)

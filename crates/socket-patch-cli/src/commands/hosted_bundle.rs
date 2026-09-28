@@ -63,6 +63,8 @@ struct Bundle {
     #[serde(default)]
     policy_paths: Option<Vec<String>>,
     #[serde(default)]
+    policy_sha256: Option<String>,
+    #[serde(default)]
     max_new_patches: Option<crate::hosted_memory::MaxNewPatchesOption>,
     #[serde(default)]
     max_new_patches_cap: Option<u32>,
@@ -139,6 +141,7 @@ pub async fn run(args: HostedBundleArgs) -> i32 {
         no_socket_yml: bundle.no_socket_yml,
         min_severity: bundle.min_severity.clone(),
         policy_paths: bundle.policy_paths.clone(),
+        policy_sha256: bundle.policy_sha256.clone(),
         max_new_patches: bundle.max_new_patches,
         max_new_patches_cap: bundle.max_new_patches_cap,
         in_flight_patches: bundle.in_flight_patches.clone(),
