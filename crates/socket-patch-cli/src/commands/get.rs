@@ -430,23 +430,6 @@ pub struct GetArgs {
     )]
     pub save_only: bool,
 
-    /// Apply the patch without saving it to the .socket folder (not yet
-    /// implemented).
-    // Hidden: it always fails with "not yet implemented" (see `run`), but
-    // stays parseable so scripts and `SOCKET_ONE_OFF` keep getting that
-    // explicit error instead of a clap parse failure.
-    // `value_parser = parse_bool_flag`: same reason as `--save-only` above —
-    // and `SOCKET_ONE_OFF` is shared with `rollback --one-off`, which parses
-    // boolishly too; the two must not diverge.
-    #[arg(
-        long = "one-off",
-        env = "SOCKET_ONE_OFF",
-        default_value_t = false,
-        value_parser = crate::args::parse_bool_flag,
-        hide = true,
-    )]
-    pub one_off: bool,
-
     /// Download patches for every release variant of a matched package,
     /// not just the one matching the locally-installed distribution.
     ///
@@ -2565,13 +2548,6 @@ pub async fn run(args: GetArgs) -> i32 {
         );
         return 2;
     }
-    if args.one_off && args.save_only {
-        report_error(
-            args.common.json,
-            "--one-off and --save-only cannot be used together",
-        );
-        return 2;
-    }
     // v5: hosted by default, like scan. `--save-only` (records a manifest
     // entry) and global installs (no project lockfile) mean agent mode.
     // Usage errors exit 2, like clap's and scan's (v5.0).
@@ -2590,14 +2566,6 @@ pub async fn run(args: GetArgs) -> i32 {
                 mode.cli_name()
             ),
         );
-        return 2;
-    }
-    if args.one_off {
-        // The flag parses but is not implemented: fail loudly rather than
-        // save to the manifest anyway. Mirrors `rollback --one-off`'s
-        // not-yet-implemented contract; rejected before any network or disk
-        // activity.
-        report_error(args.common.json, "One-off get mode is not yet implemented");
         return 2;
     }
     // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
@@ -5609,8 +5577,6 @@ mod tests {
             "parse_bool_flag",
             "No env binding",
             "locally- installed",
-            "SOCKET_ONE_OFF",
-            "--one-off",
         ] {
             assert!(!help.contains(leak), "get --help leaks {leak:?}:\n{help}");
         }

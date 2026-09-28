@@ -27,7 +27,6 @@ fn run_get(cwd: &Path, args: &[&str]) -> (i32, String) {
     }
     for var in [
         "SOCKET_SAVE_ONLY",
-        "SOCKET_ONE_OFF",
         "SOCKET_ALL_RELEASES",
         "SOCKET_PATCH_API_URL",
         "SOCKET_PATCH_API_TOKEN",

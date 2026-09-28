@@ -537,7 +537,6 @@ fn rollback_args(cwd: &Path, api_url: String, offline: bool) -> RollbackArgs {
             ecosystems: Some(vec!["gem".to_string()]),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
     }
 }
 
@@ -742,7 +741,6 @@ async fn rollback_all_over_broad_manifest_succeeds() {
             ecosystems: Some(vec!["gem".to_string()]),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
     };
     let code = rollback_run(rollback_args).await;
     assert_eq!(code, 0, "rollback-all over broad manifest should exit 0");

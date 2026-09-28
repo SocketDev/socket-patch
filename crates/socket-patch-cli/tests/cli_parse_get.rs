@@ -59,7 +59,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
     // GetArgs-specific
     "SOCKET_SAVE_ONLY",
-    "SOCKET_ONE_OFF",
     "SOCKET_ALL_RELEASES",
 ];
 
@@ -119,7 +118,7 @@ fn parse_get(extra: &[&str]) -> GetArgs {
 /// This is what makes the per-flag tests honest. A field-at-a-time assertion
 /// (`assert!(a.package)`) only proves the flag set *its* field; it says nothing
 /// about whether the same flag also flipped an unrelated one. A clap-derive
-/// copy/paste regression (e.g. `--package` accidentally wired to `one_off`)
+/// copy/paste regression (e.g. `--package` accidentally wired to `save_only`)
 /// would set both and still pass a single-field check. Comparing the whole
 /// snapshot against the independently-declared defaults — with only the field
 /// under test mutated — fails loudly the instant any other field moves.
@@ -154,7 +153,6 @@ struct Snap {
     ghsa: bool,
     package: bool,
     save_only: bool,
-    one_off: bool,
     all_releases: bool,
     mode: Option<socket_patch_cli::commands::scan::ScanMode>,
 }
@@ -190,7 +188,6 @@ fn snapshot(a: &GetArgs) -> Snap {
         ghsa: a.ghsa,
         package: a.package,
         save_only: a.save_only,
-        one_off: a.one_off,
         all_releases: a.all_releases,
         mode: a.mode,
     }
@@ -234,7 +231,6 @@ fn expected_defaults(identifier: &str) -> Snap {
         ghsa: false,
         package: false,
         save_only: false,
-        one_off: false,
         all_releases: false,
         mode: None,
     }
@@ -416,17 +412,6 @@ fn global_prefix_flag_sets_global_prefix() {
 
 #[test]
 #[serial_test::serial]
-fn one_off_flag_sets_one_off() {
-    let a = parse_get(&["some-id", "--one-off"]);
-    let mut want = expected_defaults("some-id");
-    want.one_off = true;
-    // `--one-off` and `--save-only` are semantic opposites; this guards that
-    // setting one does not also flip the other.
-    assert_eq!(snapshot(&a), want);
-}
-
-#[test]
-#[serial_test::serial]
 fn json_flag_sets_json() {
     let a = parse_get(&["some-id", "--json"]);
     let mut want = expected_defaults("some-id");
@@ -521,7 +506,7 @@ fn mode_hosted_parses() {
     let mut want = expected_defaults("some-id");
     want.mode = Some(socket_patch_cli::commands::scan::ScanMode::Hosted);
     // Full-snapshot equality: `--mode hosted` sets `mode` and nothing else
-    // (in particular it must NOT flip save_only/one_off or any GlobalArgs
+    // (in particular it must NOT flip save_only or any GlobalArgs
     // field — the runtime conflicts are run()'s job, not the parser's).
     assert_eq!(snapshot(&a), want);
 }
@@ -638,6 +623,17 @@ fn unknown_flag_errors() {
     let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--bogus"]) {
         Err(e) => e,
         Ok(_) => panic!("expected parse error for unknown flag"),
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+#[test]
+#[serial_test::serial]
+fn removed_one_off_flag_is_unknown() {
+    let _scrub = EnvScrub::new();
+    let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--one-off"]) {
+        Err(e) => e,
+        Ok(_) => panic!("expected parse error for the v5-removed --one-off"),
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }

@@ -110,7 +110,6 @@ fn default_rollback_args(cwd: &Path, eco: &str) -> RollbackArgs {
         },
         targets: Vec::new(),
         preserve_state: false,
-        one_off: false,
     }
 }
 
