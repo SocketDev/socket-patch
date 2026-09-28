@@ -10,8 +10,8 @@
 //!     → corrupt, rebuilt;
 //! (c) a planted regular file under the package's `node_modules/` →
 //!     corrupt (`vendor_inventory_mismatch`), rebuilt without it;
-//! (d) ledger deleted → reconstructed from `vlt-lock.json` (flavor `vlt`),
-//!     rebuilt member-verified, and its revert blocked by the unwired guard;
+//! (d) ledger deleted → the `vlt-lock.json` reference is reported
+//!     (`vendor_ledger_missing`), never reconstructed;
 //! (e) the orphan sweep keeps a lock-wired dir leaf and removes an
 //!     unreferenced one;
 //! (f) a deleted `<uuid>/.gitignore` is rewritten, no rebuild;
@@ -194,46 +194,34 @@ async fn vlt_repair_rebuilds_over_a_planted_file() {
 }
 
 #[tokio::test]
-async fn vlt_repair_reconstructs_the_ledger_from_the_lock() {
+async fn vlt_repair_reports_a_missing_ledger() {
     for lock in LOCKS {
         let mock = wiremock::MockServer::start().await;
         mount_patch_api(&mock).await;
-        super::mount_blob(&mock).await;
         let tmp = tempfile::tempdir().unwrap();
         write_fixture(tmp.path(), lock, None);
         vendor_project(tmp.path(), &mock.uri(), lock);
-        let inv = inventory(tmp.path());
+        let lock_bytes = std::fs::read(tmp.path().join("vlt-lock.json")).unwrap();
         std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-        let v = repair(tmp.path(), &mock.uri());
-        let entry = state(tmp.path())["entries"][PURL].clone();
-        assert_eq!(entry["flavor"], "vlt", "{lock:?}: {entry:#}\n{v}");
-        assert_eq!(entry["artifact"]["path"], rel(), "{lock:?}");
-        assert_eq!(
-            entry["artifact"]["fileInventory"], inv,
-            "{lock:?}: the fingerprint comes from a member-verified rebuild: {v}"
-        );
+        let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+        assert_eq!(code, 1, "{lock:?}: {stdout}\n{stderr}");
+        let v = parse_env(&stdout);
         assert!(
-            v["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|w| w["code"] == "vendor_wiring_unknown"),
+            events_of(&v).iter().any(|e| e["action"] == "failed"
+                && e["errorCode"] == "vendor_ledger_missing"
+                && e["uuid"] == UUID),
             "{lock:?}: {v}"
         );
-        let (code, stdout, _) = common::run_with_env(
-            tmp.path(),
-            &["vendor", "--revert", "--json"],
-            &[("SOCKET_TELEMETRY_DISABLED", "1")],
-        );
-        let r = parse_env(&stdout);
-        assert_ne!(code, 0, "{lock:?}: {r}");
         assert!(
-            events_of(&r)
-                .iter()
-                .any(|e| e["errorCode"] == "vendor_wiring_unknown_revert_blocked"),
-            "{lock:?}: the unwired guard: {r}"
+            !tmp.path().join(".socket/vendor/state.json").exists(),
+            "{lock:?}: no ledger synthesized"
         );
-        assert!(tmp.path().join(rel()).join("index.js").is_file());
+        assert_eq!(
+            std::fs::read(tmp.path().join("vlt-lock.json")).unwrap(),
+            lock_bytes,
+            "{lock:?}"
+        );
+        assert!(tmp.path().join(rel()).join("index.js").is_file(), "{lock:?}");
     }
 }
 
@@ -339,14 +327,13 @@ async fn vlt_repair_keeps_a_devdependency_stripped_manifest_healthy() {
 
 /// `package.json` edited back to the registry spec since vendoring: only
 /// `vlt-lock.json` names the vendored dir. The orphan sweep keeps it, and
-/// a ledger-less repair finds the reference and refuses the out-of-sync
-/// declaration instead of dropping the dir.
+/// a ledger-less repair finds the reference and reports the missing ledger
+/// instead of dropping the dir.
 #[tokio::test]
 async fn vlt_lock_only_reference_is_kept_and_judged() {
     for lock in LOCKS {
         let mock = wiremock::MockServer::start().await;
         mount_patch_api(&mock).await;
-        super::mount_blob(&mock).await;
         let tmp = tempfile::tempdir().unwrap();
         write_fixture(tmp.path(), lock, None);
         let registry_pkg = std::fs::read(tmp.path().join("package.json")).unwrap();
@@ -375,23 +362,21 @@ async fn vlt_lock_only_reference_is_kept_and_judged() {
         let v = parse_env(&stdout);
         assert!(
             events_of(&v).iter().any(|e| e["action"] == "failed"
-                && e["purl"] == PURL
-                && e["errorCode"] == "vendor_vlt_lock_out_of_sync"),
-            "{lock:?}: the lock-only reference is found and judged: {v}"
+                && e["uuid"] == UUID
+                && e["errorCode"] == "vendor_ledger_missing"),
+            "{lock:?}: the lock-only reference is found and reported: {v}"
         );
         assert!(dir.join("index.js").is_file(), "{lock:?}: {v}");
     }
 }
 
-/// A must-verify rebuild (a pnpm-wired entry reconstructed from its lock
-/// integrity) in a project that also carries `vlt-lock.json`: the vlt
-/// backend drives the re-wire, the rebuilt artifact fails the post-verify,
-/// and every wiring file, vlt's included, is put back byte-for-byte.
+/// A ledger-less pnpm-wired project that also carries `vlt-lock.json`:
+/// repair reports the missing ledger and touches no wiring file, vlt's
+/// included.
 #[tokio::test]
-async fn vlt_wiring_files_are_restored_after_a_failed_post_verify() {
+async fn vlt_wiring_files_are_untouched_by_a_ledger_less_repair() {
     let mock = wiremock::MockServer::start().await;
     mount_patch_api(&mock).await;
-    super::mount_blob(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     super::write_fixture(root, super::Flavor::Pnpm);
@@ -419,20 +404,20 @@ async fn vlt_wiring_files_are_restored_after_a_failed_post_verify() {
         .collect();
     std::fs::remove_dir_all(root.join(".socket/vendor")).unwrap();
 
-    let (code, stdout, stderr) = run_cli(root, &mock.uri(), &["repair", "--download-mode", "file"]);
+    let (code, stdout, stderr) = run_cli(root, &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "{stdout}\n{stderr}");
     let v = parse_env(&stdout);
     assert!(
         events_of(&v)
             .iter()
-            .any(|e| e["action"] == "failed" && e["purl"] == PURL),
+            .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_ledger_missing"),
         "{v}"
     );
     for (file, bytes) in files.iter().zip(&before) {
         assert_eq!(
             &std::fs::read(root.join(file)).unwrap(),
             bytes,
-            "{file} is restored: {v}"
+            "{file} is untouched: {v}"
         );
     }
     assert!(

@@ -81,7 +81,7 @@ pub async fn run(args: RepairArgs) -> i32 {
         let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
         if !has_vendor_traces {
             let refs =
-                crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await;
+                crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd).await;
             has_vendor_traces = !refs.is_empty();
             vendor_references = Some(refs);
         }
@@ -151,7 +151,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     // scanned this ledger-less project.
     let vendor_references = match vendor_references {
         Some(refs) => refs,
-        None => crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await,
+        None => crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd).await,
     };
 
     // The API client is built lazily: `repair_inner` constructs it only on
@@ -515,9 +515,10 @@ async fn repair_inner(
     let ledger = socket_patch_core::vendor::load_state(&args.common.cwd).await;
     let no_entries = std::collections::HashMap::new();
     let vendor_entries = ledger.as_ref().map(|s| &s.entries).unwrap_or(&no_entries);
-    // Lockfile vendor references count as vendored even before the ledger
-    // is reconstructed, so a no-ledger repair doesn't download sources for
-    // entries the vendored phase is about to own.
+    // Lockfile vendor references count as vendored even with no ledger
+    // entry: the committed artifact is the patch, so a no-ledger repair
+    // must not litter `.socket/` with sources for it (the vendored phase
+    // reports the missing ledger instead).
     let referenced_uuids: std::collections::HashSet<String> = vendor_references
         .iter()
         .map(|(_, uuid, _)| uuid.clone())
@@ -592,19 +593,25 @@ async fn repair_inner(
     downloaded_count += primary.downloaded;
     download_failed_count += primary.failed;
 
-    // Step 1.5: vendored artifacts — health-check the ledger (and any
-    // lockfile vendor references with no ledger coverage) and rebuild
-    // missing/corrupt artifacts. Runs under `--download-only` too:
+    // Step 1.5: vendored artifacts — health-check the ledger and re-vendor
+    // missing/corrupt artifacts through the vendored backend (the patch
+    // service first, like `vendor`); lockfile vendor references with no
+    // ledger entry are reported. Runs under `--download-only` too:
     // restoring artifacts IS repair's download half. The reference scan
     // and ledger load above are handed over, not repeated.
-    let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts_with_references(
+    let vendor_rebuilt = crate::commands::vendored_backend::VendoredBackend::new(
         &args.common,
-        manifest.as_ref(),
-        &socket_dir,
+        None,
+    )
+    .repair(
+        crate::commands::vendored_backend::repair::RepairRequest {
+            manifest: manifest.as_ref(),
+            socket_dir: &socket_dir,
+            references: &vendor_references,
+            ledger,
+            client: client.as_ref(),
+        },
         &mut env,
-        &vendor_references,
-        ledger,
-        client.as_ref(),
     )
     .await;
     if !quiet && vendor_rebuilt > 0 {

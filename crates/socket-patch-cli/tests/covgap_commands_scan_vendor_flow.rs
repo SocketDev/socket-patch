@@ -7,7 +7,7 @@
 //!   `scan_vendor_e2e.rs`);
 //! * the legal-but-never-executed `--dry-run --prune` combination in the
 //!   vendor JSON path (GC preview field names, nothing mutated);
-//! * every error constructor of `run_scan_vendor_step` — `lock_held`,
+//! * every error constructor of `run_vendor_step` — `lock_held`,
 //!   `lock_io` (a directory squatting on `apply.lock`; a file squatting on
 //!   `.socket` itself) and `no_local_source` — through the JSON error fold
 //!   (a lock failure precedes the step and carries NO `vendor` key; a
