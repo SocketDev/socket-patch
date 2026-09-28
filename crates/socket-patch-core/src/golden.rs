@@ -114,6 +114,7 @@ impl Golden {
     {
         self.cases += 1;
         if self.chunk == 1 {
+            let key = key.to_string().replace(char::is_whitespace, "_");
             self.lines
                 .push(format!("{key} {} {}", digest(input), digest(output)));
             return;
