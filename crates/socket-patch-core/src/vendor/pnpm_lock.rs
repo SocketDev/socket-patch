@@ -72,6 +72,13 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
+use crate::formats::pnpm::{
+    check_v9_lock_version as check_lock_version, vendored_npm_uuids,
+};
+use crate::formats::pnpm::lines::{
+    indent_of, next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
+    yaml_key_like, YamlBlock,
+};
 
 const PACKAGE_JSON: &str = "package.json";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
@@ -82,10 +89,6 @@ const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
 /// no-op that cannot accidentally glob a stray `packages/` subtree into a
 /// workspace the way `packages/*` would.
 const WS_SCAFFOLD_PACKAGES: [&str; 2] = ["packages:", "  - '.'"];
-
-/// The only lockfileVersion the surgery has byte-exact fixtures for (both
-/// pnpm 9 and 10 emit it).
-const SUPPORTED_LOCK_VERSION: &str = "9.0";
 
 /// Wiring kinds (the `WiringRecord.kind` discriminators this backend owns).
 pub(super) const KIND_PKG_OVERRIDE: &str = "pnpm_pkg_override";
@@ -559,48 +562,12 @@ pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Opti
     if check_lock_version(&text).is_err() {
         return None;
     }
-    // CRLF (a Windows autocrlf checkout) breaks every structural probe
-    // below: the scan would find nothing and call a lock that still
-    // resolves through the artifact "provably orphaned" — undeterminable,
-    // keep (the unwired-revert guard then refuses, fail-closed).
-    if text.contains('\r') {
-        return None;
-    }
     // Every `packages:`/`snapshots:` block key resolving into
-    // `.socket/vendor/npm/<uuid>/`, collected once per lock bytes (see
-    // [`LockIndex`]) once these bytes are probed again; the first probe
-    // runs [`pnpm_entry_in_use_scan`], the per-call scan it answers for.
-    let doc = LOCK_MEMO.parse_infallible(text.as_bytes(), || LockDoc::new(split_lines(&text)));
-    doc.note_probe();
-    Some(match doc.index() {
-        Some(index) => index.vendored_npm_uuids.contains(&entry.uuid),
-        None => pnpm_entry_in_use_scan(&entry.uuid, &doc.lines),
-    })
-}
-
-/// The pre-index [`pnpm_entry_in_use`] body over already-split lines: the
-/// answer for a lock probed once, and the equivalence oracle for the
-/// indexed answer.
-fn pnpm_entry_in_use_scan(uuid: &str, lines: &[String]) -> bool {
-    for section in ["packages", "snapshots"] {
-        let Some((start, end)) = section_bounds(lines, section) else {
-            continue;
-        };
-        let mut i = start + 1;
-        while let Some(block) = next_block(lines, i, end) {
-            let resolved_to_ours = block
-                .key
-                .find("@file:")
-                .map(|at| &block.key[at + 1..])
-                .and_then(parse_vendor_path)
-                .is_some_and(|p| p.eco == "npm" && p.uuid == uuid);
-            if resolved_to_ours {
-                return true;
-            }
-            i = block.end;
-        }
-    }
-    false
+    // `.socket/vendor/npm/<uuid>/` — the format model's one walk
+    // ([`vendored_npm_uuids`], CRLF read like LF), collected once per lock
+    // bytes: a revert pass probes once per ledger entry.
+    let vendored = IN_USE_MEMO.parse_infallible(text.as_bytes(), || vendored_npm_uuids(&text));
+    Some(vendored.contains(&entry.uuid))
 }
 
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
@@ -1119,46 +1086,6 @@ impl EditCtx<'_> {
 }
 
 // ─────────────────────────── pre-flight checks ───────────────────────────
-
-/// `lockfileVersion: '9.0'` head check (accept pnpm's single quotes plus
-/// double-quoted/bare spellings) — the v9 BACKEND's own guard. The flavor
-/// router sniffs with [`super::pnpm_lock_legacy::sniff_lock_grammar`]
-/// instead, whose allowlist also routes the legacy 5.4/6.0 grammars to
-/// their backend; this check only fires if a non-9.0 lock reaches
-/// `vendor_pnpm` directly.
-pub(super) fn check_lock_version(text: &str) -> Result<(), String> {
-    let version = text
-        .lines()
-        .take(5)
-        .find_map(|line| line.strip_prefix("lockfileVersion:"))
-        .map(|rest| rest.trim().trim_matches(['\'', '"']).to_string());
-    match version {
-        Some(v) if v == SUPPORTED_LOCK_VERSION => Ok(()),
-        Some(v) => {
-            // The remedy must point the right way: 5.x (pnpm 7) / 6.x
-            // (pnpm 8) locks predate the v9 grammar and upgrading pnpm
-            // re-locks them, but a HIGHER version means the user's pnpm
-            // already outgrew this build — telling them "re-lock with
-            // pnpm >= 9" would loop them back to the lock they have.
-            let major = v.split('.').next().and_then(|m| m.parse::<u32>().ok());
-            Err(match major {
-                Some(m) if m < 9 => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; only {SUPPORTED_LOCK_VERSION} is \
-                     supported — re-lock with pnpm >= 9"
-                ),
-                _ => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; this socket-patch build supports \
-                     lockfileVersion {SUPPORTED_LOCK_VERSION} — re-lock with a pnpm release \
-                     that emits it, or update socket-patch"
-                ),
-            })
-        }
-        None => Err(format!(
-            "{PNPM_LOCK} has no lockfileVersion in its head; only \
-             {SUPPORTED_LOCK_VERSION} is supported — re-lock with pnpm >= 9"
-        )),
-    }
-}
 
 /// The package-name component of a pnpm override key
 /// (`[@scope/]name[@range]`, possibly behind a `parent>child` selector
@@ -2297,6 +2224,9 @@ fn matching_blocks<L: EditLines>(
 /// is split afresh. The backend re-seeds the slot with the lock it wrote.
 static LOCK_MEMO: ParseMemo<LockDoc> = ParseMemo::new();
 
+/// [`pnpm_entry_in_use`]'s vendored-uuid set, per lock bytes.
+static IN_USE_MEMO: ParseMemo<HashSet<String>> = ParseMemo::new();
+
 /// One lock's lines plus their [`LockIndex`] — a pure function of the
 /// lines, so of the bytes the memo keys on — built only once the same lines
 /// are probed a second time ([`INDEX_AFTER_PROBES`]).
@@ -2547,9 +2477,6 @@ struct LockIndex {
     first_importer_ver_paren: HashMap<String, usize>,
     first_importer_dep_ver_paren: HashMap<(String, String), usize>,
     first_importer_catalog: HashMap<(String, String), usize>,
-    /// The uuid of every packages/snapshots key resolving into
-    /// `.socket/vendor/npm/<uuid>/` ([`pnpm_entry_in_use`]).
-    vendored_npm_uuids: HashSet<String>,
 }
 
 /// Every prefix of `s` that ends right before a `(`.
@@ -2656,20 +2583,6 @@ impl LockIndex {
                     k = f;
                 }
                 i = importer.end;
-            }
-        }
-
-        for section in [&index.packages, &index.snapshots] {
-            for block in &section.blocks {
-                if let Some(parts) = block
-                    .key
-                    .find("@file:")
-                    .map(|at| &block.key[at + 1..])
-                    .and_then(parse_vendor_path)
-                    .filter(|p| p.eco == "npm")
-                {
-                    index.vendored_npm_uuids.insert(parts.uuid);
-                }
             }
         }
         index
@@ -3245,155 +3158,7 @@ async fn unwind_override_surfaces(
     }
 }
 
-// ───────────────────────────── guarded reads ──────────────────────────────
-
-// ─────────────────────── yaml-ish line-block helpers ──────────────────────
-// pnpm-lock.yaml is machine-emitted with a fixed 2/4/6/8-space shape; these
-// helpers splice line blocks and never interpret YAML generically.
-
-pub(super) fn split_lines(text: &str) -> Vec<String> {
-    text.split('\n').map(str::to_string).collect()
-}
-
-/// `(header_idx, end_idx)` of a top-level `name:` section; `end` is the
-/// first following column-0 line (exclusive), so trailing blank separator
-/// lines belong to the section.
-pub(super) fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
-    let header = format!("{name}:");
-    let start = lines.iter().position(|l| l == &header)?;
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, l)| !l.is_empty() && !l.starts_with(' '))
-        .map(|(i, _)| i)
-        .unwrap_or(lines.len());
-    Some((start, end))
-}
-
-/// One 2-space-keyed block inside a section (`[header, end)`; `end` stops at
-/// the blank separator / next block header, so the captured fragment is the
-/// verbatim entry without surrounding blanks).
-pub(super) struct YamlBlock {
-    pub(super) header: usize,
-    pub(super) end: usize,
-    pub(super) key: String,
-    /// The key exactly as spelled in the file (incl. quotes) — rekeys
-    /// preserve the file's quoting style.
-    repr: String,
-    /// Inline value after `:` (e.g. `{}` for empty snapshots), `""` if none.
-    rest: String,
-}
-
-impl YamlBlock {
-    /// The inline-rest suffix to re-emit after the (re)written key.
-    fn rest_suffix(&self) -> String {
-        if self.rest.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", self.rest)
-        }
-    }
-}
-
-/// The next block at or after line `i` (within `[i, end)`).
-pub(super) fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<YamlBlock> {
-    while i < end {
-        if let Some((key, repr, rest)) = parse_key_line(&lines[i], 2) {
-            let mut j = i + 1;
-            while j < end && !lines[j].is_empty() && indent_of(&lines[j]) >= 4 {
-                j += 1;
-            }
-            return Some(YamlBlock {
-                header: i,
-                end: j,
-                key: key.to_string(),
-                repr: repr.to_string(),
-                rest: rest.to_string(),
-            });
-        }
-        i += 1;
-    }
-    None
-}
-
-pub(super) fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start_matches(' ').len()
-}
-
-/// Parse a mapping line at exactly `indent` spaces into
-/// `(key, verbatim_key_repr, value_after_colon)`. Accepts pnpm's bare keys
-/// and both quote styles (single quotes are what pnpm emits for `@`-leading
-/// keys); the value separator is the first `:` followed by a space or EOL
-/// (keys themselves contain `:` in `file:` specs).
-///
-/// All three are slices of `line`. Every scan below runs this over whole
-/// `packages:` / `snapshots:` sections once per vendored package, so owning
-/// copies would dominate the surgery's CPU on a multi-megabyte lock. A
-/// caller that keeps a piece past the next edit to `lines` copies it itself.
-pub(super) fn parse_key_line(line: &str, indent: usize) -> Option<(&str, &str, &str)> {
-    if line.len() <= indent || !line.as_bytes()[..indent].iter().all(|&b| b == b' ') {
-        return None;
-    }
-    let s = &line[indent..];
-    let c0 = s.as_bytes()[0];
-    if c0 == b' ' {
-        return None;
-    }
-    if c0 == b'\'' || c0 == b'"' {
-        let quote = c0 as char;
-        let close = s[1..].find(quote)? + 1;
-        let after = &s[close + 1..];
-        let rest = after.strip_prefix(':')?;
-        let rest = rest.strip_prefix(' ').unwrap_or(rest);
-        return Some((&s[1..close], &s[..close + 1], rest));
-    }
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b':' && (i + 1 == bytes.len() || bytes[i + 1] == b' ') {
-            if i == 0 {
-                return None;
-            }
-            let rest = if i + 1 < bytes.len() { &s[i + 2..] } else { "" };
-            return Some((&s[..i], &s[..i], rest));
-        }
-    }
-    None
-}
-
-/// Strip one matching pair of surrounding quotes from a mapping VALUE
-/// (pnpm quotes values that would misparse as plain YAML scalars, e.g. the
-/// default-catalog specifier `'catalog:'`).
-fn unquote_value(value: &str) -> &str {
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2
-        && (bytes[0] == b'\'' || bytes[0] == b'"')
-        && bytes[bytes.len() - 1] == bytes[0]
-    {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    }
-}
-
-/// pnpm quotes `@`-leading keys with single quotes; everything we write is
-/// otherwise bare.
-pub(super) fn yaml_key(key: &str) -> String {
-    if key.starts_with('@') {
-        format!("'{key}'")
-    } else {
-        key.to_string()
-    }
-}
-
-/// Re-spell `key` in the same quoting style as the original `repr`.
-pub(super) fn yaml_key_like(key: &str, original_repr: &str) -> String {
-    match original_repr.as_bytes().first() {
-        Some(b'\'') => format!("'{key}'"),
-        Some(b'"') => format!("\"{key}\""),
-        _ => yaml_key(key),
-    }
-}
+// ─────────────────────────── wiring record helpers ──────────────────────────
 
 pub(super) fn lines_value(lines: &[String]) -> Value {
     Value::Array(lines.iter().map(|l| Value::String(l.clone())).collect())
@@ -5285,7 +5050,7 @@ snapshots:
     /// pnpm >= 9" would loop those users back to the lock they have.
     #[test]
     fn lock_version_remedy_is_version_aware() {
-        use super::super::pnpm_lock_legacy::{sniff_lock_grammar, PnpmLockGrammar};
+        use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
 
         assert!(check_lock_version("lockfileVersion: '9.0'\n").is_ok());
         assert_eq!(
@@ -5896,13 +5661,13 @@ snapshots:
         );
     }
 
-    /// A CRLF lock breaks the packages/snapshots section probes, so the
-    /// in-use scan finds nothing and would call a still-referenced artifact
-    /// "provably orphaned" (`Some(false)`) — letting the unwired-revert
-    /// guard delete it out from under the lock. CRLF must be undeterminable
-    /// (`None`), which the guard refuses on while the lock exists.
+    /// A CRLF lock (a Windows autocrlf checkout) must never read as
+    /// "provably orphaned" while it still resolves through the artifact —
+    /// that would let the unwired-revert guard delete it out from under the
+    /// lock. The in-use walk reads CRLF like LF, so it answers `Some(true)`
+    /// and the guard refuses.
     #[tokio::test]
-    async fn crlf_lock_is_undeterminable_for_in_use_and_unwired_revert_refuses() {
+    async fn crlf_lock_reads_as_in_use_and_unwired_revert_refuses() {
         let (fx, entry) = reconstructed_fixture().await;
         let crlf_lock = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
         tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf_lock)
@@ -5911,8 +5676,8 @@ snapshots:
 
         assert_eq!(
             pnpm_entry_in_use(&entry, fx.root()).await,
-            None,
-            "a CRLF lock is undeterminable, never provably orphaned"
+            Some(true),
+            "a CRLF lock still consuming the artifact reads as in use"
         );
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(!outcome.success, "unwired revert must refuse: {outcome:?}");
@@ -8574,13 +8339,12 @@ snapshots:
                     "seed {seed} {name}"
                 );
             }
-            for uuid in [UUID, OTHER_UUID] {
-                assert_eq!(
-                    index.vendored_npm_uuids.contains(uuid),
-                    pnpm_entry_in_use_scan(uuid, &lines),
-                    "seed {seed} in-use {uuid}"
-                );
-            }
+            // The in-use walk reads a CRLF lock like its LF twin.
+            assert_eq!(
+                vendored_npm_uuids(&text),
+                vendored_npm_uuids(&text.replace('\n', "\r\n")),
+                "seed {seed} in-use"
+            );
             for name in NAMES {
                 for version in VERSIONS {
                     let scan = check_rewritable_refs_with(&lines, name, version, None);

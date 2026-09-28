@@ -7,33 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use socket_patch_core::formats::registry;
 use socket_patch_core::utils::python_lock::is_python_lock_name;
 
 use super::types::IgnoredPath;
-
-/// Lock markers that make their directory a project root, with the
-/// ecosystem each belongs to.
-pub(crate) const ROOT_LOCK_MARKERS: [(&str, &str); 19] = [
-    ("package-lock.json", "npm"),
-    ("npm-shrinkwrap.json", "npm"),
-    ("pnpm-lock.yaml", "npm"),
-    ("yarn.lock", "npm"),
-    ("bun.lock", "npm"),
-    ("bun.lockb", "npm"),
-    ("vlt-lock.json", "npm"),
-    ("rush.json", "npm"),
-    ("uv.lock", "pypi"),
-    ("poetry.lock", "pypi"),
-    ("pdm.lock", "pypi"),
-    ("Pipfile.lock", "pypi"),
-    ("requirements.txt", "pypi"),
-    ("Cargo.lock", "cargo"),
-    ("go.mod", "golang"),
-    ("go.sum", "golang"),
-    ("composer.lock", "composer"),
-    ("Gemfile.lock", "gem"),
-    ("gems.locked", "gem"),
-];
 
 /// Marker files of the ecosystems the in-memory engine cannot inventory
 /// (disk discovers them only through installed-tree crawlers).
@@ -74,10 +51,11 @@ pub(crate) fn root_markers<'a>(root: &str, paths: impl IntoIterator<Item = &'a s
     out
 }
 
-/// The ecosystem a root marker basename belongs to.
+/// The ecosystem a root marker basename belongs to: a [`registry::ROOT`]
+/// row (manifests alone never make a root) or a PEP 751 / PEP 723 lock.
 pub(crate) fn marker_ecosystem(base: &str) -> Option<&'static str> {
-    if let Some((_, eco)) = ROOT_LOCK_MARKERS.iter().find(|(name, _)| *name == base) {
-        return Some(eco);
+    if let Some(row) = registry::root_marker(base) {
+        return Some(row.ecosystem);
     }
     is_python_lock_name(base).then_some("pypi")
 }
@@ -143,10 +121,7 @@ pub(crate) fn detect_roots<'a>(
             ignore("ecosystem_filtered", &mut ignored);
             continue;
         }
-        let key: &'static str = ROOT_LOCK_MARKERS
-            .iter()
-            .find(|(name, _)| *name == base)
-            .map_or("python-lock", |(name, _)| name);
+        let key: &'static str = registry::root_marker(base).map_or("python-lock", |row| row.path);
         markers.entry(dir.to_string()).or_default().insert(key);
         marker_paths
             .entry(dir.to_string())

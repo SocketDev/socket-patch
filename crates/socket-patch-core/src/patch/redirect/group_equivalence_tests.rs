@@ -23,7 +23,7 @@ fn serial_oracle(
     let overrides = withhold(&overrides, &result.refused_pipenv_uuids);
     let overrides: &[DepOverride] = &overrides;
     rewrite_npm_lock(files, overrides, &mut result);
-    rewrite_pnpm_lock(files, overrides, &mut result);
+    plan_hosted(files, overrides, &mut result);
     rewrite_yarn_classic(files, overrides, &mut result);
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);

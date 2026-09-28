@@ -160,35 +160,12 @@ pub(crate) fn build_candidates(
 /// The ecosystem a candidate file's rewriter belongs to (`None` for files
 /// no rewriter edits), for the symlinked-read refusal.
 fn file_ecosystem(rel: &str) -> Option<&'static str> {
+    if let Some(eco) = socket_patch_core::formats::registry::hosted_file_ecosystem(rel) {
+        return Some(eco);
+    }
     let base = rel.rsplit('/').next().unwrap_or(rel);
-    Some(match base {
-        "package-lock.json"
-        | "npm-shrinkwrap.json"
-        | "pnpm-lock.yaml"
-        | "shrinkwrap.yaml"
-        | ".modules.yaml"
-        | "yarn.lock"
-        | ".yarnrc.yml"
-        | "bun.lock"
-        | "bun.lockb"
-        | "vlt-lock.json"
-        | "vlt.json"
-        | ".vlt-lock.json" => "npm",
-        "requirements.txt" | "uv.lock" | "poetry.lock" | "pdm.lock" | "Pipfile.lock"
-        | "pyproject.toml" | "hatch.toml" => "pypi",
-        "Cargo.toml" | "Cargo.lock" | "config.toml" | "config" => "cargo",
-        "composer.lock" => "composer",
-        "nuget.config" | "packages.lock.json" => "nuget",
-        "Gemfile" | "Gemfile.lock" | "gems.rb" | "gems.locked" => "gem",
-        "go.mod" | "go.sum" => "golang",
-        "pom.xml" | "maven.config" | "checksums.sha256" => "maven",
-        _ if socket_patch_core::utils::python_lock::is_python_lock_name(base)
-            || base.ends_with(".py") =>
-        {
-            "pypi"
-        }
-        _ => return None,
-    })
+    (socket_patch_core::utils::python_lock::is_python_lock_name(base) || base.ends_with(".py"))
+        .then_some("pypi")
 }
 
 /// A project's state between the reference grants and the wheel-metadata
@@ -484,7 +461,7 @@ pub(crate) fn plan(
                 None => false,
             }
         };
-        for name in REDIRECT_CANDIDATE_FILES {
+        for name in REDIRECT_CANDIDATE_FILES.iter() {
             if *name == "bun.lockb" {
                 continue;
             }

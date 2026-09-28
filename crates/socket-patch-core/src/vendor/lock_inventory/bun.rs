@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
+use crate::formats::bun::{BunTextError, BunTextLock};
 use crate::vendor::bun_lock_text::{self, BunEntry};
 use crate::vendor::bun_lockb::BunLockb;
 
@@ -18,9 +19,11 @@ use super::{http_url, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
 /// lock the backends refuse — a hand re-indented one included — is one
 /// neither the inventory nor lockfile discovery reads.
 pub(crate) fn bun_text_entries(text: &str) -> Result<Vec<BunEntry>, String> {
-    bun_lock_text::check_lock_version(text)?;
-    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    bun_lock_text::parse_packages_section(&lines).map_err(|e| format!("{BUN_LOCK}: {e}"))
+    match BunTextLock::parse(text) {
+        Ok(lock) => Ok(lock.entries),
+        Err(BunTextError::Version(detail)) => Err(detail),
+        Err(BunTextError::Packages(e)) => Err(format!("{BUN_LOCK}: {e}")),
+    }
 }
 
 // ── file selection ──

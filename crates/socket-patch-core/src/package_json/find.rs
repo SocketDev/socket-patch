@@ -3,6 +3,7 @@ use tokio::fs;
 
 use super::detect::{strip_bom, PackageManager};
 use crate::constants::npm_family;
+use crate::formats::registry;
 use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries, read_regular_to_string};
 use crate::vendor::vlt_lock_text::{sniff_lock, LockSniff};
 
@@ -11,7 +12,8 @@ use crate::vendor::vlt_lock_text::{sniff_lock, LockSniff};
 /// over pnpm's, and only the start directory is consulted: an ancestor
 /// `vlt.json` does not make a nested package a vlt project. The accepted
 /// pnpm marker spellings (including the `pnpm-lock.yml` variant no other
-/// subsystem accepts) live in the shared [`npm_family`] table.
+/// subsystem accepts) are the format registry's
+/// [`PNPM_MARKER`](registry::PNPM_MARKER) rows.
 pub async fn detect_package_manager(start_path: &Path) -> PackageManager {
     for name in npm_family::VLT_SETUP_MARKERS {
         let path = start_path.join(name);
@@ -24,7 +26,7 @@ pub async fn detect_package_manager(start_path: &Path) -> PackageManager {
             return PackageManager::Vlt;
         }
     }
-    for name in npm_family::names_with(|r| r.detects_pnpm) {
+    for name in registry::paths_with(registry::PNPM_MARKER) {
         if fs::metadata(start_path.join(name)).await.is_ok() {
             return PackageManager::Pnpm;
         }
@@ -753,11 +755,11 @@ mod tests {
 
     #[tokio::test]
     async fn detect_package_manager_accepts_every_table_flagged_pnpm_marker() {
-        // Behavioral pin on the shared npm_family table wiring: every row
-        // flagged detects_pnpm (including the `pnpm-lock.yml` spelling no
+        // Behavioral pin on the format registry wiring: every row
+        // flagged PNPM_MARKER (including the `pnpm-lock.yml` spelling no
         // other subsystem accepts) flips detection to Pnpm; an empty root
         // stays Npm.
-        for name in crate::constants::npm_family::names_with(|r| r.detects_pnpm) {
+        for name in registry::paths_with(registry::PNPM_MARKER) {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join(name), "").await.unwrap();
             assert!(
@@ -778,11 +780,11 @@ mod tests {
     #[test]
     fn pnpm_marker_spellings_are_pinned_by_value() {
         // Hardcoded on purpose, breaking the self-reference: production code
-        // iterates the same names_with(detects_pnpm) expression the guard
+        // iterates the same registry PNPM_MARKER expression the guard
         // test above does, so a row deleted from the table would shrink code
         // and guard together while `.yml` detection silently vanished. This
         // list cannot shrink with them.
-        let mut spellings = crate::constants::npm_family::names_with(|r| r.detects_pnpm);
+        let mut spellings = registry::paths_with(registry::PNPM_MARKER);
         spellings.sort_unstable();
         assert_eq!(
             spellings,

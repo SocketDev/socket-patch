@@ -61,7 +61,7 @@ use super::{
     DiscoverCtx, Discovery, LocateOpts, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
 };
 use crate::crawlers::composer_crawler::normalize_version;
-use crate::vendor::lock_inventory::{composer_lock_packages, ComposerLockPackage};
+use crate::formats::composer::{ComposerLock, ComposerLockPackage};
 
 /// The lock both backends rewrite (root-relative).
 const COMPOSER_LOCK: &str = "composer.lock";
@@ -89,8 +89,8 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // The inventory's own walk: `packages` then `packages-dev` (a missing
     // or non-array section — composer writes `"packages-dev": []`, older /
     // hand-trimmed locks may omit it — is simply empty).
-    for entry in composer_lock_packages(&doc) {
-        entry_ref(ctx, file, &entry, out);
+    for entry in ComposerLock::from_doc(&doc).packages() {
+        entry_ref(ctx, file, entry, out);
     }
 }
 

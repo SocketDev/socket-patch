@@ -58,7 +58,7 @@ use regex::Regex;
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
-use crate::vendor::gemfile_lock::{
+use crate::formats::gem::{
     bundler_manifest_for, parse_spec, same_remote, split_checksum_entry, BUNDLER_LOCKS,
 };
 
