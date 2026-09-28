@@ -9,11 +9,11 @@ pub mod maven_crawler;
 mod maven_pom_equivalence_tests;
 pub mod npm_crawler;
 pub mod nuget_crawler;
+#[cfg(test)]
+pub(crate) mod oracle_support;
 pub mod pkg_managers;
 pub mod python_crawler;
 pub mod ruby_crawler;
-#[cfg(test)]
-pub(crate) mod test_tree;
 pub mod types;
 pub mod walk_pool;
 

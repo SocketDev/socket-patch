@@ -1,10 +1,41 @@
-//! Test-only scaffolding for the randomized crawler sweeps: generators build
-//! fixture trees with these helpers, and the crawl output is pinned by a
-//! golden snapshot (see [`crate::golden`]).
+//! Test-only scaffolding shared by the crawler equivalence tests: each
+//! crawler whose async walk moved onto the blocking pool keeps its previous
+//! implementation as a `#[cfg(test)]` oracle, and randomized fixture trees
+//! built with these helpers assert both produce identical output.
 
 use std::path::{Path, PathBuf};
 
 use super::types::CrawledPackage;
+
+/// Deterministic xorshift64* generator (no `rand` dependency).
+pub(crate) struct Rng(u64);
+
+impl Rng {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    pub(crate) fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    pub(crate) fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    pub(crate) fn chance(&mut self, pct: usize) -> bool {
+        self.below(100) < pct
+    }
+
+    pub(crate) fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+        items[self.below(items.len())]
+    }
+}
 
 /// Restores permissions a generator stripped before the tempdir is removed
 /// (declare it AFTER the tempdir so it drops first). Only Unix strips
@@ -17,11 +48,6 @@ impl PermGuard {
     /// must not block the rest of the generation).
     pub(crate) fn plan(&mut self, dir: &Path, mode: u32) {
         self.0.push((dir.to_path_buf(), mode));
-    }
-
-    /// The queued `(path relative to base, mode)` pairs, for a sweep's input.
-    pub(crate) fn planned(&self, base: &Path) -> Vec<(String, u32)> {
-        self.0.iter().map(|(p, m)| (rel(base, p), *m)).collect()
     }
 
     /// Apply every queued mode, deepest paths first.
@@ -124,97 +150,22 @@ pub(crate) fn rows(pkgs: &[CrawledPackage]) -> Vec<Row> {
         .collect()
 }
 
-/// A crawled package as a row with its path relative to `base` (the sweep's
-/// tempdir), so the row is the same on every run.
-pub(crate) type RelRow = (String, String, Option<String>, String, String);
-
-pub(crate) fn rel(base: &Path, path: &Path) -> String {
-    match path.strip_prefix(base) {
-        Ok(rest) => rest.to_string_lossy().replace('\\', "/"),
-        Err(_) => format!("<abs>{}", path.display()),
-    }
-}
-
-pub(crate) fn rel_rows(base: &Path, pkgs: &[CrawledPackage]) -> Vec<RelRow> {
-    pkgs.iter().map(|p| rel_row(base, p)).collect()
-}
-
-fn rel_row(base: &Path, p: &CrawledPackage) -> RelRow {
-    (
-        p.name.clone(),
-        p.version.clone(),
-        p.namespace.clone(),
-        p.purl.clone(),
-        rel(base, &p.path),
-    )
-}
-
-/// A `find_by_purls` map as sorted [`RelRow`]s.
-pub(crate) fn rel_map_rows(
-    base: &Path,
+/// A `find_by_purls` map as sorted comparable rows.
+pub(crate) fn map_rows(
     map: &std::collections::HashMap<String, CrawledPackage>,
-) -> std::collections::BTreeMap<String, RelRow> {
+) -> std::collections::BTreeMap<String, Row> {
     map.iter()
-        .map(|(k, p)| (k.clone(), rel_row(base, p)))
+        .map(|(k, p)| {
+            (
+                k.clone(),
+                (
+                    p.name.clone(),
+                    p.version.clone(),
+                    p.namespace.clone(),
+                    p.purl.clone(),
+                    p.path.clone(),
+                ),
+            )
+        })
         .collect()
-}
-
-/// Every entry under `root` — path, kind, mode, file bytes, link target —
-/// as the input a sweep case records, so generator drift shows up as such.
-pub(crate) fn tree_listing(root: &Path) -> Vec<(String, String)> {
-    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            #[cfg(unix)]
-            let mode = {
-                use std::os::unix::fs::PermissionsExt as _;
-                meta.permissions().mode() & 0o7777
-            };
-            #[cfg(not(unix))]
-            let mode = 0;
-            let what = if meta.file_type().is_symlink() {
-                let target = std::fs::read_link(&path).unwrap_or_default();
-                format!("link {mode:o} {}", rel(base, &target))
-            } else if meta.is_dir() {
-                format!("dir {mode:o}")
-            } else if meta.is_file() {
-                // Generators may write the tempdir's own path into a file.
-                let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap_or_default())
-                    .replace(&*base.to_string_lossy(), "<base>");
-                format!("file {mode:o} {}", crate::golden::digest(&text))
-            } else {
-                format!("other {mode:o}")
-            };
-            out.push((rel(base, &path), what));
-            if meta.is_dir() && !meta.file_type().is_symlink() {
-                walk(base, &path, out);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(root, root, &mut out);
-    out.sort();
-    out
-}
-
-/// Whether this run can replay a crawler golden: they were blessed on Linux
-/// (case-sensitive, symlinks), and a sweep that strips permissions as a
-/// non-root user, where the stripped modes are honored.
-pub(crate) fn crawl_goldens_apply(strips_permissions: bool) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: geteuid has no preconditions.
-        !strips_permissions || unsafe { libc::geteuid() != 0 }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = strips_permissions;
-        false
-    }
 }

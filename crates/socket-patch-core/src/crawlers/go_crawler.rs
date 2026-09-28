@@ -6,6 +6,9 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir_sync, run_blocking};
 
+#[cfg(test)]
+mod oracle;
+
 // ---------------------------------------------------------------------------
 // Case-encoding helpers
 // ---------------------------------------------------------------------------
@@ -1365,16 +1368,14 @@ mod tests {
         assert_eq!(pkg.path, module_dir);
     }
 
-    // ── Seeded module caches, pinned by golden ───────────────────────
+    // ── Equivalence with the per-call async walk (oracle) ─────────────
 
-    mod sweep {
+    mod equivalence {
+        use super::super::oracle::LegacyGoCrawler;
         use super::*;
-        use crate::crawlers::test_tree::{
-            crawl_goldens_apply, mkdir, rel_map_rows, rel_rows, symlink, tree_listing, write,
-            PermGuard,
+        use crate::crawlers::oracle_support::{
+            map_rows, mkdir, rows, symlink, write, PermGuard, Rng,
         };
-        use crate::golden::Golden;
-        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &[
             "github.com",
@@ -1487,39 +1488,33 @@ mod tests {
 
         /// Returns (packages crawled, PURLs found) so the caller can check
         /// the fixtures are not vacuous.
-        async fn check(
-            g: &mut Golden,
-            input: &impl serde::Serialize,
-            gen: &Gen,
-            label: &str,
-        ) -> (usize, usize) {
+        async fn assert_equivalent(gen: &Gen, label: &str) -> (usize, usize) {
             let options = CrawlerOptions {
                 cwd: gen.root.clone(),
                 global: false,
                 global_prefix: Some(gen.root.clone()),
             };
             let new = GoCrawler::new().crawl_all(&options).await;
-            let purls = probe_purls(gen, &new);
+            let old = LegacyGoCrawler::crawl_all(&options).await;
+            assert_eq!(rows(&new), rows(&old), "{label}: crawl_all");
+
+            let purls = probe_purls(gen, &old);
             let new_found = GoCrawler::new()
                 .find_by_purls(&gen.root, &purls)
                 .await
                 .unwrap();
-            let base = gen.root.parent().unwrap();
-            g.case(
-                label.replace(' ', "_"),
-                input,
-                &(rel_rows(base, &new), rel_map_rows(base, &new_found)),
+            let old_found = LegacyGoCrawler::find_by_purls(&gen.root, &purls).await;
+            assert_eq!(
+                map_rows(&new_found),
+                map_rows(&old_found),
+                "{label}: find_by_purls"
             );
-            (new.len(), new_found.len())
+            (old.len(), old_found.len())
         }
 
         #[tokio::test]
-        async fn randomized_caches_match_golden() {
+        async fn randomized_caches_match_the_async_oracle() {
             let (mut crawled, mut found) = (0, 0);
-            let mut g = Golden::new(
-                "crawl_go_module_cache",
-                "One seeded GOMODCACHE tree: crawl_all, then find_by_purls.",
-            );
             // At least 48 seeds, and more until the fixtures clear the
             // non-vacuity bar below: a case-insensitive filesystem folds
             // `Azure`/`!azure`-style siblings together and Windows ignores
@@ -1537,13 +1532,8 @@ mod tests {
                 };
                 let root = gen.root.clone();
                 gen.dir(&root, 0);
-                let input = (
-                    tree_listing(tmp.path()),
-                    gen.perms.planned(tmp.path()),
-                    gen.versioned.clone(),
-                );
                 gen.perms.apply();
-                let (c, f) = check(&mut g, &input, &gen, &format!("seed {seed}")).await;
+                let (c, f) = assert_equivalent(&gen, &format!("seed {seed}")).await;
                 crawled += c;
                 found += f;
                 seed += 1;
@@ -1552,13 +1542,10 @@ mod tests {
                 crawled > 100 && found > 100,
                 "vacuous fixtures: {crawled}/{found}"
             );
-            if crawl_goldens_apply(true) {
-                g.finish();
-            }
         }
 
         #[tokio::test]
-        async fn missing_cache_root_matches_golden() {
+        async fn missing_cache_root_matches_the_async_oracle() {
             let tmp = tempfile::tempdir().unwrap();
             let gen = Gen {
                 rng: Rng::new(0),
@@ -1567,11 +1554,7 @@ mod tests {
                 perms: PermGuard::default(),
                 versioned: vec!["mod@v1.0.0".to_string()],
             };
-            let mut g = Golden::new("crawl_go_absent_root", "An absent GOMODCACHE root.");
-            check(&mut g, &(), &gen, "absent root").await;
-            if crawl_goldens_apply(false) {
-                g.finish();
-            }
+            assert_equivalent(&gen, "absent root").await;
         }
     }
 }

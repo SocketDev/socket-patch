@@ -6,6 +6,9 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, run_blocking};
 
+#[cfg(test)]
+mod oracle;
+
 // ---------------------------------------------------------------------------
 // Cargo.toml minimal parser
 // ---------------------------------------------------------------------------
@@ -1123,15 +1126,12 @@ version = "fake"
         assert_eq!(packages[0].purl, "pkg:cargo/serde@1.0.200");
     }
 
-    // ── Seeded source trees, pinned by golden ────────────────────────
+    // ── Equivalence with the per-call async scan (oracle) ─────────────
 
-    mod sweep {
+    mod equivalence {
+        use super::super::oracle::LegacyCargoCrawler;
         use super::*;
-        use crate::crawlers::test_tree::{
-            crawl_goldens_apply, mkdir, rel_rows, symlink, tree_listing, write, PermGuard,
-        };
-        use crate::golden::Golden;
-        use crate::test_rng::Rng;
+        use crate::crawlers::oracle_support::{mkdir, rows, symlink, write, PermGuard, Rng};
 
         const NAMES: &[&str] = &["serde", "serde-json", "sha-1", "tokio", "dup", "a_b"];
         const VERSIONS: &[&str] = &["1.0.0", "1.0.0-rc.1", "0.2.3", "5", "1.0.0+build"];
@@ -1184,19 +1184,14 @@ version = "fake"
         }
 
         #[tokio::test]
-        async fn randomized_sources_match_golden() {
+        async fn randomized_sources_match_the_async_oracle() {
             let mut total = 0;
-            let mut g = Golden::new(
-                "crawl_cargo_sources",
-                "One seeded crate source tree, crawled.",
-            );
             for seed in 0..64u64 {
                 let tmp = tempfile::tempdir().unwrap();
                 let mut perms = PermGuard::default();
                 let mut rng = Rng::new(seed);
                 let root = tmp.path().join("src");
                 tree(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
-                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
@@ -1204,18 +1199,16 @@ version = "fake"
                     global_prefix: Some(root.clone()),
                 };
                 let new = CargoCrawler::new().crawl_all(&options).await;
-                g.case(seed, &input, &rel_rows(tmp.path(), &new));
-                total += new.len();
+                let old = LegacyCargoCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                total += old.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
-            if crawl_goldens_apply(true) {
-                g.finish();
-            }
         }
 
         /// Local mode: a Cargo project with a `vendor/` tree.
         #[tokio::test]
-        async fn vendor_tree_matches_golden() {
+        async fn vendor_tree_matches_the_async_oracle() {
             let tmp = tempfile::tempdir().unwrap();
             let mut perms = PermGuard::default();
             let mut rng = Rng::new(7);
@@ -1226,7 +1219,6 @@ version = "fake"
                 &tmp.path().join("outside"),
                 &mut perms,
             );
-            let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
             perms.apply();
             let options = CrawlerOptions {
                 cwd: tmp.path().to_path_buf(),
@@ -1234,15 +1226,9 @@ version = "fake"
                 global_prefix: None,
             };
             let new = CargoCrawler::new().crawl_all(&options).await;
-            assert!(!new.is_empty());
-            let mut g = Golden::new(
-                "crawl_cargo_vendor",
-                "A seeded Cargo project vendor/ tree, crawled locally.",
-            );
-            g.case(7, &input, &rel_rows(tmp.path(), &new));
-            if crawl_goldens_apply(true) {
-                g.finish();
-            }
+            let old = LegacyCargoCrawler::crawl_all(&options).await;
+            assert!(!old.is_empty());
+            assert_eq!(rows(&new), rows(&old));
         }
     }
 }
