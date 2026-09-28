@@ -376,7 +376,6 @@ fn plan(
             if object.get(source_key).and_then(Value::as_str) == Some(&url)
                 && object.get("hashes") == Some(&json!([format!("sha256:{sha}")]))
                 && !object.contains_key("version")
-                && !object.contains_key("index")
             {
                 continue;
             }
@@ -388,9 +387,18 @@ fn plan(
                 dep.name, dep.version
             )));
         }
+        // `index` stays exactly as Pipenv wrote it (present or absent): it
+        // is the one registry field the upstream restore cannot re-derive.
+        // Whether Pipenv records it depends on the release, the Pipfile
+        // spelling and the locking environment (2022.12.19 writes it for an
+        // `extras` table, 2026.8.0 does not; neither writes it for a
+        // marker-excluded package or a transitive one), so dropping it would
+        // make `rollback` guess. On a `file`/`path` entry it only selects
+        // the source group Pipenv installs the URL through — pip fetches
+        // the URL itself either way (measured on 2018.11.26 through
+        // 2026.8.0: install, `--deploy`, `sync`, `verify`).
         let mut new = object.clone();
         new.remove("version");
-        new.remove("index");
         new.remove("file");
         new.remove("path");
         new.insert(source_key.into(), Value::String(url.clone()));
@@ -594,9 +602,10 @@ mod tests {
 
     /// `pipenv lock --keep-outdated` (2022) rewrites our entry into a
     /// file+version+index hybrid that Pipenv still installs from: it is
-    /// ours, so it is re-planned to the canonical shape instead of being
-    /// refused as a foreign source (which also vetoed the sibling rewriters);
-    /// a hybrid naming ANOTHER version is a real conflict.
+    /// ours, so it is re-planned to the canonical shape (`version` dropped,
+    /// Pipenv's `index` kept) instead of being refused as a foreign source
+    /// (which also vetoed the sibling rewriters); a hybrid naming ANOTHER
+    /// version is a real conflict.
     #[test]
     fn owned_hybrid_entries_are_replanned_not_refused() {
         let dep = dependency("urllib3", "1.26.18", "patch-one");
@@ -609,7 +618,7 @@ mod tests {
         assert!(!edits.is_empty(), "the hybrid is re-planned");
         let entry: Value = serde_json::from_str(&fixed).unwrap();
         assert!(entry["default"]["urllib3"].get("version").is_none());
-        assert!(entry["default"]["urllib3"].get("index").is_none());
+        assert_eq!(entry["default"]["urllib3"]["index"], json!("pypi"));
         assert!(entry["default"]["urllib3"]["file"].as_str().unwrap().contains("patch-one"));
 
         value["default"]["urllib3"]["version"] = json!("==2.0.0");

@@ -182,18 +182,20 @@ pub(super) fn is_pypi_simple(url: &str) -> bool {
     )
 }
 
-/// The index name a restored entry records: the `_meta.sources` entry that
-/// is PyPI. `Ok(None)` when the lock's registry entries carry no `index`
-/// at all (Pipenv < 2018).
-fn pipenv_index(
+/// Whether the registry entry restored for `name` resolves from PyPI (the
+/// only upstream whose hashes the restore can re-derive). The hosted
+/// rewrite keeps the entry's `index` exactly as Pipenv wrote it, so the
+/// restore never picks one: `entry_index` is carried back verbatim and only
+/// checked here. Pipenv records `index` by release, Pipfile spelling and
+/// locking environment (2022.12.19 writes it for an `extras` table and
+/// 2026.8.0 does not; neither for a marker-excluded or a transitive
+/// package) — nothing the lock's other entries could reveal.
+fn pipenv_index_is_pypi(
     doc: &Value,
-    registry_indexes: &[Option<&str>],
+    entry_index: Option<&str>,
     pipfile: Option<&str>,
     name: &str,
-) -> Result<Option<String>, String> {
-    if !registry_indexes.is_empty() && registry_indexes.iter().all(Option::is_none) {
-        return Ok(None);
-    }
+) -> Result<(), String> {
     let sources: Vec<(&str, &str)> = doc
         .pointer("/_meta/sources")
         .and_then(Value::as_array)
@@ -206,40 +208,37 @@ fn pipenv_index(
             ))
         })
         .collect();
-    let pypi: Vec<&str> = sources
-        .iter()
-        .filter(|(_, url)| is_pypi_simple(url))
-        .map(|(n, _)| *n)
-        .collect();
-    let chosen = match pypi.as_slice() {
-        [one] => *one,
-        [] => {
-            return Err(format!(
-                "no package index in Pipfile.lock `_meta.sources` is PyPI ({}), so the \
-                 upstream hashes cannot be re-derived",
-                sources
-                    .iter()
-                    .map(|(_, u)| *u)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        }
-        _ => {
-            return Err(
-                "Pipfile.lock `_meta.sources` names PyPI more than once; the entry's index is \
-                 ambiguous"
-                    .to_string(),
-            )
-        }
+    if !sources.iter().any(|(_, url)| is_pypi_simple(url)) {
+        return Err(format!(
+            "no package index in Pipfile.lock `_meta.sources` is PyPI ({}), so the \
+             upstream hashes cannot be re-derived",
+            sources
+                .iter()
+                .map(|(_, u)| *u)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let is_pypi = |index: &str| {
+        sources
+            .iter()
+            .any(|(n, url)| *n == index && is_pypi_simple(url))
     };
+    if let Some(index) = entry_index {
+        if !is_pypi(index) {
+            return Err(format!(
+                "Pipfile.lock installs {name} from index {index:?}, not PyPI"
+            ));
+        }
+    }
     if let Some(explicit) = pipfile.and_then(|p| pipfile_explicit_index(p, name)) {
-        if explicit != chosen {
+        if !is_pypi(&explicit) {
             return Err(format!(
                 "the Pipfile installs {name} from index {explicit:?}, not PyPI"
             ));
         }
     }
-    Ok(Some(chosen.to_string()))
+    Ok(())
 }
 
 /// The `index = "…"` a Pipfile declares for `name` in any package category.
@@ -310,8 +309,6 @@ pub(crate) async fn restore_pipfile_lock(
             }
         };
         let mut hits: Vec<PipenvHit> = Vec::new();
-        // The `index` of every registry entry the rewrite did not touch.
-        let mut registry_indexes: Vec<Option<&str>> = Vec::new();
         for (i, (_, entry)) in entries.iter().enumerate() {
             let Some(object) = entry.value.as_object() else {
                 continue;
@@ -321,9 +318,6 @@ pub(crate) async fn restore_pipfile_lock(
                 .or_else(|| object.get("path"))
                 .and_then(Value::as_str);
             let Some(pin) = reference.and_then(|r| pin_of(r, &pins, ctx)) else {
-                if reference.is_none() && object.contains_key("version") {
-                    registry_indexes.push(object.get("index").and_then(Value::as_str));
-                }
                 continue;
             };
             let Some((_, version)) = pin_coords(pin, &mut result) else {
@@ -380,27 +374,28 @@ pub(crate) async fn restore_pipfile_lock(
             if result.refused.contains_key(&hit.uuid) {
                 continue;
             }
-            let index = match pipenv_index(&doc, &registry_indexes, pipfile.as_deref(), &hit.name) {
-                Ok(index) => index,
-                Err(why) => {
-                    result.refuse(&hit.uuid, format!("{rel}: {why}"));
-                    continue;
-                }
-            };
+            let (_, entry) = &entries[hit.entry];
+            let mut object = entry.value.as_object().cloned().unwrap_or_default();
+            // `index` (and every other key but the reference, `version` and
+            // `hashes`) is carried back as the entry holds it: the hosted
+            // rewrite left Pipenv's own value, and a relock hybrid (Pipenv
+            // 2023+ keeps our reference on a marker-excluded entry and
+            // restores `version`/`hashes` around it) holds what Pipenv
+            // just wrote.
+            let entry_index = object.get("index").and_then(Value::as_str);
+            if let Err(why) = pipenv_index_is_pypi(&doc, entry_index, pipfile.as_deref(), &hit.name)
+            {
+                result.refuse(&hit.uuid, format!("{rel}: {why}"));
+                continue;
+            }
             let Some(release) =
                 released.get(&(canonicalize_pypi_name(&hit.name), hit.version.clone()))
             else {
                 continue;
             };
-            let (_, entry) = &entries[hit.entry];
-            let mut object = entry.value.as_object().cloned().unwrap_or_default();
             object.remove("file");
             object.remove("path");
             object.insert("version".into(), json!(format!("=={}", hit.version)));
-            match index {
-                Some(index) => object.insert("index".into(), json!(index)),
-                None => object.remove("index"),
-            };
             let mut hashes: Vec<String> = release
                 .iter()
                 .map(|f| format!("sha256:{}", f.sha256))
@@ -968,32 +963,36 @@ mod tests {
     }
 
     #[test]
-    fn pipenv_index_follows_sources_siblings_and_the_pipfile() {
+    fn pipenv_index_must_name_pypi_and_is_never_chosen() {
         let doc = json!({"_meta": {"sources": [
             {"name": "private", "url": "https://mirror.example/simple"},
             {"name": "pypi", "url": "https://pypi.org/simple/"},
         ]}});
-        assert_eq!(
-            pipenv_index(&doc, &[Some("private")], None, "x").unwrap(),
-            Some("pypi".into())
-        );
-        // Old Pipenv: registry siblings record no index.
-        assert_eq!(pipenv_index(&doc, &[None, None], None, "x").unwrap(), None);
-        let pipfile = "[packages]\nX = { version = \"==1\", index = \"private\" }\n";
-        assert!(pipenv_index(&doc, &[], Some(pipfile), "x")
+        // The entry's own index (or none at all) is checked, never picked.
+        assert!(pipenv_index_is_pypi(&doc, Some("pypi"), None, "x").is_ok());
+        assert!(pipenv_index_is_pypi(&doc, None, None, "x").is_ok());
+        assert!(pipenv_index_is_pypi(&doc, Some("private"), None, "x")
             .unwrap_err()
             .contains("not PyPI"));
+        assert!(pipenv_index_is_pypi(&doc, Some("gone"), None, "x")
+            .unwrap_err()
+            .contains("not PyPI"));
+        let pipfile = "[packages]\nX = { version = \"==1\", index = \"private\" }\n";
+        assert!(pipenv_index_is_pypi(&doc, None, Some(pipfile), "x")
+            .unwrap_err()
+            .contains("the Pipfile installs"));
+        let pipfile = "[packages]\nX = { version = \"==1\", index = \"pypi\" }\n";
+        assert!(pipenv_index_is_pypi(&doc, Some("pypi"), Some(pipfile), "x").is_ok());
         let mirror = json!({"_meta": {"sources": [{"name": "m", "url": "https://m/simple"}]}});
-        assert!(pipenv_index(&mirror, &[], None, "x")
+        assert!(pipenv_index_is_pypi(&mirror, None, None, "x")
             .unwrap_err()
             .contains("is PyPI"));
+        // Two spellings of PyPI: whichever the entry names is PyPI.
         let twice = json!({"_meta": {"sources": [
             {"name": "a", "url": "https://pypi.org/simple"},
             {"name": "b", "url": "https://pypi.python.org/simple"},
         ]}});
-        assert!(pipenv_index(&twice, &[], None, "x")
-            .unwrap_err()
-            .contains("ambiguous"));
+        assert!(pipenv_index_is_pypi(&twice, Some("b"), None, "x").is_ok());
     }
 
     #[test]

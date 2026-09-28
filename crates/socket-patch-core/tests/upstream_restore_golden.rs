@@ -1310,6 +1310,94 @@ async fn pipfile_lock_fixture_and_every_category_round_trip() {
     assert_pypi_round_trip("pipenv 2017", &input, &[urllib3_dep()], Some(11)).await;
 }
 
+/// Real `pipenv lock` output for the backtest's `extras` and
+/// `marker-excluded` shapes (`scripts/backtest-pipenv.py`), under
+/// `tests/fixtures/pipenv-shapes/<release>/<shape>/`. Whether Pipenv
+/// records `index` differs by release for the SAME Pipfile — 2018.11.26
+/// writes it on both, 2022.12.19 only on the `extras` entry (the
+/// marker-excluded one is written without resolving, and its transitive
+/// `pysocks` gets none), 2026.8.0 on neither (an inline-table Pipfile entry
+/// gets only an explicit `index`) — so the hosted entry keeps Pipenv's
+/// `index` and the restore carries it back instead of guessing it. LF and
+/// CRLF (the backtest's `crlf` shape) both round-trip byte for byte.
+#[tokio::test]
+#[serial]
+async fn pipfile_lock_real_pipenv_shapes_round_trip_their_index() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let cases = [
+        ("2018.11.26", "extras", Some(2018), Some("pypi")),
+        ("2018.11.26", "marker-excluded", Some(2018), Some("pypi")),
+        ("2022.12.19", "extras", Some(2022), Some("pypi")),
+        ("2022.12.19", "marker-excluded", Some(2022), None),
+        ("2026.8.0", "extras", Some(2026), None),
+        ("2026.8.0", "marker-excluded", Some(2026), None),
+    ];
+    for (release, shape, major, index) in cases {
+        let dir = format!("pipenv-shapes/{release}/{shape}");
+        let lock = fixture(&format!("{dir}/Pipfile.lock"));
+        let pipfile = fixture(&format!("{dir}/Pipfile"));
+        let pristine: serde_json::Value = serde_json::from_str(&lock).unwrap();
+        assert_eq!(
+            pristine["default"]["urllib3"].get("index").and_then(|v| v.as_str()),
+            index,
+            "{dir}: fixture drifted from what Pipenv writes"
+        );
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[
+                ("Pipfile.lock", lock.replace('\n', eol)),
+                ("Pipfile", pipfile.replace('\n', eol)),
+            ]);
+            let label = format!("pipenv {release} {shape} {eol:?}");
+            // The hosted entry keeps Pipenv's `index` (present or absent)
+            // and every other registry-independent key.
+            let hosted_lock = hosted(&input, &[urllib3_dep()], major)["Pipfile.lock"].clone();
+            let entry: serde_json::Value = serde_json::from_str(&hosted_lock).unwrap();
+            let entry = &entry["default"]["urllib3"];
+            assert!(entry.get("file").is_some() && entry.get("version").is_none(), "{label}: {entry}");
+            for key in ["index", "markers", "extras"] {
+                assert_eq!(entry.get(key), pristine["default"]["urllib3"].get(key), "{label}: {key}");
+            }
+            assert_pypi_round_trip(&label, &input, &[urllib3_dep()], major).await;
+        }
+    }
+}
+
+/// `pipenv lock` 2023+ over a hosted marker-excluded entry (the backtest's
+/// `rollbackAfterRelockRetires` hybrid, measured on 2026.8.0) keeps our
+/// `file` reference and writes `version` and the registry `hashes` back
+/// around it — no `index`, as for the original entry. `rollback` must turn
+/// it back into the pristine registry entry, not add an `index` Pipenv
+/// never wrote.
+#[tokio::test]
+#[serial]
+async fn pipfile_lock_marker_excluded_relock_hybrid_restores_the_original() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let dir = "pipenv-shapes/2026.8.0/marker-excluded";
+    let lock = fixture(&format!("{dir}/Pipfile.lock"));
+    let input = tree(&[
+        ("Pipfile.lock", lock.clone()),
+        ("Pipfile", fixture(&format!("{dir}/Pipfile"))),
+    ]);
+    let rewritten = hosted(&input, &[urllib3_dep()], Some(2026));
+    let mut relocked: serde_json::Value =
+        serde_json::from_str(&rewritten["Pipfile.lock"]).unwrap();
+    let pristine: serde_json::Value = serde_json::from_str(&lock).unwrap();
+    let entry = relocked["default"]["urllib3"].as_object_mut().unwrap();
+    assert!(entry.contains_key("file") && !entry.contains_key("index"), "{entry:?}");
+    entry.insert("hashes".into(), pristine["default"]["urllib3"]["hashes"].clone());
+    entry.insert("version".into(), serde_json::json!("==1.26.18"));
+    relocked.sort_all_objects();
+    let hybrid = reindent4(&serde_json::to_string_pretty(&relocked).unwrap()) + "\n";
+    let mut tree_in = rewritten.clone();
+    tree_in.insert("Pipfile.lock".into(), hybrid);
+    let (after, statuses) = restore_tree(&tree_in, &RestoreOptions::default()).await;
+    assert!(!statuses.is_empty(), "the hybrid is still a hosted pin");
+    for (purl, status) in &statuses {
+        assert_eq!(*status, PinStatus::Restored, "{purl}");
+    }
+    assert_eq!(after["Pipfile.lock"], lock, "the hybrid restores the pristine bytes");
+}
+
 #[tokio::test]
 #[serial]
 async fn pipfile_lock_refusals() {

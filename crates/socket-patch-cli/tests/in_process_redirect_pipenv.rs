@@ -357,7 +357,12 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
         serde_json::json!([format!("sha256:{}", sha256())]),
         "{redirected}"
     );
-    assert!(entry.get("version").is_none() && entry.get("index").is_none(), "{entry}");
+    assert!(entry.get("version").is_none(), "{entry}");
+    assert_eq!(
+        entry.get("index"),
+        urllib3_entry(LOCK).get("index"),
+        "Pipenv's own index is kept for rollback"
+    );
     assert_eq!(
         entry["markers"],
         urllib3_entry(LOCK)["markers"],

@@ -122,6 +122,21 @@ into the new version's section — see docs/releasing.md.
   files from version control. v4's `redirect_state_unreadable`,
   `redirect_pnpm_trust_scaffold_modified` and
   `redirect_npmrc_allow_remote_modified` are no longer emitted.
+- **The Pipenv hosted redirect keeps the entry's `index`.** A hosted
+  `Pipfile.lock` entry is now `{"file" | "path", "hashes"}` plus every key
+  but `version` exactly as Pipenv wrote it — `index` included, present or
+  absent — so `rollback` / `remove` carry it back instead of guessing it
+  from sibling entries. Pipenv records `index` by release, Pipfile spelling
+  and locking environment (2018.11.26 writes it for a marker-excluded
+  package, 2022.12.19 does not; 2022.12.19 writes it for an `extras` table,
+  2023.12.1 and later do not; no release writes it for a transitive
+  package), so no rule over the lock could re-derive it, and the guess left
+  those rollbacks off by one key. Measured on Pipenv 2018.11.26, 2020.11.15,
+  2021.11.23, 2022.12.19, 2023.12.1, 2024.4.1, 2025.1.3 and 2026.8.0: a
+  `file` entry carrying `index` still installs the referenced wheel itself
+  (`install --deploy`, `sync`, `verify`); Pipenv 7–11 ignore `index` on a
+  `path` entry. The restore refuses when the entry's `index` (or the
+  Pipfile's explicit one) does not name a PyPI source in `_meta.sources`.
 - **`list`, `vex`, `scan` and `repair` derive hosted state from the
   lockfiles.** `list` shows one entry per hosted pin: JSON
   `details.mode: "hosted"` plus `details.lockfiles: [<files wiring it>]`

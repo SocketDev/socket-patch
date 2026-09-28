@@ -1015,7 +1015,9 @@ def main():
             check("lockHasVendoredRef", b".socket/vendor/pypi" in lock_after)
         check("expectedSourceKey", keys == [expected_key], {"expected": expected_key, "got": keys})
         pristine_entries = {(s, k): e for s, k, e in lock_entries(pristine_lock.decode())}
-        check("allCategoriesRewritten", entries and all(("file" in e or "path" in e) and "version" not in e and "index" not in e for _, _, e in entries) and {(s, k) for s, k, _ in entries} == set(pristine_entries), {"pristine": sorted(pristine_entries), "rewritten": sorted((s, k) for s, k, _ in entries)})
+        # Hosted keeps Pipenv's own `index` (rollback carries it back; nothing
+        # else can re-derive it); vendored drops it.
+        check("allCategoriesRewritten", entries and all(("file" in e or "path" in e) and "version" not in e and (e.get("index") == pristine_entries.get((s, k), {}).get("index") if mode == "hosted" else "index" not in e) for s, k, e in entries) and {(s, k) for s, k, _ in entries} == set(pristine_entries), {"pristine": sorted(pristine_entries), "rewritten": sorted((s, k) for s, k, _ in entries)})
         check("markersExtrasPreserved", all(e.get("markers") == pristine_entries.get((s, k), {}).get("markers") and e.get("extras") == pristine_entries.get((s, k), {}).get("extras") for s, k, e in entries))
         after, before, uuid = record_hashes(project, mode)
         info["uuid"] = uuid
