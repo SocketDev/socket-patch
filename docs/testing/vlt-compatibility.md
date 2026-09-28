@@ -40,8 +40,8 @@ socket-patch alike.
 | Layer | Where | What it proves |
 |---|---|---|
 | Unit and golden | `socket-patch-core` lib tests; `tests/redirect_golden.rs` (`npm/vlt/*`, shared with depscan's TS rewriter), `tests/redirect_golden_reverse_replay.rs`, `tests/vlt_locks.rs` (captured locks of every era, and vendored wiring byte for byte against what real `vlt ci`, `vlt install --frozen-lockfile` and `vlt install <new>` keep on 1.2.0, 1.0.10, 1.0.4, 1.0.0-rc.32 and 1.0.0-rc.14) | DepID codec, collation (`tests/fixtures/vlt/collation-golden.json`), the node-line grammar, the hosted slot rewrite and its slot revert, vendored lock surgery and its inverse, lock inventory, VEX discovery |
-| Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, `setup_invariants`, … (the 3-OS `test` job) | every code of the vlt support, the artifact preflight against a wiremock server, the heal, takeovers, repair, the CLI surface |
-| Real-vlt capstones | the five binaries below plus the vlt legs of `e2e_hosted_production` / `e2e_vendored_production` | real installs: `vlt ci` and frozen installs of patched locks, byte-stable locks, integrity enforcement, the heal on a warm tree, re-saves, upgrades, the hardlinked global store, the setup hook |
+| Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, … (the 3-OS `test` job) | every code of the vlt support, the artifact preflight against a wiremock server, the heal, takeovers, repair, the CLI surface |
+| Real-vlt capstones | the five binaries below plus the vlt legs of `e2e_hosted_production` / `e2e_vendored_production` | real installs: `vlt ci` and frozen installs of patched locks, byte-stable locks, integrity enforcement, the heal on a warm tree, re-saves, upgrades, the hardlinked global store |
 | Native backtest | `scripts/backtest-vlt.py` | the production service end to end, per release, mode and project shape, against an oracle of the documented boundaries |
 
 `docs/testing/vlt-coverage.json` maps every vlt code and advisory variant,
@@ -212,7 +212,6 @@ them per OS).
 | `mode_migration_vlt` | `migration` | `vendored_then_hosted`, `hosted_then_vendored`, `dry_run_parity`, `scoped_unwind_one_of_two`, `rollback_from_mixed`, `agent_apply_yields_to_vendored`, `agent_apply_after_hosted`, `hosted_scan_keeps_agent_patched_tree`, `agent_rollback_after_takeovers`, `pm_switch_npm_to_vlt`, `pm_switch_vlt_to_npm`, `flavor_changed`, `upgrade_hosted`, `upgrade_vendored` |
 | `e2e_safety_vlt` | `safety` | `linux_auto`, `explicit_hardlink`, `private_copies`, `cross_device_cache`, `agent_rollback`, `peer_fanout`, `hosted_heal`, `vendored_build`, `vendor_revert_and_repair`, `layout_note` |
 | `e2e_vlt` | `agent` | `scan_apply_rollback_list`, `get_and_remove`, `install_then_apply_patches_file`, `transitive_only_dep_apply_patches_store`, `lockfile_supplement`, `launcher`, `persistence_survives`, `persistence_reverted_by_reinstall`, `reruns_and_vex` |
-| `e2e_vlt` | `setup` | `hook_fires_per_reify`, `root_scripts_advisory`, `workspace_root_only`, `twice_no_duplicate`, `hook_failure`, `hook_abort_leaves_no_staging` |
 | `e2e_hosted_production` | `production` | `hosted_install_proof` |
 | `e2e_vendored_production` | `production` | `vendored_install_proof` |
 
@@ -273,9 +272,6 @@ store-linker knob, `unset` when not given), `cache_root` and `upgrade`
 | as above | `all` | `cache_root=unset` | safety | `cross_device_cache` | `no-cache-root` |
 | a scalar `registry` makes lock-driven installs re-resolve from public npm | `1.0.0-rc.7 … 1.0.0-rc.29` | — | agent | `scan_apply_rollback_list`, `launcher` | `non-hermetic-registry` |
 | `npm:` alias specs resolve against public npm even with `registries.npm` | `1.0.0-rc.30 … 1.0.0-rc.32` | — | agent | `scan_apply_rollback_list` | `non-hermetic-registry` |
-| root `pre*`/`post*` scripts run without an `install` script | `< 1.0.0-rc.13` | — | setup | `hook_fires_per_reify`, `workspace_root_only`, `hook_failure` | `root-postinstall-not-run` |
-| a failing hook's abort on Windows (rollback EBUSY fix from 1.0.5) | `all` | `os!=windows` | setup | `hook_abort_leaves_no_staging` | `windows-only` |
-| as above | `< 1.0.5` | — | setup | `hook_abort_leaves_no_staging` | `pre-ebusy-fix` |
 | `lockfileVersion` 0 with legacy (`·`/`§`) DepIDs | `0.0.0-19 … 1.0.0-rc.14` | — | — | — | — |
 | `lockfileVersion` 1, tilde DepIDs | `>= 1.0.0-rc.15` | — | — | — | — |
 | a plain `vlt install` re-extracts a stale installed copy (`no_cleanup_stays_stale` expects the patch there) | `== 0.0.0-14` | — | — | — | — |
@@ -300,6 +296,5 @@ The legs run on Linux, macOS and Windows. The Linux-default `auto` store
 linker (hardlinks, `safety/linux_auto`) cannot run on macOS or Windows; it is
 covered on Linux by the CI `e2e` row `e2e_safety_vlt` on ubuntu with vlt
 1.2.0 and by `vlt-compatibility.yml`'s store-linker rows, and was also run
-locally in `node:24-slim` under Docker. Windows-only legs
-(`setup/hook_abort_leaves_no_staging`, the junction and dir-symlink store
-cases) run on the Windows rows.
+locally in `node:24-slim` under Docker. Windows-only cases
+(the junction and dir-symlink store cases) run on the Windows rows.

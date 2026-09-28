@@ -113,13 +113,6 @@ pub fn command_for(program: &Path) -> Command {
     Command::new(program)
 }
 
-/// [`resolve_tool`] + [`command_for`]: the command for the tool `name` found
-/// on an absolute PATH entry, or `None` when there is none — the caller
-/// decides how "not installed" degrades (a warning, a refusal).
-pub fn tool_command(name: &str) -> Option<Command> {
-    resolve_tool(name).map(|program| command_for(&program))
-}
-
 /// Run an external binary with the given args and return its
 /// stdout, trimmed, when the spawn succeeded AND the process exited
 /// with a success status AND stdout is non-empty after trimming.
@@ -253,7 +246,7 @@ mod tests {
         assert_eq!(out.as_deref(), Some("forwarded"));
     }
 
-    // ───────────────────────── resolve_tool / tool_command ─────────────────────────
+    // ───────────────────────── resolve_tool / command_for ─────────────────────────
 
     /// Mark an existing file executable (no-op off Unix: PATHEXT rules there).
     fn set_executable(path: &Path) {
@@ -447,12 +440,5 @@ mod tests {
         std::fs::write(bin.join("bun.exe"), b"").unwrap();
         let exe = resolve_tool_with("bun", &exe_only).expect("bun.exe resolves");
         assert_eq!(command_for(&exe).get_program(), exe.as_os_str());
-    }
-
-    /// `tool_command` reads the REAL environment: a name that cannot be on
-    /// any PATH yields None (the caller's "not installed" arm).
-    #[test]
-    fn tool_command_is_none_for_an_absent_tool() {
-        assert!(tool_command("definitely-not-a-real-binary-1234567").is_none());
     }
 }

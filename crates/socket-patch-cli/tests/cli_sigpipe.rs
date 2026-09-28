@@ -23,7 +23,7 @@ const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");
 const SIGPIPE: i32 = 13;
 
 /// `list` against an empty manifest is the cheapest command that writes
-/// to stdout: offline, lock-free — prints "No patches found in manifest."
+/// to stdout: offline, lock-free — prints "No patches in this project. Run `socket-patch scan`."
 /// and exits 0 when stdout is healthy.
 #[test]
 fn closed_stdout_pipe_is_not_a_panic() {

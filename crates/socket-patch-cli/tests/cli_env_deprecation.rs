@@ -145,13 +145,13 @@ fn legacy_proxy_url_warns() {
         out.stdout
     );
     // The warning must fire on the *real* code path: `list` against an empty
-    // tempdir runs to its normal "manifest not found" error (exit 1). Pinning
-    // this rejects a child that crashed (signal → `None`) after emitting the
-    // line, and proves the shim ran inside an actual command invocation.
+    // tempdir runs to its normal empty-project result (exit 0). Pinning this
+    // rejects a child that crashed (signal → `None`) after emitting the line,
+    // and proves the shim ran inside an actual command invocation.
     assert_eq!(
         out.code,
-        Some(1),
-        "expected the manifest-not-found error exit; stderr was:\n{}",
+        Some(0),
+        "expected the empty-project list exit; stderr was:\n{}",
         out.stderr
     );
 }
@@ -167,8 +167,8 @@ fn legacy_debug_warns() {
     );
     assert_eq!(
         out.code,
-        Some(1),
-        "expected the manifest-not-found error exit; stderr was:\n{}",
+        Some(0),
+        "expected the empty-project list exit; stderr was:\n{}",
         out.stderr
     );
 }
@@ -188,8 +188,8 @@ fn legacy_telemetry_disabled_warns() {
     );
     assert_eq!(
         out.code,
-        Some(1),
-        "expected the manifest-not-found error exit; stderr was:\n{}",
+        Some(0),
+        "expected the empty-project list exit; stderr was:\n{}",
         out.stderr
     );
 }
@@ -209,11 +209,11 @@ fn legacy_warning_fires_under_silent() {
     // `--silent` it must be byte-for-byte the same line emitted without it.
     assert_deprecation_warning(&out.stderr, "SOCKET_PATCH_PROXY_URL", "SOCKET_PROXY_URL");
     // `--silent` is parsed and accepted (no clap usage error, which would be
-    // exit 2); the command still runs to its normal manifest-not-found error.
+    // exit 2); the command still runs to its normal empty-project result.
     assert_eq!(
         out.code,
-        Some(1),
-        "--silent should be accepted and the command reach its normal error exit; stderr was:\n{}",
+        Some(0),
+        "--silent should be accepted and the command reach its normal exit; stderr was:\n{}",
         out.stderr
     );
     // The warning is diagnostic output: it must stay on stderr and never bleed
@@ -263,19 +263,19 @@ fn legacy_warning_fires_under_json() {
         "JSON payload should be the structured `list` command result; got:\n{}",
         out.stdout
     );
-    // The run errors (no manifest in the fresh tempdir), so the structured
-    // result must say so — and exit non-zero — proving the JSON path itself
-    // ran rather than some short-circuited stub.
+    // An empty tempdir lists as an empty project, so the structured result
+    // must be a success with no events — proving the JSON path itself ran
+    // rather than some short-circuited stub.
     assert_eq!(
         parsed.get("status").and_then(|v| v.as_str()),
-        Some("error"),
-        "JSON payload should report the manifest-not-found error; got:\n{}",
+        Some("success"),
+        "JSON payload should report the empty-project success; got:\n{}",
         out.stdout
     );
     assert_eq!(
         out.code,
-        Some(1),
-        "expected the manifest-not-found error exit under --json; stderr was:\n{}",
+        Some(0),
+        "expected the empty-project list exit under --json; stderr was:\n{}",
         out.stderr
     );
 }
@@ -294,12 +294,12 @@ fn new_var_takes_precedence_and_silences_warning() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     // Guard against a vacuous pass: if the binary never launched (or crashed
     // before promoting env vars) stderr would also lack "deprecated". Require
-    // the real manifest-not-found error exit so "no warning" means the shim
+    // the real empty-project list exit so "no warning" means the shim
     // ran and chose to stay quiet — not that nothing ran at all.
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "expected the binary to run to its manifest-not-found error; stderr was:\n{stderr}"
+        Some(0),
+        "expected the binary to run to its empty-project list result; stderr was:\n{stderr}"
     );
     assert!(
         !stderr.to_lowercase().contains("deprecated"),
@@ -325,8 +325,8 @@ fn no_warning_when_no_legacy_var_set() {
     // result of the binary failing to start.
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "expected the binary to run to its manifest-not-found error; stderr was:\n{stderr}"
+        Some(0),
+        "expected the binary to run to its empty-project list result; stderr was:\n{stderr}"
     );
     assert!(
         !stderr.to_lowercase().contains("deprecated"),

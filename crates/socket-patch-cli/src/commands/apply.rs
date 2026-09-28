@@ -69,7 +69,7 @@ fn warn_mismatch_overwrites(result: &ApplyResult, common: &GlobalArgs) {
 fn format_mismatch_warning(purl: &str, file: &str, dry_run: bool) -> String {
     let what = if dry_run { "would apply" } else { "applied" };
     format!(
-        "Warning (content_mismatch_overwritten): {purl} {file} did not match the patch's \
+        "Warning: {purl} {file} did not match the patch's \
          expected original content; {what} the full verified patched content instead \
          (pass --strict to fail on mismatches)"
     )
@@ -765,7 +765,8 @@ pub async fn run(args: ApplyArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
 
     // No manifest → nothing to apply: a clean exit-0 no-op (load-bearing
-    // for the install hooks, which run `apply --silent` on every install).
+    // for CI steps and legacy install hooks that run `apply --silent` on
+    // every install).
     // Nothing below this gate is touched — no API client (its config read,
     // stderr advisory and org-slug round-trip), no lock, no `.socket/`.
     if tokio::fs::metadata(&manifest_path).await.is_err() {
@@ -1033,11 +1034,11 @@ pub(crate) async fn run_locked(
                     // own `Error:` diagnostic (already printed, even under
                     // --silent); they exist for the JSON envelope.
                     if !is_stage_failure_code(&w.code) {
-                        eprintln!("Warning ({}): {}", w.code, w.detail);
+                        eprintln!("Warning: {}", w.detail);
                     }
                 }
                 for skip in &fallback_skips {
-                    eprintln!("Warning (gem_fallback_home_skipped): {}", skip.detail());
+                    eprintln!("Warning: {}", skip.detail());
                 }
             }
 
@@ -3108,7 +3109,7 @@ mod tests {
     fn mismatch_messages_follow_dry_run_tense() {
         assert_eq!(
             format_mismatch_warning("pkg:npm/nuxt@4.5.0", "dist/index.mjs", false),
-            "Warning (content_mismatch_overwritten): pkg:npm/nuxt@4.5.0 dist/index.mjs did \
+            "Warning: pkg:npm/nuxt@4.5.0 dist/index.mjs did \
              not match the patch's expected original content; applied the full verified \
              patched content instead (pass --strict to fail on mismatches)"
         );

@@ -462,7 +462,7 @@ async fn get_ghsa_all_uninstalled_emits_not_installed_envelope() {
 /// any network contact. Human mode names the conflict on stderr; `--json`
 /// mode emits get's `{status:"error", error:<string>}` envelope on stdout.
 #[tokio::test]
-async fn save_only_with_mode_conflicts_exit_one() {
+async fn save_only_with_mode_conflicts_exit_two() {
     // No mocks mounted: the zero-received-requests assertion below is the
     // "before any network contact" oracle.
     let server = MockServer::start().await;
@@ -475,7 +475,7 @@ async fn save_only_with_mode_conflicts_exit_one() {
             &server.uri(),
             &[UUID1, "--mode", mode, "--save-only"],
         );
-        assert_eq!(code, 1, "--save-only + --mode {mode} must exit 1");
+        assert_eq!(code, 2, "--save-only + --mode {mode} must exit 2 (usage)");
         assert!(
             stdout.is_empty(),
             "conflict error is stderr-only in human mode; stdout: {stdout:?}"
@@ -485,15 +485,15 @@ async fn save_only_with_mode_conflicts_exit_one() {
             "stderr must name the conflicting flags; got:\n{stderr}"
         );
 
-        // JSON path: ONE {status:"error"} envelope on stdout, exit 1.
+        // JSON path: ONE {status:"error"} envelope on stdout, exit 2.
         let (code, stdout, stderr) = run_get(
             tmp.path(),
             &server.uri(),
             &[UUID1, "--mode", mode, "--save-only", "--json"],
         );
         assert_eq!(
-            code, 1,
-            "--save-only + --mode {mode} --json must exit 1; stderr:\n{stderr}"
+            code, 2,
+            "--save-only + --mode {mode} --json must exit 2; stderr:\n{stderr}"
         );
         let v = parse_single_json_doc(&stdout);
         assert_eq!(v["status"], "error", "envelope={v}");
@@ -570,7 +570,7 @@ async fn get_hosted_silent_prints_nothing_to_stdout() {
     // Two files: the lock, plus the project `.npmrc` the npm 12
     // `allow-remote=all` auto-config creates.
     assert!(
-        loud_stdout.contains("Redirected 1 package; rewrote 2 files."),
+        loud_stdout.contains("Switched 1 package to hosted patches; rewrote 2 files."),
         "non-silent hosted run must print the redirect summary; got {loud_stdout:?}"
     );
 }
@@ -902,7 +902,7 @@ async fn get_pnp_only_narrowing_message_names_the_layout() {
          stdout:\n{stdout}"
     );
     assert!(
-        stderr.contains("yarn_pnp_unsupported"),
+        stderr.contains("Warning: this project uses yarn Plug'n'Play"),
         "the layout refusal warning must be on stderr; stderr:\n{stderr}"
     );
 }

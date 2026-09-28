@@ -186,7 +186,7 @@ fn lock_held_human_mode_mentions_other_process() {
 /// `--silent` is "errors only" (CLI_CONTRACT.md), never "nothing":
 /// a lock_held contention under `apply --silent` must still put the
 /// error line on stderr. Exit 1 with zero output is undiagnosable —
-/// the same violation fixed for setup/scan/apply's other error exits.
+/// the same violation fixed for scan/apply's other error exits.
 #[test]
 fn lock_held_silent_mode_still_reports_error() {
     let dir = tempfile::tempdir().unwrap();

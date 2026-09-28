@@ -13,6 +13,25 @@ const ELLIPSIS: &str = "...";
 /// over a hard mid-word cut.
 const WORD_BOUNDARY_WINDOW: usize = 15;
 
+/// The "Next steps:" block printed after a hosted or vendored run that
+/// changed the project: commit `commit`, then `reinstall` and verify with
+/// `vex`, then any `extra` steps. Shared so the two modes read alike.
+pub(crate) fn next_steps(commit: &str, reinstall: &str, extra: &[String]) -> Vec<String> {
+    let mut steps = vec![
+        format!("Commit {commit}."),
+        format!("{reinstall}, then run `socket-patch vex` to verify the installed patches."),
+    ];
+    steps.extend(extra.iter().cloned());
+    let mut out = vec!["Next steps:".to_string()];
+    out.extend(
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("  {}. {step}", i + 1)),
+    );
+    out
+}
+
 /// Fit `s` on one line of at most `max` characters.
 ///
 /// - Every whitespace run (including embedded newlines and tabs from API
@@ -136,5 +155,18 @@ mod tests {
         for max in 0..12 {
             assert!(truncate("some words here ok", max).chars().count() <= max);
         }
+    }
+
+    #[test]
+    fn next_steps_numbers_commit_reinstall_then_extras() {
+        assert_eq!(
+            next_steps("a and b", "Run `npm ci`", &["vlt: x".to_string()]),
+            vec![
+                "Next steps:",
+                "  1. Commit a and b.",
+                "  2. Run `npm ci`, then run `socket-patch vex` to verify the installed patches.",
+                "  3. vlt: x",
+            ]
+        );
     }
 }
