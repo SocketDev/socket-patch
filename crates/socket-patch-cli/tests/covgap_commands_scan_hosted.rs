@@ -1818,11 +1818,9 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         user_bytes,
         "the unreadable workspace file must be left byte-identical"
     );
-    let ledger =
-        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
     assert!(
-        !ledger.contains("redirect_pnpm_workspace_trust"),
-        "no workspace-trust edit may be recorded when the file was unreadable: {ledger}"
+        !tmp.path().join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no redirect ledger"
     );
 }
 
