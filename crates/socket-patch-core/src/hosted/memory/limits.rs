@@ -295,7 +295,7 @@ impl SessionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hosted_memory::types::HostedScanLimits;
+    use crate::hosted::memory::types::HostedScanLimits;
 
     fn options(limits: HostedScanLimits) -> HostedScanOptions {
         HostedScanOptions {

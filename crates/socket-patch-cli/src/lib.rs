@@ -8,7 +8,10 @@
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
-pub mod hosted_memory;
+/// The in-memory hosted engine, which lives in core
+/// ([`socket_patch_core::hosted::memory`]); re-exported under its old path
+/// for the `hosted-bundle` harness and the integration tests.
+pub use socket_patch_core::hosted::memory as hosted_memory;
 pub mod json_envelope;
 pub mod path_scope;
 pub mod ui;

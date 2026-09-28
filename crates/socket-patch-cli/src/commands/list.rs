@@ -1,12 +1,11 @@
 use std::path::Path;
 
 use clap::Args;
-use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::patch::redirect::RedirectState;
 use socket_patch_core::telemetry::track_patch_listed;
-use socket_patch_core::vendor::state::{VendorEntry, VENDOR_STATE_REL};
+use socket_patch_core::vendor::state::{VendorState, VENDOR_STATE_REL};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
@@ -19,25 +18,21 @@ pub struct ListArgs {
     pub common: GlobalArgs,
 }
 
-/// Where a listed record lives. Declaration order is the tie-break order
-/// when one purl appears in several stores: coexistence is real state (e.g.
-/// an agent-applied patch alongside live hosted wiring), so every copy is
-/// shown, labeled apart.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Source {
-    /// A `.socket/manifest.json` entry (agent mode).
-    Manifest,
-    /// A hosted pin the lockfiles wire: `scan --mode hosted` keeps no
-    /// ledger and never writes the manifest, so the lockfiles are the only
-    /// record of a hosted patch.
-    Hosted,
-    /// A vendor-ledger record: vendored mode is manifest-free, so every
-    /// `scan`/`get --mode vendored` patch lives ONLY in
-    /// `.socket/vendor/state.json`, as a `detached` entry's embedded record
-    /// (the hosted rule again — a vendored-only project lists and exits 0).
-    /// A standalone `vendor` entry's fallback copy lists here too once no
-    /// manifest entry covers it — the checkout `vex` attests from it.
-    Vendored,
+// Where a listed record lives (see `socket_patch_core::ledgers`): the
+// manifest (agent mode); the hosted redirect ledger, where `scan --mode
+// hosted` recorded its patches; or the vendor ledger, where vendored mode
+// keeps every `scan`/`get --mode vendored` patch as a `detached` entry's
+// embedded record (a standalone `vendor` entry's fallback copy lists too
+// once no manifest entry covers it — the checkout `vex` attests from it).
+use socket_patch_core::ledgers::Store as Source;
+
+/// The display order of one purl's copies: manifest, hosted, vendored.
+fn display_rank(source: Source) -> u8 {
+    match source {
+        Source::Manifest => 0,
+        Source::Hosted => 1,
+        Source::Vendored => 2,
+    }
 }
 
 /// The `(mode, ledger)` label pair for a vendor-ledger record — the shared
@@ -109,53 +104,46 @@ impl HostedListing {
     }
 }
 
-/// Every listable record from all three stores, in a stable order: by
-/// PURL, then manifest < hosted < vendored when one purl appears in more
-/// than one. The record maps (`HashMap` manifest and vendor ledger /
-/// hosted pins) never impose an order shared consumers could
-/// diff, so the sort here is the contract. Only vendor entries whose
-/// embedded record stands on its own fold in
-/// ([`crate::commands::vendor_record_is_unowned`], the rule `vex` attests
-/// by): a `detached` entry always (coexisting with a manifest entry is real
-/// state, shown labeled apart), a standalone `vendor` entry's fallback copy
-/// only when the manifest does not cover it — while it does, the manifest's
-/// record IS that entry's record and listing the copy would double-list the
-/// purl. A legacy entry with no embedded record never folds in.
+/// Every listable record, in a stable order: by PURL, then
+/// [`display_rank`] when one purl appears in more than one store. The
+/// manifest and the vendor ledger go through the shared owner rule
+/// ([`socket_patch_core::ledgers::Ledgers::listed`]: coexisting copies are
+/// real state, shown labeled apart; a claimed fallback copy and a legacy
+/// entry with no embedded record never list); every hosted pin lists as
+/// its own copy (the lockfiles are the only hosted record). The record
+/// maps never impose an order shared consumers could diff, so the sort
+/// here is the contract.
 fn combined_entries<'a>(
     manifest: Option<&'a PatchManifest>,
     hosted: &'a [HostedListing],
-    vendor: Option<&'a std::collections::HashMap<String, VendorEntry>>,
+    vendor: Option<&'a VendorState>,
 ) -> Vec<ListEntry<'a>> {
-    let mut entries: Vec<ListEntry<'a>> = Vec::new();
-    if let Some(manifest) = manifest {
-        entries.extend(manifest.patches.iter().map(|(purl, record)| ListEntry {
-            purl,
-            record,
-            source: Source::Manifest,
+    let ledgers = socket_patch_core::ledgers::Ledgers {
+        manifest,
+        vendor,
+        redirect: None,
+    };
+    let mut entries: Vec<ListEntry<'a>> = ledgers
+        .listed()
+        .into_iter()
+        .map(|l| ListEntry {
+            purl: l.key,
+            record: l.record,
+            source: l.store,
             lockfiles: &[],
-        }));
-    }
+        })
+        .collect();
     entries.extend(hosted.iter().map(|h| ListEntry {
         purl: &h.purl,
         record: &h.record,
         source: Source::Hosted,
         lockfiles: &h.lockfiles,
     }));
-    if let Some(vendor) = vendor {
-        entries.extend(vendor.iter().filter_map(|(purl, entry)| {
-            let record = entry
-                .record
-                .as_ref()
-                .filter(|_| crate::commands::vendor_record_is_unowned(purl, entry, manifest))?;
-            Some(ListEntry {
-                purl,
-                record,
-                source: Source::Vendored,
-                lockfiles: &[],
-            })
-        }));
-    }
-    entries.sort_by(|a, b| a.purl.cmp(b.purl).then(a.source.cmp(&b.source)));
+    entries.sort_by(|a, b| {
+        a.purl
+            .cmp(b.purl)
+            .then(display_rank(a.source).cmp(&display_rank(b.source)))
+    });
     entries
 }
 
@@ -379,8 +367,12 @@ pub async fn run(args: ListArgs) -> i32 {
     // unparseable), and any other `Err` (genuine I/O failure). No stat
     // pre-check: it would report any stat failure as `manifest_not_found`
     // and open a TOCTOU window.
-    let manifest = match read_manifest(&manifest_path).await {
-        Ok(manifest) => manifest,
+    // One load of the three stores, all from the SAME project as the
+    // manifest (see below); each keeps list's own posture.
+    let ctx = crate::commands::context::ProjectContext::new(&args.common);
+    let loaded = ctx.loaded().await;
+    let manifest = match &loaded.manifest {
+        Ok(manifest) => manifest.as_ref(),
         Err(e) => {
             // `InvalidData` (bad JSON or schema) is the contract's
             // `manifest_invalid`; everything else is `manifest_unreadable`
@@ -394,7 +386,7 @@ pub async fn run(args: ListArgs) -> i32 {
             emit_error(
                 &args,
                 code,
-                manifest_error_message(&manifest_path, &e),
+                manifest_error_message(&manifest_path, e),
                 Vec::new(),
             );
             return 1;
@@ -412,25 +404,23 @@ pub async fn run(args: ListArgs) -> i32 {
     // hosted pins it still describes; a malformed one degrades to "nothing
     // to consult", surfaced on stderr unless --silent, or in the envelope's
     // `warnings[]` under --json.
-    let project_root = args.common.project_root();
     let mut warnings: Vec<RunWarning> = Vec::new();
-    let legacy_redirect =
-        match socket_patch_core::patch::redirect::load_redirect_state(&project_root).await {
-            Ok(state) => state,
-            Err(corrupt) => {
-                if args.common.json {
-                    warnings.push(RunWarning {
-                        code: "redirect_ledger_corrupt".to_string(),
-                        detail: corrupt.to_string(),
-                    });
-                } else if !args.common.silent {
-                    eprintln!("Warning: {corrupt}");
-                }
-                None
+    let legacy_redirect = match &loaded.redirect {
+        Ok(state) => state.as_ref(),
+        Err(corrupt) => {
+            if args.common.json {
+                warnings.push(RunWarning {
+                    code: "redirect_ledger_corrupt".to_string(),
+                    detail: corrupt.to_string(),
+                });
+            } else if !args.common.silent {
+                eprintln!("Warning: {corrupt}");
             }
-        };
-    let inventory = crate::commands::hosted_inventory(&args.common, &project_root).await;
-    let hosted = HostedListing::from_pins(&inventory.pins, legacy_redirect.as_ref());
+            None
+        }
+    };
+    let inventory = crate::commands::hosted_inventory(&args.common, &ctx.root).await;
+    let hosted = HostedListing::from_pins(&inventory.pins, legacy_redirect);
     // Contested hosted wiring cannot be listed as patches, but it is hosted
     // state: surface it (stderr / `warnings[]`), never hide it.
     let contested = inventory.contested_refusal();
@@ -444,17 +434,12 @@ pub async fn run(args: ListArgs) -> i32 {
             eprintln!("Warning: {}", crate::commands::rollback::capitalize_first(detail));
         }
     }
-    let vendor_state =
-        crate::commands::load_vendor_state_lenient(&project_root, args.common.silent).await;
+    let vendor_state = crate::commands::vendor_state_lenient(&loaded.vendor, args.common.silent);
 
     // `combined_entries` folds only real records in (a record-less legacy
     // vendor entry asserts no patch), so entry emptiness is the whole exit
     // predicate.
-    let entries = combined_entries(
-        manifest.as_ref(),
-        &hosted,
-        vendor_state.as_ref().map(|s| &s.entries),
-    );
+    let entries = combined_entries(manifest, &hosted, vendor_state);
     if manifest.is_none() && entries.is_empty() {
         if let Some(detail) = contested {
             emit_error(&args, "hosted_wiring_contested", detail, warnings);
@@ -470,7 +455,7 @@ pub async fn run(args: ListArgs) -> i32 {
     // Telemetry: `patch_listed`'s `patches_count` means "manifest patches"
     // to its consumers, so it counts the manifest ONLY (0 on a ledger-only
     // project) rather than the listed entries.
-    let manifest_patch_count = manifest.as_ref().map_or(0, |m| m.patches.len());
+    let manifest_patch_count = manifest.map_or(0, |m| m.patches.len());
     let (api_token, org_slug) = args.common.telemetry_credentials();
     track_patch_listed(
         manifest_patch_count,
@@ -498,6 +483,7 @@ mod tests {
     //! consumers (PR bots, dashboards) can rely on it.
     use super::*;
     use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
+    use socket_patch_core::vendor::state::VendorEntry;
     use std::collections::HashMap;
 
     /// Envelope for a manifest-only listing (no hosted pins, no vendor
@@ -817,6 +803,13 @@ mod tests {
     /// `record` is given (the manifest-free vendored posture), a legacy
     /// manifest-tracked entry (no record of its own) otherwise. Built from
     /// the on-disk JSON shape so the fixture follows the ledger schema.
+    fn as_state(entries: &HashMap<String, VendorEntry>) -> VendorState {
+        VendorState {
+            entries: entries.clone(),
+            ..VendorState::new()
+        }
+    }
+
     fn vendor_entry(purl: &str, record: Option<PatchRecord>) -> VendorEntry {
         serde_json::from_value(serde_json::json!({
             "ecosystem": "npm",
@@ -862,7 +855,7 @@ mod tests {
         let env = build_list_envelope(&combined_entries(
             Some(&manifest),
             &pins,
-            Some(&vendor),
+            Some(&as_state(&vendor)),
         ));
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         let listed: Vec<(&str, &str)> = v["events"]
@@ -896,7 +889,7 @@ mod tests {
             "the ledger's embedded record is the one listed: {v}"
         );
 
-        let only = build_list_envelope(&combined_entries(None, &[], Some(&vendor)));
+        let only = build_list_envelope(&combined_entries(None, &[], Some(&as_state(&vendor))));
         let v: serde_json::Value = serde_json::from_str(&only.to_pretty_json()).unwrap();
         assert_eq!(v["status"], "success", "{v}");
         assert_eq!(v["summary"]["discovered"], 2, "{v}");
@@ -960,7 +953,11 @@ mod tests {
         };
 
         assert_eq!(
-            listed(&combined_entries(Some(&manifest), &[], Some(&vendor))),
+            listed(&combined_entries(
+                Some(&manifest),
+                &[],
+                Some(&as_state(&vendor))
+            )),
             vec![
                 (
                     "pkg:npm/left-pad@1.3.0".to_string(),
@@ -977,7 +974,7 @@ mod tests {
         );
 
         // No manifest at all: every fallback copy stands on its own.
-        let only = listed(&combined_entries(None, &[], Some(&vendor)));
+        let only = listed(&combined_entries(None, &[], Some(&as_state(&vendor))));
         assert_eq!(only.len(), 3, "{only:?}");
         assert!(
             only.iter().all(|(_, mode, _)| mode == "vendored"),

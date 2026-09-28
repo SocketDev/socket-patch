@@ -1843,6 +1843,19 @@ into the new version's section — see docs/releasing.md.
   file qualifier) is refused from its reference, before its bytes are
   downloaded: `auto` still warns `vendor_prebuilt_unavailable` and builds
   the wheel locally, `service` still refuses.
+- **One owner rule for the patch stores.** `list`, `vex`, `scan`'s
+  `updates[]`, `rollback` and `remove` now read the
+  manifest and the vendor ledger (plus, in `vex`, the hosted records)
+  through one view (`socket_patch_core::ledgers`) with one precedence:
+  manifest, then vendor ledger, then hosted records, by ledger key; a
+  manifest key claims every vendor entry filed under it or naming it as
+  base purl. Visible differences: `scan`'s `updates[]` no longer folds a
+  vendor entry the manifest claims by base purl; `vex` treats every vendor
+  entry a manifest key claims as a fallback copy of that key's record (a
+  second variant of the same base purl used to become its own candidate).
+  `get`'s installed-version narrowing now uses
+  `scan`'s lockfile and vendored-ledger discovery, so a corrupt vendor
+  ledger falls back to the committed artifacts there too.
 - **The npm crawl skips tagged cache directories.** The walk that finds
   workspace `node_modules` trees no longer descends into a directory that
   carries a [Cache Directory Tagging](https://bford.info/cachedir/)

@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-use socket_patch_core::api::client::{ApiError, ApiFuture, PatchApi};
-use socket_patch_core::api::ranking::cmp_search_results;
-use socket_patch_core::api::types::{
+use crate::api::client::{ApiError, ApiFuture, PatchApi};
+use crate::api::ranking::cmp_search_results;
+use crate::api::types::{
     BatchPackagePatches, PackageVendorResult, PatchResponse, PatchSearchResult, SearchResponse,
 };
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 
 use super::types::MAX_REFERENCE_BATCH;
 
@@ -102,11 +102,11 @@ impl Provider {
     pub(crate) async fn search_patches_batch(
         &self,
         purls: &[String],
-    ) -> Result<socket_patch_core::api::types::BatchSearchResponse, ApiError> {
+    ) -> Result<crate::api::types::BatchSearchResponse, ApiError> {
         let mut response = self
             .call("searchPatchesBatch", self.api.search_patches_batch(purls))
             .await?;
-        socket_patch_core::api::client::sort_batch_response(&mut response);
+        crate::api::client::sort_batch_response(&mut response);
         Ok(response)
     }
 
@@ -355,7 +355,7 @@ pub(crate) async fn fetch_wheel_metadata(
                         .download_artifact(url, max_bytes)
                         .await
                         .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))?;
-                    socket_patch_core::vendor::pypi::decode_hosted_wheel_metadata(&bytes, sha256)
+                    crate::vendor::pypi::decode_hosted_wheel_metadata(&bytes, sha256)
                 })
             },
         )

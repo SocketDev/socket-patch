@@ -8,17 +8,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use socket_patch_core::constants::npm_family::{
+use crate::constants::npm_family::{
     BUN_LOCKB, PNP_MARKERS, RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR,
 };
-use socket_patch_core::patch::redirect::npmrc::NPMRC_REL;
-use socket_patch_core::utils::python_lock::is_python_lock_name;
+use crate::patch::redirect::npmrc::NPMRC_REL;
+use crate::utils::python_lock::is_python_lock_name;
 
 use super::roots::{
     detect_roots, split_path, strip_root, EXCLUDED_ROOT_SEGMENTS, UNSUPPORTED_MARKERS,
 };
 use super::types::{IgnoredPath, PathSelection, SelectOptions, TreeEntryInput};
-use crate::commands::scan::hosted::{PNPM_WORKSPACE_REL, REDIRECT_CANDIDATE_FILES};
+use crate::hosted::engine::{REDIRECT_CANDIDATE_FILES, RUSH_REPO_STATE_REL};
+use crate::hosted::guidance::PNPM_WORKSPACE_REL;
 
 /// Most entries [`PathSelection::ignored_sample`] carries.
 pub const IGNORED_SAMPLE_MAX: usize = 100;
@@ -31,9 +32,6 @@ const MAX_PATH_DEPTH: usize = 64;
 
 /// The vendored-mode ledger (its presence refuses a vendored takeover).
 pub(crate) const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
-
-/// Rush's repo-state file (presence feeds the stale-hash warning).
-pub(crate) const RUSH_REPO_STATE_REL: &str = "common/config/rush/repo-state.json";
 
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
 const EXTRA_TEXT_FILES: [&str; 3] = [PNPM_WORKSPACE_REL, NPMRC_REL, VENDOR_STATE_REL];
