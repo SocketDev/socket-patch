@@ -70,6 +70,94 @@ pub(super) fn after_last_clear(body: &str) -> &str {
         .map_or(body, |m| &body[m.end()..])
 }
 
+/// `<packageSources …>` open tag, any whitespace or attributes.
+static NUGET_SOURCES_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<packageSources(?:\s[^>]*)?>")
+        .expect("static packageSources open-tag regex is valid")
+});
+
+/// The children span `(open_end, close_start)` of the first non-self-closing
+/// section `open` matches in `visible` (through EOF without a close tag).
+fn section_body(visible: &str, open: &Regex, close_prefix: &str) -> Option<(usize, usize)> {
+    let m = open
+        .find_iter(visible)
+        .find(|m| !m.as_str().ends_with("/>"))?;
+    let end = visible[m.end()..]
+        .find(close_prefix)
+        .map_or(visible.len(), |rel| m.end() + rel);
+    Some((m.end(), end))
+}
+
+/// A source `<add>` or mapping `<packageSource>…</packageSource>` for `key`.
+fn entry_re(key: &str) -> [Regex; 2] {
+    let key = regex::escape(key);
+    let attr = format!(r#"\bkey\s*=\s*(?:"{key}"|'{key}')"#);
+    [
+        Regex::new(&format!(r"<add\s[^>]*?{attr}[^>]*>")).expect("escaped add-entry regex"),
+        Regex::new(&format!(
+            r"(?s)<packageSource\s[^>]*?{attr}[^>]*?(?:/>|>.*?</packageSource\s*>)"
+        ))
+        .expect("escaped mapping-entry regex"),
+    ]
+}
+
+/// Whether `<packageSourceMapping>` names `key` only above its last
+/// `<clear/>`: NuGet drops that entry, so the id falls back to another
+/// source (NU1403 against the patched lock hash) although the source is
+/// kept. An older rewrite placed it there.
+pub(super) fn mapping_entry_cleared(config: &str, key: &str) -> bool {
+    let visible = visible(config);
+    let Some(open_end) = mapping_open_end(&visible) else {
+        return false;
+    };
+    let body_end = visible[open_end..]
+        .find("</packageSourceMapping")
+        .map_or(visible.len(), |rel| open_end + rel);
+    let body = &visible[open_end..body_end];
+    let [_, mapping] = entry_re(key);
+    mapping.is_match(body) && !mapping.is_match(after_last_clear(body))
+}
+
+/// `config` without any source `<add>` or mapping `<packageSource>` for
+/// `key` outside comments (each one's own line when it is alone on it).
+/// A re-wire places fresh entries, and a stale one left beside them breaks
+/// restore: NuGet drops a source key re-added below a `<clear/>` together
+/// with the one above it (NU1100), and refuses a mapping that lists a key
+/// twice.
+pub(super) fn strip_entries(config: &str, key: &str) -> String {
+    let visible = visible(config);
+    let [add, mapping] = entry_re(key);
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (open, close, re) in [
+        (&*NUGET_SOURCES_OPEN_RE, "</packageSources", &add),
+        (&*NUGET_MAPPING_OPEN_RE, "</packageSourceMapping", &mapping),
+    ] {
+        if let Some((start, end)) = section_body(&visible, open, close) {
+            spans.extend(
+                re.find_iter(&visible[start..end])
+                    .map(|m| (start + m.start(), start + m.end())),
+            );
+        }
+    }
+    spans.sort_unstable();
+    let bytes = config.as_bytes();
+    let mut out = config.to_string();
+    for (mut start, mut end) in spans.into_iter().rev() {
+        let line_start = config[..start].rfind('\n').map_or(0, |i| i + 1);
+        let tail = config[end..].find('\n').map_or(config.len(), |i| end + i);
+        let alone = bytes[line_start..start]
+            .iter()
+            .all(|b| *b == b' ' || *b == b'\t')
+            && config[end..tail].trim().is_empty();
+        if alone && tail < config.len() {
+            start = line_start;
+            end = tail + 1;
+        }
+        out.replace_range(start..end, "");
+    }
+    out
+}
+
 /// The `<add>` line for a package source. A plain-http source on a loopback
 /// host (a local patch-server stand-in) opts into `allowInsecureConnections`:
 /// NuGet 6.12+ (.NET SDK 9+) refuses every http source without it (NU1302).
@@ -173,29 +261,89 @@ mod tests {
         }
     }
 
-    /// A Socket source an older rewrite left ABOVE a `<clear/>` is not
-    /// wired (NuGet drops it), so the re-run adds it again after the clear.
-    #[test]
-    fn socket_source_above_a_clear_is_rewired_after_it() {
-        let case = "clear-sources";
-        let stale = fixture(case, "expected/nuget.config").replace(
-            "    <clear />\n    <add key=\"socket",
-            "    <add key=\"socket",
+    /// Re-runs `case`'s rewrite over `stale` (its golden with the Socket
+    /// entries moved where an older rewrite put them) and expects the golden
+    /// itself back: the stale entries are replaced, never duplicated.
+    fn assert_rewire_heals(case: &str, stale: &str) {
+        let golden = fixture(case, "expected/nuget.config");
+        assert_ne!(stale, golden, "{case}: the stale form differs");
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), stale.to_string());
+        files.insert(
+            "packages.lock.json".to_string(),
+            fixture(case, "expected/packages.lock.json"),
         );
-        let stale = stale.replacen(
-            "    <add key=\"nuget.org\"",
-            "    <clear />\n    <add key=\"nuget.org\"",
+        let r = rewrite_registry_redirect(&files, &overrides(case));
+        assert_eq!(
+            r.files.get("nuget.config").map(String::as_str),
+            Some(golden.as_str()),
+            "{case}"
+        );
+        let kinds: Vec<&str> = r.edits.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["redirect_nuget_source"], "{case}");
+    }
+
+    /// A Socket source an older rewrite left ABOVE a `<clear/>` is not
+    /// wired (NuGet drops it, and a second `<add>` of the key below the
+    /// clear is dropped with it), so the re-run moves it after the clear.
+    #[test]
+    fn socket_source_above_a_clear_is_moved_after_it() {
+        let case = "clear-sources";
+        let stale = fixture(case, "expected/nuget.config")
+            .replace(
+                "    <clear />\n    <add key=\"socket",
+                "    <add key=\"socket",
+            )
+            .replacen(
+                "    <add key=\"nuget.org\"",
+                "    <clear />\n    <add key=\"nuget.org\"",
+                1,
+            );
+        assert_rewire_heals(case, &stale);
+    }
+
+    /// A Socket mapping entry above the mapping's `<clear/>` is dropped
+    /// (the id falls back to nuget.org: NU1403), so the re-run moves it
+    /// after the clear instead of listing the key twice (which NuGet
+    /// refuses).
+    #[test]
+    fn socket_mapping_above_a_clear_is_moved_after_it() {
+        let case = "clear-mapping";
+        let golden = fixture(case, "expected/nuget.config");
+        let block =
+            "    <packageSource key=\"socket-patch-66666666-6666-6666-6666-666666666666\">\n      \
+                     <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n";
+        assert!(golden.contains(block));
+        let stale = golden.replacen(block, "", 1).replacen(
+            "    <clear />\n",
+            &format!("{block}    <clear />\n"),
             1,
         );
-        let mut files = BTreeMap::new();
-        files.insert("nuget.config".to_string(), stale);
-        let r = rewrite_registry_redirect(&files, &overrides(case));
-        let out = r.files.get("nuget.config").expect("config rewritten");
-        let clear = out.find("<clear />").expect("clear kept");
-        let socket = out
-            .rfind("<add key=\"socket-patch-")
-            .expect("socket source");
-        assert!(socket > clear, "{out}");
+        assert!(mapping_entry_cleared(
+            &stale,
+            "socket-patch-66666666-6666-6666-6666-666666666666"
+        ));
+        assert_rewire_heals(case, &stale);
+    }
+
+    #[test]
+    fn strip_entries_removes_only_visible_entries_of_the_key() {
+        let config = "<configuration>\n  <packageSources>\n    <add key=\"s\" value=\"u\" />\n    \
+                      <add key=\"sx\" value=\"u\" />\n    <!-- <add key=\"s\" value=\"old\" /> -->\n  \
+                      </packageSources>\n  <disabledPackageSources>\n    <add key=\"s\" value=\"true\" />\n  \
+                      </disabledPackageSources>\n  <packageSourceMapping>\n    <packageSource key='s' />\n    \
+                      <packageSource key=\"sx\">\n      <package pattern=\"*\" />\n    </packageSource>\n    \
+                      <packageSource key=\"s\"><package pattern=\"A\" /></packageSource>\n  \
+                      </packageSourceMapping>\n</configuration>\n";
+        let expected = "<configuration>\n  <packageSources>\n    <add key=\"sx\" value=\"u\" />\n    \
+                        <!-- <add key=\"s\" value=\"old\" /> -->\n  </packageSources>\n  \
+                        <disabledPackageSources>\n    <add key=\"s\" value=\"true\" />\n  \
+                        </disabledPackageSources>\n  <packageSourceMapping>\n    \
+                        <packageSource key=\"sx\">\n      <package pattern=\"*\" />\n    </packageSource>\n  \
+                        </packageSourceMapping>\n</configuration>\n";
+        assert_eq!(strip_entries(config, "s"), expected);
+        assert_eq!(strip_entries(expected, "missing"), expected);
+        assert!(!mapping_entry_cleared(config, "s"));
     }
 
     #[test]

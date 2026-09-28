@@ -5369,17 +5369,22 @@ fn rewrite_nuget(
         // Idempotency probe over the parsed `<packageSources>` keys — the
         // same reader `add_nuget_source` fans the catch-all out with — so a
         // hand-normalized spelling (`key = 'socket-patch-…'`) is recognized
-        // as already wired instead of being duplicated on a re-run.
+        // as already wired instead of being duplicated on a re-run. A
+        // source or mapping entry an older rewrite left above a `<clear/>`
+        // is not wired: it is replaced, never duplicated.
         if !nuget_package_source_keys(&config)
             .iter()
             .any(|key| key == &reg)
+            || nuget_source::mapping_entry_cleared(&config, &reg)
         {
+            let config_base = nuget_source::strip_entries(&config, &reg);
             // A failed insert skips the WHOLE dep (no edit record, no lock
             // re-pin): a mapping without its source routes the patched id to
             // a source that was never defined, and a lock pinned at the
             // patched contentHash over an upstream fetch fails NU1403 — both
             // while the ledger would claim the redirect landed.
-            let Some(updated) = add_nuget_source(&config, &reg, &ov.index_url, &dep.name) else {
+            let Some(updated) = add_nuget_source(&config_base, &reg, &ov.index_url, &dep.name)
+            else {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_nuget_config_unwritable".into(),
                     detail: format!(

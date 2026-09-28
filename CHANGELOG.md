@@ -942,7 +942,11 @@ into the new version's section — see docs/releasing.md.
   Socket source and its `packageSourceMapping` entry used to land above a
   user's `<clear/>`, which NuGet discards, so `dotnet restore` failed
   NU1100 / NU1403. Both now land after the section's last `<clear/>`, and
-  the `*` catch-all fans out only to the sources NuGet keeps.
+  the `*` catch-all fans out only to the sources NuGet keeps. A re-run
+  over a config an older version wired above a `<clear/>` moves the
+  Socket entries below it instead of adding second copies (NuGet drops a
+  source key repeated across a `<clear/>` and rejects a mapping key listed
+  twice).
 
 - **`rollback` fetches a before-blob that only a store peer variant
   needs.** The before-blob gate now probes every pnpm and vlt store variant
