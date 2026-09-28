@@ -3353,6 +3353,56 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
         }
     }
 
+    // `--revert` returns to UPSTREAM: a package vendored over hosted wiring
+    // before v5 recorded the hosted fragment as its pre-vendor original, so
+    // its revert just wired it back to the patch server. Restore those pins
+    // to their upstream registry entries too (a wet run only — a dry revert
+    // wrote nothing to inspect).
+    if !common.dry_run {
+        let reverted: HashSet<String> = env
+            .events
+            .iter()
+            .filter(|e| e.action == PatchAction::Removed)
+            .filter_map(|e| e.purl.as_deref().map(canonical_purl))
+            .collect();
+        let rehosted: Vec<HostedPin> =
+            HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
+                .into_iter()
+                .filter(|pin| reverted.contains(&canonical_purl(&pin.purl)))
+                .collect();
+        if !rehosted.is_empty() {
+            let leg = crate::commands::rollback::run_hosted_leg(common, &rehosted).await;
+            for purl in &leg.reverted {
+                record_warning(
+                    env,
+                    purl,
+                    &VendorWarning::new(
+                        "vendor_revert_restored_upstream",
+                        format!(
+                            "{purl} was vendored over a hosted pin before v5, so its revert \
+                             re-wired it to the hosted patch server; restored its upstream \
+                             registry entry"
+                        ),
+                    ),
+                    common,
+                );
+            }
+            for (purl, why) in &leg.failed {
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, purl.clone())
+                        .with_error("hosted_restore_failed", why.clone()),
+                );
+            }
+            for (code, detail) in &leg.warnings {
+                env.warnings.push(RunWarning {
+                    code: code.clone(),
+                    detail: detail.clone(),
+                });
+            }
+        }
+    }
+
     // Orphan sweep: uuid dirs on disk with no ledger entry (a hand-edited
     // state file, or artifacts left by an interrupted run). Unparseable dirs
     // are reported, never deleted — and neither are dirs a lockfile still
