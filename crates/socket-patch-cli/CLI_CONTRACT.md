@@ -504,8 +504,12 @@ downloaded again, with a local build from a lockfile-verified pristine source as
 the artifact only: lockfiles stay byte-identical and the ledger entry keeps its recorded
 pre-vendor originals. The re-vendored artifact is verified against the ledger fingerprint before
 the run counts it (`rebuilt` event; a mismatch removes the artifact and fails with
-`vendor_artifact_rebuild_failed`). A corrupt artifact is moved aside for the rebuild and put back
-when nothing replaced it.
+`vendor_artifact_rebuild_failed`). The check is always against the ORIGINAL ledger entry: a source
+that produces other bytes (a service archive re-packed since vendoring) is never committed — its
+wiring and ledger entry are put back and repair falls back to the deterministic local build. A
+corrupt artifact's afterHash-verified members are harvested as patch content (so `--offline`
+repairs it from the installed copy) before it is moved aside for the rebuild, and put back when
+nothing replaced it.
 
 **The ledger is not rebuilt from lockfiles (v5.0).** A lockfile reference to
 `.socket/vendor/<eco>/<uuid>/...` with NO ledger entry (state.json deleted or never committed)

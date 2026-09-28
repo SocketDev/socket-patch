@@ -1300,3 +1300,130 @@ fn repair_previews_then_rebuilds_a_deleted_vlt_dir() {
     );
     assert!(uuid_dir.join(".gitignore").is_file());
 }
+
+/// Rewrite a `.tgz` through `edit` over its (path, bytes) members, then
+/// re-gzip with `mtime` in the gzip header.
+fn retar(tgz: &[u8], mtime: u32, edit: impl FnOnce(&mut Vec<(String, Vec<u8>)>)) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
+    let mut members: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        members.push((path, bytes));
+    }
+    edit(&mut members);
+    let gz = flate2::GzBuilder::new()
+        .mtime(mtime)
+        .write(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    for (path, bytes) in &members {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, bytes.as_slice()).unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// A corrupt artifact that still carries the valid patched member (an
+/// unrelated member was added): `repair --offline` harvests the verified
+/// patched bytes BEFORE setting the artifact aside, rebuilds from the
+/// pristine installed copy, and restores the byte-exact recorded archive.
+#[tokio::test]
+async fn repair_offline_harvests_a_corrupt_artifacts_valid_members() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    let tgz_bytes = std::fs::read(&tgz).unwrap();
+    let lock1 = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let state1 = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
+    assert!(!tmp.path().join(".socket/blobs").exists(), "no local blobs");
+
+    let corrupt = retar(&tgz_bytes, 0, |m| {
+        m.push(("package/extra.txt".into(), b"planted\n".to_vec()))
+    });
+    std::fs::write(&tgz, &corrupt).unwrap();
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
+    assert_eq!(std::fs::read(&tgz).unwrap(), tgz_bytes, "byte-exact archive");
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock1
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+        state1
+    );
+}
+
+/// Repair keeps the ORIGINAL artifact identity: a service archive with the
+/// same members but different bytes (only the gzip mtime changed) is not
+/// committed. Repair falls back to the deterministic local build, restores
+/// the recorded bytes, and leaves the lockfile and ledger byte-identical.
+#[tokio::test]
+async fn repair_never_rewires_to_different_service_bytes() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    let tgz_bytes = std::fs::read(&tgz).unwrap();
+    let lock1 = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let state1 = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
+
+    let service_bytes = retar(&tgz_bytes, 1_234_567, |_| {});
+    assert_ne!(service_bytes, tgz_bytes, "fixture: the bytes must differ");
+    let serve = "/serve/left-pad-1.3.0.tgz";
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "granted",
+                "url": format!("{}{serve}", mock.uri()),
+                "artifacts": [{ "kind": "tarball", "url": format!("{}{serve}", mock.uri()),
+                                "integrity": { "sha512": sri_of(&service_bytes) } }]
+            }}
+        })))
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(serve))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(service_bytes.clone()))
+        .mount(&mock)
+        .await;
+
+    std::fs::remove_file(&tgz).unwrap();
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
+    assert_eq!(std::fs::read(&tgz).unwrap(), tgz_bytes, "the recorded bytes");
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock1,
+        "lockfile untouched"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+        state1,
+        "ledger untouched"
+    );
+}
