@@ -1,17 +1,15 @@
 //! `scan --max-new-patches` (work item B of the staged-rollout design,
 //! `docs/design/staged-rollout.md` §5).
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use clap::Args;
+pub(crate) use socket_patch_core::rollout::stage::RolloutCarry;
 use socket_patch_core::rollout::{resolve_max_new, MaxNew};
 
 /// The env binding of `--max-new-patches`. Read by [`RolloutArgs::resolve`]
 /// rather than clap's `env =`, because the rollout block reports whether
 /// the value came from the flag or the environment.
-pub const MAX_NEW_PATCHES_ENV: &str = "SOCKET_MAX_NEW_PATCHES";
+pub use socket_patch_core::rollout::stage::MAX_NEW_PATCHES_ENV;
 
 /// A parsed `--max-new-patches` value; `None` is `none` (no cap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,35 +77,6 @@ impl RolloutArgs {
     }
 }
 
-/// What one invocation's project directories share: the cap as configured,
-/// the budget left, and the base purls already admitted (admitted free in
-/// later directories).
-#[derive(Debug)]
-pub(crate) struct Carry {
-    pub(crate) configured: MaxNew,
-    pub(crate) remaining: Option<u32>,
-    pub(crate) admitted: BTreeSet<String>,
-    /// The directory the project paths are relative to.
-    pub(crate) root: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RolloutCarry(pub(crate) Arc<Mutex<Carry>>);
-
-impl RolloutCarry {
-    pub(crate) fn new(configured: MaxNew, root: PathBuf) -> Self {
-        RolloutCarry(Arc::new(Mutex::new(Carry {
-            configured,
-            remaining: configured.value,
-            admitted: BTreeSet::new(),
-            root,
-        })))
-    }
-
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Carry> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
 
 #[cfg(test)]
 mod tests {

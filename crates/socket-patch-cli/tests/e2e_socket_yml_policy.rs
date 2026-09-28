@@ -686,6 +686,30 @@ async fn enabled_false_reports_and_writes_nothing() {
 
 #[tokio::test]
 #[serial]
+async fn report_only_json_fails_when_every_detail_query_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_api(&server, catalog()).await;
+    // `--prune` with no mode is the report-only arm.
+    let repo = Repo::new(Some("version: 2\npatches:\n  minSeverity: critical\n"));
+    let before = repo.snapshot();
+    let (code, doc) = scan_json(&repo.dir("services/web"), &server.uri(), &["--prune"], &[]);
+    assert_eq!(code, 1, "{doc:#}");
+    assert_eq!(doc["status"], "error", "{doc:#}");
+    assert!(
+        doc["error"].as_str().unwrap_or_default().contains("patch-detail queries failed"),
+        "{doc:#}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[tokio::test]
+#[serial]
 async fn recorded_merged_patch_below_a_new_floor_is_kept() {
     let server = MockServer::start().await;
     mount_api(&server, vec![P_ALPHA_MERGED_LOW, P_ALPHA]).await;

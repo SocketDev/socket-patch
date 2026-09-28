@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-use socket_patch_core::api::client::{ApiError, ApiFuture, PatchApi};
-use socket_patch_core::api::ranking::cmp_search_results;
-use socket_patch_core::api::types::{
+use crate::api::client::{ApiError, ApiFuture, PatchApi};
+use crate::api::ranking::cmp_search_results;
+use crate::api::types::{
     BatchPackagePatches, PackageVendorResult, PatchResponse, SearchResponse,
 };
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 
 use super::types::MAX_REFERENCE_BATCH;
 
@@ -102,11 +102,11 @@ impl Provider {
     pub(crate) async fn search_patches_batch(
         &self,
         purls: &[String],
-    ) -> Result<socket_patch_core::api::types::BatchSearchResponse, ApiError> {
+    ) -> Result<crate::api::types::BatchSearchResponse, ApiError> {
         let mut response = self
             .call("searchPatchesBatch", self.api.search_patches_batch(purls))
             .await?;
-        socket_patch_core::api::client::sort_batch_response(&mut response);
+        crate::api::client::sort_batch_response(&mut response);
         Ok(response)
     }
 
@@ -332,7 +332,7 @@ pub(crate) async fn fetch_wheel_metadata(
                         .download_artifact(url, max_bytes)
                         .await
                         .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))?;
-                    socket_patch_core::vendor::pypi::decode_hosted_wheel_metadata(&bytes, sha256)
+                    crate::vendor::pypi::decode_hosted_wheel_metadata(&bytes, sha256)
                 })
             },
         )
@@ -366,7 +366,7 @@ pub(crate) async fn fetch_records(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use socket_patch_core::api::types::PatchSearchResult;
+    use crate::api::types::PatchSearchResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -420,7 +420,7 @@ mod tests {
         ];
         // The engine selects through the disk flow's own seam.
         let pairs = |paid: bool| -> Vec<(String, String)> {
-            crate::commands::scan::rollout::offers_from_results(&results, paid)
+            crate::rollout::stage::offers_from_results(&results, paid)
                 .selected
                 .into_iter()
                 .map(|(purl, p)| (purl, p.uuid))

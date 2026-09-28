@@ -277,21 +277,22 @@ pub struct RedirectedPatch {
     pub uuid: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkippedPatch {
-    pub purl: String,
-    pub uuid: String,
-    pub reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
+pub use crate::hosted::engine::SkippedPatch;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectError {
     pub code: String,
     pub message: String,
+}
+
+impl From<crate::hosted::engine::Refusal> for ProjectError {
+    fn from(refusal: crate::hosted::engine::Refusal) -> Self {
+        ProjectError {
+            code: refusal.code,
+            message: refusal.message,
+        }
+    }
 }
 
 /// `ProjectResult`.

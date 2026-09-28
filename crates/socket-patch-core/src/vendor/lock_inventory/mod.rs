@@ -65,8 +65,8 @@ pub(crate) mod npm_family;
 pub(crate) mod pnpm;
 pub(crate) mod pypi;
 pub(crate) mod recover;
-pub(crate) mod vlt;
 pub mod view;
+pub(crate) mod vlt;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
@@ -75,7 +75,7 @@ pub(crate) use self::npm::{npm_lock_nodes, NpmLockNode};
 pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
-pub use self::view::{MemoryEntry, MemoryProject, ProjectView};
+pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView};
 pub use self::wired::wired_vendor_integrity;
 
 // The per-format views `inventory_project_diagnosed` unions (and the test
@@ -201,6 +201,39 @@ pub struct UnsupportedNpmLayout {
     pub code: &'static str,
     /// Human-readable diagnosis with format or filesystem error details.
     pub detail: String,
+}
+
+/// Map a core npm-layout refusal onto scan's warning channel as
+/// `(code, detail)`. The yarn code matches apply's refusal errorCode
+/// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
+/// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
+/// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
+pub fn unsupported_layout_warnings(unsupported: &[UnsupportedNpmLayout]) -> Vec<(String, String)> {
+    unsupported
+        .iter()
+        .map(|diag| match diag.code {
+            "vendor_yarn_berry_unsupported" => (
+                "yarn_pnp_unsupported".to_string(),
+                "this project uses yarn Plug'n'Play (a `.pnp.*` loader is present): its npm \
+                 packages live inside `.yarn/cache/*.zip`, not `node_modules/`, so socket-patch \
+                 cannot discover or patch them in ANY mode (agent, hosted, or vendored) — npm \
+                 dependencies were NOT scanned. Use `yarn patch <pkg>` to patch them instead."
+                    .to_string(),
+            ),
+            "vendor_pnpm_pnp_unsupported" => (
+                "pnpm_pnp_unsupported".to_string(),
+                "this project uses pnpm's Plug'n'Play linker (`node-linker=pnp` in .npmrc): \
+                 lockfile discovery is skipped under this layout, so lockfile-only npm \
+                 dependencies were NOT scanned. Switch .npmrc to `node-linker=isolated`, run \
+                 `pnpm install`, and re-run — or use `socket-patch scan --mode hosted`, which \
+                 edits pnpm-lock.yaml in place."
+                    .to_string(),
+            ),
+            // Forward-compat: a new refusal code surfaces verbatim rather
+            // than being swallowed back into silence.
+            other => (other.to_string(), diag.detail.clone()),
+        })
+        .collect()
 }
 
 /// Match a manifest/API purl (possibly percent-encoded, possibly carrying

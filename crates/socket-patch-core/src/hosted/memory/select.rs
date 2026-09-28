@@ -8,13 +8,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use socket_patch_core::constants::npm_family::{
+use crate::constants::npm_family::{
     BUN_LOCKB, PNP_MARKERS, RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR,
 };
-use socket_patch_core::patch::redirect::npmrc::NPMRC_REL;
-use socket_patch_core::utils::python_lock::is_python_lock_name;
+use crate::patch::redirect::npmrc::NPMRC_REL;
+use crate::utils::python_lock::is_python_lock_name;
 
-use socket_patch_core::policy::{
+use crate::policy::{
     MemoryPolicyFs, PolicyOverrides, PolicySource, Root, RootFile, SelectionPolicy, POLICY_FILE_NAMES,
     SOCKET_YML_INVALID,
 };
@@ -26,7 +26,8 @@ use super::roots::{
 use super::types::{
     IgnoredPath, PathSelection, PolicyErrorInfo, PolicyFileInput, SelectOptions, TreeEntryInput,
 };
-use crate::commands::scan::hosted::{PNPM_WORKSPACE_REL, REDIRECT_CANDIDATE_FILES};
+use crate::hosted::engine::{REDIRECT_CANDIDATE_FILES, RUSH_REPO_STATE_REL};
+use crate::hosted::guidance::PNPM_WORKSPACE_REL;
 
 /// Most entries [`PathSelection::ignored_sample`] carries.
 pub const IGNORED_SAMPLE_MAX: usize = 100;
@@ -39,9 +40,6 @@ const MAX_PATH_DEPTH: usize = 64;
 
 /// The vendored-mode ledger (its presence refuses a vendored takeover).
 pub(crate) const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
-
-/// Rush's repo-state file (presence feeds the stale-hash warning).
-pub(crate) const RUSH_REPO_STATE_REL: &str = "common/config/rush/repo-state.json";
 
 /// The agent-mode manifest: part of the recorded view the rollout cap
 /// classifies against (a package it records is not NEW).
@@ -208,7 +206,7 @@ fn selection_policy(
             code: SOCKET_YML_INVALID.to_string(),
             detail: format!(
                 "policyFiles entry `{}` is not a root socket.yml or socket.yaml",
-                socket_patch_core::policy::sanitize(&bad.path)
+                crate::policy::sanitize(&bad.path)
             ),
         });
     }

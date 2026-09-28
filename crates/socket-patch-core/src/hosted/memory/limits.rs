@@ -32,7 +32,7 @@ pub(crate) struct ResolvedOptions {
     max_new_patches_cap: Option<u32>,
     /// `inFlightPatches` as canonical base purls.
     pub(crate) in_flight: std::collections::BTreeSet<String>,
-    pub(crate) policy_overrides: socket_patch_core::policy::PolicyOverrides,
+    pub(crate) policy_overrides: crate::policy::PolicyOverrides,
     pub(crate) policy_paths: Vec<String>,
     pub(crate) policy_sha256: Option<String>,
 }
@@ -41,8 +41,8 @@ impl ResolvedOptions {
     /// The run-wide cap on NEW patches: the `maxNewPatches` option (reported
     /// as `flag`), then the socket.yml `patches.maxNewPatches`, then
     /// unlimited; `maxNewPatchesCap` only tightens it.
-    pub(crate) fn max_new(&self, file: Option<u32>) -> socket_patch_core::rollout::MaxNew {
-        socket_patch_core::rollout::resolve_max_new(
+    pub(crate) fn max_new(&self, file: Option<u32>) -> crate::rollout::MaxNew {
+        crate::rollout::resolve_max_new(
             self.max_new_patches,
             None,
             file,
@@ -79,18 +79,18 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
     let min_severity = match options.min_severity.as_deref() {
         None => None,
         Some(value) => Some((
-            socket_patch_core::policy::parse_min_severity(value)
+            crate::policy::parse_min_severity(value)
                 .map_err(|e| EngineError::invalid("invalid_min_severity", format!("minSeverity: {e}")))?,
-            socket_patch_core::policy::OverrideSource::Flag,
+            crate::policy::OverrideSource::Flag,
         )),
     };
-    let policy_overrides = socket_patch_core::policy::PolicyOverrides {
+    let policy_overrides = crate::policy::PolicyOverrides {
         bypass: options.no_socket_yml.unwrap_or(false),
         min_severity,
     };
     let mut policy_paths: Vec<String> = Vec::new();
     for path in options.policy_paths.iter().flatten() {
-        if !socket_patch_core::policy::POLICY_FILE_NAMES.contains(&path.as_str()) {
+        if !crate::policy::POLICY_FILE_NAMES.contains(&path.as_str()) {
             return Err(EngineError::invalid(
                 "invalid_policy_path",
                 format!("policyPaths entry `{path}` is not a root socket.yml or socket.yaml"),
@@ -153,7 +153,7 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
             .in_flight_patches
             .iter()
             .flatten()
-            .map(|p| socket_patch_core::rollout::canonical_base_purl(p))
+            .map(|p| crate::rollout::canonical_base_purl(p))
             .collect(),
         policy_overrides,
         policy_paths,
@@ -350,7 +350,7 @@ impl SessionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hosted_memory::types::HostedScanLimits;
+    use crate::hosted::memory::types::HostedScanLimits;
 
     fn options(limits: HostedScanLimits) -> HostedScanOptions {
         HostedScanOptions {

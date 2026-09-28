@@ -11,6 +11,8 @@
 //! inputs always give the same plan and repeated runs converge: run k lands
 //! the top N, run k+1 sees them as recorded and lands the next N.
 
+pub mod stage;
+
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 

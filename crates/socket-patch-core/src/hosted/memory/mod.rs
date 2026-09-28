@@ -38,39 +38,37 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
-use socket_patch_core::api::client::PatchApi;
-use socket_patch_core::api::types::{PatchResponse, PatchSearchResult};
-use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::utils::cargo_workspace::member_manifests_in;
-use socket_patch_core::vendor::lock_inventory::{
+use crate::api::client::PatchApi;
+use crate::api::types::{PatchResponse, PatchSearchResult};
+use crate::crawlers::Ecosystem;
+use crate::utils::cargo_workspace::member_manifests_in;
+use crate::vendor::lock_inventory::{
     inventory_project_diagnosed_in, MemoryEntry, MemoryProject, ProjectView,
 };
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod discover;
 pub mod limits;
-pub(crate) mod redirect;
-pub(crate) mod roots;
+pub mod roots;
 pub mod select;
+pub(crate) mod stages;
 pub mod types;
 
 pub use limits::SessionBuilder;
 pub use select::{candidate_files, safe_repo_path, select_paths};
 pub use types::*;
 
-use crate::commands::scan::rollout::{
+use crate::rollout::stage::{
     classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
     Stage,
     ROLLOUT_DEFERRED,
 };
 use discover::Provider;
-use redirect::{Planned, Refused, Rewritten, StageOptions};
-use socket_patch_core::policy::{
-    patch_severity_order, FilterReason, MemoryPolicyFs, PolicyError, PolicySource, Root, RootFile,
-    SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
+use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
+use crate::policy::{
+    canon, patch_severity_order, policy_block, FilterReason, FilteredEntry, MemoryPolicyFs, PolicyError,
+    PolicySource, Root, RootFile, SelectionPolicy, PATCHES_DISABLED, POLICY_FILE_NAMES,
 };
-
-use crate::commands::scan::policy::{policy_block, FilteredEntry};
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -121,7 +119,7 @@ struct RootState {
     unreadable: BTreeSet<String>,
     purls: Vec<String>,
     summary: ProjectSummary,
-    packages: Vec<socket_patch_core::api::types::BatchPackagePatches>,
+    packages: Vec<crate::api::types::BatchPackagePatches>,
     /// Every accessible offer per purl, and the winner per purl.
     offers: Offers,
     /// Purls whose detail query failed.
@@ -394,7 +392,7 @@ fn memory_recorded(
     let manifest = project
         .text(select::MANIFEST_REL)
         .and_then(|text| serde_json::from_str(text).ok());
-    let vendor = redirect::vendored_entries(project);
+    let vendor = stages::vendored_entries(project);
     let nested: Vec<String> = roots
         .iter()
         .filter(|other| other.as_str() != root)
@@ -421,7 +419,7 @@ fn memory_recorded(
                 .map(|p| (purl.clone(), p.uuid.clone()))
         })
         .collect();
-    let merged = crate::commands::scan::merge_ledger_records_for_updates(
+    let merged = crate::ledgers::merge_ledger_records_for_updates(
         manifest.as_ref(),
         vendor.as_ref(),
         &pins,
@@ -572,7 +570,9 @@ async fn engine(
         };
         let (entries, unsupported) =
             inventory_project_diagnosed_in(&ProjectView::Memory(project)).await;
-        for (code, detail) in crate::commands::scan::unsupported_layout_warnings(&unsupported) {
+        for (code, detail) in
+            crate::vendor::lock_inventory::unsupported_layout_warnings(&unsupported)
+        {
             warnings.push(EngineWarning::new(code, detail, Some(&state.root)));
         }
         unsupported_ecosystem_warnings(&state.root, project, ecosystems, &mut warnings);
@@ -586,7 +586,7 @@ async fn engine(
             match policy.admits_purl(&purl) {
                 Ok(()) => admitted.push(purl),
                 Err(reason) => policy_filtered.push(FilteredEntry {
-                    purl: Some(crate::commands::scan::policy::canon(&purl)),
+                    purl: Some(canon(&purl)),
                     uuid: None,
                     project: state.root.clone(),
                     reason,
@@ -797,9 +797,9 @@ async fn engine(
             continue;
         };
         let unreadable = std::mem::take(&mut state.unreadable);
-        match redirect::plan(project, unreadable, &state.selected, &references) {
+        match stages::plan(project, unreadable, &state.selected, &references).await {
             Ok(plan) => planned.push((index, plan)),
-            Err(Refused { error }) => state.error = Some(error),
+            Err(refusal) => state.error = Some(ProjectError::from(refusal)),
         }
     }
     let wheels: BTreeSet<(String, String)> = planned
@@ -820,15 +820,17 @@ async fn engine(
         npm_allow_remote_config: options.npm_allow_remote_config,
     };
     let mut rewritten: Vec<(usize, Rewritten)> = Vec::new();
-    let mut skipped_before: BTreeMap<usize, Vec<SkippedPatch>> = BTreeMap::new();
+    let mut first_plans: BTreeMap<usize, Planned> = BTreeMap::new();
     for (index, plan) in planned {
         checkpoint(&cancel).await?;
-        skipped_before.insert(index, plan.skipped.clone());
-        match redirect::rewrite(plan, &wheel_metadata, stage_options) {
+        if stage.capped() {
+            first_plans.insert(index, plan.clone());
+        }
+        match stages::rewrite(plan, &wheel_metadata, stage_options).await {
             Ok(done) => rewritten.push((index, done)),
-            Err(Refused { error }) => {
-                states[index].skipped = skipped_before[&index].clone();
-                states[index].error = Some(error);
+            Err(RewriteRefused { refusal, skipped }) => {
+                states[index].skipped = skipped;
+                states[index].error = Some(ProjectError::from(refusal));
             }
         }
     }
@@ -842,7 +844,8 @@ async fn engine(
         .iter()
         .flat_map(|(index, done)| {
             let root = states[*index].root.clone();
-            done.confirmed
+            done.done
+                .confirmed
                 .iter()
                 .map(move |(_, uuid)| (root.clone(), uuid.clone()))
         })
@@ -856,7 +859,7 @@ async fn engine(
         unknown_roots.contains(&row.candidate.project)
             || confirmed.contains(&(row.candidate.project.clone(), row.writer.uuid.clone()))
     });
-    let deferred_rows: Vec<(socket_patch_core::rollout::Candidate, u32)> =
+    let deferred_rows: Vec<(crate::rollout::Candidate, u32)> =
         stage.plan.as_ref().map(|p| p.deferred.clone()).unwrap_or_default();
     if !deferred_rows.is_empty() {
         let root_index: BTreeMap<String, usize> = states
@@ -871,7 +874,7 @@ async fn engine(
             states[i].deferred.push(DeferredPatch {
                 purl: row.purl.clone(),
                 uuid: row.uuid.clone(),
-                severity: socket_patch_core::rollout::severity_label(row.severity_order).into(),
+                severity: crate::rollout::severity_label(row.severity_order).into(),
                 rank: *rank,
             });
         }
@@ -899,17 +902,19 @@ async fn engine(
             // The first pass's skips stay (wheel metadata the rewrite could
             // not fetch): its candidates are already gone, so the second
             // pass cannot report them again.
-            let mut plan = done.planned;
+            let Some(mut plan) = first_plans.remove(&index) else {
+                again.push((index, done));
+                continue;
+            };
             plan.candidates
                 .retain(|c| !root_deferred.contains(&c.dep.patch_uuid));
             plan.skipped
                 .extend(states[index].deferred.iter().map(deferred_skip));
-            let skipped_now = plan.skipped.clone();
-            match redirect::rewrite(plan, &wheel_metadata, stage_options) {
+            match stages::rewrite(plan, &wheel_metadata, stage_options).await {
                 Ok(done) => again.push((index, done)),
-                Err(Refused { error }) => {
-                    states[index].skipped = skipped_now;
-                    states[index].error = Some(error);
+                Err(RewriteRefused { refusal, skipped }) => {
+                    states[index].skipped = skipped;
+                    states[index].error = Some(ProjectError::from(refusal));
                 }
             }
         }
@@ -933,7 +938,7 @@ async fn engine(
     } else {
         rewritten
             .iter()
-            .flat_map(|(_, r)| r.confirmed.iter().map(|(_, u)| u.clone()))
+            .flat_map(|(_, r)| r.done.confirmed.iter().map(|(_, u)| u.clone()))
             .collect()
     };
     let records: BTreeMap<String, Option<PatchResponse>> = if record_uuids.is_empty() {
@@ -968,7 +973,7 @@ async fn engine(
         }
         let redirect = match &state.error {
             Some(_) => serde_json::json!({ "mode": "hosted" }),
-            None => crate::commands::scan::hosted::redirect_json_block(
+            None => crate::hosted::render::redirect_json_block(
                 0,
                 Vec::new(),
                 Vec::new(),
@@ -1049,7 +1054,7 @@ fn memory_policy_fs(files: &BTreeMap<String, SharedFile>, listed: &[String]) -> 
 /// The session result for a policy file that cannot be honored: no root
 /// processed, no file changed.
 fn policy_error_output(
-    error: &socket_patch_core::policy::PolicyError,
+    error: &crate::policy::PolicyError,
     warnings: Vec<EngineWarning>,
     files_input: u64,
     bytes_input: u64,
@@ -1111,7 +1116,7 @@ fn select_with_policy(
         }
     }
     for (purl, mut group) in by_purl {
-        group.sort_by(|a, b| socket_patch_core::api::ranking::cmp_search_results(&a.0, &b.0));
+        group.sort_by(|a, b| crate::api::ranking::cmp_search_results(&a.0, &b.0));
         let (winner, reason) = group.swap_remove(0);
         skipped.push(SkippedPatch {
             purl: purl.clone(),
@@ -1120,7 +1125,7 @@ fn select_with_policy(
             detail: Some(reason.detail()),
         });
         filtered.push(FilteredEntry {
-            purl: Some(crate::commands::scan::policy::canon(&purl)),
+            purl: Some(canon(&purl)),
             uuid: Some(winner.uuid.clone()),
             project: root.to_string(),
             severity: Some(patch_severity_order(&winner)),
@@ -1141,37 +1146,36 @@ fn finish_root(
     warnings: &mut Vec<EngineWarning>,
 ) -> ProjectResult {
     let Rewritten {
-        planned,
+        project,
+        skipped,
+        pre_warnings,
+        done,
+    } = done;
+    let crate::hosted::engine::Rewritten {
         rewrite,
         rewritten,
         confirmed,
         rush_warnings,
         pnpm_warnings,
         npm_warnings,
+        ..
     } = done;
     let root = state.root.clone();
     // No ledger keeps the records; the fetch mirrors the disk flow's, so a
     // record the API cannot serve warns the same way.
-    let mut record_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut record_warnings: Vec<crate::patch::redirect::RewriteWarning> = Vec::new();
     if !dry_run {
         for (purl, uuid) in &confirmed {
             match records.get(uuid) {
                 Some(Some(_)) => {}
-                _ => record_warnings.push(serde_json::json!({
-                    "code": "record_fetch_failed",
-                    "detail": format!(
-                        "{purl} was switched to hosted, but its patch record could not be \
-                         fetched; this run's VEX attestation omits it (`socket-patch vex` \
-                         fetches it again once the API answers)"
-                    ),
-                })),
+                _ => record_warnings.push(crate::hosted::engine::record_fetch_failed_warning(purl)),
             }
         }
     }
 
     let mut project_changes: Vec<(String, String)> = Vec::new();
     for (rel, content) in &rewrite.files {
-        if planned.project.text(rel) != Some(content.as_str()) {
+        if project.text(rel) != Some(content.as_str()) {
             project_changes.push((rel.clone(), content.clone()));
         }
     }
@@ -1184,7 +1188,7 @@ fn finish_root(
         .iter()
         .filter(|(rel, bytes)| {
             !matches!(
-                planned.project.get(rel.as_str()),
+                project.get(rel.as_str()),
                 Some(MemoryEntry::Binary(existing)) if existing.as_ref() == bytes.as_slice()
             )
         })
@@ -1219,7 +1223,7 @@ fn finish_root(
             redirect: serde_json::json!({ "mode": "hosted" }),
             summary: state.summary.clone(),
             redirected: Vec::new(),
-            skipped: planned.skipped,
+            skipped,
             deferred: state.deferred.clone(),
             error: Some(ProjectError {
                 code: "conflicting_write".into(),
@@ -1238,22 +1242,19 @@ fn finish_root(
             .or_insert_with(|| (root.clone(), bytes));
     }
 
-    let mut redirect_warnings: Vec<serde_json::Value> = rewrite
-        .warnings
+    // One typed list in the envelope's order; JSON only at the boundary.
+    let mut warnings = rewrite.warnings.clone();
+    warnings.extend(record_warnings);
+    warnings.extend(rush_warnings);
+    warnings.extend(pnpm_warnings);
+    warnings.extend(npm_warnings);
+    warnings.extend(pre_warnings);
+    let redirect_warnings = crate::hosted::render::rewrite_warnings_json(&warnings);
+    let skipped_values: Vec<serde_json::Value> = skipped
         .iter()
-        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail }))
+        .map(crate::hosted::render::skipped_json)
         .collect();
-    redirect_warnings.extend(record_warnings);
-    redirect_warnings.extend(rush_warnings);
-    redirect_warnings.extend(pnpm_warnings);
-    redirect_warnings.extend(npm_warnings);
-    redirect_warnings.extend(planned.pre_warnings.iter().cloned());
-    let skipped_values: Vec<serde_json::Value> = planned
-        .skipped
-        .iter()
-        .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
-        .collect();
-    let redirect = crate::commands::scan::hosted::redirect_json_block(
+    let redirect = crate::hosted::render::redirect_json_block(
         confirmed.len(),
         rewritten,
         skipped_values,
@@ -1268,7 +1269,7 @@ fn finish_root(
             .into_iter()
             .map(|(purl, uuid)| RedirectedPatch { purl, uuid })
             .collect(),
-        skipped: planned.skipped,
+        skipped,
         deferred: state.deferred.clone(),
         error: None,
     }
@@ -1277,7 +1278,7 @@ fn finish_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use socket_patch_core::patch::redirect::{FileEdit, RewriteResult};
+    use crate::patch::redirect::{FileEdit, RewriteResult};
 
     fn state(root: &str, project: MemoryProject) -> RootState {
         RootState {
@@ -1299,8 +1300,6 @@ mod tests {
     }
 
     fn rewritten(files: &[(&str, &str)]) -> Rewritten {
-        let planned = redirect::plan(MemoryProject::new(), BTreeSet::new(), &[], &HashMap::new())
-            .unwrap_or_else(|r| panic!("{:?}", r.error));
         let mut rewrite = RewriteResult::default();
         for (rel, content) in files {
             rewrite
@@ -1316,13 +1315,24 @@ mod tests {
             });
         }
         Rewritten {
-            planned,
-            rewrite,
-            rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
-            confirmed: vec![("pkg:cargo/serde@1.0.190".into(), "u".into())],
-            rush_warnings: Vec::new(),
-            pnpm_warnings: Vec::new(),
-            npm_warnings: Vec::new(),
+            project: MemoryProject::new(),
+            skipped: Vec::new(),
+            pre_warnings: Vec::new(),
+            done: crate::hosted::engine::Rewritten {
+                files: BTreeMap::new(),
+                symlinked_reads: Vec::new(),
+                unreadable_reads: Vec::new(),
+                overrides: Vec::new(),
+                rewrite,
+                rewritten: files.iter().map(|(rel, _)| (*rel).to_string()).collect(),
+                confirmed: vec![("pkg:cargo/serde@1.0.190".into(), "u".into())],
+                binary_bun: false,
+                rush_warnings: Vec::new(),
+                pnpm_warnings: Vec::new(),
+                npm_warnings: Vec::new(),
+                pnpm_rerun_only: false,
+                workspace_symlinked: false,
+            },
         }
     }
 
@@ -1380,7 +1390,8 @@ mod tests {
         changed_binary.insert("web/bun.lockb".to_string(), ("".to_string(), vec![1u8]));
         let mut warnings = Vec::new();
         let mut done = rewritten(&[]);
-        done.rewrite
+        done.done
+            .rewrite
             .binary_files
             .insert("bun.lockb".to_string(), vec![2u8]);
         let result = finish_root(
@@ -1484,7 +1495,7 @@ mod tests {
             paths.into_iter(),
             &["web".to_string()],
             None,
-            socket_patch_core::policy::builtin_defaults(),
+            crate::policy::builtin_defaults(),
             &mut out,
         );
         assert_eq!(out.len(), 2);
@@ -1506,7 +1517,7 @@ mod tests {
             paths.into_iter(),
             &[],
             Some(&["npm".to_string()]),
-            socket_patch_core::policy::builtin_defaults(),
+            crate::policy::builtin_defaults(),
             &mut filtered,
         );
         assert!(filtered.is_empty());
