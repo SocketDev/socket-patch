@@ -94,14 +94,17 @@ The trust boundary is unchanged and gains its positive half:
   never widen it, name an endpoint or credential, choose a mode or download
   format, or disable a safety interlock. The parser has no fields for any
   of those; such keys are unknown keys and fail validation.
-- Because the file only narrows, an invalid file fails closed (exit 1,
-  `socket_yml_invalid`, nothing written) instead of being treated as
-  absent. This is the opposite of the socket-cli `config.json` rule above
+- Because the file only narrows, an unreadable file or an invalid
+  `patches` block fails closed (exit 1, `socket_yml_invalid`, nothing
+  written) instead of being treated as absent. (A repo with no `patches`
+  block and a malformed `projectIgnorePaths` gets a warning, so repos that
+  never opted in do not start failing.) This is the opposite of the socket-cli `config.json` rule above
   (corrupt → warn and ignore), and deliberately so: ignoring a broken
   user-level login file loses a convenience; ignoring a broken repo policy
   widens the rollout.
 - Lookup is bounded to the repository (nearest `.git` ancestor of
-  `--cwd`, else `--cwd`), root files only.
+  `--cwd` owned by the user, honoring `GIT_CEILING_DIRECTORIES`, else
+  `--cwd`), root files only, regular files only.
 - Flags and env vars still win over the file for scalars (CLI > env >
   file > default) and intersect with it for list filters;
   `--no-socket-yml` / `SOCKET_NO_SOCKET_YML` ignores the file.

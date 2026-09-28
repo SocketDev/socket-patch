@@ -44,7 +44,8 @@ per-directory `socket.yml` files.
   walks up from cwd and prefers `socket.yml`. The docs say `socket.yml`
   wins. Nobody merges multiple files; there are no per-directory files.
 - Glob semantics (backend): the `ignore` npm package, i.e. **gitignore
-  rules**, case-insensitive (`list-files.ts:476-507`). A leading `/` or a
+  rules**, case-insensitive, tested against each manifest **file** path
+  (`list-files.ts:476-507`). A leading `/` or a
   middle `/` anchors to the repo root, a bare name matches at any depth, a
   trailing `/` matches directories only, `!` negates, last match wins, a
   child of an excluded directory cannot be re-included.
@@ -129,14 +130,17 @@ pairs, `enabled`, a severity floor spelled as a minimum (`--min-severity`,
 Snyk/GitLab/OSV), a per-run new-item cap (GitLab/OSV/Snyk backlog), a
 fixed total order (not Dependabot's shuffle), deny-wins.
 
+
 ## 3. Trust boundary (decision)
 
 The rule in `CLI_CONTRACT.md` ("Repo-level files never carry endpoints,
 credentials, or interlock-disablers") stays and gains its positive half:
 
 > A repository file may **narrow or pace** what `scan` patches. It may
-> never widen it, name an endpoint or credential, pick a mode, or turn off
-> a safety check.
+> never name an endpoint or credential, pick a mode or download format,
+> turn off a safety check, or make `scan` patch anything it would not
+> patch with no file present. The one exception is negating the built-in
+> test/fixture path ignores (4.3), which are repo policy by nature.
 
 Every `patches:` key only removes candidates (`enabled`, `includePaths`,
 `ignorePaths`, `ecosystems`, `packages`, `ignorePackages`, `minSeverity`)
@@ -148,6 +152,8 @@ fail validation (4.4).
 
 Failure direction follows from that: because the file only narrows, an
 unreadable or invalid policy must not mean "no policy". It fails closed.
+And because a policy can hide security fixes, what it hides is always
+reported (4.7, 7.3), never silent.
 
 ## 4. `socket.yml` grammar (work item A)
 
@@ -160,22 +166,28 @@ projectIgnorePaths:            # existing scanner key; socket-patch honors it to
 patches:                       # new; every key optional
   enabled: true                # bool. Default true. false = report only.
   includePaths: ["/services/payments/"]   # gitignore list. Absent = every project.
-  ignorePaths: ["/legacy/"]    # gitignore list, added after the defaults. Default [].
+  ignorePaths: ["/legacy/"]    # gitignore list, evaluated after the defaults. Default [].
   ecosystems: [npm, pypi]      # allowlist of --ecosystems names. Absent = all.
-  packages: ["lodash"]         # allowlist of --package specs. Absent = all.
+  packages: ["pkg:npm/lodash"] # allowlist of --package specs. Absent = all.
   ignorePackages: ["pkg:npm/left-pad"]  # denylist of --package specs. Default [].
   minSeverity: high            # critical|high|medium|moderate|low. Absent = no floor.
-  maxNewPatches: 5             # integer >= 0. Absent = unlimited. 0 = upgrades only.
+  maxNewPatches: 5             # integer 0..=4294967295. Absent = unlimited. 0 = upgrades only.
 ```
 
 - camelCase, like every existing socket.yml key.
-- Ecosystem names are `Ecosystem::cli_name()`: `npm pypi cargo gem golang
-  maven composer nuget deno`, case-insensitive.
+- Ecosystem names are any `Ecosystem::cli_name()` (`npm pypi cargo gem
+  golang maven composer nuget deno`), case-insensitive, valid whatever the
+  build supports; an unsupported ecosystem simply matches nothing.
 - Package specs use exactly the `--package` grammar and matcher
-  (`package_spec_matches`): a name (full or last segment,
-  case-insensitive) or a purl with or without a version; qualifiers
-  ignored.
-- `moderate` is an alias of `medium`, as in `severity_order`.
+  (`package_spec_matches`, moved from the cli crate to core by A): a name
+  (full or last segment, case-insensitive) or a purl with or without a
+  version; qualifiers ignored. A bare name matches across ecosystems and
+  by last segment (`core` matches `@babel/core`), so the docs recommend
+  purls in `packages`/`ignorePackages`. Invalid spec: empty, or `pkg:`
+  without a type and name.
+- `moderate` is an alias of `medium` everywhere (file, flag, env, napi).
+- An empty allowlist (`includePaths: []`, `ecosystems: []`,
+  `packages: []`) is an error ("use `enabled: false`"), never "all".
 - Deny wins: `ignorePackages` beats `packages`, ignore paths beat
   `includePaths`.
 
@@ -183,91 +195,142 @@ patches:                       # new; every key optional
 
 | Setting | Rule |
 |---|---|
-| List filters (`includePaths`/`ignorePaths`/`projectIgnorePaths` vs PATH args; `ecosystems` vs `--ecosystems`; `packages`/`ignorePackages` vs `--package`) | **intersect**: flags narrow further, never widen |
-| `minSeverity` | `--min-severity <critical\|high\|medium\|low\|none>` > `SOCKET_MIN_SEVERITY` > file > no floor |
+| List filters (paths vs PATH args; `ecosystems` vs `--ecosystems`; `packages`/`ignorePackages` vs `--package`) | **intersect**: flags narrow further, never widen |
+| `minSeverity` | `--min-severity <critical\|high\|medium\|moderate\|low\|none>` > `SOCKET_MIN_SEVERITY` > file > no floor |
 | `maxNewPatches` | `--max-new-patches <N\|none>` > `SOCKET_MAX_NEW_PATCHES` > file > unlimited |
-| whole file | `--no-socket-yml` / `SOCKET_NO_SOCKET_YML` skips the file (built-in default path ignores still apply) |
+| whole file | `--no-socket-yml` / `SOCKET_NO_SOCKET_YML` (bool, the contract's spellings) skips the file; built-in default path ignores still apply |
 
 Scalars follow the contract's CLI > env > default order, with the file as
 the layer above the default. The person running the CLI is trusted; the
-file is the repo's default. (depscan adds its own server ceiling, section
-7.) Every new flag has an env binding, as the contract requires.
+file is the repo's default. Every new flag has an env binding. An empty env
+value is unset (repo-wide rule); a malformed flag or env value is a usage
+error (exit 2). depscan adds its own server ceiling (7.1).
 
 ### 4.3 Paths
 
-- **Subject.** Path rules decide which *project roots* are patched: the
-  directory holding the lockfile/manifest, relative to the repo root, with
-  `/` separators, tested as a directory. The rule is the same in every
-  mode, including agent mode (its project is `--cwd`).
-- **Semantics.** gitignore, identical to the backend's `ignore` package:
-  Rust `ignore::gitignore::GitignoreBuilder` with `case_insensitive(true)`,
-  anchored at the repo root, `matched_path_or_any_parents` so a directory
-  pattern covers everything under it.
-- **Repo-root project.** gitignore cannot match the empty path, so in
-  `patches.includePaths` / `patches.ignorePaths` the literal entry `/`
-  (and `!/`) means "the repository-root project". It has no meaning in
-  `projectIgnorePaths`, which stays scanner semantics.
-- **Evaluation order** (last match wins):
+- **Subject: marker files.** The backend tests `projectIgnorePaths`
+  against manifest file paths, so socket-patch does the same for every
+  path list. A project root's **markers** are the lockfile/manifest files
+  in its directory that the engine reads for it (disk: the root's
+  lockfiles per the formats registry, plus its manifest; memory:
+  `hosted_memory/roots.rs` marker files). Paths are repo-relative with `/`
+  separators, e.g. `services/api/package-lock.json`, `package-lock.json`
+  for the repo-root project.
+  - A root is **ignored** iff **every** marker is ignored.
+  - With `includePaths` set, a root is **included** iff **any** marker
+    matches `includePaths`.
+  - Admitted iff included and not ignored.
+  This makes `/package-lock.json`, `**/yarn.lock`, `examples/**` and
+  `crates/x/fixtures/**` mean what they mean to the scanner, and needs no
+  special form for the repo-root project (target only it with
+  `includePaths: ["/*", "!/*/"]`).
+- **Semantics: npm `ignore` exactly.** gitignore rules, case-insensitive,
+  anchored at the repo root: a leading or middle `/` anchors, a bare name
+  matches at any depth, a trailing `/` matches directories only, `!`
+  negates, last match wins. Evaluation walks **top-down**: for
+  `a/b/c.lock`, test `a/`, then `a/b/`, then the file; the first ignored
+  ancestor decides and a negation cannot re-include anything under it
+  (`fixtures/` + `!/a/fixtures/keep/` leaves `keep` ignored, as in the
+  backend). Do not use `ignore::gitignore`'s `matched_path_or_any_parents`
+  as-is: it walks bottom-up and would re-include. Implement the walk over
+  `Gitignore::matched(path, is_dir)`. `includePaths` uses the same walk
+  with "matched" in place of "ignored".
+- A golden fixture of (patterns, path, expected) generated from the npm
+  `ignore` package is checked into the tests; the Rust matcher must agree
+  on all of it.
+- **Pattern hygiene.** Reject (4.4) patterns that contain a `..` segment, a
+  drive letter, NUL, or exceed 1024 bytes. Backslash is gitignore's escape
+  character, not a separator (documented).
+- **Evaluation order** of the ignore lists (one combined list, last match
+  wins within a path, top-down across ancestors):
   1. built-in defaults: `test/ tests/ fixtures/ __fixtures__/ testdata/`
   2. `projectIgnorePaths`
   3. `patches.ignorePaths`
 
-  A user re-includes a default with a negation, e.g.
-  `ignorePaths: ["!/e2e/tests/"]`. Adding an unrelated ignore never
-  silently re-enables fixtures.
-- **Admission.** A root is admitted iff it is not ignored by the list
-  above AND (`includePaths` is absent OR `includePaths` matches it).
-- **Defaults apply to discovered roots only.** Built-in defaults (step 1)
-  prune roots the tool discovers (in-memory root detection; disk PATH-glob
-  expansion). A directory the user names explicitly (`--cwd`, a literal
-  PATH) is exempt from step 1 but not from steps 2-3 or `includePaths`.
+  Re-include a default with a negation: `ignorePaths: ["!/e2e/tests/"]`.
+  Adding an unrelated ignore never re-enables fixtures. The defaults are
+  now case-insensitive (`Test/` too), unlike H1. The backend's own
+  scanner defaults (`coverage`, `bower_components`, …) are not mirrored:
+  those are not dependency roots socket-patch would find.
+- **Defaults apply to discovered roots only.** Step 1 never applies to a
+  root the user named explicitly:
+
+  | Mode / entry point | Explicit roots | Discovered roots |
+  |---|---|---|
+  | disk hosted/vendored | `--cwd` with no PATH; a literal (non-glob) PATH | PATH-glob matches (`run_project_dirs` carries the flag per directory) |
+  | disk agent | `--cwd` (its only project; agent PATHs are package globs, not roots) | none |
+  | in-memory | roots given in `projectRoots` | roots found by detection |
+
+  Steps 2-3 and `includePaths` apply to every root.
 - **Structural excludes** (`node_modules .git .socket .yarn vendor`) stay
   hard-coded and cannot be negated.
 - **Granularity.** A workspace member that shares the root lockfile is part
   of the root project; exclude it with `ignorePackages`, not paths.
-  Documented.
-- A root excluded by the policy is reported as filtered (4.6) with the
-  pattern that decided it and the list it came from.
+- **Outside the repo.** Roots are canonicalized; a PATH that resolves
+  outside the repo root (4.5) is a usage error (exit 2). One policy per
+  invocation.
 
 ### 4.4 Validation (fail closed)
 
-socket-patch validates only what it reads: `version`, `projectIgnorePaths`
-and `patches`. Other top-level keys are never inspected.
+socket-patch validates `version`, `projectIgnorePaths` and `patches`, and
+checks top-level key names for case variants of `patches`. It does not
+validate any other key.
+
+Checks run in this order: file access, encoding, YAML, top-level shape,
+case-variant check, version gate, keys.
 
 | Situation | Behavior |
 |---|---|
-| No file | Defaults. |
-| YAML syntax error, duplicate key, top level not a mapping, file over 64 KiB, symlink resolving outside the repo root | **Error** `socket_yml_invalid` |
-| `patches` present and `version` is not `2` (integer 2 or the string `"2"`, matching ajv coercion), including a missing `version` | **Error** `socket_yml_invalid` ("patches requires version: 2") |
-| No `patches` and `version` is not 2 | File ignored (a v1 or future file is not ours to judge); warning `socket_yml_unsupported_version` |
-| Unknown key under `patches` | **Error**, with a did-you-mean hint when one key is within edit distance 2 |
-| Wrong type (no coercion: `"false"` is not a bool; YAML 1.2 so `no` is a string), unknown ecosystem or severity, `maxNewPatches` negative or non-integer, invalid glob or package spec, `projectIgnorePaths` not a list of strings | **Error** naming the key path (`patches.minSeverity`) and the file |
-| Top-level key equal to `patch`/`patches` ignoring case but not exactly `patches` (`Patches:`, `PATCH:`, `patch:`) | **Error**: a misspelled block must not silently mean "no policy" |
-| Both `socket.yml` and `socket.yaml` at the root | Parse both. If the parts socket-patch reads (`projectIgnorePaths`, `patches`) are equal, use them; otherwise **error** `socket_yml_ambiguous` naming both. The existing consumers disagree on which file wins, so we refuse to pick. |
+| No file; empty or comment-only file | no file: defaults |
+| Not a regular file after resolving (directory, FIFO, device), resolves outside the repo root, larger than 64 KiB (read at most 64 KiB + 1 from the opened handle; metadata from the same handle) | **error** |
+| Invalid UTF-8, UTF-16, NUL bytes (a UTF-8 BOM is stripped; CRLF is fine) | **error** |
+| YAML syntax error, duplicate key, top level not a mapping, nesting deeper than 32 | **error** |
+| An anchor, alias or merge key (`<<`) inside `patches` or `projectIgnorePaths` | **error** (bounds expansion; nobody needs them here) |
+| Top-level key equal to `patch` or `patches` ignoring case but not exactly `patches` | **error**: a misspelled block must not mean "no policy" |
+| `patches` present and `version` is not 2 (integer 2 or string `"2"`, as ajv coerces), including missing | **error** ("patches requires version: 2") |
+| `patches: null` or `patches: {}` | defaults |
+| Unknown key under `patches` | **error**, with a did-you-mean hint (edit distance <= 2) and "a newer socket-patch may support it; upgrade or remove it" |
+| Wrong type (no coercion: `"false"` is not a bool; YAML 1.2, so `no` is a string), unknown severity, `maxNewPatches` not an integer in range, empty allowlist, invalid pattern or spec, a list over 1000 entries, an entry over 1024 bytes | **error** naming the key path (`patches.minSeverity`) |
+| `projectIgnorePaths` with a `patches` block present: a string is coerced to a one-element list (as ajv does); anything else not a list of strings is an **error** | |
+| `projectIgnorePaths` with **no** `patches` block: same coercion; otherwise warning `socket_yml_ignored_value` and the key is ignored | repos that never opted in do not start failing on a scanner key |
+| No `patches` block, any `version` | `projectIgnorePaths` honored whatever the version, as the backend (P2) does |
+| Both `socket.yml` and `socket.yaml` at the root | validate both (either invalid is an error). If their `projectIgnorePaths` and `patches` are equal as parsed values (order-sensitive), use `socket.yml`; otherwise **error** `socket_yml_ambiguous`. The existing consumers disagree on which file wins, so we refuse to pick. |
+| Only a case variant exists (`Socket.yml`) | not read (the name must match a directory entry exactly, via `read_dir`, so case-insensitive disks behave like the memory tree); warning `socket_yml_name_case` |
 
-**Error behavior:** before any write, `scan` exits **1** with
-`errorCode: socket_yml_invalid` (or `socket_yml_ambiguous`), a human
-message naming file, key path and remedy (fix the file, or
-`--no-socket-yml`), `--json` stdout still a valid envelope. Exit 1, not 2:
-it is a bad input file, like an invalid manifest, not a usage error.
+**Error behavior.** Before any write, `scan` fails with exit **1** and
+`errorCode: socket_yml_invalid` (or `socket_yml_ambiguous`). The message
+names the file, the key path and the remedy (fix the file, or
+`--no-socket-yml`). Exit 1, not 2: it is a bad input file, like an invalid
+manifest. Scan's JSON is still the legacy shape (not the unified envelope):
+the error output is scan's existing error object `{"status": "error",
+"error": "<message>"}` plus an additive `"errorCode"`; no `policy` or
+`rollout` block is emitted on error.
 
-**Forward compatibility.** A strict parser means an older pinned CLI fails
-on a key a newer CLI understands. That is deliberate (the alternative is a
-silently wider rollout); the error text says "unknown key … (a newer
-socket-patch may support it; upgrade or remove it)". The contract documents
-that keys are only ever added in minor releases and never change meaning.
+Every string copied from the file into output (patterns, specs, key names)
+is truncated to 200 characters with control characters stripped; depscan
+additionally renders them as escaped code spans (7.3).
+
+Keys are only ever added in minor releases and never change meaning. An
+older pinned CLI fails on a newer key by design, and the error says so.
 
 ### 4.5 Lookup
 
-1. Repo root := the nearest ancestor of `--cwd` (inclusive) containing
-   `.git` (a directory, or a file for worktrees and submodules). With no
-   `.git` ancestor, repo root := `--cwd` (never the home directory or
-   filesystem root; socket-cli's unbounded walk could pick up an untrusted
-   `/tmp/socket.yml`).
+1. Canonicalize `--cwd`. Repo root := the nearest ancestor (inclusive)
+   containing `.git` (a directory, or a file for worktrees and submodules),
+   not walking past any directory in `GIT_CEILING_DIRECTORIES`, and, on
+   Unix, only if `.git` is owned by the current user or root (git's
+   safe.directory spirit; otherwise warning `socket_yml_repo_untrusted`
+   and the walk stops). With no qualifying `.git`, repo root := `--cwd`.
+   Never the home directory unless `--cwd` is it; never above `--cwd`
+   without a `.git`.
 2. Read `<repo root>/socket.yml` and `<repo root>/socket.yaml` only.
-   Nested `socket.yml` files are not read. One file per repo, as in the
-   GitHub App.
-3. The in-memory engine's repo root is the tree root it was given.
+   Nested files are never read (one file per repo, as in the GitHub App).
+   A symlinked socket.yml is followed only if it resolves to a regular
+   file inside the repo root.
+3. In memory, the repo root is the tree root; the file must arrive with
+   content (7.2). A socket.yml the tree lists but the engine never
+   receives, or receives only as present-without-content (symlink,
+   oversize, LFS pointer, binary), is `socket_yml_invalid`, never absent.
 4. `--global` / `--global-prefix` scans have no repo and ignore the file.
 
 ### 4.6 Commands
@@ -275,7 +338,7 @@ that keys are only ever added in minor releases and never change meaning.
 | Command | Policy |
 |---|---|
 | `scan` (hosted, vendored, agent; wet and `--dry-run`), `hosted-bundle`, the napi engine | honor filters and limit |
-| `get` | explicit intent: ignores filters and limit; warns `policy_bypassed` when the target would have been filtered |
+| `get` | explicit intent: ignores filters and limit; warns `policy_bypassed` when the target would have been filtered; never fails on the policy (an invalid file just skips the warning) |
 | `apply`, `list`, `vex`, `rollback`, `remove`, `repair`, `vendor` (eject/revert) | ignore it: they report, attest or undo existing state |
 
 **Narrowing never removes.** The policy runs after the prune universe is
@@ -287,14 +350,18 @@ over; left byte-identical. It is reported under `policy.retained[]` with
 `upgradeAvailable`. Removing a patch is only ever `rollback`/`remove`, or
 the dependency leaving the lockfile.
 
-`minSeverity` filters **candidates** before per-package ranking (so a
-lower-ranked patch above the floor can still win), using the patch's real
-severity (`severity_order` on `BatchPatchInfo.severity`, or
-`max_severity_order` over `vulnerabilities`), never `RankKey.severity`.
-With a floor set, a patch with unknown severity is filtered (fail closed).
-A recorded patch below the floor stays in place; it is replaced only when a
-candidate above the floor supersedes it under the existing
-`batch_supersedes` rule, which is an ordinary upgrade.
+**Severity floor.** One data source: the by-package records the selector
+already fetches (`fetch_patch_details` on disk, the provider's by-package
+lookup in memory), severity = `max_severity_order` over the patch's
+`vulnerabilities`, never `RankKey.severity` (forced to 0 for merged
+patches) and never the batch list. The floor restricts which candidates
+may **win** per-package ranking; a lower-ranked patch above the floor can
+still win. With a floor set, unknown severity is filtered (fail closed;
+note `minSeverity: low` therefore drops unknown-severity patches, which the
+recipes say). Supersession of a recorded patch is judged against the
+**unfiltered** offer list (5.1): the floor never turns a recorded patch
+into "no longer offered". A recorded package with no candidate above the
+floor keeps its recorded patch (ALREADY).
 
 `enabled: false`: discovery and the table still run; nothing is written;
 every candidate is reported filtered with `policy_disabled`; warning
@@ -302,154 +369,214 @@ every candidate is reported filtered with `policy_disabled`; warning
 
 ### 4.7 JSON (`policy` block, owned by A)
 
-Additive top-level key on every `scan --json` result (MINOR), always
-present:
+Additive top-level key on every successful `scan --json` result (MINOR),
+always present. Policy warnings go to scan's top-level `warnings[]`.
 
 ```json
 "policy": {
-  "source": "file",                     // "none" | "file" | "bypassed"
-  "path": "socket.yml",                 // repo-relative; null unless source=file
-  "sha256": "…",                        // of the file bytes; null unless source=file
+  "source": "file",
+  "path": "socket.yml",
+  "sha256": "…",
   "enabled": true,
-  "minSeverity": {"value": "high", "source": "file"},   // value null = no floor; source flag|env|file|default
+  "minSeverity": {"value": "high", "source": "file"},
   "counts": {"filtered": 3, "retained": 1},
   "filtered": [
-    {"purl": "pkg:npm/qs@6.5.2", "uuid": "…", "project": "services/legacy",
+    {"purl": "pkg:npm/qs@6.5.2", "uuid": null, "project": "services/legacy",
      "reason": "policy_path_excluded", "detail": "/legacy/ (patches.ignorePaths)"}
   ],
   "retained": [
-    {"purl": "pkg:npm/lodash@4.17.20", "project": ".", "recordedUuid": "…",
+    {"purl": "pkg:npm/lodash@4.17.20", "project": "", "recordedUuid": "…",
      "reason": "policy_package_ignored", "upgradeAvailable": true}
   ]
 }
 ```
 
-- `uuid` is null when the package was filtered before any patch was looked
-  up (path, ecosystem, package reasons).
+| `source` | When | `path` / `sha256` |
+|---|---|---|
+| `none` | no file, empty file, file ignored (`--global`), or only a case variant | null |
+| `file` | a root file was read (with or without a `patches` block) | the file used (`socket.yml` when both are equal) / its bytes' hash |
+| `bypassed` | `--no-socket-yml` / `SOCKET_NO_SOCKET_YML` | null |
+
+- `project` is the repo-relative root directory; the repo root is `""`
+  (the memory engine's spelling) everywhere.
+- `minSeverity.source` is `flag|env|file|default`; `value` null = no floor.
+- `uuid` is null when the package was filtered before any patch lookup
+  (path, ecosystem, package reasons). A root filtered as a whole is one
+  entry with `purl: null`.
+- `counts.filtered` counts entries of `filtered[]`; `counts.retained`
+  counts entries of `retained[]`.
 - Reason codes (stable): `policy_disabled`, `policy_path_excluded`,
   `policy_path_not_included`, `policy_ecosystem`,
   `policy_package_not_listed`, `policy_package_ignored`, `policy_severity`
   (detail `unknown < high` or `medium < high`).
-- A root filtered as a whole is one entry with `purl: null`.
-- Human output: one line, e.g.
-  `Policy (socket.yml): 3 skipped by filters, 1 patched package held.`
-  and `--verbose` lists them.
+- Human output: one line, e.g. `Policy (socket.yml): 3 skipped by filters,
+  1 patched package held.` Filtered critical/high candidates are always
+  named on the human path (a policy must not silently hide them);
+  `--verbose` lists everything.
 
 ## 5. Per-run limit (work item B)
 
 ### 5.1 Classification
 
+**Recorded view.** Always the merged view, in every mode and both engines:
+`merge_ledger_records_for_updates` (manifest > hosted lockfile pins >
+vendor ledger), scoped to the lockfiles and state files of the project
+root being written. The in-memory engine reads the same three stores from
+the tree (`.socket/manifest.json`, `.socket/vendor/state.json`, hosted
+pins discovered from the in-memory lockfiles; new, B). When the lockfiles
+of one root pin a purl to different uuids, the recorded uuid is the
+selected uuid if it is among them, else the smallest (today's rule).
+
+**Supersession** uses the by-package records (the same data as selection
+and the severity floor), with the `batch_supersedes` rungs applied to
+them: merged over unmerged, higher severity between unmerged, a real,
+strictly later publish date. It is judged against the **unfiltered** offer
+list. B adds the by-package twin of `batch_supersedes` in `ranking.rs`;
+`detect_updates` and scan's `updates[]` switch to it so classification,
+selection and reporting can never disagree.
+
 After filtering and per-package selection, each selected `(project root,
-purl, uuid)` row is classified against that project's recorded view
-(`merge_ledger_records_for_updates`: manifest > hosted lockfile pins >
-vendor ledger), with `detect_updates`' qualifier-twin handling:
+purl)` row is:
 
-| Class | Rule | Counts toward the cap |
-|---|---|---|
-| ALREADY | recorded uuid == selected uuid, or recorded uuid kept because the selection does not supersede it (`batch_supersedes`) | no; hosted re-confirms it idempotently as today |
-| UPGRADE | recorded uuid differs and the selection supersedes it (existing `detect_updates` rule, including "recorded patch no longer offered") | no |
-| NEW | no patch recorded for this base purl **in this project root** | **yes** |
+| Class | Rule | Counts toward the cap | Writer receives |
+|---|---|---|---|
+| ALREADY | recorded uuid == selected uuid, or the selection does not supersede the recorded uuid | no | the **recorded** uuid (re-confirmed idempotently) |
+| UPGRADE | the selection supersedes the recorded uuid, or the recorded uuid is no longer offered at all (unfiltered) | no | the selected uuid |
+| NEW | nothing recorded for this base purl in this project root | **yes** | the selected uuid, if admitted |
 
-- NEW is per project root. Widening `includePaths` from a pilot directory
-  to more services makes piloted packages NEW in the added roots, and they
-  go through the cap again. A patch already in another project is not a
-  free pass.
+- NEW is per project root. Widening `includePaths` makes piloted packages
+  NEW in the added roots, so they go through the cap again.
 - UPGRADEs are exempt (decision): rollout risk is about whether a package
-  runs patched code at all, and an upgrade fixes more in a package that is
-  already patched. Capping upgrades would leave known-superseded patches in
-  place. To freeze everything, use `enabled: false`; `maxNewPatches: 0`
-  freezes new packages only.
+  runs patched code at all, and an upgrade fixes more in an already-patched
+  package. `enabled: false` freezes everything; `maxNewPatches: 0` freezes
+  new packages only.
+- **Known limit: version bumps.** When a dependency moves to a new version
+  its hosted pin goes with the old lockfile entry, so the new version is
+  NEW and goes through the cap. (Hosted state cannot tell a bump from a new
+  package.) Documented.
+- **Qualifier twins** (wheel/sdist, gem platforms) share a base purl. If
+  one twin lands and another was ineligible, the next run sees the base
+  purl as recorded and the late twin lands as ALREADY/UPGRADE, uncapped.
+  Documented; it is one package.
 
-### 5.2 Budget and ordering
+### 5.2 Eligibility, budget and ordering
 
+- **Eligibility is decided by the planning pass**, the same pass
+  `--dry-run` runs, before any budget is spent. A NEW row is eligible only
+  if every check that can be decided without writing passes:
+  - tier filter;
+  - agent partition (vendored / not installed);
+  - vendored preflight;
+  - hosted reference grant `granted`, with a usable purl and url;
+  - vlt artifact preflight;
+  - symlink refusals;
+  - rewriter planning shows at least one lockfile edit that would pin it
+    (no refusal, entry found).
+
+  Ineligible rows keep their existing skip reasons and never hold a slot,
+  so a patch that cannot land can never stall the rollout.
+- **One fetch strategy.** References are requested for every eligible-so-far
+  candidate (NEW, UPGRADE and ALREADY) in the run's normal batches, before
+  budgeting; never lazily in rank order. A reference or lookup failure that
+  affects only rows that end up deferred never fails the run or the root;
+  it becomes warning `rollout_reference_failed`.
+- **Incomplete data.** With a finite cap, if any batch, detail or reference
+  lookup failed for a package that could have been NEW, no NEW row is
+  admitted this run (all NEW rows deferred) and warning
+  `rollout_incomplete_lookup` is emitted. Otherwise a failure would let
+  lower-ranked patches take the missing ones' slots. ALREADY and UPGRADE
+  rows proceed as today.
 - **Unit:** a distinct **base purl** (ecosystem + name + version,
-  qualifiers stripped) among NEW rows, run-wide: across every project root
-  of one invocation (disk multi-directory human runs, every root of the
-  in-memory engine). Admitting a base purl admits all of its NEW rows in
-  every root. One package patched in ten roots costs 1.
-- **Order** (ascending; a total order with no time-dependent keys):
-  1. in-flight first (in-memory option `inFlightPatches` only, 7.2;
-     absent on the CLI)
-  2. real severity of the selected patch (`severity_order`: critical,
-     high, medium, low, unknown)
+  qualifiers stripped, via one shared core function `canonical_base_purl`)
+  among eligible NEW rows. Admitting a base purl admits all of its eligible
+  NEW rows in every root of the invocation; it costs 1 slot.
+- **Scope of the budget:**
+  - in-memory engine: one budget across all roots (collect, plan, apply);
+  - disk: one budget per invocation. `run_project_dirs` visits
+    directories in sorted order and passes the **remaining** budget to
+    each; each directory spends it in rank order. `scan --json` accepts one
+    directory, so a CI job per directory gets N per directory. Documented.
+- **Order** (ascending; total; no time-dependent keys):
+  1. in-flight first (in-memory option `inFlightPatches` only, matched by
+     base purl; absent on the CLI)
+  2. severity of the selected patch (`max_severity_order`: critical, high,
+     medium, low, unknown)
   3. advisory count, descending (merged patches first within a severity)
   4. ecosystem `cli_name`, ascending
-  5. canonical base purl, ascending bytewise (one shared core
-     normalization function, used by disk and memory)
-  6. uuid, ascending
+  5. canonical base purl, ascending bytewise
+  6. smallest selected uuid across the base purl's rows, ascending
 
-  A base purl present in several roots uses the minimum key of its rows.
-  `publishedAt` is deliberately **not** a key: the batch endpoint omits it,
-  so using it would reorder the top N between runs and between the disk
-  and memory engines. Per-package ranking (which patch a package gets)
-  still uses `publishedAt` as today; this order only decides which
-  packages go first.
-- **Eligibility before budget.** A row consumes budget only if it can land
-  this run: it passed the tier filter, the agent partition (vendored /
-  not installed), the vendored preflight and, in hosted mode, its reference
-  grant came back `granted`. Rows that cannot land (withdrawn,
-  build_failed, pending_build, not_found, forbidden, refused) keep their
-  existing skip reasons and do not hold a slot, so a permanently broken
-  patch can never stall the rollout. Implementations may fetch references
-  for every NEW candidate, or in rank-ordered batches until the budget is
-  full; the resulting plan must be identical.
-- **Write failures** after admission consume budget (the run stays bounded;
-  no backfill within a run). They are reported as failures, as today.
+  A base purl in several roots uses the minimum key over its rows.
+  `publishedAt` is not a key: it would reorder the queue whenever a date is
+  missing. Per-package ranking (which patch a package gets) still uses
+  `publishedAt` as today; this order only decides which packages go first.
+- **Write failures** after admission (I/O at commit time) consume budget
+  and are reported as failures. No backfill within a run, so `--dry-run`
+  predicts the wet run exactly.
 - **`maxNewPatches: 0`** admits no NEW rows; ALREADY and UPGRADE proceed.
-- Everything NEW beyond the budget is **deferred**: not written, not
-  downloaded, not vendored, reported with its rank.
+- Everything eligible and NEW beyond the budget is **deferred**: not
+  written, not downloaded, not vendored, reported with its rank.
 
 ### 5.3 Convergence and determinism
 
 - Same inputs, same plan, same bytes. The limit is stateless: run k lands
   the top N; on run k+1 they are ALREADY and the next N land. M waiting
-  patches take ceil(M/N) committed runs.
+  patches take **at most** ceil(M/N) committed runs, absent new or
+  ineligible patches.
 - A newly published or re-scored higher-severity patch moves ahead of the
-  queue. That is intended ("most critical first") and is visible because
+  queue. That is intended ("most critical first") and visible, because
   every deferred entry carries its rank and severity.
 - Low-severity patches can wait indefinitely while higher ones keep
   arriving. Documented; it is the point of severity ordering.
 - **CI that does not commit** the scan's result never advances recorded
-  state, so a cap there means "only the top N, every run". Documented in
-  the recipes: commit the lockfile changes (or use a PR bot), or do not set
-  a cap in non-committing jobs.
+  state, so a cap there means "only the top N, every run". The recipes
+  say: commit the lockfile changes (or use a PR bot), or set no cap in
+  non-committing jobs.
 - `pending_build` references are transient: a row can be ineligible one
   run and eligible the next. The plan is still a function of the inputs.
+- `--dry-run` fetches reference grants like a wet run (it must, to decide
+  eligibility), so it has the same server-side effects a dry run has
+  today.
 
 ### 5.4 Modes
 
-| Mode | Recorded state | NEW/ALREADY/UPGRADE source | Deferred rows |
-|---|---|---|---|
-| hosted (disk) | lockfile hosted pins (`HostedPin`) | recorded view | never granted, never rewritten; mirrored into `redirect.skipped[]` with reason `rollout_deferred` |
-| vendored | `.socket/vendor/state.json` | ALREADY = `already_vendored`, UPGRADE = `would_revendor` | never downloaded or vendored |
-| agent | `.socket/manifest.json` | ALREADY = `skipped`, UPGRADE = `updated` | never downloaded; not in `apply.patches[]` |
-| in-memory (napi, hosted-bundle) | hosted pins discovered from the in-memory lockfiles (**new**, B) | same | in `ProjectResult.deferred[]` and `skipped[]` with `rollout_deferred` |
+| Mode | ALREADY / UPGRADE surface | Deferred rows |
+|---|---|---|
+| hosted (disk) | re-confirmed / rewritten, as today | never rewritten; mirrored into `redirect.skipped[]` with reason `rollout_deferred` |
+| vendored | `already_vendored` / `would_revendor` | never downloaded or vendored |
+| agent | `skipped` / `updated` | never downloaded; not in `apply.patches[]` |
+| in-memory (napi, hosted-bundle) | as hosted | in `ProjectResult.deferred[]` and `skipped[]` with `rollout_deferred` |
 
-`--dry-run` makes exactly the same decisions and reports them the same way.
-A takeover of an existing vendored or hosted entry counts as recorded, not
-NEW.
+Recorded state is the merged view (5.1) in every row. A takeover of an
+existing vendored or hosted entry counts as recorded, not NEW. `--dry-run`
+makes exactly the same decisions.
 
 ### 5.5 JSON (`rollout` block, owned by B)
 
-Additive top-level key on every `scan --json` result (MINOR), always
-present:
+Additive top-level key on every successful `scan --json` result (MINOR),
+always present:
 
 ```json
 "rollout": {
-  "maxNewPatches": {"value": 5, "source": "file"},   // value null = unlimited; source flag|env|file|default|cap
+  "maxNewPatches": {"value": 5, "source": "file"},
   "counts": {"new": 5, "deferred": 9, "upgrade": 1, "already": 12},
   "deferred": [
-    {"purl": "pkg:npm/minimist@1.2.5", "uuid": "…", "severity": "critical",
+    {"purl": "pkg:npm/minimist@1.2.5", "uuids": ["…"], "severity": "critical",
      "advisoryCount": 1, "projects": ["services/api", "services/web"], "rank": 6}
   ]
 }
 ```
 
-- `counts.new` is the number of NEW base purls admitted this run
-  (landed, or would land under `--dry-run`); `deferred` lists the rest in
-  rank order; `rank` is 1-based across all NEW candidates.
-- Human output (hosted/vendored/agent summary, then the Next-steps
-  renderer):
+- `maxNewPatches.value` null = unlimited; `source` is
+  `flag|env|file|default|cap`.
+- `counts.new` and `counts.deferred` count base purls (admitted this run,
+  or would be under `--dry-run`; deferred). `counts.upgrade` and
+  `counts.already` count `(project, purl)` rows.
+- `deferred[]` is in rank order; `purl` is the base purl; `uuids` lists
+  the distinct selected uuids across its rows and qualifier twins; `rank`
+  is 1-based among **eligible** NEW base purls. Ineligible rows are not
+  ranked; they appear under their existing skip reasons.
+- Human output (after the mode's summary, then the Next-steps renderer):
 
   ```
   Rollout: 5 of 14 new patches applied (maxNewPatches=5 from socket.yml); 1 upgrade, 12 already applied.
@@ -470,11 +597,11 @@ patches:
 ```
 
 ```yaml
-# R2 Critical first: critical only, then widen by editing one line
+# R2 Critical first: widen by editing one line
 version: 2
 patches:
-  minSeverity: critical   # later: high, then remove
-  maxNewPatches: 5
+  minSeverity: critical   # later: high, then low, then remove the key
+  maxNewPatches: 5        # (low still skips patches whose severity is unknown)
 ```
 
 ```yaml
@@ -511,6 +638,9 @@ patches:
 #   maxNewPatches: 0
 ```
 
+A cap only advances when the scan's changes are committed (or merged by a
+PR bot). In a CI job that scans without committing, set no cap.
+
 One-off overrides from the command line: `socket-patch scan
 --max-new-patches none` (drain the queue this run), `--min-severity none`,
 `--no-socket-yml` (ignore the file entirely).
@@ -520,29 +650,36 @@ One-off overrides from the command line: `socket-patch scan
 ### 7.1 Behavior with the new engine
 
 - `repo` jobs rebuild one commit from the base SHA each run. With
-  `maxNewPatches: 5`, "recorded" means pinned on the **base** branch, so
+  `maxNewPatches: 5`, "recorded" means recorded on the **base** branch, so
   every rebuild proposes the same top 5 until the PR merges, then the next
-  5. No churn, no new PR per batch.
-- `pull_request` jobs honor the filters but pass `maxNewPatches: "none"`:
-  deferring there would leave the check permanently showing work.
-- socket.yml is read from the same commit as the tree (base SHA for `repo`
-  jobs, head SHA for `pull_request` jobs), through the engine: the file is
-  one of the paths the engine asks for, so there is no second parser.
-- Effective limit = min(repo value or override, server cap). The server
-  can tighten, never loosen. Org-level kill switches, entitlement and
-  safety (D1-D6) always win.
+  5. `inFlightPatches` (the base purls already in the open PR) keeps a
+  reviewed patch from being displaced by a newly published one mid-review.
+- **Policy source.** Both job kinds read socket.yml from the **base** SHA:
+  the reviewed, merged policy. A pull request cannot loosen the policy
+  that judges its own check (for example by adding `ignorePackages` for
+  the vulnerable dependency it introduces). If the PR head changes
+  `patches` or `projectIgnorePaths`, the check run says so and lists what
+  the head's policy would additionally filter.
+- `pull_request` jobs honor the filters and pass `maxNewPatches: "none"`
+  and **no** `maxNewPatchesCap`: deferring there would leave the check
+  permanently showing work.
+- Effective limit for `repo` jobs = min(repo value, `maxNewPatchesCap`).
+  The server can tighten, never loosen; the cap applies to every value
+  including `"none"`. Org-level kill switches, entitlement and safety
+  (D1-D6) always win.
 
 ### 7.2 Engine API changes (napi `HostedScanOptions` / result, and the `hosted-bundle` harness)
 
 | Owner | Change |
 |---|---|
-| A | `selectHostedScanPaths` returns root `socket.yml` / `socket.yaml` when present in the tree listing (one phase: the file is small and root-only; roots the policy excludes are simply not processed) |
-| A | options `noSocketYml?: boolean`, `minSeverity?: "critical"\|"high"\|"medium"\|"low"\|"none"` |
-| A | result: session-level `policy` block (4.7) and `policyError?: {code, detail}`; on error no project is processed and no files change; `skipped[].reason` gains the `policy_*` codes |
-| B | options `maxNewPatches?: number \| "none"`, `maxNewPatchesCap?: number`, `inFlightPatches?: string[]` (uuids already in the open PR; ranked first so a reviewed patch is not displaced by a newly published one mid-review) |
+| A | `selectHostedScanPaths` also returns root `socket.yml` / `socket.yaml` when listed, and returns the list of policy paths it selected; it applies only the **built-in** default ignores (it cannot see file contents); the session fails `socket_yml_invalid` if a selected policy path never arrives with content or arrives present-without-content |
+| A | the session applies the full policy to detected roots **before** the `max_projects` check (`hosted_memory/mod.rs:377`) |
+| A | options `noSocketYml?: boolean`, `minSeverity?: "critical"\|"high"\|"medium"\|"moderate"\|"low"\|"none"` |
+| A | result: session-level `policy` block (4.7) and `policyError?: {code, detail}`; on error no root is processed and no files change; `skipped[].reason` gains the `policy_*` codes |
+| B | options `maxNewPatches?: number \| "none"`, `maxNewPatchesCap?: number`, `inFlightPatches?: string[]` (base purls) |
 | B | result: session-level `rollout` block (5.5); `ProjectResult.deferred[]`; `skipped[]` rows with `rollout_deferred` |
-| B | hosted-pin discovery over the in-memory lockfiles (the memory twin of `HostedPin::all(discover_wiring(..))`), so NEW/ALREADY/UPGRADE work in memory. A finite cap must never ship in the engine without it: every merged pin would look NEW and the rollout would stall at N. |
-| B | restructure the per-root loop at `hosted_memory/mod.rs:537` into collect all roots → plan once → apply, so the budget is run-wide |
+| B | hosted-pin discovery over the in-memory lockfiles and reading `.socket/manifest.json` / `.socket/vendor/state.json` from the tree, for the merged recorded view. A finite cap must never ship in the engine without it: every merged pin would look NEW and the rollout would stall at N. |
+| B | restructure the per-root loop around `hosted_memory/mod.rs:537` into collect all roots → plan once → apply, so the budget is run-wide |
 
 `hosted-bundle` rejects unknown fields, so each owner adds its fields there
 too.
@@ -550,26 +687,34 @@ too.
 ### 7.3 depscan follow-up (after A and B merge; separate PR in depscan)
 
 1. Bump the socket-patch submodule and rebuild the addon.
-2. Pass `inFlightPatches` (uuids in the open patch-all PR) and, for
-   `pull_request` jobs, `maxNewPatches: "none"`.
-3. New job outcome `policy_invalid` (from `policyError`): leave the
+2. Stream root socket.yml content from the **base** SHA for both job kinds
+   (for `repo` jobs that is the tree being scanned; for `pull_request`
+   jobs push the base-SHA blob under the policy path the engine selected).
+   Never let the file be dropped by the size/path caps silently: the
+   engine turns a missing policy blob into `policyError`.
+3. Pass `inFlightPatches` (base purls in the open patch-all PR); for
+   `pull_request` jobs pass `maxNewPatches: "none"` and no cap.
+4. New job outcome `policy_invalid` (from `policyError`): leave the
    existing PR untouched, surface the error on the admin page and in the
-   job's check-run text.
-4. Render a "Deferred (next batch)" table and severity/rank columns in the
-   PR body; add `patchesDeferred` to stats.
-5. Optional server cap per org (future org setting), passed as
-   `maxNewPatchesCap`; intersect the admin `config.ecosystems` (D3) with
-   the file by passing it as `ecosystems` as today.
-6. Do **not** add `patches` to the ajv schema in
-   `socket-yaml-schema.ts` with strict types: a typo would reject the whole
-   file and turn PR checks neutral. If documentation value is wanted, add
-   it as a permissive `{type: object}`.
-7. Docs repo: add a `patches` section to the socket.yml page, and fix the
-   two stale statements found in research (which file wins when both
-   exist; v1 files are rejected by the GitHub App).
+   check-run text.
+5. PR body and check run: a "Deferred (next batch)" table with severity
+   and rank; `policy.filtered`/`retained` counts, naming every critical or
+   high candidate the policy suppressed; a note when the PR head changes
+   the policy. Render every file-derived string as an escaped code span,
+   truncated.
+6. Stats: `patchesDeferred`, `patchesFiltered`.
+7. Optional server cap per org (future setting) passed as
+   `maxNewPatchesCap`; keep passing the admin `config.ecosystems` (D3) as
+   `ecosystems`, which intersects with the file.
+8. Do **not** add `patches` with strict types to the ajv schema in
+   `socket-yaml-schema.ts`: a typo there rejects the whole file and turns
+   PR checks neutral. If wanted for docs, add a permissive `{type: object}`.
+9. Docs repo: a `patches` section on the socket.yml page; fix the two
+   stale statements found in research (which file wins when both exist;
+   v1 files are rejected by the GitHub App).
 
-A closed/rejected rolling PR re-proposes the same patches next run;
-document `ignorePackages` as the way to decline one.
+A closed or rejected rolling PR re-proposes the same patches next run;
+`ignorePackages` is the documented way to decline one.
 
 ## 8. Decisions log
 
@@ -577,46 +722,48 @@ document `ignorePackages` as the way to decline one.
 |---|---|---|
 | 1 | Top-level `patches:` in socket.yml v2; no `version: 3` | breaks no parser (P1/P2 strip, P3 ignores); P3 rejects any version but 2 |
 | 2 | socket-patch reads socket.yml (reverses configuration.md) | owner request; policy that only narrows fits the trust boundary |
-| 3 | Keys `enabled includePaths ignorePaths ecosystems packages ignorePackages minSeverity maxNewPatches` | include/ignore pairs mirror existing keys; `packages` allowlist covers single-package pilots; `maxNewPatches` says it counts new patches only |
-| 4 | gitignore semantics via the `ignore` crate, case-insensitive, anchored at repo root | identical to `projectIgnorePaths` in the backend |
-| 5 | socket-patch also honors `projectIgnorePaths` | users expect one ignore list; every other consumer already honors it |
-| 6 | Defaults `test/ tests/ fixtures/ __fixtures__/ testdata/` evaluated first, overridden by `!`; discovered roots only | moves H1; replace-on-set would re-enable fixtures when someone adds one unrelated pattern |
-| 7 | Strict validation, fail closed, exit 1 `socket_yml_invalid` | a broken narrowing rule must not widen the rollout |
-| 8 | Both files: error only if the parts we read differ | existing consumers disagree on precedence; repos that already have both keep working |
-| 9 | Repo root = nearest `.git` ancestor, else `--cwd`; root files only | matches the GitHub App; memory engine can mirror it; never reads outside the checkout |
+| 3 | Keys `enabled includePaths ignorePaths ecosystems packages ignorePackages minSeverity maxNewPatches` | include/ignore pairs mirror existing keys; `packages` covers single-package pilots; `maxNewPatches` says it counts new patches only |
+| 4 | Paths match marker **files**, npm-`ignore` semantics, top-down, case-insensitive; golden parity fixture | identical meaning to `projectIgnorePaths` in the backend; no root special form |
+| 5 | socket-patch also honors `projectIgnorePaths` (leniently when there is no `patches` block) | users expect one ignore list; repos that never opted in do not start failing |
+| 6 | Defaults `test/ tests/ fixtures/ __fixtures__/ testdata/` first, overridden by `!`; discovered roots only | moves H1; replace-on-set would re-enable fixtures on any unrelated edit |
+| 7 | Strict validation of `patches`, fail closed, exit 1 `socket_yml_invalid` | a broken narrowing rule must not widen the rollout |
+| 8 | Both files: error only if the parts we read differ | consumers disagree on precedence; repos that have both keep working |
+| 9 | Repo root = nearest trusted `.git` ancestor (ceiling dirs honored), else `--cwd`; root files only; PATHs outside it are exit 2 | matches the GitHub App; memory can mirror it; never reads outside the checkout |
 | 10 | Flags intersect lists; scalars CLI > env > file > default; `--no-socket-yml` with env | contract precedence and "every flag has an env var" |
 | 11 | `maxNewPatches: 0` = upgrades only; absent / `none` = unlimited | literal meaning; avoids the Dependabot/Renovate 0 disagreement |
 | 12 | Unknown severity is filtered when a floor is set | fail closed |
-| 13 | NEW per (project root, base purl); budget per base purl run-wide | a widened pilot re-enters the cap; one package in many roots costs 1 |
-| 14 | Upgrades exempt from the cap | rollout risk is per package; keeps patched packages current |
-| 15 | Order: severity, advisory count, ecosystem, base purl, uuid; no `publishedAt` | total and time-independent; batch lacks the date |
-| 16 | Budget after eligibility (grants, partition, preflight) | a withdrawn/broken patch never holds a slot |
-| 17 | Filtered packages with recorded patches are retained, never removed or upgraded | narrowing freezes, never removes |
-| 18 | `get` bypasses the policy with a warning | explicit intent |
-| 19 | Separate `policy` (A) and `rollout` (B) JSON blocks | clean ownership seam; both additive |
-| 20 | Everything ships in 5.0 | honoring `projectIgnorePaths`, disk default ignores and fail-closed file errors change scan's default behavior (MAJOR) |
+| 13 | One data source (by-package records) for floor, supersession, classification and order | selection, classification and reporting can never disagree |
+| 14 | NEW per (project root, base purl); budget per base purl; memory run-wide, disk per invocation carried across directories | a widened pilot re-enters the cap; one package in many roots costs 1 |
+| 15 | Upgrades exempt from the cap | rollout risk is per package; keeps patched packages current |
+| 16 | Order: severity, advisory count, ecosystem, base purl, uuid; no `publishedAt` | total and time-independent |
+| 17 | Eligibility = everything the planning pass can decide; fetch-all references; incomplete lookups admit no NEW rows | a broken patch never holds a slot; failures never reshuffle the queue |
+| 18 | Filtered packages with recorded patches are retained, never removed or upgraded | narrowing freezes, never removes |
+| 19 | `get` bypasses the policy with a warning | explicit intent |
+| 20 | Separate `policy` (A) and `rollout` (B) JSON blocks | clean ownership seam; both additive |
+| 21 | depscan reads the policy from the base SHA for PR jobs too | a PR cannot loosen the policy judging it |
+| 22 | Everything ships in 5.0 | honoring `projectIgnorePaths`, disk default ignores and fail-closed file errors change scan's default behavior (MAJOR) |
 
 ## 9. Work items
 
 Both items branch from `release/v5-prerelease` (suggested branches
 `v5/rollout-policy` for A, `v5/rollout-limit` for B). **Merge order: A,
-then B.**
-B rebases onto A and owns the final integration (section 9.3). Neither
-item depends on the other's types: the only exchanged values are plain
-`Option<u32>` / `Option<u8>` and the pipeline order below.
+then B.** B rebases onto A and owns the final integration (9.3). Neither
+item needs the other's types to compile: the only exchanged values are
+plain integers and the pipeline order below.
 
 ### 9.0 Shared contract (frozen by this plan)
 
 Scan pipeline, in order (disk and memory):
 
-1. load policy (A) — fail closed before any write
+1. load policy (A); fail closed before any write
 2. crawl; capture the prune universe (unchanged)
 3. root filter, ecosystem/package filter, retained set (A)
-4. batch API (unchanged)
-5. candidate severity filter (A)
+4. batch API, by-package details (unchanged fetches)
+5. candidate severity filter on by-package records (A)
 6. per-package ranking (unchanged `ranking`)
-7. classify NEW/ALREADY/UPGRADE, eligibility, budget, deferral (B)
-8. writers (unchanged; receive only admitted rows)
+7. classify, planning pass for eligibility, budget, deferral (B)
+8. writers (receive only admitted NEW rows, ALREADY rows with the recorded
+   uuid, and UPGRADE rows)
 
 ```rust
 // crates/socket-patch-core/src/policy/mod.rs — OWNER A
@@ -628,20 +775,26 @@ pub enum FilterReason {
     Severity { found: Option<String>, floor: String },
 }
 impl FilterReason { pub fn code(&self) -> &'static str; pub fn detail(&self) -> String; }
-pub enum PolicyError { Invalid { file: String, key: String, message: String }, Ambiguous { files: [String; 2] } }
+pub enum PolicyError {
+    Invalid { file: String, key: String, message: String },
+    Ambiguous { files: [String; 2] },
+}
 impl PolicyError { pub fn code(&self) -> &'static str; } // socket_yml_invalid | socket_yml_ambiguous
-pub trait PolicyFs { fn read_root_file(&self, name: &str, cap: usize) -> std::io::Result<Option<Vec<u8>>>; }
+pub enum RootFile { Absent, Present(Vec<u8>), PresentWithoutContent }
+pub trait PolicyFs { fn read_root_file(&self, name: &str, cap: usize) -> std::io::Result<RootFile>; }
 pub struct PolicyOverrides { pub bypass: bool, pub min_severity: Option<Option<u8>> } // Some(None) = "none"
+pub struct Root<'a> { pub rel_dir: &'a str, pub markers: &'a [String], pub explicit: bool }
 impl SelectionPolicy {
-    pub fn unrestricted() -> Self;                         // defaults (built-in path ignores only)
-    pub fn load(fs: &dyn PolicyFs, o: &PolicyOverrides) -> Result<Self, PolicyError>;
+    pub fn unrestricted() -> Self;                          // built-in default ignores only
+    pub fn load(fs: &dyn PolicyFs, o: &PolicyOverrides) -> Result<(Self, Vec<PolicyWarning>), PolicyError>;
     pub fn source(&self) -> &PolicySource;
     pub fn enabled(&self) -> bool;
-    pub fn admits_root(&self, rel_dir: &str, explicit: bool) -> Result<(), FilterReason>;
-    pub fn admits_purl(&self, purl: &str) -> Result<(), FilterReason>;       // ecosystem + packages
+    pub fn admits_root(&self, root: &Root) -> Result<(), FilterReason>;
+    pub fn admits_purl(&self, purl: &str) -> Result<(), FilterReason>;        // ecosystem + packages
     pub fn admits_severity(&self, severity_order: u8) -> Result<(), FilterReason>;
-    pub fn max_new_patches(&self) -> Option<u32>;          // the FILE value only; B resolves precedence
+    pub fn max_new_patches(&self) -> Option<u32>;           // the FILE value only; B resolves precedence
 }
+pub fn package_spec_matches(spec: &str, purl: &str) -> bool; // moved from cli scan/mod.rs:383
 
 // crates/socket-patch-core/src/rollout.rs — OWNER B
 pub enum Recorded { None, Same, Kept { uuid: String }, Superseded { old_uuid: String } }
@@ -656,149 +809,182 @@ pub fn resolve_max_new(flag: Option<Option<u32>>, env: Option<Option<u32>>,
                        file: Option<u32>, cap: Option<u32>) -> MaxNew;
 pub fn canonical_base_purl(purl: &str) -> String;
 pub fn rollout_cmp(a: &Candidate, b: &Candidate) -> std::cmp::Ordering;
-pub struct RolloutPlan { pub admitted: Vec<Candidate>, pub deferred: Vec<(Candidate, u32)>, pub counts: RolloutCounts }
-pub fn plan_rollout(candidates: Vec<Candidate>, max_new: &MaxNew) -> RolloutPlan; // pure
+pub struct RolloutCounts { pub new: u32, pub deferred: u32, pub upgrade: u32, pub already: u32 }
+pub struct RolloutPlan {
+    pub admitted: Vec<Candidate>, pub deferred: Vec<(Candidate, u32)>,
+    pub counts: RolloutCounts, pub remaining: Option<u32>,   // carried to the next directory
+}
+pub fn plan_rollout(candidates: Vec<Candidate>, max_new: &MaxNew, incomplete: bool) -> RolloutPlan; // pure
+
+// crates/socket-patch-core/src/api/ranking.rs — OWNER B (addition)
+pub fn search_result_supersedes(candidate: &PatchSearchResult, recorded: &PatchSearchResult) -> bool;
 ```
 
 Rules both items follow:
-- Severity input is always the patch's real severity (`severity_order` /
-  `max_severity_order`), never `RankKey.severity`.
-- Skip-reason strings are the stable codes in 4.7 and 5.5.
+- Severity input is always `max_severity_order` over the by-package
+  record's `vulnerabilities`, never `RankKey.severity`, never the batch
+  list.
+- Skip-reason strings are the stable codes in 4.7 and 5.5; warnings go to
+  scan's top-level `warnings[]`.
 - JSON: A owns the top-level `policy` block; B owns the top-level
   `rollout` block. Neither edits the other's.
-- CLI args: A adds a `#[command(flatten)]` `SocketYmlArgs` (`--no-socket-yml`,
-  `--min-severity`) in `scan/socket_yml_args.rs`; B adds a flattened
-  `RolloutArgs` (`--max-new-patches`) in `scan/rollout_args.rs`. Both
-  derive `Default`; each adds its field to the ~18 `ScanArgs` struct
-  literals. The resulting adjacent-line conflicts are resolved by B on
-  rebase.
+- CLI args: A adds a `#[command(flatten)]` `SocketYmlArgs`
+  (`--no-socket-yml`, `--min-severity`) in `scan/socket_yml_args.rs`; B
+  adds a flattened `RolloutArgs` (`--max-new-patches`) in
+  `scan/rollout_args.rs`. Both derive `Default`; each adds its field to
+  the ~18 `ScanArgs` struct literals. B resolves the adjacent-line
+  conflicts on rebase.
+- `run_project_dirs` changes: A adds the per-directory `explicit` flag;
+  B adds the carried remaining budget. B resolves the overlap on rebase.
 
 ### 9.1 Work item A — socket.yml loading and filtering
 
 Scope:
 - `crates/socket-patch-core/src/policy/{mod.rs, socket_yml.rs, paths.rs}`;
-  `pub mod policy;` in `crates/socket-patch-core/src/lib.rs`.
+  `pub mod policy;` in `crates/socket-patch-core/src/lib.rs`; move
+  `package_spec_matches` to core (the cli re-uses it).
 - Dependencies, exact-pinned in `Cargo.toml`: a maintained YAML 1.2 serde
-  crate that reports duplicate keys (e.g. `serde_norway`; verify
-  duplicate-key rejection with a test, reject it otherwise), and `ignore`
-  (gitignore matcher). No other new deps.
-- Loader: lookup (4.5), size and symlink confinement, both-files rule,
-  strict validation with key paths and did-you-mean (4.4), `PolicyFs` for
-  disk and for the in-memory engine.
-- Filters, wired at the pipeline points in 9.0:
+  crate that reports duplicate keys and can refuse aliases and bound depth
+  (e.g. `serde_norway`; prove each property with a test, pick another
+  crate otherwise), and `ignore` (for `Gitignore::matched`; the top-down
+  walk is ours). No other new deps.
+- Loader: lookup (4.5, incl. ceiling dirs and ownership), regular-file,
+  size and symlink confinement on the opened handle, exact-name match,
+  encoding, both-files rule, strict validation with key paths and
+  did-you-mean (4.4), `PolicyFs` for disk and memory.
+- Path matcher (4.3): marker-file subject, npm-`ignore` top-down
+  semantics, defaults + lists in order, `includePaths`, pattern hygiene;
+  golden fixture generated from npm `ignore` (commit the generator script
+  under `scripts/` and the fixture under `crates/socket-patch-core/tests/`).
+- Filters at the pipeline points in 9.0:
   - disk: root filter in `project_dirs` / `run_project_dirs`
-    (`scan/mod.rs:1268-1320`) and the agent project; `admits_purl` next to
-    `--package` (`scan/mod.rs:1490-1511`); severity filter on batch
-    candidates after `scan/mod.rs:1801` and on by-package candidates before
-    `select_patches` in the human arm; retained set computed from the
-    recorded view and excluded from writers.
-  - memory: root filter in `hosted_memory/roots.rs` root detection;
-    `admits_purl` at `hosted_memory/mod.rs:428-432`; severity filter before
+    (`scan/mod.rs:1268-1320`, carrying `explicit`) and the agent project;
+    `admits_purl` next to `--package` (`scan/mod.rs:1490-1511`); severity
+    filter on by-package candidates before `select_patches`
+    (`discover_selected`, `scan/mod.rs:553`, and the human arm,
+    `mod.rs:2386-2402`); retained set computed from the recorded view and
+    excluded from writers.
+  - memory: built-in defaults in `selectHostedScanPaths`
+    (`hosted_memory/select.rs`); full root filter in the session before
+    `max_projects` (`hosted_memory/mod.rs:377`); `admits_purl` at
+    `hosted_memory/mod.rs:428-432`; severity filter before
     `select_top_ranked`.
 - Move `test tests fixtures __fixtures__ testdata` out of
   `EXCLUDED_ROOT_SEGMENTS` (`hosted_memory/roots.rs:56-67`) into the
   built-in default ignores, and apply them to disk PATH-glob expansion.
 - `enabled: false` report-only path; `get`'s `policy_bypassed` warning;
-  `--global` ignores the file.
+  `--global` ignores the file; PATHs outside the repo root → exit 2.
 - Flags: `--no-socket-yml`/`SOCKET_NO_SOCKET_YML`,
   `--min-severity`/`SOCKET_MIN_SEVERITY` (`SocketYmlArgs`).
-- napi + hosted-bundle: `selectHostedScanPaths` includes root
-  `socket.yml`/`socket.yaml`; options `noSocketYml`, `minSeverity`; result
-  `policy` and `policyError`; `npm/index.d.ts` types.
-- JSON `policy` block (4.7), human policy line, error envelopes for
-  `socket_yml_invalid` / `socket_yml_ambiguous`, warnings
-  `socket_yml_unsupported_version`, `patches_disabled`, `policy_bypassed`.
+- napi + hosted-bundle (7.2, A rows); `npm/index.d.ts` types.
+- JSON `policy` block (4.7), human policy line (naming suppressed
+  critical/high), error output with `errorCode`, warnings
+  `socket_yml_ignored_value`, `socket_yml_name_case`,
+  `socket_yml_repo_untrusted`, `patches_disabled`, `policy_bypassed`;
+  output string hygiene.
 
 Tests:
-- Unit (core, table-driven): every row of 4.4; gitignore cases (anchoring,
-  bare names, trailing `/`, `!` and the excluded-parent rule, case
-  insensitivity, the `/` root form, defaults + negation); package specs;
-  severity floor incl. unknown and `moderate`; both-files equal/different;
-  lookup with `.git` dir, `.git` file, no git.
-- Parser contract: `tests/cli_parse_scan.rs` rows for the two flags and
-  env vars.
+- Unit (core, table-driven): every row of 4.4 in order; the npm-`ignore`
+  golden fixture (anchoring, bare names, trailing `/`, `!`, excluded
+  parents, case); marker rule (all markers ignored / any included);
+  defaults + negation; explicit vs discovered; package specs incl.
+  invalid ones; severity floor incl. unknown and `moderate`; both-files
+  equal / different / one invalid; lookup with `.git` dir, `.git` file,
+  none, `GIT_CEILING_DIRECTORIES`, foreign-owned `.git`; symlink inside
+  and outside, directory, FIFO; alias bomb; oversize; BOM, CRLF, UTF-16.
+- Parser contract: `tests/cli_parse_scan.rs` rows for both flags and env
+  vars (empty = unset, malformed = exit 2).
 - E2E (wiremock, `tests/in_process_scan.rs` style): hosted, vendored,
-  agent and `--dry-run` with a socket.yml that filters by path, ecosystem,
-  package and severity; invalid file → exit 1, no bytes changed;
-  `--no-socket-yml` bypass; narrowing after a patch is applied leaves the
-  pinned package byte-identical in hosted, vendored and agent modes
-  (retained); `--prune` universe unchanged.
-- Parity: `tests/hosted_memory_parity.rs` gains a socket.yml fixture; disk
-  and memory filter the same roots and packages.
+  agent and `--dry-run` with a socket.yml filtering by path, ecosystem,
+  package and severity; invalid file → exit 1, `errorCode`, no bytes
+  changed; `--no-socket-yml`; narrowing after a patch is applied leaves the
+  pinned package byte-identical in all three modes (retained); a recorded
+  merged patch below a new floor is kept, not replaced; `--prune` universe
+  unchanged; PATH outside the repo → exit 2.
+- Parity: `tests/hosted_memory_parity.rs` gains a socket.yml fixture
+  (single-lockfile roots) where disk and memory filter the same roots and
+  packages; a memory test where the tree lists socket.yml but its content
+  is withheld → `policyError`.
 - This repo's own `socket.yml` keeps working (its `projectIgnorePaths`
   now also excludes the fixtures from patching).
 
 Docs (A): `CLI_CONTRACT.md` (new "socket.yml patch policy" section:
-grammar, precedence, lookup, validation, commands; flag + env rows; error
-codes; `policy` JSON block; the trust-boundary bullet gains the "narrow or
-pace" sentence), README (scan section: "Roll out gradually" with recipes
-R1-R4, R6), CHANGELOG `[Unreleased]` (Added: socket.yml patch policy;
-Changed (BREAKING): scan honors `projectIgnorePaths`, default test/fixture
-ignores on discovered roots, invalid socket.yml fails scan).
+grammar, precedence, paths, lookup, validation, commands; flag + env rows;
+error codes; `policy` JSON block; the trust-boundary bullet gains the
+"narrow or pace" sentence), README (scan section: "Roll out gradually"
+with recipes R1-R4, R6), CHANGELOG `[Unreleased]` (Added: socket.yml
+patch policy; Changed (BREAKING): scan honors `projectIgnorePaths`,
+default test/fixture ignores on discovered roots, invalid socket.yml with
+a `patches` block fails scan).
 
 ### 9.2 Work item B — limit, ordering, reporting
 
 Scope:
 - `crates/socket-patch-core/src/rollout.rs`; `pub mod rollout;` in
-  `crates/socket-patch-core/src/lib.rs`.
+  `crates/socket-patch-core/src/lib.rs`; `search_result_supersedes` in
+  `ranking.rs`, and `detect_updates` / `updates[]` switched to by-package
+  supersession.
 - Make `discover_selected` (`scan/mod.rs:553`) the single disk selection
   point: route the human agent/vendored arm (`mod.rs:2386-2402`) through
-  it, and have it return `{selected, deferred}` so hosted
+  it, and have it return `{admitted, deferred}` so hosted
   (`run_redirect_selected`, `hosted.rs:1196`), vendored and agent writers
-  receive only admitted rows.
-- Classification from `merge_ledger_records_for_updates` /
-  `detect_updates` per project root; eligibility (tier, agent partition,
-  vendored preflight, hosted reference grants — grants fetched for NEW
-  candidates in rank order, identical result either way); `plan_rollout`
-  with one run-wide budget across `run_project_dirs`.
-- In-memory engine: hosted-pin discovery over in-memory lockfiles;
-  collect → plan → apply restructure around `hosted_memory/mod.rs:537`;
-  options `maxNewPatches`, `maxNewPatchesCap`, `inFlightPatches`; result
-  `rollout`, `ProjectResult.deferred[]`, `rollout_deferred` skips;
-  `npm/index.d.ts`; hosted-bundle fields.
+  receive only the rows 9.0 step 8 allows (ALREADY with the recorded
+  uuid).
+- Classification from the merged recorded view (5.1); the planning pass
+  for eligibility (hosted: grants, purl/url, vlt preflight, symlink
+  refusals, rewriter planning; vendored: preflight; agent: partition);
+  fetch-all references; `rollout_reference_failed` and
+  `rollout_incomplete_lookup`; `plan_rollout`; the remaining budget
+  carried through `run_project_dirs` in sorted directory order.
+- In-memory engine (7.2, B rows): pin discovery and state-file reads,
+  collect → plan → apply, options and result fields, `npm/index.d.ts`,
+  hosted-bundle fields.
 - Flag: `--max-new-patches <N|none>`/`SOCKET_MAX_NEW_PATCHES`
-  (`RolloutArgs`); `resolve_max_new` precedence including the file value
-  from A (9.3).
+  (`RolloutArgs`); `resolve_max_new` including the file value from A
+  (9.3).
 - JSON `rollout` block (5.5), `redirect.skipped[]` mirror, human
   "Rollout:" line and the Next-steps deferred line (hosted
   `format_next_steps`, `hosted.rs:3457`, and the agent/vendored
   summaries).
 
 Tests:
-- Unit (core): `rollout_cmp` total order (property: sorting any
-  permutation gives the same result); `plan_rollout` caps only NEW,
-  counts base purls run-wide, one package across roots costs 1, 0 = no
-  NEW, `none` = unlimited, ineligible rows hold no slot, in-flight first;
-  `resolve_max_new` precedence table incl. cap; `canonical_base_purl`
-  twins.
+- Unit (core): `rollout_cmp` total order (property test: every
+  permutation sorts the same); `plan_rollout` caps only eligible NEW,
+  counts base purls, one package across roots costs 1, 0 = no NEW, `none`
+  = unlimited, ineligible rows hold no slot, `incomplete` admits nothing
+  NEW, in-flight first, remaining budget; `resolve_max_new` precedence
+  table incl. cap on `none`; `canonical_base_purl` twins;
+  `search_result_supersedes` rungs.
 - E2E (wiremock): hosted, vendored, agent, `--dry-run`: 9 candidates with
-  `--max-new-patches 3` apply the 3 most severe; rerun on the result
-  applies the next 3; a third run the last 3; a fourth run changes nothing
-  (convergence); upgrades land regardless of the cap; a withdrawn
-  top-ranked patch does not consume budget; JSON `rollout` and
-  `redirect.skipped[]` contents; exit 0.
-- Parity: `hosted_memory_parity.rs` cap fixture — disk and memory admit
-  and defer the same rows; memory rerun with pins in the lockfiles lands
-  the next N (needs pin discovery).
+  `--max-new-patches 3` apply the 3 most severe; a rerun on the result
+  applies the next 3; a third run the last 3; a fourth changes nothing;
+  dry-run output equals the wet run's decisions; upgrades land regardless
+  of the cap; a withdrawn, a `bad_purl` and a vlt-withheld top-ranked
+  patch hold no slot; a failed detail lookup with a cap admits nothing
+  NEW; two PATH directories share one budget in sorted order; JSON
+  `rollout` and `redirect.skipped[]`; exit 0.
+- Parity: `hosted_memory_parity.rs` cap fixture: disk and memory admit and
+  defer the same rows; a memory rerun with pins (and with a committed
+  manifest / vendor state) lands the next N.
 - Parser contract rows for the flag and env var.
 
-Docs (B): `CLI_CONTRACT.md` (limit semantics: classification, unit,
-order, eligibility, convergence, starvation and non-committing-CI notes;
-flag + env rows; `rollout` block; `rollout_deferred`; `jq` recipe; the
-"Which patch gets selected" section notes the separate cross-package
-order), README (recipe R5, `--max-new-patches`), CHANGELOG `[Unreleased]`
-Added.
+Docs (B): `CLI_CONTRACT.md` (limit semantics: classification,
+eligibility, unit, budget scope, order, convergence, version-bump and
+twin notes, starvation and non-committing CI; flag + env rows; `rollout`
+block; `rollout_deferred`; warnings; `jq` recipe; "Which patch gets
+selected" gains the cross-package order and the by-package supersession
+change), README (recipe R5, `--max-new-patches`), CHANGELOG
+`[Unreleased]` Added (and Changed: `updates[]` uses by-package data).
 
 ### 9.3 Integration (B, after rebasing on A)
 
 - Pass `policy.max_new_patches()` as the `file` layer of `resolve_max_new`.
-- Resolve the `ScanArgs` struct-literal conflicts (both flattened fields
-  present).
+- Resolve the `ScanArgs` struct-literal and `run_project_dirs` conflicts.
 - Combined e2e: a socket.yml with `includePaths`, `minSeverity: high` and
   `maxNewPatches: 2` over a two-root fixture, disk and memory, three runs to
   convergence; `--no-socket-yml` drops the file's cap but keeps a flag cap.
 - If B is ready before A merges, B ships with the file layer passed as
-  `None` and a follow-up commit on its branch wires it once A lands.
+  `None` and wires it in a follow-up commit on its branch once A lands.
 
 ## 10. Open questions (decided by default, revisit with evidence)
 
@@ -808,3 +994,5 @@ Added.
   exposes them; they would slot between severity and advisory count.
 - A generated JSON Schema for the `patches` block, shared with depscan and
   the docs, to keep validators from drifting.
+- Recognizing a dependency version bump of an already-patched package as
+  exempt from the cap (needs state hosted mode does not keep).
