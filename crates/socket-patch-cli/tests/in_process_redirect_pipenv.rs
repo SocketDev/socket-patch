@@ -436,7 +436,11 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
     // installs from requirements.txt.
     let stale = LOCK.replace("\"urllib3\"", "\"six\"").replace("==1.26.18", "==1.16.0");
     std::fs::write(tmp.path().join("Pipfile.lock"), &stale).unwrap();
-    std::fs::write(tmp.path().join("requirements.txt"), "urllib3==1.26.18\n").unwrap();
+    // An unpatched, unhashed sibling makes the file's hash mode derivable,
+    // so rollback can restore the hosted line (a file whose every line is a
+    // hosted pin is refused with the `git checkout` remedy instead).
+    const REQS: &str = "urllib3==1.26.18\nrequests==2.31.0\n";
+    std::fs::write(tmp.path().join("requirements.txt"), REQS).unwrap();
 
     let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0);
@@ -454,13 +458,13 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
     // The requirements wiring attests manifest-less; the stale lock beside
     // it neither vetoes nor contributes.
     manifestless_vex(tmp.path(), "requirements past a stale lock", &|p: &Path| {
-        std::fs::write(p.join("requirements.txt"), "urllib3==1.26.18\n").unwrap();
+        std::fs::write(p.join("requirements.txt"), REQS).unwrap();
     });
 
     roll_back(tmp.path(), &server).await;
     assert_eq!(
         read(&tmp.path().join("requirements.txt")),
-        "urllib3==1.26.18\n"
+        REQS
     );
     assert_eq!(read(&tmp.path().join("Pipfile.lock")), stale);
 }
