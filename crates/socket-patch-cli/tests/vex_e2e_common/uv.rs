@@ -450,7 +450,12 @@ impl Report<'_> {
 
 // ── filesystem ─────────────────────────────────────────────────────────
 
+/// Copy `src` recursively to `dst`; a missing `src` copies nothing (a
+/// hosted flow commits no `.socket/` in v5).
 pub fn copy_tree(src: &Path, dst: &Path) {
+    if !src.is_dir() {
+        return;
+    }
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap().flatten() {
         let to = dst.join(entry.file_name());
@@ -1552,7 +1557,21 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         &|step, result| report.row(step, result),
     );
 
-    // ── 6. the real revert restores every wiring file ─────────────────
+    // ── 6. the real revert ────────────────────────────────────────────
+    // Vendored: `vendor --revert` restores every wiring file byte for
+    // byte. Hosted (v5): `rollback` rewrites each pin back to the DEFAULT
+    // upstream registry entry, re-resolved from the registry — or, where
+    // the lock gives it nothing to re-derive the entry's shape from,
+    // refuses that pin (exit 1) and leaves the files alone for a
+    // version-control restore.
+    let wired_files = snapshot(
+        &proj,
+        &built
+            .registry
+            .iter()
+            .map(|(f, _)| f.as_str())
+            .collect::<Vec<_>>(),
+    );
     let out = match mode {
         Mode::Hosted => {
             let uri = patch_server.clone().unwrap();
@@ -1570,6 +1589,10 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                     "fake-token",
                     "--org",
                     ORG,
+                    // v5: the hosted pins ARE the state; one on the mock
+                    // origin counts only when that origin is configured.
+                    "--patch-server-url",
+                    &uri,
                 ],
             )
         }
@@ -1584,6 +1607,58 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
             ],
         ),
     };
+    if mode == Mode::Hosted {
+        let env: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
+        let still_wired = |f: &str| {
+            String::from_utf8_lossy(&std::fs::read(proj.join(f)).unwrap()).contains(uuid)
+        };
+        match out.status.code() {
+            Some(0) => {
+                assert_eq!(
+                    env["hosted"]["reverted"],
+                    json!([built.purl]),
+                    "{}:\n{}",
+                    report.what("revert"),
+                    dump(&out)
+                );
+                for (f, _) in &built.registry {
+                    assert!(
+                        !still_wired(f),
+                        "{}: {f} still names the hosted patch",
+                        report.what("revert")
+                    );
+                }
+                report.row("revert", "restored to the upstream registry entry");
+            }
+            _ => {
+                let error = env["hosted"]["failed"][0]["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    error.starts_with(&format!(
+                        "cannot restore {} to its upstream registry entry:",
+                        built.purl
+                    )) && error.contains("restore it from version control instead"),
+                    "{}:\n{}",
+                    report.what("revert"),
+                    dump(&out)
+                );
+                assert_eq!(
+                    snapshot(
+                        &proj,
+                        &wired_files.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>()
+                    ),
+                    wired_files,
+                    "{}: a refused pin writes nothing",
+                    report.what("revert")
+                );
+                report.row("revert", &format!("refused ({error})"));
+            }
+        }
+        return;
+    }
     assert_eq!(
         out.status.code(),
         Some(0),
