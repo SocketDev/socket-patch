@@ -195,6 +195,39 @@ impl<'a> Resolution<'a> {
     }
 }
 
+impl Resolution<'_> {
+    /// The default-registry spelling of this resolution: `integrity` only
+    /// (pnpm omits `tarball` for a package the configured registry serves),
+    /// every other field kept in place — the inverse of
+    /// [`Resolution::rewrite`] for the v5 upstream restore.
+    pub fn restore(&self, integrity: &str) -> String {
+        let scalar = if integrity
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ',' | '[' | ']' | '{' | '}' | '\'' | '"'))
+        {
+            serde_json::to_string(integrity).expect("string serializes")
+        } else {
+            integrity.to_string()
+        };
+        let mut fields = vec![format!("integrity: {scalar}")];
+        fields.extend(
+            self.fields
+                .iter()
+                .filter(|(k, _)| !matches!(*k, "integrity" | "tarball"))
+                .map(|(k, v)| format!("{k}: {v}")),
+        );
+        if self.block {
+            format!(
+                "{}      {}",
+                self.newline,
+                fields.join(&format!("{}      ", self.newline))
+            )
+        } else {
+            format!("{{{}}}", fields.join(", "))
+        }
+    }
+}
+
 /// The key line every `packages:` entry's resolution map starts at.
 const RESOLUTION_KEY: &str = "    resolution:";
 

@@ -14,9 +14,10 @@
 //!   lock over an importer copy; then vlt's installed state is staged (the
 //!   importer copy and `node_modules/.vlt/<DepID>/node_modules/left-pad`)
 //!   and, with the manifest deleted:
-//!   - the redirect ledger's embedded record attests offline;
-//!   - with the ledgers deleted too, installed + patched attests
-//!     `(redirected)` from the patch API's record;
+//!   - the scan wrote no ledger (v5), so offline there is no local record
+//!     (`record_unavailable`, zero requests);
+//!   - installed + patched attests `(redirected)` from the patch API's
+//!     record;
 //!   - a tampered or pristine store copy is omitted (`hash_mismatch` /
 //!     `not_applied`) even though the importer copy is patched;
 //!   - not installed attests from the lock's sha512 pin, except in the
@@ -120,7 +121,7 @@ fn hosted_project(tmp: &Path, era: Era, tag: &str) -> HostedProject {
         "[{tag}] the lock must pin the hosted tarball:\n{lock}"
     );
     assert!(!root.join(".socket/manifest.json").exists());
-    assert!(hosted::ledger_path(&root).is_file(), "[{tag}]");
+    vlt_vex::assert_no_hosted_ledger(&root, &format!("[{tag}]"));
     HostedProject {
         root,
         origin: server.uri(),
@@ -153,10 +154,9 @@ fn hosted_every_vlt_era_manifestless_evidence_cells() {
                 ..VexRun::offline()
             },
         );
-        assert_eq!(out.code, Some(0), "[{tag}] ledger, offline: {out}");
-        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+        assert_eq!(out.code, Some(1), "[{tag}] no local record, offline: {out}");
+        assert_not_attested(&out.envelope, PURL, "record_unavailable");
         silent.assert_no_requests();
-        strip_ledgers(root);
 
         let api = api_with(UUID, PURL);
         let out = run_vex(&bin, root, &online(&api));

@@ -916,6 +916,21 @@ pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<Strin
 /// work per anchor, so a tampered multi-megabyte lock costs one linear pass
 /// per anchor kind.
 fn socket_identities(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
+    socket_identities_inner(text, origins)
+}
+
+/// The hosted patch uuids `text` mentions, under the same recognition
+/// rules as discovery's sweep (the upstream restore's "does anything in
+/// this file still need the hosted-side setting" probe).
+pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<String> {
+    socket_identities(text, origins)
+        .into_iter()
+        .filter(|(_, mode)| *mode == WiringMode::Hosted)
+        .map(|(uuid, _)| uuid)
+        .collect()
+}
+
+fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
     let mut found = BTreeSet::new();
     let norm = decode_escapes(text)
         .replace("\\/", "/")

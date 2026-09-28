@@ -1,18 +1,11 @@
-//! The hosted-mode ledger (`.socket/vendor/redirect-state.json`), written by
-//! hosted-mode `scan` (the default mode; also `--mode hosted` / the legacy
-//! `--redirect`).
+//! The retired pre-v5 hosted-mode ledger (`.socket/vendor/redirect-state.json`).
 //!
-//! Mirrors the vendor `state.json` shape but records a REMOTE per-dependency
-//! redirect (no local artifact bytes). It carries the recorded [`FileEdit`]s
-//! (which `rollback` and the hosted→vendored takeover replay in reverse to
-//! restore the pre-redirect files) plus, per redirected PURL, the manifest
-//! [`PatchRecord`] (file hashes + vulnerability metadata) so a post-install
-//! `socket-patch vex` can attest the redirected patches against the installed
-//! tree exactly as it does for `apply` / `vendor`. VEX folds `records`
-//! into its record view (keyed by PURL, the same key the manifest uses) —
-//! but only while the lockfile still wires each record's patch (the
-//! CLI's `commands::vex_sources` liveness gate): a stale ledger alone never
-//! attests.
+//! socket-patch v5 derives hosted state from the lockfiles (see
+//! `upstream::HostedPin` / `vex::discover`) and never writes this file. It
+//! is read only for migration: `list` and `vex` may borrow a record's patch
+//! details (vulnerabilities, file hashes) for a pin that is still wired in a
+//! lockfile, and `rollback` / `remove` delete it once no hosted pin remains.
+//! Its recorded edits are never replayed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,11 +13,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::FileEdit;
-use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::read_regular_to_bytes;
-use crate::utils::purl::{canonical_purl, purl_name_version};
-use crate::utils::socket_dir::{remove_file_and_prune, write_json_ledger};
+
+use crate::utils::socket_dir::write_json_ledger;
 
 /// Repo-relative path of the redirect ledger.
 pub const REDIRECT_STATE_REL: &str = ".socket/vendor/redirect-state.json";
@@ -65,71 +57,6 @@ impl RedirectState {
         }
     }
 
-    /// The stored record keys whose canonical purl (qualifiers stripped,
-    /// percent-decoded — [`canonical_purl`]) matches `purl`, in ledger
-    /// order. Normally zero or one; a hand-edited ledger may carry the same
-    /// package under two spellings, and every caller must drop them all.
-    pub(crate) fn record_keys_for(&self, purl: &str) -> Vec<String> {
-        let target = canonical_purl(purl);
-        self.records
-            .keys()
-            .filter(|k| canonical_purl(k) == target)
-            .cloned()
-            .collect()
-    }
-
-    /// The first `redirect_*` edit this release cannot classify (a newer
-    /// socket-patch's writer) whose `key`, `original` or `new` names
-    /// `<name>@<version>` at a package-name boundary. Anything that claims
-    /// that package's ledger data must refuse while one exists: dropping the
-    /// record or its known edits would strand the unknown one.
-    pub(crate) fn unclassified_edit_naming(&self, name: &str, version: &str) -> Option<&FileEdit> {
-        let needle = format!("{name}@{version}");
-        let scoped = name.starts_with('@');
-        let names = |v: &Option<serde_json::Value>| match v {
-            Some(serde_json::Value::String(s)) => names_at_boundary(s, &needle, scoped),
-            Some(other) => names_at_boundary(&other.to_string(), &needle, scoped),
-            None => false,
-        };
-        self.edits.iter().find(|e| {
-            is_unclassified_redirect_edit(e)
-                && (e
-                    .key
-                    .as_deref()
-                    .is_some_and(|k| names_at_boundary(k, &needle, scoped))
-                    || names(&e.original)
-                    || names(&e.new))
-        })
-    }
-}
-
-fn is_unclassified_redirect_edit(edit: &FileEdit) -> bool {
-    edit.kind.starts_with("redirect_")
-        && super::replay::is_unclassified_kind(&edit.kind, &edit.action)
-}
-
-fn is_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
-}
-
-/// Does `text` contain `needle` starting at a package-name boundary? A
-/// match glued to a longer name (`left-pad@…` for `pad@…`) or to a scope
-/// (`@scope/a@…` for an unscoped `a@…`) names a different package.
-fn names_at_boundary(text: &str, needle: &str, scoped: bool) -> bool {
-    text.match_indices(needle).any(|(at, _)| {
-        let before = &text[..at];
-        match before.chars().next_back() {
-            None => true,
-            Some('/') => {
-                scoped
-                    || !before[..before.len() - 1]
-                        .rsplit(|c: char| !(is_name_char(c) || c == '@'))
-                        .next()
-                        .is_some_and(|segment| segment.starts_with('@'))
-            }
-            Some(c) => !is_name_char(c),
-        }
-    })
 }
 
 impl Default for RedirectState {
@@ -138,55 +65,22 @@ impl Default for RedirectState {
     }
 }
 
-/// A redirect ledger that exists on disk but cannot be loaded (torn write,
-/// truncation, hand-editing gone wrong, or an unreadable file). The ledger is
-/// the ONLY store of the pre-redirect lockfile originals a future revert
-/// needs, so a loader that shrugged this off as "no ledger" would let the
-/// next hosted run start fresh and silently overwrite that revert data.
-/// Instead every load distinguishes absent (fine, fresh start) from malformed
-/// (this error), and the hosted writer refuses to proceed.
+/// A pre-v5 redirect ledger that exists on disk but cannot be loaded (torn
+/// write, truncation, hand-editing gone wrong, or an unreadable file). Every
+/// load distinguishes absent from malformed so read-only consumers can
+/// surface it (as the `redirect_ledger_corrupt` warning) instead of silently
+/// treating it as "no ledger".
 #[derive(Debug)]
 pub struct CorruptRedirectState {
     /// Absolute path of the malformed ledger.
     pub path: PathBuf,
     /// What went wrong reading/parsing it.
     pub detail: String,
-    /// Where [`CorruptRedirectState::quarantine`] moved the file, when it did.
-    pub quarantined_to: Option<PathBuf>,
     /// True when the ledger could not be READ (an I/O error, or a directory /
     /// FIFO squatting the path) rather than parsed. The bytes on disk may be
-    /// perfectly valid revert data — or not a file at all — so
-    /// [`CorruptRedirectState::quarantine`] leaves them where they are and the
-    /// message asks for the I/O problem to be fixed, not for JSON repair.
+    /// perfectly valid pre-v5 data — or not a file at all — so the message
+    /// asks for the I/O problem to be fixed, not for JSON repair.
     pub unreadable: bool,
-}
-
-impl CorruptRedirectState {
-    /// Move the malformed ledger aside to `redirect-state.json.corrupt` so no
-    /// later run can overwrite the revert data it may still hold. Never
-    /// clobbers an existing `.corrupt` file (an earlier quarantine may hold
-    /// older revert data); on any failure the original file simply stays put
-    /// — the caller's hard error already prevents overwriting it. An
-    /// UNREADABLE ledger is never moved: it is not known to be malformed.
-    ///
-    /// The quarantine file is the one sanctioned `.socket/vendor/` residue:
-    /// the empty-directory prunes are non-recursive and leave both it and the
-    /// directory in place until the user resolves it.
-    pub async fn quarantine(&mut self) {
-        if self.unreadable {
-            return;
-        }
-        let target = match self.path.parent() {
-            Some(parent) => parent.join("redirect-state.json.corrupt"),
-            None => return,
-        };
-        if !matches!(tokio::fs::try_exists(&target).await, Ok(false)) {
-            return;
-        }
-        if tokio::fs::rename(&self.path, &target).await.is_ok() {
-            self.quarantined_to = Some(target);
-        }
-    }
 }
 
 impl std::fmt::Display for CorruptRedirectState {
@@ -194,9 +88,8 @@ impl std::fmt::Display for CorruptRedirectState {
         if self.unreadable {
             return write!(
                 f,
-                "the redirect ledger {} cannot be read ({}); it may hold the \
-                 pre-redirect lockfile values a future revert needs, so it was \
-                 left in place and will not be overwritten. Fix the file's \
+                "the pre-v5 redirect ledger {} cannot be read ({}); it was left \
+                 in place. Fix the file's \
                  permissions (or move a stray directory or special file at that \
                  path aside), then re-run.",
                 self.path.display(),
@@ -205,39 +98,21 @@ impl std::fmt::Display for CorruptRedirectState {
         }
         write!(
             f,
-            "the redirect ledger {} is malformed ({}); it records the \
-             pre-redirect lockfile values a future revert needs, so it will \
-             not be overwritten. ",
+            "the pre-v5 redirect ledger {} is malformed ({}); socket-patch v5 \
+             only reads it for migration and never overwrites it. Repair its \
+             JSON or restore it from version control, or delete it if you no \
+             longer need its patch details.",
             self.path.display(),
             self.detail
-        )?;
-        match &self.quarantined_to {
-            Some(target) => write!(
-                f,
-                "The unreadable file was moved aside to {}; to recover, repair \
-                 its JSON and rename it back to redirect-state.json, or restore \
-                 the ledger and the rewritten files from version control. If \
-                 the revert data is expendable, delete the moved-aside file and \
-                 re-run.",
-                target.display()
-            ),
-            None => write!(
-                f,
-                "To recover, repair its JSON, restore it from version control, \
-                 or move it aside if the revert data is expendable, then re-run."
-            ),
-        }
+        )
     }
 }
 
 impl std::error::Error for CorruptRedirectState {}
 
 /// Load the redirect ledger. Missing → `Ok(None)` (a fresh start is fine).
-/// Present but unreadable/malformed → [`CorruptRedirectState`], so no caller
-/// can mistake a torn ledger for "no ledger" and overwrite the revert data it
-/// still holds (see the type's docs). Read-only consumers may degrade a
-/// malformed ledger to "nothing to consult", but must surface it; the hosted
-/// writer must abort.
+/// Present but unreadable/malformed → [`CorruptRedirectState`]. Consumers
+/// degrade a malformed ledger to "nothing to consult", but must surface it.
 ///
 /// The bytes come from the (untrusted) project tree through the FIFO-safe
 /// [`read_regular_to_bytes`] — non-blocking on Unix, rejecting FIFOs /
@@ -255,7 +130,6 @@ pub async fn load_redirect_state(
             return Err(CorruptRedirectState {
                 path,
                 detail: e.to_string(),
-                quarantined_to: None,
                 unreadable: true,
             });
         }
@@ -265,176 +139,20 @@ pub async fn load_redirect_state(
         Err(e) => Err(CorruptRedirectState {
             path,
             detail: format!("invalid JSON: {e}"),
-            quarantined_to: None,
             unreadable: false,
         }),
     }
 }
 
-/// Persist the redirect ledger atomically (stage + fsync + rename, the same
-/// hardened writer the sibling vendor ledger uses). A bare `fs::write`
-/// truncates the target first, so a crash or `ENOSPC` mid-write would tear
-/// the only store of the pre-redirect originals a future revert needs. A
-/// byte-identical ledger already on disk (an idempotent hosted re-run) is
-/// left untouched. Always a write, never a delete — see
-/// [`persist_redirect_state`] for the emptied-ledger rule.
+/// Write a redirect ledger atomically. socket-patch v5 never writes this
+/// file: this exists only so tests (and migration tooling) can lay down a
+/// pre-v5 ledger fixture in the exact on-disk shape older releases wrote.
+#[doc(hidden)]
 pub async fn save_redirect_state(
     project_root: &Path,
     state: &RedirectState,
 ) -> std::io::Result<()> {
     write_json_ledger(&project_root.join(REDIRECT_STATE_REL), state).await
-}
-
-/// Drop one PURL's superseded takeover leftovers from the ledger: its
-/// `records` entry (canonical-purl match, qualifiers stripped and
-/// percent-decoded) and every recorded edit keyed to that package. This is
-/// the npm-family half of the hosted→vendored takeover reconciliation: the
-/// vendored flows call it ONLY after the LIVE lockfile provably wires the
-/// package to the committed `.socket/vendor/` artifact and no longer
-/// resolves the hosted URL — at that point the vendor ledger's wiring
-/// `original` embeds the hosted-spliced lock fragment, so `vendor --revert`
-/// stays lossless without these ledger edits, and keeping them would feed
-/// VEX/updates stale records and re-fire the takeover warning on every
-/// later run. CARGO purls are refused (returns `false`, drops nothing): a
-/// cargo takeover must revert the hosted edits ON DISK first — that path is
-/// [`revert_cargo_redirect_purl`](super::revert_cargo_redirect_purl), which
-/// does its own ledger drop.
-///
-/// The edit matcher is ARTIFACT-ANCHORED, never name-anchored. An edit is
-/// claimed when either:
-///
-/// * its `new` content references THIS purl's hosted artifact — every hosted
-///   artifact URL embeds the patch uuid (on ANY patch-server host; the same
-///   invariant the takeover classifier's `redirect_record_live` proof rests
-///   on), and a uuid is hex-and-dashes so it spells identically raw,
-///   `\/`-escaped (old composer) and percent-encoded (yarn-berry
-///   `::__archiveUrl=`). The uuid(s) come from this purl's own `records`
-///   entry, captured before it is removed. This is what claims the
-///   version-blind key shapes: npm `node_modules/…` path keys, legacy
-///   `dependencies` bare-name keys, bun `<prefix>/<name>` keys.
-/// * (secondary guard, for when the record — and with it the artifact URL —
-///   is unavailable) its key is a VERSION-EXACT instance key:
-///   `"name@version"`, pnpm v6 peer-suffixed `"name@version(peer…)"`, or the
-///   pnpm-v5 respelling `"name@version_peer…"`.
-///
-/// Never claim by NAME alone (`key == name`, key ends with `"/name"`): with
-/// two versions of one package hosted, vendoring one would delete BOTH
-/// versions' path-keyed edits, destroying the other version's revert
-/// originals. Version-blind keys with no artifact anchor are KEPT (fail-closed — they may be the other version's
-/// only revert data). Consequence for the CLI's takeover-overlap fallback
-/// matcher (which still matches edit keys by bare name, but ONLY when
-/// `records` is empty — the degraded record-fetch-failed ledger): a normal
-/// record-carrying ledger reconciles fully here (the record removal alone
-/// ends the overlap), while a degraded ledger's unattributable path-keyed
-/// edits stay and its takeover warning keeps advising the manual per-package
-/// cleanup — the correct outcome when the ledger lacks the records needed to
-/// attribute edits to a version safely.
-///
-/// Edits that are not package-keyed (e.g. the pnpm workspace-trust edit,
-/// keyed `"trustLockfile"`) stay: they belong to the hosted flow's own
-/// config surface and other still-redirected package(s) may ride on them.
-///
-/// A `redirect_*` edit kind this release cannot classify that names the
-/// purl or would be claimed by the rules above drops nothing and returns
-/// `false`: its lockfile may still resolve the hosted artifact.
-///
-/// Returns whether anything was removed. The caller persists the mutated
-/// ledger via [`persist_redirect_state`] (atomic; an emptied ledger is
-/// deleted).
-pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
-    let target = canonical_purl(purl);
-    if target.starts_with("pkg:cargo/") {
-        return false;
-    }
-    let Some((name, version)) = purl_name_version(&target) else {
-        return false;
-    };
-    let (name, version) = (name.to_string(), version.to_string());
-
-    if state.unclassified_edit_naming(&name, &version).is_some() {
-        return false;
-    }
-
-    let record_keys = state.record_keys_for(purl);
-    // THIS purl's patch uuid(s), captured before the records are removed —
-    // the artifact anchor (see the doc comment). Distinct purls (including
-    // two versions of one package) carry distinct patch uuids, so a uuid
-    // match is version-exact by construction.
-    let uuids: Vec<String> = record_keys
-        .iter()
-        .filter_map(|k| state.records.get(k))
-        .map(|r| r.uuid.clone())
-        // An empty uuid (hand-repaired or degraded ledger) is no anchor at
-        // all: `contains("")` matches EVERY edit, claiming other packages'
-        // revert data. Fail closed to the version-exact-only path instead.
-        .filter(|u| !u.is_empty())
-        .collect();
-
-    let name_at_version = format!("{name}@{version}");
-    let claims = |e: &FileEdit| {
-        let Some(key) = e.key.as_deref() else {
-            // No key ⇒ not attributable to any package; keep.
-            return false;
-        };
-        // Version-exact instance keys: `name@version`, pnpm v6 peer-suffixed
-        // `name@version(peer…)`, pnpm v5 respelled `name@version_peer…`, vlt
-        // peer/modifier variants `name@version~extra`.
-        let version_exact = key == name_at_version
-            || key
-                .strip_prefix(name_at_version.as_str())
-                .is_some_and(|rest| rest.starts_with(['(', '_', '~']));
-        // Artifact anchor: the edit's rewritten (`new`) content references
-        // this purl's hosted artifact (its patch uuid — spelling-invariant
-        // across raw / `\/`-escaped / percent-encoded URL forms).
-        let anchored = !uuids.is_empty()
-            && e.new.as_ref().is_some_and(|new| {
-                // A text-fragment payload is probed in place; only an object
-                // payload (a whole JSON lock entry) needs re-serializing.
-                let text: std::borrow::Cow<'_, str> = match new {
-                    serde_json::Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                    other => std::borrow::Cow::Owned(other.to_string()),
-                };
-                uuids.iter().any(|uuid| text.contains(uuid.as_str()))
-            });
-        version_exact || anchored
-    };
-    if state
-        .edits
-        .iter()
-        .any(|e| is_unclassified_redirect_edit(e) && claims(e))
-    {
-        return false;
-    }
-
-    for key in &record_keys {
-        state.records.remove(key);
-    }
-    let edits_before = state.edits.len();
-    state.edits.retain(|e| !claims(e));
-
-    !record_keys.is_empty() || state.edits.len() != edits_before
-}
-
-/// Persist the redirect ledger via [`save_redirect_state`]'s atomic writer.
-/// An EMPTY ledger (no edits, no records) is DELETED instead: a residual
-/// empty file would keep takeover-overlap detection and VEX reading a ledger
-/// that asserts nothing. The delete then prunes a now-empty `.socket/vendor/`
-/// (best-effort, non-recursive — the vendor ledger, artifacts or a `.corrupt`
-/// quarantine keep it), so a fully unwound hosted project leaves no residue
-/// below `.socket/` itself, which the lock guard owns. A failed unlink
-/// propagates before any prune.
-pub async fn persist_redirect_state(
-    project_root: &Path,
-    state: &RedirectState,
-) -> std::io::Result<()> {
-    if state.edits.is_empty() && state.records.is_empty() {
-        return remove_file_and_prune(
-            &project_root.join(REDIRECT_STATE_REL),
-            &project_root.join(SOCKET_DIR),
-        )
-        .await;
-    }
-    save_redirect_state(project_root, state).await
 }
 
 #[cfg(test)]
@@ -443,8 +161,7 @@ mod tests {
     use crate::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
     use std::collections::HashMap;
 
-    /// The sample record's patch uuid — hosted artifact URLs embed it (the
-    /// artifact anchor `drop_superseded_purl` claims edits by).
+    /// The sample record's patch uuid.
     const SAMPLE_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
     fn sample_record() -> PatchRecord {
@@ -479,12 +196,6 @@ mod tests {
             license: "MIT".to_string(),
             tier: "free".to_string(),
         }
-    }
-
-    /// The hosted artifact URL shape the patch server serves: the patch uuid
-    /// is a path segment, exactly the anchor `drop_superseded_purl` matches.
-    fn hosted_url(name: &str, version: &str, uuid: &str) -> String {
-        format!("https://patch.test/patch/npm/{name}/{version}/{uuid}/{name}-{version}.tgz")
     }
 
     #[test]
@@ -584,540 +295,6 @@ mod tests {
         assert_eq!(loaded.edits[1].kind, "redirect_kind_from_the_future");
     }
 
-    fn edit(path: &str, kind: &str, key: Option<&str>) -> FileEdit {
-        FileEdit {
-            path: path.to_string(),
-            kind: kind.to_string(),
-            action: "rewritten".to_string(),
-            key: key.map(str::to_string),
-            original: Some(serde_json::json!("orig")),
-            new: Some(serde_json::json!("new")),
-        }
-    }
-
-    /// An edit whose rewritten content points at a hosted artifact URL — the
-    /// shape the npm rewriter records (`new` = the spliced resolved/integrity
-    /// pair), carrying the artifact anchor.
-    fn edit_resolved(path: &str, kind: &str, key: &str, url: &str) -> FileEdit {
-        FileEdit {
-            path: path.to_string(),
-            kind: kind.to_string(),
-            action: "rewritten".to_string(),
-            key: Some(key.to_string()),
-            original: Some(serde_json::json!({
-                "resolved": "https://registry.npmjs.org/upstream.tgz",
-                "integrity": "sha512-UPSTREAM=="
-            })),
-            new: Some(serde_json::json!({ "resolved": url, "integrity": "sha512-P==" })),
-        }
-    }
-
-    /// The takeover reconciliation drops exactly the superseded package's
-    /// halves — its `records` entry and every edit keyed to it (pnpm
-    /// `name@version`, pnpm v6 peer-suffixed and v5 `_`-suffixed instances,
-    /// npm `node_modules/…` paths whose rewritten content carries this purl's
-    /// hosted artifact) — while other packages' data and non-package-keyed
-    /// edits (the pnpm workspace-trust edit) survive verbatim.
-    #[test]
-    fn drop_superseded_purl_removes_both_halves_and_only_them() {
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-        state
-            .records
-            .insert("pkg:npm/minimist@1.2.2".to_string(), sample_record());
-        state.edits = vec![
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0"),
-            ),
-            // pnpm v6 peer-suffixed instance key for the SAME package.
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0(react@18.2.0)"),
-            ),
-            // pnpm v5 `_`-suffixed instance key (the rewriter's own respelled
-            // `/left-pad/1.3.0_react@18.2.0` key) for the same package.
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0_react@18.2.0"),
-            ),
-            // npm nested node_modules path for the same package: the key is
-            // version-blind, so the claim rides the artifact anchor in `new`.
-            edit_resolved(
-                "package-lock.json",
-                "redirect_npm_lock_entry",
-                "node_modules/a/node_modules/left-pad",
-                &hosted_url("left-pad", "1.3.0", SAMPLE_UUID),
-            ),
-            // Another package's edit — must survive.
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("minimist@1.2.2"),
-            ),
-            // Non-package-keyed workspace-trust edit — must survive.
-            edit(
-                "pnpm-workspace.yaml",
-                "redirect_pnpm_workspace_trust",
-                Some("trustLockfile"),
-            ),
-        ];
-
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-
-        assert!(
-            !state.records.contains_key("pkg:npm/left-pad@1.3.0"),
-            "the superseded record must be dropped"
-        );
-        assert!(
-            state.records.contains_key("pkg:npm/minimist@1.2.2"),
-            "other packages' records must survive"
-        );
-        let keys: Vec<&str> = state
-            .edits
-            .iter()
-            .filter_map(|e| e.key.as_deref())
-            .collect();
-        assert_eq!(
-            keys,
-            vec!["minimist@1.2.2", "trustLockfile"],
-            "only the superseded package's edits may be dropped: {keys:?}"
-        );
-
-        // Idempotent: a second drop finds nothing and reports it.
-        assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-    }
-
-    /// TWO versions of one package hosted at once: dropping the vendored one
-    /// must not touch the other version's halves. The npm path keys
-    /// (`node_modules/…/left-pad`) and legacy `dependencies` bare-name keys
-    /// carry NO version, so a name-anchored matcher would claim BOTH
-    /// versions' edits here — destroying left-pad@2.0.0's pre-redirect
-    /// originals (its only revert data) when left-pad@1.3.0 was vendored.
-    /// Only edits whose rewritten content references the dropped purl's own
-    /// hosted artifact go.
-    #[test]
-    fn drop_superseded_purl_never_claims_the_other_hosted_versions_edits() {
-        const UUID_V2: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0f9e8d7c6b5a";
-        let url_v1 = hosted_url("left-pad", "1.3.0", SAMPLE_UUID);
-        let url_v2 = hosted_url("left-pad", "2.0.0", UUID_V2);
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-        state.records.insert(
-            "pkg:npm/left-pad@2.0.0".to_string(),
-            record_with_uuid(UUID_V2),
-        );
-        state.edits = vec![
-            // v1's edits: a version-blind path key (anchored via `new`) and
-            // a version-exact pnpm key.
-            edit_resolved(
-                "package-lock.json",
-                "redirect_npm_lock_entry",
-                "node_modules/left-pad",
-                &url_v1,
-            ),
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0"),
-            ),
-            // v2's edits: a nested path key, a legacy bare-name key, and a
-            // version-exact pnpm key — ALL must survive dropping v1.
-            edit_resolved(
-                "package-lock.json",
-                "redirect_npm_lock_entry",
-                "node_modules/a/node_modules/left-pad",
-                &url_v2,
-            ),
-            edit_resolved(
-                "package-lock.json",
-                "redirect_npm_lock_dep",
-                "left-pad",
-                &url_v2,
-            ),
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@2.0.0"),
-            ),
-        ];
-
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-
-        assert!(
-            !state.records.contains_key("pkg:npm/left-pad@1.3.0"),
-            "the vendored version's record must be dropped"
-        );
-        assert!(
-            state.records.contains_key("pkg:npm/left-pad@2.0.0"),
-            "the still-hosted version's record must survive"
-        );
-        let keys: Vec<&str> = state
-            .edits
-            .iter()
-            .filter_map(|e| e.key.as_deref())
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                "node_modules/a/node_modules/left-pad",
-                "left-pad",
-                "left-pad@2.0.0"
-            ],
-            "the other hosted version's edits are its only revert data and \
-             must survive verbatim: {keys:?}"
-        );
-    }
-
-    /// A DEGRADED ledger (record fetch failed: `records` empty, edits only)
-    /// offers no artifact anchor. The secondary guard must stay version-exact
-    /// — `name@version` plus the `(`/`_` instance suffixes — and version-blind
-    /// path/bare-name keys must be KEPT (they cannot be attributed to a
-    /// version, and dropping them could destroy another version's revert
-    /// originals). Fail closed: leftover keys mean the takeover warning's
-    /// manual advisory keeps firing, which is the correct degraded outcome.
-    #[test]
-    fn drop_superseded_purl_without_a_record_claims_only_version_exact_keys() {
-        let mut state = RedirectState::new();
-        state.edits = vec![
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0"),
-            ),
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0_react@18.2.0"),
-            ),
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0(react@18.2.0)"),
-            ),
-            // A LONGER version sharing the prefix: `1.3.0` must not claim
-            // `1.3.01`'s instances (the `_`/`(` boundary is load-bearing).
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.01_react@18.2.0"),
-            ),
-            // Version-blind keys: unattributable without the anchor — keep.
-            edit_resolved(
-                "package-lock.json",
-                "redirect_npm_lock_entry",
-                "node_modules/left-pad",
-                "https://patch.test/no-uuid-here/left-pad-1.3.0.tgz",
-            ),
-            edit_resolved(
-                "package-lock.json",
-                "redirect_npm_lock_dep",
-                "left-pad",
-                "https://patch.test/no-uuid-here/left-pad-1.3.0.tgz",
-            ),
-        ];
-
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-
-        let keys: Vec<&str> = state
-            .edits
-            .iter()
-            .filter_map(|e| e.key.as_deref())
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                "left-pad@1.3.01_react@18.2.0",
-                "node_modules/left-pad",
-                "left-pad"
-            ],
-            "without an artifact anchor only version-exact instance keys may \
-             be claimed: {keys:?}"
-        );
-    }
-
-    fn future_lock_edit(name: &str, version: &str, url: &str) -> FileEdit {
-        FileEdit {
-            path: "future.lock".to_string(),
-            kind: "redirect_future_lock_entry".to_string(),
-            action: "rewritten".to_string(),
-            key: Some(format!("{name}@{version}")),
-            original: Some(serde_json::json!(format!("{name}@{version} sha512-r"))),
-            new: Some(serde_json::json!(format!("{name}@{version} {url}"))),
-        }
-    }
-
-    #[test]
-    fn drop_superseded_purl_drops_nothing_beside_an_unclassified_edit_naming_it() {
-        let url = hosted_url("left-pad", "1.3.0", SAMPLE_UUID);
-        let unanchored = hosted_url("left-pad", "1.3.0", "0e0e0e0e-0000-4000-8000-000000000000");
-        for (with_record, future_key, future_url) in [
-            (true, "left-pad@1.3.0", url.as_str()),
-            (false, "left-pad@1.3.0", url.as_str()),
-            (false, "left-pad@1.3.0~custom", unanchored.as_str()),
-        ] {
-            let mut state = RedirectState::new();
-            if with_record {
-                state
-                    .records
-                    .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-            }
-            state.edits = vec![
-                edit_resolved(
-                    "yarn.lock",
-                    "redirect_yarn_classic_entry",
-                    "left-pad@1.3.0",
-                    &url,
-                ),
-                FileEdit {
-                    key: Some(future_key.to_string()),
-                    ..future_lock_edit("left-pad", "1.3.0", future_url)
-                },
-            ];
-            let before = serde_json::to_value(&state).unwrap();
-            assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-            assert_eq!(
-                serde_json::to_value(&state).unwrap(),
-                before,
-                "{with_record} {future_key}"
-            );
-        }
-    }
-
-    #[test]
-    fn drop_superseded_purl_drops_nothing_when_an_unclassified_edit_is_anchored() {
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-        state.edits = vec![FileEdit {
-            key: Some("nodes/0".to_string()),
-            ..edit_resolved(
-                "future.lock",
-                "redirect_future_lock_entry",
-                "unused",
-                &hosted_url("left-pad", "1.3.0", SAMPLE_UUID),
-            )
-        }];
-        let before = serde_json::to_value(&state).unwrap();
-        assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-        assert_eq!(serde_json::to_value(&state).unwrap(), before);
-    }
-
-    #[test]
-    fn drop_superseded_purl_ignores_an_unclassified_edit_for_another_package() {
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/pad@1.3.0".to_string(), sample_record());
-        state.edits = vec![
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("pad@1.3.0"),
-            ),
-            future_lock_edit(
-                "left-pad",
-                "1.3.0",
-                &hosted_url("left-pad", "1.3.0", "0e0e0e0e-0000-4000-8000-000000000000"),
-            ),
-            future_lock_edit(
-                "@scope/pad",
-                "1.3.0",
-                &hosted_url(
-                    "@scope/pad",
-                    "1.3.0",
-                    "1e1e1e1e-0000-4000-8000-000000000000",
-                ),
-            ),
-        ];
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/pad@1.3.0"));
-        assert!(state.records.is_empty());
-        let kinds: Vec<&str> = state.edits.iter().map(|e| e.kind.as_str()).collect();
-        assert_eq!(
-            kinds,
-            ["redirect_future_lock_entry", "redirect_future_lock_entry"]
-        );
-    }
-
-    #[test]
-    fn drop_superseded_purl_claims_vlt_variant_keys() {
-        let mut state = RedirectState::new();
-        state.edits = vec![
-            edit(
-                "vlt-lock.json",
-                "redirect_vlt_lock_node",
-                Some("left-pad@1.3.0"),
-            ),
-            edit(
-                "vlt-lock.json",
-                "redirect_vlt_lock_node",
-                Some("left-pad@1.3.0~peer.0df72515a50372ba"),
-            ),
-            edit(
-                "vlt-lock.json",
-                "redirect_vlt_lock_node",
-                Some("left-pad@1.3.0-rc.1~peer.1"),
-            ),
-        ];
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-        let keys: Vec<&str> = state
-            .edits
-            .iter()
-            .filter_map(|e| e.key.as_deref())
-            .collect();
-        assert_eq!(keys, ["left-pad@1.3.0-rc.1~peer.1"]);
-    }
-
-    /// A version-boundary key (`left-pad@1.3.10`) and a different package
-    /// whose name merely ends with the target's (`not-left-pad`) must never
-    /// be claimed — the `/`-boundary and `(`-boundary checks are load-bearing.
-    #[test]
-    fn drop_superseded_purl_respects_name_and_version_boundaries() {
-        let mut state = RedirectState::new();
-        state.edits = vec![
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.10"),
-            ),
-            edit(
-                "package-lock.json",
-                "redirect_npm_lock_entry",
-                Some("node_modules/not-left-pad"),
-            ),
-        ];
-        assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.1"));
-        assert_eq!(state.edits.len(), 2, "no foreign edit may be claimed");
-    }
-
-    /// Scoped names: the record key may carry the percent-encoded API form
-    /// while the caller passes the canonical decoded purl; both halves must
-    /// still be claimed (the path-keyed edit via the artifact anchor its
-    /// rewritten content carries).
-    #[test]
-    fn drop_superseded_purl_matches_percent_encoded_scoped_records() {
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/%40scope%2Fpkg@1.0.0".to_string(), sample_record());
-        state.edits = vec![edit_resolved(
-            "package-lock.json",
-            "redirect_npm_lock_entry",
-            "node_modules/@scope/pkg",
-            &hosted_url("%40scope%2Fpkg", "1.0.0", SAMPLE_UUID),
-        )];
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/@scope/pkg@1.0.0"));
-        assert!(state.records.is_empty() && state.edits.is_empty());
-    }
-
-    /// Cargo purls are refused: their takeover must revert the hosted edits
-    /// ON DISK first (`revert_cargo_redirect_purl`), so a bare ledger drop
-    /// would destroy the only revert data. Fail closed by dropping nothing.
-    #[test]
-    fn drop_superseded_purl_refuses_cargo() {
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:cargo/cfg-if@1.0.4".to_string(), sample_record());
-        state.edits = vec![edit(
-            "Cargo.lock",
-            "redirect_cargo_lock_entry",
-            Some("cfg-if@1.0.4"),
-        )];
-        assert!(!drop_superseded_purl(&mut state, "pkg:cargo/cfg-if@1.0.4"));
-        assert_eq!(state.records.len(), 1);
-        assert_eq!(state.edits.len(), 1);
-    }
-
-    /// A purl that cannot name one exact package instance — versionless
-    /// (`pkg:npm/left-pad`) or empty-named (`pkg:npm/@1.0.0`, whose only `@`
-    /// is at index 0) — is refused outright: nothing is dropped and `false`
-    /// is reported. Fail closed — without a `(name, version)` pair the
-    /// matcher could only claim by name, the exact over-deletion the
-    /// artifact anchor exists to prevent.
-    #[test]
-    fn drop_superseded_purl_unversioned_purl_drops_nothing() {
-        for bogus in ["pkg:npm/left-pad", "pkg:npm/@1.0.0"] {
-            let mut state = RedirectState::new();
-            state
-                .records
-                .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-            state.edits = vec![edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0"),
-            )];
-            assert!(
-                !drop_superseded_purl(&mut state, bogus),
-                "{bogus} names no exact instance and must report false"
-            );
-            assert_eq!(
-                state.records.len(),
-                1,
-                "{bogus} must drop no record (fail closed)"
-            );
-            assert_eq!(
-                state.edits.len(),
-                1,
-                "{bogus} must drop no edit (fail closed)"
-            );
-        }
-    }
-
-    /// An edit with NO key is not attributable to any package, so the retain
-    /// pass keeps it BEFORE consulting the artifact anchor — even when its
-    /// rewritten content happens to reference the dropped purl's own hosted
-    /// artifact. The documented fail-closed contract: a keyless edit may be
-    /// some other surface's only revert data, and keeping a stale edit is
-    /// recoverable where destroying revert originals is not.
-    #[test]
-    fn drop_superseded_purl_keeps_keyless_edits_even_when_anchored() {
-        let keyless = FileEdit {
-            path: "package-lock.json".to_string(),
-            kind: "redirect_npm_lock_entry".to_string(),
-            action: "rewritten".to_string(),
-            key: None,
-            original: Some(serde_json::json!("orig")),
-            new: Some(serde_json::json!({
-                "resolved": hosted_url("left-pad", "1.3.0", SAMPLE_UUID),
-                "integrity": "sha512-P=="
-            })),
-        };
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-        state.edits = vec![
-            keyless.clone(),
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0"),
-            ),
-        ];
-
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-
-        assert!(
-            state.records.is_empty(),
-            "the superseded record must still be dropped"
-        );
-        assert_eq!(
-            state.edits,
-            vec![keyless],
-            "the keyless edit must survive verbatim even though its rewritten \
-             content carries the dropped purl's artifact uuid"
-        );
-    }
-
     #[tokio::test]
     async fn load_missing_ledger_is_none() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1165,9 +342,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_malformed_ledger_is_a_hard_error_naming_the_file() {
-        // A torn/hand-mangled ledger must NOT load as "no ledger": a
-        // tolerant `None` would let the next hosted run start a fresh ledger
-        // and silently overwrite the only copy of the pre-redirect revert data.
+        // A torn/hand-mangled ledger must NOT load as "no ledger": callers
+        // surface it rather than silently ignoring it.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".socket/vendor");
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -1182,70 +358,12 @@ mod tests {
             "error must name the file: {message}"
         );
         assert!(
-            message.contains("revert"),
-            "error must explain what is at stake: {message}"
+            message.contains("pre-v5") && message.contains("never overwrites"),
+            "error must say the file is a read-only pre-v5 leftover: {message}"
         );
         // The pure load never mutates the project.
         assert!(dir.join("redirect-state.json").exists());
         assert!(!dir.join("redirect-state.json.corrupt").exists());
-    }
-
-    #[tokio::test]
-    async fn quarantine_moves_the_malformed_ledger_aside_preserving_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".socket/vendor");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("redirect-state.json"), b"{ torn ledger")
-            .await
-            .unwrap();
-        let mut err = load_redirect_state(tmp.path()).await.unwrap_err();
-        err.quarantine().await;
-        assert_eq!(
-            err.quarantined_to.as_deref(),
-            Some(dir.join("redirect-state.json.corrupt").as_path())
-        );
-        assert!(
-            err.to_string().contains("redirect-state.json.corrupt"),
-            "error must point at the moved-aside file: {err}"
-        );
-        assert!(!dir.join("redirect-state.json").exists());
-        assert_eq!(
-            tokio::fs::read(dir.join("redirect-state.json.corrupt"))
-                .await
-                .unwrap(),
-            b"{ torn ledger",
-            "quarantine must preserve the corrupt bytes verbatim"
-        );
-    }
-
-    #[tokio::test]
-    async fn quarantine_never_clobbers_an_earlier_corrupt_snapshot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".socket/vendor");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(
-            dir.join("redirect-state.json.corrupt"),
-            b"older revert data",
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(dir.join("redirect-state.json"), b"{ newer torn")
-            .await
-            .unwrap();
-        let mut err = load_redirect_state(tmp.path()).await.unwrap_err();
-        err.quarantine().await;
-        assert!(err.quarantined_to.is_none());
-        assert_eq!(
-            tokio::fs::read(dir.join("redirect-state.json.corrupt"))
-                .await
-                .unwrap(),
-            b"older revert data",
-            "an earlier quarantine snapshot must never be overwritten"
-        );
-        assert!(
-            dir.join("redirect-state.json").exists(),
-            "with the quarantine slot taken the malformed file stays put"
-        );
     }
 
     /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
@@ -1290,30 +408,23 @@ mod tests {
             let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
             panic!("load_redirect_state must complete promptly with a FIFO ledger");
         };
-        let mut err = result.unwrap_err();
+        let err = result.unwrap_err();
         assert_eq!(err.path, fifo, "the error must name the planted path");
         assert!(err.unreadable, "a non-regular file is an I/O problem");
         // The pure load never mutates the project — the FIFO stays put.
         assert!(fifo.exists());
-        // And neither does the quarantine: a file we could not read is not
-        // known to be malformed, so it is never moved aside.
-        err.quarantine().await;
-        assert!(err.quarantined_to.is_none());
-        assert!(fifo.exists());
-        assert!(!dir.join("redirect-state.json.corrupt").exists());
     }
 
     /// An I/O failure (here: a directory squatting the ledger path) is
     /// classified as UNREADABLE, not malformed: the message names the I/O
-    /// problem and does not tell the user to "repair its JSON", and
-    /// `quarantine` refuses to move the path aside.
+    /// problem and does not tell the user to "repair its JSON".
     #[tokio::test]
-    async fn load_unreadable_ledger_is_not_quarantined_or_called_malformed() {
+    async fn load_unreadable_ledger_is_not_called_malformed() {
         let tmp = tempfile::tempdir().unwrap();
         let squatter = tmp.path().join(REDIRECT_STATE_REL);
         tokio::fs::create_dir_all(&squatter).await.unwrap();
 
-        let mut err = load_redirect_state(tmp.path()).await.unwrap_err();
+        let err = load_redirect_state(tmp.path()).await.unwrap_err();
         assert!(err.unreadable);
         let message = err.to_string();
         assert!(
@@ -1324,78 +435,14 @@ mod tests {
             !message.contains("malformed") && !message.contains("repair its JSON"),
             "an unreadable ledger must not be described as malformed: {message}"
         );
-        err.quarantine().await;
-        assert!(err.quarantined_to.is_none());
         assert!(squatter.is_dir(), "the squatting path is left in place");
-        assert!(!tmp
-            .path()
-            .join(".socket/vendor/redirect-state.json.corrupt")
-            .exists());
 
-        // The malformed classification is unchanged: parse failures still
-        // say so and still quarantine.
+        // Parse failures are classified as malformed.
         tokio::fs::remove_dir(&squatter).await.unwrap();
         tokio::fs::write(&squatter, b"{ torn").await.unwrap();
         let err = load_redirect_state(tmp.path()).await.unwrap_err();
         assert!(!err.unreadable);
         assert!(err.to_string().contains("malformed"));
-    }
-
-    /// A record carrying an EMPTY uuid (a hand-repaired ledger — a workflow
-    /// the corrupt-ledger message itself instructs — or a degraded record
-    /// fetch) must not turn the artifact anchor into a match-everything
-    /// wildcard: `text.contains("")` is true for EVERY edit with rewritten
-    /// content, so dropping one purl would claim every other package's edits
-    /// and destroy their only revert data. No usable anchor ⇒ fall back to
-    /// the version-exact-only claim, exactly like the recordless ledger.
-    #[test]
-    fn drop_superseded_purl_empty_uuid_record_claims_no_anchored_edits() {
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), record_with_uuid(""));
-        state
-            .records
-            .insert("pkg:npm/minimist@1.2.2".to_string(), sample_record());
-        state.edits = vec![
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("left-pad@1.3.0"),
-            ),
-            // ANOTHER package's edits — its path-keyed lock entry (rewritten
-            // content carrying its own artifact URL) and its version-exact
-            // pnpm key. Both must survive dropping left-pad.
-            edit_resolved(
-                "package-lock.json",
-                "redirect_npm_lock_entry",
-                "node_modules/minimist",
-                &hosted_url("minimist", "1.2.2", SAMPLE_UUID),
-            ),
-            edit(
-                "pnpm-lock.yaml",
-                "redirect_pnpm_resolution",
-                Some("minimist@1.2.2"),
-            ),
-        ];
-
-        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
-
-        assert!(
-            state.records.contains_key("pkg:npm/minimist@1.2.2"),
-            "the other package's record must survive"
-        );
-        let keys: Vec<&str> = state
-            .edits
-            .iter()
-            .filter_map(|e| e.key.as_deref())
-            .collect();
-        assert_eq!(
-            keys,
-            vec!["node_modules/minimist", "minimist@1.2.2"],
-            "an empty uuid offers no anchor and may claim only the dropped \
-             purl's version-exact keys: {keys:?}"
-        );
     }
 
     #[tokio::test]
@@ -1472,124 +519,4 @@ mod tests {
         );
     }
 
-    /// Persisting an EMPTY state into a project with no ledger must succeed
-    /// as a pure no-op: the delete-instead-of-write path tolerates NotFound
-    /// (a fresh project has nothing to delete) and must not scaffold
-    /// `.socket/` or leave a residual empty ledger behind.
-    #[tokio::test]
-    async fn persist_empty_state_with_no_ledger_is_a_no_op() {
-        let tmp = tempfile::tempdir().unwrap();
-        persist_redirect_state(tmp.path(), &RedirectState::new())
-            .await
-            .unwrap();
-        assert!(
-            !tmp.path().join(REDIRECT_STATE_REL).exists(),
-            "no ledger may be created by an empty persist"
-        );
-        assert!(
-            !tmp.path().join(".socket").exists(),
-            "an empty persist must not scaffold .socket/"
-        );
-    }
-
-    /// Emptying the ledger deletes it AND prunes the now-empty
-    /// `.socket/vendor/` it lived in — but never `.socket/` itself (the lock
-    /// guard owns that level).
-    #[tokio::test]
-    async fn persist_empty_state_prunes_the_emptied_vendor_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-        save_redirect_state(tmp.path(), &state).await.unwrap();
-        // Something else lives in `.socket/` (the lock, a manifest…).
-        tokio::fs::write(tmp.path().join(".socket/apply.lock"), b"")
-            .await
-            .unwrap();
-
-        persist_redirect_state(tmp.path(), &RedirectState::new())
-            .await
-            .unwrap();
-
-        assert!(!tmp.path().join(REDIRECT_STATE_REL).exists());
-        assert!(
-            !tmp.path().join(".socket/vendor").exists(),
-            "an emptied hosted ledger leaves no .socket/vendor/ husk"
-        );
-        assert!(
-            tmp.path().join(".socket").exists(),
-            ".socket/ itself is never pruned here"
-        );
-    }
-
-    /// The prune is non-recursive: a `.corrupt` quarantine (the one
-    /// sanctioned residue) or the sibling vendor ledger keeps `.socket/vendor/`.
-    #[tokio::test]
-    async fn persist_empty_state_keeps_vendor_dir_with_siblings() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = RedirectState::new();
-        state
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-        save_redirect_state(tmp.path(), &state).await.unwrap();
-        let dir = tmp.path().join(".socket/vendor");
-        tokio::fs::write(dir.join("redirect-state.json.corrupt"), b"older")
-            .await
-            .unwrap();
-
-        persist_redirect_state(tmp.path(), &RedirectState::new())
-            .await
-            .unwrap();
-
-        assert!(!dir.join("redirect-state.json").exists());
-        assert!(dir.join("redirect-state.json.corrupt").exists());
-        assert!(dir.exists(), "a non-empty vendor dir is kept");
-    }
-
-    /// A FAILED delete of the emptied ledger (anything but NotFound) must
-    /// propagate, never report success: callers treat `Ok` as "the ledger no
-    /// longer asserts anything", and a swallowed error would leave a live
-    /// ledger feeding VEX and takeover detection stale state.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn persist_empty_state_propagates_non_notfound_delete_errors() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".socket/vendor");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let ledger = dir.join("redirect-state.json");
-        let mut nonempty = RedirectState::new();
-        nonempty
-            .records
-            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
-        tokio::fs::write(&ledger, serde_json::to_string_pretty(&nonempty).unwrap())
-            .await
-            .unwrap();
-        // A read-only parent dir makes the unlink fail with EACCES.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Root ignores mode bits; skip there (CI containers sometimes run as root).
-        if std::fs::File::create(dir.join("probe")).is_ok() {
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
-            let _ = std::fs::remove_file(dir.join("probe"));
-            eprintln!("skipping: running as root, 0555 does not block writes");
-            return;
-        }
-
-        let err = persist_redirect_state(tmp.path(), &RedirectState::new())
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "the delete failure must propagate verbatim: {err}"
-        );
-
-        // Restore so the tempdir can clean up, then confirm nothing was lost.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            ledger.exists(),
-            "a failed delete must leave the ledger in place"
-        );
-    }
 }

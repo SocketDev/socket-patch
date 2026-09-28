@@ -445,7 +445,9 @@ fn vendored_spoofed_paths_are_not_references() {
 // ── embedded ──────────────────────────────────────────────────────────
 
 /// The embedded `apply --vex` / `vendor --vex` of a manifest-less checkout
-/// attest exactly what standalone `vex` does, in every era.
+/// attest exactly what standalone `vex` does, in every era. (`vendor` over a
+/// HOSTED checkout is the v5 eject flow, not a manifest-less no-op, so the
+/// hosted cells drive `apply` only.)
 #[test]
 fn embedded_vex_agrees_in_every_era() {
     for era in ERAS {
@@ -453,7 +455,12 @@ fn embedded_vex_agrees_in_every_era() {
             ("hosted", Marker::Redirected),
             ("vendored", Marker::Vendored),
         ] {
-            for via in [VexVia::Apply, VexVia::Vendor] {
+            let vias: &[VexVia] = if mode == "hosted" {
+                &[VexVia::Apply]
+            } else {
+                &[VexVia::Apply, VexVia::Vendor]
+            };
+            for &via in vias {
                 let api = api();
                 let tmp = tempfile::tempdir().unwrap();
                 let dir = tmp.path();

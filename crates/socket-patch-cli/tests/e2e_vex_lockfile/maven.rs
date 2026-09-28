@@ -1190,8 +1190,8 @@ fn vendored_spoofed_locations_never_attest() {
 // ══════════════════════════════════════════════════════════════════════════
 // EMBEDDED — the REAL writers lay the wiring down (`vendor --vex`,
 // `scan --mode hosted --vex`, `apply --vex`); then the manifest and the
-// ledgers are deleted and the standalone `vex` must re-attest from the
-// project files alone.
+// vendor ledger are deleted (v5 hosted mode writes no ledger at all) and
+// the standalone `vex` must re-attest from the project files alone.
 // ══════════════════════════════════════════════════════════════════════════
 
 const ORG: &str = "test-org";
@@ -1307,6 +1307,43 @@ fn standalone_after_writer(
     for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
         let (code, env) = fx.vex(extra);
         assert_omitted(code, &env, record_purl, dead_reason, "writer, reverted");
+    }
+}
+
+/// After the real HOSTED writer ran: v5 hosted mode left NO ledger, so
+/// the lock pin is the only hosted state — offline there is no local
+/// record (`record_unavailable`, zero requests), online the API's record
+/// attests, and with the wiring reverted nothing is discovered at all.
+fn standalone_after_hosted_writer(
+    fx: &Fx,
+    uuid: &str,
+    record_purl: &str,
+    api_view: Value,
+    revert: &dyn Fn(&Fx),
+) {
+    fx.rm(".socket/manifest.json");
+    fx.rm(".socket/blobs");
+    assert!(
+        !fx.cwd.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted mode writes no ledger"
+    );
+    let api = Api::serve(vec![(uuid, api_view)]);
+    let (code, env) = fx.vex(&["--offline", "--proxy-url", &api.uri()]);
+    assert_omitted(
+        code,
+        &env,
+        record_purl,
+        "record_unavailable",
+        "hosted writer, offline",
+    );
+    assert_eq!(api.requests(), 0, "--offline never asks the API");
+    let (code, env) = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_attested(fx, code, &env, uuid, record_purl, "redirected");
+
+    revert(fx);
+    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+        let (code, env) = fx.vex(extra);
+        assert_nothing_to_attest(code, &env, "hosted writer, reverted");
     }
 }
 
@@ -1475,8 +1512,9 @@ fn scan_hosted_vex(fx: &Fx, api: &Api) -> (Option<i32>, Value, String) {
 
 /// `scan --mode hosted --vex` against a project whose pristine base
 /// version is cached: the real rewriter pins `-socket.<hex8>`, the in-run
-/// VEX attests; the pristine base is never the consumed copy, so the
-/// standalone vex keeps attesting from the pin with no manifest/ledger.
+/// VEX attests and no ledger is written; the pristine base is never the
+/// consumed copy, so the standalone vex keeps attesting from the pin (with
+/// the API's record) with no manifest/ledger.
 #[test]
 fn maven_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
     let golden = "maven/pom/basic";
@@ -1496,15 +1534,12 @@ fn maven_scan_hosted_wiring_reattests_without_manifest_or_ledger() {
     );
     let reverted =
         std::fs::read_to_string(fixture_dir(&format!("{golden}/input/pom.xml"))).unwrap();
-    standalone_after_writer(
+    standalone_after_hosted_writer(
         &fx,
-        ".socket/vendor/redirect-state.json",
         MVN_HOSTED_UUID,
         MVN_PURL,
-        "redirected",
         mvn_hosted_view(),
         &|fx| fx.put("pom.xml", &reverted),
-        "redirect_unwired",
     );
 }
 

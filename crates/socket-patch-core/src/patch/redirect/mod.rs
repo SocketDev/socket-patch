@@ -53,7 +53,8 @@ use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 pub(crate) use crate::formats::yarn::is_berry_lock;
 use crate::formats::cargo::hosted::CargoLockPlan;
-pub(crate) use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
+#[cfg(test)]
+use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 #[cfg(test)]
@@ -61,28 +62,23 @@ mod pnpm_equivalence_tests;
 mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
-mod replay;
 mod requirements;
 #[cfg(test)]
 mod rewrite_oracle_support;
 mod staged;
 mod state;
-mod takeover;
+mod hosted_url;
+pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
 pub mod vlt_preflight;
-pub use replay::{revert_remaining_redirect_edits, GroupRefusal, ReplayOutcome};
 pub use state::{
-    drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
+    load_redirect_state, save_redirect_state,
     CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
 };
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
-pub(crate) use takeover::{hosted_url_names, hosted_url_version};
-pub use takeover::{
-    redirect_revert_supported, revert_cargo_redirect_purl, revert_golang_redirect_purl,
-    revert_npm_redirect_purl, revert_redirect_purl, RedirectRevert,
-};
+pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3157,18 +3153,6 @@ fn yarn_classic_block_head(block: &str) -> Option<(String, Option<String>)> {
 /// Only cacheKey `10c0` (yarn 4, compressionLevel 0 default) has a checksum we
 /// can reproduce offline; matches the vendored backend's `SUPPORTED_CACHE_KEY`.
 const YARN_BERRY_SUPPORTED_CACHE_KEY: &str = "10c0";
-
-/// Whether ledger edits of `kind` are yarn.lock blocks — the fragments the
-/// yarn rewriters record in the lock's ON-DISK line endings, which the
-/// reverts (the per-purl takeover and the whole-ledger replay) may respell
-/// in the live lock's ending when a `core.autocrlf` checkout changed it
-/// ([`crate::utils::line_endings::fragments_in_eol_of`]).
-pub(crate) fn yarn_lock_fragment_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "redirect_yarn_berry_entry" | "redirect_yarn_classic_entry"
-    )
-}
 
 /// The `cacheKey:` value from the `__metadata` block (berry writes it unquoted:
 /// `  cacheKey: 10c0`), mirroring the vendored backend's `berry_field`.

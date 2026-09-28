@@ -1,6 +1,5 @@
 use socket_patch_core::patch::redirect::{
-    revert_remaining_redirect_edits, rewrite_registry_redirect, DepOverride, Integrity,
-    RedirectState,
+    rewrite_registry_redirect, DepOverride, Integrity,
 };
 use socket_patch_core::utils::poetry_lock::rewrite_poetry_lock;
 use std::collections::BTreeMap;
@@ -39,8 +38,8 @@ fn patch() -> DepOverride {
     }
 }
 
-#[tokio::test]
-async fn native_lock_generations_redirect_idempotently_and_restore_every_byte() {
+#[test]
+fn native_lock_generations_redirect_idempotently() {
     for version in VERSIONS {
         for crlf in [false, true] {
             let pristine = if crlf {
@@ -75,23 +74,6 @@ async fn native_lock_generations_redirect_idempotently_and_restore_every_byte() 
             assert!(again.warnings.is_empty(), "{version}: {:?}", again.warnings);
             assert!(again.files.is_empty());
             assert!(again.edits.is_empty());
-            let directory = tempfile::tempdir().unwrap();
-            tokio::fs::write(directory.path().join("poetry.lock"), redirected)
-                .await
-                .unwrap();
-            let mut state = RedirectState {
-                edits: result.edits,
-                ..RedirectState::default()
-            };
-            let outcome =
-                revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-            assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
-            assert_eq!(
-                tokio::fs::read_to_string(directory.path().join("poetry.lock"))
-                    .await
-                    .unwrap(),
-                pristine
-            );
         }
     }
 }
@@ -119,6 +101,31 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     assert_eq!(lock10.matches(&format!("sha256:{sha}")).count(), 2, "{lock10}");
     let doc: toml_edit::DocumentMut = lock10.parse().unwrap();
     assert!(doc["package"][0]["files"].is_array(), "{lock10}");
+
+    // A legacy entry that listed files is replaced one file per line (as
+    // Poetry renders it), an empty `[]` one inline: the layout is how the
+    // hosted rollback tells which to put back.
+    let populated = original("1.0.10").replace(
+        "urllib3 = []",
+        "urllib3 = [\n    {file = \"urllib3-1.26.18.tar.gz\", hash = \"sha256:f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0\"},\n]",
+    );
+    let lock10_populated = rewrite_registry_redirect(
+        &BTreeMap::from([("poetry.lock".to_string(), populated)]),
+        &[patch()],
+    )
+    .files["poetry.lock"]
+        .clone();
+    assert!(
+        lock10_populated.contains(&format!(
+            "urllib3 = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{sha}\"}},\n]"
+        )),
+        "{lock10_populated}"
+    );
+    let rerun = rewrite_registry_redirect(
+        &BTreeMap::from([("poetry.lock".to_string(), lock10_populated)]),
+        &[patch()],
+    );
+    assert!(rerun.files.is_empty() && rerun.warnings.is_empty(), "{:?}", rerun.warnings);
 
     let lock11 = rewrite_registry_redirect(
         &BTreeMap::from([("poetry.lock".to_string(), original("1.2.2"))]),
@@ -227,124 +234,6 @@ fn invalid_inputs_never_produce_edits() {
     assert_eq!(result.warnings[0].code, "redirect_poetry_missing_sha256");
 }
 
-#[tokio::test]
-async fn drift_keeps_the_lock_and_rollback_ledger() {
-    let files = BTreeMap::from([("poetry.lock".into(), original("1.1.15"))]);
-    let result = rewrite_registry_redirect(&files, &[patch()]);
-    let changed = result.files["poetry.lock"].replace("sha256:aaaa", "sha256:bbbb");
-    let directory = tempfile::tempdir().unwrap();
-    tokio::fs::write(directory.path().join("poetry.lock"), &changed)
-        .await
-        .unwrap();
-    let mut state = RedirectState {
-        edits: result.edits,
-        ..RedirectState::default()
-    };
-    let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-    assert!(!outcome.fully_reverted());
-    assert!(!state.edits.is_empty());
-    assert_eq!(
-        tokio::fs::read_to_string(directory.path().join("poetry.lock"))
-            .await
-            .unwrap(),
-        changed
-    );
-}
-
-#[tokio::test]
-async fn either_patch_reverts_independently_with_unrelated_edits() {
-    for version in VERSIONS.iter().filter(|version| **version != "0.12.17") {
-        for crlf in [false, true] {
-            for first_name in ["urllib3", "six"] {
-                let mut lock: toml_edit::DocumentMut = original(version).parse().unwrap();
-                let packages = lock["package"].as_array_of_tables_mut().unwrap();
-                let mut second = packages.get(0).unwrap().clone();
-                second["name"] = toml_edit::value("six");
-                second["version"] = toml_edit::value("1.16.0");
-                second.set_position(None);
-                second.remove("extras");
-                packages.push(second);
-                if let Some(files) = lock["metadata"].get_mut("files") {
-                    if let Some(value) = files.get("urllib3").cloned() {
-                        files["six"] = value;
-                    }
-                }
-                let pristine = lock.to_string();
-                let pristine = if crlf {
-                    pristine.replace('\n', "\r\n")
-                } else {
-                    pristine
-                };
-                let second_patch = DepOverride {
-                    name: "six".into(),
-                    version: "1.16.0".into(),
-                    artifact_url: URL.replace("urllib3", "six").replace("1.26.18", "1.16.0"),
-                    ..patch()
-                };
-                let files = BTreeMap::from([("poetry.lock".into(), pristine.clone())]);
-                let first = rewrite_registry_redirect(&files, &[patch()]);
-                assert!(
-                    !first.files.is_empty(),
-                    "{version}: {:?}\n{pristine}",
-                    first.warnings
-                );
-                let second = rewrite_registry_redirect(&first.files, &[second_patch]);
-                assert!(
-                    !second.files.is_empty(),
-                    "{version}: {:?}\n{}",
-                    second.warnings,
-                    first.files["poetry.lock"]
-                );
-                assert!(
-                    second
-                        .warnings
-                        .iter()
-                        .all(|w| w.code == "redirect_poetry_stale_install_risk"),
-                    "{:?}",
-                    second.warnings
-                );
-                let directory = tempfile::tempdir().unwrap();
-                let unrelated = if crlf {
-                    "# retained user edit\r\n"
-                } else {
-                    "# retained user edit\n"
-                };
-                tokio::fs::write(
-                    directory.path().join("poetry.lock"),
-                    format!("{unrelated}{}", second.files["poetry.lock"]),
-                )
-                .await
-                .unwrap();
-                let mut states: Vec<_> = [first, second]
-                    .into_iter()
-                    .map(|result| RedirectState {
-                        edits: result.edits,
-                        ..RedirectState::default()
-                    })
-                    .collect();
-                if first_name == "six" {
-                    states.reverse();
-                }
-                for state in &mut states {
-                    let outcome =
-                        revert_remaining_redirect_edits(directory.path(), state, false).await;
-                    assert!(
-                        outcome.fully_reverted(),
-                        "{version}: {:?}",
-                        outcome.refusals
-                    );
-                }
-                assert_eq!(
-                    tokio::fs::read_to_string(directory.path().join("poetry.lock"))
-                        .await
-                        .unwrap(),
-                    format!("{unrelated}{pristine}")
-                );
-            }
-        }
-    }
-}
-
 #[test]
 fn absent_entries_warn_once_and_missing_sha256_is_gated_once_per_dep() {
     let files = BTreeMap::from([
@@ -373,32 +262,17 @@ fn absent_entries_warn_once_and_missing_sha256_is_gated_once_per_dep() {
 /// A future Poetry that bumps the lock minor (2.2) is rewritten like 2.1 in
 /// hosted mode — the vendored loader already accepts it with an advisory, and
 /// the same lock must not be a silent no-op on one path and applied on another.
-#[tokio::test]
-async fn newer_2x_minor_redirects_and_reverts() {
+#[test]
+fn newer_2x_minor_redirects() {
     let lock = original("2.4.3").replace("lock-version = \"2.1\"", "lock-version = \"2.2\"");
     let files = BTreeMap::from([("poetry.lock".to_string(), lock.clone())]);
     let result = rewrite_registry_redirect(&files, &[patch()]);
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert!(result.files["poetry.lock"].contains(URL));
-    let directory = tempfile::tempdir().unwrap();
-    tokio::fs::write(directory.path().join("poetry.lock"), &result.files["poetry.lock"])
-        .await
-        .unwrap();
-    let mut state = RedirectState {
-        edits: result.edits,
-        ..RedirectState::default()
-    };
-    let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-    assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
-    assert_eq!(
-        tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
-        lock
-    );
 }
 
 /// A rotated grant token (or republished patch) supersedes the earlier hosted
-/// URL in place; rollback of the SECOND run restores the FIRST run's fragment,
-/// exactly as the ledger records it.
+/// URL in place.
 #[test]
 fn rotated_grant_token_supersedes_the_prior_hosted_url() {
     let files = BTreeMap::from([("poetry.lock".to_string(), original("1.8.5"))]);
@@ -412,66 +286,4 @@ fn rotated_grant_token_supersedes_the_prior_hosted_url() {
     assert!(lock.contains(&rotated.artifact_url) && !lock.contains(URL));
     assert_eq!(second.edits.len(), 1);
     assert!(second.edits[0].original.as_ref().unwrap().as_str().unwrap().contains(URL));
-}
-
-/// A relock (or hand edit) that drops the inserted `files` line but keeps
-/// `[package.source]` must be REFUSED by rollback, never mistaken for an
-/// already-reverted lock (the fragment's boundary header keeps the pristine
-/// unit from matching as a prefix, which would delete the ledger and leave the
-/// lock redirecting with upstream hashes in `[metadata.files]`).
-#[tokio::test]
-async fn dropped_files_line_with_source_kept_is_refused_not_converged() {
-    for version in ["1.2.2", "2.4.3"] {
-        let pristine = original(version);
-        let files = BTreeMap::from([("poetry.lock".to_string(), pristine.clone())]);
-        let result = rewrite_registry_redirect(&files, &[patch()]);
-        let redirected = &result.files["poetry.lock"];
-        let drifted: String = redirected
-            .lines()
-            .filter(|line| !line.starts_with("files = [{ file = "))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        assert_ne!(drifted, *redirected, "{version}: the files line must have been removed");
-        assert!(drifted.contains("[package.source]"));
-        let directory = tempfile::tempdir().unwrap();
-        tokio::fs::write(directory.path().join("poetry.lock"), &drifted).await.unwrap();
-        let mut state = RedirectState {
-            edits: result.edits.clone(),
-            ..RedirectState::default()
-        };
-        let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-        assert!(!outcome.fully_reverted(), "{version}: must refuse, not report success");
-        assert_eq!(
-            tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
-            drifted,
-            "{version}: a refused revert writes nothing"
-        );
-        assert!(!state.edits.is_empty(), "{version}: the ledger keeps its edits for a re-scan");
-    }
-}
-
-/// Lock 1.0 only APPENDS `[package.source]` to the unit. A lock restored to
-/// pristine by hand (or by Poetry 1.0's own bare `poetry lock`, which drops
-/// the source) must let rollback converge and clear the ledger instead of
-/// refusing with a spurious drift.
-#[tokio::test]
-async fn lock_1_0_rollback_converges_on_a_hand_restored_lock() {
-    let pristine = original("1.0.10");
-    let files = BTreeMap::from([("poetry.lock".to_string(), pristine.clone())]);
-    let result = rewrite_registry_redirect(&files, &[patch()]);
-    assert!(!result.edits.is_empty());
-    let directory = tempfile::tempdir().unwrap();
-    tokio::fs::write(directory.path().join("poetry.lock"), &pristine).await.unwrap();
-    let mut state = RedirectState {
-        edits: result.edits,
-        ..RedirectState::default()
-    };
-    let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
-    assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
-    assert!(state.edits.is_empty());
-    assert_eq!(
-        tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
-        pristine
-    );
 }

@@ -64,7 +64,7 @@ const MODE_FILE_EXEC: u32 = 0o100755;
 /// — `./`, `..`, `//`, absolute — and duplicate paths) is an `Err` — a wrong
 /// checksum would brick the user's `yarn install` with a YN0018, so we never
 /// guess.
-pub(super) fn berry_cache_checksum_10c0(
+pub(crate) fn berry_cache_checksum_10c0(
     tgz_bytes: &[u8],
     package_ident: &str,
 ) -> Result<String, String> {
