@@ -15,7 +15,7 @@
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::python_lock::table_likes;
+use crate::utils::python_lock::{is_prior_hosted_url, table_likes};
 
 /// The `{file, hash}` tables Poetry records in `package`'s own
 /// `files = [...]` (lock 2.x; also written into 1.0/1.1 locks). Read by the
@@ -160,32 +160,6 @@ pub fn generated_by_version(lock_text: &str) -> Option<(u64, u64)> {
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     Some((major, minor))
-}
-
-/// Whether `existing` is an earlier hosted redirect of the SAME artifact:
-/// same origin (`scheme://host[:port]`) and same trailing filename as the
-/// current artifact URL, fragments ignored. Grant tokens and patch uuids live
-/// in the path between them, so a rotated token or a republished patch is
-/// superseded in place instead of stranding the pin on a URL that no longer
-/// serves (the bun / requirements / cargo rewriters make the same call).
-fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
-    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return None;
-        }
-        let url = url.split('#').next()?;
-        let scheme_end = url.find("://")? + 3;
-        let path_start = url[scheme_end..].find('/')? + scheme_end;
-        let leaf = url[path_start..]
-            .rsplit('/')
-            .next()
-            .filter(|leaf| !leaf.is_empty())?;
-        Some((&url[..path_start], leaf))
-    }
-    match (origin_and_leaf(existing), origin_and_leaf(current)) {
-        (Some(old), Some(new)) => old == new,
-        _ => false,
-    }
 }
 
 /// Rewrite the `[[package]]` for `name`@`version` to install the wheel at
