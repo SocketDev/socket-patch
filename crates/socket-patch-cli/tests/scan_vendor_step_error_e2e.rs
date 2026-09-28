@@ -1,7 +1,7 @@
 //! Regression: the vendor step's ERROR returns must still hand the JSON
 //! consumer the step's `vendor` envelope — demoted — instead of dropping it.
 //!
-//! `scan --vendor`'s vendor step (`run_scan_vendor_step`) takes the apply
+//! `scan --vendor`'s vendor step (`run_vendor_step`) takes the apply
 //! lock, stages the fetched records' patch content in memory, then drives
 //! the vendor engine. Vendored mode is manifest-free: the step never reads
 //! the manifest and never reconciles ledger entries against it, so a

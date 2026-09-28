@@ -64,7 +64,7 @@ per-directory `socket.yml` files.
   reachability or direct/transitive information anywhere.
 - Scan selects patches in five disk call sites plus one in the in-memory
   engine: `discover_selected` (`scan/mod.rs:553`, called from `mod.rs:1999`,
-  `hosted.rs:1063`, `vendor_flow.rs:459`, `mod.rs:2349`), the human
+  `hosted.rs:1063`, `vendor_flow.rs:473`, `mod.rs:2349`), the human
   agent/vendored arm (`mod.rs:2386-2402` via `get.rs:1097`), and
   `hosted_memory/discover.rs:286` (`select_top_ranked`, called at
   `hosted_memory/mod.rs:537`).
