@@ -269,7 +269,11 @@ fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// it comes back empty.
 pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
     let project = match view {
-        ProjectView::Disk(project_root) => return inventory_rush_pnpm_locks(project_root).await,
+        ProjectView::Disk(project_root)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: project_root,
+            ..
+        }) => return inventory_rush_pnpm_locks(project_root).await,
         ProjectView::Memory(project) => *project,
     };
     if !project.contains("rush.json") {

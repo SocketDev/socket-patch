@@ -707,7 +707,22 @@ pub async fn discover_patched_refs(root: &Path) -> Discovery {
 /// See the module docs for the contract; the extractor order below is fixed
 /// only for deterministic diagnostics — refs are sorted afterwards.
 pub async fn discover_patched_refs_with(root: &Path, opts: &DiscoverOptions) -> Discovery {
-    let ctx = DiscoverCtx::with_origins(root, &opts.patch_server_origins);
+    discover_with_ctx(DiscoverCtx::with_origins(root, &opts.patch_server_origins)).await
+}
+
+/// [`discover_patched_refs_with`] reading the lock and config files through
+/// `snapshot`, so a run that also inventories the lockfiles reads each file
+/// once.
+pub async fn discover_patched_refs_in(
+    snapshot: &crate::vendor::lock_inventory::DiskSnapshot<'_>,
+    opts: &DiscoverOptions,
+) -> Discovery {
+    let mut ctx = DiscoverCtx::with_origins(snapshot.root, &opts.patch_server_origins);
+    ctx.view = crate::vendor::lock_inventory::ProjectView::Snapshot(snapshot);
+    discover_with_ctx(ctx).await
+}
+
+async fn discover_with_ctx(ctx: DiscoverCtx<'_>) -> Discovery {
     let mut out = Discovery::default();
     npm::extract(&ctx, &mut out).await;
     yarn::extract(&ctx, &mut out).await;
@@ -737,6 +752,9 @@ fn is_script_lock(file: &Path) -> bool {
 /// allowlist, with the guarded-read and identity helpers bolted on.
 pub(crate) struct DiscoverCtx<'a> {
     pub(crate) root: &'a Path,
+    /// Where the guarded reads read from: `root` on disk, or a per-run
+    /// snapshot of it.
+    view: crate::vendor::lock_inventory::ProjectView<'a>,
     patch_server_origins: &'a [String],
     /// What the guarded reads have recognized so far (rule 11) — collected
     /// here, not in the extractor's `&mut Discovery`, so a read into a
@@ -749,6 +767,7 @@ impl<'a> DiscoverCtx<'a> {
     pub(crate) fn with_origins(root: &'a Path, patch_server_origins: &'a [String]) -> Self {
         DiscoverCtx {
             root,
+            view: crate::vendor::lock_inventory::ProjectView::Disk(root),
             patch_server_origins,
             recognized: Mutex::new(BTreeSet::new()),
         }
@@ -813,7 +832,7 @@ impl<'a> DiscoverCtx<'a> {
     /// ledger claim it alone keeps textually "alive" must be dead (rule 11).
     /// Quiet — a missing or unreadable ignored file is not a finding.
     pub(crate) async fn recognize_ignored(&self, rel: &str) {
-        if let Ok(bytes) = crate::utils::fs::read_regular_to_bytes(&self.root.join(rel)).await {
+        if let Ok(bytes) = self.view.read_bytes(rel).await {
             self.recognize_text(rel, &String::from_utf8_lossy(&bytes));
         }
     }
@@ -828,9 +847,7 @@ impl<'a> DiscoverCtx<'a> {
     /// Whether `rel` exists (lstat — a dangling symlink still "exists", the
     /// read then fails and diagnoses).
     pub(crate) async fn exists(&self, rel: &str) -> bool {
-        tokio::fs::symlink_metadata(self.root.join(rel))
-            .await
-            .is_ok()
+        self.view.exists_no_follow(rel).await
     }
 
     /// Guarded UTF-8 read of root-relative `rel`: `None` when missing
@@ -839,7 +856,7 @@ impl<'a> DiscoverCtx<'a> {
     /// parsing (rule 11) — so a file that then fails to parse, or an entry
     /// the extractor rejects or skips, is still recognized.
     pub(crate) async fn read_text(&self, rel: &str, out: &mut Discovery) -> Option<String> {
-        match crate::utils::fs::read_regular_to_string(&self.root.join(rel)).await {
+        match self.view.read_text(rel).await {
             Ok(text) => {
                 self.recognize_text(rel, &text);
                 Some(text)
@@ -862,7 +879,7 @@ impl<'a> DiscoverCtx<'a> {
     /// left in `bun.lockb`'s append-only pool names a DEAD patch, which is
     /// exactly what recognition should say about it.
     pub(crate) async fn read_bytes(&self, rel: &str, out: &mut Discovery) -> Option<Vec<u8>> {
-        match crate::utils::fs::read_regular_to_bytes(&self.root.join(rel)).await {
+        match self.view.read_bytes(rel).await {
             Ok(bytes) => {
                 self.recognize_text(rel, &String::from_utf8_lossy(&bytes));
                 Some(bytes)
@@ -2951,7 +2968,10 @@ mod tests {
                     "uv.lock",
                 ],
             ),
-            ("cargo", &[".cargo/config", ".cargo/config.toml", "Cargo.toml"]),
+            (
+                "cargo",
+                &[".cargo/config", ".cargo/config.toml", "Cargo.toml"],
+            ),
             ("golang", &["go.mod"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),

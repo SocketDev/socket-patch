@@ -5,14 +5,21 @@
 //! read these through one [`ProjectContext`] instead of each re-loading
 //! and re-merging them its own way.
 //!
+//! The lock set and the discovery read `--cwd` through one
+//! [`DiskSnapshot`], so each lock and config file is read once and both see
+//! the same bytes.
+//!
 //! Everything here is a read-only snapshot. A command that writes a store
 //! under the apply lock (the hosted engine, rollback, remove) re-loads it
-//! under that lock instead of trusting a pre-lock snapshot.
+//! under that lock instead of trusting a pre-lock snapshot, and an embedded
+//! `--vex` after the writes loads its own inputs.
 
 use std::path::PathBuf;
 
 use socket_patch_core::ledgers::{Ledgers, LoadedLedgers};
-use socket_patch_core::vendor::lock_inventory::{LockfileEntry, UnsupportedNpmLayout};
+use socket_patch_core::vendor::lock_inventory::{
+    DiskSnapshot, LockfileEntry, ProjectView, UnsupportedNpmLayout,
+};
 use socket_patch_core::vex::discover::Discovery;
 use tokio::sync::OnceCell;
 
@@ -29,6 +36,7 @@ pub(crate) struct ProjectContext<'a> {
     /// Where the ledgers live: the manifest's project (see
     /// [`GlobalArgs::project_root`]).
     pub(crate) root: PathBuf,
+    snapshot: DiskSnapshot<'a>,
     ledgers: OnceCell<LoadedLedgers>,
     locks: OnceCell<LockSet>,
     discovery: OnceCell<Discovery>,
@@ -45,6 +53,7 @@ impl<'a> ProjectContext<'a> {
         Self {
             common,
             root,
+            snapshot: DiskSnapshot::new(&common.cwd),
             ledgers: OnceCell::new(),
             locks: OnceCell::new(),
             discovery: OnceCell::new(),
@@ -70,8 +79,8 @@ impl<'a> ProjectContext<'a> {
         self.locks
             .get_or_init(|| async {
                 let (entries, unsupported) =
-                    socket_patch_core::vendor::lock_inventory::inventory_project_diagnosed(
-                        &self.common.cwd,
+                    socket_patch_core::vendor::lock_inventory::inventory_project_diagnosed_in(
+                        &ProjectView::Snapshot(&self.snapshot),
                     )
                     .await;
                 LockSet {
@@ -85,7 +94,7 @@ impl<'a> ProjectContext<'a> {
     /// The lockfile wiring discovery of `--cwd` ([`super::discover_wiring`]).
     pub(crate) async fn discovery(&self) -> &Discovery {
         self.discovery
-            .get_or_init(|| super::discover_wiring(self.common, &self.common.cwd))
+            .get_or_init(|| super::discover_wiring_in(self.common, &self.snapshot))
             .await
     }
 }

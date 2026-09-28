@@ -65,8 +65,8 @@ pub(crate) mod npm_family;
 pub(crate) mod pnpm;
 pub(crate) mod pypi;
 pub(crate) mod recover;
-pub(crate) mod vlt;
 pub mod view;
+pub(crate) mod vlt;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
@@ -77,7 +77,7 @@ pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pnpm::pnpm_registry_key;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
-pub use self::view::{MemoryEntry, MemoryProject, ProjectView};
+pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView};
 pub use self::wired::wired_vendor_integrity;
 
 // The per-format views `inventory_project_diagnosed` unions (and the test
@@ -210,9 +210,7 @@ pub struct UnsupportedNpmLayout {
 /// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
 /// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
 /// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
-pub fn unsupported_layout_warnings(
-    unsupported: &[UnsupportedNpmLayout],
-) -> Vec<(String, String)> {
+pub fn unsupported_layout_warnings(unsupported: &[UnsupportedNpmLayout]) -> Vec<(String, String)> {
     unsupported
         .iter()
         .map(|diag| match diag.code {

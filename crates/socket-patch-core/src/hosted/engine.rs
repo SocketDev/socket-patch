@@ -313,7 +313,10 @@ pub fn build_candidates(
 /// Bun's precedence when both lock spellings are present.
 pub fn bun_lock_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd) => cwd.join("bun.lock").exists(),
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => cwd.join("bun.lock").exists(),
         ProjectView::Memory(project) => project.contains("bun.lock"),
     }
 }
@@ -373,7 +376,7 @@ impl CandidateFiles {
             // (non-blocking open + fstat regular-file check), so a FIFO
             // under a candidate name is skipped like a missing file instead
             // of wedging the run in open(2).
-            ProjectView::Disk(_) => view.read_text(rel).await.ok(),
+            ProjectView::Disk(_) | ProjectView::Snapshot(_) => view.read_text(rel).await.ok(),
             ProjectView::Memory(project) => {
                 if project.is_symlink(rel) {
                     self.symlinked_reads.push(rel.to_string());
@@ -407,9 +410,10 @@ impl CandidateFiles {
 /// The root-level Python lock names (sorted).
 async fn python_lock_paths(view: &ProjectView<'_>) -> Vec<String> {
     match view {
-        ProjectView::Disk(cwd) => {
-            crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default()
-        }
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default(),
         ProjectView::Memory(project) => project
             .children("")
             .into_iter()
@@ -424,7 +428,10 @@ async fn python_lock_paths(view: &ProjectView<'_>) -> Vec<String> {
 /// Whether the project is a Rush monorepo (disk: `rush.json` is a file).
 fn rush_repo(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd) => cwd.join("rush.json").is_file(),
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => cwd.join("rush.json").is_file(),
         ProjectView::Memory(project) => project.contains("rush.json"),
     }
 }
@@ -640,7 +647,10 @@ pub struct Rewritten {
 /// symbolic link (absent to the planner, refused by [`guard`]).
 fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, bool) {
     match view {
-        ProjectView::Disk(cwd) => (
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => (
             read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
             false,
         ),
@@ -670,7 +680,10 @@ fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, b
 /// [`read_npmrc_for_allow_remote`]).
 fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
     match view {
-        ProjectView::Disk(cwd) => read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL)),
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => read_npmrc_for_allow_remote(&cwd.join(NPMRC_REL)),
         ProjectView::Memory(project) => match project.get(NPMRC_REL) {
             None => Ok(None),
             Some(MemoryEntry::Symlink) => {
@@ -690,7 +703,10 @@ fn read_npmrc(view: &ProjectView<'_>) -> Result<Option<String>, String> {
 /// Whether Rush's repo-state file is present (disk: a regular file).
 fn rush_repo_state_present(view: &ProjectView<'_>) -> bool {
     match view {
-        ProjectView::Disk(cwd) => cwd.join(RUSH_REPO_STATE_REL).is_file(),
+        ProjectView::Disk(cwd)
+        | ProjectView::Snapshot(crate::vendor::lock_inventory::DiskSnapshot {
+            root: cwd, ..
+        }) => cwd.join(RUSH_REPO_STATE_REL).is_file(),
         ProjectView::Memory(project) => project.contains(RUSH_REPO_STATE_REL),
     }
 }

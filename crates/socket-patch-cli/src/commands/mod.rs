@@ -52,15 +52,26 @@ pub(crate) async fn discover_wiring(
     common: &crate::args::GlobalArgs,
     root: &Path,
 ) -> socket_patch_core::vex::discover::Discovery {
-    let opts = socket_patch_core::vex::DiscoverOptions {
+    socket_patch_core::vex::discover_patched_refs_with(root, &discover_options(common)).await
+}
+
+/// [`discover_wiring`] of the snapshot's root, reading through `snapshot`.
+pub(crate) async fn discover_wiring_in(
+    common: &crate::args::GlobalArgs,
+    snapshot: &socket_patch_core::vendor::lock_inventory::DiskSnapshot<'_>,
+) -> socket_patch_core::vex::discover::Discovery {
+    socket_patch_core::vex::discover_patched_refs_in(snapshot, &discover_options(common)).await
+}
+
+fn discover_options(common: &crate::args::GlobalArgs) -> socket_patch_core::vex::DiscoverOptions {
+    socket_patch_core::vex::DiscoverOptions {
         patch_server_origins: common
             .patch_server_url
             .iter()
             .filter(|url| !url.trim().is_empty())
             .cloned()
             .collect(),
-    };
-    socket_patch_core::vex::discover_patched_refs_with(root, &opts).await
+    }
 }
 
 /// Read-only lenient view of a loaded hosted redirect ledger: missing → `None`
