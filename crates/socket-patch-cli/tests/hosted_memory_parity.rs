@@ -853,10 +853,18 @@ async fn parity_socket_yml_filters_the_same_roots_and_packages() {
     );
     let server = MockServer::start().await;
     mount_api(&server, &patches).await;
-    let memory = run_engine(&server, policy_input(&repo)).await;
+    let (selection, input) = two_phase(&repo, options(false));
+    assert!(selection.policy_error.is_none(), "{:?}", selection.policy_error);
+    let memory = run_engine(&server, input).await;
     assert!(memory.policy_error.is_none(), "{:?}", memory.policy_error);
     let roots: Vec<&str> = memory.projects.iter().map(|p| p.root.as_str()).collect();
     assert_eq!(roots, vec!["apps/web", "services/api"], "the ignored root is not processed");
+    // Selection reports the root it excluded; nothing of it is streamed.
+    assert!(selection
+        .ignored_sample
+        .iter()
+        .any(|i| i.path == "apps/legacy/package-lock.json" && i.reason == "policy_path_excluded"));
+    assert!(!selection.fetch_text.iter().chain(&selection.present_only).any(|p| p.starts_with("apps/legacy/")));
     let memory_policy = memory.policy.clone().expect("policy block");
     assert_eq!(memory_policy["source"], "file");
 
@@ -878,7 +886,9 @@ async fn parity_socket_yml_filters_the_same_roots_and_packages() {
             assert!(disk.changed.is_empty(), "{root}: an ignored root changes nothing");
         }
     }
-    assert_eq!(filtered_set(&memory_policy), disk_filtered);
+    let mut memory_filtered = filtered_set(&memory_policy);
+    memory_filtered.insert(("apps/legacy".to_string(), None, "policy_path_excluded".to_string()));
+    assert_eq!(memory_filtered, disk_filtered);
     assert!(disk_filtered.contains(&("apps/legacy".to_string(), None, "policy_path_excluded".to_string())));
     assert!(disk_filtered.contains(&(
         "services/api".to_string(),
@@ -944,6 +954,11 @@ async fn memory_policy_file_withheld_or_invalid_is_a_policy_error() {
     let err = out.policy_error.expect("policyError");
     assert!(err.detail.contains("patches.apiUrl"), "{}", err.detail);
     assert!(out.changed_files.is_empty());
+    // A bypassed session with a selection that applied the file.
+    let mut half = opts.clone();
+    half.no_socket_yml = Some(true);
+    let out = run_engine(&server, build_input(&repo, &[], half)).await;
+    assert_eq!(out.policy_error.expect("policyError").code, "socket_yml_invalid");
     // noSocketYml skips it on both sides.
     let mut bypass = options(false);
     bypass.no_socket_yml = Some(true);
@@ -1005,10 +1020,13 @@ fn selection_applies_the_path_policy_and_fails_closed() {
     assert!(selection.fetch_text.contains(&"socket.yml".to_string()));
     assert_eq!(selection.roots, vec!["apps/web"]);
     // Excluded roots (file list and built-in ignores, any case) are
-    // presence-only: never fetched, still reported by the session.
+    // reported and never streamed.
     for path in ["apps/old/yarn.lock", "apps/web/tests/app/package-lock.json", "Fixtures/x/yarn.lock"] {
-        assert!(selection.present_only.contains(&path.to_string()), "{path}: {selection:?}");
-        assert!(!selection.fetch_text.contains(&path.to_string()), "{path}");
+        assert!(
+            selection.ignored_sample.iter().any(|i| i.path == path && i.reason == "policy_path_excluded"),
+            "{path}: {selection:?}"
+        );
+        assert!(!selection.fetch_text.contains(&path.to_string()) && !selection.present_only.contains(&path.to_string()), "{path}");
     }
     // Named roots are explicit: the built-in ignores do not apply.
     let named = select_paths(
@@ -1070,14 +1088,21 @@ async fn memory_negation_reincludes_a_default_ignored_root() {
     assert_eq!(selection.roots, vec!["e2e/tests"]);
     assert!(selection.fetch_text.contains(&"e2e/tests/package-lock.json".to_string()));
     assert!(!selection.fetch_text.iter().any(|p| p.starts_with("x/")), "{selection:?}");
+    assert!(selection
+        .ignored_sample
+        .iter()
+        .any(|i| i.path == "x/tests/package-lock.json" && i.reason == "policy_path_excluded"));
     let memory = run_engine(&server, input).await;
     let roots: Vec<&str> = memory.projects.iter().map(|p| p.root.as_str()).collect();
     assert_eq!(roots, vec!["e2e/tests"]);
     assert!(!memory.projects[0].redirected.is_empty(), "{:#}", memory.projects[0].redirect);
-    let filtered = filtered_set(memory.policy.as_ref().unwrap());
-    assert!(filtered.contains(&("x/tests".to_string(), None, "policy_path_excluded".to_string())));
-    let entry = &memory.policy.as_ref().unwrap()["filtered"][0];
-    assert_eq!(entry["detail"], "tests/ (built-in default)");
+
+    // Given every root anyway, the session applies the same filter itself.
+    let direct = run_engine(&server, build_input(&repo, &[], policy_options(&repo))).await;
+    let roots: Vec<&str> = direct.projects.iter().map(|p| p.root.as_str()).collect();
+    assert_eq!(roots, vec!["e2e/tests"]);
+    let entry = &direct.policy.as_ref().unwrap()["filtered"][0];
+    assert_eq!((entry["project"].as_str(), entry["detail"].as_str()), (Some("x/tests"), Some("tests/ (built-in default)")));
 
     // Disk patches the same root the same way.
     let disk = run_disk_in(&server, &repo, "e2e/tests", false);

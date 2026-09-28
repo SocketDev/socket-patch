@@ -289,24 +289,31 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
     };
     // The same root filter the session applies, so a socket.yml negation
     // of a built-in ignore brings that tree's files in here too. An
-    // excluded root's markers stay presence-only: the session sees the root
-    // and reports it filtered, as disk does, without its content.
+    // excluded root is reported here, not streamed: its markers would
+    // count against the session's file limit.
     let explicit = options.project_roots.is_some();
     let mut roots: Vec<String> = Vec::with_capacity(candidate_roots.len());
-    let mut excluded_markers: Vec<String> = Vec::new();
     for root in candidate_roots {
         let markers = root_markers(&root, blobs.keys().map(String::as_str));
-        let admitted = policy
-            .admits_root(&Root {
-                rel_dir: &root,
-                markers: &markers,
-                explicit,
-            })
-            .is_ok();
-        if admitted {
-            roots.push(root);
-        } else {
-            excluded_markers.extend(markers.iter().map(|m| join_root(&root, m)));
+        match policy.admits_root(&Root {
+            rel_dir: &root,
+            markers: &markers,
+            explicit,
+        }) {
+            Ok(()) => roots.push(root),
+            Err(reason) => {
+                let paths: Vec<String> = if markers.is_empty() {
+                    vec![root.clone()]
+                } else {
+                    markers.iter().map(|m| join_root(&root, m)).collect()
+                };
+                for path in paths {
+                    ignored.push(IgnoredPath {
+                        path,
+                        reason: reason.code().to_string(),
+                    });
+                }
+            }
         }
     }
     let root_set: BTreeSet<&str> = roots.iter().map(String::as_str).collect();
@@ -369,9 +376,6 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         }
     }
 
-    for path in excluded_markers {
-        needs.entry(path).or_insert(Need::Present);
-    }
     // The session reads the same policy text again.
     for name in &policy_paths {
         needs.entry(name.clone()).or_insert(Need::Text);

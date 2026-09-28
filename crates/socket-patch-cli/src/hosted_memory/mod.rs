@@ -403,7 +403,10 @@ async fn engine(
         PolicySource::File { path, sha256 } => Some((path.as_str(), sha256.as_str())),
         PolicySource::None | PolicySource::Bypassed => None,
     };
-    if !options.policy_overrides.bypass && read.map(|(_, sha)| sha) != options.policy_sha256.as_deref() {
+    // Selection returns no digest when it bypassed the file, so a digest
+    // with a bypassed session means the two sides disagree.
+    let expected = if options.policy_overrides.bypass { None } else { read.map(|(_, sha)| sha) };
+    if expected != options.policy_sha256.as_deref() {
         let error = PolicyError::Invalid {
             file: read.map_or(POLICY_FILE_NAMES[0], |(path, _)| path).to_string(),
             key: String::new(),

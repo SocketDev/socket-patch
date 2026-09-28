@@ -1069,9 +1069,11 @@ Gaps and contradictions A resolved with the smallest reasonable decision
    option, since 7.2 does not say how the session learns what the
    selector saw; a session that reads a policy file without it fails
    closed. Selection also takes `noSocketYml` so both sides bypass
-   together. A root the selector excludes keeps its markers in
-   `presentOnly` (no content), so the session still lists it under
-   `policy.filtered[]` as disk does.
+   together; a bypassed session given a digest fails closed. A root the
+   selector excludes is reported in its `ignoredSample` with the
+   `policy_*` reason and never streamed (streaming its markers would count
+   every fixture lockfile against `maxFiles`), so in memory
+   `policy.filtered[]` lists only the roots the session received.
 10. **Env layer of `--min-severity`** is read by scan, not clap, so the
     `policy` block can say `source: "env"`; a malformed env value exits 2 at
     run time, a malformed flag at parse time.

@@ -10,10 +10,11 @@ export interface PathSelection {
   ignoredCount: number
   ignoredSample: { path: string; reason: string }[]   // ≤100
   policyPaths: string[]        // root socket.yml / socket.yaml the tree lists (also in fetchText or symlinks); pass back as the session's policyPaths
-  policySha256: string | null  // the policy file selection applied; pass back as the session's policySha256
+  policySha256: string | null  // the policy file selection applied (null: none, empty, or noSocketYml); pass back as the session's policySha256
   policyError?: { code: 'socket_yml_invalid' | 'socket_yml_ambiguous'; detail: string }   // nothing selected
 }
 // Fetch every root socket.yml / socket.yaml the listing holds first and pass it in policyFiles: selection applies the full socket.yml path policy.
+// text must decode losslessly (buffer.toString('utf8'); TextDecoder drops a BOM and the session then sees different content). Excluded roots are reported in ignoredSample, not streamed.
 export type PolicyFileInput = { path: string; text: string } | { path: string; missing: true }
 export function selectHostedScanPaths(entries: TreeEntryInput[], options?: { projectRoots?: string[]; ecosystems?: Ecosystem[]; policyFiles?: PolicyFileInput[]; noSocketYml?: boolean }): PathSelection
 export function hostedScanCandidateFiles(): string[]    // debug listing only
