@@ -5,8 +5,8 @@
 //!    (PyPI is used for fixture setup only);
 //! 2. OUR CLI produces the committed state against a wiremock patch service:
 //!    hosted = `scan --redirect --vex` on the lock-only checkout (the lock is
-//!    repointed at a patched wheel the mock serves, the redirect ledger is
-//!    written, the same-run VEX attests from the lock's sha256 pin); vendored
+//!    repointed at a patched wheel the mock serves — v5 writes NO redirect
+//!    ledger — the same-run VEX attests from the lock's sha256 pin); vendored
 //!    = `scan --vendor --vendor-source build --vex` over the pristine
 //!    install (the patched wheel is committed under
 //!    `.socket/vendor/pypi/<uuid>/`, the lock is rewired to it, and only the
@@ -19,19 +19,21 @@
 //! 4. manifest-less VEX over that installed checkout, with standalone
 //!    `socket-patch vex --json --output` against a separate records API:
 //!    - (1) `.socket/manifest.json` deleted → attested with the right
-//!      `(redirected)` / `(vendored)` marker and vulnerability ids, and also
-//!      offline from the committed ledger;
-//!    - (2) the ledgers deleted too → still attested, via lockfile discovery
-//!      and the API record (installed tree / committed wheel hash-verified);
-//!      embedded `apply --vex` (and vendored `vendor --vex`) agree;
+//!      `(redirected)` / `(vendored)` marker and vulnerability ids (vendored
+//!      also offline from the committed vendor ledger);
+//!    - (2) no ledgers → still attested, via lockfile discovery and the API
+//!      record (installed tree / committed wheel hash-verified); embedded
+//!      `apply --vex` (and vendored `vendor --vex`) agree;
 //!    - (3) `--offline` with no ledgers → `record_unavailable`, zero API
 //!      requests;
-//!    - (4) the lock reverted to the registry version with the ledgers and
-//!      artifacts kept → NOT attested (`redirect_unwired` /
-//!      `vendor_unwired`), under `--no-verify` too;
+//!    - (4) the lock reverted to the registry version (vendor ledger and
+//!      artifacts kept) → NOT attested: `vendor_unwired` for vendored,
+//!      nothing names the patch at all for hosted — under `--no-verify` too;
 //!
-//!    then the real `rollback` / `vendor --revert` in the original project
-//!    restores the pristine lock byte for byte.
+//!    then the real `rollback` (hosted: the upstream PyPI entry re-resolved
+//!    from the registry, pins discovered on the `--patch-server-url` origin)
+//!    / `vendor --revert` in the original project restores the pristine lock
+//!    byte for byte.
 //!
 //! Poetry selection: `SOCKET_PATCH_POETRY_BIN` (a Poetry executable, e.g.
 //! `<venv>/bin/poetry` of a pinned release) or `poetry` on `PATH`. With
@@ -632,16 +634,16 @@ fn manifestless_vex_matrix(
 ) {
     let label = format!("poetry {} {marker:?}", ctx.poetry.version);
     let api = PatchApi::start(vec![(uuid.into(), record_view(uuid, pristine, patched))]);
-    let unwired = match marker {
-        Marker::Redirected => "redirect_unwired",
-        _ => "vendor_unwired",
-    };
+    let hosted = marker == Marker::Redirected;
 
-    // (1) manifest deleted, ledger kept: offline from the ledger, online.
+    // (1) manifest deleted, ledger kept: offline from the vendor ledger,
+    // online. v5 hosted keeps no ledger: no local record to go offline from.
     strip_manifest(ctx.project);
-    let out = ctx.standalone(&api, true, &[]);
-    attested(&format!("{label} (1) ledger offline"), &out, uuid, marker);
-    api.assert_no_requests();
+    if !hosted {
+        let out = ctx.standalone(&api, true, &[]);
+        attested(&format!("{label} (1) ledger offline"), &out, uuid, marker);
+        api.assert_no_requests();
+    }
     let out = ctx.standalone(&api, false, &[]);
     attested(&format!("{label} (1) online"), &out, uuid, marker);
 
@@ -656,7 +658,11 @@ fn manifestless_vex_matrix(
             (p, bytes)
         })
         .collect();
-    assert!(!ledgers.is_empty(), "{label}: the writer left a ledger");
+    assert_eq!(
+        ledgers.is_empty(),
+        hosted,
+        "{label}: vendored leaves its vendor ledger, hosted (v5) none: {ledgers:?}"
+    );
     strip_ledgers(ctx.project);
     let before = api.view_requests(uuid);
     let out = ctx.standalone(&api, false, &[]);
@@ -700,20 +706,29 @@ fn manifestless_vex_matrix(
     for extra in [&[][..], &["--no-verify"][..]] {
         for offline in [true, false] {
             let out = ctx.standalone(&api, offline, extra);
-            omitted(
-                &format!("{label} (4) reverted offline={offline} {extra:?}"),
-                &out,
-                unwired,
-            );
+            let what = format!("{label} (4) reverted offline={offline} {extra:?}");
+            if hosted {
+                // No ledger and no wiring: nothing names the patch any more.
+                assert_eq!(out.code, Some(2), "{what}: {out}");
+                assert_eq!(
+                    out.envelope["error"]["code"], "manifest_not_found",
+                    "{what}: {out}"
+                );
+                assert_absent(out.doc.as_ref(), PURL);
+            } else {
+                omitted(&what, &out, "vendor_unwired");
+            }
         }
     }
-    let out = ctx.run(&api, VexVia::Apply, false, &["--vex-no-verify"]);
-    assert_eq!(out.code, Some(1), "{label} (4) apply --vex: {out}");
-    assert_eq!(
-        out.envelope["error"]["code"], "no_applicable_patches",
-        "{label} (4) apply --vex: {out}"
-    );
-    assert!(out.doc.is_none(), "{label} (4) apply --vex: {out}");
+    if !hosted {
+        let out = ctx.run(&api, VexVia::Apply, false, &["--vex-no-verify"]);
+        assert_eq!(out.code, Some(1), "{label} (4) apply --vex: {out}");
+        assert_eq!(
+            out.envelope["error"]["code"], "no_applicable_patches",
+            "{label} (4) apply --vex: {out}"
+        );
+        assert!(out.doc.is_none(), "{label} (4) apply --vex: {out}");
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -859,14 +874,28 @@ fn poetry_hosted_fresh_install_then_manifestless_vex() {
     let out = ctx.standalone(&api, false, &[]);
     omitted("hosted pristine install", &out, "not_applied");
 
-    // The real rollback in the writer's project restores every byte.
-    let (code, env) = socket_patch(&project, &poetry, &service, &["rollback"]);
+    // The real rollback in the writer's project restores every byte: the
+    // pin is discovered from the lock on the mock's origin
+    // (`--patch-server-url`) and its upstream entry re-resolved from PyPI.
+    let uri = service.uri();
+    let (code, env) = socket_patch(
+        &project,
+        &poetry,
+        &service,
+        &["rollback", "--patch-server-url", &uri],
+    );
     assert_eq!(code, Some(0), "rollback: {env}");
+    assert_eq!(
+        env["hosted"]["reverted"],
+        json!([PURL]),
+        "rollback restores the hosted pin: {env}"
+    );
     assert_eq!(
         std::fs::read_to_string(project.join("poetry.lock")).unwrap(),
         pristine_lock,
         "rollback restores the pristine lock"
     );
+    assert!(!project.join(".socket/vendor/redirect-state.json").exists());
 }
 
 // ════════════════════════════════════════════════════════════════════════

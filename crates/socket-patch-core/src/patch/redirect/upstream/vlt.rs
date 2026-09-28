@@ -10,7 +10,10 @@
 //! lock's other default-registry nodes of the same DepID era; with none to
 //! read, a legacy-era (`·`) id never carries one, and a tilde-era (`~`)
 //! id carries one when the lock records `options.registries` (the rc.33+
-//! writer) and the node sits on the default alias.
+//! writer), the node sits on the default alias, and the tarball URL is not
+//! under a recorded `options.registry` (vlt's own save rule: slot [3] is
+//! written only when no `registry` is configured or the resolved URL does
+//! not start with it — the rc.33 … 1.0.4 `config.registry` projects).
 //!
 //! Every hosted instance of a pin is restored together, and every other
 //! byte of the lock (flags, trailing slots, indent, comma, `\r`) is kept.
@@ -94,6 +97,23 @@ fn records_url(
             .and_then(|o| o.get("registries"))
             .is_some_and(Value::is_object)
         && (segment.is_empty() || segment == default_alias(options))
+        && !under_configured_registry(segment, options)
+}
+
+/// Would a default-registry node on `segment` resolve under the lock's
+/// recorded `options.registry`? vlt omits slot [3] for such a node
+/// (`lockfile/save.ts`: `customRegistry = resolved && (!registry ||
+/// !resolved.startsWith(registry))`).
+fn under_configured_registry(segment: &str, options: Option<&Map<String, Value>>) -> bool {
+    let Some(registry) = options
+        .and_then(|o| o.get("registry"))
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty())
+    else {
+        return false;
+    };
+    let resolved_prefix = format!("{}/", registry_base(segment, options).trim_end_matches('/'));
+    resolved_prefix.starts_with(registry)
 }
 
 pub(crate) async fn restore(
@@ -374,6 +394,17 @@ mod tests {
         ));
         let alias = opts(r#"{"default-registry-alias":"corp","registries":{"corp":"https://c/"}}"#);
         assert!(records_url(DepIdEra::Tilde, "corp", &[], Some(&alias)));
+        // A recorded `registry` the node resolves under: vlt (rc.33 … 1.0.4
+        // with `config.registry`) writes no slot [3].
+        let configured = opts(
+            r#"{"registry":"http://127.0.0.1:4873/","registries":{"npm":"http://127.0.0.1:4873/"}}"#,
+        );
+        assert!(!records_url(DepIdEra::Tilde, "npm", &[], Some(&configured)));
+        // ...but a node on another registry than the configured one does.
+        let elsewhere = opts(
+            r#"{"registry":"https://registry.npmjs.org/","registries":{"npm":"http://127.0.0.1:4873/"}}"#,
+        );
+        assert!(records_url(DepIdEra::Tilde, "npm", &[], Some(&elsewhere)));
     }
 
     use super::super::{restore_upstream, RestoreOptions, RestoreOutcome};

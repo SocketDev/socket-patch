@@ -53,17 +53,24 @@ Boundaries the oracle encodes (measured against real releases):
 Manifest-less VEX (every supported cell, after the installs): a fresh checkout
 of the committed state with .socket/manifest.json deleted and a real frozen
 `bun install` must be attested by standalone `vex` against the public patch
-API — the patched purl under the ledger record's uuid with the `(redirected)` /
-`(vendored)` marker and exactly the record's vulnerability ids (+ CVE aliases),
-also through the embedded `apply --vex`; with both ledgers deleted too
-(lockfile discovery + the API); `--offline` with no ledgers must omit it as
-`record_unavailable` (exit 1); and with the lock put back to the registry
-version (ledgers, artifacts and the patched install kept) it must NOT be
-attested, also under `--no-verify` (`redirect_unwired` / `vendor_unwired`).
+API — the patched purl under the record's uuid (vendored: the vendor
+ledger's record; hosted: v5 writes NO redirect ledger, so the public API's
+`/patch/view/<uuid>` record) with the `(redirected)` / `(vendored)` marker and
+exactly the record's vulnerability ids (+ CVE aliases), also through the
+embedded `apply --vex`; with the vendor ledger deleted too (lockfile discovery
++ the API); `--offline` with no ledger must omit it as `record_unavailable`
+(exit 1); and with the lock put back to the registry version (vendor ledger,
+artifacts and the patched install kept) it must NOT be attested, also under
+`--no-verify` (`vendor_unwired`; hosted: nothing names the patch any more —
+`manifest_not_found`, exit 2).
 
 Every cell records the CLI exit codes (main, repeat, rollback, conversion),
 the exact refusal-code set, the repeat-run envelope semantics, digest
 enforcement, and after rollback the lockfile presence rules and byte identity.
+A hosted rollback restores the DEFAULT upstream registry entry re-resolved
+from the npm registry (a custom-registry slot comes back as bun's default
+`""`); a hosted bun.lockb is binary, so its rollback refuses with the
+`git checkout -- bun.lockb` remedy and the cell applies that remedy.
 
 Provenance: `--cli-revision` is the branch-resolvable commit the row is about
 (PR head, or the pushed commit); `--cli-build-sha` (or the CLI_BUILD_SHA
@@ -558,18 +565,47 @@ def rerun_clean(code, envelope, mode):
             and not set(codes) - INFORMATIONAL - {'already_vendored'})
 
 
-def ledger_record(project, mode):
-    """The patch record the mode's ledger holds for PURL (None when absent).
+PUBLIC_PATCH_API = 'https://patches-api.socket.dev'
+_PUBLISHED_RECORDS = {}
 
-    Both ledgers embed the record — hosted under `records`, vendored under the
-    entry's `record`; vendored mode never writes `.socket/manifest.json`."""
-    path = project / ('.socket/vendor/redirect-state.json' if mode == 'hosted'
-                      else '.socket/vendor/state.json')
+
+def published_record(uuid):
+    """The public proxy's `/patch/view/<uuid>` record (cached per run)."""
+    if uuid not in _PUBLISHED_RECORDS:
+        url = f'{PUBLIC_PATCH_API}/patch/view/{uuid}'
+        for attempt in range(1, 6):
+            try:
+                request = urllib.request.Request(url, headers={'Accept': 'application/json'})
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    _PUBLISHED_RECORDS[uuid] = json.loads(response.read().decode('utf-8'))
+                break
+            except RETRYABLE:
+                if attempt == 5:
+                    raise
+                time.sleep(10 * attempt)
+    return _PUBLISHED_RECORDS[uuid]
+
+
+def hosted_wired(project):
+    """Whether a bun lock of `project` pins the hosted patch UUID."""
+    return any(UUID.encode() in (project / name).read_bytes()
+               for name in ('bun.lock', 'bun.lockb') if (project / name).is_file())
+
+
+def ledger_record(project, mode):
+    """The patch record for PURL the mode's state carries (None when absent).
+
+    Vendored: the vendor ledger's entry `record` (vendored mode never writes
+    `.socket/manifest.json`). Hosted: v5 writes no ledger — the lock pin is
+    the state — so the record is the public API's for the pinned uuid."""
+    if mode == 'hosted':
+        if (project / '.socket/vendor/redirect-state.json').exists():
+            raise RuntimeError('hosted mode wrote the pre-v5 redirect ledger')
+        return published_record(UUID) if hosted_wired(project) else None
+    path = project / '.socket/vendor/state.json'
     if not path.is_file():
         return None
     state = json.loads(path.read_text(encoding='utf-8'))
-    if mode == 'hosted':
-        return state.get('records', {}).get(PURL)
     return state.get('entries', {}).get(PURL, {}).get('record')
 
 
@@ -577,16 +613,30 @@ def load_json(path):
     return json.loads(path.read_text(encoding='utf-8')) if path.is_file() else None
 
 
-def wired_fragments(project, mode):
-    """The {original, new} bun.lock line pair the mode's ledger recorded for
-    PURL: the hosted ledger's `redirect_bun_lock_package` edit, or the
-    vendored ledger's `bun_lock_package` wiring."""
+def wired_fragments(project, mode, before=None, after=None):
+    """The {original, new} bun.lock line pair for PURL: the vendored ledger's
+    `bun_lock_package` wiring, or — hosted, which keeps no ledger in v5 — the
+    text-lock line pinning the hosted UUID in `after` (the lock the CLI wrote)
+    and the line with the same key in `before` (the registry lock)."""
     if mode == 'hosted':
-        edits = load_json(project / '.socket/vendor/redirect-state.json')['edits']
-        return next(e for e in edits if e['path'] in ('bun.lock', 'bun.lockb') and
-                    e['kind'] in ('redirect_bun_lock_package', 'redirect_bun_lockb_package'))
+        new = next(line for line in after.decode('utf-8').split('\n') if UUID in line)
+        key = new[:new.index(': [') + 3]
+        original = next(line for line in before.decode('utf-8').split('\n') if line.startswith(key))
+        return {'original': original.rstrip('\r'), 'new': new.rstrip('\r')}
     wiring = load_json(project / '.socket/vendor/state.json')['entries'][PURL]['wiring']
     return next(w for w in wiring if w['file'] in ('bun.lock', 'bun.lockb'))
+
+
+def hosted_lockb_digest(lockb):
+    """The raw sha512 the hosted bun.lockb pins for the patched tarball: the
+    digest of the hosted artifact its URL names (downloaded — the binary lock
+    stores the integrity as raw bytes, and v5 keeps no ledger to read it from)."""
+    match = re.search(rb'https://patch\.socket\.dev/[\x21-\x7e]+?\.tgz', lockb)
+    if match is None:
+        raise RuntimeError('the hosted bun.lockb names no patch.socket.dev tarball')
+    url = match.group(0).decode('ascii')
+    with urllib.request.urlopen(url, timeout=60) as response:
+        return hashlib.sha512(response.read()).digest()
 
 
 def wired_line(text, recorded_new):
@@ -801,6 +851,7 @@ def main():
                 # fills the slot: inject the full-URL form bun emits for any other
                 # registry and prove bun installs from it before the CLI runs.
                 text = lock.read_text(encoding='utf-8')
+                pre_injection = text.encode('utf-8')
                 injected = text.replace('["minimist@1.2.2", ""', f'["minimist@1.2.2", "{REGISTRY_SLOT}"')
                 checks['registrySlotInjected'] = injected != text
                 lock.write_text(injected, encoding='utf-8')
@@ -848,7 +899,9 @@ def main():
 
             if shape in CONVERSION_SHAPES:
                 # First mode (or the first vendoring): must land and install.
+                before_conversion = lock.read_bytes()
                 code, output = run(cli_command(['scan'], pre_mode), project, env, case / 'conversion.log', False)
+                after_conversion = lock.read_bytes()
                 exit_codes['conversion'] = code
                 pre_envelope = parse_envelope(output)
                 save(case / 'conversion-output.json', pre_envelope)
@@ -868,7 +921,7 @@ def main():
                     code, _ = install(bun, 'member', cache='cache')
                     text = lock.read_text(encoding='utf-8')
                     checks['memberInstall'] = code == 0 and 'workspace:packages/consumer' in text
-                    wiring = wired_fragments(project, pre_mode)
+                    wiring = wired_fragments(project, pre_mode, before_conversion, after_conversion)
                     # Bun < 1.3.10 re-saves URL/local tarball tuples WITHOUT
                     # their sha512 (the 2-tuple `["name@<spec>", {meta}]`);
                     # 1.3.10+ keep the 3-tuple. Either spelling is the CLI's
@@ -935,12 +988,13 @@ def main():
                         raise RuntimeError(f'Expected one applied patch: {output[-4000:]}')
                 record = ledger_record(project, main_mode)
                 if record is None:
-                    raise RuntimeError(f'No ledger record for {PURL} in {main_mode} mode')
+                    raise RuntimeError(f'No patch record for {PURL} in {main_mode} mode')
                 row['patchUuid'] = record['uuid']
                 checks['publishedPatch'] = record['uuid'] == UUID
-                # Neither ledger-backed mode writes .socket/manifest.json: vendored
-                # is manifest-free and hosted persists only the redirect ledger.
+                # Neither mode writes .socket/manifest.json: vendored is
+                # manifest-free and hosted (v5) persists only the lock pin.
                 checks['noManifest'] = not manifest.exists()
+                checks['noRedirectLedger'] = not (project / '.socket/vendor/redirect-state.json').exists()
                 patched_lock = lock.read_bytes()
                 lockb_origin = lock.name == 'bun.lockb'
                 lock_text = patched_lock.decode('utf-8', errors='replace')
@@ -948,9 +1002,10 @@ def main():
                     checks['takeoverReported'] = 'vendor_takeover_reverted_redirect' in codes
                     checks['localPathTuple'] = (f'.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz'
                                                 if lockb_origin else LOCAL_TUPLE_SPEC) in lock_text
-                    redirect_ledger = load_json(project / '.socket/vendor/redirect-state.json')
-                    checks['redirectLedgerRecordGone'] = (redirect_ledger is None
-                                                          or PURL not in redirect_ledger.get('records', {}))
+                    # The takeover restored the upstream registry entry before
+                    # vendoring, so no hosted URL is left and the vendor
+                    # ledger's recorded original is the registry line.
+                    checks['hostedPinGone'] = 'patch.socket.dev' not in lock_text
                     original_wiring = wired_fragments(project, main_mode)['original']
                     if lockb_origin:
                         checks['vendorLedgerOriginalPristine'] = (
@@ -978,9 +1033,10 @@ def main():
                     checks['lockEolPreserved'] = crlf_only(patched_lock)
                 if lockb_origin:
                     checks['nativeBinaryPreserved'] = (project / 'bun.lockb').is_file() and not (project / 'bun.lock').exists()
-                    wiring = wired_fragments(project, main_mode)
-                    checks['binaryPackageSnapshot'] = (isinstance(wiring.get('original'), dict) and
-                                                       isinstance(wiring.get('new'), dict))
+                    if main_mode != 'hosted':
+                        wiring = wired_fragments(project, main_mode)
+                        checks['binaryPackageSnapshot'] = (isinstance(wiring.get('original'), dict) and
+                                                           isinstance(wiring.get('new'), dict))
                 capture = case / 'tree'
                 if capture.exists():
                     shutil.rmtree(capture)
@@ -1060,7 +1116,8 @@ def main():
                 checks['vexApplyEmbedded'] = (code == 0 and envelope.get('status') == 'noManifest'
                                               and vex_attested(doc, PURL, record['uuid'], marker, vulns))
                 saved_ledgers = {rel: (checkout / rel).read_bytes() for rel in LEDGERS if (checkout / rel).is_file()}
-                checks['vexLedgerPresent'] = bool(saved_ledgers)
+                # Vendored commits its vendor ledger; hosted (v5) none at all.
+                checks['vexLedgerPresent'] = bool(saved_ledgers) == (main_mode != 'hosted')
                 for rel in saved_ledgers:
                     (checkout / rel).unlink()
                 code, _, doc = vex('ledgersDeleted')
@@ -1071,12 +1128,14 @@ def main():
                 for rel, data in saved_ledgers.items():
                     (checkout / rel).write_bytes(data)
                 (checkout / lock.name).write_bytes(original[lock.name])
-                unwired = 'redirect_unwired' if main_mode == 'hosted' else 'vendor_unwired'
                 for label, extra in (('reverted', []), ('revertedNoVerify', ['--no-verify'])):
                     code, envelope, doc = vex(label, *extra)
-                    checks['vex' + label[0].upper() + label[1:]] = (
-                        code == 1 and vex_skip_reason(envelope, PURL) == unwired
-                        and not vex_statements(doc, PURL))
+                    if main_mode == 'hosted':
+                        # No ledger and no wiring: nothing names the patch.
+                        dead = (code == 2 and (envelope.get('error') or {}).get('code') == 'manifest_not_found')
+                    else:
+                        dead = code == 1 and vex_skip_reason(envelope, PURL) == 'vendor_unwired'
+                    checks['vex' + label[0].upper() + label[1:]] = dead and not vex_statements(doc, PURL)
                 shutil.rmtree(checkout, ignore_errors=True)
                 code, repeat = run(command, project, env, case / 'repeat.log', False)
                 exit_codes['repeat'] = code
@@ -1118,8 +1177,11 @@ def main():
                     checks['repairFrozenPatchedBytes'] = code == 0 and oracle(project, record, 'after')[0]
                     checks['repairStableLock'] = lock.read_bytes() == patched_lock
                 if lockb_origin:
-                    digest = wired_fragments(project, main_mode)['new']['integrity']
-                    raw_digest = base64.b64decode(digest.removeprefix('sha512-'))
+                    if main_mode == 'hosted':
+                        raw_digest = hosted_lockb_digest(patched_lock)
+                    else:
+                        digest = wired_fragments(project, main_mode)['new']['integrity']
+                        raw_digest = base64.b64decode(digest.removeprefix('sha512-'))
                     tampered = patched_lock.replace(raw_digest, bytes(len(raw_digest)))
                 else:
                     tampered = tamper_digests(patched_lock, UUID.encode())
@@ -1153,10 +1215,27 @@ def main():
                 rolled = parse_envelope(output)
                 rollback_codes = [w.get('code') for w in rolled.get('warnings', [])]
                 row['rollbackWarnings'] = rollback_codes
-                checks['rollbackSucceeded'] = code == 0 and rolled.get('status') == 'success'
+                expected_files = dict(original)
+                if main_mode == 'hosted' and lockb_origin:
+                    # bun.lockb is binary: the v5 upstream restore refuses it
+                    # with the version-control remedy and writes nothing; the
+                    # cell then applies that remedy.
+                    failed = (rolled.get('hosted') or {}).get('failed') or []
+                    checks['rollbackLockbRefused'] = (
+                        code == 1 and any(f.get('purl') == PURL and
+                                          'git checkout -- bun.lockb' in (f.get('error') or '')
+                                          for f in failed)
+                        and lock.read_bytes() == patched_lock)
+                    lock.write_bytes(original['bun.lockb'])
+                else:
+                    checks['rollbackSucceeded'] = code == 0 and rolled.get('status') == 'success'
+                    if main_mode == 'hosted' and shape == 'custom-registry':
+                        # The upstream restore writes the DEFAULT registry entry:
+                        # bun's "" slot, i.e. the lock before the slot injection.
+                        expected_files['bun.lock'] = pre_injection
                 checks['rollbackOriginalFiles'] = all(
                     (project / n).exists() and (project / n).read_bytes() == b
-                    for n, b in original.items() if not (binary_schema_upgraded and n == 'bun.lockb'))
+                    for n, b in expected_files.items() if not (binary_schema_upgraded and n == 'bun.lockb'))
                 if binary_schema_upgraded:
                     _, restored_dump = run([bun, lock.name], project, env,
                                            case / 'rollback-binary-dump.log')
