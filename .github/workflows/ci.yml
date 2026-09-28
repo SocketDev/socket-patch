@@ -26,9 +26,11 @@ permissions:
 # A newer push to the same PR supersedes its older run; nothing else is
 # cancelled. Push, dispatch and schedule runs always finish: main runs are
 # the ONLY rust-cache writers (save-if) and must not die mid-save, and a
-# dispatched base-branch run is the base's only CI verdict.
+# dispatched base-branch run is the base's only CI verdict. The nightly
+# gets its own group: a group holds one pending run, so sharing main's would
+# let a queued push and the nightly cancel each other.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
