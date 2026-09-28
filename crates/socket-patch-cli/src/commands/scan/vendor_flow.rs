@@ -46,7 +46,7 @@ use crate::ui::{plural, print_json};
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 use super::{
     discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json,
-    note_vendor_supersedes_redirect, push_run_warning, ScanArgs,
+    push_run_warning, ScanArgs,
 };
 
 /// Run-level warning: a `.socket/manifest.json` record for a purl the
@@ -190,9 +190,8 @@ async fn run_scan_vendor_step(
     let manifest_path = common.resolved_manifest_path();
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    // The guard lives to the end of the step so the ledger migration and
-    // the redirect-ledger reconcile in `note_vendor_supersedes_redirect`
-    // run under the lock too.
+    // The guard lives to the end of the step so the ledger migration runs
+    // under the lock too.
     let _guard =
         crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout).map_err(|e| {
             let (code, message) = lock_failure(&e, timeout);
@@ -230,7 +229,6 @@ async fn run_scan_vendor_step(
         env.mark_partial_failure();
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
-    note_vendor_supersedes_redirect(&mut env, &common.cwd, common).await;
     Ok((has_errors, env))
 }
 
@@ -241,7 +239,7 @@ async fn run_scan_vendor_step(
 /// `no_local_source` fold (staging could not obtain the patch content —
 /// offline, or the view fetch failed).
 #[allow(clippy::too_many_arguments)]
-async fn stage_and_vendor(
+pub(crate) async fn stage_and_vendor(
     common: &GlobalArgs,
     socket_dir: &Path,
     manifest: &PatchManifest,

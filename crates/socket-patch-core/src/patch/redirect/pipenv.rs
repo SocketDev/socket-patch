@@ -7,10 +7,10 @@ use serde_json::{json, Value};
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 
-struct Property {
-    name: String,
-    range: Range<usize>,
-    value: Value,
+pub(super) struct Property {
+    pub(super) name: String,
+    pub(super) range: Range<usize>,
+    pub(super) value: Value,
 }
 
 fn properties(text: &str, offset: usize) -> Result<Vec<Property>, String> {
@@ -82,7 +82,7 @@ fn properties(text: &str, offset: usize) -> Result<Vec<Property>, String> {
     }
 }
 
-fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
+pub(super) fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
     // A UTF-8 BOM (Windows editors) is not JSON; parse past it. Offsets
     // below come from `text.find('{')`, so they stay byte-accurate.
     let value =
@@ -111,7 +111,7 @@ fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
     Ok(result)
 }
 
-fn format_entry(value: &Value, text: &str, start: usize) -> Result<String, String> {
+pub(super) fn format_entry(value: &Value, text: &str, start: usize) -> Result<String, String> {
     let mut bytes = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
     value
@@ -160,82 +160,6 @@ pub(super) fn reserialized_around_reference(live: &Value, ours: &Value) -> bool 
         .chain(ours.keys())
         .filter(|key| !RELOCK_REWRITES.contains(&key.as_str()))
         .all(|key| live.get(key) == ours.get(key))
-}
-
-pub(super) fn restore(text: &str, edit: &FileEdit) -> Result<String, String> {
-    if edit.path != "Pipfile.lock" {
-        return Err("Pipenv edit must target Pipfile.lock".into());
-    }
-    let [section, name]: [String; 2] =
-        serde_json::from_str(edit.key.as_deref().ok_or("missing Pipenv key")?)
-            .map_err(|e| e.to_string())?;
-    let original = edit
-        .original
-        .as_ref()
-        .and_then(Value::as_str)
-        .ok_or("missing Pipenv original")?;
-    // The ledger is committed and tamper-able: only a JSON object may be
-    // spliced back into the lock (never arbitrary text that would corrupt
-    // it or smuggle in extra entries).
-    if !serde_json::from_str::<Value>(original).is_ok_and(|value| value.is_object()) {
-        return Err("Pipenv original is not a JSON object".into());
-    }
-    let new = edit
-        .new
-        .as_ref()
-        .and_then(Value::as_str)
-        .ok_or("missing Pipenv replacement")?;
-    let Some((_, entry)) = entries(text)?
-        .into_iter()
-        .find(|(category, entry)| category == &section && entry.name == name)
-    else {
-        // A relock that DROPPED the entry (`pipenv uninstall <pkg>`, a Pipfile
-        // edit + `pipenv lock`): the redirect is gone with it — nothing to
-        // unwind, the edit retires.
-        return Ok(text.into());
-    };
-    let live = &text[entry.range.clone()];
-    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let original_value: Value = serde_json::from_str(original).map_err(|e| e.to_string())?;
-    let new_value: Option<Value> = serde_json::from_str(new).ok();
-    // Comparisons are SEMANTIC (parsed JSON), so a line-ending conversion of
-    // the whole file (git autocrlf, a cross-OS checkout) or a re-serialization
-    // that only moved whitespace is neither drift nor a reason to refuse.
-    if live == original || entry.value == original_value {
-        return Ok(text.into());
-    }
-    // "Still ours": Pipenv re-serialized the entry around the very reference
-    // we wrote (see [`reserialized_around_reference`]).
-    let same_reference = new_value
-        .as_ref()
-        .is_some_and(|new_value| reserialized_around_reference(&entry.value, new_value));
-    if live != new && new_value.as_ref() != Some(&entry.value) && !same_reference {
-        // A relock (`pipenv lock`, `pipenv update`, `pipenv install <other>`
-        // on <= 2023) regenerates the entry to registry shape: the redirect
-        // is already gone and the user's fresh resolution is the desired end
-        // state, so the edit is retired instead of holding every pypi revert
-        // hostage forever. A DIFFERENT `file`/`path` reference (a user's own
-        // source, a hand edit) is real drift and still refuses.
-        let registry_shaped = entry
-            .value
-            .as_object()
-            .is_some_and(|object| !object.contains_key("file") && !object.contains_key("path"));
-        if registry_shaped {
-            return Ok(text.into());
-        }
-        return Err(format!("Pipenv entry {section}.{name} drifted"));
-    }
-    // Still our reference (byte-identical, re-serialized by Pipenv, or a
-    // `--keep-outdated` hybrid that kept our `file`/`path`): splice the
-    // recorded original back, in the live file's line ending.
-    let restored = if ending == "\r\n" {
-        original.replace("\r\n", "\n").replace('\n', "\r\n")
-    } else {
-        original.replace("\r\n", "\n")
-    };
-    let mut result = text.to_owned();
-    result.replace_range(entry.range, &restored);
-    Ok(result)
 }
 
 /// Whether any pypi override names a package this `Pipfile.lock` pins — the
@@ -452,7 +376,6 @@ fn plan(
             if object.get(source_key).and_then(Value::as_str) == Some(&url)
                 && object.get("hashes") == Some(&json!([format!("sha256:{sha}")]))
                 && !object.contains_key("version")
-                && !object.contains_key("index")
             {
                 continue;
             }
@@ -464,9 +387,18 @@ fn plan(
                 dep.name, dep.version
             )));
         }
+        // `index` stays exactly as Pipenv wrote it (present or absent): it
+        // is the one registry field the upstream restore cannot re-derive.
+        // Whether Pipenv records it depends on the release, the Pipfile
+        // spelling and the locking environment (2022.12.19 writes it for an
+        // `extras` table, 2026.8.0 does not; neither writes it for a
+        // marker-excluded package or a transitive one), so dropping it would
+        // make `rollback` guess. On a `file`/`path` entry it only selects
+        // the source group Pipenv installs the URL through — pip fetches
+        // the URL itself either way (measured on 2018.11.26 through
+        // 2026.8.0: install, `--deploy`, `sync`, `verify`).
         let mut new = object.clone();
         new.remove("version");
-        new.remove("index");
         new.remove("file");
         new.remove("path");
         new.insert(source_key.into(), Value::String(url.clone()));
@@ -529,11 +461,6 @@ mod tests {
                 );
             }
             assert_eq!(plan(&text, &dep, None).unwrap(), (text.clone(), Vec::new()));
-            let mut restored = text;
-            for edit in edits.iter().rev() {
-                restored = restore(&restored, edit).unwrap();
-            }
-            assert_eq!(restored, original);
         }
     }
 
@@ -629,17 +556,13 @@ mod tests {
     }
 
     #[test]
-    fn bom_prefixed_lock_is_rewritten_and_restored_with_the_bom_intact() {
+    fn bom_prefixed_lock_is_rewritten_with_the_bom_intact() {
         let dep = dependency("urllib3", "1.26.18", "patch-one");
         let original = format!("\u{feff}{}", lock());
         let (text, edits) = plan(&original, &dep, None).unwrap();
         assert!(text.starts_with('\u{feff}'), "the BOM is preserved");
         assert!(text.contains("patch.socket.dev"));
-        let mut restored = text;
-        for edit in edits.iter().rev() {
-            restored = restore(&restored, edit).unwrap();
-        }
-        assert_eq!(restored, original);
+        assert!(!edits.is_empty());
     }
 
     #[test]
@@ -663,50 +586,6 @@ mod tests {
         assert!(plan(&lock(), &missing_hash, None).is_err());
     }
 
-    /// `pipenv lock` (and `update`, and `install <other>` before 2024)
-    /// regenerates the redirected entry to registry shape. That is the
-    /// desired end state of a rollback, so the edit retires cleanly instead
-    /// of refusing forever; a foreign `file`/`path` reference is still drift.
-    /// A re-scan after the relock (second edit on the same key) unwinds
-    /// newest-first to the relocked text.
-    #[test]
-    fn relocked_registry_entry_retires_the_edit_instead_of_refusing() {
-        let dep = dependency("urllib3", "1.26.18", "patch-one");
-        // One category, so the relock below regenerates the ONLY redirect.
-        let mut value: Value = serde_json::from_str(&lock()).unwrap();
-        value.as_object_mut().unwrap().remove("tests");
-        let original = format_entry(&value, "{", 0).unwrap() + "\n";
-        let (redirected, edits) = plan(&original, &dep, None).unwrap();
-        assert_eq!(edits.len(), 1);
-        let redirected_entry = edits[0].new.as_ref().unwrap().as_str().unwrap();
-        let relocked_entry = format_entry(
-            &json!({"hashes": ["sha256:relocked"], "index": "pypi", "version": "==1.26.18"}),
-            &redirected,
-            redirected.find(redirected_entry).unwrap(),
-        )
-        .unwrap();
-        let relocked = redirected.replacen(redirected_entry, &relocked_entry, 1);
-        assert_eq!(
-            restore(&relocked, &edits[0]).unwrap(),
-            relocked,
-            "a registry-shaped entry is already unwound"
-        );
-        let foreign = redirected.replacen(
-            redirected_entry,
-            &format_entry(&json!({"file": "https://example.org/fork.whl"}), &redirected, 0).unwrap(),
-            1,
-        );
-        assert!(restore(&foreign, &edits[0]).is_err(), "a foreign reference is drift");
-
-        // Re-scan after the relock, then roll back newest-first.
-        let (again, second) = plan(&relocked, &dep, None).unwrap();
-        let mut current = again;
-        for edit in second.iter().chain(edits.iter()) {
-            current = restore(&current, edit).unwrap();
-        }
-        assert_eq!(current, relocked);
-    }
-
     #[test]
     fn lock_targets_requires_a_matching_pin_in_a_parseable_lock() {
         let dep = dependency("URLlib3", "1.26.18", "patch-one");
@@ -723,9 +602,10 @@ mod tests {
 
     /// `pipenv lock --keep-outdated` (2022) rewrites our entry into a
     /// file+version+index hybrid that Pipenv still installs from: it is
-    /// ours, so it is re-planned to the canonical shape instead of being
-    /// refused as a foreign source (which also vetoed the sibling rewriters);
-    /// a hybrid naming ANOTHER version is a real conflict.
+    /// ours, so it is re-planned to the canonical shape (`version` dropped,
+    /// Pipenv's `index` kept) instead of being refused as a foreign source
+    /// (which also vetoed the sibling rewriters); a hybrid naming ANOTHER
+    /// version is a real conflict.
     #[test]
     fn owned_hybrid_entries_are_replanned_not_refused() {
         let dep = dependency("urllib3", "1.26.18", "patch-one");
@@ -738,7 +618,7 @@ mod tests {
         assert!(!edits.is_empty(), "the hybrid is re-planned");
         let entry: Value = serde_json::from_str(&fixed).unwrap();
         assert!(entry["default"]["urllib3"].get("version").is_none());
-        assert!(entry["default"]["urllib3"].get("index").is_none());
+        assert_eq!(entry["default"]["urllib3"]["index"], json!("pypi"));
         assert!(entry["default"]["urllib3"]["file"].as_str().unwrap().contains("patch-one"));
 
         value["default"]["urllib3"]["version"] = json!("==2.0.0");
@@ -763,84 +643,25 @@ mod tests {
         assert!(owned_url(&dep.artifact_url, &dep), "the grant's own origin is ours");
         assert!(owned_url(public, &dep), "and so is the public service");
         assert!(!owned_url("https://patches.internal.example:8443/patch/pypi/urllib3/1.26.19/tok/patch-one/urllib3-1.26.19-py3-none-any.whl", &dep), "another version is not");
-        // Rotation on the custom origin restores through the chain.
-        let original = lock();
-        let (first, edits) = plan(&original, &dep, None).unwrap();
+        // Rotation on the custom origin re-points the owned entry.
+        let (first, _) = plan(&lock(), &dep, None).unwrap();
         dep.artifact_url = dep.artifact_url.replace("/tok/", "/rotated/");
         let (second, rotation) = plan(&first, &dep, None).unwrap();
-        let mut restored = second;
-        for edit in rotation.iter().chain(edits.iter()) {
-            restored = restore(&restored, edit).unwrap();
-        }
-        assert_eq!(restored, original);
+        assert!(!rotation.is_empty());
+        assert!(second.contains("/rotated/") && !second.contains("/tok/"));
     }
 
-    #[test]
-    fn restore_refuses_a_non_object_ledger_original() {
-        let dep = dependency("urllib3", "1.26.18", "patch-one");
-        let (text, edits) = plan(&lock(), &dep, None).unwrap();
-        for bad in ["\"just a string\"", "[1, 2]", "not json at all", "{\"a\": 1}, \"injected\": {}"] {
-            let mut edit = edits[0].clone();
-            edit.original = Some(Value::String(bad.to_string()));
-            assert!(restore(&text, &edit).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn rollback_is_per_entry_preserves_unrelated_edits_and_refuses_drift() {
-        let mut value: Value = serde_json::from_str(&lock()).unwrap();
-        value["default"]["six"] = json!({"version":"==1.16.0"});
-        let original = serde_json::to_string_pretty(&value).unwrap();
-        let first = dependency("urllib3", "1.26.18", "patch-one");
-        let second = dependency("six", "1.16.0", "patch-two");
-        let (one, first_edits) = plan(&original, &first, None).unwrap();
-        let (two, second_edits) = plan(&one, &second, None).unwrap();
-        for first_removed in [true, false] {
-            let mut current = two.replace("unchanged", "unrelated-edit");
-            let edits = if first_removed {
-                first_edits
-                    .iter()
-                    .chain(second_edits.iter())
-                    .collect::<Vec<_>>()
-            } else {
-                second_edits.iter().chain(first_edits.iter()).collect()
-            };
-            for edit in edits {
-                current = restore(&current, edit).unwrap();
-            }
-            assert_eq!(current, original.replace("unchanged", "unrelated-edit"));
-        }
-        for edit in &first_edits {
-            let replacement = edit.new.as_ref().unwrap().as_str().unwrap();
-            // A tampered reference (its `#sha256=` pin) is drift…
-            let drift = two.replacen(replacement, &replacement.replace("#sha256=", "#sha256=0"), 1);
-            assert!(restore(&drift, edit).is_err());
-            // …while a re-serialized entry that kept our reference (Pipenv
-            // 2023+ relocking a marker-excluded entry restores the registry
-            // `hashes` and `version` next to it) is still ours and restores.
-            let mut value: Value = serde_json::from_str(&two).unwrap();
-            let section: &str = serde_json::from_str::<[String; 2]>(edit.key.as_deref().unwrap()).unwrap()[0].clone().leak();
-            value[section]["urllib3"]["hashes"] = json!(["sha256:upstream-a", "sha256:upstream-b"]);
-            value[section]["urllib3"]["version"] = json!("==1.26.18");
-            let kept = serde_json::to_string_pretty(&value).unwrap();
-            let restored: Value = serde_json::from_str(&restore(&kept, edit).unwrap()).unwrap();
-            assert!(restored[section]["urllib3"].get("file").is_none(), "{restored}");
-            let mut unsafe_edit = edit.clone();
-            unsafe_edit.path = "../Pipfile.lock".into();
-            assert!(restore(&two, &unsafe_edit).is_err());
-        }
-    }
 }
 
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
     #[test]
-    fn rotates_owned_grants_and_preserves_rollback_chain() {
+    fn rotates_owned_grants() {
         let mut dep = super::tests::dependency("urllib3", "1.26.18", "patch-one");
         for major in [Some(7), Some(11), Some(2018), Some(2026), None] {
             let original = super::tests::lock();
-            let (first, edits) = plan(&original, &dep, major).unwrap();
+            let (first, _) = plan(&original, &dep, major).unwrap();
             let parsed: Value = serde_json::from_str(&first).unwrap();
             let field = if major.is_some_and(|value| value < 2018) {
                 "path"
@@ -850,11 +671,8 @@ mod compatibility_tests {
             assert!(parsed["default"]["urllib3"][field].is_string());
             dep.artifact_url = dep.artifact_url.replace("/token/", "/rotated/");
             let (second, rotation) = plan(&first, &dep, major).unwrap();
-            let mut restored = second;
-            for edit in rotation.iter().chain(edits.iter()) {
-                restored = restore(&restored, edit).unwrap();
-            }
-            assert_eq!(restored, original);
+            assert!(!rotation.is_empty());
+            assert!(second.contains("/rotated/") && !second.contains("/token/"));
             dep.artifact_url = dep.artifact_url.replace("/rotated/", "/token/");
         }
     }
@@ -886,49 +704,4 @@ mod compatibility_tests {
         assert!(result.warnings.iter().any(|w| w.code == "redirect_pipenv_refused" && w.detail.contains("no Pipfile")));
     }
 
-    /// Rollback survives what git and Pipenv do to the lock between the
-    /// redirect and the revert: a whole-file CRLF<->LF conversion, Pipenv
-    /// re-serializing our entry (a `--keep-outdated` hybrid that kept our
-    /// reference), and a relock that dropped the entry altogether.
-    #[test]
-    fn rollback_tolerates_line_ending_conversion_hybrids_and_dropped_entries() {
-        let dep = super::tests::dependency("urllib3", "1.26.18", "patch-one");
-        let original = super::tests::lock();
-        let (redirected, edits) = plan(&original, &dep, None).unwrap();
-        // CRLF conversion of the redirected file → restores the original in CRLF.
-        let crlf = redirected.replace('\n', "\r\n");
-        let mut restored = crlf;
-        for edit in edits.iter().rev() {
-            restored = restore(&restored, edit).unwrap();
-        }
-        assert_eq!(restored, original.replace('\n', "\r\n"));
-        // LF file, CRLF-recorded edits (the redirect ran on a CRLF checkout).
-        let crlf_original = original.replace('\n', "\r\n");
-        let (crlf_redirected, crlf_edits) = plan(&crlf_original, &dep, None).unwrap();
-        let mut restored = crlf_redirected.replace("\r\n", "\n");
-        for edit in crlf_edits.iter().rev() {
-            restored = restore(&restored, edit).unwrap();
-        }
-        assert_eq!(restored, original);
-        // Hybrid: Pipenv re-added version/index next to our reference.
-        let mut value: Value = serde_json::from_str(&redirected).unwrap();
-        value["default"]["urllib3"]["version"] = json!("==1.26.18");
-        value["default"]["urllib3"]["index"] = json!("pypi");
-        let hybrid = serde_json::to_string_pretty(&value).unwrap();
-        let default_edit = edits.iter().find(|e| e.key.as_deref() == Some(r#"["default","urllib3"]"#)).unwrap();
-        let restored = restore(&hybrid, default_edit).unwrap();
-        let value: Value = serde_json::from_str(&restored).unwrap();
-        assert_eq!(value["default"]["urllib3"]["version"], json!("==1.26.18"));
-        assert!(value["default"]["urllib3"].get("file").is_none(), "{restored}");
-        // Dropped entry (`pipenv uninstall`): nothing to unwind, retires.
-        let mut value: Value = serde_json::from_str(&redirected).unwrap();
-        value["default"].as_object_mut().unwrap().remove("urllib3");
-        let dropped = serde_json::to_string_pretty(&value).unwrap();
-        assert_eq!(restore(&dropped, default_edit).unwrap(), dropped);
-        // A foreign reference is still drift.
-        let mut value: Value = serde_json::from_str(&redirected).unwrap();
-        value["default"]["urllib3"]["file"] = json!("https://example.org/fork.whl");
-        let foreign = serde_json::to_string_pretty(&value).unwrap();
-        assert!(restore(&foreign, default_edit).is_err());
-    }
 }

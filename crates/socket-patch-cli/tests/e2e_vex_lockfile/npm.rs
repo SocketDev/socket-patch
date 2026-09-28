@@ -494,7 +494,10 @@ fn json_envelopes_carry_why_a_patch_was_gated() {
         "{out}"
     );
 
-    for via in [VexVia::Apply, VexVia::Vendor] {
+    // Embedded: `apply --vex` (on this HOSTED checkout `vendor` is the v5
+    // eject flow, not a manifest-less VEX run).
+    {
+        let via = VexVia::Apply;
         let out = run_vex(&binary(), p, &unreachable.clone().via(via));
         assert_eq!(out.code, Some(1), "{via:?}:\n{out}");
         let warnings = warnings_of(&out.envelope);

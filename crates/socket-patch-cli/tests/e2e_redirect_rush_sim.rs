@@ -37,7 +37,7 @@ mod cache_env;
 mod vex_e2e_common;
 use vex_e2e_common::{
     assert_absent, assert_attested, assert_not_attested, git_sha256, patch_view, run_vex,
-    strip_ledgers, strip_manifest, Marker, PatchApi, VexRun,
+    strip_manifest, Marker, PatchApi, VexRun,
 };
 
 const ORG: &str = "test-org";
@@ -253,7 +253,7 @@ async fn mount_hosted(
         })))
         .mount(server)
         .await;
-    // The record the ledger embeds: the patched bytes' real hash, so a
+    // The record the hosted run fetches: the patched bytes' real hash, so a
     // post-install VEX verifies what the install landed.
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
@@ -336,11 +336,11 @@ fn simulate_rush_install(root: &Path, store: &Path) -> Output {
 /// Manifest-less VEX over the Rush repo root after an install landed the
 /// patched bytes. Discovery reads `common/config/rush/pnpm-lock.yaml` (the
 /// rewritten source of truth); the hosted URLs sit on `patch_server` (the
-/// wiremock), named via `--patch-server-url`. Cells: ledger kept (the
-/// ledger record); ledgers deleted (the lock + the patch API record);
-/// `--offline` with no ledgers (`record_unavailable`, zero requests); the
-/// common lock reverted with the ledger restored (`redirect_unwired`,
-/// `--no-verify` too).
+/// wiremock), named via `--patch-server-url`. v5 hosted mode writes no
+/// ledger, so the cells are: online (the lock + the patch API record);
+/// `--offline` (`record_unavailable`, zero requests); the common lock
+/// reverted (nothing names the patch any more — never attested, with or
+/// without `--no-verify`).
 fn assert_rush_manifestless_vex(root: &Path, patch_server: &str, patched: &[u8], pristine: &[u8]) {
     std::thread::scope(|s| {
         s.spawn(|| {
@@ -362,15 +362,12 @@ fn assert_rush_manifestless_vex(root: &Path, patch_server: &str, patched: &[u8],
             let lock = root.join("common/config/rush/pnpm-lock.yaml");
             let wired = std::fs::read(&lock).unwrap();
             strip_manifest(root);
+            assert!(
+                !root.join(".socket/vendor/redirect-state.json").exists(),
+                "v5 hosted mode must not write the redirect ledger"
+            );
             let out = run_vex(&bin, root, &online(false));
-            assert_eq!(out.code, Some(0), "rush, ledger kept: {out}");
-            assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
-
-            let ledger = root.join(".socket/vendor/redirect-state.json");
-            let ledger_bytes = std::fs::read(&ledger).unwrap();
-            strip_ledgers(root);
-            let out = run_vex(&bin, root, &online(false));
-            assert_eq!(out.code, Some(0), "rush, ledgers deleted: {out}");
+            assert_eq!(out.code, Some(0), "rush, lock + API: {out}");
             assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
             assert!(api.view_requests(UUID) >= 1, "{:?}", api.requests());
 
@@ -387,12 +384,10 @@ fn assert_rush_manifestless_vex(root: &Path, patch_server: &str, patched: &[u8],
             assert_not_attested(&out.envelope, PURL, "record_unavailable");
             assert_eq!(api.request_count(), seen, "--offline hit the API");
 
-            std::fs::write(&ledger, &ledger_bytes).unwrap();
             std::fs::write(&lock, pristine).unwrap();
             for no_verify in [false, true] {
                 let out = run_vex(&bin, root, &online(no_verify));
                 assert_ne!(out.code, Some(0), "rush, reverted: {out}");
-                assert_not_attested(&out.envelope, PURL, "redirect_unwired");
                 assert_absent(out.doc.as_ref(), PURL);
             }
             std::fs::write(&lock, &wired).unwrap();

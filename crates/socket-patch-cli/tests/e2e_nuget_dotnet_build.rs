@@ -26,10 +26,10 @@
 //!
 //! | step | shape | expectation |
 //! |---|---|---|
-//! | 1 | no manifest, ledger present | attested `(redirected)` / `(vendored)` online and `--offline` (ledger record) |
+//! | 1 | no manifest, vendor ledger present (vendored only — v5 hosted writes no ledger) | attested `(vendored)` online and `--offline` (ledger record) |
 //! | 2 | no manifest, no ledgers | attested from the lockfile wiring + the patch API record; embedded `apply --vex` (+ `vendor --vex`) too |
 //! | 3 | `--offline`, no ledgers | omitted `record_unavailable`, ZERO requests to the API |
-//! | 4 | lock + config reverted to the registry, ledger + artifacts kept | omitted `redirect_unwired` / `vendor_unwired`, with and without `--no-verify`; a real `dotnet restore --locked-mode` of the reverted files installs the PRISTINE bytes |
+//! | 4 | lock + config reverted to the registry (vendor ledger + artifacts kept) | vendored: omitted `vendor_unwired`; hosted: nothing names the patch any more (`manifest_not_found`) — with and without `--no-verify`; a real `dotnet restore --locked-mode` of the reverted files installs the PRISTINE bytes |
 //!
 //! Gates (the `e2e` CI matrix runs this suite once per SDK major with
 //! `--ignored`): `#[ignore]` keeps it out of the unpinned `test` job (it
@@ -593,7 +593,10 @@ fn allow_http_source(config_path: &Path, uuid: &str) {
 // ── the shared manifest-less VEX matrix ───────────────────────────────
 
 /// Steps 1–4 on a fresh, really-restored checkout. `ledger` is the one the
-/// flow persisted; `store` holds the checkout's (patched) restore.
+/// flow persisted and `dead_reason` the skip a reverted checkout reports
+/// while it is kept — `None` for hosted (v5 writes no redirect ledger, so a
+/// reverted checkout names the patch nowhere); `store` holds the
+/// checkout's (patched) restore.
 #[allow(clippy::too_many_arguments)]
 fn manifestless_vex_matrix(
     dn: &Dotnet,
@@ -602,8 +605,7 @@ fn manifestless_vex_matrix(
     store: &Path,
     uuid: &str,
     marker: Marker,
-    ledger: &str,
-    dead_reason: &str,
+    ledger: Option<(&str, &str)>,
     pristine: &[u8],
     patched: &[u8],
     registry: &(String, String),
@@ -618,22 +620,29 @@ fn manifestless_vex_matrix(
     };
     assert!(!checkout.join(".socket/manifest.json").exists());
     assert!(
-        checkout.join(ledger).is_file(),
-        "the flow committed {ledger}"
+        !checkout
+            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL)
+            .exists(),
+        "v5 hosted mode writes no redirect ledger"
     );
+    let saved_ledger = ledger.map(|(rel, _)| {
+        assert!(checkout.join(rel).is_file(), "the flow committed {rel}");
+        std::fs::read(checkout.join(rel)).unwrap()
+    });
 
     // (1) manifest gone, ledger present: online and offline (ledger record).
-    for (label, run) in [
-        ("online+ledger", VexRun::online(&api)),
-        ("offline+ledger", VexRun::offline()),
-    ] {
-        let out = vex_in(checkout, store, hosted_origin(run));
-        assert_eq!(out.code, Some(0), "SDK {sdk} {label}: {out}");
-        assert_attested(out.doc(), PURL, uuid, marker, &vulns());
+    if saved_ledger.is_some() {
+        for (label, run) in [
+            ("online+ledger", VexRun::online(&api)),
+            ("offline+ledger", VexRun::offline()),
+        ] {
+            let out = vex_in(checkout, store, hosted_origin(run));
+            assert_eq!(out.code, Some(0), "SDK {sdk} {label}: {out}");
+            assert_attested(out.doc(), PURL, uuid, marker, &vulns());
+        }
     }
 
-    // (2) ledgers gone too: the lockfile/config wiring + the API record.
-    let saved_ledger = std::fs::read(checkout.join(ledger)).unwrap();
+    // (2) no ledgers: the lockfile/config wiring + the API record.
     strip_ledgers(checkout);
     let before = api.view_requests(uuid);
     let out = vex_in(checkout, store, hosted_origin(VexRun::online(&api)));
@@ -685,10 +694,12 @@ fn manifestless_vex_matrix(
     );
     quiet.assert_no_requests();
 
-    // (4) the lock + config reverted to the registry, ledger + artifacts
-    // kept: the claim is dead even though the patched bytes are still in
-    // the checkout's store, with and without --no-verify.
-    std::fs::write(checkout.join(ledger), &saved_ledger).unwrap();
+    // (4) the lock + config reverted to the registry (a vendor ledger +
+    // artifacts kept): the claim is dead even though the patched bytes are
+    // still in the checkout's store, with and without --no-verify.
+    if let (Some((rel, _)), Some(bytes)) = (ledger, &saved_ledger) {
+        std::fs::write(checkout.join(rel), bytes).unwrap();
+    }
     std::fs::write(checkout.join("nuget.config"), &registry.0).unwrap();
     std::fs::write(checkout.join("packages.lock.json"), &registry.1).unwrap();
     let reverted_store = sb.dir(&format!("store-reverted-{uuid}"));
@@ -709,11 +720,17 @@ fn manifestless_vex_matrix(
             let mut run = hosted_origin(VexRun::offline());
             run.no_verify = no_verify;
             let out = vex_in(checkout, s, run);
-            assert_omitted(
-                &out,
-                dead_reason,
-                &format!("SDK {sdk} reverted nv={no_verify}"),
-            );
+            let cell = format!("SDK {sdk} reverted nv={no_verify}");
+            match ledger {
+                Some((_, dead_reason)) => assert_omitted(&out, dead_reason, &cell),
+                None => {
+                    assert_eq!(out.code, Some(2), "{cell}: nothing names the patch: {out}");
+                    assert_eq!(
+                        out.envelope["error"]["code"], "manifest_not_found",
+                        "{cell}: {out}"
+                    );
+                }
+            }
         }
     }
 }
@@ -818,8 +835,7 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
         &store_co,
         HOSTED_UUID,
         Marker::Redirected,
-        socket_patch_core::patch::redirect::REDIRECT_STATE_REL,
-        "redirect_unwired",
+        None,
         &pristine,
         &patched,
         &registry,
@@ -919,8 +935,10 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
         &store_co,
         VENDORED_UUID,
         Marker::Vendored,
-        socket_patch_core::vendor::VENDOR_STATE_REL,
-        "vendor_unwired",
+        Some((
+            socket_patch_core::vendor::VENDOR_STATE_REL,
+            "vendor_unwired",
+        )),
         &pristine,
         &patched,
         &registry,

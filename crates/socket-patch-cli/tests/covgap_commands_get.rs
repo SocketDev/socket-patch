@@ -294,6 +294,7 @@ fn engine_params(root: &Path) -> DownloadParams {
         strict: false,
         ecosystems: None,
         persist_blobs: true,
+        patch_server_url: None,
         all_releases: true,
     }
 }

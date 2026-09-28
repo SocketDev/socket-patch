@@ -133,7 +133,7 @@ does (the core `fetch_artifact_probe`) and branches on what it sees:
 
 | Probe | Asserted |
 |---|---|
-| `Content-Encoding` other than identity | the clean refusal: `redirect_vlt_artifact_unverifiable` naming the encoding, `vlt-lock.json` byte-identical, no redirect ledger. With `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` the encoded response is itself a failure. |
+| `Content-Encoding` other than identity | the clean refusal: `redirect_vlt_artifact_unverifiable` naming the encoding, `vlt-lock.json` byte-identical (v5 hosted mode writes no ledger either way). With `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` the encoded response is itself a failure. |
 | identity | the full proof: slot [2] is the served sha512, and a fresh checkout's `vlt ci` installs the patched minimist |
 
 So the leg neither breaks nor goes vacuous when the serve fix

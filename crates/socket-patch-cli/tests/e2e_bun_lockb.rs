@@ -1,6 +1,9 @@
 //! Real Bun binary-lock acceptance tests. The CLI must never invoke a Bun
 //! conversion or replace bun.lockb with text. Every terminal mode is checked
-//! with an empty-cache frozen install, and rollback restores the exact input.
+//! with an empty-cache frozen install, and rollback restores the exact input
+//! (v5: a hosted pin in a binary lock is refused by rollback — restored from
+//! version control instead — while a vendor takeover rebuilds its registry
+//! record from the npm registry, refusing only offline).
 //!
 //! Run scripts/backtest-bun-lockb.py for the writer/reader release matrix.
 //! SOCKET_PATCH_BUN_LOCKB_REQUIRED=1 makes missing tools a hard error;
@@ -62,8 +65,14 @@ fn require_success(output: Output, label: &str) -> Output {
 }
 
 fn cli(project: &Path, args: &[&str]) -> Value {
+    cli_env(project, args, &[])
+}
+
+/// [`cli`] with extra environment variables.
+fn cli_env(project: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
     let output = require_success(
         command(env!("CARGO_BIN_EXE_socket-patch"), project)
+            .envs(envs.iter().copied())
             .args(args)
             .args([
                 "--cwd",
@@ -82,6 +91,69 @@ fn cli(project: &Path, args: &[&str]) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+/// [`cli`] for a run expected to fail: `(exit code, envelope)`.
+fn cli_code(project: &Path, args: &[&str]) -> (i32, Value) {
+    let output = command(env!("CARGO_BIN_EXE_socket-patch"), project)
+        .args(args)
+        .args([
+            "--cwd",
+            project.to_str().unwrap(),
+            "--json",
+            "--no-telemetry",
+        ])
+        .output()
+        .unwrap();
+    let envelope = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code().unwrap_or(-1), envelope)
+}
+
+/// v5 keeps no hosted ledger, so undoing a hosted pin means restoring the
+/// entry's upstream registry form. For a binary `bun.lockb` only a vendor
+/// takeover rebuilds that record (it refuses a workspace-normalized lock), so
+/// `rollback` REFUSES the pin, naming the checkout remedy, and leaves the
+/// lock exactly as found; the test then applies that remedy (`git checkout --
+/// bun.lockb`, here: the original bytes written back).
+fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &MockServer) {
+    let hosted_lock = fixture.lock();
+    let uri = server.uri();
+    let (code, env) = cli_code(
+        &fixture.project,
+        &["rollback", "--yes", "--patch-server-url", &uri],
+    );
+    assert_eq!(code, 1, "a binary hosted pin cannot be restored: {env}");
+    assert_eq!(env["status"], "partial_failure", "{env}");
+    let failed = env["hosted"]["failed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        failed.iter().any(|f| f["purl"] == PURL
+            && f["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("git checkout -- bun.lockb"))),
+        "the refusal names the checkout remedy: {env}"
+    );
+    assert_eq!(
+        fixture.lock(),
+        hosted_lock,
+        "a refused restore writes nothing"
+    );
+    assert!(
+        !fixture
+            .project
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "no hosted ledger exists"
+    );
+    std::fs::write(fixture.project.join("bun.lockb"), &fixture.original_lock).unwrap();
 }
 
 fn scan(project: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> Value {
@@ -670,10 +742,116 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         "hosted rerun: {repeat}"
     );
     assert_eq!(fixture.lock(), hosted_lock);
+    assert!(
+        !project.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
+    );
     std::fs::rename(&modules, project.join("node_modules")).unwrap();
 
-    // Hosted -> vendored, including truthful dry run and exact rerun state.
+    // Hosted -> vendored: v5 restores a hosted pin's upstream entry before
+    // vendoring over it, re-resolving the registry record from the npm
+    // registry — which an OFFLINE takeover cannot do, so it is REFUSED (dry
+    // and wet alike, nothing written) with the checkout remedy. Online, the
+    // takeover rebuilds the binary registry record exactly and vendors over
+    // it; `vendor --revert` then gives back the original bytes. After that
+    // (equivalently, after `git checkout -- bun.lockb`) the offline vendor
+    // proceeds, with a truthful dry run and exact rerun state.
     fixture.stage();
+    let uri = server.uri();
+    let before = snapshot(project);
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let mut args = vec!["vendor", "--offline", "--patch-server-url", &uri];
+        args.extend_from_slice(extra);
+        let (code, refused) = cli_code(project, &args);
+        assert_eq!(
+            code, 1,
+            "vendor {extra:?} over a binary hosted pin: {refused}"
+        );
+        let failed = refused["events"]
+            .as_array()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|e| e["errorCode"] == "redirect_revert_failed")
+            })
+            .unwrap_or_else(|| panic!("expected redirect_revert_failed: {refused}"));
+        assert_eq!(failed["purl"], PURL, "{refused}");
+        assert!(
+            failed["error"].as_str().is_some_and(|e| {
+                e.contains("cannot vendor over the live hosted pin")
+                    && e.contains("git checkout -- bun.lockb")
+            }),
+            "{refused}"
+        );
+        assert_eq!(
+            snapshot(project),
+            before,
+            "refused vendor {extra:?} wrote nothing"
+        );
+    }
+    // The npm registry's version document for minimist@1.2.2 (the public
+    // registry's values, which the original lock pins), served locally.
+    let integrity = "sha512-rIqbOrKb8GJmx/5bc2M0QchhUouMXSpd1RTclXsB41JdL+VtnojfaJR+h7F9k18/4kHUsBFgk80Uk+q569vjPA==";
+    let digest = base64::engine::general_purpose::STANDARD
+        .decode(integrity.trim_start_matches("sha512-"))
+        .unwrap();
+    assert!(
+        fixture.original_lock.windows(64).any(|w| w == digest.as_slice()),
+        "the original lock pins the registry digest"
+    );
+    Mock::given(method("GET"))
+        .and(path("/minimist/1.2.2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dist": {
+            "tarball": "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
+            "integrity": integrity}})))
+        .mount(&server)
+        .await;
+    let taken_over = cli_env(
+        project,
+        &["vendor", "--patch-server-url", &uri, "--vendor-source", "build"],
+        &[("SOCKET_NPM_REGISTRY", &uri)],
+    );
+    assert_eq!(
+        taken_over["summary"]["applied"], 1,
+        "online vendor over the binary hosted pin: {taken_over}"
+    );
+    assert!(
+        taken_over["events"].as_array().is_some_and(|events| events
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect")),
+        "the takeover is reported: {taken_over}"
+    );
+    let vendor_lock = fixture.lock();
+    assert!(
+        !vendor_lock
+            .windows(uri.len())
+            .any(|w| w == uri.as_bytes()),
+        "no hosted URL is left in bun.lockb"
+    );
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(project.join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    let original = state["entries"][PURL]["wiring"]
+        .as_array()
+        .and_then(|w| w.iter().find(|r| r["kind"] == "bun_lockb_package"))
+        .map(|r| r["original"].clone())
+        .unwrap_or_else(|| panic!("bun_lockb_package wiring: {state}"));
+    assert_eq!(original["name"], "minimist", "{original}");
+    assert_eq!(original["version"], "1.2.2", "{original}");
+    assert_eq!(
+        original["resolution"],
+        "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
+        "the vendor ledger records the registry record: {original}"
+    );
+    fixture.frozen("taken-over", &fixture.patched, "minimist");
+    let reverted = cli(project, &["vendor", "--revert", "--offline"]);
+    assert_eq!(
+        fixture.lock(),
+        fixture.original_lock,
+        "the revert restores the pre-hosted bytes exactly: {reverted}"
+    );
+    assert!(!project.join(".socket/vendor").exists(), "{reverted}");
     let before = snapshot(project);
     let preview = cli(project, &["vendor", "--offline", "--dry-run"]);
     assert_eq!(snapshot(project), before, "vendor dry run: {preview}");
@@ -767,8 +945,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     );
     fixture.frozen("hosted-again", &fixture.patched, "minimist");
     fixture.manifestless_vex("hosted-again", bun_vex::BunMode::Hosted, &server.uri());
-    let reverted = cli(project, &["rollback", "--yes"]);
-    assert_eq!(reverted["status"], "success", "rollback: {reverted}");
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
     fixture.pristine();
     fixture.frozen("rolled-back", &fixture.original, "minimist");
 }
@@ -847,7 +1024,7 @@ async fn native_binary_alias_and_transitive() {
             bun_vex::BunMode::Hosted,
             &server.uri(),
         );
-        cli(&fixture.project, &["rollback", "--yes"]);
+        rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
         fixture.pristine();
         fixture.stage();
         let result = cli(&fixture.project, &["vendor", "--offline"]);
