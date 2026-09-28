@@ -2044,6 +2044,17 @@ fn pypi_uv_lock_hosted_install_proof() {
     assert_redirected(&env_json, "uv.lock");
     let lock = read(&proj.join("uv.lock"));
     assert_hosted_pin(&lock, PYPI_UUIDS, LEG);
+    // The ONE uuid the resolver granted (and the lock now pins). The VEX
+    // stand-in below serves exactly that record: v5 hosted keeps no local
+    // record, so `production_record` resolves it from the public proxy, and
+    // handing it all of PYPI_UUIDS would let it serve the first one the
+    // proxy answers for — a different patch than the lock wires, which the
+    // manifest-less `vex` then (rightly) reports `record_unavailable` for.
+    let wired_uuid: &str = PYPI_UUIDS
+        .iter()
+        .copied()
+        .find(|u| lock.contains(u))
+        .unwrap_or_else(|| panic!("{LEG}: the uv.lock pins none of PYPI_UUIDS"));
 
     std::fs::remove_dir_all(&venv).expect("rm venv");
     let resync = tool(&proj, &uv, &["sync", "--frozen", "--quiet"], &env);
@@ -2072,7 +2083,7 @@ fn pypi_uv_lock_hosted_install_proof() {
         tmp: tmp.path(),
         mode: uv_vex::Mode::Hosted,
         purl: PYPI_PURL,
-        uuids: PYPI_UUIDS,
+        uuids: &[wired_uuid],
         registry: &registry,
         uv: &uv,
         patched: &|dir: &Path| {
