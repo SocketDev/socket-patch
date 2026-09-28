@@ -124,10 +124,23 @@ fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
     ecosystems.is_none_or(|list| list.iter().any(|e| e == eco))
 }
 
-/// The detected roots (sorted) and the marker paths that did not make one.
+/// The detected roots (sorted) and the marker paths that did not make one,
+/// with the policy's built-in default ignores applied (path selection,
+/// which cannot see socket.yml's content).
 pub(crate) fn detect_roots<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     ecosystems: Option<&[String]>,
+) -> (Vec<String>, Vec<IgnoredPath>) {
+    detect_roots_with(paths, ecosystems, true)
+}
+
+/// [`detect_roots`]; `apply_defaults: false` leaves the built-in default
+/// ignores to the caller (the session applies the full policy, whose
+/// negations can re-include a default-ignored root).
+pub(crate) fn detect_roots_with<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    ecosystems: Option<&[String]>,
+    apply_defaults: bool,
 ) -> (Vec<String>, Vec<IgnoredPath>) {
     let mut ignored: Vec<IgnoredPath> = Vec::new();
     let mut markers: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
@@ -178,7 +191,8 @@ pub(crate) fn detect_roots<'a>(
             .flatten()
             .map(|p| split_path(p).1.to_string())
             .collect();
-        let default_ignored = socket_patch_core::policy::builtin_defaults()
+        let default_ignored = apply_defaults
+            && socket_patch_core::policy::builtin_defaults()
             .admits_root(&socket_patch_core::policy::Root {
                 rel_dir: dir,
                 markers: &marker_names,

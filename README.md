@@ -747,6 +747,8 @@ patches:
   and `testdata/` directories are skipped by default when scan discovers projects
   (a directory glob such as `scan 'services/*'`); re-include one with a negation
   (`ignorePaths: ["!/e2e/tests/"]`). A directory you name yourself is always scanned.
+  (The autopatch bot's tree listing skips those directories before it reads
+  socket.yml, so there a negation cannot bring one back.)
 - `packages` / `ignorePackages` take `--package` specs; prefer purls (`pkg:npm/core`),
   because a bare name also matches other ecosystems and scoped packages (`core`
   matches `@babel/core`).
@@ -757,8 +759,9 @@ patches:
   is written, with the key and the fix in the message — a typo never widens the
   rollout. `--no-socket-yml` ignores the file for one run.
 - `scan --json` reports what the policy did in a top-level `policy` block
-  (`jq '.policy.counts'`); the human output adds a `Policy (socket.yml): …` line and
-  always names skipped critical/high patches. `get` ignores the policy (explicit
+  (`jq '.policy.counts'`); the human output adds a `Policy (socket.yml): …` line that
+  names every skipped project and every critical/high patch the severity floor held
+  back (`--verbose` lists everything). `get` ignores the policy (explicit
   intent) and warns `policy_bypassed`.
 
 Every key: `enabled`, `includePaths`, `ignorePaths`, `ecosystems`, `packages`,

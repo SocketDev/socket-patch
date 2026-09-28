@@ -558,31 +558,23 @@ mod disk {
     #[cfg(unix)]
     #[test]
     fn owner_rule() {
-        assert!(owner_trusted(1000, 1000));
-        assert!(owner_trusted(0, 1000));
-        assert!(!owner_trusted(1001, 1000));
+        assert!(owner_trusted(1000, 1000, None));
+        assert!(owner_trusted(0, 1000, None));
+        assert!(!owner_trusted(1001, 1000, None));
+        assert!(owner_trusted(1001, 1000, Some(1001)), "sudo's invoking user");
+        assert!(owner_trusted(1001, 0, None), "root trusts every owner");
     }
 
     #[cfg(unix)]
     #[test]
-    fn foreign_owned_git_stops_the_walk() {
-        // SAFETY: no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            // Only root can hand `.git` to another owner; `owner_rule`
-            // covers the decision itself.
-            return;
-        }
+    fn symlinked_git_marks_the_repo_root() {
         let tmp = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
-        fs::create_dir_all(base.join(".git")).unwrap();
-        let cwd = base.join("sub");
-        fs::create_dir_all(&cwd).unwrap();
-        let git = std::ffi::CString::new(base.join(".git").to_str().unwrap()).unwrap();
-        // SAFETY: a valid NUL-terminated path.
-        assert_eq!(unsafe { libc::chown(git.as_ptr(), 4242, 4242) }, 0);
-        let (found, warnings) = find_repo_root_with_warnings(&cwd);
-        assert_eq!(found, cwd);
-        assert_eq!(warnings[0].code, "socket_yml_repo_untrusted");
+        fs::create_dir_all(base.join("gitdir")).unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        std::os::unix::fs::symlink(base.join("gitdir"), repo.join(".git")).unwrap();
+        assert_eq!(find_repo_root(&repo.join("sub")), repo);
     }
 }
 

@@ -331,9 +331,8 @@ pub fn run_disk_in(
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
     }
-    if !cwd_rel.is_empty() {
-        std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
-    }
+    // The checkout is its own repo: no socket.yml above the temp dir applies.
+    std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
     let cwd = checkout.path().join(cwd_rel);
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.env_clear();

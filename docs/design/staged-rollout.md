@@ -1054,9 +1054,11 @@ Gaps and contradictions A resolved with the smallest reasonable decision
    is empty and the floor rule of item 5 cannot see recorded pins (filtered
    packages' pins stay byte-identical regardless: the rewriters only touch
    selected dependencies). `selectHostedScanPaths` applies the built-in
-   default ignores, so a socket.yml negation of a default cannot re-include
-   an in-memory root (the file's content is unknown at selection time); a
-   root named in `projectRoots` is explicit and skips the defaults. There
+   default ignores (the file's content is unknown at selection time), so a
+   socket.yml negation re-includes an in-memory root only when the host
+   streamed its files anyway; the session itself detects roots without the
+   defaults and applies the full policy. A root named in `projectRoots` is
+   explicit and skips the defaults. There
    is no case-variant warning in memory (selection streams exact names
    only). `ProjectResult.skipped[]` carries the post-lookup policy reasons
    (severity, disabled); the pre-lookup ones are in the session `policy`
@@ -1071,6 +1073,22 @@ Gaps and contradictions A resolved with the smallest reasonable decision
     validates the key but does not enforce the cap); R1 and R5 come with B.
 12. **`get`'s `policy_bypassed`** is one warning per package; the severity
     reason fires only when none of the package's patches passes the floor.
+13. **Repo-root trust** (review follow-up): root trusts every `.git` owner
+    and `SUDO_UID`'s user is trusted, so a root CI container over a checkout
+    owned by another uid still applies the policy (distrust would drop a
+    policy that only narrows). A `.git` symlink counts, as in git.
+14. **A disk root with no lockfile** uses its manifests as markers, so
+    `includePaths: ["/*", "!/*/"]` can match a lockfile-less repo root.
+15. **Top-level typos and merge keys fail closed**: a key within two edits
+    of `patches` starting `pat`/`pac`, and a top-level `<<` or aliased key,
+    are errors (another YAML reader could see a `patches` block there).
+16. **Report-only `--json`** fetches patch details only when a floor or
+    `enabled: false` could withhold something, so its `filtered[]` matches
+    the human output.
+17. **What the floor reports**: the top-ranked patch it withheld, when the
+    package ends up unpatched or held at its recorded patch; not when a
+    lower-ranked admitted patch wins. A kept recorded patch that is itself
+    below the floor is not a skip.
 
 ## 10. Open questions (decided by default, revisit with evidence)
 

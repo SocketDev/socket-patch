@@ -475,6 +475,8 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // sub-object onto the hosted default path fails loudly.
     let bin = env!("CARGO_BIN_EXE_socket-patch");
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Its own repo root, so no socket.yml above the temp dir leaks in.
+    std::fs::create_dir(tmp.path().join(".git")).expect(".git");
     let mut cmd = std::process::Command::new(bin);
     cmd.args(["scan", "--json", "--cwd"]).arg(tmp.path());
     // Strip *every* SOCKET_* override the child would otherwise inherit.

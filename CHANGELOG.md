@@ -573,9 +573,11 @@ into the new version's section — see docs/releasing.md.
   detected roots (which used to skip them through a hard-coded, case-
   sensitive segment list). A directory you name (`--cwd`, a literal PATH,
   `projectRoots`) is not affected; `ignorePaths: ["!/e2e/tests/"]`
-  re-includes one.
-- **An invalid socket.yml fails scan.** An unparseable file, a misspelled or
-  invalid `patches` block (unknown key, wrong type, bad glob, `patches`
+  re-includes one (in memory only when the host streamed that root's
+  files: `selectHostedScanPaths` applies the defaults).
+- **An invalid socket.yml fails scan.** An unparseable file, a misspelled
+  top-level `patches` key (`Patches`, `patchs`), a top-level merge or
+  aliased key, an invalid `patches` block (unknown key, wrong type, bad glob, `patches`
   without `version: 2`), or `socket.yml` and `socket.yaml` that disagree
   now fail `scan` before any request or write: exit 1, `errorCode:
   socket_yml_invalid` / `socket_yml_ambiguous`, the key path and the fix
@@ -592,14 +594,17 @@ into the new version's section — see docs/releasing.md.
   `ecosystems`, `packages` / `ignorePackages` (`--package` specs),
   `minSeverity` (critical|high|medium|moderate|low, judged by the worst
   advisory a patch fixes) and `maxNewPatches` (validated; the per-run cap
-  lands with `--max-new-patches`). Flags only narrow further. A package
+  lands with `--max-new-patches`). List flags (`--ecosystems`,
+  `--package`, PATHs) only narrow further; `--min-severity` beats the
+  file's floor and `--no-socket-yml` ignores the file. A package
   that already carries a patch is never removed, upgraded or replaced by
   the policy: it is held and reported under `policy.retained[]`. New flags
   `--min-severity` / `SOCKET_MIN_SEVERITY` and `--no-socket-yml` /
   `SOCKET_NO_SOCKET_YML`; every successful `scan --json` result gains a
   top-level `policy` block (`source`, `sha256`, `minSeverity`, `filtered[]`,
   `retained[]`) and the human output a `Policy (socket.yml): …` line that
-  names every skipped critical/high patch. The in-memory engine takes
+  names every skipped project and every critical/high patch the severity
+  floor held back. The in-memory engine takes
   `noSocketYml` / `minSeverity` / `policyPaths`, `selectHostedScanPaths`
   returns `policyPaths`, and the result carries `policy` or `policyError`.
   `get` ignores the policy and warns `policy_bypassed`.

@@ -1277,8 +1277,9 @@ async fn run_project_dirs(
             let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
             if !resolved.starts_with(&invocation.repo_root) {
                 eprintln!(
-                    "Error: `{}` is outside the repository root {}: scan one repository per \
-                     invocation",
+                    "Error: `{}` is outside {} (the repository root socket.yml is read \
+                     from; without a trusted .git it is --cwd): run one scan per repository, \
+                     or pass --cwd at a common parent",
                     dir.display(),
                     invocation.repo_root.display()
                 );
@@ -1705,14 +1706,17 @@ async fn run_scan(
             print_json(&result);
             return code;
         } else if !args.common.silent {
-            println!(
-                "{}",
-                render::no_packages_message(
-                    args.common.is_global(),
-                    args.common.ecosystems.as_deref(),
-                    &args.paths,
-                )
-            );
+            // A project the policy skipped as a whole is not an empty one.
+            if !policy.root_excluded() {
+                println!(
+                    "{}",
+                    render::no_packages_message(
+                        args.common.is_global(),
+                        args.common.ecosystems.as_deref(),
+                        &args.paths,
+                    )
+                );
+            }
             policy.print_human(args.common.silent, args.common.verbose);
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
@@ -2040,6 +2044,23 @@ async fn run_scan(
 
         let dry = args.common.dry_run;
         let mut apply_code = 0i32;
+
+        // A report-only run selects nothing, but a severity floor or
+        // `enabled: false` still hides candidates; report them like the
+        // human arm does (the detail fetch runs only then).
+        if !apply && !vendor && policy.reports_selection() && !all_packages_with_patches.is_empty() {
+            let _ = discover_selected(
+                &api_client,
+                &all_packages_with_patches,
+                can_access_paid_patches,
+                &policy,
+                false,
+                false,
+                telemetry,
+                Some(&mut result),
+            )
+            .await;
+        }
 
         // --- Apply path (if requested) -----------------------------------
         if apply {

@@ -39,6 +39,9 @@ pub(crate) struct InvocationPolicy {
     pub policy: SelectionPolicy,
     pub repo_root: PathBuf,
     pub warnings: Vec<PolicyWarning>,
+    /// Set once the invocation's warnings were printed (a PATH list runs
+    /// one scan per directory; the file was read once).
+    pub warned: std::sync::atomic::AtomicBool,
 }
 
 /// Load the policy for `args` (4.5): `--global` scans have no repo and read
@@ -54,6 +57,7 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
             policy,
             repo_root: cwd,
             warnings: Vec::new(),
+            warned: Default::default(),
         });
     }
     let (repo_root, mut warnings) = find_repo_root_with_warnings(&cwd);
@@ -64,6 +68,7 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
         policy,
         repo_root,
         warnings,
+        warned: Default::default(),
     })
 }
 
@@ -86,9 +91,29 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
+    if markers.is_empty() {
+        // No lockfile: the manifests say what the project is.
+        markers = MANIFEST_MARKERS
+            .iter()
+            .filter(|name| dir.join(name).is_file())
+            .map(|name| name.to_string())
+            .collect();
+    }
     markers.sort();
     markers
 }
+
+/// Manifests that stand in as markers for a root with no lockfile.
+const MANIFEST_MARKERS: [&str; 8] = [
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "Cargo.toml",
+    "composer.json",
+    "Gemfile",
+    "pom.xml",
+    "build.gradle",
+];
 
 /// One `policy.filtered[]` entry.
 #[derive(Debug, Clone)]
@@ -123,6 +148,11 @@ pub(crate) fn policy_block(
         _ => (serde_json::Value::Null, serde_json::Value::Null),
     };
     let (floor, floor_source) = policy.min_severity();
+    // Sorted: crawl order is filesystem order, and the two engines differ.
+    let mut filtered: Vec<&FilteredEntry> = filtered.iter().collect();
+    filtered.sort_by(|a, b| (&a.project, &a.purl, a.reason.code()).cmp(&(&b.project, &b.purl, b.reason.code())));
+    let mut retained: Vec<&RetainedEntry> = retained.iter().collect();
+    retained.sort_by(|a, b| (&a.project, &a.purl).cmp(&(&b.project, &b.purl)));
     let filtered: Vec<serde_json::Value> = filtered
         .iter()
         .map(|f| {
@@ -178,6 +208,8 @@ struct Report {
 pub(crate) struct ScanPolicy {
     pub policy: SelectionPolicy,
     pub warnings: Vec<PolicyWarning>,
+    /// Print [`Self::warnings`] on the human path (first root only).
+    announce_warnings: bool,
     /// Repo-relative root directory (`""` for the repo root).
     pub project: String,
     /// The root filter's verdict (`Ok` for global scans).
@@ -211,14 +243,38 @@ impl ScanPolicy {
                     .to_string(),
             });
         }
+        let mut report = Report::default();
+        // A root filtered as a whole is one entry, whatever it holds.
+        if let Err(reason) = &root_verdict {
+            report.filtered.push(FilteredEntry {
+                purl: None,
+                uuid: None,
+                project: project.clone(),
+                reason: reason.clone(),
+                severity: None,
+            });
+        }
+        let announce_warnings = !invocation.warned.swap(true, std::sync::atomic::Ordering::Relaxed);
         Self {
             policy: invocation.policy.clone(),
             warnings,
+            announce_warnings,
             project,
             root_verdict,
             recorded: HashMap::new(),
-            report: Mutex::new(Report::default()),
+            report: Mutex::new(report),
         }
+    }
+
+    /// Whether selection can filter anything (a floor, or patching
+    /// disabled): report-only runs select only for the report then.
+    pub(crate) fn reports_selection(&self) -> bool {
+        !self.policy.enabled() || self.policy.min_severity().0.is_some()
+    }
+
+    /// Whether the policy filtered this whole project root.
+    pub(crate) fn root_excluded(&self) -> bool {
+        self.root_verdict.is_err()
     }
 
     fn report(&self) -> std::sync::MutexGuard<'_, Report> {
@@ -271,15 +327,7 @@ impl ScanPolicy {
             return true;
         }
         if self.root_verdict.is_err() {
-            if !report.filtered.iter().any(|f| f.purl.is_none()) {
-                report.filtered.push(FilteredEntry {
-                    purl: None,
-                    uuid: None,
-                    project: self.project.clone(),
-                    reason,
-                    severity: None,
-                });
-            }
+            // Already reported as the root's one entry.
         } else if report.filtered_purls.insert(canon(purl)) {
             report.filtered.push(FilteredEntry {
                 purl: Some(canon(purl)),
@@ -341,7 +389,7 @@ impl ScanPolicy {
                         }
                     }
                     None => report.filtered.push(FilteredEntry {
-                        purl: Some(purl.clone()),
+                        purl: Some(canon(&purl)),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
@@ -362,21 +410,24 @@ impl ScanPolicy {
                 (_, Some(w), _) => Some(w),
                 // Nothing above the floor: a recorded package keeps its patch.
                 (true, None, Some(r)) => Some(r),
-                (true, None, None) => None,
-                (false, None, _) => {
+                (_, None, _) => None,
+            };
+            // What the floor hid is reported: the top-ranked patch it withheld
+            // when the package ends up unpatched or held at its recorded patch
+            // (not when a lower-ranked admitted patch simply wins).
+            let top_withheld = self.policy.admits_severity(patch_severity_order(&group[0]));
+            if let Err(reason) = top_withheld {
+                let upgrade_withheld = chosen.is_some() && chosen == recorded_at && recorded_at != Some(0);
+                if chosen.is_none() || upgrade_withheld {
                     report.filtered.push(FilteredEntry {
-                        purl: Some(purl.clone()),
+                        purl: Some(canon(&purl)),
                         uuid: Some(group[0].uuid.clone()),
                         project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
-                        reason: self
-                            .policy
-                            .admits_severity(patch_severity_order(&group[0]))
-                            .expect_err("no offer passed the floor"),
+                        reason,
                     });
-                    None
                 }
-            };
+            }
             if let Some(i) = chosen {
                 offers.selected.insert(purl.clone(), group[i].clone());
             }
@@ -425,7 +476,7 @@ impl ScanPolicy {
 
     /// Print the policy warnings (stderr) once, human path.
     pub(crate) fn print_warnings(&self, silent: bool) {
-        if silent {
+        if silent || !self.announce_warnings {
             return;
         }
         for w in &self.warnings {
@@ -444,7 +495,7 @@ impl ScanPolicy {
         }
         let filtered = report.filtered.len();
         let retained = report.retained.len();
-        if filtered == 0 && retained == 0 && matches!(self.policy.source(), PolicySource::None) {
+        if filtered == 0 && retained == 0 && self.policy.enabled() {
             return;
         }
         let label = match self.policy.source() {
@@ -461,13 +512,17 @@ impl ScanPolicy {
             line.push_str(" Patching is disabled (patches.enabled: false).");
         }
         println!("{line}");
-        for f in &report.filtered {
+        let mut entries: Vec<&FilteredEntry> = report.filtered.iter().collect();
+        entries.sort_by(|a, b| (&a.project, &a.purl).cmp(&(&b.project, &b.purl)));
+        for f in entries {
+            // A skipped project and a withheld critical/high patch are always
+            // named; everything else only with --verbose.
             let severe = f.severity.is_some_and(|s| s <= 1);
-            if !(verbose || severe) {
+            if !(verbose || severe || f.purl.is_none()) {
                 continue;
             }
             let what = match &f.purl {
-                Some(purl) => normalize_purl(purl).into_owned(),
+                Some(purl) => sanitize(&normalize_purl(purl)),
                 None if self.project.is_empty() => "this project".to_string(),
                 None => format!("project {}", sanitize(&self.project)),
             };
@@ -482,8 +537,8 @@ impl ScanPolicy {
             for r in &report.retained {
                 println!(
                     "  held {} at {}: {}",
-                    normalize_purl(&r.purl),
-                    r.recorded_uuid,
+                    sanitize(&normalize_purl(&r.purl)),
+                    sanitize(&r.recorded_uuid),
                     r.reason.detail()
                 );
             }

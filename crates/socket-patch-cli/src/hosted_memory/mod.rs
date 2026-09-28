@@ -404,7 +404,7 @@ async fn engine(
 
     let root_list: Vec<String> = match &options.project_roots {
         Some(roots) => roots.clone(),
-        None => roots::detect_roots(files.keys().map(String::as_str), ecosystems).0,
+        None => roots::detect_roots_with(files.keys().map(String::as_str), ecosystems, false).0,
     };
     // The full policy (paths from the file too) judges every root before
     // the project limit; roots named in `projectRoots` are explicit.
@@ -493,7 +493,7 @@ async fn engine(
             match policy.admits_purl(&purl) {
                 Ok(()) => admitted.push(purl),
                 Err(reason) => policy_filtered.push(FilteredEntry {
-                    purl: Some(purl),
+                    purl: Some(crate::commands::scan::policy::canon(&purl)),
                     uuid: None,
                     project: state.root.clone(),
                     reason,
@@ -825,7 +825,7 @@ fn policy_error_output(
         policy: None,
         policy_error: Some(PolicyErrorInfo {
             code: error.code().to_string(),
-            detail: error.to_string(),
+            detail: error.detail(),
         }),
     }
 }
@@ -875,7 +875,7 @@ fn select_with_policy(
             detail: Some(reason.detail()),
         });
         filtered.push(FilteredEntry {
-            purl: Some(purl),
+            purl: Some(crate::commands::scan::policy::canon(&purl)),
             uuid: Some(winner.uuid.clone()),
             project: root.to_string(),
             severity: Some(patch_severity_order(&winner)),

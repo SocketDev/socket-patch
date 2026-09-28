@@ -927,3 +927,28 @@ fn selection_streams_policy_files_and_applies_built_in_ignores() {
     );
     assert_eq!(named.roots, vec!["apps/web/tests/app"]);
 }
+
+#[tokio::test]
+async fn memory_negation_reincludes_a_default_ignored_root_it_was_given() {
+    let npm = fixtures_root().join("redirect/npm/package-lock-v3/basic");
+    let patches = patches_from_overrides(&npm.join("overrides.json"), None);
+    let server = MockServer::start().await;
+    mount_api(&server, &patches).await;
+    let mut repo: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for root in ["e2e/tests", "x/tests"] {
+        for (rel, bytes) in fixture_files(&npm.join("input")) {
+            repo.insert(format!("{root}/{rel}"), bytes);
+        }
+    }
+    repo.insert(
+        "socket.yml".to_string(),
+        b"version: 2\npatches:\n  ignorePaths: [\"!/e2e/tests/\"]\n".to_vec(),
+    );
+    let memory = run_engine(&server, build_input(&repo, &[], policy_options())).await;
+    let roots: Vec<&str> = memory.projects.iter().map(|p| p.root.as_str()).collect();
+    assert_eq!(roots, vec!["e2e/tests"]);
+    let filtered = filtered_set(memory.policy.as_ref().unwrap());
+    assert!(filtered.contains(&("x/tests".to_string(), None, "policy_path_excluded".to_string())));
+    let entry = &memory.policy.as_ref().unwrap()["filtered"][0];
+    assert_eq!(entry["detail"], "tests/ (built-in default)");
+}

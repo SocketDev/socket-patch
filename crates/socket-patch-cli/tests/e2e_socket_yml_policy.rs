@@ -700,6 +700,35 @@ async fn recorded_merged_patch_below_a_new_floor_is_kept() {
     let (code, doc) = scan_json(&web, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(repo.lock("services/web"), pinned, "the floor never replaces the recorded merged patch");
+    assert_eq!(doc["policy"]["minSeverity"], json!({"value": "high", "source": "file"}));
+    assert_eq!(doc["policy"]["counts"]["filtered"], 0, "a kept recorded patch is not a skip: {:#}", doc["policy"]);
+
+    // The floor is live: a fresh root with the same offers gets the
+    // floor-admitted patch, not the merged low one.
+    let fresh = Repo::new(Some("version: 2\npatches:\n  minSeverity: high\n"));
+    let (code, doc) = scan_json(&fresh.dir("services/web"), &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let lock = fresh.lock("services/web");
+    assert!(lock.contains(&P_ALPHA.hosted_url()), "{lock}");
+    assert!(!lock.contains(P_ALPHA_MERGED_LOW.uuid), "{lock}");
+}
+
+#[tokio::test]
+#[serial]
+async fn floor_with_nothing_admitted_reports_the_withheld_patch() {
+    let server = MockServer::start().await;
+    mount_api(&server, vec![P_BETA]).await;
+    let repo = Repo::new(Some("version: 2\npatches:\n  minSeverity: critical\n"));
+    let web = repo.dir("services/web");
+    let lock = repo.lock("services/web");
+    let (code, stdout, stderr) = scan(&web, &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(repo.lock("services/web"), lock);
+    assert!(stdout.contains("Policy (socket.yml): 1 skipped by filters"), "{stdout}");
+    // Only critical/high are named without --verbose.
+    assert!(!stdout.contains("skipped beta"), "{stdout}");
+    let (_, stdout, _) = scan(&web, &server.uri(), &["--verbose"], &[]);
+    assert!(stdout.contains("skipped pkg:npm/beta@1.0.0 (low): low < critical"), "{stdout}");
 }
 
 #[tokio::test]
@@ -712,7 +741,7 @@ async fn path_outside_the_repo_is_a_usage_error() {
     write_npm_root(&outside, &["alpha"]);
     let (code, _, stderr) = scan(&repo.dir("services"), &server.uri(), &["web", "../../elsewhere"], &[]);
     assert_eq!(code, 2, "{stderr}");
-    assert!(stderr.contains("outside the repository root"), "{stderr}");
+    assert!(stderr.contains("is outside") && stderr.contains("run one scan per repository"), "{stderr}");
 }
 
 #[tokio::test]
@@ -861,3 +890,77 @@ async fn get_bypasses_the_policy_with_a_warning() {
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!stdout.contains("policy_bypassed"), "{stdout}");
 }
+
+#[tokio::test]
+#[serial]
+async fn agent_mode_honors_path_filters_and_keeps_the_prune_universe() {
+    let server = MockServer::start().await;
+    mount_api(&server, vec![P_ALPHA, P_BETA]).await;
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    let (code, doc) = scan_json(&web, &server.uri(), &["--mode", "agent"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let manifest_before = std::fs::read(web.join(".socket/manifest.json")).unwrap();
+    let recorded: Value = serde_json::from_slice(&manifest_before).unwrap();
+    assert_eq!(recorded["patches"].as_object().unwrap().len(), 2);
+
+    // The root is excluded by path: nothing selected, and a --sync (agent
+    // + prune) still judges the full crawl, so no entry is pruned.
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  includePaths: [\"/services/legacy/\"]\n").unwrap();
+    let (code, doc) = scan_json(&web, &server.uri(), &["--sync"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(std::fs::read(web.join(".socket/manifest.json")).unwrap(), manifest_before);
+    assert_eq!(doc["policy"]["filtered"][0]["purl"], Value::Null);
+    assert_eq!(doc["policy"]["filtered"][0]["reason"], "policy_path_not_included");
+    assert_eq!(doc["policy"]["counts"]["retained"], 2, "{:#}", doc["policy"]);
+    assert_eq!(doc["gc"]["removed"].as_array().map_or(0, Vec::len), 0, "{:#}", doc["gc"]);
+
+    // A narrower ecosystem list under --sync prunes nothing either.
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  ecosystems: [pypi]\n").unwrap();
+    let (code, doc) = scan_json(&web, &server.uri(), &["--sync"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(std::fs::read(web.join(".socket/manifest.json")).unwrap(), manifest_before);
+
+    // patches.enabled: false skips the GC entirely.
+    std::fs::remove_dir_all(web.join("node_modules/beta")).unwrap();
+    let pkg_lock = repo.lock("services/web").replace("\"node_modules/beta\"", "\"node_modules/gone\"");
+    std::fs::write(web.join("package-lock.json"), pkg_lock).unwrap();
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  enabled: false\n").unwrap();
+    let (code, doc) = scan_json(&web, &server.uri(), &["--sync"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(doc.get("gc").is_none(), "{doc:#}");
+    assert_eq!(std::fs::read(web.join(".socket/manifest.json")).unwrap(), manifest_before);
+}
+
+#[tokio::test]
+#[serial]
+async fn narrowing_after_vendoring_leaves_the_vendored_package_byte_identical() {
+    let server = MockServer::start().await;
+    mount_api(&server, vec![P_ALPHA]).await;
+    let repo = Repo::new(None);
+    let web = repo.dir("services/web");
+    // Vendor alpha for real (offline, from a seeded manifest + blob).
+    let before = compute_git_sha256_from_bytes(orig_index("alpha").as_bytes());
+    let after = compute_git_sha256_from_bytes(patched_index("alpha").as_bytes());
+    std::fs::create_dir_all(web.join(".socket/blobs")).unwrap();
+    std::fs::write(web.join(".socket/blobs").join(&after), patched_index("alpha")).unwrap();
+    let manifest = json!({"patches": {P_ALPHA.purl(): {
+        "uuid": P_ALPHA.uuid, "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {"package/index.js": {"beforeHash": before, "afterHash": after}},
+        "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free"
+    }}});
+    std::fs::write(web.join(".socket/manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    let (code, stdout, stderr) = run_cli(&web, &["vendor", "--json", "--offline", "--cwd", web.to_str().unwrap()], &[]);
+    assert_eq!(code, 0, "vendor fixture: {stdout}\n{stderr}");
+    assert!(repo.lock("services/web").contains(".socket/vendor/"), "vendored lock");
+    let snapshot = repo.snapshot();
+
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches:\n  ignorePackages: [\"pkg:npm/alpha\"]\n").unwrap();
+    let (code, doc) = scan_json(&web, &server.uri(), &["--mode", "vendored"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let mut after_scan = repo.snapshot();
+    after_scan.remove("socket.yml");
+    assert_eq!(after_scan, snapshot, "the vendored package, its lock wiring and ledger stay byte-identical");
+    assert_eq!(doc["policy"]["retained"][0]["purl"], "pkg:npm/alpha@1.0.0", "{:#}", doc["policy"]);
+}
+
