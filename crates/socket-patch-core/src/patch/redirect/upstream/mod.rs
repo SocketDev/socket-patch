@@ -10,8 +10,9 @@
 //! crates.io sparse index, the Go module proxy, and so on.
 //!
 //! Where that is impossible — a format whose entry carries fields only the
-//! package manager can compute, a binary lockfile, an offline run, a
-//! registry that does not answer — the pin is REFUSED with a message naming
+//! package manager can compute, an offline run, a registry that does not
+//! answer, a binary `bun.lockb` outside a vendor takeover
+//! ([`RestoreOptions::bun_lockb`]) — the pin is REFUSED with a message naming
 //! the remedy (`git checkout -- <lockfile>`). A refusal is all-or-nothing
 //! per pin: a pin refused in one of its files is restored in none of them,
 //! so no pin is ever left half hosted.
@@ -25,6 +26,7 @@ use std::path::Path;
 
 use crate::vex::discover::{Discovery, PatchedRef, WiringMode};
 
+mod bun_lockb;
 mod cargo;
 mod client;
 mod composer;
@@ -236,6 +238,14 @@ pub struct RestoreOptions {
     /// Extra patch-server origins whose URLs count as hosted (the
     /// operator's `--patch-server-url`), exactly as discovery takes them.
     pub patch_server_origins: Vec<String>,
+    /// Restore hosted pins in a binary `bun.lockb` by rebuilding the npm
+    /// registry record (see `bun_lockb`). Off, they are refused with the
+    /// checkout remedy. The rebuild is exact for a record the hosted rewrite
+    /// wrote, but not for every lock (a format-1 lock stays promoted, a
+    /// workspace lock keeps its normalized dependency behaviors), so only a
+    /// vendor takeover — which re-records the rebuilt record as its own
+    /// pre-vendor original — opts in; `rollback` keeps refusing.
+    pub bun_lockb: bool,
 }
 
 /// What happened to one pin.
@@ -308,6 +318,9 @@ pub(crate) struct View<'a> {
     /// Original on-disk text of every file read, so a write that restores
     /// the exact original bytes is not reported as a change.
     originals: BTreeMap<String, Option<String>>,
+    /// Binary files (bun.lockb): staged bytes and their on-disk originals.
+    staged_bytes: StagedBytes,
+    original_bytes: BTreeMap<String, Option<Vec<u8>>>,
 }
 
 impl<'a> View<'a> {
@@ -316,7 +329,42 @@ impl<'a> View<'a> {
             root,
             staged: Staged::new(),
             originals: BTreeMap::new(),
+            staged_bytes: StagedBytes::new(),
+            original_bytes: BTreeMap::new(),
         }
+    }
+
+    /// The current (staged) bytes of the binary file `rel`; `Ok(None)` when
+    /// absent. FIFO-guarded like [`Self::read`].
+    pub(crate) async fn read_bytes(&mut self, rel: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(pending) = self.staged_bytes.get(rel) {
+            return Ok(Some(pending.clone()));
+        }
+        if let Some(original) = self.original_bytes.get(rel) {
+            return Ok(original.clone());
+        }
+        let bytes = match crate::utils::fs::read_regular_to_bytes(&self.root.join(rel)).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("read {rel}: {e}")),
+        };
+        self.original_bytes.insert(rel.to_string(), bytes.clone());
+        Ok(bytes)
+    }
+
+    pub(crate) fn write_bytes(&mut self, rel: &str, content: Vec<u8>) {
+        self.staged_bytes.insert(rel.to_string(), content);
+    }
+
+    /// Binary files whose staged bytes differ from what was read from disk.
+    fn changed_bytes(&self) -> StagedBytes {
+        self.staged_bytes
+            .iter()
+            .filter(|(rel, pending)| {
+                self.original_bytes.get(*rel).and_then(Option::as_ref) != Some(*pending)
+            })
+            .map(|(rel, pending)| (rel.clone(), pending.clone()))
+            .collect()
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -385,6 +433,8 @@ impl FormatResult {
 pub(crate) struct Ctx<'a> {
     pub client: &'a UpstreamClient,
     pub origins: &'a [String],
+    /// [`RestoreOptions::bun_lockb`].
+    pub bun_lockb: bool,
 }
 
 impl Ctx<'_> {
@@ -403,6 +453,8 @@ enum Format {
     YarnLock,
     PnpmLock,
     BunLock,
+    /// Binary bun.lockb (restored only under [`RestoreOptions::bun_lockb`]).
+    BunLockb,
     Cargo,
     Golang,
     Gem,
@@ -429,6 +481,7 @@ fn format_of(rel: &str) -> Format {
         "yarn.lock" => Format::YarnLock,
         "pnpm-lock.yaml" | "shrinkwrap.yaml" => Format::PnpmLock,
         "bun.lock" => Format::BunLock,
+        "bun.lockb" => Format::BunLockb,
         "Cargo.toml" | "Cargo.lock" | "config.toml" | "config" => Format::Cargo,
         "go.mod" | "go.sum" | "go.work" => Format::Golang,
         "Gemfile.lock" | "gems.locked" | "Gemfile" | "gems.rb" => Format::Gem,
@@ -458,6 +511,7 @@ pub async fn restore_upstream(
     let ctx = Ctx {
         client: &client,
         origins: &opts.patch_server_origins,
+        bun_lockb: opts.bun_lockb,
     };
 
     // Pins refused so far (uuid → reason). Each pass restores the pins not
@@ -503,11 +557,16 @@ pub async fn restore_upstream(
     };
 
     let changed = view.changed();
-    let reverted_files: BTreeSet<String> = changed.keys().cloned().collect();
-    let flush_error = if opts.dry_run || changed.is_empty() {
+    let changed_bytes = view.changed_bytes();
+    let reverted_files: BTreeSet<String> = changed
+        .keys()
+        .chain(changed_bytes.keys())
+        .cloned()
+        .collect();
+    let flush_error = if opts.dry_run || (changed.is_empty() && changed_bytes.is_empty()) {
         None
     } else {
-        flush_staged(root, &changed, &StagedBytes::new()).await.err()
+        flush_staged(root, &changed, &changed_bytes).await.err()
     };
 
     let pins_out = pins
@@ -555,6 +614,9 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::YarnLock => npm::restore_yarn_locks(view, &pins, &files, ctx).await,
             Format::PnpmLock => npm::restore_pnpm_locks(view, &pins, &files, ctx).await,
             Format::BunLock => npm::restore_bun_locks(view, &pins, &files, ctx).await,
+            Format::BunLockb if ctx.bun_lockb => {
+                bun_lockb::restore(view, &pins, &files, ctx).await
+            }
             Format::Cargo => cargo::restore(view, &pins, &files, ctx).await,
             Format::Golang => golang::restore(view, &pins, &files, ctx).await,
             Format::Gem => gem::restore(view, &pins, &files, ctx).await,
@@ -568,22 +630,28 @@ async fn restore_pass(view: &mut View<'_>, active: &[&HostedPin], ctx: &Ctx<'_>)
             Format::VltLock => vlt::restore(view, &pins, &files, ctx).await,
             Format::Maven => maven::restore(view, &pins, &files, ctx).await,
             Format::NuGet => nuget::restore(view, &pins, &files, ctx).await,
-            Format::Unsupported => {
+            Format::Unsupported | Format::BunLockb => {
                 let mut r = FormatResult::default();
                 for pin in &pins {
                     let unsupported: Vec<&str> = pin
                         .files
                         .iter()
-                        .filter(|f| format_of(f) == Format::Unsupported)
+                        .filter(|f| format_of(f) == format)
                         .map(String::as_str)
                         .collect();
-                    r.refuse(
-                        &pin.uuid,
+                    let why = if format == Format::BunLockb {
+                        format!(
+                            "{} is a binary lock whose rebuilt registry record is not \
+                             byte-exact for every lock, so it is not restored here",
+                            unsupported.join(", ")
+                        )
+                    } else {
                         format!(
                             "socket-patch cannot re-derive the upstream entry in {}",
                             unsupported.join(", ")
-                        ),
-                    );
+                        )
+                    };
+                    r.refuse(&pin.uuid, why);
                 }
                 r
             }

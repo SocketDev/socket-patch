@@ -351,9 +351,9 @@ clean tree and an empty store, then check with `socket-patch vex`. See
 
 Both text `bun.lock` and binary `bun.lockb` support hosted and vendored
 patches, mode switching, repair, and rollback — with one exception: a hosted
-`bun.lockb` entry cannot be restored to its upstream registry entry, so
-`rollback`, `remove` and switching it to vendored mode refuse it and point you at
-`git checkout -- bun.lockb`. Binary locks are read and
+`bun.lockb` entry is not rolled back to its upstream registry entry, so
+`rollback` and `remove` refuse it and point you at `git checkout -- bun.lockb`
+(switching it to vendored mode rebuilds the registry entry and works). Binary locks are read and
 patched natively: Socket Patch does not need Bun installed to discover or
 rewrite them, and does not convert them to text. If both filenames exist,
 `bun.lock` takes precedence. See [Bun compatibility](docs/testing/bun-compatibility.md)

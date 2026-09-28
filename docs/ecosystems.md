@@ -110,9 +110,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   in place (mode takeover) — on a lock the vendored backend refuses (a pre-version-2
   `workspace:` lock) `vendor` reports the refusal before the upstream restore and leaves the
   purl hosted-patched — and `rollback <purl>` / `remove <purl>` restore one of several
-  hosted bun packages to its upstream registry entry. A hosted `bun.lockb` entry cannot be
-  restored (v5.0 keeps no hosted ledger): rollback, remove and the hosted → vendored
-  takeover refuse it with the `git checkout -- bun.lockb` remedy.
+  hosted bun packages to its upstream registry entry. A hosted `bun.lockb` entry is not
+  rolled back (v5.0 keeps no hosted ledger, and a rebuilt binary record is not byte-exact
+  for every lock): rollback and remove refuse it with the `git checkout -- bun.lockb`
+  remedy, while the hosted → vendored takeover rebuilds its npm registry record natively
+  and vendors over it.
   Bun verifies the sha512 of URL and local-tarball tuples only from 1.3.10 (registry
   tuples from 1.2.0), so on 1.1.39–1.3.9 a hosted or vendored rewrite removes digest
   enforcement for the patched package. Every boundary here is measured against real

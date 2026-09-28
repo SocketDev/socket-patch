@@ -1123,6 +1123,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             dry_run: true,
             offline: common.offline,
             patch_server_origins: origins.clone(),
+            bun_lockb: true,
         },
     )
     .await;
@@ -1222,6 +1223,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             dry_run: false,
             offline: common.offline,
             patch_server_origins: origins,
+            bun_lockb: true,
         },
     )
     .await;
@@ -2954,6 +2956,7 @@ pub(crate) async fn vendor_records_reusing(
                         dry_run: common.dry_run,
                         offline: common.offline,
                         patch_server_origins: origins,
+                        bun_lockb: true,
                     },
                 )
                 .await;

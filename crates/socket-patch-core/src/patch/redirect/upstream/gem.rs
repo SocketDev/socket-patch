@@ -751,6 +751,7 @@ mod tests {
         Ctx {
             client,
             origins: &[],
+            bun_lockb: false,
         }
     }
 

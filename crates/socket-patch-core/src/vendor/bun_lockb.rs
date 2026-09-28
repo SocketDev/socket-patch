@@ -341,16 +341,152 @@ impl BunLockb {
         } else {
             target.strip_prefix("file:").unwrap_or(target)
         };
+        if remote && old_tag == 80 {
+            // Re-pinning a hosted record: its superseded URL leaves the pool
+            // tail instead of accumulating there.
+            let replaced = self.data[at + 8..at + 16].to_vec();
+            self.data[at + 8..at + 16].fill(0);
+            self.drop_tail_string(&replaced)?;
+        }
         let pointer = self.intern(target)?;
         // Tarball variants have distinct cache identities. Keeping npm tag 2
         // would allow Bun to reuse an already-cached, unpatched name@version.
-        self.data[at..at + self.resolution_size].fill(0);
+        // A remote (hosted) tarball keeps the registry record's bytes the
+        // tarball variant never reads (padding, semver): v5 hosted mode keeps
+        // no ledger, and they let `set_registry_package` rebuild the exact
+        // registry record — including a writer's uninitialized padding.
+        if !remote {
+            self.data[at..at + self.resolution_size].fill(0);
+        }
         self.data[at] = if remote { 80 } else { 8 };
         self.data[at + 8..at + 16].copy_from_slice(&pointer);
         let integrity_at = self.integrity_at(id);
         self.data[integrity_at..integrity_at + INTEGRITY_LEN].copy_from_slice(&digest);
         self.normalize_production_pool()?;
         self.update_hash(style)?;
+        Ok(())
+    }
+
+    /// Rebuild package `id` (a tarball record) as Bun's npm registry record
+    /// for `version` (resolution tag 2) resolving `url` with `integrity` —
+    /// the inverse of [`Self::set_package`] when no snapshot of the original
+    /// record survives (v5 hosted mode keeps no ledger).
+    ///
+    /// When the record still carries the registry record's inactive bytes
+    /// (a hosted rewrite by `set_package` retains them) and they spell
+    /// `version`, they are kept verbatim — padding, semver and prerelease
+    /// tags included — so the rebuild is byte-exact. Otherwise the record is
+    /// built the way Bun writes one: zero padding, the semver triple and
+    /// empty prerelease/build tags; a prerelease or build version is then
+    /// refused, since its tags carry Bun's own string hashes.
+    ///
+    /// The URL is interned, so a registry URL the pool still holds is
+    /// re-used at its original offset, and the string the replaced record
+    /// pointed at is trimmed from the pool tail when nothing else references
+    /// it: a lock whose tarball string the hosted rewrite appended gets its
+    /// pre-rewrite pool back.
+    pub(crate) fn set_registry_package(
+        &mut self,
+        id: usize,
+        version: &str,
+        url: &str,
+        integrity: &str,
+    ) -> Result<(), String> {
+        let mut candidate = self.clone();
+        candidate.set_registry_package_inner(id, version, url, integrity)?;
+        let rebuilt = candidate.package(id)?;
+        if rebuilt.version.as_deref() != Some(version) || rebuilt.resolution != url {
+            return Err("bun.lockb: rebuilt registry record does not read back".into());
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn set_registry_package_inner(
+        &mut self,
+        id: usize,
+        version: &str,
+        url: &str,
+        integrity: &str,
+    ) -> Result<(), String> {
+        self.check_id(id)?;
+        self.check_editable()?;
+        let style = self.hash_style()?;
+        if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains('\0') {
+            return Err("bun.lockb: the registry tarball URL is not an http(s) URL".into());
+        }
+        let digest = encode_integrity(integrity)?;
+        let at = self.resolution_at(id);
+        if !matches!(self.data[at], 8 | 80) {
+            return Err("bun.lockb: only tarball packages can be restored to the registry".into());
+        }
+        // Format 1 has no URL column; the hosted rewrite promoted it already.
+        self.promote_legacy_format()?;
+        self.normalize_workspace_behaviors()?;
+        let at = self.resolution_at(id);
+        let replaced = self.data[at + 8..at + 16].to_vec();
+        // The registry record's inactive bytes the hosted rewrite retained
+        // (see `set_package`), when they still spell `version`.
+        let mut record = self.data[at..at + self.resolution_size].to_vec();
+        let retained = self.version_at(at + 16).is_ok_and(|v| v == version);
+        if !retained {
+            let triple: Vec<u64> = version
+                .split('.')
+                .map(|part| {
+                    (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| part.parse::<u64>().ok())
+                        .flatten()
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|parts| parts.len() == 3)
+                .ok_or_else(|| {
+                    format!(
+                        "bun.lockb: cannot rebuild the registry record of version {version} \
+                         (only plain major.minor.patch versions are supported)"
+                    )
+                })?;
+            record.fill(0);
+            for (i, number) in triple.into_iter().enumerate() {
+                if self.format == 3 {
+                    record[16 + i * 8..24 + i * 8].copy_from_slice(&number.to_le_bytes());
+                } else {
+                    let number = u32::try_from(number)
+                        .map_err(|_| "bun.lockb: version exceeds this binary format")?;
+                    record[16 + i * 4..20 + i * 4].copy_from_slice(&number.to_le_bytes());
+                }
+            }
+        }
+        // Unlink the replaced record first, so its string (appended by the
+        // rewrite) can leave the pool tail before the registry URL interns.
+        self.data[at..at + self.resolution_size].fill(0);
+        self.drop_tail_string(&replaced)?;
+        let pointer = self.intern(url)?;
+        let at = self.resolution_at(id);
+        record[0] = 2;
+        record[8..16].copy_from_slice(&pointer);
+        self.data[at..at + self.resolution_size].copy_from_slice(&record);
+        let integrity_at = self.integrity_at(id);
+        self.data[integrity_at..integrity_at + INTEGRITY_LEN].copy_from_slice(&digest);
+        self.normalize_production_pool()?;
+        self.update_hash(style)?;
+        Ok(())
+    }
+
+    /// Trim the out-of-line string `pointer` names from the pool when it is
+    /// the pool's (8-byte padded) tail and nothing references it any more.
+    fn drop_tail_string(&mut self, pointer: &[u8]) -> Result<(), String> {
+        if pointer.len() != 8 || pointer[7] & 0x80 == 0 {
+            return Ok(());
+        }
+        let start = u32::from_le_bytes(pointer[..4].try_into().unwrap()) as usize;
+        let len = (u32::from_le_bytes(pointer[4..].try_into().unwrap()) & 0x7fff_ffff) as usize;
+        let end = len
+            .checked_add(7)
+            .map(|n| n & !7)
+            .and_then(|n| start.checked_add(n));
+        if end == Some(self.strings.data.len()) {
+            self.trim_unreferenced_tail(start)?;
+        }
         Ok(())
     }
 
@@ -1503,6 +1639,108 @@ mod tests {
                 lock.bytes().len(),
                 original.len()
             );
+        }
+    }
+
+    const HOSTED: &str = "https://patch.socket.dev/patch/npm/11111111-1111-4111-8111-111111111111/77777777-7777-4777-8777-777777777777/minimist-1.2.2.tgz";
+
+    #[test]
+    fn registry_rebuild_inverts_a_hosted_rewrite_without_a_snapshot() {
+        for version in VERSIONS.iter().copied().chain(["0.5.9", "two-versions"]) {
+            let original = fixture(version);
+            let mut lock = BunLockb::parse(&original).unwrap();
+            let package = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == "minimist" && p.version.as_deref() == Some("1.2.2"))
+                .unwrap();
+            lock.set_package(package.id, HOSTED, &digest()).unwrap();
+            // A re-pin (a later grant's URL) drops the superseded URL.
+            let first = lock.bytes();
+            let token = "11111111-1111-4111-8111-111111111111";
+            let repin = HOSTED.replace(token, "33333333-3333-4333-8333-333333333333");
+            lock.set_package(package.id, &repin, &digest()).unwrap();
+            assert_eq!(lock.bytes().len(), first.len(), "{version}");
+            assert!(
+                !lock.bytes().windows(token.len()).any(|w| w == token.as_bytes()),
+                "{version}: the superseded URL is gone"
+            );
+            // A remote tarball keeps the registry record's inactive bytes; a
+            // local (vendored) one does not.
+            let at = lock.resolution_at(package.id);
+            assert_eq!(lock.data[at], 80, "{version}");
+            if BunLockb::parse(&original).unwrap().format != 1 {
+                assert_eq!(
+                    lock.data[at + 16..at + lock.resolution_size],
+                    original[at + 16..at + lock.resolution_size],
+                    "{version}"
+                );
+            }
+            lock.set_registry_package(
+                package.id,
+                "1.2.2",
+                &package.resolution,
+                package.integrity.as_deref().unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("{version}: {e}"));
+            lock.validate_mutation().unwrap();
+            let restored = lock.package(package.id).unwrap();
+            assert_eq!(restored.version.as_deref(), Some("1.2.2"), "{version}");
+            assert_eq!(restored.resolution, package.resolution, "{version}");
+            assert_eq!(restored.integrity, package.integrity, "{version}");
+            // Format 1 stays promoted to format 2; every other writer's
+            // bytes come back exactly.
+            if !matches!(version, "0.1.1" | "0.1.6") {
+                assert!(lock.bytes() == original, "exact rebuild: {version}");
+            }
+        }
+        let mut local = BunLockb::parse(&fixture("0.8.1")).unwrap();
+        local
+            .set_package(1, ".socket/vendor/npm/x/minimist-1.2.2.tgz", &digest())
+            .unwrap();
+        let at = local.resolution_at(1);
+        assert!(local.data[at + 16..at + local.resolution_size].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn registry_rebuild_from_a_zeroed_hosted_record() {
+        // A hosted record whose registry bytes are gone (an older rewrite, or
+        // Bun re-saving the record) is rebuilt the way Bun writes one.
+        for version in ["0.8.1", "1.0.0", "1.1.38", "1.2.0", "1.2.23", "1.4.2"] {
+            let original = fixture(version);
+            let mut lock = BunLockb::parse(&original).unwrap();
+            let package = lock.package(1).unwrap();
+            assert_eq!(package.name, "minimist", "{version}");
+            lock.set_package(1, HOSTED, &digest()).unwrap();
+            let at = lock.resolution_at(1);
+            let size = lock.resolution_size;
+            lock.data[at + 1..at + 8].fill(0);
+            lock.data[at + 16..at + size].fill(0);
+            lock.validate_mutation().unwrap();
+            let hosted = lock.bytes();
+            let err = lock
+                .set_registry_package(1, "1.2.2-beta.1", &package.resolution, &digest())
+                .unwrap_err();
+            assert!(err.contains("major.minor.patch"), "{version}: {err}");
+            assert!(lock.bytes() == hosted, "{version}: transactional");
+            lock.set_registry_package(
+                1,
+                "1.2.2",
+                &package.resolution,
+                package.integrity.as_deref().unwrap(),
+            )
+            .unwrap();
+            lock.validate_mutation().unwrap();
+            assert_eq!(lock.package(1).unwrap().version.as_deref(), Some("1.2.2"));
+            // Writers that zero their padding get their exact bytes back.
+            if version != "0.8.1" {
+                assert!(lock.bytes() == original, "{version}");
+            }
+            // A registry record is not a tarball record to restore.
+            assert!(lock
+                .set_registry_package(1, "1.2.2", &package.resolution, &digest())
+                .is_err());
         }
     }
 

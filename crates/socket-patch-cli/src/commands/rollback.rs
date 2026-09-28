@@ -1057,6 +1057,9 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
         dry_run: common.dry_run,
         offline: common.offline,
         patch_server_origins: origins,
+        // A binary bun.lockb pin refuses with the checkout remedy: its
+        // rebuilt registry record is not byte-exact for every lock.
+        bun_lockb: false,
     };
     let outcome = restore_upstream(&common.cwd, pins, &opts).await;
     for pin in &outcome.pins {

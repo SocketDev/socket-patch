@@ -95,7 +95,8 @@ into the new version's section — see docs/releasing.md.
   restore <purl> to its upstream registry entry: <why>; restore it from
   version control instead (`git checkout -- <files>`)`: every pin under
   `--offline` except Maven, a registry that does not answer or no longer
-  describes the entry, a binary `bun.lockb` (always), a composer entry that
+  describes the entry, a binary `bun.lockb` (for `rollback` / `remove`; see
+  the vendor takeover below), a composer entry that
   is not packagist-sourced or whose `dist.reference` packagist no longer
   serves, a gem whose upstream section is ambiguous or not rubygems.org, a
   nuget id the restored config would not resolve from nuget.org alone, a
@@ -183,6 +184,21 @@ into the new version's section — see docs/releasing.md.
   live hosted pin: …`) and leaves it hosted. The cargo backend's
   `hosted_redirect_live` refusal now names `socket-patch rollback` and
   `git checkout -- Cargo.toml Cargo.lock` instead of the ledger.
+- **Vendoring over a hosted binary `bun.lockb` works again** (Bun 0.8–1.1's
+  default lock and Bun 1.2's legacy lock; it was refused
+  `redirect_revert_failed` once the hosted ledger was gone). The takeover
+  and the eject rebuild each hosted remote-tarball record as Bun's npm
+  registry record for `name@version` from the registry's `dist.tarball` /
+  `dist.integrity`, re-derive the package metadata hash, drop the hosted
+  URL from the string pool, then vendor; `vendor --revert` returns the
+  pre-hosted lock. The hosted rewrite now keeps the registry record's
+  inactive bytes (padding, semver) in the tarball record it writes, and a
+  re-pin to a later grant's URL drops the superseded URL from the string
+  pool, so the rebuild is byte-exact — early writers' uninitialized padding included —
+  except for a binary format 1 lock (kept promoted to format 2) and a
+  workspace lock (dependency behaviors kept normalized). Those exceptions
+  keep `rollback` / `remove` refusing a hosted `bun.lockb` pin with the
+  `git checkout -- bun.lockb` remedy; an `--offline` vendor still refuses.
 - **`vendor_supersedes_redirect` is removed.** The vendored flows no longer
   warn about (or auto-reconcile, or unwind the `.npmrc` for) a stale hosted
   ledger record: once the lock routes a package to `.socket/vendor/`, no
