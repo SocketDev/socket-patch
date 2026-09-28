@@ -1057,19 +1057,21 @@ Gaps and contradictions A resolved with the smallest reasonable decision
 8. **In-memory engine gaps until B lands its recorded view**: `retained[]`
    is empty and the floor rule of item 5 cannot see recorded pins (filtered
    packages' pins stay byte-identical regardless: the rewriters only touch
-   selected dependencies). `selectHostedScanPaths` applies the built-in
-   default ignores (the file's content is unknown at selection time), so a
-   socket.yml negation re-includes an in-memory root only when the host
-   streamed its files anyway; the session itself detects roots without the
-   defaults and applies the full policy. A root named in `projectRoots` is
-   explicit and skips the defaults. There
-   is no case-variant warning in memory (selection streams exact names
-   only). `ProjectResult.skipped[]` carries the post-lookup policy reasons
+   selected dependencies). A root named in `projectRoots` is explicit and
+   skips the defaults. There is no case-variant warning in memory
+   (selection reads exact names only). `ProjectResult.skipped[]` carries the post-lookup policy reasons
    (severity, disabled); the pre-lookup ones are in the session `policy`
    block only.
 9. **Session option `policyPaths`** (selection's list, handed back like
    `projectRoots`) is how the session tells "listed but never sent" from
-   absent.
+   absent. Two-phase selection (7.2) names its outputs: selection returns
+   `policySha256` (`null` without a file) and the session takes it as an
+   option, since 7.2 does not say how the session learns what the
+   selector saw; a session that reads a policy file without it fails
+   closed. Selection also takes `noSocketYml` so both sides bypass
+   together. A root the selector excludes keeps its markers in
+   `presentOnly` (no content), so the session still lists it under
+   `policy.filtered[]` as disk does.
 10. **Env layer of `--min-severity`** is read by scan, not clap, so the
     `policy` block can say `source: "env"`; a malformed env value exits 2 at
     run time, a malformed flag at parse time.

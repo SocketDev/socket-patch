@@ -60,6 +60,8 @@ struct Bundle {
     min_severity: Option<String>,
     #[serde(default)]
     policy_paths: Option<Vec<String>>,
+    #[serde(default)]
+    policy_sha256: Option<String>,
 }
 
 fn print_error(code: &str, message: &str) {
@@ -131,6 +133,7 @@ pub async fn run(args: HostedBundleArgs) -> i32 {
         no_socket_yml: bundle.no_socket_yml,
         min_severity: bundle.min_severity.clone(),
         policy_paths: bundle.policy_paths.clone(),
+        policy_sha256: bundle.policy_sha256.clone(),
         ..HostedScanOptions::default()
     };
     let input = match build_input(bundle, options) {

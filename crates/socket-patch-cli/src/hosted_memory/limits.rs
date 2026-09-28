@@ -29,6 +29,7 @@ pub(crate) struct ResolvedOptions {
     pub(crate) limits: ResolvedLimits,
     pub(crate) policy_overrides: socket_patch_core::policy::PolicyOverrides,
     pub(crate) policy_paths: Vec<String>,
+    pub(crate) policy_sha256: Option<String>,
 }
 
 pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOptions, EngineError> {
@@ -129,6 +130,7 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
         limits: options.limits.clone().unwrap_or_default().resolve(),
         policy_overrides,
         policy_paths,
+        policy_sha256: options.policy_sha256.clone(),
     })
 }
 
