@@ -1751,12 +1751,12 @@ async fn human_uuid_paid_via_proxy_prints_upgrade_message() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = mock.uri();
     // No --api-token / --org: the scrubbed child env falls back to the
-    // public proxy seeded via the legacy env var (get_invariants' recipe).
+    // public proxy seeded via `SOCKET_PROXY_URL` (get_invariants' recipe).
     let (code, stdout, stderr) = common::run_with_env(
         tmp.path(),
         &["get", UUID, "--save-only", "--yes", "--api-url", &uri],
         &[
-            ("SOCKET_PATCH_PROXY_URL", uri.as_str()),
+            ("SOCKET_PROXY_URL", uri.as_str()),
             ("SOCKET_TELEMETRY_DISABLED", "1"),
         ],
     );
@@ -2862,7 +2862,7 @@ async fn proxy_403_on_uuid_is_paid_required() {
             tmp.path(),
             &args,
             &[
-                ("SOCKET_PATCH_PROXY_URL", uri.as_str()),
+                ("SOCKET_PROXY_URL", uri.as_str()),
                 ("SOCKET_TELEMETRY_DISABLED", "1"),
             ],
         )

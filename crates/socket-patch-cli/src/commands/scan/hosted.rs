@@ -1,4 +1,4 @@
-//! The hosted-mode (`--mode hosted` / `--redirect`) flow: rewrite ONLY the
+//! The hosted-mode (`--mode hosted`) flow: rewrite ONLY the
 //! patched dependencies' lockfile / registry-config entries to point at
 //! Socket's hosted vendored patches. Self-contained — reuses `run`'s
 //! discovery, then returns without touching the apply/vendor branches.

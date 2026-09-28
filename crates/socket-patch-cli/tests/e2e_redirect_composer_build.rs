@@ -1,7 +1,7 @@
 //! Real-composer HOSTED (redirect) capstone — the composer twin of
 //! `e2e_redirect_npm_build.rs`, ending in the manifest-less VEX legs.
 //!
-//! `scan --redirect` never lands patched bytes in the repo: it rewrites
+//! `scan --mode hosted` never lands patched bytes in the repo: it rewrites
 //! composer.lock so the patched package's `dist` RESOLVES from Socket's
 //! hosted patch archive (here: a wiremock standing in for patch.socket.dev)
 //! and pins the archive's sha1 in `dist.shasum`. This proves every link of
@@ -15,7 +15,7 @@
 //!      marker comment appended to `src/LoggerInterface.php`, wrapped in a
 //!      GitHub-zipball-style top-level dir) and serve it from wiremock with
 //!      the discovery / reference / view API mocks.
-//!   3. `scan --redirect --json --vex …` (or its `get <uuid> --mode hosted`
+//!   3. `scan --mode hosted --json --vex …` (or its `get <uuid> --mode hosted`
 //!      twin): composer.lock's psr/log `dist` now points at the wiremock
 //!      archive with its sha1, NO redirect ledger and no manifest is written
 //!      (v5: the lock is the hosted state), and the in-run VEX is
@@ -89,7 +89,7 @@ const FILE_KEY: &str = "src/LoggerInterface.php";
 /// Which CLI front door performs the redirect (step 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RedirectCli {
-    /// `scan --redirect --json --yes --vex …` (embedded VEX asserted).
+    /// `scan --mode hosted --json --yes --vex …` (embedded VEX asserted).
     ScanRedirectVex,
     /// `get <UUID> --mode hosted --json --yes` (get has no `--vex`).
     GetUuidHosted,
@@ -331,7 +331,7 @@ async fn redirected_project(
     let mut argv: Vec<&str> = match cli {
         RedirectCli::ScanRedirectVex => vec![
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--vex",
             "out.vex.json",
             "--vex-product",

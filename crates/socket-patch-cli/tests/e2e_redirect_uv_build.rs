@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Real-uv capstones for HOSTED mode (`scan --redirect`), ending in
+//! Real-uv capstones for HOSTED mode (`scan --mode hosted`), ending in
 //! manifest-less VEX — the hermetic twin of the production
 //! `e2e_hosted_production::pypi_uv_lock_hosted_install_proof` leg, for every
 //! uv lock shape:
@@ -19,12 +19,12 @@
 //!   pylock.toml` and `pip lock`, installed by `uv pip sync`.
 //!
 //! Each lane: real uv builds and installs the pristine project from PyPI →
-//! `scan --redirect --vex` against a wiremock patch API (which also serves
+//! `scan --mode hosted --vex` against a wiremock patch API (which also serves
 //! the patched wheel at its hosted url) → a fresh checkout of ONLY the
 //! committable files installs with uv from an EMPTY cache, fetching the
 //! wheel from the mock and checking its pin, and imports the patched bytes →
 //! manifest-less VEX: attested with/without ledgers, `record_unavailable`
-//! offline with zero requests, embedded `apply --vex` / `scan --redirect
+//! offline with zero requests, embedded `apply --vex` / `scan --mode hosted
 //! --vex`, NOT attested once the wiring is reverted (ledgers left behind,
 //! `--no-verify` too) → `rollback` restores the files byte for byte. The
 //! driver is `vex_e2e_common/uv.rs`.

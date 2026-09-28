@@ -66,7 +66,6 @@ async fn run(args: &[&str], cwd: &Path, proxy_url: &str) -> Output {
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_PATCH_PROXY_URL")
             .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")

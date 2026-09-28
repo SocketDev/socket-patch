@@ -70,7 +70,6 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_PATCH_PROXY_URL")
             .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")

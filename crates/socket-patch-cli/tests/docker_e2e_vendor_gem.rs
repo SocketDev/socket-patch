@@ -252,7 +252,7 @@ exit 0
 "#;
 
 /// Stage 2b (`--network none`, the fresh checkout stage 2 just installed):
-/// MANIFEST-LESS VEX, the depscan / `vendor --detached` shape. Shared by
+/// MANIFEST-LESS VEX, the depscan shape. Shared by
 /// both flavors.
 ///
 ///   1. `.socket/manifest.json` deleted → `vex --offline` attests from the

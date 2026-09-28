@@ -293,10 +293,8 @@ async fn get_by_package_with_single_paid_patch_emits_paid_required() {
 
     let tmp = tempfile::tempdir().unwrap();
     let uri = mock.uri();
-    // Seed the proxy under its MODERN name: `SOCKET_PROXY_URL` outranks the
-    // legacy `SOCKET_PATCH_PROXY_URL` in `proxy_url_from_env`, so pinning the
-    // legacy name alone loses to an ambient modern one. The scrub in
-    // `run_with_env` also strips any ambient `SOCKET_API_TOKEN`, forcing the
+    // Seed the proxy via `SOCKET_PROXY_URL`. The scrub in `run_with_env`
+    // also strips any ambient `SOCKET_API_TOKEN`, forcing the
     // public-proxy (free-tier) client this test is about.
     let (code, stdout, _stderr) = common::run_with_env(
         tmp.path(),

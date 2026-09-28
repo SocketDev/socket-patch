@@ -652,8 +652,7 @@ socket-patch scan [PATHS]... [options]
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_*` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
 > Deprecated, hidden spellings (still accepted): `--apply` (== `--mode agent`) and
-> `--vendor` (== `--mode vendored`). `--detached` is a hidden no-op kept for compatibility (vendored mode is
-> always manifest-free); it is still an error without vendored mode.
+> `--vendor` (== `--mode vendored`).
 
 **Examples:**
 ```bash

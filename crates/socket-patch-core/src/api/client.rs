@@ -1890,8 +1890,7 @@ fn rewrite_url_host(original: &str, new_base: &str) -> Result<String, ApiError> 
 /// Explicit overrides for environment-based API client construction.
 ///
 /// Each `Some(value)` wins over the corresponding env var; `None` falls
-/// back to env-var lookup (with the legacy `SOCKET_PATCH_*` shim where
-/// applicable).
+/// back to env-var lookup.
 #[derive(Debug, Clone, Default)]
 pub struct ApiClientEnvOverrides {
     pub api_url: Option<String>,
@@ -1919,7 +1918,7 @@ pub struct ApiClientEnvOverrides {
 /// |---|---|
 /// | `SOCKET_API_URL` | Override the API URL (default `https://api.socket.dev`; socket-cli config `apiBaseUrl` sits between) |
 /// | `SOCKET_API_TOKEN` | API token for authenticated access (socket-cli config `apiToken` is the fallback) |
-/// | `SOCKET_PROXY_URL` | Override the public proxy URL (default `https://patches-api.socket.dev`). Legacy: `SOCKET_PATCH_PROXY_URL`. |
+/// | `SOCKET_PROXY_URL` | Override the public proxy URL (default `https://patches-api.socket.dev`) |
 /// | `SOCKET_ORG_SLUG` | Organization slug (socket-cli config `defaultOrg` is the fallback) |
 /// | `SOCKET_NO_API_TOKEN` | Truthy: ignore ambient tokens (env + config); only an explicit override authenticates |
 /// | `SOCKET_NO_CONFIG` | Truthy: disable the socket-cli config fallback layer entirely |
@@ -3118,9 +3117,7 @@ mod tests {
     fn binary_url_rederives_proxy_from_env_when_org_slug_missing() {
         const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let saved_proxy = std::env::var("SOCKET_PROXY_URL").ok();
-        let saved_legacy = std::env::var("SOCKET_PATCH_PROXY_URL").ok();
         std::env::set_var("SOCKET_PROXY_URL", "http://env-proxy.test:9999/");
-        std::env::remove_var("SOCKET_PATCH_PROXY_URL");
 
         let client = ApiClient::new(ApiClientOptions {
             api_url: "https://api.socket.dev".into(),
@@ -3130,17 +3127,13 @@ mod tests {
         });
         let (env_url, env_use_auth) = client.binary_url("blob", HASH);
 
-        // With the vars unset the base falls back to the built-in default.
+        // With the var unset the base falls back to the built-in default.
         std::env::remove_var("SOCKET_PROXY_URL");
         let (default_url, default_use_auth) = client.binary_url("blob", HASH);
 
         match saved_proxy {
             Some(v) => std::env::set_var("SOCKET_PROXY_URL", v),
             None => std::env::remove_var("SOCKET_PROXY_URL"),
-        }
-        match saved_legacy {
-            Some(v) => std::env::set_var("SOCKET_PATCH_PROXY_URL", v),
-            None => std::env::remove_var("SOCKET_PATCH_PROXY_URL"),
         }
 
         assert_eq!(

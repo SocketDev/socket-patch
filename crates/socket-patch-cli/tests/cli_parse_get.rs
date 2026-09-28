@@ -546,43 +546,32 @@ fn mode_agent_parses() {
 
 #[test]
 #[serial_test::serial]
-fn mode_hidden_value_aliases_parse() {
-    // The hidden value aliases mirror the legacy scan flag spellings:
-    // `host` (old mode name) and `redirect` (the `--redirect` boolean)
-    // for hosted; `vendor` (the `--vendor` boolean) for vendored. Each
-    // must parse byte-identically to its canonical spelling across the
-    // ENTIRE surface, not merely land on the right variant.
-    for (alias, canonical) in [
-        ("host", "hosted"),
-        ("redirect", "hosted"),
-        ("vendor", "vendored"),
-    ] {
-        let via_alias = parse_get(&["some-id", "--mode", alias]);
-        let via_canonical = parse_get(&["some-id", "--mode", canonical]);
-        assert_eq!(
-            snapshot(&via_alias),
-            snapshot(&via_canonical),
-            "--mode {alias} must parse identically to --mode {canonical}"
+fn removed_mode_value_aliases_are_rejected() {
+    // v5.0 dropped the hidden `host` / `redirect` / `vendor` value aliases
+    // (shared with `scan --mode`); only the canonical names parse.
+    let _scrub = EnvScrub::new();
+    for alias in ["host", "redirect", "vendor"] {
+        let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--mode", alias]) {
+            Ok(_) => panic!("--mode {alias} should fail to parse"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
+            ),
+            "--mode {alias}: expected ValueValidation or InvalidValue, got {:?}",
+            err.kind()
         );
-        // ...and the canonical parse itself is default-everything + mode,
-        // so the alias equality above can't be satisfied by two equally
-        // wrong parses.
-        let mut want = expected_defaults("some-id");
-        want.mode = Some(match canonical {
-            "hosted" => socket_patch_cli::commands::scan::ScanMode::Hosted,
-            _ => socket_patch_cli::commands::scan::ScanMode::Vendored,
-        });
-        assert_eq!(snapshot(&via_canonical), want);
     }
 }
 
 #[test]
 #[serial_test::serial]
 fn mode_rejects_unknown_value() {
-    // The shared value_enum restricts `--mode` to the three known names
-    // (+ hidden aliases). `apply` is deliberately NOT an alias of agent —
-    // applying is not a scan-mode name anywhere else (see ScanMode's doc)
-    // — so it must be rejected exactly like a bogus value.
+    // The shared value_enum restricts `--mode` to the three known names.
+    // `apply` is not a scan-mode name anywhere, so it must be rejected
+    // exactly like a bogus value.
     let _scrub = EnvScrub::new();
     for bad in ["bogus", "apply"] {
         let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--mode", bad]) {

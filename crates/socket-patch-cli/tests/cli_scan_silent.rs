@@ -514,7 +514,7 @@ fn scan_silent_vex_failure_keeps_error_output() {
 }
 
 /// The redirect flow's embedded-VEX failure path must keep its error
-/// under `--silent` too ("errors only", not "nothing"): `scan --redirect
+/// under `--silent` too ("errors only", not "nothing"): `scan --mode hosted
 /// --vex out.json --silent` with nothing to attest (the reference is
 /// forbidden, no manifest exists) exits 1, and the failure message must
 /// still reach stderr: `run_redirect`'s `vex_error` must not sit inside the
@@ -544,7 +544,7 @@ async fn scan_redirect_silent_vex_failure_keeps_error_output() {
     let vex_arg = vex_path.to_str().unwrap().to_string();
 
     let args = |silent: bool| {
-        let mut v = vec!["--redirect", "--yes"];
+        let mut v = vec!["--mode=hosted", "--yes"];
         if silent {
             v.push("--silent");
         }

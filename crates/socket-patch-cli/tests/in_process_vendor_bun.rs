@@ -1,6 +1,5 @@
 //! Hermetic subprocess tests for the Bun VENDORED-mode refusals and their
-//! positive twins: `scan --mode vendored` (with and without the no-op
-//! `--detached`), `get <uuid> --mode vendored`, `get <purl> --mode
+//! positive twins: `scan --mode vendored`, `get <uuid> --mode vendored`, `get <purl> --mode
 //! vendored`, their `--dry-run` previews, `--silent`, and the agent
 //! `--save-only` exemption — driven through the built binary against a
 //! wiremock patch API, on lockfiles written in the grammar REAL bun
@@ -569,11 +568,10 @@ async fn scan_vendored_refusal_preserves_seeded_manifest_record() {
 }
 
 // ---------------------------------------------------------------------------
-// scan --mode vendored --detached: the same refusal, BEFORE any fetch
+// scan --mode vendored: the same refusal, BEFORE any fetch
 // ---------------------------------------------------------------------------
 
-/// Every vendored download phase (with or without the no-op `--detached`)
-/// refuses pre-fetch with the vendor code — never fetching the view and
+/// Every vendored download phase refuses pre-fetch with the vendor code — never fetching the view and
 /// deferring the refusal to the vendor engine (which degrades to
 /// `package_not_installed` for alias installs) — and writes no manifest.
 #[tokio::test]
@@ -584,7 +582,7 @@ async fn scan_vendored_detached_refuses_v1_workspace_before_fetch() {
     write_bun_project(tmp.path(), LockShape::V1Workspace);
     let lock_before = lock_bytes(tmp.path());
 
-    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--detached", "--json"]);
+    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "partial_failure", "{v}");
@@ -613,7 +611,7 @@ async fn scan_vendored_detached_refuses_bun_lockb_before_fetch() {
     let tmp = tempfile::tempdir().unwrap();
     write_bun_project(tmp.path(), LockShape::MalformedLockb);
 
-    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--detached", "--json"]);
+    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["download"]["downloaded"], 0, "{v}");
@@ -817,17 +815,6 @@ async fn dry_run_previews_report_would_refuse_on_refused_bun_project() {
         (
             "scan",
             vec!["scan", "--mode", "vendored", "--dry-run", "--json"],
-        ),
-        (
-            "scan --detached",
-            vec![
-                "scan",
-                "--mode",
-                "vendored",
-                "--detached",
-                "--dry-run",
-                "--json",
-            ],
         ),
         (
             "get <uuid>",
@@ -1069,7 +1056,7 @@ async fn preserved_ledger_does_not_bypass_bun_refusal_after_rollback() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_bun_project(root, LockShape::V1Direct);
-    let (exit, stdout, stderr) = scan_vendored(root, &mock.uri(), &["--json", "--detached"]);
+    let (exit, stdout, stderr) = scan_vendored(root, &mock.uri(), &["--json"]);
     assert_eq!(exit, 0, "{stdout}\n{stderr}");
     assert!(!root.join(".socket/manifest.json").exists());
     let (exit, stdout, stderr) = run(root, &["rollback", "--preserve-state", "--yes", "--json"]);
@@ -1381,7 +1368,7 @@ async fn corrupt_vendor_ledger_on_refused_bun_lock_reports_vendor_state_unreadab
     assert_eq!(rec["errorCode"], LEDGER_CODE, "{v}");
 
     // Detached download phase: the same code before any fetch.
-    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--detached", "--json"]);
+    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     let rec = &v["download"]["patches"][0];

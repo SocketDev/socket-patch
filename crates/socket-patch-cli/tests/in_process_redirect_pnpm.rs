@@ -75,8 +75,7 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
     code
 }
 
-/// `--mode hosted` (the documented spelling; the hidden `--redirect` boolean
-/// folds into it).
+/// `--mode hosted`.
 fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
         paths: Vec::new(),
@@ -95,8 +94,6 @@ fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),

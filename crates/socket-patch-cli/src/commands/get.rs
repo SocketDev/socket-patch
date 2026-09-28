@@ -5705,7 +5705,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let purl = "pkg:npm/covgap-no-after@1.0.0";
@@ -5749,7 +5749,7 @@ mod tests {
     async fn download_patch_records_view_404_is_fetch_miss() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         // No view mock mounted: wiremock answers 404, which the API client
         // maps to Ok(None) — the "could not fetch details" fetch-miss arm.
         let server = MockServer::start().await;
@@ -5776,7 +5776,7 @@ mod tests {
     async fn download_patch_records_uninstalled_variant_base_warns_and_keeps_all() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         // Two qualified PyPI variants sharing an UNINSTALLED base: release
         // narrowing must keep both (with the not-installed warning), and the
         // warnings key must ride the detached envelope. Views stay unmounted
@@ -6063,7 +6063,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let purl = "pkg:npm/covgap-blobfail@1.0.0";
@@ -6114,7 +6114,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let purl = "pkg:npm/covgap-badblob@1.0.0";
@@ -6168,7 +6168,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let good_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let good_purl = "pkg:npm/covgap-good@1.0.0";
@@ -6248,7 +6248,7 @@ mod tests {
     async fn download_patch_records_already_vendored_detached_skips_offline() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await; // trap: no mounts
         let tmp = tempfile::tempdir().unwrap();
         let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -6354,7 +6354,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
         let purl = "pkg:npm/covgap-bun@1.0.0";
@@ -6411,7 +6411,7 @@ mod tests {
     async fn download_patch_records_bun_v1_workspace_refuses_before_fetch() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await; // trap: no mounts
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), BUN_V1_WORKSPACE_LOCK).unwrap();
@@ -6452,7 +6452,7 @@ mod tests {
     async fn download_patch_records_bun_refusal_skips_non_npm_purls() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
@@ -6483,7 +6483,7 @@ mod tests {
     async fn download_patch_records_bun_refusal_rejects_unwired_ledger_entries() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), BUN_V1_WORKSPACE_LOCK).unwrap();
@@ -6706,7 +6706,7 @@ mod tests {
     async fn download_patch_records_with_prefetched_view_never_fetches() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await; // trap: no mounts
         let tmp = tempfile::tempdir().unwrap();
         // Two files: one with served `blobContent` (→ the blob seed), one
@@ -6774,7 +6774,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let purl = "pkg:npm/covgap-supersede@1.0.0";
         let old_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -6844,7 +6844,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let uuid = |c: char| {
             format!("{0}{0}{0}{0}{0}{0}{0}{0}-{0}{0}{0}{0}-4{0}{0}{0}-8{0}{0}{0}-{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}", c)
@@ -7019,7 +7019,7 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let site = tempfile::tempdir().unwrap();
         // Two installed pypi distributions, each with its own bytes.
         let installed = |name: &str, body: &[u8]| {
@@ -7235,7 +7235,7 @@ mod tests {
     async fn download_patches_json_is_purl_ordered() {
         use wiremock::MockServer;
 
-        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let names = [

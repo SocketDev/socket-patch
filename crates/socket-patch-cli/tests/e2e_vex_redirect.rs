@@ -1,6 +1,6 @@
 //! End-to-end tests for redirect-patch awareness in `socket-patch vex`.
 //!
-//! `socket-patch scan --redirect` rewrites lockfiles so a patched dependency
+//! `socket-patch scan --mode hosted` rewrites lockfiles so a patched dependency
 //! resolves from Socket's HOSTED vendored patch, and records the patch (file
 //! hashes + vulnerabilities) in `.socket/vendor/redirect-state.json`. After the
 //! package manager installs, the patched bytes land in the installed tree, so
@@ -15,7 +15,7 @@
 //!   3. tampered installed file → omitted with skip reason `hash_mismatch`
 //!      (fail-closed)
 //!   4. `--no-verify` attests from the ledger records with NO installed tree
-//!      (the same shape as the in-run `scan --redirect --vex` attestation) —
+//!      (the same shape as the in-run `scan --mode hosted --vex` attestation) —
 //!      but only while the lockfile still wires the hosted patch: a stale
 //!      ledger is `redirect_unwired` even under `--no-verify`
 //!   5. every ecosystem attests through the ledger with its real hosted
@@ -25,7 +25,7 @@
 //!      evidence until install, an installed tree that does not verify wins,
 //!      foreign hosts and pin-less entries are refused
 //!
-//! Every ledger fixture carries the lockfile wiring `scan --redirect` wrote
+//! Every ledger fixture carries the lockfile wiring `scan --mode hosted` wrote
 //! next to it: `vex` only attests a redirect-ledger record while some
 //! lockfile still resolves the dependency from its hosted patch (a reverted
 //! lockfile with the ledger left behind must not keep attesting).
@@ -141,7 +141,7 @@ fn make_record(uuid: &str, after_hash: &str, vuln_id: &str, cves: &[&str]) -> Pa
 }
 
 /// Write a `.socket/vendor/redirect-state.json` ledger embedding `record` for
-/// `purl` (the shape `scan --redirect` persists for VEX).
+/// `purl` (the shape `scan --mode hosted` persists for VEX).
 fn write_redirect_state(cwd: &Path, purl: &str, record: PatchRecord) {
     let mut state = RedirectState::new();
     state.records.insert(purl.to_string(), record);
@@ -377,7 +377,7 @@ fn tampered_installed_file_omits_redirected_patch() {
 
 // ──────────────────────────────────────────────────────────────────────
 // 4. --no-verify attests from the ledger with NO installed tree — the same
-// shape as the in-run `scan --redirect --vex` attestation (bytes are remote,
+// shape as the in-run `scan --mode hosted --vex` attestation (bytes are remote,
 // fetched at install time, so there is nothing to hash yet).
 // ──────────────────────────────────────────────────────────────────────
 
@@ -389,7 +389,7 @@ fn redirected_no_verify_attests_without_installed_tree() {
 
     // No node_modules, no manifest — the redirect ledger is the only record
     // source. The ledger alone does not attest; the lockfile must still wire the hosted patch (see the gated twin below),
-    // so the fixture carries the rewrite `scan --redirect` recorded.
+    // so the fixture carries the rewrite `scan --mode hosted` recorded.
     write_redirect_state(
         cwd,
         purl,
@@ -637,7 +637,7 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
         ),
     ];
 
-    // The ledger records both halves `scan --redirect` persists: the
+    // The ledger records both halves `scan --mode hosted` persists: the
     // records AND the file edits (whose files still carry each patch's
     // hosted wiring — the liveness proof the ledger record needs).
     let mut state = RedirectState::new();
@@ -852,7 +852,7 @@ fn lockfile_hosted_ref_attests_without_manifest_or_ledger() {
     assert_eq!(skipped_reason(&env, purl), "record_unavailable");
 
     // Online: the record is fetched, and the PINNED hosted wiring attests
-    // until install (the in-run `scan --redirect --vex` evidence).
+    // until install (the in-run `scan --mode hosted --vex` evidence).
     let (_rt, server) = serve_patch_views(vec![(UUID.to_string(), left_pad_view(&"b".repeat(64)))]);
     let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
     assert_eq!(code, Some(0), "{env}");
