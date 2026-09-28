@@ -1769,6 +1769,7 @@ dependencies = [
  "hex",
  "libc",
  "portable-pty",
+ "qbsdiff",
  "regex",
  "reqwest",
  "semver",
