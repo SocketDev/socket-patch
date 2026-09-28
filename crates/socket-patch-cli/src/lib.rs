@@ -26,12 +26,19 @@ use clap::{Parser, Subcommand};
     about = "Patch vulnerable dependencies with Socket's security patches",
     version,
     propagate_version = true,
-    after_help = "Typical workflow:\n  \
-        socket-patch scan      Patch dependencies (rewrites lockfiles to Socket-hosted patched packages)\n  \
-        socket-patch vex       Emit an OpenVEX document for your vulnerability scanner\n  \
-        socket-patch vendor    Eject the patches into .socket/vendor/ for offline installs\n  \
-        socket-patch list      Show the patches in this project\n\n\
-        get, apply, rollback, remove and repair are the older agent-mode commands."
+    after_help = "Patch a project:\n  \
+        socket-patch scan       Patch every dependency with a patch (hosted: rewrites lockfiles)\n  \
+        socket-patch get        Patch one package, CVE, GHSA or patch UUID\n  \
+        socket-patch list       Show the patches in this project\n\n\
+        Undo:\n  \
+        socket-patch remove     Unwind one patch (by PURL or UUID)\n  \
+        socket-patch rollback   Unwind every patch\n\n\
+        Ship:\n  \
+        socket-patch vex        Emit an OpenVEX document for your vulnerability scanner\n  \
+        socket-patch vendor     Eject the patches into .socket/vendor/ for offline installs\n\n\
+        Agent mode (`scan --mode agent` edits installed files in place):\n  \
+        socket-patch apply      Re-apply .socket/manifest.json after each install (e.g. in CI)\n  \
+        socket-patch repair     Restore missing patch artifacts"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -60,6 +67,23 @@ pub enum Commands {
     /// lockfiles to Socket-hosted patched packages
     Scan(commands::scan::ScanArgs),
 
+    /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
+    #[command(visible_alias = "download")]
+    Get(commands::get::GetArgs),
+
+    /// List the patches in this project: hosted and vendored lockfile
+    /// references plus any agent-mode manifest entries
+    List(commands::list::ListArgs),
+
+    /// Remove one patch by PURL or UUID: unwind its hosted or vendored
+    /// wiring, or roll back its agent-mode files and drop it from the
+    /// manifest
+    Remove(commands::remove::RemoveArgs),
+
+    /// Undo patches: restore original files and unwind hosted or vendored
+    /// lockfile wiring
+    Rollback(commands::rollback::RollbackArgs),
+
     /// Generate an OpenVEX 0.2.0 document for the vulnerabilities the
     /// project's patches fix
     Vex(commands::vex::VexArgs),
@@ -71,24 +95,8 @@ pub enum Commands {
     /// Socket API needed.
     Vendor(commands::vendor::VendorArgs),
 
-    /// List the patches in this project: hosted and vendored lockfile
-    /// references plus any agent-mode manifest entries
-    List(commands::list::ListArgs),
-
-    /// Patch one package, CVE, GHSA or patch UUID (hosted mode by default)
-    #[command(visible_alias = "download")]
-    Get(commands::get::GetArgs),
-
     /// Agent mode: apply the patches in `.socket/manifest.json` in place
     Apply(commands::apply::ApplyArgs),
-
-    /// Undo patches: restore original files and unwind hosted or vendored
-    /// lockfile wiring
-    Rollback(commands::rollback::RollbackArgs),
-
-    /// Agent mode: remove a patch from the manifest by PURL or UUID (rolls
-    /// back files first)
-    Remove(commands::remove::RemoveArgs),
 
     /// Agent mode: download missing patch artifacts and clean up unused ones
     ///
@@ -145,7 +153,7 @@ impl Commands {
 
 /// Global options every subcommand's short help (`-h`) still lists; the
 /// rest move to `--help` only.
-const SHORT_HELP_GLOBALS: &[&str] = &["json", "dry_run", "verbose"];
+const SHORT_HELP_GLOBALS: &[&str] = &["json", "dry_run", "cwd", "ecosystems", "offline"];
 
 /// Per-subcommand arguments shown in `-h` on top of its own (non-global)
 /// ones: the commands that prompt keep `--yes`.
@@ -162,6 +170,7 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
     match sub {
         "scan" => &[
             "batch_size",
+            "prune",
             "sync",
             "all_releases",
             "vex_product",

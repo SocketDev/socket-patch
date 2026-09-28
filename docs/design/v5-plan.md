@@ -147,7 +147,7 @@ patch-UI review.
   keep the detail), code-free `Warning:`/`GC: skipped:` lines (error lines keep their code),
   "hosted" wording in human text, `ui::next_steps` shared by hosted and
   vendored, prompt-free hosted/vendored `get` (JSON too), `list`'s
-  `No patches in this project.` line (exit codes unchanged: 1 missing,
+  `No patches in this project.` line (exit 0, empty success envelope in JSON; was 1 missing,
   0 empty), `ui::CANCELLED` / `ui::PAID_UPGRADE`, exit 2 for `get` and
   `rollback --one-off` usage errors. **Not done:** scan/get JSON onto
   `json_envelope` (larger contract change; deferred). Per-row

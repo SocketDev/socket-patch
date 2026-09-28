@@ -276,7 +276,7 @@ fn list_empty_manifest_non_json() {
 fn list_no_manifest_non_json_prints_the_empty_project_line() {
     let tmp = tempfile::tempdir().unwrap();
     let (code, stdout, stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 0, "an empty project is a successful empty list");
     assert!(
         stdout.contains("No patches in this project. Run `socket-patch scan`."),
         "non-JSON list-without-manifest names the next step; got: {stdout} / {stderr}"

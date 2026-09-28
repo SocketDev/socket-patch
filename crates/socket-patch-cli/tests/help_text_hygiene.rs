@@ -176,10 +176,14 @@ fn root_command_list_leads_with_the_v5_workflow() {
         .collect();
     assert_eq!(
         &order[..9],
-        ["scan", "vex", "vendor", "list", "get", "apply", "rollback", "remove", "repair"],
+        ["scan", "get", "list", "remove", "rollback", "vex", "vendor", "apply", "repair"],
         "{text}"
     );
-    assert!(text.contains("Typical workflow:"), "{text}");
+    assert!(
+        text.contains("Patch a project:") && text.contains("Agent mode ("),
+        "{text}"
+    );
+    assert!(!text.contains("older agent-mode"), "{text}");
 }
 
 #[test]
@@ -247,10 +251,16 @@ fn short_help_lists_about_eight_options_and_long_help_lists_all() {
         let name = sub.get_name().to_string();
         let short = sub.render_help().to_string();
         let long = sub.render_long_help().to_string();
-        let count = |t: &str| t.lines().filter(|l| l.trim_start().starts_with('-')).count();
+        // Options only: `-h`/`-V` are on every command.
+        let count = |t: &str| {
+            t.lines()
+                .map(str::trim_start)
+                .filter(|l| l.starts_with('-') && !l.starts_with("-h,") && !l.starts_with("-V,"))
+                .count()
+        };
         assert!(count(&short) <= 9, "{name} -h lists {} options:\n{short}", count(&short));
         assert!(count(&long) > count(&short), "{name} --help must list more than -h");
-        assert!(short.contains("--json") && long.contains("--cwd"), "{name}");
+        assert!(short.contains("--json") && short.contains("--cwd"), "{name}");
     }
     let scan = cmd.find_subcommand_mut("scan").expect("scan");
     let long = scan.render_long_help().to_string();

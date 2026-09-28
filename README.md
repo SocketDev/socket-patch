@@ -472,11 +472,11 @@ need the network and refuse to run with `--offline`.
 | [`vex`](#vex) | Generate an OpenVEX document for the vulnerabilities the project's patches fix |
 | [`vendor`](#vendor) | Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles to use them (`--revert` undoes it) |
 | [`list`](#list) | List the patches in this project: hosted and vendored records plus any agent-mode manifest entries |
-| **Agent mode (older commands)** | |
-| [`get`](#get) | Fetch and apply one patch by UUID / CVE / GHSA / PURL / name (alias: `download`) |
-| [`apply`](#apply) | Apply the patches in `.socket/manifest.json` in place |
-| [`rollback`](#rollback) | Undo patches in every mode: restore original files and unwind hosted or vendored lockfile wiring |
-| [`remove`](#remove) | Remove one patch by PURL or UUID (rolls back first) |
+| [`get`](#get) | Patch one package, CVE, GHSA or patch UUID (hosted by default; alias: `download`) |
+| [`remove`](#remove) | Unwind one patch by PURL or UUID, in any mode |
+| [`rollback`](#rollback) | Unwind every patch, in any mode: restore original files and hosted or vendored lockfile wiring |
+| **[Agent mode](#agent-mode)** | |
+| [`apply`](#apply) | Apply the patches in `.socket/manifest.json` in place (run it after every install) |
 | [`repair`](#repair) | Download missing patch artifacts, rebuild vendored artifacts, clean up unused ones (alias: `gc`) |
 
 `socket-patch --update` updates the CLI itself (see [Updating](#updating)).
@@ -798,8 +798,7 @@ socket-patch vendor --json
 List the patches in this project: the hosted ledger's records (labeled
 `Mode: hosted`), the vendor ledger's (`Mode: vendored`), and any agent-mode entries in
 `.socket/manifest.json`. A project with none prints `No patches in this project. Run
-\`socket-patch scan\`.` (exit 1 when there is no manifest or ledger record at all, 0 for
-an empty manifest).
+\`socket-patch scan\`.` and exits 0 (`--json`: the success envelope with no events).
 
 **Usage:**
 ```bash
@@ -837,12 +836,6 @@ Package: pkg:npm/flatted@3.3.1
     - package/es.js
     ...
 ```
-
-### Agent mode (older commands)
-
-Agent mode keeps patches in `.socket/manifest.json` + `.socket/blobs/` and edits the
-installed files in place, so the CLI has to run again after every install. These
-commands drive it. `rollback` also undoes hosted and vendored patches.
 
 ### `get`
 
@@ -911,6 +904,100 @@ socket-patch get lodash -g
 socket-patch get CVE-2024-12345 --json -y
 ```
 
+### `remove`
+
+Remove a patch from the manifest (rolls back files first by default). If the package is
+[vendored](#vendor), `remove` also **reverts the vendoring** — the lockfile is restored
+byte-for-byte and the `.socket/vendor/` artifact is deleted — so the patch is fully gone
+in one command. Patches vendored by `scan --mode vendored` have no manifest entry and are
+removable by PURL or UUID all the same (reverting the vendoring *is* the removal, so
+`--skip-rollback` is refused for them).
+
+**Usage:**
+```bash
+socket-patch remove <identifier> [options]
+```
+
+**Arguments:**
+- `identifier` — package PURL (e.g. `pkg:npm/package@version`) or patch UUID.
+
+**Command-specific options** (plus all [Global options](#global-options)):
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--preserve-state` | `SOCKET_PRESERVE_STATE` | Restore the files and lockfiles but keep the patch's local state (manifest entry, vendored artifact + ledger entry) for a later re-apply, and skip blob cleanup — the single-patch twin of `rollback --preserve-state`. Conflicts with `--skip-rollback`. |
+| `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Only update the manifest, do not restore original files (for a vendored package that still has a manifest entry this also leaves the vendor wiring + artifact in place; refused for manifest-less vendored patches, where the revert *is* the removal). |
+
+**Examples:**
+```bash
+# Remove by PURL
+socket-patch remove "pkg:npm/lodash@4.17.20"
+
+# Remove by UUID
+socket-patch remove 550e8400-e29b-41d4-a716-446655440000
+
+# Remove without rolling back files
+socket-patch remove "pkg:npm/lodash@4.17.20" --skip-rollback
+
+# JSON output
+socket-patch remove "pkg:npm/lodash@4.17.20" --json
+```
+
+### `rollback`
+
+Roll back patches to restore the system to unpatched. If no target is given, everything
+is rolled back, across all three modes: in-place file restores (agent), vendored unwire +
+artifact deletion + ledger-entry drop, and hosted lockfile-redirect unwind + record drop.
+The rolled-back entries are then removed from `.socket/manifest.json` (a zero-patch
+`{"patches": {}}` husk stays) and their blobs are garbage-collected — a later `apply` has
+nothing to re-apply. Pass `--preserve-state` to keep the local patch state (manifest
+entries, vendored artifacts + ledger entries) for a later re-apply; use
+[`remove`](#remove) for a single patch.
+
+A wet run confirms once (auto-accepted under `--yes`/`--json`/non-TTY). Vendor-owned purls
+the run did NOT act on (a corrupt vendor ledger) are listed in the JSON output's
+`vendored` array; acted-on entries ride `vendoredReverted` / `vendoredPreserved` /
+`vendoredKept`.
+
+**Usage:**
+```bash
+socket-patch rollback [targets]... [options]
+```
+
+**Arguments:**
+- `targets` — zero or more package PURLs, patch UUIDs or path globs (unioned). Omit to roll
+  back everything.
+
+**Command-specific options** (plus all [Global options](#global-options)):
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--preserve-state` | `SOCKET_PRESERVE_STATE` | Unpatch the system but keep the local patch state — manifest entries, vendored artifacts + ledger entries — for a later re-apply, and skip GC. Hosted redirects have no preservable state and are unwound either way. |
+| `--one-off` | `SOCKET_ONE_OFF` | Reserved: rollback by fetching original (`beforeHash`) files from the API, no manifest required. **Not yet implemented** — the command currently errors up front. |
+
+**Examples:**
+```bash
+# Rollback all patches
+socket-patch rollback
+
+# Rollback a specific package
+socket-patch rollback "pkg:npm/lodash@4.17.20"
+
+# Rollback by UUID
+socket-patch rollback 550e8400-e29b-41d4-a716-446655440000
+
+# Dry run
+socket-patch rollback --dry-run
+
+# JSON output
+socket-patch rollback --json
+```
+
+### Agent mode
+
+Agent mode keeps patches in `.socket/manifest.json` + `.socket/blobs/` and edits the
+installed files in place, so the CLI has to run again after every install. `apply`
+and `repair` are agent-mode commands; `get`, `list`, `remove` and `rollback` work in
+every mode.
+
 ### `apply`
 
 Apply the patches in `.socket/manifest.json` to the installed files in place. Idempotent — safe to run from install
@@ -969,14 +1056,8 @@ socket-patch scan --mode agent
 socket-patch apply
 ```
 
-> **v5.0: `setup` was removed.** It used to wire install hooks (npm `postinstall` /
-> `dependencies` scripts, the `socket-patch[hook]` Python `.pth` wheel, a Bundler plugin,
-> Composer script events) that ran `apply` for you. Hooks an earlier release committed
-> keep working — they call `socket-patch apply`, which still exists — until you delete
-> them by hand: the `package.json` scripts, the `socket-patch[hook]` dependency (the
-> `socket-patch-hook` wheel is no longer published; `pip uninstall socket-patch-hook`),
-> the managed `plugin "socket-patch"` Gemfile block and `.socket/bundler-plugin/`, and
-> the `composer.json` script entries.
+> **v5.0: `setup` was removed.** See [Upgrading from `setup`](#upgrading-from-setup) to
+> retire the install hooks it wrote.
 
 Per-ecosystem notes for in-place patching:
 
@@ -996,92 +1077,37 @@ Per-ecosystem notes for in-place patching:
   [ecosystems.md](docs/ecosystems.md#maven--nuget-caveats).
 - **Deno** has no hosted or vendored mode, so agent mode is the only way to patch it.
 
-### `rollback`
+### Upgrading from `setup`
 
-Roll back patches to restore the system to unpatched. If no target is given, everything
-is rolled back, across all three modes: in-place file restores (agent), vendored unwire +
-artifact deletion + ledger-entry drop, and hosted lockfile-redirect unwind + record drop.
-The rolled-back entries are then removed from `.socket/manifest.json` (a zero-patch
-`{"patches": {}}` husk stays) and their blobs are garbage-collected — a later `apply` has
-nothing to re-apply. Pass `--preserve-state` to keep the local patch state (manifest
-entries, vendored artifacts + ledger entries) for a later re-apply; use
-[`remove`](#remove) for a single patch.
+v5 removes `socket-patch setup`. The hooks it wrote only ran `socket-patch apply`, so
+they keep working until you delete them, but nothing maintains them any more. For each
+project that ran `setup`:
 
-A wet run confirms once (auto-accepted under `--yes`/`--json`/non-TTY). Vendor-owned purls
-the run did NOT act on (a corrupt vendor ledger) are listed in the JSON output's
-`vendored` array; acted-on entries ride `vendoredReverted` / `vendoredPreserved` /
-`vendoredKept`.
-
-**Usage:**
-```bash
-socket-patch rollback [targets]... [options]
-```
-
-**Arguments:**
-- `targets` — zero or more package PURLs, patch UUIDs or path globs (unioned). Omit to roll
-  back everything.
-
-**Command-specific options** (plus all [Global options](#global-options)):
-| Flag | Env var | Description |
-|------|---------|-------------|
-| `--preserve-state` | `SOCKET_PRESERVE_STATE` | Unpatch the system but keep the local patch state — manifest entries, vendored artifacts + ledger entries — for a later re-apply, and skip GC. Hosted redirects have no preservable state and are unwound either way. |
-| `--one-off` | `SOCKET_ONE_OFF` | Reserved: rollback by fetching original (`beforeHash`) files from the API, no manifest required. **Not yet implemented** — the command currently errors up front. |
-
-**Examples:**
-```bash
-# Rollback all patches
-socket-patch rollback
-
-# Rollback a specific package
-socket-patch rollback "pkg:npm/lodash@4.17.20"
-
-# Rollback by UUID
-socket-patch rollback 550e8400-e29b-41d4-a716-446655440000
-
-# Dry run
-socket-patch rollback --dry-run
-
-# JSON output
-socket-patch rollback --json
-```
-
-### `remove`
-
-Remove a patch from the manifest (rolls back files first by default). If the package is
-[vendored](#vendor), `remove` also **reverts the vendoring** — the lockfile is restored
-byte-for-byte and the `.socket/vendor/` artifact is deleted — so the patch is fully gone
-in one command. Patches vendored by `scan --mode vendored` have no manifest entry and are
-removable by PURL or UUID all the same (reverting the vendoring *is* the removal, so
-`--skip-rollback` is refused for them).
-
-**Usage:**
-```bash
-socket-patch remove <identifier> [options]
-```
-
-**Arguments:**
-- `identifier` — package PURL (e.g. `pkg:npm/package@version`) or patch UUID.
-
-**Command-specific options** (plus all [Global options](#global-options)):
-| Flag | Env var | Description |
-|------|---------|-------------|
-| `--preserve-state` | `SOCKET_PRESERVE_STATE` | Restore the files and lockfiles but keep the patch's local state (manifest entry, vendored artifact + ledger entry) for a later re-apply, and skip blob cleanup — the single-patch twin of `rollback --preserve-state`. Conflicts with `--skip-rollback`. |
-| `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Only update the manifest, do not restore original files (for a vendored package that still has a manifest entry this also leaves the vendor wiring + artifact in place; refused for manifest-less vendored patches, where the revert *is* the removal). |
-
-**Examples:**
-```bash
-# Remove by PURL
-socket-patch remove "pkg:npm/lodash@4.17.20"
-
-# Remove by UUID
-socket-patch remove 550e8400-e29b-41d4-a716-446655440000
-
-# Remove without rolling back files
-socket-patch remove "pkg:npm/lodash@4.17.20" --skip-rollback
-
-# JSON output
-socket-patch remove "pkg:npm/lodash@4.17.20" --json
-```
+1. **Pick a mode.**
+   - *Move to hosted mode* (recommended; nothing runs after installs): run
+     `socket-patch rollback` (restores the patched files and empties the agent-mode
+     manifest), then `socket-patch scan`, and commit the lockfile changes and
+     `.socket/`.
+   - *Stay in agent mode*: keep `.socket/`, and add `socket-patch apply` to CI after
+     every install (see [Agent mode in CI](#agent-mode-in-ci)).
+2. **Delete the hook for each ecosystem `setup` wired:**
+   - **npm / pnpm / yarn / bun**: in `package.json`, remove the
+     `npx @socketsecurity/socket-patch apply --silent --ecosystems npm` command (or its
+     `pnpm dlx` twin) from `scripts.postinstall`, and from `scripts.dependencies` if it
+     is there. Drop the script key if nothing else is left in it.
+   - **Composer**: in `composer.json`, remove
+     `socket-patch apply --offline --silent --ecosystems composer` from
+     `scripts.post-install-cmd` and `scripts.post-update-cmd`.
+   - **Python**: remove `socket-patch[hook]` from `requirements.txt`, or from
+     `[project].dependencies` / `[tool.poetry.dependencies]` in `pyproject.toml`, then
+     `pip uninstall socket-patch-hook` in each environment that has it (the wheel is no
+     longer published, so a fresh install fails while the dependency is still listed).
+   - **Bundler**: delete the managed `plugin "socket-patch", path: ...` block from the
+     `Gemfile`, then `bundle plugin uninstall socket-patch`, and delete
+     `.socket/bundler-plugin/`, `.socket/gem-plugin-stamp` and the `/gem-plugin-stamp`
+     line in `.socket/.gitignore`.
+3. **Check:** `socket-patch list` shows what remains. In agent mode, run
+   `socket-patch apply` once to confirm the manifest still applies.
 
 ### `repair`
 
