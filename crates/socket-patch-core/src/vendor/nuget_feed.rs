@@ -1140,10 +1140,10 @@ struct ConfigEdit {
     mapping_fragment: String,
 }
 
-/// Resolve the existing `nuget.config` (prefer lowercase `nuget.config`, then
-/// `NuGet.Config`), or `None` when the project has none.
+/// Resolve the existing config in NuGet's own probe order, or `None` when the
+/// project has none.
 async fn existing_config_path(project_root: &Path) -> Option<PathBuf> {
-    for name in ["nuget.config", "NuGet.Config"] {
+    for name in crate::patch::redirect::NUGET_CONFIG_FILE_NAMES {
         let p = project_root.join(name);
         // Answers from a group-committed run's capture: a config an earlier
         // package of this run created is not on disk yet.
@@ -2533,6 +2533,41 @@ mod tests {
             orig_cfg,
             "pre-existing nuget.config restored byte-identically"
         );
+    }
+
+    /// NuGet reads `NuGet.config` when no `nuget.config` exists; creating
+    /// one beside it would shadow the project's own sources.
+    #[tokio::test]
+    async fn wiring_edits_mixed_case_nuget_config_in_place() {
+        let orig_cfg = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                        <configuration>\n\
+                        \x20 <packageSources>\n\
+                        \x20   <add key=\"corp\" value=\"https://nuget.corp.example/v3/index.json\" />\n\
+                        \x20 </packageSources>\n\
+                        </configuration>\n";
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        tokio::fs::write(root.join("NuGet.config"), orig_cfg)
+            .await
+            .unwrap();
+        let case_sensitive = !root.join("nuget.config").exists();
+
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        assert_eq!(entry.wiring[0].action, WiringAction::Rewritten);
+        let wired = tokio::fs::read_to_string(root.join("NuGet.config"))
+            .await
+            .unwrap();
+        assert!(wired.contains(&format!("socket-patch-{UUID}")), "{wired}");
+        assert!(wired.contains("key=\"corp\""), "{wired}");
+        if case_sensitive {
+            assert_eq!(entry.wiring[0].file, "NuGet.config");
+            assert!(
+                !root.join("nuget.config").exists(),
+                "no shadowing nuget.config created"
+            );
+        }
     }
 
     #[tokio::test]

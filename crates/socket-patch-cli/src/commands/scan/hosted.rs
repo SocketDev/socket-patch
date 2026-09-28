@@ -72,7 +72,11 @@ pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // otherwise the `[registries.…]` block lands in a file cargo ignores.
     ".cargo/config",
     "composer.lock",
+    // Every spelling NuGet probes: the rewriter edits the one NuGet reads
+    // rather than shadowing it with a fresh `nuget.config`.
     "nuget.config",
+    "NuGet.config",
+    "NuGet.Config",
     "packages.lock.json",
     "Gemfile",
     "Gemfile.lock",
