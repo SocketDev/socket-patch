@@ -984,7 +984,7 @@ fn remove_hosted_revert_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("could not restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
+        msg.contains("cannot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
             && msg.contains("404")
             && msg.contains("git checkout -- package-lock.json")
             && msg.contains("The manifest was not modified."),
@@ -1016,7 +1016,7 @@ fn remove_hosted_only_revert_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("could not restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
+        msg.contains("cannot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
             && msg.contains("this run is offline"),
         "the error must name the purl and the offline cause; got: {msg}"
     );

@@ -2921,7 +2921,7 @@ pub(crate) async fn run_redirect_selected(
 
     // Emit an OpenVEX attestation when `--vex` was requested. The redirected
     // bytes are fetched from the hosted patch server at install time, so the
-    // PURLs CONFIRMED REDIRECTED BY THIS RUN are attested from the ledger
+    // PURLs CONFIRMED REDIRECTED BY THIS RUN are attested from this run's
     // records WITHOUT hash verification (`assume_applied` — the integrity
     // pins written into the lockfile are the evidence), while any OTHER
     // manifest patches (previously applied / vendored — and any stale ledger
@@ -3131,7 +3131,7 @@ pub(crate) async fn run_redirect_selected(
             if let Some(statements) = vex_statements {
                 eprintln!(
                     "Wrote OpenVEX document with {} to {} (redirected patches are attested \
-                     from the ledger, not hash-verified — their bytes are fetched at install \
+                     from their patch records, not hash-verified — their bytes are fetched at install \
                      time; run `socket-patch vex` after installing to verify against the \
                      installed tree).",
                     crate::ui::plural(statements, "statement", "statements"),

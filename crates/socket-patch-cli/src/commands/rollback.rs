@@ -1117,7 +1117,10 @@ pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option
     if !HostedPin::all(&remaining).is_empty() {
         return None;
     }
-    match socket_patch_core::utils::fs::remove_file(&path).await {
+    // The emptied `.socket/vendor/` goes with it; the apply lock's drop
+    // prunes an emptied `.socket/` itself.
+    let stop = common.cwd.join(socket_patch_core::constants::SOCKET_DIR);
+    match socket_patch_core::utils::socket_dir::remove_file_and_prune(&path, &stop).await {
         Ok(()) => None,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some((

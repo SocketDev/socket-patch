@@ -1304,16 +1304,15 @@ async fn unwind_hosted(
 
 /// Error code + message for a stopped hosted unwind.
 fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'static str, String) {
-    let HostedUnwindError { what, why } = err;
+    // `why` already names the pin (the restore's refusal) or the write
+    // that failed, with its remedy; `what` is only the leg's failure key.
+    let HostedUnwindError { what: _, why } = err;
     (
         "hosted_revert_failed",
         if manifest_backed {
-            format!(
-                "could not restore {what} to its upstream registry entry: {why}. The manifest \
-                 was not modified."
-            )
+            format!("{why}. The manifest was not modified.")
         } else {
-            format!("could not restore {what} to its upstream registry entry: {why}")
+            why
         },
     )
 }

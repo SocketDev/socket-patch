@@ -2038,7 +2038,7 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
         "the VEX summary must name the count and the path; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("attested from the ledger"),
+        stderr.contains("attested from their patch records"),
         "the no-verify caveat is load-bearing; stderr=\n{stderr}"
     );
     let doc: Value =
