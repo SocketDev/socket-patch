@@ -49,13 +49,16 @@
 //!    vendored: `--offline` where the release allows) and prove the PATCHED
 //!    bytes are what Python imports;
 //! 4. manifest-less VEX there: (a) standalone `vex` attests the purl with
-//!    the right marker and vulnerability ids; (b) with both ledgers deleted
-//!    it still attests from lockfile discovery + the API record; (c)
-//!    `--offline` without ledgers is `record_unavailable` with ZERO requests;
-//!    (d) the embedded `apply --vex` (+ `vendor --vex` / `scan --redirect
-//!    --vex`) attest too; (e) the wiring reverted to the registry files with
-//!    the ledgers and artifacts left behind, reinstalled pristine by uv, is
-//!    NOT attested — verified or `--no-verify`, online or offline;
+//!    the right marker and vulnerability ids; (b) with the vendor ledger
+//!    deleted (a hosted flow writes none in v5 — asserted) it still attests
+//!    from lockfile discovery + the API record; (c) `--offline` without
+//!    ledgers is `record_unavailable` with ZERO requests; (d) the embedded
+//!    `apply --vex` (+ `vendor --vex` / `scan --redirect --vex`) attest too
+//!    (hosted: online, there is no local record); (e) the wiring reverted to
+//!    the registry files with the ledgers and artifacts left behind,
+//!    reinstalled pristine by uv, is NOT attested — verified or
+//!    `--no-verify`, online or offline (vendored: `vendor_unwired`; hosted:
+//!    nothing is discovered at all);
 //! 5. the lanes with project metadata also run a plain (re-resolving) `uv
 //!    sync` — for a transitive target this is the 0.5.6 boundary: older uv
 //!    re-resolves the override against the registry, reinstalls the
@@ -1044,7 +1047,10 @@ pub fn manifestless_matrix(m: &Matrix<'_>, row: &dyn Fn(&str, &str)) {
     attested(&vex(VexRun::online(m.api)), "manifest-deleted");
     // (b) ledgers deleted too: lockfile discovery + the API record.
     let ledgers = snapshot(fresh, &LEDGERS);
-    assert!(!ledgers.is_empty(), "the flow left no ledger");
+    match m.mode {
+        Mode::Hosted => crate::vex_e2e_common::assert_no_hosted_ledger(fresh, "hosted flow"),
+        Mode::Vendored => assert!(!ledgers.is_empty(), "the vendored flow left no ledger"),
+    }
     strip_ledgers(fresh);
     let before = m.api.view_requests(m.uuid);
     let out = vex(VexRun::online(m.api));
@@ -1066,6 +1072,13 @@ pub fn manifestless_matrix(m: &Matrix<'_>, row: &dyn Fn(&str, &str)) {
     // (d) embedded entry points, manifest-less, ledgers back.
     restore(fresh, &ledgers);
     for (label, run) in &m.embedded {
+        let mut run = run.clone();
+        if m.mode == Mode::Hosted && run.offline {
+            // v5 hosted mode keeps no local record: the embedded run
+            // fetches it like the standalone one.
+            run.offline = false;
+            run.proxy_url = Some(m.api.uri());
+        }
         let out = vex(run.clone());
         assert_eq!(out.code, Some(0), "[{label}]:\n{out}");
         assert_attested(out.doc(), m.purl, m.uuid, marker, m.vulns);
@@ -1109,16 +1122,28 @@ pub fn manifestless_matrix(m: &Matrix<'_>, row: &dyn Fn(&str, &str)) {
                 if no_verify { " --no-verify" } else { "" },
                 if online { " online" } else { " offline" }
             );
-            assert_eq!(out.code, Some(1), "[{step}]:\n{out}");
-            assert_not_attested(&out.envelope, m.purl, m.mode.unwired());
+            match m.mode {
+                Mode::Vendored => {
+                    assert_eq!(out.code, Some(1), "[{step}]:\n{out}");
+                    assert_not_attested(&out.envelope, m.purl, m.mode.unwired());
+                }
+                Mode::Hosted => {
+                    assert_eq!(out.code, Some(2), "[{step}]:\n{out}");
+                    assert_eq!(
+                        out.envelope["error"]["code"], "manifest_not_found",
+                        "[{step}]: no hosted state is left:\n{out}"
+                    );
+                }
+            }
         }
     }
+    let why = match m.mode {
+        Mode::Vendored => m.mode.unwired(),
+        Mode::Hosted => "nothing discovered",
+    };
     row(
         "reverted",
-        &format!(
-            "not attested ({}; verified + --no-verify)",
-            m.mode.unwired()
-        ),
+        &format!("not attested ({why}; verified + --no-verify)"),
     );
     restore(fresh, &wired);
 }
@@ -1672,8 +1697,33 @@ pub struct Production<'a> {
     pub embedded: Vec<(&'a str, VexRun)>,
 }
 
-/// The first production record for one of `p.uuids`, from the ledgers or
-/// the manifest `p.proj` holds.
+/// The public patch view for `uuid` from the production proxy (the free
+/// tier needs no token), or `None` when it does not answer.
+fn fetch_public_view(uuid: &str) -> Option<Value> {
+    let url = format!(
+        "{}/patch/view/{uuid}",
+        socket_patch_core::constants::DEFAULT_PATCH_API_PROXY_URL
+    );
+    // Own thread + runtime: callers may already be inside a tokio runtime.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().ok()?;
+        rt.block_on(async {
+            let resp = reqwest::get(&url).await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.json::<Value>().await.ok()
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+/// The first production record for one of `p.uuids`, from the vendor
+/// ledger or the manifest `p.proj` holds (or a pre-v5 redirect ledger) —
+/// and, for a hosted leg (v5 hosted mode keeps no local record), from the
+/// production patch API itself.
 fn production_record(p: &Production<'_>) -> Value {
     let read = |rel: &str| -> Value {
         std::fs::read(p.proj.join(rel))
@@ -1699,9 +1749,14 @@ fn production_record(p: &Production<'_>) -> Value {
     candidates
         .into_iter()
         .find(|r| r["uuid"].as_str().is_some_and(|u| p.uuids.contains(&u)))
+        .or_else(|| {
+            (p.mode == Mode::Hosted)
+                .then(|| p.uuids.iter().find_map(|u| fetch_public_view(u)))
+                .flatten()
+        })
         .unwrap_or_else(|| {
             panic!(
-                "{}: no production record for the leg's pinned patches in the ledgers",
+                "{}: no production record for the leg's pinned patches (local state or API)",
                 p.leg
             )
         })
