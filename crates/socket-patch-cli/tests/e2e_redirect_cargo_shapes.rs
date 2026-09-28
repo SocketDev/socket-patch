@@ -7,7 +7,8 @@
 //!   own version's registry, and removing both purls restores every byte.
 //! * `legacy_config` — an existing legacy `.cargo/config`: the registry
 //!   block lands there, and `remove` restores the file byte-for-byte —
-//!   also when it lacks a final newline or ends in a blank line.
+//!   also when it ends in a blank line (one lacking a final newline gets
+//!   that newline back: v5 keeps no ledger fragment to tell them apart).
 //! * `crlf` — CRLF `Cargo.toml` + `Cargo.lock`: rewritten with CRLF kept,
 //!   and restored byte-for-byte.
 //! * `workspace_direct_member` — a virtual workspace whose root pins
@@ -27,10 +28,14 @@
 //! wiremock sparse registry per patch, `scan --mode hosted`, then a FRESH
 //! checkout (only the committed files travel) where `cargo fetch --locked`
 //! and an offline `cargo build --locked` must link each patched-only symbol
-//! and a post-install `vex` must attest exactly the patches, and finally
+//! and a post-install `vex` must attest exactly the patches (v5: no hosted
+//! ledger, so each record comes from the patch API), and finally
 //! `remove <purl>` for every patch — in apply order and, from the same
 //! post-scan state, in reverse — which must leave the project
-//! byte-identical to its pre-scan state.
+//! byte-identical to its pre-scan state. v5 `remove` restores each hosted
+//! pin's crates.io entry, re-resolving the checksum from the sparse index:
+//! a wiremock mirror of the pristine checksums (`SOCKET_CRATES_INDEX`), with
+//! the mock origin named the patch server.
 //!
 //! `SOCKET_PATCH_CARGO_E2E_LOCK_VERSION` / `_TOOLCHAIN` (see
 //! `cargo_e2e_matrix`) re-encode the baseline lock, so a v1 lock's full-id
@@ -107,6 +112,16 @@ fn binary() -> PathBuf {
 }
 
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
+    run_socket_env(cwd, args, cargo_home, &[])
+}
+
+/// [`run_socket`] with extra env applied after the scrub.
+fn run_socket_env(
+    cwd: &Path,
+    args: &[&str],
+    cargo_home: &Path,
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).current_dir(cwd);
     for (k, _) in std::env::vars_os() {
@@ -116,6 +131,9 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
     }
     cmd.env("SOCKET_NO_CONFIG", "1");
     cmd.env("CARGO_HOME", cargo_home);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -151,6 +169,40 @@ fn sparse_index_rel(name: &str) -> String {
         3 => format!("3/{}/{name}", &name[..1]),
         _ => format!("{}/{}/{name}", &name[..2], &name[2..4]),
     }
+}
+
+/// A crates.io sparse-index mirror of the PRISTINE lock's checksums for
+/// every patched crate — what the v5 upstream restore reads to put a hosted
+/// `Cargo.lock` entry back on crates.io.
+async fn mount_crates_index_mirror(pristine_lock: &str, patches: &[Patch]) -> MockServer {
+    let server = MockServer::start().await;
+    let lock = pristine_lock.replace("\r\n", "\n");
+    let mut rows: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for pkg in cargo_e2e_matrix::parse_lock(&lock) {
+        if !patches.iter().any(|p| p.name == pkg.name) {
+            continue;
+        }
+        let cksum = pkg
+            .checksum
+            .unwrap_or_else(|| panic!("{} {} has no checksum", pkg.name, pkg.version));
+        rows.entry(pkg.name.clone()).or_default().push(
+            serde_json::json!({
+                "name": pkg.name, "vers": pkg.version, "deps": [], "cksum": cksum,
+                "features": {}, "yanked": false,
+            })
+            .to_string(),
+        );
+    }
+    for (name, lines) in rows {
+        Mock::given(wiremock::matchers::path(format!(
+            "/{}",
+            sparse_index_rel(&name)
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string(lines.join("\n")))
+        .mount(&server)
+        .await;
+    }
+    server
 }
 
 fn build_crate(stage: &Path, crate_dir: &Path, leaf: &str, patched: &[u8]) -> Vec<u8> {
@@ -579,6 +631,13 @@ async fn run_shape(shape: Shape) -> Option<()> {
             "pkg:cargo/consumer@0.1.0",
             "--patch-server-url",
             &uri,
+            // No hosted ledger (v5): the records come from the patch API.
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
             "--cwd",
             &fresh_s,
         ],
@@ -605,9 +664,25 @@ async fn run_shape(shape: Shape) -> Option<()> {
     expected.sort();
     assert_eq!(attested, expected, "{}: attested purls: {doc}", shape.tag);
 
+    assert!(
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "{}: hosted mode writes no redirect ledger",
+        shape.tag
+    );
+
     // Rollback: removing every purl restores the pre-scan project exactly —
     // in apply order AND in reverse (a v1 lock's shared dependent blocks
     // once made the first-applied purl unremovable before its sibling).
+    // v5: each removal restores the pin's crates.io entry from the index
+    // mirror; the mock origin is named the patch server so the pins are
+    // found without a ledger.
+    let pristine_lock = String::from_utf8(before["Cargo.lock"].clone()).unwrap();
+    let index = mount_crates_index_mirror(&pristine_lock, &shape.patches).await;
+    let index_uri = index.uri();
+    let unwind_env = [
+        ("SOCKET_CRATES_INDEX", index_uri.as_str()),
+        ("SOCKET_PATCH_SERVER_URL", uri.as_str()),
+    ];
     let post_scan = tmp.path().join("post-scan");
     copy_tree(&proj, &post_scan);
     let mut orders = vec![shape.patches.clone()];
@@ -621,7 +696,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
         }
         for patch in order {
             let purl = patch.purl();
-            let (code, stdout, err) = run_socket(
+            let (code, stdout, err) = run_socket_env(
                 &proj,
                 &[
                     "remove",
@@ -633,6 +708,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
                     "--no-telemetry",
                 ],
                 &home,
+                &unwind_env,
             );
             assert_eq!(
                 code, 0,
@@ -642,11 +718,21 @@ async fn run_shape(shape: Shape) -> Option<()> {
         }
         let after = snapshot(&proj);
         for (rel, bytes) in &before {
+            // v5 keeps no ledger fragment, and the rewriter separates its
+            // appended registry block with the same bytes whether or not the
+            // original file ended in a newline — so an UNTERMINATED file can
+            // only come back with its final newline (every other byte exact).
+            let want = match after.get(rel) {
+                Some(got) if !bytes.ends_with(b"\n") && *got == [bytes.as_slice(), b"\n"].concat() => {
+                    got.clone()
+                }
+                _ => bytes.clone(),
+            };
             assert_eq!(
                 after
                     .get(rel)
                     .map(|b| String::from_utf8_lossy(b).into_owned()),
-                Some(String::from_utf8_lossy(bytes).into_owned()),
+                Some(String::from_utf8_lossy(&want).into_owned()),
                 "{} (removal order {n}): {rel} not restored byte-for-byte by remove",
                 shape.tag
             );
@@ -753,9 +839,11 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
     let _ = run_shape(shape).await;
 }
 
-/// Bug H, exactly: a config without a final newline, and one ending in a
-/// blank line, both come back byte-for-byte (the appended block's removal
-/// once normalized the trailing newline run).
+/// Bug H: a config ending in a blank line comes back byte-for-byte (the
+/// appended block's removal once normalized the trailing newline run). A
+/// config without a final newline comes back with every byte but that
+/// missing newline: v5 keeps no ledger fragment to tell it apart from a
+/// terminated file, since the rewriter's separator is the same for both.
 #[tokio::test(flavor = "multi_thread")]
 async fn cargo_hosted_config_trailing_bytes_are_restored() {
     for (tag, rel, config) in [
