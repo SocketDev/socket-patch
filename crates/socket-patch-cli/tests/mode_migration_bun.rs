@@ -602,7 +602,6 @@ fn packages_line(lock: &str, name: &str) -> String {
         .to_string()
 }
 
-
 fn warning_codes(v: &Value) -> Vec<String> {
     v.as_array()
         .map(|w| {
@@ -1341,7 +1340,10 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
                         .contains(DEP_A.uuid_v),
                 "the stale manifest uuid must not be attested ({tag}): {out}"
             );
-            let warnings = out.envelope["warnings"].as_array().cloned().unwrap_or_default();
+            let warnings = out.envelope["warnings"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             assert!(
                 warnings
                     .iter()

@@ -124,7 +124,10 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &
     );
     assert_eq!(code, 1, "a binary hosted pin cannot be restored: {env}");
     assert_eq!(env["status"], "partial_failure", "{env}");
-    let failed = env["hosted"]["failed"].as_array().cloned().unwrap_or_default();
+    let failed = env["hosted"]["failed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         failed.iter().any(|f| f["purl"] == PURL
             && f["error"]
@@ -132,9 +135,16 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &
                 .is_some_and(|e| e.contains("git checkout -- bun.lockb"))),
         "the refusal names the checkout remedy: {env}"
     );
-    assert_eq!(fixture.lock(), hosted_lock, "a refused restore writes nothing");
+    assert_eq!(
+        fixture.lock(),
+        hosted_lock,
+        "a refused restore writes nothing"
+    );
     assert!(
-        !fixture.project.join(".socket/vendor/redirect-state.json").exists(),
+        !fixture
+            .project
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
         "no hosted ledger exists"
     );
     std::fs::write(fixture.project.join("bun.lockb"), &fixture.original_lock).unwrap();
@@ -744,7 +754,10 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         let mut args = vec!["vendor", "--offline", "--patch-server-url", &uri];
         args.extend_from_slice(extra);
         let (code, refused) = cli_code(project, &args);
-        assert_eq!(code, 1, "vendor {extra:?} over a binary hosted pin: {refused}");
+        assert_eq!(
+            code, 1,
+            "vendor {extra:?} over a binary hosted pin: {refused}"
+        );
         let failed = refused["events"]
             .as_array()
             .and_then(|events| {
@@ -761,7 +774,11 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
             }),
             "{refused}"
         );
-        assert_eq!(snapshot(project), before, "refused vendor {extra:?} wrote nothing");
+        assert_eq!(
+            snapshot(project),
+            before,
+            "refused vendor {extra:?} wrote nothing"
+        );
     }
     std::fs::write(project.join("bun.lockb"), &fixture.original_lock).unwrap();
     let before = snapshot(project);

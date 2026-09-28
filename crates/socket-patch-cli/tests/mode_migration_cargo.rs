@@ -917,7 +917,8 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
     );
 
     // B: plain `vendor` over the hosted state — the takeover.
-    let index = mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
+    let index =
+        mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
     stage_patch(&proj, &purl, &orig, &patched);
     let (code, stdout, stderr) = vendor_over_hosted(&proj, &cargo_home, &server, &index);
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
@@ -1074,7 +1075,8 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
 
     // A again: vendor back (restoring the hosted pin's crates.io entry
     // first).
-    let index = mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
+    let index =
+        mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
     let (code, stdout, stderr) = vendor_over_hosted(&proj, &cargo_home, &server, &index);
     assert_eq!(code, 0, "re-vendor failed: {stdout}\n{stderr}");
 

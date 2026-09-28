@@ -1442,7 +1442,10 @@ async fn unwind_env_for(
         .mount(server)
         .await;
     vec![
-        ("SOCKET_PATCH_SERVER_URL".to_string(), patch_origin.to_string()),
+        (
+            "SOCKET_PATCH_SERVER_URL".to_string(),
+            patch_origin.to_string(),
+        ),
         (
             "SOCKET_NPM_REGISTRY".to_string(),
             format!("{}/registry", server.uri()),
@@ -1470,7 +1473,10 @@ async fn assert_rollback_restores_pristine(server: &MockServer, root: &Path, pri
         ],
         &unwind,
     );
-    assert_eq!(code, 0, "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert_eq!(
         std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
         pristine,

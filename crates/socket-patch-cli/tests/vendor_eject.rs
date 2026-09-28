@@ -223,7 +223,10 @@ async fn eject_vendors_hosted_pins_and_revert_returns_to_upstream() {
     let applied = find_event(&env, "applied", None);
     assert_eq!(applied["purl"], PURL, "{env:#}");
     find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
-    assert!(p.artifact().is_file(), "the artifact lands in .socket/vendor/");
+    assert!(
+        p.artifact().is_file(),
+        "the artifact lands in .socket/vendor/"
+    );
     let lock = p.lock();
     let entry = &lock["packages"]["node_modules/left-pad"];
     let resolved = entry["resolved"].as_str().unwrap_or_default();
@@ -240,10 +243,9 @@ async fn eject_vendors_hosted_pins_and_revert_returns_to_upstream() {
         !p.root().join(".socket/manifest.json").exists(),
         "an eject is manifest-free"
     );
-    let state: Value = serde_json::from_slice(
-        &std::fs::read(p.root().join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap();
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(p.root().join(".socket/vendor/state.json")).unwrap())
+            .unwrap();
     assert!(
         state["entries"].get(PURL).is_some(),
         "the vendor ledger tracks the ejected purl: {state:#}"
@@ -336,7 +338,11 @@ async fn no_manifest_and_no_hosted_pins_is_a_noop() {
     assert_eq!(p.lock_bytes(), before);
     assert!(!p.root().join(".socket").exists(), "nothing is created");
     assert!(
-        p.server.received_requests().await.unwrap_or_default().is_empty(),
+        p.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "the no-op never talks to the API or the registry"
     );
 

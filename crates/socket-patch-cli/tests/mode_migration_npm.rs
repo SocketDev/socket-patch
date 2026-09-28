@@ -395,7 +395,9 @@ async fn mount_hosted_mocks(
 async fn mount_registry_from_classic_lock(server: &MockServer, lock: &str) -> String {
     let block = lock
         .split("\n\n")
-        .find(|b| b.contains(&format!("{DEP}@")) && b.contains(&format!("version \"{DEP_VERSION}\"")))
+        .find(|b| {
+            b.contains(&format!("{DEP}@")) && b.contains(&format!("version \"{DEP_VERSION}\""))
+        })
         .unwrap_or_else(|| panic!("no {DEP} block in the pristine lock:\n{lock}"));
     let field = |name: &str| {
         block
@@ -807,11 +809,8 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
     // upstream restore re-resolves the registry entry (mirrored from the
     // pristine lock), and the mock origin is named hosted via
     // --patch-server-url.
-    let registry = mount_registry_from_classic_lock(
-        &server,
-        &String::from_utf8_lossy(&lock_pristine),
-    )
-    .await;
+    let registry =
+        mount_registry_from_classic_lock(&server, &String::from_utf8_lossy(&lock_pristine)).await;
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket_env(
         &proj,
@@ -1059,11 +1058,8 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
     // The originals chain across migrations: `rollback` restores the hosted
     // pin's upstream registry entry, which is the pristine lock byte for
     // byte (online: the entry is re-resolved from the registry document).
-    let registry = mount_registry_from_classic_lock(
-        &server,
-        &String::from_utf8_lossy(&lock_pristine),
-    )
-    .await;
+    let registry =
+        mount_registry_from_classic_lock(&server, &String::from_utf8_lossy(&lock_pristine)).await;
     let (code, stdout, stderr) = run_socket_env(
         &proj,
         &[

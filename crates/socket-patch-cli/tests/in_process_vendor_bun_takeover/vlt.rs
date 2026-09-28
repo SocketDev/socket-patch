@@ -88,7 +88,11 @@ async fn mock_api(server: &MockServer) {
 /// pristine node's integrity and tarball.
 async fn mock_registry(server: &MockServer) {
     Mock::given(method("GET"))
-        .and(path(format!("/registry/{}/{}", hosted::NAME, hosted::VERSION)))
+        .and(path(format!(
+            "/registry/{}/{}",
+            hosted::NAME,
+            hosted::VERSION
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "name": hosted::NAME,
             "version": hosted::VERSION,

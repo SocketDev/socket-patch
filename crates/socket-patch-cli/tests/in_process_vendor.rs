@@ -1228,8 +1228,13 @@ fn split_berry_checksum(lock: &str) -> (String, String) {
 async fn berry_crlf_takeovers_round_trip_both_directions() {
     let server = wiremock::MockServer::start().await;
     let hosted_url = mount_berry_hosted_api(&server).await;
-    mount_npm_registry(&server, "left-pad", "1.3.0", npm_tgz("left-pad", "1.3.0", ORIG_INDEX))
-        .await;
+    mount_npm_registry(
+        &server,
+        "left-pad",
+        "1.3.0",
+        npm_tgz("left-pad", "1.3.0", ORIG_INDEX),
+    )
+    .await;
     let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
     let (pkg, lock) = (
         windows_shape(BERRY_WIN_PKG, true),
@@ -1334,10 +1339,7 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     assert_eq!(code, 0, "rollback: {stdout}\n{stderr}");
     let rolled_back = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
     let (normalized, checksum) = split_berry_checksum(&rolled_back);
-    assert_eq!(
-        normalized, lock,
-        "rollback restores the upstream CRLF lock"
-    );
+    assert_eq!(normalized, lock, "rollback restores the upstream CRLF lock");
     assert_eq!(
         checksum, upstream_checksum,
         "both unwinds re-derive the same upstream checksum"
@@ -3436,7 +3438,9 @@ snapshots:
         assert_eq!(code, 1, "{env:#}");
         let failed = find_event(&env, "failed", Some("redirect_revert_failed"));
         assert!(
-            failed.to_string().contains("git checkout -- pnpm-lock.yaml"),
+            failed
+                .to_string()
+                .contains("git checkout -- pnpm-lock.yaml"),
             "the refusal names the checkout remedy: {failed:#}"
         );
         assert_eq!(

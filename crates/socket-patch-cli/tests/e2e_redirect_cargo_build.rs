@@ -758,7 +758,10 @@ impl ManifestlessHosted {
         //     record comes from the API, verified against the extracted
         //     hosted copy.
         strip_manifest(fresh);
-        assert!(!ledger_path.exists(), "hosted mode writes no redirect ledger");
+        assert!(
+            !ledger_path.exists(),
+            "hosted mode writes no redirect ledger"
+        );
         strip_ledgers(fresh);
         let out = run_vex(&bin, fresh, &run);
         assert_eq!(out.code, Some(0), "(2) lockfile-only:\n{out}");

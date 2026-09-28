@@ -551,9 +551,16 @@ async fn dry_run_over_hosted_pin_warns_and_writes_nothing() {
         env["summary"]["skipped"], 0,
         "the takeover advisory is uncounted: {env:#}"
     );
-    assert_eq!(fx.lock_bytes(), hosted_lock, "a dry run must not touch the lock");
+    assert_eq!(
+        fx.lock_bytes(),
+        hosted_lock,
+        "a dry run must not touch the lock"
+    );
     assert!(!fx.tgz_path().exists(), "a dry run vendors nothing");
-    assert!(!fx.state_path().exists(), "a dry run writes no vendor ledger");
+    assert!(
+        !fx.state_path().exists(),
+        "a dry run writes no vendor ledger"
+    );
     assert!(
         !fx.redirect_state_path().exists(),
         "no hosted ledger is ever written"
@@ -583,10 +590,16 @@ async fn vendor_over_hosted_pin_restores_upstream_then_revert_returns_to_registr
     let lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
     let entry = &lock["packages"]["node_modules/left-pad"];
     assert!(
-        entry["resolved"].as_str().unwrap_or_default().contains(".socket/vendor/"),
+        entry["resolved"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(".socket/vendor/"),
         "the lock is vendored: {lock:#}"
     );
-    assert!(!fx.lock_bytes().windows(HOSTED_ORIGIN.len()).any(|w| w == HOSTED_ORIGIN.as_bytes()));
+    assert!(!fx
+        .lock_bytes()
+        .windows(HOSTED_ORIGIN.len())
+        .any(|w| w == HOSTED_ORIGIN.as_bytes()));
     assert!(!fx.redirect_state_path().exists(), "no hosted ledger");
 
     let (code, env) = vendor_cli(fx.root(), &["--revert"]);
@@ -620,7 +633,11 @@ fn unrestorable_hosted_pin_fails_closed() {
             && detail.contains("git checkout -- package-lock.json"),
         "{env:#}"
     );
-    assert_eq!(fx.lock_bytes(), hosted_lock, "the hosted pin stays as found");
+    assert_eq!(
+        fx.lock_bytes(),
+        hosted_lock,
+        "the hosted pin stays as found"
+    );
     assert!(!fx.tgz_path().exists(), "no artifact for the refused purl");
     assert!(!fx.state_path().exists(), "no vendor ledger entry");
     assert!(!fx.redirect_state_path().exists());

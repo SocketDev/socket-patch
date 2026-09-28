@@ -723,7 +723,9 @@ async fn run_shape(shape: Shape) -> Option<()> {
             // original file ended in a newline — so an UNTERMINATED file can
             // only come back with its final newline (every other byte exact).
             let want = match after.get(rel) {
-                Some(got) if !bytes.ends_with(b"\n") && *got == [bytes.as_slice(), b"\n"].concat() => {
+                Some(got)
+                    if !bytes.ends_with(b"\n") && *got == [bytes.as_slice(), b"\n"].concat() =>
+                {
                     got.clone()
                 }
                 _ => bytes.clone(),
