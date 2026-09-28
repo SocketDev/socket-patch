@@ -5094,6 +5094,8 @@ fn rewrite_composer_lock(
 }
 
 // ── nuget (nuget.config + packages.lock.json) ────────────────────────────────
+mod nuget_source;
+
 fn default_nuget_config() -> String {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n".to_string()
 }
@@ -5141,12 +5143,12 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
     if !creating_mapping {
         // A mapping already exists (e.g. a prior patched dep, or the project's
         // own): append ONLY this source's mapping — every other source is
-        // already covered.
-        out = out.replacen(
-            "<packageSourceMapping>",
-            &format!("<packageSourceMapping>\n{socket_mapping}"),
-            1,
-        );
+        // already covered. It goes after the section's last `<clear/>`,
+        // which would otherwise discard it.
+        let open = "<packageSourceMapping>";
+        let open_end = out.find(open)? + open.len();
+        let at = nuget_source::child_insert_at(&out, open_end, "</packageSourceMapping");
+        out = format!("{}\n{socket_mapping}{}", &out[..at], &out[at..]);
     } else {
         // Creating the mapping from scratch. Once ANY <packageSourceMapping>
         // exists, NuGet requires EVERY package to match some source's pattern,
@@ -5218,7 +5220,9 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
         // through to the from-scratch branch rather than insert outside it.
         .filter(|m| !m.as_str().ends_with("/>"))
     {
-        let end = m.end();
+        // After the section's last `<clear/>`, which would otherwise
+        // discard the source.
+        let end = nuget_source::child_insert_at(config, m.end(), "</packageSources");
         Some(format!(
             "{}\n{source_line}{}",
             &config[..end],
@@ -5240,8 +5244,9 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
     }
 }
 
-/// The `key` of every `<add … />` under `<packageSources>` (empty when there
-/// is no such element). Used to preserve resolution for non-patched packages
+/// The `key` of every `<add … />` under `<packageSources>` that NuGet keeps
+/// (those after the section's last `<clear/>`; empty when there is no such
+/// element). Used to preserve resolution for non-patched packages
 /// when a `<packageSourceMapping>` is introduced.
 // The open tag may carry whitespace (`<packageSources >` is valid XML NuGet
 // parses); a literal match reads a real source list as "no sources" —
@@ -5273,7 +5278,7 @@ fn nuget_package_source_keys(config: &str) -> Vec<String> {
         })
         .unwrap_or("");
     NUGET_ADD_KEY_RE
-        .captures_iter(scope)
+        .captures_iter(nuget_source::after_last_clear(scope))
         .map(|c| {
             c.get(1)
                 .or_else(|| c.get(2))

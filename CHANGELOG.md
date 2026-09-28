@@ -914,6 +914,12 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Hosted NuGet redirects survive a `<clear/>` in `nuget.config`.** The
+  Socket source and its `packageSourceMapping` entry used to land above a
+  user's `<clear/>`, which NuGet discards, so `dotnet restore` failed
+  NU1100 / NU1403. Both now land after the section's last `<clear/>`, and
+  the `*` catch-all fans out only to the sources NuGet keeps.
+
 - **`rollback` fetches a before-blob that only a store peer variant
   needs.** The before-blob gate now probes every pnpm and vlt store variant
   copy the rollback restores, so an online rollback no longer fails

@@ -1,0 +1,26 @@
+[
+  {
+    "path": "nuget.config",
+    "kind": "redirect_nuget_source",
+    "action": "rewritten",
+    "key": "socket-patch-66666666-6666-6666-6666-666666666666",
+    "new": {
+      "source": "https://patch.socket.dev/patch-registry/nuget/11111111-1111-1111-1111-111111111111/66666666-6666-6666-6666-666666666666/index.json",
+      "pattern": "Newtonsoft.Json"
+    }
+  },
+  {
+    "path": "packages.lock.json",
+    "kind": "redirect_nuget_lock",
+    "action": "rewritten",
+    "key": "Newtonsoft.Json",
+    "original": {
+      "resolved": "13.0.3",
+      "contentHash": "ckEKf1MtNHGmiyXVMOQUWA1NhmENd95EZ8h2znGTaccCdgF/RgjlfKWRH+iEdgEx68wOpY+UFhWisuq3tHFA=="
+    },
+    "new": {
+      "resolved": "13.0.3",
+      "contentHash": "PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashAA=="
+    }
+  }
+]
