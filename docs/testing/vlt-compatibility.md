@@ -73,7 +73,8 @@ asserted and each named test or row exists.
   `install-proof` (every capstone on 31 Linux, 11 macOS and 15 Windows
   releases, the Node floors 22.22.0 / 22.13.0 / 22.7.0 / 22.0.0 with the
   collation golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
-  cache root); `native` (the backtest against production, artifacts
+  cache root; a cell `ci.yml`'s `e2e` rows run identically is left to them,
+  see `scripts/ci-vlt-proof-suites.py`, except on dispatch); `native` (the backtest against production, artifacts
   `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape);
   `lock-diff` (the same cell's `vlt-lock.json` must be byte-identical on Linux,
   macOS and Windows); `matrix-coverage` (every era × suite × OS).
