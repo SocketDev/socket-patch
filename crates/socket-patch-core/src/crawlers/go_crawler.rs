@@ -1373,9 +1373,12 @@ mod tests {
     mod equivalence {
         use super::super::oracle::LegacyGoCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{
-            map_rows, mkdir, rows, symlink, write, PermGuard, Rng,
+        use crate::crawlers::test_tree::{
+            crawl_goldens_apply, map_rows, mkdir, rel_map_rows, rel_rows, rows, symlink,
+            tree_listing, write, PermGuard,
         };
+        use crate::golden::Golden;
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &[
             "github.com",
@@ -1488,7 +1491,12 @@ mod tests {
 
         /// Returns (packages crawled, PURLs found) so the caller can check
         /// the fixtures are not vacuous.
-        async fn assert_equivalent(gen: &Gen, label: &str) -> (usize, usize) {
+        async fn assert_equivalent(
+            g: &mut Golden,
+            input: &impl serde::Serialize,
+            gen: &Gen,
+            label: &str,
+        ) -> (usize, usize) {
             let options = CrawlerOptions {
                 cwd: gen.root.clone(),
                 global: false,
@@ -1509,12 +1517,22 @@ mod tests {
                 map_rows(&old_found),
                 "{label}: find_by_purls"
             );
+            let base = gen.root.parent().unwrap();
+            g.case(
+                label.replace(' ', "_"),
+                input,
+                &(rel_rows(base, &new), rel_map_rows(base, &new_found)),
+            );
             (old.len(), old_found.len())
         }
 
         #[tokio::test]
         async fn randomized_caches_match_the_async_oracle() {
             let (mut crawled, mut found) = (0, 0);
+            let mut g = Golden::new(
+                "crawl_go_module_cache",
+                "One seeded GOMODCACHE tree: crawl_all, then find_by_purls.",
+            );
             // At least 48 seeds, and more until the fixtures clear the
             // non-vacuity bar below: a case-insensitive filesystem folds
             // `Azure`/`!azure`-style siblings together and Windows ignores
@@ -1532,8 +1550,13 @@ mod tests {
                 };
                 let root = gen.root.clone();
                 gen.dir(&root, 0);
+                let input = (
+                    tree_listing(tmp.path()),
+                    gen.perms.planned(tmp.path()),
+                    gen.versioned.clone(),
+                );
                 gen.perms.apply();
-                let (c, f) = assert_equivalent(&gen, &format!("seed {seed}")).await;
+                let (c, f) = assert_equivalent(&mut g, &input, &gen, &format!("seed {seed}")).await;
                 crawled += c;
                 found += f;
                 seed += 1;
@@ -1542,6 +1565,9 @@ mod tests {
                 crawled > 100 && found > 100,
                 "vacuous fixtures: {crawled}/{found}"
             );
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
 
         #[tokio::test]
@@ -1554,7 +1580,11 @@ mod tests {
                 perms: PermGuard::default(),
                 versioned: vec!["mod@v1.0.0".to_string()],
             };
-            assert_equivalent(&gen, "absent root").await;
+            let mut g = Golden::new("crawl_go_absent_root", "An absent GOMODCACHE root.");
+            assert_equivalent(&mut g, &(), &gen, "absent root").await;
+            if crawl_goldens_apply(false) {
+                g.finish();
+            }
         }
     }
 }

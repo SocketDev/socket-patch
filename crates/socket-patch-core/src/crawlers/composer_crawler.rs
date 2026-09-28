@@ -1734,7 +1734,12 @@ mod tests {
     mod equivalence {
         use super::super::oracle::LegacyComposerCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{map_rows, mkdir, rows, symlink, write, Rng};
+        use crate::crawlers::test_tree::{
+            crawl_goldens_apply, map_rows, mkdir, rel_map_rows, rel_rows, rows, symlink,
+            tree_listing, write,
+        };
+        use crate::golden::Golden;
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &[
             "monolog/monolog",
@@ -1794,11 +1799,16 @@ mod tests {
         #[tokio::test]
         async fn randomized_vendor_trees_match_the_async_oracle() {
             let (mut crawled, mut found) = (0, 0);
+            let mut g = Golden::new(
+                "crawl_composer_vendor",
+                "One seeded vendor/composer tree: crawl_all, then find_by_purls.",
+            );
             for seed in 0..64u64 {
                 let mut rng = Rng::new(seed);
                 let tmp = tempfile::tempdir().unwrap();
                 let root = tmp.path().join("proj");
                 let packages = project(&mut rng, &root);
+                let input = tree_listing(tmp.path());
                 let options = CrawlerOptions {
                     cwd: root.clone(),
                     global: false,
@@ -1828,6 +1838,14 @@ mod tests {
                     map_rows(&old_found),
                     "seed {seed}: find_by_purls"
                 );
+                g.case(
+                    seed,
+                    &input,
+                    &(
+                        rel_rows(tmp.path(), &new),
+                        rel_map_rows(tmp.path(), &new_found),
+                    ),
+                );
                 crawled += old.len();
                 found += old_found.len();
             }
@@ -1835,6 +1853,9 @@ mod tests {
                 crawled > 50 && found > 50,
                 "vacuous fixtures: {crawled}/{found}"
             );
+            if crawl_goldens_apply(false) {
+                g.finish();
+            }
         }
 
         /// The `composer global config home` memo re-runs only when the

@@ -2737,9 +2737,12 @@ mod tests {
     mod equivalence {
         use super::super::oracle::{self, LegacyPythonCrawler};
         use super::*;
-        use crate::crawlers::oracle_support::{
-            fifo, map_rows, mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+        use crate::crawlers::test_tree::{
+            crawl_goldens_apply, fifo, map_rows, mkdir, rel_map_rows, rel_rows, rows, symlink,
+            tree_listing, write, write_bytes, PermGuard,
         };
+        use crate::golden::Golden;
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &["requests", "Flask_Cors", "zope.interface", "dup", "Dup"];
         const VERSIONS: &[&str] = &["1.0", "2.31.0", "1.0+local", "3.0a1"];
@@ -2785,16 +2788,22 @@ mod tests {
         #[tokio::test]
         async fn randomized_site_packages_match_the_async_oracle() {
             let (mut crawled, mut found) = (0, 0);
+            let mut g = Golden::new(
+                "crawl_python_site_packages",
+                "One seeded site-packages: the dist-info listing, crawl_all, find_by_purls and find_each_by_purl.",
+            );
             for seed in 0..64u64 {
                 let tmp = tempfile::tempdir().unwrap();
                 let mut perms = PermGuard::default();
                 let mut rng = Rng::new(seed);
                 let root = tmp.path().join("site-packages");
                 site(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
 
+                let listing = list_dist_info_packages(&root).await;
                 assert_eq!(
-                    list_dist_info_packages(&root).await,
+                    listing,
                     oracle::list_dist_info_packages(&root).await,
                     "seed {seed}: listing"
                 );
@@ -2830,6 +2839,23 @@ mod tests {
                         "seed {seed}: find_each_by_purl {purl}"
                     );
                 }
+                let each_rows: Vec<_> = each
+                    .iter()
+                    .map(|p| {
+                        p.as_ref()
+                            .map(|p| rel_rows(tmp.path(), std::slice::from_ref(p)))
+                    })
+                    .collect();
+                g.case(
+                    seed,
+                    &input,
+                    &(
+                        &listing,
+                        rel_rows(tmp.path(), &new),
+                        rel_map_rows(tmp.path(), &found_new),
+                        each_rows,
+                    ),
+                );
                 crawled += old.len();
                 found += found_new.len();
             }
@@ -2837,6 +2863,9 @@ mod tests {
                 crawled > 100 && found > 100,
                 "vacuous fixtures: {crawled}/{found}"
             );
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
     }
 

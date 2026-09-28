@@ -1467,6 +1467,14 @@ mod tests {
     }
 
     async fn assert_equivalent(root: &Path, label: &str) {
+        let base = root.parent().unwrap();
+        let rel = |p: &Path| crate::crawlers::test_tree::rel(base, p);
+        let rel_rows = |pkgs: &[CrawledPackage]| crate::crawlers::test_tree::rel_rows(base, pkgs);
+        let rel_pairs = |v: &[(String, PathBuf)]| -> Vec<(String, String)> {
+            v.iter().map(|(k, p)| (k.clone(), rel(p))).collect()
+        };
+        let input = crate::crawlers::test_tree::tree_listing(base);
+        let mut per_nm = Vec::new();
         let options = CrawlerOptions {
             cwd: root.to_path_buf(),
             global: false,
@@ -1520,11 +1528,33 @@ mod tests {
                 new_nested, old_nested,
                 "{label}: nested store entries differ"
             );
+            let found: BTreeMap<String, Vec<_>> = new_found
+                .iter()
+                .map(|(k, v)| (k.clone(), rel_rows(v)))
+                .collect();
+            let vlt: Vec<(String, String)> = NpmCrawler::list_vlt_store_entries(&vlt)
+                .await
+                .iter()
+                .map(|(k, p)| (k.to_string_lossy().into_owned(), rel(p)))
+                .collect();
+            per_nm.push((
+                rel(nm),
+                found,
+                rel_pairs(&NpmCrawler::list_pnpm_store_entries(&store).await),
+                vlt,
+                rel_pairs(&new_nested),
+            ));
         }
+        let paths: Vec<String> = new_paths.iter().map(|p| rel(p)).collect();
+        crate::golden::record(&input, &(paths, rel_rows(&new_pkgs), per_nm));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn randomized_trees_match_the_sequential_oracle() {
+        let sweep = crate::golden::Sweep::start(
+            "crawl_npm_trees",
+            "One seeded project tree: node_modules roots, crawl_all, find_by_purls and store listings.",
+        );
         let mut nonempty = 0;
         for seed in 0..64u64 {
             let tmp = tempfile::tempdir().unwrap();
@@ -1548,6 +1578,9 @@ mod tests {
         // The generator must actually produce packages most of the time,
         // or the comparison above is vacuous.
         assert!(nonempty > 32, "only {nonempty} non-empty trees");
+        if crate::crawlers::test_tree::crawl_goldens_apply(true) {
+            sweep.finish();
+        }
     }
 
     /// A store entry whose own child's package.json disagrees with the
@@ -1596,7 +1629,14 @@ mod tests {
             "7.7.7",
         );
 
+        let sweep = crate::golden::Sweep::start(
+            "crawl_npm_foreign_identity",
+            "A pnpm store entry whose child names a foreign identity.",
+        );
         assert_equivalent(&root, "foreign identity").await;
+        if crate::crawlers::test_tree::crawl_goldens_apply(false) {
+            sweep.finish();
+        }
 
         let options = CrawlerOptions {
             cwd: root.clone(),
@@ -1634,6 +1674,10 @@ mod tests {
     #[tokio::test]
     async fn walk_without_a_pool_matches_the_sequential_oracle() {
         let _off = crate::crawlers::walk_pool::test_hooks::DisablePool::new();
+        let sweep = crate::golden::Sweep::start(
+            "crawl_npm_no_pool",
+            "One seeded project tree, walked with no walk pool.",
+        );
         for seed in 0..16u64 {
             let tmp = tempfile::tempdir().unwrap();
             let mut guard = PermGuard(Vec::new());
@@ -1643,6 +1687,9 @@ mod tests {
             gen.apply_locks(&mut guard);
             assert_equivalent(&root, &format!("no pool, seed {seed}")).await;
             drop(guard);
+        }
+        if crate::crawlers::test_tree::crawl_goldens_apply(true) {
+            sweep.finish();
         }
     }
 
@@ -1807,7 +1854,14 @@ mod tests {
             tmp_guard = PermGuard(Vec::new());
         }
 
+        let sweep = crate::golden::Sweep::start(
+            "crawl_npm_kitchen_sink",
+            "A hand-built project tree with one of every tricky shape.",
+        );
         assert_equivalent(&root, "kitchen sink").await;
+        if crate::crawlers::test_tree::crawl_goldens_apply(true) {
+            sweep.finish();
+        }
 
         let options = CrawlerOptions {
             cwd: root.clone(),

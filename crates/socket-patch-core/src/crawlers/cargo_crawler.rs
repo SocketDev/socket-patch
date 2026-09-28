@@ -1131,7 +1131,11 @@ version = "fake"
     mod equivalence {
         use super::super::oracle::LegacyCargoCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{mkdir, rows, symlink, write, PermGuard, Rng};
+        use crate::crawlers::test_tree::{
+            crawl_goldens_apply, mkdir, rel_rows, rows, symlink, tree_listing, write, PermGuard,
+        };
+        use crate::golden::Golden;
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &["serde", "serde-json", "sha-1", "tokio", "dup", "a_b"];
         const VERSIONS: &[&str] = &["1.0.0", "1.0.0-rc.1", "0.2.3", "5", "1.0.0+build"];
@@ -1186,12 +1190,17 @@ version = "fake"
         #[tokio::test]
         async fn randomized_sources_match_the_async_oracle() {
             let mut total = 0;
+            let mut g = Golden::new(
+                "crawl_cargo_sources",
+                "One seeded crate source tree, crawled.",
+            );
             for seed in 0..64u64 {
                 let tmp = tempfile::tempdir().unwrap();
                 let mut perms = PermGuard::default();
                 let mut rng = Rng::new(seed);
                 let root = tmp.path().join("src");
                 tree(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
@@ -1201,9 +1210,13 @@ version = "fake"
                 let new = CargoCrawler::new().crawl_all(&options).await;
                 let old = LegacyCargoCrawler::crawl_all(&options).await;
                 assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                g.case(seed, &input, &rel_rows(tmp.path(), &new));
                 total += old.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
 
         /// Local mode: a Cargo project with a `vendor/` tree.
@@ -1219,6 +1232,7 @@ version = "fake"
                 &tmp.path().join("outside"),
                 &mut perms,
             );
+            let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
             perms.apply();
             let options = CrawlerOptions {
                 cwd: tmp.path().to_path_buf(),
@@ -1229,6 +1243,14 @@ version = "fake"
             let old = LegacyCargoCrawler::crawl_all(&options).await;
             assert!(!old.is_empty());
             assert_eq!(rows(&new), rows(&old));
+            let mut g = Golden::new(
+                "crawl_cargo_vendor",
+                "A seeded Cargo project vendor/ tree, crawled locally.",
+            );
+            g.case(7, &input, &rel_rows(tmp.path(), &new));
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
     }
 }

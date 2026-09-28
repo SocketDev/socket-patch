@@ -1294,9 +1294,12 @@ mod tests {
     mod equivalence {
         use super::super::oracle::LegacyNuGetCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{
-            map_rows, mkdir, rows, symlink, write, PermGuard, Rng,
+        use crate::crawlers::test_tree::{
+            crawl_goldens_apply, map_rows, mkdir, rel_map_rows, rel_rows, rows, symlink,
+            tree_listing, write, PermGuard,
         };
+        use crate::golden::Golden;
+        use crate::test_rng::Rng;
 
         const IDS: &[&str] = &["Newtonsoft.Json", "xunit", "System.Text.Json", "Dup", "dup"];
         const VERSIONS: &[&str] = &["13.0.3", "2.0.0-RC1", "8.0.0", "1.0.0"];
@@ -1434,6 +1437,18 @@ mod tests {
             let old = LegacyNuGetCrawler::find_by_purls(&root, &purls).await;
             assert_eq!(map_rows(&new), map_rows(&old));
             assert_eq!(new.len(), 2, "{new:?}");
+            let mut g = Golden::new(
+                "crawl_nuget_legacy_fallback",
+                "A legacy packages/ root probed by case-variant PURLs.",
+            );
+            g.case(
+                0,
+                &tree_listing(tmp.path()),
+                &rel_map_rows(tmp.path(), &new),
+            );
+            if crawl_goldens_apply(false) {
+                g.finish();
+            }
             for purl in [
                 "pkg:nuget/NEWTONSOFT.JSON@13.0.3",
                 "pkg:nuget/SeriLog@2.12.0",
@@ -1477,12 +1492,17 @@ mod tests {
         #[tokio::test]
         async fn randomized_package_dirs_match_the_async_oracle() {
             let (mut crawled, mut found) = (0, 0);
+            let mut g = Golden::new(
+                "crawl_nuget_packages",
+                "One seeded NuGet packages root: crawl_all, then find_by_purls.",
+            );
             for seed in 0..64u64 {
                 let tmp = tempfile::tempdir().unwrap();
                 let mut perms = PermGuard::default();
                 let mut rng = Rng::new(seed);
                 let root = tmp.path().join("packages");
                 tree(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
@@ -1504,6 +1524,14 @@ mod tests {
                     map_rows(&old_found),
                     "seed {seed}: find_by_purls"
                 );
+                g.case(
+                    seed,
+                    &(input, &purls),
+                    &(
+                        rel_rows(tmp.path(), &new),
+                        rel_map_rows(tmp.path(), &new_found),
+                    ),
+                );
                 crawled += old.len();
                 found += old_found.len();
             }
@@ -1511,6 +1539,9 @@ mod tests {
                 crawled > 100 && found > 100,
                 "vacuous fixtures: {crawled}/{found}"
             );
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
     }
 }

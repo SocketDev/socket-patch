@@ -152,6 +152,7 @@ fn run_both(
     let mut got = RewriteResult::default();
     rewrite_uv_lock(files, overrides, metadata, &mut got);
     assert_same(&want, &got, what);
+    crate::golden::record(&(files, overrides, metadata), &got);
     got
 }
 
@@ -584,6 +585,13 @@ fn case(seed: u64) -> Case {
 
 #[test]
 fn single_parse_uv_rewrite_matches_oracle() {
+    let sweep = crate::golden::Sweep::with(
+        crate::golden::Golden::new(
+            "python_lock_rewrite",
+            "One seeded uv / pylock / PEP 723 lock set + overrides + wheel metadata.",
+        )
+        .chunked(5),
+    );
     let mut rewritten = 0;
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
@@ -609,12 +617,17 @@ fn single_parse_uv_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }
+    sweep.finish();
 }
 
 /// A refusal between two rewritten deps must leave the lock exactly as the
 /// first dep left it — the session decides every refusal before mutating.
 #[test]
 fn refusal_in_the_middle_leaves_the_prior_rewrite_intact() {
+    let sweep = crate::golden::Sweep::start(
+        "python_lock_refusal",
+        "A uv.lock + pyproject.toml whose middle dep is refused, LF and CRLF.",
+    );
     let lock = "version = 1\nrevision = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [{ name = \"a\" }, { name = \"b\" }, { name = \"c\" }]\n\n[package.metadata]\nrequires-dist = [{ name = \"a\" }, { name = \"b\" }, { name = \"c\" }]\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/a-1.0.0-py3-none-any.whl\", hash = \"sha256:00\" }]\n\n[[package]]\nname = \"b\"\nversion = \"1.0.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/b-1.0.0-py3-none-any.whl\", hash = \"sha256:00\" }]\n\n[[package]]\nname = \"c\"\nversion = \"1.0.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/c-1.0.0-py3-none-any.whl\", hash = \"sha256:00\" }]\n";
     let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"a\", \"b\", \"c\"]\n\n[tool.uv]\noverride-dependencies = [\"b==1.0.0\"]\n";
     let mk = |name: &str, n: usize| DepOverride {
@@ -670,6 +683,7 @@ fn refusal_in_the_middle_leaves_the_prior_rewrite_intact() {
             .refused_python_lock_uuids
             .contains(&overrides[1].patch_uuid));
     }
+    sweep.finish();
 }
 
 /// Runs the oracle over the benchmark fixtures (real ~1.9 MB uv,

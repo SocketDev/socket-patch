@@ -1,0 +1,3 @@
+# A pnpm lock with peer-suffixed instances of one package.
+# <case> <input digest> <output digest>
+0 086e91d468b55bb7 53796577f31fa17b

@@ -1,0 +1,3 @@
+# A legacy packages/ root probed by case-variant PURLs.
+# <case> <input digest> <output digest>
+0 36ae401955e34281 afcd4f7d169b9926

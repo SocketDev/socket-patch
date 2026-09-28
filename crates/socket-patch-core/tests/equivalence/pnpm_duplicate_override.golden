@@ -1,0 +1,4 @@
+# A pnpm lock whose overrides repeat a package.
+# <case> <input digest> <output digest>
+0 079dd0b62fc67e8a d4b25ff165bd224e
+1 c276c7dbae69afbc 8d62d8bae9f344d2

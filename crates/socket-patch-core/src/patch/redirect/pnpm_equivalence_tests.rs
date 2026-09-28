@@ -16,6 +16,7 @@ fn assert_equivalent(files: &BTreeMap<String, String>, overrides: &[DepOverride]
     let mut got = RewriteResult::default();
     plan_hosted(files, overrides, &mut got);
     assert_same(&want, &got, "pnpm");
+    crate::golden::record(&(files, overrides), &got);
     got
 }
 
@@ -219,6 +220,10 @@ fn packages(n: usize, rng: &mut Rng) -> Vec<Pkg> {
 /// missing-sha512 deps, plus a non-npm override the rewriter must ignore.
 #[test]
 fn indexed_pnpm_rewrite_matches_oracle_on_depscan_sized_lock_set() {
+    let sweep = crate::golden::Sweep::start(
+        "pnpm_depscan_sized",
+        "A depscan-sized seeded pnpm-lock.yaml set + shuffled overrides.",
+    );
     let mut rng = Rng(0x5eed_cafe_f00d_0001);
     let root = packages(4000, &mut rng);
     let nested = packages(1200, &mut rng);
@@ -325,6 +330,7 @@ fn indexed_pnpm_rewrite_matches_oracle_on_depscan_sized_lock_set() {
     ] {
         assert!(codes.contains(&code), "missing {code}: {codes:?}");
     }
+    sweep.finish();
 }
 
 /// Two overrides of the SAME name@version with different artifacts: the
@@ -332,6 +338,10 @@ fn indexed_pnpm_rewrite_matches_oracle_on_depscan_sized_lock_set() {
 /// is the first's `new`), exactly as the per-dep re-parse did.
 #[test]
 fn duplicate_override_sees_the_prior_rewrite() {
+    let sweep = crate::golden::Sweep::start(
+        "pnpm_duplicate_override",
+        "A pnpm lock whose overrides repeat a package.",
+    );
     let p = Pkg {
         name: "left-pad".into(),
         version: "1.3.0".into(),
@@ -355,6 +365,7 @@ fn duplicate_override_sees_the_prior_rewrite() {
     // The same pair with identical artifacts: the second is a no-op.
     let r = assert_equivalent(&files, &[second.clone(), second]);
     assert_eq!(r.edits.len(), 2, "{:#?}", r.edits);
+    sweep.finish();
 }
 
 /// Every peer-suffixed instance gets its own edit, in file order, keyed by
@@ -362,6 +373,10 @@ fn duplicate_override_sees_the_prior_rewrite() {
 /// contexts and a v5 `_` suffix in a second lock.
 #[test]
 fn peer_suffixed_instances_rewrite_in_file_order() {
+    let sweep = crate::golden::Sweep::start(
+        "pnpm_peer_suffixed",
+        "A pnpm lock with peer-suffixed instances of one package.",
+    );
     let lock_v6 = "lockfileVersion: '6.0'\n\npackages:\n\n  '/@s/p@1.0.0(react@18.2.0(scheduler@0.23.2))':\n    resolution: {integrity: sha512-UP==}\n\n  /@s/p@1.0.0:\n    resolution: {integrity: sha512-UP==}\n\n  /@s/p@1.0.0(react@17.0.2):\n    resolution: {integrity: sha512-UP==}\n\n  /@s/p@1.0.01:\n    resolution: {integrity: sha512-OTHER==}\n";
     let lock_v5 = "lockfileVersion: 5.4\n\npackages:\n\n  /@s/p/1.0.0_react@18.2.0:\n    resolution: {integrity: sha512-UP==}\n";
     let files = BTreeMap::from([
@@ -391,6 +406,7 @@ fn peer_suffixed_instances_rewrite_in_file_order() {
         ]
     );
     assert!(r.files["a/pnpm-lock.yaml"].contains("sha512-OTHER=="));
+    sweep.finish();
 }
 
 /// Randomized small lock sets over every flavor (including the refused
@@ -398,6 +414,10 @@ fn peer_suffixed_instances_rewrite_in_file_order() {
 /// residuals and misses all interleave.
 #[test]
 fn indexed_pnpm_rewrite_matches_oracle_on_random_lock_sets() {
+    let sweep = crate::golden::Sweep::start(
+        "pnpm_random",
+        "One seeded pnpm-lock.yaml set (every flavor) + overrides.",
+    );
     let flavors = [
         Flavor::V9,
         Flavor::V6,
@@ -524,6 +544,7 @@ fn indexed_pnpm_rewrite_matches_oracle_on_random_lock_sets() {
             "sweep never reached {want}: {outcomes:?}"
         );
     }
+    sweep.finish();
 }
 
 // ── oracle: the pre-index implementation, verbatim ──────────────────────────

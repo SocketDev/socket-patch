@@ -82,6 +82,7 @@ pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct Integrity {
     pub sha512: Option<String>,
@@ -99,6 +100,7 @@ pub struct Integrity {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryOverrideIdentifiers {
     pub name: String,
@@ -147,6 +149,7 @@ pub struct RegistryOverrideIdentifiers {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryOverride {
     pub kind: String,
@@ -156,6 +159,7 @@ pub struct RegistryOverride {
 
 /// One patched dependency to redirect (mirrors the TS `DepOverride`).
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct DepOverride {
     pub ecosystem: String,
@@ -198,6 +202,7 @@ pub struct RewriteWarning {
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
     pub files: BTreeMap<String, String>,

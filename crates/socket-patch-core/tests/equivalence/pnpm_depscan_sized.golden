@@ -1,0 +1,3 @@
+# A depscan-sized seeded pnpm-lock.yaml set + shuffled overrides.
+# <case> <input digest> <output digest>
+0 ac457be5dab9ce57 f3e10497dfc8fec6

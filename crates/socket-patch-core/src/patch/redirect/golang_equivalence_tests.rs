@@ -316,6 +316,7 @@ fn assert_same(want: &RewriteResult, got: &RewriteResult, what: &str) {
 }
 
 fn run_both(
+    g: &mut crate::golden::Golden,
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     what: &str,
@@ -325,6 +326,7 @@ fn run_both(
     let mut got = RewriteResult::default();
     rewrite_golang(files, overrides, &mut got);
     assert_same(&want, &got, what);
+    g.next(&(files, overrides), &got);
     got
 }
 
@@ -560,6 +562,11 @@ fn single_walk_golang_rewrite_matches_oracle() {
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
     let mut kinds = std::collections::BTreeSet::new();
+    let mut g = crate::golden::Golden::new(
+        "golang_rewrite",
+        "One seeded go.mod / go.sum pair + overrides, or the re-run over its output.",
+    )
+    .chunked(20);
     for seed in 1..=3000u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let pool = 3 + rng.below(12);
@@ -579,11 +586,11 @@ fn single_walk_golang_rewrite_matches_oracle() {
             let again = overrides[rng.below(overrides.len())].clone();
             overrides.push(again);
         }
-        let got = run_both(&files, &overrides, &format!("seed {seed}"));
+        let got = run_both(&mut g, &files, &overrides, &format!("seed {seed}"));
         // A second pass over the output (the idempotent re-run) must agree too.
         let mut rerun = files.clone();
         rerun.extend(got.files.clone());
-        run_both(&rerun, &overrides, &format!("seed {seed} re-run"));
+        run_both(&mut g, &rerun, &overrides, &format!("seed {seed} re-run"));
         rewritten += got.files.len();
         edits += got.edits.len();
         codes.extend(got.warnings.iter().map(|w| w.code.clone()));
@@ -612,6 +619,7 @@ fn single_walk_golang_rewrite_matches_oracle() {
     ] {
         assert!(kinds.contains(kind), "no case reached {kind}: {kinds:?}");
     }
+    g.finish();
 }
 
 /// Runs the oracle over the benchmark go.mod / go.sum pairs (too
@@ -623,6 +631,7 @@ fn single_walk_golang_rewrite_matches_oracle_on_fixtures() {
         return;
     };
     let root = std::path::PathBuf::from(root);
+    let mut scratch = crate::golden::Golden::new("unused", "");
     for dir in ["go-grafana", "go-cache", "go-k8s"] {
         let read = |name: &str| std::fs::read_to_string(root.join(dir).join(name)).unwrap();
         let go_mod = read("go.mod");
@@ -666,7 +675,12 @@ fn single_walk_golang_rewrite_matches_oracle_on_fixtures() {
             let mut files = BTreeMap::new();
             files.insert("go.mod".to_string(), conv(go_mod.clone()));
             files.insert("go.sum".to_string(), conv(read("go.sum")));
-            let got = run_both(&files, &overrides, &format!("{dir} crlf={crlf}"));
+            let got = run_both(
+                &mut scratch,
+                &files,
+                &overrides,
+                &format!("{dir} crlf={crlf}"),
+            );
             // k8s pins every staging module with a user-authored replace, so
             // there every dep is a refused conflict.
             assert!(
@@ -675,7 +689,12 @@ fn single_walk_golang_rewrite_matches_oracle_on_fixtures() {
             );
             let mut rerun = files.clone();
             rerun.extend(got.files.clone());
-            run_both(&rerun, &overrides, &format!("{dir} crlf={crlf} re-run"));
+            run_both(
+                &mut scratch,
+                &rerun,
+                &overrides,
+                &format!("{dir} crlf={crlf} re-run"),
+            );
         }
     }
 }

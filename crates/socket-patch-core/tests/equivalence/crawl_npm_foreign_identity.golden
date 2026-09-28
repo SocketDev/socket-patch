@@ -1,0 +1,3 @@
+# A pnpm store entry whose child names a foreign identity.
+# <case> <input digest> <output digest>
+0 ba28487ce0d2cf60 c5c151111ff2d527

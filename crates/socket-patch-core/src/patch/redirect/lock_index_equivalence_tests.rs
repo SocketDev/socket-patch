@@ -146,6 +146,13 @@ fn npm_lock(rng: &mut Rng, pool: &mut Vec<(String, String)>) -> String {
 
 #[test]
 fn indexed_npm_lock_rewrite_matches_oracle() {
+    let sweep = crate::golden::Sweep::with(
+        crate::golden::Golden::new(
+            "npm_lock_rewrite",
+            "One seeded package-lock.json / npm-shrinkwrap.json + overrides.",
+        )
+        .chunked(4),
+    );
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
     for seed in 1..=400u64 {
@@ -160,6 +167,7 @@ fn indexed_npm_lock_rewrite_matches_oracle() {
             let mut got = RewriteResult::default();
             rewrite_one_npm_lock(&text, lockfile, &refs, &mut got);
             assert_same(&want, &got, &format!("seed {seed} {lockfile}"));
+            crate::golden::record(&(&text, lockfile, &deps), &got);
             edits += got.edits.len();
             codes.extend(got.warnings.iter().map(|w| w.code.clone()));
         }
@@ -176,6 +184,7 @@ fn indexed_npm_lock_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "missing {code}: {codes:?}");
     }
+    sweep.finish();
 }
 
 fn yarn_block(rng: &mut Rng, pool: &mut Vec<(String, String)>, i: usize) -> String {
@@ -223,6 +232,13 @@ fn yarn_block(rng: &mut Rng, pool: &mut Vec<(String, String)>, i: usize) -> Stri
 
 #[test]
 fn indexed_yarn_classic_rewrite_matches_oracle() {
+    let sweep = crate::golden::Sweep::with(
+        crate::golden::Golden::new(
+            "yarn_classic_rewrite",
+            "One seeded yarn.lock (v1) + overrides.",
+        )
+        .chunked(2),
+    );
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
     for seed in 1..=400u64 {
@@ -248,6 +264,7 @@ fn indexed_yarn_classic_rewrite_matches_oracle() {
         let mut got = RewriteResult::default();
         rewrite_yarn_classic(&files, &deps, &mut got);
         assert_same(&want, &got, &format!("seed {seed}"));
+        crate::golden::record(&(&files, &deps), &got);
         edits += got.edits.len();
         codes.extend(got.warnings.iter().map(|w| w.code.clone()));
     }
@@ -260,6 +277,7 @@ fn indexed_yarn_classic_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "missing {code}: {codes:?}");
     }
+    sweep.finish();
 }
 
 // ── oracles: the pre-index implementations, verbatim ────────────────────────

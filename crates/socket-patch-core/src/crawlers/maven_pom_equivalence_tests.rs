@@ -363,21 +363,30 @@ fn synth_pom(rng: &mut Rng) -> String {
 
 #[test]
 fn parser_matches_reference_on_random_poms() {
+    let mut g = crate::golden::Golden::new(
+        "maven_pom_random",
+        "One seeded POM fragment soup, parsed for its coordinates.",
+    )
+    .chunked(100);
     let mut rng = Rng(0xA076_1D64_78BD_642F);
     for case in 0..20_000 {
         let pom = synth_pom(&mut rng);
-        assert_eq!(
-            parse_pom_group_artifact_version(&pom),
-            reference_parse_pom(&pom),
-            "case {case}: {pom:?}"
-        );
+        let got = parse_pom_group_artifact_version(&pom);
+        assert_eq!(got, reference_parse_pom(&pom), "case {case}: {pom:?}");
+        g.next(&pom, &got);
     }
+    g.finish();
 }
 
 /// Well-formed project poms with the coordinates placed before, between and
 /// after the noisy sections — the shapes the early exit stops on.
 #[test]
 fn parser_matches_reference_on_project_shaped_poms() {
+    let mut g = crate::golden::Golden::new(
+        "maven_pom_project",
+        "One seeded project-shaped POM, parsed for its coordinates.",
+    )
+    .chunked(25);
     let mut rng = Rng(0xE703_7ED1_A0B4_28DB);
     let mut resolved = 0;
     for case in 0..5_000 {
@@ -407,6 +416,8 @@ fn parser_matches_reference_on_project_shaped_poms() {
             want,
             "case {case}: {pom:?}"
         );
+        g.next(&pom, &want);
     }
     assert!(resolved > 1_000, "the corpus exercises the resolving path");
+    g.finish();
 }

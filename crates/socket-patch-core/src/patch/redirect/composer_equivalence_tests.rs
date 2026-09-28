@@ -441,6 +441,11 @@ fn in_place_composer_rewrite_matches_oracle() {
     let mut rewritten = 0;
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
+    let mut golden = crate::golden::Golden::new(
+        "composer_lock_rewrite",
+        "One seeded composer.lock + overrides; the output covers a re-run over the result.",
+    )
+    .chunked(10);
     for seed in 1..=3000u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let pool = 3 + rng.below(12);
@@ -461,7 +466,8 @@ fn in_place_composer_rewrite_matches_oracle() {
         let got = run_both(&files, &overrides, &format!("seed {seed}"));
         let mut rerun = files.clone();
         rerun.extend(got.files.clone());
-        run_both(&rerun, &overrides, &format!("seed {seed} re-run"));
+        let again = run_both(&rerun, &overrides, &format!("seed {seed} re-run"));
+        golden.case(seed, &(&files, &overrides), &(&got, &again));
         rewritten += got.files.len();
         edits += got.edits.len();
         codes.extend(got.warnings.iter().map(|w| w.code.clone()));
@@ -479,6 +485,7 @@ fn in_place_composer_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }
+    golden.finish();
 }
 
 #[test]

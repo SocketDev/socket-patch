@@ -2170,9 +2170,12 @@ mod tests {
     mod equivalence {
         use super::super::oracle::LegacyMavenCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{
-            mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+        use crate::crawlers::test_tree::{
+            crawl_goldens_apply, mkdir, rel, rel_rows, rows, symlink, tree_listing, write,
+            write_bytes, PermGuard,
         };
+        use crate::golden::Golden;
+        use crate::test_rng::Rng;
 
         const GROUPS: &[&str] = &["org/apache/commons", "com/google/guava", "io/netty"];
         const ARTIFACTS: &[&str] = &["commons-lang3", "guava", "netty-all", "dup"];
@@ -2248,6 +2251,10 @@ mod tests {
         /// across a chunk boundary.
         #[tokio::test]
         async fn every_parse_chunk_size_matches_the_serial_oracle() {
+            let mut g = Golden::new(
+                "crawl_maven_parse_chunks",
+                "One seeded ~/.m2 repository, scanned at one parse chunk size.",
+            );
             let mut total = 0;
             for seed in 0..16u64 {
                 let tmp = tempfile::tempdir().unwrap();
@@ -2255,6 +2262,7 @@ mod tests {
                 let mut rng = Rng::new(seed);
                 let root = tmp.path().join("repository");
                 repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
@@ -2266,10 +2274,18 @@ mod tests {
                     let mut seen = HashSet::new();
                     let found = MavenCrawler.scan_maven_repo_chunked(&root, &mut seen, chunk);
                     assert_eq!(rows(&found), rows(&old), "seed {seed}, chunk {chunk}");
+                    g.case(
+                        format!("{seed}/{chunk}"),
+                        &input,
+                        &rel_rows(tmp.path(), &found),
+                    );
                 }
                 total += old.len();
             }
             assert!(total > 50, "vacuous fixtures: {total}");
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
 
         /// The no-walk-pool fallback (the OS refused even one walk thread,
@@ -2280,6 +2296,10 @@ mod tests {
         /// cannot get them — where the serial scan simply finished.
         #[tokio::test]
         async fn no_pool_repos_match_the_serial_oracle() {
+            let mut g = Golden::new(
+                "crawl_maven_no_pool",
+                "One seeded ~/.m2 repository, crawled with no walk pool.",
+            );
             let _off = crate::crawlers::walk_pool::test_hooks::DisablePool::new();
             let mut total = 0;
             for seed in 0..16u64 {
@@ -2288,6 +2308,7 @@ mod tests {
                 let mut rng = Rng::new(seed);
                 let root = tmp.path().join("repository");
                 repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
@@ -2297,9 +2318,13 @@ mod tests {
                 let new = MavenCrawler::new().crawl_all(&options).await;
                 let old = LegacyMavenCrawler::crawl_all(&options).await;
                 assert_eq!(rows(&new), rows(&old), "no pool, seed {seed}");
+                g.case(seed, &input, &rel_rows(tmp.path(), &new));
                 total += old.len();
             }
             assert!(total > 50, "vacuous fixtures: {total}");
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
 
         /// MVN-1 changes nothing on a repository whose canonically placed
@@ -2310,6 +2335,10 @@ mod tests {
         /// and comment-only POMs).
         #[tokio::test]
         async fn consistent_repos_match_the_content_first_scan() {
+            let mut g = Golden::new(
+                "crawl_maven_consistent",
+                "One seeded ~/.m2 repository whose POMs agree with their dirs, crawled.",
+            );
             let mut total = 0;
             for seed in 0..64u64 {
                 let tmp = tempfile::tempdir().unwrap();
@@ -2323,6 +2352,7 @@ mod tests {
                     &mut perms,
                     true,
                 );
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
@@ -2332,9 +2362,13 @@ mod tests {
                 let new = MavenCrawler::new().crawl_all(&options).await;
                 let old = super::super::oracle::crawl_all_content_first(&options).await;
                 assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                g.case(seed, &input, &rel_rows(tmp.path(), &new));
                 total += old.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
 
         /// The path-first step is only as right as the scan root: from a
@@ -2345,6 +2379,10 @@ mod tests {
         /// path-rescue arms included.
         #[tokio::test]
         async fn misrooted_repos_match_the_content_first_scan() {
+            let mut g = Golden::new(
+                "crawl_maven_misrooted",
+                "One seeded ~/.m2 repository, crawled from a misplaced root.",
+            );
             let mut total = 0;
             for seed in 0..64u64 {
                 let tmp = tempfile::tempdir().unwrap();
@@ -2358,6 +2396,7 @@ mod tests {
                     &mut perms,
                     true,
                 );
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let mut misroots = vec![tmp.path().to_path_buf()];
                 misroots.extend(
@@ -2375,14 +2414,23 @@ mod tests {
                     let new = MavenCrawler::new().crawl_all(&options).await;
                     let old = super::super::oracle::crawl_all_content_first(&options).await;
                     assert_eq!(rows(&new), rows(&old), "seed {seed}, {}", misroot.display());
+                    g.case(
+                        format!("{seed}/{}", rel(tmp.path(), &misroot)),
+                        &input,
+                        &rel_rows(tmp.path(), &new),
+                    );
                     total += old.len();
                 }
             }
             assert!(total > 400, "vacuous fixtures: {total}");
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
 
         #[tokio::test]
         async fn randomized_repos_match_the_serial_oracle() {
+            let mut g = Golden::new("crawl_maven_repos", "One seeded ~/.m2 repository, crawled.");
             let mut total = 0;
             for seed in 0..64u64 {
                 let tmp = tempfile::tempdir().unwrap();
@@ -2390,6 +2438,7 @@ mod tests {
                 let mut rng = Rng::new(seed);
                 let root = tmp.path().join("repository");
                 repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                let input = (tree_listing(tmp.path()), perms.planned(tmp.path()));
                 perms.apply();
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
@@ -2399,9 +2448,13 @@ mod tests {
                 let new = MavenCrawler::new().crawl_all(&options).await;
                 let old = LegacyMavenCrawler::crawl_all(&options).await;
                 assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                g.case(seed, &input, &rel_rows(tmp.path(), &new));
                 total += old.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
+            if crawl_goldens_apply(true) {
+                g.finish();
+            }
         }
     }
 }

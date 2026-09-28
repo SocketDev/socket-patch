@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::formats::cargo::hosted::{CargoLockPlan, CARGO_LOCK_REFERENCE_KIND};
 use crate::formats::cargo::CargoLock;
+use crate::golden::Golden;
 use crate::patch::redirect::FileEdit;
 
 // ── the oracle: the previous line-grammar planner, verbatim ──
@@ -399,10 +400,18 @@ fn shape(plan: &CargoLockPlan) -> (String, Option<String>, Vec<FileEdit>) {
     }
 }
 
-fn assert_same(lock: &str, name: &str, version: &str, cksum: &str, what: &str) -> Option<String> {
+fn assert_same(
+    g: &mut Golden,
+    lock: &str,
+    name: &str,
+    version: &str,
+    cksum: &str,
+    what: &str,
+) -> Option<String> {
     let old = plan_cargo_lock(lock, name, version, INDEX, cksum);
     let new = plan_new(lock, name, version, cksum);
     let (old, new) = (shape(&old), shape(&new));
+    g.next(&(lock, name, version, cksum), &new);
     // The one shape the line grammar cannot read and cargo can: the block's
     // canonical header without the newline after `version` (a final block
     // at EOF with no trailing newline). The span planner finds it.
@@ -432,31 +441,44 @@ fn targets(lock: &str) -> Vec<(String, String)> {
 
 /// Every package of `lock`, planned by both, then a second package planned
 /// over the first's output and a re-run of the first (the no-op path).
-fn assert_lock(lock: &str, rng: &mut Rng, what: &str) {
+fn assert_lock(g: &mut Golden, lock: &str, rng: &mut Rng, what: &str) {
     let all = targets(lock);
     for (name, version) in &all {
         let cksum = format!("{:016x}{:016x}", rng.next(), rng.next());
-        let Some(once) = assert_same(lock, name, version, &cksum, what) else {
+        let Some(once) = assert_same(g, lock, name, version, &cksum, what) else {
             continue;
         };
-        assert_same(&once, name, version, &cksum, &format!("{what} re-run"));
+        assert_same(g, &once, name, version, &cksum, &format!("{what} re-run"));
         if let Some((other, other_version)) = all.get(rng.below(all.len())) {
-            assert_same(&once, other, other_version, "00ff", &format!("{what} then another"));
+            assert_same(
+                g,
+                &once,
+                other,
+                other_version,
+                "00ff",
+                &format!("{what} then another"),
+            );
         }
     }
     // An absent package, on both sides.
-    assert_same(lock, "absent-crate", "9.9.9", "00", what);
+    assert_same(g, lock, "absent-crate", "9.9.9", "00", what);
 }
 
 #[test]
 fn span_splice_matches_the_line_grammar_on_random_locks() {
+    let mut g = Golden::new(
+        "cargo_lock_random",
+        "One package of a seeded Cargo.lock, planned for the hosted index.",
+    )
+    .chunked(20);
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for case in 0..300 {
         let v1 = rng.chance(50);
         let blocks = rng.below(12);
         let lock = synth_lock(&mut rng, blocks, v1);
-        assert_lock(&lock, &mut rng, &format!("case {case} (v1={v1})"));
+        assert_lock(&mut g, &lock, &mut rng, &format!("case {case} (v1={v1})"));
     }
+    g.finish();
 }
 
 /// Hand-written shapes the generator does not produce: multi-source twins
@@ -475,6 +497,10 @@ fn span_splice_matches_the_line_grammar_on_hand_written_locks() {
     let sourceless_v1 = "[[package]]\nname = \"s\"\nversion = \"1.0.0\"\n\n[metadata]\n\"checksum s 1.0.0 (registry+x)\" = \"ee\"\n".to_string();
     let source_at_eof = format!("[[package]]\nname = \"e\"\nversion = \"1.0.0\"\nsource = \"{crates_io}\"");
     let bare = "version = 3\n\n[[package]]\nname = \"b\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"c\"\nversion = \"1.0.0\"\n".to_string();
+    let mut g = Golden::new(
+        "cargo_lock_hand_written",
+        "One package of a hand-written Cargo.lock shape, planned for the hosted index.",
+    );
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
     for (what, lock) in [
         ("twins, one ours", twins_ours),
@@ -484,20 +510,33 @@ fn span_splice_matches_the_line_grammar_on_hand_written_locks() {
         ("source at EOF", source_at_eof),
         ("bare blocks", bare),
     ] {
-        assert_lock(&lock, &mut rng, what);
+        assert_lock(&mut g, &lock, &mut rng, what);
     }
+    g.finish();
 }
 
 /// The large-lock shape: ≥1k blocks, both formats, a sample of targets.
 #[test]
 fn span_splice_matches_the_line_grammar_on_a_large_lock() {
+    let mut g = Golden::new(
+        "cargo_lock_large",
+        "One sampled package of a seeded ≥1k-block Cargo.lock, planned for the hosted index.",
+    );
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     for v1 in [false, true] {
         let lock = synth_lock(&mut rng, 1_200, v1);
         let all = targets(&lock);
         assert!(all.len() >= 1_000, "fixture keeps the ≥1k-block shape");
         for (name, version) in all.iter().step_by(97) {
-            assert_same(&lock, name, version, "abcd", &format!("large (v1={v1})"));
+            assert_same(
+                &mut g,
+                &lock,
+                name,
+                version,
+                "abcd",
+                &format!("large (v1={v1})"),
+            );
         }
     }
+    g.finish();
 }

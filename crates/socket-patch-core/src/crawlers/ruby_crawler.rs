@@ -2815,7 +2815,8 @@ mod tests {
 
     #[tokio::test]
     async fn find_each_by_purl_matches_per_purl_find_by_purls() {
-        use crate::crawlers::oracle_support::{mkdir, symlink, write, PermGuard, Rng};
+        use crate::crawlers::test_tree::{mkdir, symlink, write, PermGuard};
+        use crate::test_rng::Rng;
 
         const GEMS: &[&str] = &["rails", "nokogiri", "rack", "rails-html"];
         const VERSIONS: &[&str] = &["7.1.0", "1.16.5", "3.0.0"];
