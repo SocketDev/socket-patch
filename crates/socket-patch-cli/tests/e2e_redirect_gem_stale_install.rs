@@ -458,7 +458,7 @@ async fn gem_hosted_rescan_with_failing_record_fetch_reports_it_and_keeps_the_wi
     assert_eq!(
         failed["detail"],
         format!(
-            "{PURL} redirected, but its patch record could not be fetched; this run's VEX \
+            "{PURL} was switched to hosted, but its patch record could not be fetched; this run's VEX \
              attestation omits it (`socket-patch vex` fetches it again once the API answers)"
         ),
         "{env}"
