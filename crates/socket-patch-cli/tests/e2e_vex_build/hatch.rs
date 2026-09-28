@@ -25,9 +25,10 @@
 //! 5. manifest-less VEX there (`vex_pypi_real_common::VexMatrix`, with
 //!    `VIRTUAL_ENV` naming Hatch's out-of-tree environment so the crawler
 //!    hashes the real install): manifest deleted, tampered install (hosted),
-//!    ledgers deleted, embedded `apply --vex` / `vendor --vex`, offline with
-//!    no ledger → `record_unavailable`, declaration reverted →
-//!    `redirect_unwired` / `vendor_unwired` (`--no-verify` too); plus the
+//!    ledgers deleted (v5 hosted writes none), embedded `apply --vex` /
+//!    `vendor --vex`, offline with no ledger → `record_unavailable`,
+//!    declaration reverted → `vendor_unwired` / hosted: nothing names the
+//!    patch (`--no-verify` too); plus the
 //!    manifest-less `scan --vex` re-run and, hosted, the not-installed
 //!    (pin) basis.
 //!
@@ -290,6 +291,12 @@ fn flow(flavor: Flavor, mode: Mode) {
         Flavor::HatchTomlEnv => "hatch.toml",
     };
     let wired = std::fs::read_to_string(project.join(wired_file)).unwrap();
+    assert!(
+        !project
+            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL)
+            .exists(),
+        "{what}: v5 writes no redirect ledger"
+    );
     match mode {
         Mode::Hosted => assert!(
             wired.contains(&format!(

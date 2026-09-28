@@ -9,8 +9,8 @@
 //! restore bytes but never the link (git: a 120000→100644 typechange). The
 //! hosted REVERT side already refuses symlinked files fail-closed; these
 //! tests pin the WRITE side to the same policy: the whole (transactional)
-//! rewrite is refused with a stable code, before the ledger and before any
-//! file write.
+//! rewrite is refused with a stable code before any file write (v5 hosted
+//! mode keeps no ledger at all; the tests still pin that none appears).
 //!
 //! A FIFO planted under a candidate name (`pyproject.toml`) must be skipped
 //! like an unreadable file, never opened with a blocking `open(2)` that waits
@@ -472,7 +472,10 @@ async fn hosted_rewrites_the_same_lock_once_it_is_a_regular_file() {
     assert!(std::fs::read_to_string(root.join("package-lock.json"))
         .unwrap()
         .contains(NPM_HOSTED_URL));
-    assert!(root.join(LEDGER_REL).exists());
+    assert!(
+        !root.join(LEDGER_REL).exists(),
+        "v5 hosted mode keeps no ledger: the lockfile is the record"
+    );
 }
 
 /// A FIFO planted as `pyproject.toml` beside a real uv.lock: the candidate

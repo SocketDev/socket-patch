@@ -2,7 +2,8 @@
 //! filesystem, no subprocesses, no environment reads, no telemetry. Every
 //! patch lookup goes through the caller's [`PatchApi`]; the caller hands
 //! in the repository's candidate files (chosen by [`select_paths`]) and
-//! gets back the changed files, ledger included.
+//! gets back the changed files (v5 hosted mode keeps no ledger: the
+//! rewritten lockfiles are the whole record).
 //!
 //! Per project root the result matches `scan --mode hosted --json` over a
 //! checkout holding the same files (the parity tests hold the two paths to
@@ -40,8 +41,6 @@ use std::time::Instant;
 use socket_patch_core::api::client::PatchApi;
 use socket_patch_core::api::types::{PatchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::manifest::schema::PatchRecord;
-use socket_patch_core::patch::redirect::{RedirectState, REDIRECT_STATE_REL};
 use socket_patch_core::utils::cargo_workspace::member_manifests_in;
 use socket_patch_core::vendor::lock_inventory::{
     inventory_project_diagnosed_in, MemoryEntry, MemoryProject, ProjectView,
@@ -49,7 +48,6 @@ use socket_patch_core::vendor::lock_inventory::{
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod discover;
-pub(crate) mod ledger;
 pub mod limits;
 pub(crate) mod redirect;
 pub(crate) mod roots;
@@ -110,7 +108,6 @@ struct RootState {
     /// (oversize, LFS pointers, presence-only): the disk flow would read
     /// them, so a rewrite that depends on one is refused.
     unreadable: BTreeSet<String>,
-    ledger: Option<RedirectState>,
     purls: Vec<String>,
     summary: ProjectSummary,
     packages: Vec<socket_patch_core::api::types::BatchPackagePatches>,
@@ -405,7 +402,6 @@ async fn engine(
             root: root.clone(),
             project: Some(project),
             unreadable,
-            ledger: None,
             purls: Vec::new(),
             summary: ProjectSummary::default(),
             packages: Vec::new(),
@@ -423,13 +419,6 @@ async fn engine(
         let Some(project) = state.project.as_ref() else {
             continue;
         };
-        match ledger::load(project, &state.root) {
-            Ok(loaded) => state.ledger = loaded,
-            Err(message) => {
-                state.fail("corrupt_ledger", message);
-                continue;
-            }
-        }
         let (entries, unsupported) =
             inventory_project_diagnosed_in(&ProjectView::Memory(project)).await;
         for (code, detail) in crate::commands::scan::unsupported_layout_warnings(&unsupported) {
@@ -711,7 +700,7 @@ async fn engine(
     })
 }
 
-/// Records → ledger merge → the project's result and changed files.
+/// Records → the project's result and changed files.
 fn finish_root(
     state: &mut RootState,
     done: Rewritten,
@@ -731,22 +720,19 @@ fn finish_root(
         npm_warnings,
     } = done;
     let root = state.root.clone();
-    let mut record_map: BTreeMap<String, PatchRecord> = BTreeMap::new();
+    // No ledger keeps the records; the fetch mirrors the disk flow's, so a
+    // record the API cannot serve warns the same way.
     let mut record_warnings: Vec<serde_json::Value> = Vec::new();
     if !dry_run {
         for (purl, uuid) in &confirmed {
             match records.get(uuid) {
-                Some(Some(response)) => {
-                    let (rec_purl, record) =
-                        crate::commands::get::record_from_patch_response(response);
-                    record_map.insert(rec_purl, record);
-                }
+                Some(Some(_)) => {}
                 _ => record_warnings.push(serde_json::json!({
                     "code": "record_fetch_failed",
                     "detail": format!(
                         "{purl} redirected, but its patch record could not be fetched; \
-                         it will be missing from VEX until `socket-patch scan --mode \
-                         hosted` is re-run"
+                         this run's VEX attestation omits it (`socket-patch vex` \
+                         fetches it again once the API answers)"
                     ),
                 })),
             }
@@ -754,34 +740,6 @@ fn finish_root(
     }
 
     let mut project_changes: Vec<(String, String)> = Vec::new();
-    let mut ledger_error: Option<ProjectError> = None;
-    if !dry_run && (!rewrite.edits.is_empty() || !record_map.is_empty()) {
-        let mut ledger = state.ledger.take().unwrap_or_default();
-        ledger::merge(&mut ledger, &rewrite.edits, record_map, &planned.files);
-        match ledger::serialize(&ledger) {
-            Ok(text) => {
-                if planned.project.text(REDIRECT_STATE_REL) != Some(text.as_str()) {
-                    project_changes.push((REDIRECT_STATE_REL.to_string(), text));
-                }
-            }
-            Err(message) => {
-                ledger_error = Some(ProjectError {
-                    code: "ledger_serialize_failed".into(),
-                    message,
-                })
-            }
-        }
-    }
-    if let Some(error) = ledger_error {
-        return ProjectResult {
-            root,
-            redirect: serde_json::json!({ "mode": "hosted" }),
-            summary: state.summary.clone(),
-            redirected: Vec::new(),
-            skipped: planned.skipped,
-            error: Some(error),
-        };
-    }
     for (rel, content) in &rewrite.files {
         if planned.project.text(rel) != Some(content.as_str()) {
             project_changes.push((rel.clone(), content.clone()));
@@ -894,7 +852,6 @@ mod tests {
             root: root.to_string(),
             project: Some(project),
             unreadable: BTreeSet::new(),
-            ledger: None,
             purls: Vec::new(),
             summary: ProjectSummary::default(),
             packages: Vec::new(),

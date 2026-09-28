@@ -458,6 +458,29 @@ pub async fn invalidate(root: &Path, state: &InstallState, stale: &[String]) -> 
     out
 }
 
+/// The Socket-hosted vlt nodes of `lock` (read BEFORE a restore rewrites
+/// it) that stand for one of `purls` — the ledger-free rollback heal's
+/// targets. No patch record rides along (v5 keeps no hosted ledger), so the
+/// heal judges each installed copy against the lock's own pins.
+pub fn lock_targets(lock: &str, origins: &[String], purls: &[String]) -> Vec<LedgerTarget> {
+    let wanted: Vec<String> = purls.iter().map(|p| canonical_purl(p)).collect();
+    socket_owned_instances(lock, origins)
+        .into_iter()
+        .filter_map(|instance| {
+            let purl = crate::utils::purl::npm_purl(&instance.name, &instance.version)?;
+            let canon = canonical_purl(&purl);
+            let at = wanted.iter().position(|w| *w == canon)?;
+            Some(LedgerTarget {
+                purl: purls[at].clone(),
+                dep_id: instance.dep_id,
+                name: instance.name,
+                record: None,
+                flags: instance.flags,
+            })
+        })
+        .collect()
+}
+
 /// The vlt nodes the ledger's `redirect_vlt_lock_node` edits name for each
 /// of `purls`, with the purl's patch record. With the pre-revert `lock`,
 /// a node vlt re-keyed (a new peer context) is named by the DepID its pin
