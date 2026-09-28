@@ -33,10 +33,10 @@
 //! (`npm_lock_nodes`, `pnpm::pnpm_packages`, `yarn::classic_entries` /
 //! `berry_entries`, `BunLockb::parse_packages`, `vlt::vlt_lock_model`) and,
 //! for the other formats, the readers the writers own (`cargo_lock` /
-//! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `gemfile_lock`,
-//! `composer_lock_packages`, the
+//! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `formats::gem`,
+//! `formats::composer`, the
 //! `utils::python_lock` / `poetry_lock` / `requirements` / `hatch` readers,
-//! `maven_pom`, `nuget_config` / `nuget_feed`). The inventory's registry
+//! `formats::maven`, `nuget_config` / `nuget_feed`). The inventory's registry
 //! views drop the Socket-owned entries (they feed registry discovery and
 //! fetches); the extractors here classify and validate exactly those. File
 //! selection and I/O stay with each consumer: discovery reads every present
@@ -1755,33 +1755,15 @@ pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uui
 }
 
 /// The root files a vendored `eco` artifact can be wired from — the vendor
-/// backends' lockfile / wiring config for that ecosystem (npm: every
-/// npm-family lock the `vendor_probe` table flags, `vlt-lock.json`
-/// included; cargo: the root `Cargo.toml` `[patch.crates-io]` table and the
+/// backends' lockfile / wiring config for that ecosystem, the format
+/// registry's [`crate::formats::registry::PROBE`] rows (npm: every
+/// npm-family lock, `vlt-lock.json` included; cargo: the root `Cargo.toml` `[patch.crates-io]` table and the
 /// pre-v5 `.cargo/config.toml` / `.cargo/config` spellings; maven /
 /// nuget: the repository / source that serves the vendored dir). Manifests
 /// such as package.json are deliberately absent: the lock is what the
 /// install consumes.
 pub fn vendored_wiring_probe_files(root: &Path, eco: &str) -> Vec<String> {
-    let fixed: Vec<&str> = match eco {
-        "npm" => crate::constants::npm_family::names_with(|r| r.vendor_probe),
-        "pypi" => vec![
-            "uv.lock",
-            "poetry.lock",
-            "pdm.lock",
-            "Pipfile.lock",
-            "requirements.txt",
-            "pyproject.toml",
-            "hatch.toml",
-        ],
-        "cargo" => vec!["Cargo.toml", ".cargo/config.toml", ".cargo/config"],
-        "golang" => vec!["go.mod"],
-        "gem" => vec!["Gemfile.lock"],
-        "composer" => vec!["composer.lock"],
-        "maven" => vec!["pom.xml"],
-        "nuget" => crate::vendor::nuget_config::CONFIG_NAMES.to_vec(),
-        _ => Vec::new(),
-    };
+    let fixed = crate::formats::registry::probe_paths(eco);
     let mut files: Vec<String> = fixed.into_iter().map(str::to_string).collect();
     if eco == "pypi" {
         // pylock.toml / pylock.<name>.toml / *.py.lock.

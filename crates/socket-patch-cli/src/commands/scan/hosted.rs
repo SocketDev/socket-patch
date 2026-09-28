@@ -2092,7 +2092,6 @@ mod tests {
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
-    use socket_patch_core::constants::npm_family;
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use socket_patch_core::patch::redirect::DepOverride;
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
@@ -3316,25 +3315,54 @@ mod tests {
     }
 
     #[test]
-    fn redirect_candidates_match_the_shared_npm_family_table() {
-        // Drift guard, both directions, without classifying the non-npm
-        // rows: every table row flagged redirect_candidate must be in the
-        // candidate list, and no npm-family row NOT so flagged may appear
-        // (binary candidates are read separately).
-        for name in npm_family::names_with(|r| r.redirect_candidate) {
-            assert!(
-                REDIRECT_CANDIDATE_FILES.contains(&name),
-                "{name} is flagged redirect_candidate but missing from \
-                 REDIRECT_CANDIDATE_FILES"
-            );
-        }
-        for name in npm_family::names_with(|r| !r.redirect_candidate) {
-            assert!(
-                !REDIRECT_CANDIDATE_FILES.contains(&name),
-                "{name} is deliberately NOT a redirect candidate (see the \
-                 npm_family table) but appears in REDIRECT_CANDIDATE_FILES"
-            );
-        }
+    fn redirect_candidates_are_pinned_by_value() {
+        // Hardcoded on purpose: the candidate list is derived from the
+        // format registry, so a row dropped (or a HOSTED flag lost) there
+        // must fail here instead of silently shrinking what hosted reads.
+        assert_eq!(
+            *REDIRECT_CANDIDATE_FILES,
+            [
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "pnpm-lock.yaml",
+                "shrinkwrap.yaml",
+                "node_modules/.modules.yaml",
+                "yarn.lock",
+                ".yarnrc.yml",
+                "bun.lock",
+                "bun.lockb",
+                "vlt-lock.json",
+                "vlt.json",
+                "node_modules/.vlt-lock.json",
+                "requirements.txt",
+                "uv.lock",
+                "poetry.lock",
+                "pdm.lock",
+                "Pipfile.lock",
+                "pyproject.toml",
+                "hatch.toml",
+                "Cargo.toml",
+                "Cargo.lock",
+                ".cargo/config.toml",
+                ".cargo/config",
+                "composer.lock",
+                "nuget.config",
+                "packages.lock.json",
+                "Gemfile",
+                "Gemfile.lock",
+                "gems.rb",
+                "gems.locked",
+                "go.mod",
+                "go.sum",
+                "pom.xml",
+                ".mvn/maven.config",
+                ".mvn/checksums/checksums.sha256",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "build.gradle",
+                "build.gradle.kts",
+            ]
+        );
     }
     // ── Human-output formatting ────────────────────────────────────────────
 

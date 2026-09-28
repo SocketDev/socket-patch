@@ -53,71 +53,13 @@ use super::guidance::{
 use super::vlt::bun_lockb_present;
 
 /// Candidate lockfiles / registry configs the redirect rewriters may touch —
-/// read from the project when present and handed to `rewrite_registry_redirect`.
-pub const REDIRECT_CANDIDATE_FILES: &[&str] = &[
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "pnpm-lock.yaml",
-    // pnpm <=2 uses the same package identities under the old filename.
-    "shrinkwrap.yaml",
-    "node_modules/.modules.yaml",
-    "yarn.lock",
-    // A berry lock's cache-config gate reads `.yarnrc.yml`; bun's text lock is
-    // `bun.lock`; binary locks are read separately below.
-    ".yarnrc.yml",
-    "bun.lock",
-    "bun.lockb",
-    // vlt: the lock is rewritten, vlt.json is read-only (the old-lockfile
-    // advisory), and the hidden lock is only stat'ed as the install-state
-    // sentinel.
-    "vlt-lock.json",
-    "vlt.json",
-    "node_modules/.vlt-lock.json",
-    "requirements.txt",
-    "uv.lock",
-    "poetry.lock",
-    "pdm.lock",
-    "Pipfile.lock",
-    "pyproject.toml",
-    "hatch.toml",
-    "Cargo.toml",
-    "Cargo.lock",
-    ".cargo/config.toml",
-    // The LEGACY extensionless spelling: cargo reads `.cargo/config` in
-    // preference to `config.toml` when both exist, so the rewriter must see
-    // it (it wires the managed registry into whichever one is present) —
-    // otherwise the `[registries.…]` block lands in a file cargo ignores.
-    ".cargo/config",
-    "composer.lock",
-    "nuget.config",
-    "packages.lock.json",
-    "Gemfile",
-    "Gemfile.lock",
-    // Bundler's modern manifest spelling — preferred over Gemfile when both
-    // exist (the gem rewriter picks the pair bundler reads and fails closed
-    // on diverging spellings).
-    "gems.rb",
-    "gems.locked",
-    // The golang rewriter edits the main module's go.mod (fork-style
-    // `replace`) and go.sum (the socket module's two h1: lines). go.sum may
-    // legitimately be absent — the rewriter creates it in that case.
-    "go.mod",
-    "go.sum",
-    "pom.xml",
-    // Maven Trusted Checksums files the fail-closed maven rewriter merges into
-    // (read so an existing user config / checksum set is preserved, not
-    // clobbered).
-    ".mvn/maven.config",
-    ".mvn/checksums/checksums.sha256",
-    // Gradle build scripts are never edited — their presence only feeds the
-    // maven rewriter's paste-able `exclusiveContent` snippet warning.
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-    // deno.lock is deliberately absent: no redirect rewriter edits its
-    // integrity entries.
-];
+/// read from the project when present and handed to
+/// `rewrite_registry_redirect`: the [`crate::formats::registry::HOSTED`]
+/// rows of the format registry, in its read order.
+pub static REDIRECT_CANDIDATE_FILES: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        crate::formats::registry::paths_with(crate::formats::registry::HOSTED)
+    });
 
 /// Refusal code for a rewrite target (or a file the rewrite reads) that is
 /// a symbolic link: the writers stage next to the path and rename over it,
@@ -446,7 +388,7 @@ pub async fn read_candidate_files(
     candidates: &[Candidate],
 ) -> CandidateFiles {
     let mut out = CandidateFiles::default();
-    for name in REDIRECT_CANDIDATE_FILES {
+    for name in REDIRECT_CANDIDATE_FILES.iter() {
         // The binary lock is read and rewritten directly.
         if *name == "bun.lockb" {
             continue;
@@ -1416,33 +1358,12 @@ fn confirm(
 /// The ecosystem a candidate file's rewriter belongs to (`None` for files
 /// no rewriter edits), for the in-memory symlinked/unreadable-read refusal.
 fn file_ecosystem(rel: &str) -> Option<&'static str> {
+    if let Some(eco) = crate::formats::registry::hosted_file_ecosystem(rel) {
+        return Some(eco);
+    }
     let base = rel.rsplit('/').next().unwrap_or(rel);
-    Some(match base {
-        "package-lock.json"
-        | "npm-shrinkwrap.json"
-        | "pnpm-lock.yaml"
-        | "shrinkwrap.yaml"
-        | ".modules.yaml"
-        | "yarn.lock"
-        | ".yarnrc.yml"
-        | "bun.lock"
-        | "bun.lockb"
-        | "vlt-lock.json"
-        | "vlt.json"
-        | ".vlt-lock.json" => "npm",
-        "requirements.txt" | "uv.lock" | "poetry.lock" | "pdm.lock" | "Pipfile.lock"
-        | "pyproject.toml" | "hatch.toml" => "pypi",
-        "Cargo.toml" | "Cargo.lock" | "config.toml" | "config" => "cargo",
-        "composer.lock" => "composer",
-        "nuget.config" | "packages.lock.json" => "nuget",
-        "Gemfile" | "Gemfile.lock" | "gems.rb" | "gems.locked" => "gem",
-        "go.mod" | "go.sum" => "golang",
-        "pom.xml" | "maven.config" | "checksums.sha256" => "maven",
-        _ if crate::utils::python_lock::is_python_lock_name(base) || base.ends_with(".py") => {
-            "pypi"
-        }
-        _ => return None,
-    })
+    (crate::utils::python_lock::is_python_lock_name(base) || base.ends_with(".py"))
+        .then_some("pypi")
 }
 
 /// SYMLINK GUARD — fail-closed, whole rewrite, before the ledger and before

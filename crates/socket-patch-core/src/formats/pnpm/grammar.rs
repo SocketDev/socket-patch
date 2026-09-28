@@ -1,13 +1,16 @@
-//! Read pnpm's package blocks without reserializing unrelated YAML. The old
-//! shrinkwrap and lockfile 5.1/5.2 formats use block resolutions; newer locks
-//! use flow mappings. Peer suffixes are identities, not part of the version.
+//! The `packages:` entry grammar: read pnpm's package blocks without
+//! reserializing unrelated YAML. The old shrinkwrap and lockfile 5.1/5.2
+//! formats use block resolutions; newer locks use flow mappings. Peer
+//! suffixes are identities, not part of the version. The hosted planner
+//! ([`super::hosted`]), the lock inventory and lockfile discovery all read
+//! entries through this one walk.
 
 use std::ops::Range;
 
 /// Early pnpm 1 writes shrinkwrapVersion 3 without a minor version and
 /// unconditionally drops registry tarball URLs on install. Its frozen flag
 /// cannot preserve this redirect (verified with pnpm 1.0.0).
-pub(super) fn unsupported_early_shrinkwrap(content: &str) -> bool {
+pub(crate) fn unsupported_early_shrinkwrap(content: &str) -> bool {
     let version = content
         .lines()
         .find_map(|line| line.strip_prefix("shrinkwrapVersion:"));
@@ -100,7 +103,7 @@ pub(crate) fn entry_field<'a>(entry: &Entry<'a>, field: &str) -> Option<&'a str>
 }
 
 /// Loose identity match, also used to refuse unsupported suffixes atomically.
-pub(super) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a str> {
+pub(crate) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a str> {
     let key = unquote(key);
     let key = key.strip_prefix('/').unwrap_or(key);
     let suffix = key
@@ -116,7 +119,7 @@ pub(super) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a 
     Some(suffix)
 }
 
-pub(super) fn supported_suffix(suffix: &str) -> bool {
+pub(crate) fn supported_suffix(suffix: &str) -> bool {
     if suffix.is_empty() || suffix.starts_with('_') {
         return true;
     }

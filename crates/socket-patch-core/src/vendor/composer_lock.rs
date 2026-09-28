@@ -50,7 +50,7 @@ use super::common::{
     prune_empty_vendor_levels, refused, serialize_json, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
-use super::lock_inventory::{composer_lock_packages, ComposerLockPackage};
+use crate::formats::composer::{composer_lock_packages, ComposerLockPackage};
 use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
@@ -905,29 +905,21 @@ fn find_lock_entry(lock: &Value, pkg_lc: &str, version: &str) -> Option<(&'stati
 }
 
 /// The index in `lock[section]` of the FIRST entry named `pkg` (any case),
-/// if its dist is still [`wired_to`] `uuid`. The ownership gate of a restore:
+/// if its dist is still [`ComposerLockPackage::wired_to`] `uuid`. The ownership gate of a restore:
 /// a registry dist (composer update reverted it) or a different uuid (a
 /// newer vendor run owns the entry) is third-party state — never clobber it.
 fn wired_entry_index(lock: &Value, section: &str, pkg: &str, uuid: &str) -> Option<usize> {
     composer_lock_packages(lock)
         .into_iter()
         .find(|p| p.section == section && p.name.is_some_and(|n| n.eq_ignore_ascii_case(pkg)))
-        .filter(|p| wired_to(p, uuid))
+        .filter(|p| p.wired_to(uuid))
         .map(|p| p.index)
-}
-
-/// Whether the entry's `dist.url` points into patch `uuid`'s vendored
-/// composer copy — the ownership gate every restore / strand check applies.
-fn wired_to(pkg: &ComposerLockPackage<'_>, uuid: &str) -> bool {
-    pkg.dist_vendor_path()
-        .is_some_and(|p| p.eco == "composer" && p.uuid == uuid)
 }
 
 /// True when the live entry already carries our path dist.
 fn entry_is_wired(entry: &Value, dist_url: &str) -> bool {
-    let dist = entry.get("dist");
-    dist.and_then(|d| d.get("type")).and_then(Value::as_str) == Some("path")
-        && dist.and_then(|d| d.get("url")).and_then(Value::as_str) == Some(dist_url)
+    let pkg = ComposerLockPackage::of("packages", 0, entry);
+    pkg.dist_str("type") == Some("path") && pkg.dist_str("url") == Some(dist_url)
 }
 
 /// Rebuild the lock entry for the path dist (see module doc): every original
@@ -1019,7 +1011,7 @@ async fn stranded_wired_packages(
 fn stranded_in(lock: &Value, uuid: &str, restorable: &HashSet<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for pkg in composer_lock_packages(lock) {
-        let Some(name) = pkg.name.filter(|_| wired_to(&pkg, uuid)) else {
+        let Some(name) = pkg.name.filter(|_| pkg.wired_to(uuid)) else {
             continue;
         };
         let name = name.to_lowercase();
