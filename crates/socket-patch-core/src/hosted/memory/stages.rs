@@ -90,7 +90,7 @@ fn refuse_takeovers(
     project: &MemoryProject,
     candidates: &mut Vec<Candidate>,
     skipped: &mut Vec<SkippedPatch>,
-    pre_warnings: &mut Vec<serde_json::Value>,
+    pre_warnings: &mut Vec<crate::patch::redirect::RewriteWarning>,
 ) {
     let takeover_capable = |p: &str| {
         p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
@@ -115,17 +115,21 @@ fn refuse_takeovers(
     if refused.is_empty() {
         return;
     }
-    pre_warnings.push(serde_json::json!({
-        "code": VENDORED_TAKEOVER_UNSUPPORTED,
-        "detail": format!(
+    pre_warnings.push(engine::warning(
+        VENDORED_TAKEOVER_UNSUPPORTED,
+        format!(
             "{} currently vendored ({}); migrating a vendored package to hosted \
              reverts its committed vendored wiring, which the in-memory hosted scan \
              does not do — run `socket-patch scan --mode hosted` in a checkout to \
              migrate, then re-run",
-            if refused.len() == 1 { "1 package is" } else { "packages are" },
+            if refused.len() == 1 {
+                "1 package is"
+            } else {
+                "packages are"
+            },
             refused.iter().cloned().collect::<Vec<_>>().join(", ")
         ),
-    }));
+    ));
     for c in candidates.iter().filter(|c| refused.contains(&c.purl)) {
         skipped.push(SkippedPatch::new(
             &c.purl,
@@ -143,7 +147,7 @@ pub(crate) struct Planned {
     pub(crate) project: MemoryProject,
     pub(crate) candidates: Vec<Candidate>,
     pub(crate) skipped: Vec<SkippedPatch>,
-    pub(crate) pre_warnings: Vec<serde_json::Value>,
+    pub(crate) pre_warnings: Vec<crate::patch::redirect::RewriteWarning>,
     pub(crate) read: CandidateFiles,
     /// `(artifact url, sha256)` of every pypi wheel whose metadata a
     /// native lock rewrite needs.
@@ -185,7 +189,7 @@ pub(crate) async fn plan(
         &vlt_preflight.withheld_everywhere,
         &mut skipped,
     );
-    let mut pre_warnings: Vec<serde_json::Value> = vlt_preflight.warnings.clone();
+    let mut pre_warnings = vlt_preflight.warnings.clone();
     refuse_takeovers(&project, &mut candidates, &mut skipped, &mut pre_warnings);
 
     let read = if candidates.is_empty() {
@@ -213,7 +217,7 @@ pub(crate) async fn plan(
 pub(crate) struct Rewritten {
     pub(crate) project: MemoryProject,
     pub(crate) skipped: Vec<SkippedPatch>,
-    pub(crate) pre_warnings: Vec<serde_json::Value>,
+    pub(crate) pre_warnings: Vec<crate::patch::redirect::RewriteWarning>,
     pub(crate) done: engine::Rewritten,
 }
 

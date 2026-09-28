@@ -434,7 +434,9 @@ async fn engine(
         }
         let (entries, unsupported) =
             inventory_project_diagnosed_in(&ProjectView::Memory(project)).await;
-        for (code, detail) in crate::vendor::lock_inventory::unsupported_layout_warnings(&unsupported) {
+        for (code, detail) in
+            crate::vendor::lock_inventory::unsupported_layout_warnings(&unsupported)
+        {
             warnings.push(EngineWarning::new(code, detail, Some(&state.root)));
         }
         unsupported_ecosystem_warnings(&state.root, project, ecosystems, &mut warnings);
@@ -659,7 +661,7 @@ async fn engine(
         }
         let redirect = match &state.error {
             Some(_) => serde_json::json!({ "mode": "hosted" }),
-            None => crate::hosted::engine::redirect_json_block(
+            None => crate::hosted::render::redirect_json_block(
                 0,
                 Vec::new(),
                 Vec::new(),
@@ -740,7 +742,7 @@ fn finish_root(
     } = done;
     let root = state.root.clone();
     let mut record_map: BTreeMap<String, PatchRecord> = BTreeMap::new();
-    let mut record_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut record_warnings: Vec<crate::patch::redirect::RewriteWarning> = Vec::new();
     if !dry_run {
         for (purl, uuid) in &confirmed {
             match records.get(uuid) {
@@ -850,16 +852,19 @@ fn finish_root(
             .or_insert_with(|| (root.clone(), bytes));
     }
 
-    let mut redirect_warnings: Vec<serde_json::Value> =
-        crate::hosted::engine::rewrite_warnings_json(&rewrite.warnings);
-    redirect_warnings.extend(record_warnings);
-    redirect_warnings.extend(rush_warnings);
-    redirect_warnings.extend(pnpm_warnings);
-    redirect_warnings.extend(npm_warnings);
-    redirect_warnings.extend(pre_warnings);
-    let skipped_values: Vec<serde_json::Value> =
-        skipped.iter().map(SkippedPatch::to_json).collect();
-    let redirect = crate::hosted::engine::redirect_json_block(
+    // One typed list in the envelope's order; JSON only at the boundary.
+    let mut warnings = rewrite.warnings.clone();
+    warnings.extend(record_warnings);
+    warnings.extend(rush_warnings);
+    warnings.extend(pnpm_warnings);
+    warnings.extend(npm_warnings);
+    warnings.extend(pre_warnings);
+    let redirect_warnings = crate::hosted::render::rewrite_warnings_json(&warnings);
+    let skipped_values: Vec<serde_json::Value> = skipped
+        .iter()
+        .map(crate::hosted::render::skipped_json)
+        .collect();
+    let redirect = crate::hosted::render::redirect_json_block(
         confirmed.len(),
         rewritten,
         skipped_values,

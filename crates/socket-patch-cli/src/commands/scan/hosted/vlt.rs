@@ -6,14 +6,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use socket_patch_core::constants::npm_family::{
-    VLT_HIDDEN_LOCK_REL, VLT_LOCK,
-};
+use socket_patch_core::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_LOCK};
+use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::redirect::vlt_heal::{
     self, classify_target, read_install_state, Expected, LedgerTarget, Target, TargetState,
 };
-use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
 use socket_patch_core::patch::redirect::vlt_preflight;
 use socket_patch_core::patch::redirect::{vlt, DepOverride};
 use socket_patch_core::vendor::lock_inventory::ProjectView;
@@ -617,7 +615,7 @@ mod tests {
             Some("pkg:npm/left-pad@1.3.0")
         );
         assert_eq!(
-            pre.warnings[0]["detail"],
+            pre.warnings[0].detail,
             format!(
                 "vlt would fail to verify {url}: offline; nothing was written for \
                  pkg:npm/left-pad@1.3.0"
@@ -698,7 +696,7 @@ mod tests {
         assert!(claimed.withheld_from_vlt.is_empty());
         assert!(claimed.withheld_everywhere.contains_key(&dep.patch_uuid));
         assert_eq!(
-            claimed.warnings[0]["detail"],
+            claimed.warnings[0].detail,
             format!("vlt would fail to verify {url}: http 404; nothing was written for pkg:npm/left-pad@1.3.0")
         );
     }

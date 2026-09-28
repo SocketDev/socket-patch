@@ -26,7 +26,6 @@ pub(crate) mod vlt;
 pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
 pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
 
-pub(crate) use socket_patch_core::hosted::engine::redirect_json_block;
 #[cfg(test)]
 pub(crate) use socket_patch_core::hosted::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
@@ -35,11 +34,12 @@ pub(crate) use socket_patch_core::hosted::guidance::{
     npm_allow_remote_user_set_detail, plan_workspace_trust, pnpm_heal_root,
     pnpm_lock_carries_hosted_redirect, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
     pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote,
-    read_workspace_for_trust, TrustPlan,
+    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
+    TrustPlan,
 };
 #[cfg(test)]
 pub(crate) use socket_patch_core::hosted::ledger::{rebase_vlt_edits, REBASE_KINDS};
+pub(crate) use socket_patch_core::hosted::render::redirect_json_block;
 
 /// Most hosted wheel-metadata downloads in flight at once, below the patch
 /// API's own in-flight cap: each one buffers a whole wheel (up to
@@ -667,7 +667,11 @@ pub(crate) async fn run_redirect_selected(
     // (the takeover reverts rewrite locks in place, never create or remove
     // one, so the lock-presence probe holds for the rewrite below too).
     if engine::bun_lockb_symlinked(&view, &candidates) {
-        return refuse(common, scan_result.take(), &engine::bun_lockb_symlink_refusal());
+        return refuse(
+            common,
+            scan_result.take(),
+            &engine::bun_lockb_symlink_refusal(),
+        );
     }
 
     // vlt artifact preflight: before any takeover or rewrite (dry runs
@@ -926,7 +930,7 @@ pub(crate) async fn run_redirect_selected(
     // stderr) so CI can detect the attestation gap and re-run.
     let mut records: std::collections::BTreeMap<String, PatchRecord> =
         std::collections::BTreeMap::new();
-    let mut record_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut record_warnings: Vec<socket_patch_core::patch::redirect::RewriteWarning> = Vec::new();
 
     // SYMLINK GUARD (see `engine::guard`) — before the ledger and before any
     // write, dry runs included, so a dry run predicts the refusal. The
@@ -1216,12 +1220,14 @@ pub(crate) async fn run_redirect_selected(
     // One merged warning list, in one order, for both channels: the
     // rewriter's own warnings first (e.g. `no package-lock.json`), then the
     // record, package-manager, stale-install, takeover and prune warnings.
-    let mut warnings: Vec<serde_json::Value> = engine::rewrite_warnings_json(&rewrite.warnings);
-    warnings.extend(vlt_preflight.warnings.iter().cloned());
-    warnings.extend(record_warnings.iter().cloned());
-    warnings.extend(done.rush_warnings.iter().cloned());
-    warnings.extend(done.pnpm_warnings.iter().cloned());
-    warnings.extend(done.npm_warnings.iter().cloned());
+    let mut engine_warnings = rewrite.warnings.clone();
+    engine_warnings.extend(vlt_preflight.warnings.iter().cloned());
+    engine_warnings.extend(record_warnings);
+    engine_warnings.extend(done.rush_warnings.iter().cloned());
+    engine_warnings.extend(done.pnpm_warnings.iter().cloned());
+    engine_warnings.extend(done.npm_warnings.iter().cloned());
+    let mut warnings: Vec<serde_json::Value> =
+        socket_patch_core::hosted::render::rewrite_warnings_json(&engine_warnings);
     warnings.extend(gem_stale.warnings.iter().cloned());
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(vlt_stale.warnings.iter().cloned());
@@ -1237,7 +1243,10 @@ pub(crate) async fn run_redirect_selected(
         let redirect = redirect_json_block(
             confirmed.len(),
             done.rewritten.clone(),
-            skipped.iter().map(SkippedPatch::to_json).collect(),
+            skipped
+                .iter()
+                .map(socket_patch_core::hosted::render::skipped_json)
+                .collect(),
             warnings,
             common.dry_run,
         );
@@ -2142,7 +2151,6 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
 
 #[cfg(test)]
 mod tests {
-    use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use super::{
         build_redirect_json_envelope, gem_stale_cache_warning, gem_stale_install_warning,
         gem_stale_install_warnings, installed_stale_positive_evidence,
@@ -2164,6 +2172,7 @@ mod tests {
     use super::{rebase_vlt_edits, REBASE_KINDS};
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
+    use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use socket_patch_core::patch::redirect::{DepOverride, FileEdit};
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
 

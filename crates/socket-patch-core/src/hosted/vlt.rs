@@ -66,7 +66,7 @@ pub struct Preflight {
     pub passed: BTreeSet<String>,
     /// Artifact bytes by URL, for the heal's no-record comparison.
     pub artifacts: BTreeMap<String, Vec<u8>>,
-    pub warnings: Vec<serde_json::Value>,
+    pub warnings: Vec<crate::patch::redirect::RewriteWarning>,
 }
 
 /// The files `vlt_drives` and the preflight scope read: `vlt-lock.json`
@@ -172,10 +172,10 @@ pub fn judge(
             dep.already_pinned,
             everywhere,
         );
-        out.warnings.push(serde_json::json!({
-            "code": ARTIFACT_UNVERIFIABLE,
-            "detail": redact_grant_token(&detail, &dep.artifact_url, &dep.patch_uuid),
-        }));
+        out.warnings.push(crate::hosted::engine::warning(
+            ARTIFACT_UNVERIFIABLE,
+            redact_grant_token(&detail, &dep.artifact_url, &dep.patch_uuid),
+        ));
         if everywhere {
             out.withheld_everywhere
                 .insert(dep.patch_uuid.clone(), purl.to_string());

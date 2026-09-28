@@ -24,7 +24,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
-use crate::constants::npm_family::{RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK};
+use crate::constants::npm_family::{
+    RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
+};
 use crate::patch::redirect::npmrc::{
     plan_npmrc_allow_remote_with, NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND,
     NPMRC_REL,
@@ -44,9 +46,9 @@ use super::guidance::{
     npm_allow_remote_user_set_detail, npm_lock_url_needles, plan_workspace_trust, pnpm_heal_root,
     pnpm_lock_may_need_store_flag, pnpm_lock_version_major, pnpm_trust_configured_detail,
     pnpm_trust_legacy_detail, pnpm_trust_manual_guidance, pnpm_trust_policy_preamble,
-    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote,
-    read_workspace_for_trust, url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION,
-    PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
+    url_host, TrustPlan, NPM_LOCKS, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -165,11 +167,6 @@ impl SkippedPatch {
             reason: reason.to_string(),
             detail: None,
         }
-    }
-
-    /// The `skipped[]` JSON entry (`{purl, uuid, reason[, detail]}`).
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("SkippedPatch is plain strings: serialization cannot fail")
     }
 }
 
@@ -290,9 +287,7 @@ pub fn build_candidates(
         let token = reference
             .registry_override
             .as_ref()
-            .and_then(|o| {
-                crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid)
-            })
+            .and_then(|o| crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid))
             .or_else(|| crate::patch::redirect::grant_token_path_segment(&url, sel_uuid))
             .unwrap_or_default();
         candidates.push(Candidate {
@@ -412,7 +407,9 @@ impl CandidateFiles {
 /// The root-level Python lock names (sorted).
 async fn python_lock_paths(view: &ProjectView<'_>) -> Vec<String> {
     match view {
-        ProjectView::Disk(cwd) => crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default(),
+        ProjectView::Disk(cwd) => {
+            crate::utils::python_lock::python_lock_paths(cwd).unwrap_or_default()
+        }
         ProjectView::Memory(project) => project
             .children("")
             .into_iter()
@@ -626,9 +623,9 @@ pub struct Rewritten {
     pub confirmed: Vec<(String, String)>,
     /// A `bun.lockb` without a text `bun.lock` drives npm.
     pub binary_bun: bool,
-    pub rush_warnings: Vec<serde_json::Value>,
-    pub pnpm_warnings: Vec<serde_json::Value>,
-    pub npm_warnings: Vec<serde_json::Value>,
+    pub rush_warnings: Vec<RewriteWarning>,
+    pub pnpm_warnings: Vec<RewriteWarning>,
+    pub npm_warnings: Vec<RewriteWarning>,
     /// Human mode: this run touched nothing pnpm-related (no lock spliced,
     /// trust already configured), so the full guidance shrinks to a
     /// one-line reminder.
@@ -643,7 +640,10 @@ pub struct Rewritten {
 /// symbolic link (absent to the planner, refused by [`guard`]).
 fn read_workspace(view: &ProjectView<'_>) -> (std::io::Result<Option<String>>, bool) {
     match view {
-        ProjectView::Disk(cwd) => (read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)), false),
+        ProjectView::Disk(cwd) => (
+            read_workspace_for_trust(&cwd.join(PNPM_WORKSPACE_REL)),
+            false,
+        ),
         ProjectView::Memory(project) => match project.get(PNPM_WORKSPACE_REL) {
             None => (Ok(None), false),
             Some(MemoryEntry::Text(text)) => (Ok(Some(text.to_string())), false),
@@ -844,26 +844,37 @@ pub async fn rewrite(
     // survives `rush update` (pnpm preserves locked resolutions for
     // unchanged specifiers). Warn only when the rewrite actually landed in
     // a Rush lock and the repo-state file that carries the hash is present.
-    let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut rush_warnings: Vec<RewriteWarning> = Vec::new();
     if rush_lock_keys
         .iter()
         .any(|key| rewrite.files.contains_key(key))
         && rush_repo_state_present(view)
     {
-        rush_warnings.push(serde_json::json!({
-            "code": "redirect_rush_repo_state_stale",
-            "detail":
-                "pnpm-lock.yaml was edited outside `rush update`; if \
+        rush_warnings.push(warning(
+            "redirect_rush_repo_state_stale",
+            "pnpm-lock.yaml was edited outside `rush update`; if \
                  preventManualShrinkwrapChanges is enabled, `rush install` fails until \
                  `rush update` refreshes repo-state.json (the redirect survives `rush \
                  update`)",
-        }));
+        ));
     }
 
-    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) =
-        pnpm_trust(view, &files, &rewrite, &overrides, takeover_previews, &options);
-    let (npm_warnings, npmrc_config_write) =
-        npm_allow_remote(view, &files, &rewrite, &overrides, takeover_previews, &options);
+    let (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked) = pnpm_trust(
+        view,
+        &files,
+        &rewrite,
+        &overrides,
+        takeover_previews,
+        &options,
+    );
+    let (npm_warnings, npmrc_config_write) = npm_allow_remote(
+        view,
+        &files,
+        &rewrite,
+        &overrides,
+        takeover_previews,
+        &options,
+    );
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last: `--revert` walks edits in reverse, so the trust key
@@ -933,8 +944,8 @@ fn pnpm_trust(
     overrides: &[DepOverride],
     takeover_previews: &[TakeoverPreview],
     options: &RewriteOptions<'_>,
-) -> (Vec<serde_json::Value>, ConfigWrite, bool, bool) {
-    let mut pnpm_warnings: Vec<serde_json::Value> = Vec::new();
+) -> (Vec<RewriteWarning>, ConfigWrite, bool, bool) {
+    let mut pnpm_warnings: Vec<RewriteWarning> = Vec::new();
     let mut trust_config_write: ConfigWrite = None;
     let mut pnpm_rerun_only = false;
     let mut workspace_symlinked = false;
@@ -987,7 +998,12 @@ fn pnpm_trust(
         pnpm_lock_texts.push(text);
     }
     if pnpm_lock_texts.is_empty() {
-        return (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked);
+        return (
+            pnpm_warnings,
+            trust_config_write,
+            pnpm_rerun_only,
+            workspace_symlinked,
+        );
     }
     // Name only the hosts whose artifact URL actually landed in a touched
     // pnpm lock's final text (spliced this run, or the already-redirected
@@ -1097,9 +1113,9 @@ fn pnpm_trust(
     } else {
         ""
     };
-    pnpm_warnings.push(serde_json::json!({
-        "code": "redirect_pnpm_trust_lockfile",
-        "detail": format!(
+    pnpm_warnings.push(warning(
+        "redirect_pnpm_trust_lockfile",
+        format!(
             "{}. After a lock-only change, existing node_modules or a warm pnpm store \
              can still contain upstream files. For a reliable reinstall, use a clean \
              node_modules tree and an empty store with \
@@ -1109,8 +1125,13 @@ fn pnpm_trust(
              the patched files.",
             detail.trim_end_matches('.')
         ),
-    }));
-    (pnpm_warnings, trust_config_write, pnpm_rerun_only, workspace_symlinked)
+    ));
+    (
+        pnpm_warnings,
+        trust_config_write,
+        pnpm_rerun_only,
+        workspace_symlinked,
+    )
 }
 
 /// npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every
@@ -1141,8 +1162,8 @@ fn npm_allow_remote(
     overrides: &[DepOverride],
     takeover_previews: &[TakeoverPreview],
     options: &RewriteOptions<'_>,
-) -> (Vec<serde_json::Value>, ConfigWrite) {
-    let mut npm_warnings: Vec<serde_json::Value> = Vec::new();
+) -> (Vec<RewriteWarning>, ConfigWrite) {
+    let mut npm_warnings: Vec<RewriteWarning> = Vec::new();
     let mut npmrc_config_write: ConfigWrite = None;
     let npm_hosts: Vec<&str> = {
         let npm_lock_texts: Vec<&String> = NPM_LOCKS
@@ -1188,32 +1209,31 @@ fn npm_allow_remote(
     let detail = match read_npmrc(view) {
         // Opt-out still reports an explicit / already-set value truthfully;
         // only the WRITE is suppressed.
-        Ok(existing) => match plan_npmrc_allow_remote_with(existing.as_deref(), &(options.npm_outer)()) {
-            NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
-            NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
-            NpmrcPlan::EnvSet { var, value } => {
-                npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
+        Ok(existing) => {
+            match plan_npmrc_allow_remote_with(existing.as_deref(), &(options.npm_outer)()) {
+                NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
+                NpmrcPlan::UserSet(value) => npm_allow_remote_user_set_detail(&npm_hosts, &value),
+                NpmrcPlan::EnvSet { var, value } => {
+                    npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
+                }
+                NpmrcPlan::OuterSet { layer, path, value } => {
+                    npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
+                }
+                NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
+                _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
+                NpmrcPlan::Create(text) => {
+                    npmrc_config_write = Some((text, edit("created")));
+                    npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
+                }
+                NpmrcPlan::Append(text) => {
+                    npmrc_config_write = Some((text, edit("added")));
+                    npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
+                }
             }
-            NpmrcPlan::OuterSet { layer, path, value } => {
-                npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
-            }
-            NpmrcPlan::Unsupported(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
-            _ if !options.npm_allow_remote_config => npm_allow_remote_manual_detail(&npm_hosts),
-            NpmrcPlan::Create(text) => {
-                npmrc_config_write = Some((text, edit("created")));
-                npm_allow_remote_configured_detail(&npm_hosts, true, options.dry_run)
-            }
-            NpmrcPlan::Append(text) => {
-                npmrc_config_write = Some((text, edit("added")));
-                npm_allow_remote_configured_detail(&npm_hosts, false, options.dry_run)
-            }
-        },
+        }
         Err(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
     };
-    npm_warnings.push(serde_json::json!({
-        "code": "redirect_npm_allow_remote",
-        "detail": detail,
-    }));
+    npm_warnings.push(warning("redirect_npm_allow_remote", detail));
     (npm_warnings, npmrc_config_write)
 }
 
@@ -1419,7 +1439,11 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
 /// In memory, additionally: a candidate file read through a link (its bytes
 /// are unknown) or present without content, when a candidate of its
 /// ecosystem could rewrite it.
-pub fn guard(view: &ProjectView<'_>, done: &Rewritten, candidates: &[Candidate]) -> Option<Refusal> {
+pub fn guard(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    candidates: &[Candidate],
+) -> Option<Refusal> {
     if done.workspace_symlinked {
         return Some(symlink_refusal(PNPM_WORKSPACE_REL));
     }
@@ -1463,46 +1487,23 @@ pub fn guard(view: &ProjectView<'_>, done: &Rewritten, candidates: &[Candidate])
 
 /// The `record_fetch_failed` warning for a confirmed redirect whose patch
 /// record could not be fetched.
-pub fn record_fetch_failed_warning(purl: &str) -> serde_json::Value {
-    serde_json::json!({
-        "code": "record_fetch_failed",
-        "detail": format!(
+pub fn record_fetch_failed_warning(purl: &str) -> RewriteWarning {
+    warning(
+        "record_fetch_failed",
+        format!(
             "{purl} redirected, but its patch record could not be fetched; \
              it will be missing from VEX until `socket-patch scan --mode \
              hosted` is re-run"
         ),
-    })
+    )
 }
 
-/// The rewriters' own warnings as `{code, detail}` JSON.
-pub fn rewrite_warnings_json(warnings: &[RewriteWarning]) -> Vec<serde_json::Value> {
-    warnings
-        .iter()
-        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail }))
-        .collect()
-}
-
-/// The nested `redirect` block of every hosted `--json` envelope — the ONE
-/// spelling of its key set (`mode`, `redirected`, `rewrittenFiles`,
-/// `skipped`, `warnings`, `dryRun`), shared by every hosted path (disk
-/// scan, its zero-discovery arm, and the in-memory engine), so the two cannot drift by convention.
-/// `mode` is `"hosted"`: an additive key so consumers dispatch on the mode without inferring it from which
-/// sub-object is present.
-pub fn redirect_json_block(
-    redirected: usize,
-    rewritten: Vec<String>,
-    skipped: Vec<serde_json::Value>,
-    warnings: Vec<serde_json::Value>,
-    dry_run: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "mode": "hosted",
-        "redirected": redirected,
-        "rewrittenFiles": rewritten,
-        "skipped": skipped,
-        "warnings": warnings,
-        "dryRun": dry_run,
-    })
+/// A `{code, detail}` warning.
+pub fn warning(code: &str, detail: impl Into<String>) -> RewriteWarning {
+    RewriteWarning {
+        code: code.to_string(),
+        detail: detail.into(),
+    }
 }
 
 #[cfg(test)]

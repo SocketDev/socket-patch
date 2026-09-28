@@ -18,4 +18,5 @@ pub mod engine;
 pub mod guidance;
 pub mod ledger;
 pub mod memory;
+pub mod render;
 pub mod vlt;
