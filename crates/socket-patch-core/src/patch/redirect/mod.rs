@@ -50,7 +50,7 @@ use crate::formats::pnpm::grammar as pnpm;
 use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
-use crate::formats::gem::hosted::converge_gem_lock_source;
+use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 pub(crate) use crate::formats::yarn::is_berry_lock;
 use crate::formats::cargo::hosted::{self as cargo_lock, plan_cargo_lock, CargoLockPlan};
 pub(crate) use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
@@ -5044,46 +5044,30 @@ fn rewrite_gem(
                 });
                 continue;
             }
-            let sum_line_re = Regex::new(
-                &(String::from(r"(?m)^(  ")
-                    + &regex::escape(&dep.name)
-                    + r" \("
-                    + &regex::escape(&dep.version)
-                    + r"\)) sha256=([0-9a-f]+)(\r?)$"),
-            )
-            .expect("checksum-line regex from the escaped name/version is valid");
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
-            // Already redirected (re-run): the CHECKSUMS line is at the
-            // target value; recording an edit would grow the ledger forever.
-            let already_re =
-                Regex::new(&(String::from(r"(?m)^  ") + &regex::escape(&new_val) + r"\r?$"))
-                    .expect("already-redirected regex from the escaped line is valid");
             let mut checksums_era = true;
-            if already_re.is_match(lk) {
-                // no-op
-            } else if let Some(m) = sum_line_re.captures(lk) {
-                // The pre-edit line goes into the ledger as `original` so a
-                // revert can restore the upstream sha.
-                let old_val = format!(
-                    "{} ({}) sha256={}",
-                    dep.name,
-                    dep.version,
-                    m.get(2)
-                        .expect("sum_line_re always captures group 2 (sha hex)")
-                        .as_str()
-                );
-                *lk = sum_line_re
-                    .replace(lk, format!("${{1}} sha256={sha256}${{3}}").as_str())
-                    .to_string();
-                lock_changed = true;
-                result.edits.push(FileEdit {
-                    path: lock_name.into(),
-                    kind: "redirect_gemfile_lock_checksum".into(),
-                    action: "rewritten".into(),
-                    key: Some(dep.name.clone()),
-                    original: Some(Value::String(old_val)),
-                    new: Some(Value::String(new_val)),
-                });
+            // The entry for exactly `name (version)`, read with the shared
+            // Bundler-lock grammar the discovery reader uses — whatever
+            // digests it carries (bare, uppercase, several algorithms), so it
+            // is REPLACED, never shadowed by a second, conflicting entry.
+            if let Some((start, end)) = checksum_entry_span(lk, &dep.name, &dep.version) {
+                let old_val = lk[start + 2..end].to_string();
+                // Already redirected (re-run): the entry is at the target
+                // value; recording an edit would grow the ledger forever.
+                if old_val != new_val {
+                    lk.replace_range(start + 2..end, &new_val);
+                    lock_changed = true;
+                    // The pre-edit entry goes into the ledger verbatim as
+                    // `original` so a revert restores the upstream digests.
+                    result.edits.push(FileEdit {
+                        path: lock_name.into(),
+                        kind: "redirect_gemfile_lock_checksum".into(),
+                        action: "rewritten".into(),
+                        key: Some(dep.name.clone()),
+                        original: Some(Value::String(old_val)),
+                        new: Some(Value::String(new_val)),
+                    });
+                }
             } else if checksums_re.is_match(lk) {
                 *lk = checksums_re
                     .replace(
@@ -9944,6 +9928,77 @@ mod tests {
              PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\n\
              CHECKSUMS\n{checksums}\n\nBUNDLED WITH\n   2.6.2\n"
         )
+    }
+
+    /// The CHECKSUMS writer finds the dep's entry with the shared Bundler-lock
+    /// grammar the discovery reader uses, so every spelling that reader
+    /// accepts — lowercase, uppercase, extra digest tokens (space- or
+    /// comma-joined), a bare entry, CRLF — is REPLACED by the patched pin:
+    /// exactly one `rails (7.0.0)` row survives, it reads back as the
+    /// patched sha, and the ledger holds the old entry verbatim for revert.
+    #[test]
+    fn gem_checksum_rewrite_replaces_every_spelling_the_reader_accepts() {
+        let lower = "2".repeat(64);
+        let upper = "A".repeat(64);
+        let sha512 = "b".repeat(128);
+        let patched = "f".repeat(64);
+        let entries = [
+            format!("rails (7.0.0) sha256={lower}"),
+            format!("rails (7.0.0) sha256={upper}"),
+            format!("rails (7.0.0) sha256={lower} sha512={sha512}"),
+            format!("rails (7.0.0) sha256={lower},sha512={sha512}"),
+            "rails (7.0.0)".to_string(),
+        ];
+        for crlf in [false, true] {
+            for entry in &entries {
+                let mut lock = gem_lock(&format!("  {entry}"));
+                if crlf {
+                    lock = lock.replace('\n', "\r\n");
+                }
+                let mut files = BTreeMap::new();
+                files.insert(
+                    "Gemfile".to_string(),
+                    "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+                );
+                files.insert("Gemfile.lock".to_string(), lock);
+                let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+                let out = r.files.get("Gemfile.lock").expect("lock rewritten");
+                let rows: Vec<&str> = out
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with("rails (7.0.0)") && l.starts_with("  ") && !l.starts_with("    "))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    [format!("  rails (7.0.0) sha256={patched}")],
+                    "{entry} (crlf={crlf}): exactly one patched row\n{out}"
+                );
+                let eol = if crlf { "\r\n" } else { "\n" };
+                assert!(
+                    out.contains(&format!("  rails (7.0.0) sha256={patched}{eol}")),
+                    "{entry}: the entry keeps its line ending: {out:?}"
+                );
+                let model = crate::formats::gem::GemfileLock::parse(out);
+                assert_eq!(model.checksum("rails", "7.0.0"), Some(patched.as_str()), "{entry}");
+                assert!(!out.contains("\r\r"), "line endings kept: {out:?}");
+                let edit = r
+                    .edits
+                    .iter()
+                    .find(|e| e.kind == "redirect_gemfile_lock_checksum")
+                    .expect("checksum edit recorded");
+                assert_eq!(edit.action, "rewritten", "{entry}");
+                assert_eq!(edit.original, Some(Value::String(entry.clone())), "{entry}");
+
+                // A re-run over the rewritten lock records nothing new.
+                files.insert("Gemfile".to_string(), r.files["Gemfile"].clone());
+                files.insert("Gemfile.lock".to_string(), out.clone());
+                let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+                assert!(
+                    !again.edits.iter().any(|e| e.kind == "redirect_gemfile_lock_checksum"),
+                    "{entry}: rerun is a no-op: {:?}",
+                    again.edits
+                );
+            }
+        }
     }
 
     /// The edit must splice by the regex match's byte range: a substring

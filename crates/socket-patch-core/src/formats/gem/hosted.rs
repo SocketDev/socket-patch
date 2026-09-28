@@ -273,3 +273,35 @@ pub(crate) fn converge_gem_lock_source(
     }
     true
 }
+
+/// The byte span (line content, ending excluded) of the `CHECKSUMS` entry
+/// for exactly `name (version)` — the platform-less spec the hosted planner
+/// pins — read with the shared entry grammar
+/// ([`super::split_checksum_entry`]): a 2-space entry inside the column-0
+/// `CHECKSUMS` section, whatever digests it carries (bare, uppercase,
+/// several algorithms). The first such entry; `None` when there is none.
+/// CRLF endings stay outside the span.
+pub(crate) fn checksum_entry_span(lock: &str, name: &str, version: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut in_checksums = false;
+    for line in lock.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let content = gem_lock_line_content(line);
+        if !content.is_empty() && !content.starts_with(' ') {
+            in_checksums = content == "CHECKSUMS";
+            continue;
+        }
+        let Some(entry) = content.strip_prefix("  ").filter(|e| !e.starts_with(' ')) else {
+            continue;
+        };
+        if in_checksums
+            && super::split_checksum_entry(entry)
+                .is_some_and(|(n, token, _)| n == name && token == version)
+        {
+            return Some((start, start + content.len()));
+        }
+    }
+    None
+}
+
