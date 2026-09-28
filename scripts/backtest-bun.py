@@ -854,13 +854,16 @@ def main():
                 # bun writes "" for its default registry, so `.npmrc` alone never
                 # fills the slot: inject the full-URL form bun emits for any other
                 # registry and prove bun installs from it before the CLI runs.
-                text = lock.read_text(encoding='utf-8')
-                pre_injection = text.encode('utf-8')
+                # Bytes, not text mode: Windows text I/O would turn the lock's LF
+                # into CRLF, and the restore (which keeps the lock's line endings)
+                # would then never match the LF pre-injection bytes.
+                pre_injection = lock.read_bytes()
+                text = pre_injection.decode('utf-8')
                 injected = text.replace('["minimist@1.2.2", ""', f'["minimist@1.2.2", "{REGISTRY_SLOT}"')
                 checks['registrySlotInjected'] = injected != text
-                lock.write_text(injected, encoding='utf-8')
+                lock.write_bytes(injected.encode('utf-8'))
                 code, _ = install(bun, 'registry-accepted', ['--frozen-lockfile'])
-                checks['registrySlotAccepted'] = code == 0 and lock.read_text(encoding='utf-8') == injected
+                checks['registrySlotAccepted'] = code == 0 and lock.read_bytes() == injected.encode('utf-8')
             original = {name: (project / name).read_bytes()
                         for name in [*files, 'bun.lock', 'bun.lockb'] if (project / name).exists()}
             row['originalSha256'] = {n: sha256(b) for n, b in original.items()}
