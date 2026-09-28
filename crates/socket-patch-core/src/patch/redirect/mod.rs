@@ -52,7 +52,7 @@ use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
 pub(crate) use crate::formats::yarn::is_berry_lock;
-use crate::formats::cargo::hosted::{self as cargo_lock, plan_cargo_lock, CargoLockPlan};
+use crate::formats::cargo::hosted::CargoLockPlan;
 pub(crate) use crate::formats::cargo::hosted::CARGO_LOCK_REFERENCE_KIND;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
@@ -1356,7 +1356,12 @@ fn rewrite_cargo(
             Absent,
         }
         let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
-            match plan_cargo_lock(lock_text, &dep.name, &dep.version, index_url, &cksum) {
+            // A lock that does not parse never reaches here: the dependents
+            // check above refuses it.
+            let plan = CargoLock::parse(lock_text).map_or(CargoLockPlan::NotFound, |lock| {
+                lock.plan_hosted(lock_text, &dep.name, &dep.version, index_url, &cksum)
+            });
+            match plan {
                 CargoLockPlan::Rewritten { content, edits } => LockCommit::Write(content, edits),
                 CargoLockPlan::AlreadyRedirected => LockCommit::InPlace,
                 CargoLockPlan::NotFound => {
@@ -1493,7 +1498,7 @@ fn cargo_not_declared_detail(
     } else {
         "Cargo.toml".to_string()
     };
-    let transitive = lock.is_some_and(|lock| cargo_lock::is_locked(lock, crate_name, version));
+    let transitive = cargo_lock_holds(lock, crate_name, version);
     if transitive {
         format!(
             "{crate_name}@{version} is a transitive-only dependency (Cargo.lock resolves it, \
@@ -1523,7 +1528,7 @@ fn cargo_requirement_excludes_detail(
         .map(|(path, req)| format!("\"{req}\" in {path}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let locked = lock.is_some_and(|lock| cargo_lock::is_locked(lock, crate_name, version));
+    let locked = cargo_lock_holds(lock, crate_name, version);
     let remedy = if locked {
         "; Cargo.lock resolves it for another package, which a pin cannot reach — patch it \
          with `socket-patch scan --mode vendored`"
@@ -2383,12 +2388,22 @@ enum CargoWorkspaceEntry {
     OtherPackage,
 }
 
+/// Whether a Cargo.lock (when there is one, and it parses) resolves
+/// `crate_name`@`version`.
+fn cargo_lock_holds(lock: Option<&str>, crate_name: &str, version: &str) -> bool {
+    lock.and_then(|lock| CargoLock::parse(lock).ok())
+        .is_some_and(|lock| lock.is_locked(crate_name, version))
+}
+
 /// Every version of `crate_name` a Cargo.lock holds other than `version`.
 fn cargo_lock_other_versions(lock: Option<&str>, crate_name: &str, version: &str) -> Vec<String> {
     let Some(lock) = lock else {
         return Vec::new();
     };
-    let mut versions = cargo_lock::locked_versions(lock, crate_name);
+    let Ok(lock) = CargoLock::parse(lock) else {
+        return Vec::new();
+    };
+    let mut versions = lock.locked_versions(crate_name);
     versions.retain(|v| v != version);
     versions
 }

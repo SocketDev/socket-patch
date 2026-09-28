@@ -14,8 +14,10 @@
 //!   crate (the hosted planner's unpinnable-dependents refusal);
 //! * [`CargoLock::vendored_in_use`] — whether the lock builds a vendored
 //!   `[patch]` copy ([`CopyClaim`]);
-//! * [`hosted::plan_cargo_lock`] — the hosted planner's lock splice, and the
-//!   line-grammar probes the hosted rewriter reads with;
+//! * [`CargoLock::plan_hosted`] ([`hosted`]) — the hosted planner's lock
+//!   splice, at the byte spans [`CargoLock::parse`] records, and the
+//!   [`CargoLock::is_locked`] / [`CargoLock::locked_versions`] probes the
+//!   hosted rewriter reads with;
 //! * the vendored planner (`vendor::cargo_lock`) edits the same document
 //!   with `toml_edit`;
 //!
@@ -23,7 +25,9 @@
 
 pub(crate) mod hosted;
 
-use toml_edit::{DocumentMut, Item};
+use std::ops::Range;
+
+use toml_edit::{Document, DocumentMut, Item, Table, Value};
 
 use crate::utils::digest::is_hex;
 use crate::utils::purl::simple_purl;
@@ -61,12 +65,38 @@ pub(crate) struct LockedPackage {
 /// entry without a string `name` and `version` is skipped. A lock with no
 /// packages has no `package` key and yields nothing.
 pub(crate) fn locked_packages(doc: &DocumentMut) -> Vec<LockedPackage> {
-    let metadata = doc.get("metadata").and_then(Item::as_table_like);
+    read_packages(doc.as_table(), false)
+        .into_iter()
+        .map(|(pkg, _)| pkg)
+        .collect()
+}
+
+/// Where one `[[package]]`'s pieces sit in the lock text it was parsed
+/// from — what the hosted splice ([`hosted`]) edits, so it rewrites exactly
+/// the bytes the read model read. Every range is a TOML value's own span
+/// (quotes included).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PackageSpans {
+    /// Offset of the block's `[[package]]` header.
+    pub(crate) header: usize,
+    pub(crate) version: Range<usize>,
+    pub(crate) source: Option<Range<usize>>,
+    /// The inline (v2+) `checksum`.
+    pub(crate) checksum: Option<Range<usize>>,
+    /// Every string value in the block (`dependencies`, a v1 `replace`):
+    /// where a full package id `"name version (source)"` can be spelled.
+    pub(crate) strings: Vec<Range<usize>>,
+}
+
+/// [`locked_packages`] over any root table, with each package's
+/// [`PackageSpans`] when the table was parsed with spans (`spanned`).
+fn read_packages(root: &Table, spanned: bool) -> Vec<(LockedPackage, Option<PackageSpans>)> {
+    let metadata = root.get("metadata").and_then(Item::as_table_like);
     let metadata_checksum = |name: &str, version: &str, source: Option<&str>| {
         let key = metadata_checksum_key(name, version, source?);
         metadata?.get(&key)?.as_str().map(str::to_string)
     };
-    doc.get("package")
+    root.get("package")
         .and_then(Item::as_array_of_tables)
         .map(|pkgs| {
             pkgs.iter()
@@ -88,24 +118,103 @@ pub(crate) fn locked_packages(doc: &DocumentMut) -> Vec<LockedPackage> {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    Some(LockedPackage {
-                        name,
-                        version,
-                        source,
-                        checksum,
-                        dependencies,
-                    })
+                    let spans = if spanned { package_spans(t) } else { None };
+                    Some((
+                        LockedPackage {
+                            name,
+                            version,
+                            source,
+                            checksum,
+                            dependencies,
+                        },
+                        spans,
+                    ))
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
+/// The [`PackageSpans`] of a spanned `[[package]]` table.
+fn package_spans(t: &Table) -> Option<PackageSpans> {
+    let value_span = |key: &str| t.get(key).and_then(Item::as_value).and_then(Value::span);
+    let mut strings = Vec::new();
+    string_spans(t, &mut strings);
+    Some(PackageSpans {
+        header: t.span()?.start,
+        version: value_span("version")?,
+        source: value_span("source"),
+        checksum: value_span("checksum"),
+        strings,
+    })
+}
+
+/// The span of every string value under `t`, arrays and inline tables
+/// included.
+fn string_spans(t: &Table, out: &mut Vec<Range<usize>>) {
+    fn value(v: &Value, out: &mut Vec<Range<usize>>) {
+        match v {
+            Value::String(_) => out.extend(v.span()),
+            Value::Array(a) => a.iter().for_each(|v| value(v, out)),
+            Value::InlineTable(t) => t.iter().for_each(|(_, v)| value(v, out)),
+            _ => {}
+        }
+    }
+    for (_, item) in t.iter() {
+        match item {
+            Item::Value(v) => value(v, out),
+            Item::Table(t) => string_spans(t, out),
+            _ => {}
+        }
+    }
+}
+
+/// The start of every table header (`[x]` / `[[x]]`) in a spanned lock,
+/// sorted: what bounds a `[[package]]` block. Implicit tables (a dotted
+/// `[patch.crates-io]`'s `patch`) have no header of their own.
+fn header_starts(root: &Table, text: &str) -> Vec<usize> {
+    fn walk(t: &Table, text: &str, out: &mut Vec<usize>) {
+        for (_, item) in t.iter() {
+            let tables: Vec<&Table> = match item {
+                Item::Table(t) => vec![t],
+                Item::ArrayOfTables(a) => a.iter().collect(),
+                _ => continue,
+            };
+            for t in tables {
+                if let Some(span) = t.span().filter(|s| text[s.clone()].starts_with('[')) {
+                    out.push(span.start);
+                }
+                walk(t, text, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, text, &mut out);
+    out.sort_unstable();
+    out
+}
+
+/// The spanned lock's `[metadata]` entries: each key as read, and the
+/// span of its whole `"key" = "value"` line.
+fn metadata_lines(root: &Table) -> Vec<(String, Range<usize>)> {
+    let Some(metadata) = root.get("metadata").and_then(Item::as_table) else {
+        return Vec::new();
+    };
+    metadata
+        .iter()
+        .filter_map(|(key, item)| {
+            let start = metadata.key(key)?.span()?.start;
+            let end = item.as_value()?.span()?.end;
+            Some((key.to_string(), start..end))
+        })
+        .collect()
+}
+
 /// `(name, version)` of every `[[patch.unused]]` entry: a `[patch]` cargo
 /// resolved and then did NOT use in the crate graph — the lock's own record
 /// that a patch (e.g. a vendored copy) is not what builds.
-pub(crate) fn unused_patches(doc: &DocumentMut) -> Vec<(String, String)> {
-    doc.get("patch")
+pub(crate) fn unused_patches(root: &Table) -> Vec<(String, String)> {
+    root.get("patch")
         .and_then(|patch| patch.get("unused"))
         .and_then(Item::as_array_of_tables)
         .map(|entries| {
@@ -231,21 +340,94 @@ pub(crate) fn parse_ref(spelled: &str) -> (&str, Option<&str>, Option<&str>) {
 pub struct CargoLock {
     packages: Vec<LockedPackage>,
     unused: Vec<(String, String)>,
+    /// Present when parsed from text ([`CargoLock::parse`]): where each
+    /// package, table header and `[metadata]` line sits in it.
+    spans: Option<LockSpans>,
+}
+
+/// The byte spans of a [`CargoLock`] parsed from text.
+#[derive(Debug)]
+pub(crate) struct LockSpans {
+    /// Parallel to [`CargoLock::packages`].
+    pub(crate) packages: Vec<PackageSpans>,
+    /// Every table header's start, sorted.
+    pub(crate) headers: Vec<usize>,
+    /// The string values of a v1 lock's standalone `[root]` table.
+    pub(crate) root_strings: Vec<Range<usize>>,
+    /// `[metadata]` keys and their line spans.
+    pub(crate) metadata: Vec<(String, Range<usize>)>,
 }
 
 impl CargoLock {
-    /// The model of an already-parsed lock document.
+    /// The model of an already-parsed lock document (no spans: a
+    /// `DocumentMut` keeps none).
     pub fn from_doc(doc: &DocumentMut) -> Self {
         CargoLock {
             packages: locked_packages(doc),
-            unused: unused_patches(doc),
+            unused: unused_patches(doc.as_table()),
+            spans: None,
         }
     }
 
-    /// Parse a lock text; `Err` when it is not TOML (cargo itself refuses
-    /// to build from it).
+    /// Parse a lock text, keeping every span the hosted splice edits;
+    /// `Err` when it is not TOML (cargo itself refuses to build from it).
     pub fn parse(text: &str) -> Result<Self, toml_edit::TomlError> {
-        Ok(Self::from_doc(&text.parse::<DocumentMut>()?))
+        let doc = Document::parse(text)?;
+        let root = doc.as_table();
+        let mut packages = Vec::new();
+        let mut spans = Vec::new();
+        let mut spanned = true;
+        for (pkg, span) in read_packages(root, true) {
+            packages.push(pkg);
+            match span {
+                Some(span) => spans.push(span),
+                None => spanned = false,
+            }
+        }
+        let root_strings = root
+            .get("root")
+            .and_then(Item::as_table)
+            .map(|t| {
+                let mut out = Vec::new();
+                string_spans(t, &mut out);
+                out
+            })
+            .unwrap_or_default();
+        Ok(CargoLock {
+            unused: unused_patches(root),
+            spans: spanned.then(|| LockSpans {
+                packages: spans,
+                headers: header_starts(root, text),
+                root_strings,
+                metadata: metadata_lines(root),
+            }),
+            packages,
+        })
+    }
+
+    /// The spans, when parsed from text.
+    pub(crate) fn spans(&self) -> Option<&LockSpans> {
+        self.spans.as_ref()
+    }
+
+    /// Whether the lock holds a `[[package]]` for `name`@`version`.
+    pub(crate) fn is_locked(&self, name: &str, version: &str) -> bool {
+        self.packages
+            .iter()
+            .any(|p| p.name == name && p.version == version)
+    }
+
+    /// Every version of `name` the lock holds, sorted and deduplicated.
+    pub(crate) fn locked_versions(&self, name: &str) -> Vec<String> {
+        let mut versions: Vec<String> = self
+            .packages
+            .iter()
+            .filter(|p| p.name == name)
+            .map(|p| p.version.clone())
+            .collect();
+        versions.sort();
+        versions.dedup();
+        versions
     }
 
     /// Every `[[package]]`, in lock order.
