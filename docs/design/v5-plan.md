@@ -183,6 +183,13 @@ patch-UI review.
   exit 2 for all usage errors; scan/get JSON onto `json_envelope`.
 - Full item list: 22 findings from the UI review (sizes S/M/L, contract flags).
 
+### WS9 — Staged patch rollout  *(branches `v5/rollout-policy` (A), `v5/rollout-limit` (B))*
+- Added 2026-09-28 at the owner's request. `socket.yml` `patches:` policy
+  (paths, ecosystems, packages, severity floor, enabled) read by `scan`
+  and the in-memory engine, plus `scan --max-new-patches` (severity-ordered
+  per-run cap on new patches). Full plan and the two work-item specs:
+  `docs/design/staged-rollout.md`. Merge order A then B.
+
 ## Remaining small follow-ups
 - ci.yml `e2e_cargo`/`e2e_golang` rows select `--ignored` but have no ignored
   tests (vacuous legs) → give them `--include-ignored` or drop the rows.
