@@ -10,7 +10,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --test e2e_maven -- --ignored
+//! cargo test -p socket-patch-cli --test e2e_maven
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -99,7 +99,6 @@ async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
 
 /// Verify that `socket-patch scan` discovers artifacts in a fake Maven local repo.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opt-in maven crawl e2e; run with --ignored"]
 async fn scan_discovers_maven_artifacts() {
     let server = start_proxy().await;
     let proxy_url = server.uri();
@@ -226,7 +225,6 @@ async fn scan_discovers_maven_artifacts() {
 
 /// Verify that `socket-patch scan` discovers Gradle project artifacts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "opt-in maven crawl e2e; run with --ignored"]
 async fn scan_discovers_gradle_project_artifacts() {
     let server = start_proxy().await;
     let proxy_url = server.uri();
