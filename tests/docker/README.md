@@ -67,8 +67,9 @@ the real package managers, each in its ecosystem's image:
 | `docker_e2e_vendor_nuget` | `nuget` | .NET SDK 8.0, Newtonsoft.Json 13.0.3 |
 | `docker_e2e_vendor_pypi_pm` | `pypi` | poetry, pdm, pipenv on six 1.16.0 |
 
-CI's `e2e-docker` job runs the composer, nuget and pypi_pm capstones;
-`coverage-docker` runs all five. Unlike the scan→apply suites they are MULTI-STAGE: a host
+CI's `coverage-docker` job runs all five on every push; the nightly
+`e2e-docker` job runs the composer, nuget and pypi_pm capstones against
+the release binary. Unlike the scan→apply suites they are MULTI-STAGE: a host
 tempdir is bind-mounted at `/workspace` and shared across three `docker run`s
 (networked fixture install + offline `socket-patch vendor`; then a
 fresh-checkout install under `--network none` with cold caches; then

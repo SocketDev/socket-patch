@@ -1362,7 +1362,7 @@ def main():
             for s in args.shapes:
                 for m in args.modes:
                     if wanted(v, s, m):
-                        results.append({"pdm": v, "python": python_for(v), "shape": s, "mode": m, "outcome": "SKIP", "passed": None, "checks": {}, "info": {"skip": "tool bootstrap failed: " + tool_environments.get(v, {}).get("error", "?")[-300:]}})
+                        results.append({"pdm": v, "python": python_for(v), "shape": s, "mode": m, "outcome": "ERROR", "passed": False, "checks": {}, "info": {"error": "tool bootstrap failed: " + tool_environments.get(v, {}).get("error", "?")[-300:]}})
     jobs = [j for j in jobs if tool_environments.get(j[0], {}).get("ok")]
 
     def persist():
@@ -1394,6 +1394,10 @@ def main():
     say(render_matrix(summary))
     bad = [r for r in summary["results"] if r["outcome"] in ("FAIL", "ERROR")]
     say(f"{len(summary['results'])} rows: " + ", ".join(f"{o} {sum(1 for r in summary['results'] if r['outcome'] == o)}" for o in ("PASS", "REFUSED-EXPECTED", "UNSUPPORTED", "SKIP", "FAIL", "ERROR")))
+    # A cell whose every row skipped exercised nothing; it must not read as green.
+    if summary["results"] and all(r["outcome"] == "SKIP" for r in summary["results"]):
+        say("every row SKIPPED: this cell exercised nothing")
+        sys.exit(1)
     if bad or errors:
         sys.exit(1)
 
