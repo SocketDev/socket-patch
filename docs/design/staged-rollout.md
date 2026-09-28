@@ -327,8 +327,8 @@ older pinned CLI fails on a newer key by design, and the error says so.
    Nested files are never read (one file per repo, as in the GitHub App).
    A symlinked socket.yml is followed only if it resolves to a regular
    file inside the repo root.
-3. In memory, the repo root is the tree root; the file must arrive with
-   content (7.2). A socket.yml the tree lists but the engine never
+3. In memory, the repo root is the tree root; the caller supplies the
+   file's content to path selection and to the session (7.2). A socket.yml the tree lists but the engine never
    receives, or receives only as present-without-content (symlink,
    oversize, LFS pointer, binary), is `socket_yml_invalid`, never absent.
 4. `--global` / `--global-prefix` scans have no repo and ignore the file.
@@ -675,7 +675,7 @@ One-off overrides from the command line: `socket-patch scan
 
 | Owner | Change |
 |---|---|
-| A | `selectHostedScanPaths` also returns root `socket.yml` / `socket.yaml` when listed, and returns the list of policy paths it selected; it applies only the **built-in** default ignores (it cannot see file contents); the session fails `socket_yml_invalid` if a selected policy path never arrives with content or arrives present-without-content |
+| A | Two-phase selection so the memory engine applies the same path policy as disk. `selectHostedScanPaths` gains an option `policyFiles?: Array<{path: string, text: string} \| {path: string, missing: true}>`, one entry per root `socket.yml` / `socket.yaml` the listing contains (the both-files rule of 4.4 applies): the caller fetches those root blobs first (they are root files, known from the tree listing) and passes the content. The selector parses it with the same loader and applies the **full** path policy (defaults, `projectIgnorePaths`, `patches` lists, negations) when choosing which files to fetch, so an `ignorePaths` negation re-includes a default-ignored tree in memory exactly as on disk. If the listing has a root policy file with no matching entry, or an entry is `missing: true`, or the text is invalid, the selector returns `policyError` (never "no policy"). The session re-parses the same text and fails `socket_yml_invalid` if the policy content that arrives differs (sha256) from what the selector saw |
 | A | the session applies the full policy to detected roots **before** the `max_projects` check (`hosted_memory/mod.rs:377`) |
 | A | options `noSocketYml?: boolean`, `minSeverity?: "critical"\|"high"\|"medium"\|"moderate"\|"low"\|"none"` |
 | A | result: session-level `policy` block (4.7) and `policyError?: {code, detail}`; on error no root is processed and no files change; `skipped[].reason` gains the `policy_*` codes |
@@ -690,11 +690,12 @@ too.
 ### 7.3 depscan follow-up (after A and B merge; separate PR in depscan)
 
 1. Bump the socket-patch submodule and rebuild the addon.
-2. Stream root socket.yml content from the **base** SHA for both job kinds
-   (for `repo` jobs that is the tree being scanned; for `pull_request`
-   jobs push the base-SHA blob under the policy path the engine selected).
-   Never let the file be dropped by the size/path caps silently: the
-   engine turns a missing policy blob into `policyError`.
+2. Fetch the root socket.yml / socket.yaml blob from the **base** SHA
+   for both job kinds **before** calling `selectHostedScanPaths`, and
+   pass them as `policyFiles` (7.2); stream the same content to the session.
+   Never let the file be dropped by the size/path caps silently: a
+   missing or oversize policy blob is passed as `missing: true`, which the
+   engine turns into `policyError`.
 3. Pass `inFlightPatches` (base purls in the open patch-all PR); for
    `pull_request` jobs pass `maxNewPatches: "none"` and no cap.
 4. New job outcome `policy_invalid` (from `policyError`): leave the
@@ -884,8 +885,9 @@ Scope:
     (`discover_selected`, `scan/mod.rs:553`, and the human arm,
     `mod.rs:2386-2402`); retained set computed from the recorded view and
     excluded from writers.
-  - memory: built-in defaults in `selectHostedScanPaths`
-    (`hosted_memory/select.rs`); full root filter in the session before
+  - memory: full path policy in `selectHostedScanPaths`
+    (`hosted_memory/select.rs`), from the caller-supplied `policyFiles`
+    text (7.2, two-phase); the same root filter in the session before
     `max_projects` (`hosted_memory/mod.rs:377`); `admits_purl` at
     `hosted_memory/mod.rs:428-432`; severity filter before
     `select_top_ranked`.
@@ -924,7 +926,9 @@ Tests:
 - Parity: `tests/hosted_memory_parity.rs` gains a socket.yml fixture
   (single-lockfile roots) where disk and memory filter the same roots and
   packages; a memory test where the tree lists socket.yml but its content
-  is withheld → `policyError`.
+  is withheld → `policyError`; a memory test where
+  `ignorePaths: ["!/e2e/tests/"]` re-includes a default-ignored root, so
+  its lockfile is selected, fetched and patched as on disk.
 - This repo's own `socket.yml` keeps working (its `projectIgnorePaths`
   now also excludes the fixtures from patching).
 

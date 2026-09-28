@@ -1484,8 +1484,9 @@ async fn scan_hosted_paths_run_once_per_project_directory() {
 
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["apps/*"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    for app in ["apps/a", "apps/b"] {
-        let header = format!("== {} ==", std::path::Path::new(app).display());
+    // glob rebuilds matches with the native separator (`apps\a` on Windows).
+    for app in ["a", "b"] {
+        let header = format!("== {} ==", Path::new("apps").join(app).display());
         assert!(stdout.contains(&header), "missing {header:?}: {stdout}");
     }
     assert_eq!(stdout.matches("Redirected 0 packages").count(), 2, "{stdout}");
