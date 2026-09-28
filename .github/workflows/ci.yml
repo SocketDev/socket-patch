@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # The v5 integration branch too: PRs into it skip the full tier, and
+    # `schedule` only fires on main, so each landing runs the full tier.
+    branches: [main, release/v5-prerelease]
   pull_request:
   schedule:
     # Nightly on main: the `full` tier (e2e-full, cargo-vex-matrix-full,
@@ -747,7 +749,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p socket-patch-cli --all-features --tests --no-run --message-format=json > target-build.json
+          cargo test --locked -p socket-patch-cli --all-features --tests --no-run --message-format=json-render-diagnostics > target-build.json
 
       - name: Bundle the binaries the legs run
         shell: bash
@@ -1507,7 +1509,7 @@ jobs:
   # managers and run socket-patch against a wiremock-served fixture —
   # no real Socket API contact. Hermetic, reproducible.
   #
-  # Nightly and on dispatch only: coverage-docker runs every one of these
+  # Nightly, on dispatch and on v5 pushes only: coverage-docker runs these
   # suites on each push (with an instrumented binary mounted in); this job
   # is the one run of them against the base image's full-LTO release
   # binary. The `e2e` job above runs the `#[ignore]`-gated real-toolchain
@@ -1515,7 +1517,8 @@ jobs:
   # its matrix).
   # ----------------------------------------------------------------------
   e2e-docker:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # The v5 branch has no nightly of its own, so its pushes run it too.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/release/v5-prerelease'
     needs: docker-base
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -1679,8 +1682,9 @@ jobs:
   # Every toolchain and every lock re-encoding at least once on PRs (the
   # toolchain's own lock is re-encoded as v1-v4 before socket-patch touches
   # it, the committed-lockfile case; '' keeps the toolchain's own format),
-  # plus macOS and Windows; 1.93.1 with its own lock is the pinned
-  # rust-toolchain.toml cell. cargo-vex-matrix-full runs the rest of the
+  # plus macOS and Windows; 1.93.1 with its own lock (on every OS) is the
+  # pinned rust-toolchain.toml cell `cargo test` used to give
+  # e2e_safety_cargo_build. cargo-vex-matrix-full runs the rest of the
   # toolchain x lock cross off pull_request. Each leg also runs
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
@@ -1704,6 +1708,8 @@ jobs:
           - {os: ubuntu-latest, toolchain: '1.93.1', lock: '4'}
           - {os: macos-latest, toolchain: stable, lock: '1'}
           - {os: windows-latest, toolchain: stable, lock: '1'}
+          - {os: macos-latest, toolchain: '1.93.1', lock: ''}
+          - {os: windows-latest, toolchain: '1.93.1', lock: ''}
     steps: &cargo-vex-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

@@ -55,6 +55,8 @@ on:
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
       - 'scripts/ci-vlt-proof-suites.py'
+      - '.github/workflows/ci.yml'
+      - 'scripts/tests/test_ci_vlt_rows.py'
   push:
     branches: [main]
     paths:
@@ -93,6 +95,8 @@ on:
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
       - 'scripts/ci-vlt-proof-suites.py'
+      - '.github/workflows/ci.yml'
+      - 'scripts/tests/test_ci_vlt_rows.py'
   schedule:
     # Nightly: vlt releases and the production service drift with no PR open.
     - cron: '17 4 * * *'

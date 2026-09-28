@@ -68,7 +68,7 @@ class Tiers(unittest.TestCase):
 
     def test_nightly_schedule_runs_the_full_tier(self):
         self.assertRegex(TEXT, r"(?m)^  schedule:\n(?:    #.*\n)*    - cron: '[^']+'$")
-        self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+        self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||",
                       job_text("e2e-docker"))
 
     def test_cargo_cross_is_split_exactly(self):
@@ -76,9 +76,12 @@ class Tiers(unittest.TestCase):
         full = [(r["os"], r["toolchain"], r.get("lock", "")) for r in rows("cargo-vex-matrix-full")]
         want = {("ubuntu-latest", t, l) for t, l in itertools.product(("1.82.0", "1.93.1", "stable"),
                                                                     ("", "1", "2", "3", "4"))}
-        want |= {("macos-latest", "stable", "1"), ("windows-latest", "stable", "1")}
+        want |= {("macos-latest", "stable", "1"), ("windows-latest", "stable", "1"),
+                 ("macos-latest", "1.93.1", ""), ("windows-latest", "1.93.1", "")}
         self.assertEqual(len(pr + full), len(want))
         self.assertEqual(set(pr) | set(full), want)
+        for os_name in ("ubuntu-latest", "macos-latest", "windows-latest"):
+            self.assertIn((os_name, "1.93.1", ""), pr, "the pinned toolchain's own lock on every OS")
         ubuntu = [c for c in pr if c[0] == "ubuntu-latest"]
         self.assertEqual({c[1] for c in ubuntu}, {"1.82.0", "1.93.1", "stable"}, "every toolchain on PRs")
         self.assertEqual({c[2] for c in ubuntu}, {"", "1", "2", "3", "4"}, "every lock on PRs")
@@ -146,6 +149,15 @@ class VltProofDedupe(unittest.TestCase):
                     upgrade = proof.proof_upgrade(row["vlt"], "") if suite == proof.UPGRADE_SUITE else None
                     self.assertTrue(any(c[:4] == (suite, row["os"], row["vlt"], row.get("linker", ""))
                                         and (upgrade is None or c[4] == upgrade) for c in cells))
+
+    def test_ci_vlt_rows_match_the_proof_invocation(self):
+        for row in rows("e2e"):
+            if row.get("vlt"):
+                self.assertEqual(row["test_filter"], "--include-ignored vlt_pinned_matrix", row)
+        ci_node = rows_mod.step(JOBS["e2e"], "Setup Node.js 24 (vlt legs)")
+        proof_text = "\n".join(rows_mod.jobs(COMPAT.read_text(encoding="utf-8"))["install-proof"])
+        node = re.search(r"node-version: '([^']+)'", ci_node).group(1)
+        self.assertIn(f"node-version: ${{{{ matrix.node || '{node}' }}}}", proof_text)
 
     def test_upgrade_rule_matches_the_install_step(self):
         text = "\n".join(rows_mod.jobs(COMPAT.read_text(encoding="utf-8"))["install-proof"])

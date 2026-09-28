@@ -26,6 +26,8 @@ on:
       - 'crates/socket-patch-cli/tests/e2e_vex_build/main.rs'
       - 'crates/socket-patch-cli/tests/e2e_vex_build/pdm.rs'
       - 'crates/socket-patch-cli/tests/vex_pypi_real_common/**'
+      # The capstone skips the cells ci.yml's e2e rows run.
+      - '.github/workflows/ci.yml'
   push:
     branches: [main]
     paths:
@@ -75,7 +77,7 @@ jobs:
       - name: Compile the CLI and the capstone once
         run: |
           set -euo pipefail
-          cargo test --locked -p socket-patch-cli --test e2e_vex_build --no-run --message-format=json > target-build.json
+          cargo test --locked -p socket-patch-cli --test e2e_vex_build --no-run --message-format=json-render-diagnostics > target-build.json
           python3 - <<'PY'
           import json, pathlib, shutil
           dest = pathlib.Path('target/pdm-e2e')

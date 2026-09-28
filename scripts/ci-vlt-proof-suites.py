@@ -41,7 +41,7 @@ def ci_cells(text=None):
     reader = load_reader()
     rows = reader.matrix_include(reader.jobs(text if text is not None else CI.read_text(encoding="utf-8"))["e2e"])
     return {(r["suite"], r["os"], r["vlt"], r.get("vlt_store_linker", ""), r.get("vlt_upgrade", ""))
-            for r in rows if r.get("vlt")}
+            for r in rows if r.get("vlt") and r.get("test_filter") == "--include-ignored vlt_pinned_matrix"}
 
 
 def remaining(suites, os_name, vlt, node="", linker="", cache_root="", text=None):
