@@ -99,7 +99,8 @@ into the new version's section — see docs/releasing.md.
   probing and staging the directory, and `apply`'s JSON `appliedVia` loses
   its `"package"` value (`"diff"` or `"blob"` remain). The GC sweeps
   (`scan --prune`, `rollback`, `remove`, `repair`) delete any leftover
-  `.socket/packages/` files whole, still counted as `removedPackageArchives`.
+  `.socket/packages/` files whole (`rollback` and `scan --prune` still
+  report them as `removedPackageArchives`).
 - **Core crate:** removed uncalled public helpers
   (`bun_lock::snapshot_binary_workspace_artifacts`, `vlt_lock_sniff_ok`,
   and several `lock_inventory::view` accessors) and the never-read

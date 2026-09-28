@@ -353,15 +353,17 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
 }
 
 /// The loud orphan-archive removal print — each directory's summary names
-/// its own artifact kind (`format_cleanup_result_for` takes the noun). One orphan in `diffs/` and one in `packages/`, each next
-/// to the referenced `<uuid>.tar.gz` that must survive.
+/// its own artifact kind (`format_cleanup_result_for` takes the noun). One orphan in `diffs/` next to the
+/// referenced `<uuid>.tar.gz` that must survive, and two legacy archives in
+/// `packages/` (one under the referenced uuid) that both go: v5.0 reads no
+/// package archives, so the sweep keeps none.
 #[test]
 fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"kept");
-    // Referenced archives keep the default diff mode's missing-check happy
-    // AND must survive the sweep.
+    // The referenced diff archive keeps the default diff mode's
+    // missing-check happy AND must survive the sweep.
     write_archive(&socket, "diffs", REFERENCED_UUID, b"kept-diff");
     write_archive(&socket, "packages", REFERENCED_UUID, b"kept-package");
     const ORPHAN_DIFF: &str = "99999999-9999-4999-8999-999999999999";
@@ -387,7 +389,7 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
         "the diffs sweep must print its own summary; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Removed 1 unused package archive (16 B freed)"),
+        stdout.contains("Removed 2 unused package archives (28 B freed)"),
         "the packages sweep must print its own summary; stdout=\n{stdout}"
     );
     assert!(
@@ -400,7 +402,8 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
         stdout.contains("All diff archives are present locally."),
         "diff mode with the referenced archive present is all-present; stdout=\n{stdout}"
     );
-    // Disk effects: orphans gone, referenced archives intact.
+    // Disk effects: orphans and legacy archives gone, the referenced diff
+    // archive intact.
     assert!(
         !socket
             .join("diffs")
@@ -419,7 +422,7 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
         .join("diffs")
         .join(format!("{REFERENCED_UUID}.tar.gz"))
         .exists());
-    assert!(socket
+    assert!(!socket
         .join("packages")
         .join(format!("{REFERENCED_UUID}.tar.gz"))
         .exists());

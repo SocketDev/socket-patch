@@ -404,3 +404,12 @@ fn unknown_flag_fails() {
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
+
+#[test]
+fn removed_one_off_flag_is_unknown() {
+    let err = match Cli::try_parse_from(["socket-patch", "rollback", "--one-off"]) {
+        Ok(_) => panic!("expected parse error for the v5-removed --one-off"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+}

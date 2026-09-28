@@ -575,7 +575,7 @@ async fn scan_vendored_refusal_preserves_seeded_manifest_record() {
 /// deferring the refusal to the vendor engine (which degrades to
 /// `package_not_installed` for alias installs) — and writes no manifest.
 #[tokio::test]
-async fn scan_vendored_detached_refuses_v1_workspace_before_fetch() {
+async fn scan_vendored_refuses_v1_workspace_before_fetch() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -602,10 +602,10 @@ async fn scan_vendored_detached_refuses_v1_workspace_before_fetch() {
     assert_refusal_left_tree_alone(tmp.path(), &lock_before);
 }
 
-/// The lockb twin of the detached refusal: the shape that used to
+/// The lockb twin of the pre-fetch refusal: the shape that used to
 /// misreport `package_not_installed` after a needless fetch.
 #[tokio::test]
-async fn scan_vendored_detached_refuses_bun_lockb_before_fetch() {
+async fn scan_vendored_refuses_bun_lockb_before_fetch() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();

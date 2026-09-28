@@ -517,7 +517,7 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
 }
 
 #[tokio::test]
-async fn scan_vendor_detached_mode_writes_no_manifest() {
+async fn scan_vendor_writes_no_manifest() {
     // scan --vendor: the manifest-free flow, embedded-record ledger and all.
     let mock = MockServer::start().await;
     mount_patch_api(&mock, UUID).await;
@@ -666,7 +666,7 @@ async fn scan_vendor_dry_run_previews_without_touching_disk() {
 /// non-zero with no error output at all (the JSON report is discarded and
 /// the vendor engine just says "No vendorable patches in scope").
 #[tokio::test]
-async fn scan_vendor_detached_fetch_failure_reports_error() {
+async fn scan_vendor_fetch_failure_reports_error() {
     let mock = MockServer::start().await;
     // Discovery succeeds (batch + per-package search, same shapes as
     // `mount_patch_api`), but the view fetch fails.
