@@ -5305,7 +5305,7 @@ fn nuget_after_last_clear(config: &str, from: usize, section: &str) -> usize {
     static COMMENT_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("static comment regex is valid"));
     // Blank comment bytes in place so offsets still index `config`.
-    let mut masked = config[from..].as_bytes().to_vec();
+    let mut masked = config.as_bytes()[from..].to_vec();
     for m in COMMENT_RE.find_iter(&config[from..]) {
         masked[m.range()].fill(b' ');
     }
