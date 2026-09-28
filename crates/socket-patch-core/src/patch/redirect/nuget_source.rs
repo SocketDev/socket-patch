@@ -40,6 +40,49 @@ pub(super) fn after_last_clear(body: &str) -> &str {
         .map_or(body, |m| &body[m.end()..])
 }
 
+/// The `<add>` line for a package source. A plain-http source on a loopback
+/// host (a local patch-server stand-in) opts into `allowInsecureConnections`:
+/// NuGet 6.12+ (.NET SDK 9+) refuses every http source without it (NU1302).
+/// Any other URL is written exactly as before.
+pub(super) fn source_add_line(key: &str, url: &str) -> String {
+    let opt_in = if is_http_loopback(url) {
+        " allowInsecureConnections=\"true\""
+    } else {
+        ""
+    };
+    format!("    <add key=\"{key}\" value=\"{url}\"{opt_in} />")
+}
+
+/// Whether `url` is `http://` to `localhost`, an IPv4 loopback address or
+/// `[::1]`.
+fn is_http_loopback(url: &str) -> bool {
+    let Some(scheme_end) = url.find("://") else {
+        return false;
+    };
+    if !url[..scheme_end].eq_ignore_ascii_case("http") {
+        return false;
+    }
+    let rest = &url[scheme_end + 3..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((host, _)) => {
+                return host
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_ok_and(|ip| ip.is_loopback());
+            }
+            None => return false,
+        }
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -104,6 +147,47 @@ mod tests {
             .rfind("<add key=\"socket-patch-")
             .expect("socket source");
         assert!(socket > clear, "{out}");
+    }
+
+    #[test]
+    fn http_loopback_detection() {
+        for url in [
+            "http://127.0.0.1:4010/patch-registry/nuget/t/u/index.json",
+            "HTTP://LOCALHOST/index.json",
+            "http://localhost:80",
+            "http://[::1]:8080/index.json",
+            "http://user:pw@127.1.2.3/index.json",
+        ] {
+            assert!(is_http_loopback(url), "{url}");
+        }
+        for url in [
+            "https://127.0.0.1/index.json",
+            "https://patch.socket.dev/patch-registry/nuget/t/u/index.json",
+            "http://patch.socket.dev/index.json",
+            "http://localhost.example.com/index.json",
+            "http://127.0.0.1.example.com/index.json",
+            "http://10.0.0.1/index.json",
+            "http://[::2]/index.json",
+            "http://[::1/index.json",
+            "http://127.0.0.1@evil.example/index.json",
+            "localhost/index.json",
+            "",
+        ] {
+            assert!(!is_http_loopback(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn only_http_loopback_sources_opt_into_insecure_connections() {
+        assert_eq!(
+            source_add_line("k", "https://patch.socket.dev/i.json"),
+            "    <add key=\"k\" value=\"https://patch.socket.dev/i.json\" />"
+        );
+        assert_eq!(
+            source_add_line("k", "http://127.0.0.1:9/i.json"),
+            "    <add key=\"k\" value=\"http://127.0.0.1:9/i.json\" \
+             allowInsecureConnections=\"true\" />"
+        );
     }
 
     #[test]

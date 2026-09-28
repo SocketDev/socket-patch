@@ -575,21 +575,6 @@ impl Backend {
     }
 }
 
-/// .NET 9+ (NuGet 6.12+) refuses plain-http sources (NU1302) unless the
-/// source opts in; the stand-in is `http://127.0.0.1`, production is https.
-/// The opt-in is a hand edit on the Socket `<add>` the rewriter wrote —
-/// discovery must still recognize it.
-fn allow_http_source(config_path: &Path, uuid: &str) {
-    let text = std::fs::read_to_string(config_path).unwrap();
-    let key = format!("<add key=\"socket-patch-{uuid}\" ");
-    assert!(text.contains(&key), "no Socket source to opt in: {text}");
-    std::fs::write(
-        config_path,
-        text.replace(&key, &format!("{key}allowInsecureConnections=\"true\" ")),
-    )
-    .unwrap();
-}
-
 // ── the shared manifest-less VEX matrix ───────────────────────────────
 
 /// Steps 1–4 on a fresh, really-restored checkout. `ledger` is the one the
@@ -779,6 +764,15 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
             && config.contains(&format!("pattern=\"{ID}\"")),
         "the rewriter wired the Socket source + mapping: {config}"
     );
+    // .NET 9+ (NuGet 6.12+) refuses plain-http sources (NU1302) unless they
+    // opt in; the stand-in is `http://127.0.0.1`, so the rewriter must.
+    assert!(
+        config.contains(&format!(
+            "value=\"{uri}/patch-registry/nuget/{HOSTED_TOKEN}/{HOSTED_UUID}/index.json\" \
+             allowInsecureConnections=\"true\" />"
+        )),
+        "the loopback http source opts into insecure connections: {config}"
+    );
     let lock = std::fs::read_to_string(fixture.join("packages.lock.json")).unwrap();
     assert!(
         lock.contains(&content_hash(&nupkg)),
@@ -790,9 +784,6 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
     // patched nupkg from the hosted feed and extracts the patched bytes.
     let checkout = sb.dir("checkout");
     fresh_checkout(&fixture, &checkout);
-    if dn.major >= 9 {
-        allow_http_source(&checkout.join("nuget.config"), HOSTED_UUID);
-    }
     let store_co = sb.dir("store-checkout");
     dn.restore_ok(
         &sb,

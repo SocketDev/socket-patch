@@ -5191,7 +5191,7 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
 /// element. `None` when no anchor exists at all — the caller must treat the
 /// insert as failed rather than proceed on unchanged text.
 fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
-    let source_line = format!("    <add key=\"{key}\" value=\"{url}\" />");
+    let source_line = nuget_source::source_add_line(key, url);
     // A self-closing element carries no children, so expand it to an open/close
     // pair holding the new source. Matched before the open-tag check because
     // the tolerant open-tag regex below also matches the whitespace-carrying

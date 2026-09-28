@@ -914,6 +914,12 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Hosted NuGet redirects to a local http patch server restore on .NET
+  9+.** NuGet 6.12+ refuses plain-http sources (NU1302), so a
+  `--patch-server-url http://localhost:…` redirect needed a hand edit. A
+  Socket source on `http://` to `localhost`, `127.0.0.0/8` or `[::1]` now
+  carries `allowInsecureConnections="true"`; https sources are unchanged.
+
 - **Hosted NuGet redirects survive a `<clear/>` in `nuget.config`.** The
   Socket source and its `packageSourceMapping` entry used to land above a
   user's `<clear/>`, which NuGet discards, so `dotnet restore` failed
