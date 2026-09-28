@@ -141,11 +141,50 @@ impl HostedInventory {
             })
             .map(|d| norm(&d.file))
             .collect();
+        // The grant tokens of the attributable pins' own hosted URLs. The
+        // sweep recognizes every uuid-shaped segment of a hosted URL, so a
+        // file that repeats an attributed pin's URL names its token too:
+        // the paired `pyproject.toml` `[tool.uv.sources]` entry of a
+        // `uv.lock` pin (no pin file itself), or a `vlt-lock.json` whose pins
+        // are refs but withheld from the lock basis (a flagged pin file).
+        // Without a ledger that token is NOT unattributed hosted wiring: it
+        // is excused in a file that also names the pin's own patch uuid.
+        let pin_tokens: BTreeMap<String, BTreeSet<&str>> = {
+            let mut tokens: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+            for r in &discovery.refs {
+                if r.mode != WiringMode::Hosted {
+                    continue;
+                }
+                let Some(url) = r.url.as_deref() else {
+                    continue;
+                };
+                for token in url_uuid_segments(url) {
+                    if token != r.uuid {
+                        tokens.entry(token).or_default().insert(r.uuid.as_str());
+                    }
+                }
+            }
+            tokens
+        };
+        let hosted_in_file: BTreeSet<(String, &str)> = discovery
+            .recognized
+            .iter()
+            .filter(|r| r.mode == WiringMode::Hosted)
+            .map(|r| (norm(&r.file), r.uuid.as_str()))
+            .collect();
+        let is_pin_token = |uuid: &str, file: &str| {
+            pin_tokens.get(uuid).is_some_and(|patches| {
+                patches
+                    .iter()
+                    .any(|patch| hosted_in_file.contains(&(file.to_string(), *patch)))
+            })
+        };
         let mut contested: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for r in &discovery.recognized {
             let file = norm(&r.file);
             if r.mode == WiringMode::Hosted
                 && !pinned.contains(r.uuid.as_str())
+                && !is_pin_token(&r.uuid, &file)
                 && (!pinned_files.contains(file.as_str()) || flagged_files.contains(&file))
             {
                 contested
@@ -225,6 +264,26 @@ impl HostedInventory {
         ));
         Some(msg)
     }
+}
+
+/// The canonical-uuid path segments of a hosted URL discovery already
+/// accepted (`\/` unescaped; a wholly percent-encoded URL decoded first;
+/// each segment percent-decoded after splitting).
+fn url_uuid_segments(url: &str) -> Vec<String> {
+    use crate::patch::path_safety::is_canonical_uuid;
+    use crate::utils::purl::percent_decode_purl_component;
+    let unescaped = url.trim().replace("\\/", "/");
+    let lower = unescaped.to_ascii_lowercase();
+    let decoded = if lower.starts_with("https%3a%2f%2f") || lower.starts_with("http%3a%2f%2f") {
+        percent_decode_purl_component(&unescaped).into_owned()
+    } else {
+        unescaped
+    };
+    let path = decoded.split(['?', '#']).next().unwrap_or_default();
+    path.split('/')
+        .map(|s| percent_decode_purl_component(s).into_owned())
+        .filter(|s| is_canonical_uuid(s))
+        .collect()
 }
 
 /// Knobs for [`restore_upstream`].
