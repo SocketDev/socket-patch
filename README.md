@@ -900,7 +900,6 @@ socket-patch get <identifier> [options]
 | `--ghsa` | — | Force identifier to be treated as a GHSA ID. |
 | `-p, --package` | — | Force identifier to be treated as a package name. |
 | `--save-only` | `SOCKET_SAVE_ONLY` | Download the patch without applying it (alias: `--no-apply`). |
-| `--one-off` | `SOCKET_ONE_OFF` | Reserved (hidden from `--help`): apply the patch immediately without saving to the `.socket` folder. **Not yet implemented** — the command currently errors up front. |
 | `--all-releases` | `SOCKET_ALL_RELEASES` | Download patches for every release/distribution variant of a matched package (PyPI wheel/sdist, RubyGems platform, Maven classifier), not just the installed one. |
 | `--mode <hosted\|vendored\|agent>` | — | How to consume the patch; the same modes as `scan --mode` (default: `agent`). |
 
@@ -1019,7 +1018,6 @@ socket-patch rollback [targets]... [options]
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--preserve-state` | `SOCKET_PRESERVE_STATE` | Unpatch the system but keep the local patch state — manifest entries, vendored artifacts + ledger entries — for a later re-apply, and skip GC. Hosted patches have no preservable state (the lockfile is their only record) and are restored to upstream either way. |
-| `--one-off` | `SOCKET_ONE_OFF` | Reserved: rollback by fetching original (`beforeHash`) files from the API, no manifest required. **Not yet implemented** — the command currently errors up front. |
 
 **Examples:**
 ```bash

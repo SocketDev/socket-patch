@@ -20,10 +20,9 @@ const BLOB_BYTES: &[u8] = b"patched\n";
 
 /// Run `get` via `common::run_with_env`, which scrubs the ambient
 /// `SOCKET_*` environment before spawning. The binary binds a wide env
-/// surface (`SOCKET_ONE_OFF`, `SOCKET_MANIFEST_PATH`, `SOCKET_CWD`,
-/// `SOCKET_OFFLINE`, ...); an ambient value silently changes what these
-/// tests exercise — `SOCKET_ONE_OFF=true` alone fails every invocation
-/// here ("--one-off and --save-only cannot be used together"), and
+/// surface (`SOCKET_MANIFEST_PATH`, `SOCKET_CWD`, `SOCKET_OFFLINE`, ...);
+/// an ambient value silently changes what these tests exercise —
+/// `SOCKET_OFFLINE=1` alone fails every invocation here, and
 /// `SOCKET_MANIFEST_PATH` aims the manifest write OUTSIDE the tempdir.
 fn run_get(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec![

@@ -313,7 +313,6 @@ async fn roll_back(cwd: &Path, server: &MockServer) {
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: global(cwd, server.uri()),
-        one_off: false,
         preserve_state: false,
     })
     .await;

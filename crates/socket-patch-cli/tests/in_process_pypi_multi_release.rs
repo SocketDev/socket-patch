@@ -576,7 +576,6 @@ async fn rollback_all_over_broad_manifest_succeeds() {
             ecosystems: Some(vec!["pypi".to_string()]),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
     };
     let code = rollback_run(rollback_args).await;
     assert_eq!(code, 0, "rollback-all over broad manifest should exit 0");

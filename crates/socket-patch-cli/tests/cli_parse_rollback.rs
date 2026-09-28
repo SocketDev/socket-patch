@@ -25,7 +25,7 @@ fn parse_rollback(extra: &[&str]) -> RollbackArgs {
 /// Every boolean toggle on `rollback`, as `(contract name, current value)`.
 /// Used to prove that a single flag flips *only* its own field — without this,
 /// each positive test ignores all other fields, so a parser bug that
-/// cross-wired e.g. `--one-off` into `--global`, `--silent` into `--yes`
+/// cross-wired e.g. `--preserve-state` into `--global`, `--silent` into `--yes`
 /// (auto-approving prompts), or any flag into another would still stay green.
 /// Keep this in sync with the boolean flags in the contract.
 fn bool_flags(a: &RollbackArgs) -> Vec<(&'static str, bool)> {
@@ -39,7 +39,6 @@ fn bool_flags(a: &RollbackArgs) -> Vec<(&'static str, bool)> {
         ("yes", a.common.yes),
         ("debug", a.common.debug),
         ("no_telemetry", a.common.no_telemetry),
-        ("one_off", a.one_off),
         ("preserve_state", a.preserve_state),
     ]
 }
@@ -71,7 +70,6 @@ fn defaults_no_positional() {
     assert!(!args.common.offline);
     assert!(!args.common.global);
     assert_eq!(args.common.global_prefix, None);
-    assert!(!args.one_off);
     assert_eq!(args.common.org, None);
     assert_eq!(args.common.api_url, None); // default applied in core resolver
     assert_eq!(args.common.api_token, None);
@@ -183,15 +181,6 @@ fn json_long() {
 fn global_prefix_long() {
     let args = parse_rollback(&["--global-prefix", "/foo"]);
     assert_eq!(args.common.global_prefix, Some(PathBuf::from("/foo")));
-}
-
-#[test]
-fn one_off_long() {
-    let args = parse_rollback(&["--one-off"]);
-    assert!(args.one_off);
-    // `--one-off` is rollback-specific (fetch beforeHash blobs from API). It
-    // must NOT silently imply `--offline`, `--global`, or any other toggle.
-    assert_only_true(&args, &["one_off"]);
 }
 
 #[test]
@@ -317,7 +306,6 @@ fn all_bools_settable_together() {
         "--yes",
         "--debug",
         "--no-telemetry",
-        "--one-off",
         "--preserve-state",
     ]);
     assert_only_true(
@@ -332,7 +320,6 @@ fn all_bools_settable_together() {
             "yes",
             "debug",
             "no_telemetry",
-            "one_off",
             "preserve_state",
         ],
     );
@@ -360,16 +347,17 @@ fn all_short_flags_map_to_distinct_fields() {
 }
 
 /// Bare boolean flags are `SetTrue` (num_args = 0): they must NOT swallow the
-/// following token as a value. If `--one-off` silently became value-taking, a
-/// wrapper invoking `rollback --one-off <purl>` would change meaning (the purl
+/// following token as a value. If `--preserve-state` silently became
+/// value-taking, a wrapper invoking `rollback --preserve-state <purl>` would
+/// change meaning (the purl
 /// would be consumed as the flag's value, not the `targets` positional).
 #[test]
 fn bare_bool_does_not_consume_next_token() {
-    let args = parse_rollback(&["--one-off", "pkg:npm/foo@1"]);
-    assert!(args.one_off);
-    // The trailing token landed in `targets`, not as a value for `--one-off`.
+    let args = parse_rollback(&["--preserve-state", "pkg:npm/foo@1"]);
+    assert!(args.preserve_state);
+    // The trailing token landed in `targets`, not as a value for the flag.
     assert_eq!(args.targets, vec!["pkg:npm/foo@1".to_string()]);
-    assert_only_true(&args, &["one_off"]);
+    assert_only_true(&args, &["preserve_state"]);
 }
 
 /// Variadic targets (v4 duality rework): multiple positionals parse in

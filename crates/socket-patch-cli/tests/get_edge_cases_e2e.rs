@@ -1,5 +1,5 @@
 //! Additional e2e tests for `get` edge cases — exercises the
-//! validation branches (--one-off + --save-only conflict, --id flag,
+//! validation branches (--id flag,
 //! multi-patch selection via --id, auto-select for single free patch
 //! match) and a few error paths the main get_invariants suite doesn't
 //! reach.
@@ -9,9 +9,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Every invocation must go through `common::run`/`run_with_env`: the binary
 // binds a wide `SOCKET_*` env surface, and a raw `Command::new(binary())`
-// inherits the developer's shell — an exported `SOCKET_ONE_OFF=true` aborts
-// every `get` here, `SOCKET_PROXY_URL` outranks the proxy these tests pin,
-// and `SOCKET_MANIFEST_PATH` makes a *passing* test write its manifest and
+// inherits the developer's shell — `SOCKET_PROXY_URL` outranks the proxy
+// these tests pin, and `SOCKET_MANIFEST_PATH` makes a *passing* test write its manifest and
 // blobs into whatever real project the variable points at.
 #[path = "common/mod.rs"]
 mod common;
@@ -54,37 +53,6 @@ fn single_file_view() -> serde_json::Value {
             "blobContent": "cGF0Y2hlZAo=",
         }
     })
-}
-
-#[test]
-fn get_one_off_and_save_only_together_errors() {
-    // The two flags are mutually exclusive — using both must fail.
-    let tmp = tempfile::tempdir().unwrap();
-    let (code, stdout, _stderr) = common::run(
-        tmp.path(),
-        &[
-            "get",
-            UUID_A,
-            "--one-off",
-            "--save-only",
-            "--yes",
-            "--json",
-            "--api-url",
-            "http://127.0.0.1:1",
-            "--api-token",
-            "fake",
-            "--org",
-            ORG_SLUG,
-        ],
-    );
-    assert_eq!(code, 2, "a usage error (v5.0)");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "error");
-    let err = v["error"].as_str().expect("error message");
-    assert!(
-        err.contains("one-off") && err.contains("save-only"),
-        "error must mention both flags: {err}"
-    );
 }
 
 #[tokio::test]
@@ -501,9 +469,6 @@ fn get_help_lists_all_identifier_flags() {
             "get --help missing flag {flag}; got: {stdout}"
         );
     }
-    // `--one-off` always fails with "not yet implemented": it stays
-    // parseable (scripts get that explicit error) but is not advertised.
-    assert!(!stdout.contains("--one-off"), "{stdout}");
     // Help text is for users: no implementation notes from the source.
     for leak in ["value_parser", "parse_bool_flag", "No env binding", "locally- installed"] {
         assert!(!stdout.contains(leak), "get --help leaks {leak:?}: {stdout}");

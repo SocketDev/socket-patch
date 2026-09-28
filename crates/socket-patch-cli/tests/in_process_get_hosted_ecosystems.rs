@@ -66,7 +66,6 @@ fn get_hosted_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
         ghsa: false,
         package: false,
         save_only: false,
-        one_off: false,
         all_releases: false,
         mode: Some(ScanMode::Hosted),
     }

@@ -67,7 +67,6 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state: false,
     })
     .await;

@@ -612,7 +612,6 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_FORCE",
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
-    "SOCKET_ONE_OFF",
     "SOCKET_ALL_RELEASES",
     "SOCKET_SKIP_ROLLBACK",
     "SOCKET_PRESERVE_STATE",
@@ -1568,12 +1567,10 @@ mod tests {
             ("SOCKET_FORCE", &["socket-patch", "vendor"]),
             ("SOCKET_FORCE", &["socket-patch", "self-update"]),
             ("SOCKET_SAVE_ONLY", &["socket-patch", "get", "x"]),
-            ("SOCKET_ONE_OFF", &["socket-patch", "get", "x"]),
-            ("SOCKET_ONE_OFF", &["socket-patch", "rollback"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "scan"]),
             ("SOCKET_SKIP_ROLLBACK", &["socket-patch", "remove", "x"]),
-            // Shared by rollback and remove, like SOCKET_ONE_OFF above.
+            // Shared by rollback and remove.
             ("SOCKET_PRESERVE_STATE", &["socket-patch", "rollback"]),
             ("SOCKET_PRESERVE_STATE", &["socket-patch", "remove", "x"]),
             ("SOCKET_DOWNLOAD_ONLY", &["socket-patch", "repair"]),

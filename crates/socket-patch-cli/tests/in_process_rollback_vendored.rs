@@ -211,7 +211,6 @@ fn rollback_args(cwd: &Path, preserve_state: bool) -> RollbackArgs {
             lock_timeout: Some(5),
             ..GlobalArgs::default()
         },
-        one_off: false,
         preserve_state,
     }
 }

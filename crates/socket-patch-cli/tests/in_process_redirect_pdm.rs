@@ -119,7 +119,6 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             patch_server_url: Some(PATCH_SERVER.to_string()),
             ..global(cwd, server.uri())
         },
-        one_off: false,
         preserve_state: false,
     })
     .await;
