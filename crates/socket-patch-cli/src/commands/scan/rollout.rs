@@ -12,6 +12,7 @@ use socket_patch_core::api::ranking::{
 use socket_patch_core::api::types::PatchSearchResult;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::schema::PatchManifest;
+pub(crate) use socket_patch_core::policy::Offers;
 use socket_patch_core::rollout::{
     canonical_base_purl, plan_rollout, severity_label, Candidate, MaxNew, MaxNewSource, Recorded,
     RolloutPlan,
@@ -30,43 +31,30 @@ pub(crate) const ROLLOUT_REFERENCE_FAILED: &str = "rollout_reference_failed";
 /// `skipped[].reason` of a deferred row.
 pub(crate) const ROLLOUT_DEFERRED: &str = "rollout_deferred";
 
-/// The step 5 → 7 seam: every offer per purl, and the winner per purl.
-///
-/// Work item A owns the shared `policy::Offers`; until it lands the
-/// severity floor does not exist, so `selected` is the top of `unfiltered`.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Offers {
-    /// purl → every accessible offer, best first.
-    pub(crate) unfiltered: BTreeMap<String, Vec<PatchSearchResult>>,
-    /// purl → the offer per-package ranking selects.
-    pub(crate) selected: BTreeMap<String, PatchSearchResult>,
-}
-
-impl Offers {
-    /// Group the by-package records per purl, dropping paid patches the
-    /// org cannot download, and take the top-ranked one per purl.
-    pub(crate) fn from_results(results: &[PatchSearchResult], can_access_paid: bool) -> Self {
-        let mut unfiltered: BTreeMap<String, Vec<PatchSearchResult>> = BTreeMap::new();
-        for p in results {
-            if can_access_paid || p.tier == "free" {
-                unfiltered
-                    .entry(p.purl.clone())
-                    .or_default()
-                    .push(p.clone());
-            }
+/// Group the by-package records per purl into the step 5 → 7 seam (work
+/// item A's [`Offers`]), dropping paid patches the org cannot download, and
+/// take the top-ranked offer per purl.
+pub(crate) fn offers_from_results(results: &[PatchSearchResult], can_access_paid: bool) -> Offers {
+    let mut unfiltered: BTreeMap<String, Vec<PatchSearchResult>> = BTreeMap::new();
+    for p in results {
+        if can_access_paid || p.tier == "free" {
+            unfiltered
+                .entry(p.purl.clone())
+                .or_default()
+                .push(p.clone());
         }
-        for group in unfiltered.values_mut() {
-            group.sort_by(cmp_search_results);
-            group.dedup_by(|a, b| a.uuid == b.uuid);
-        }
-        let selected = unfiltered
-            .iter()
-            .filter_map(|(purl, group)| group.first().map(|p| (purl.clone(), p.clone())))
-            .collect();
-        Offers {
-            unfiltered,
-            selected,
-        }
+    }
+    for group in unfiltered.values_mut() {
+        group.sort_by(cmp_search_results);
+        group.dedup_by(|a, b| a.uuid == b.uuid);
+    }
+    let selected = unfiltered
+        .iter()
+        .filter_map(|(purl, group)| group.first().map(|p| (purl.clone(), p.clone())))
+        .collect();
+    Offers {
+        unfiltered,
+        selected,
     }
 }
 
@@ -260,17 +248,6 @@ pub(super) fn merge_updates(
     out
 }
 
-/// Repo-relative `/`-separated path of `dir` under `root`; `""` for the
-/// root itself.
-pub(crate) fn project_rel(root: &Path, dir: &Path) -> String {
-    let rel = dir.strip_prefix(root).unwrap_or(dir);
-    rel.components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .filter(|s| s != ".")
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 /// One directory's budget and the outcome of its plan.
 #[derive(Debug, Clone)]
 pub(crate) struct Stage {
@@ -302,7 +279,7 @@ impl Stage {
                         source: c.configured.source,
                     },
                     c.admitted.clone(),
-                    project_rel(
+                    socket_patch_core::policy::repo_relative(
                         &c.root,
                         &std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
                     ),
@@ -636,10 +613,10 @@ mod tests {
             paid,
             offer("pkg:npm/a@1", "new", "2026-01-01T00:00:00Z", &["high"]),
         ];
-        let free = Offers::from_results(&results, false);
+        let free = offers_from_results(&results, false);
         assert_eq!(free.selected["pkg:npm/a@1"].uuid, "new");
         assert_eq!(free.unfiltered["pkg:npm/a@1"].len(), 2);
-        let all = Offers::from_results(&results, true);
+        let all = offers_from_results(&results, true);
         assert_eq!(all.selected["pkg:npm/a@1"].uuid, "p");
     }
 
@@ -659,7 +636,7 @@ mod tests {
             // UPGRADE: the recorded uuid is no longer offered
             offer("pkg:npm/gone@1", "g2", "2026-01-01T00:00:00Z", &["low"]),
         ];
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let recorded = manifest(&[
             ("pkg:npm/same@1", "s1"),
             ("pkg:npm/up@1", "u-old"),
@@ -714,7 +691,7 @@ mod tests {
             offer("pkg:npm/%40s/x@1", "e1", "", &["high"]),
             offer("pkg:pypi/w@1?artifact_id=b", "w2", "", &["high"]),
         ];
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let recorded = manifest(&[
             ("pkg:npm/@s/x@1", "e1"),
             ("pkg:pypi/w@1?artifact_id=a", "w1"),
@@ -734,7 +711,7 @@ mod tests {
     #[test]
     fn several_recorded_uuids_prefer_the_selected_one_else_the_smallest() {
         let results = vec![offer("pkg:pypi/w@1", "b", "", &["high"])];
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let recorded = manifest(&[
             ("pkg:pypi/w@1?artifact_id=1", "c"),
             ("pkg:pypi/w@1?artifact_id=2", "b"),
@@ -765,7 +742,7 @@ mod tests {
             offer("pkg:npm/a@1", "ua", "", &["critical"]),
             offer("pkg:npm/b@1", "ub", "", &["low"]),
         ];
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let mut first = Stage::new(configured, Some(carry.clone()), Path::new("/repo/x"));
         assert_eq!(first.project, "x");
         let rows = classify(&offers, None, &first.project);
@@ -775,7 +752,7 @@ mod tests {
             offer("pkg:npm/a@1", "ua", "", &["critical"]),
             offer("pkg:npm/c@1", "uc", "", &["high"]),
         ];
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let mut second = Stage::new(configured, Some(carry.clone()), Path::new("/repo/y"));
         let rows = classify(&offers, None, &second.project);
         second.plan(&rows, |_| true);
@@ -822,7 +799,7 @@ mod tests {
     #[test]
     fn unlimited_runs_print_no_rollout_line() {
         let results = vec![offer("pkg:npm/a@1", "ua", "", &["critical"])];
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let mut stage = Stage::new(MaxNew::UNLIMITED, None, Path::new("/repo"));
         let rows = classify(&offers, None, "");
         stage.plan(&rows, |_| true);
@@ -840,7 +817,7 @@ mod tests {
             .iter()
             .map(|n| offer(&format!("pkg:npm/{n}@1"), n, "", &["high"]))
             .collect();
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let zero = MaxNew {
             value: Some(0),
             source: MaxNewSource::File,
@@ -866,7 +843,7 @@ mod tests {
     #[test]
     fn incomplete_lookups_warn_only_when_they_deferred_something() {
         let results = vec![offer("pkg:npm/a@1", "ua", "", &["critical"])];
-        let offers = Offers::from_results(&results, true);
+        let offers = offers_from_results(&results, true);
         let capped = MaxNew {
             value: Some(3),
             source: MaxNewSource::Flag,
@@ -882,11 +859,5 @@ mod tests {
         assert!(unlimited.may_admit_new());
         unlimited.plan(&classify(&offers, None, ""), |_| true);
         assert!(unlimited.warnings().is_empty());
-    }
-
-    #[test]
-    fn project_paths_are_repo_relative() {
-        assert_eq!(project_rel(Path::new("/r"), Path::new("/r")), "");
-        assert_eq!(project_rel(Path::new("/r"), Path::new("/r/a/b")), "a/b");
     }
 }
