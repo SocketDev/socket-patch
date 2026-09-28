@@ -988,3 +988,59 @@ fn no_vlt_install_cleanup_flag_and_env_parse() {
         _ => panic!("expected Scan"),
     }
 }
+
+// ── --max-new-patches (staged rollout) ───────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn max_new_patches_defaults_to_unset() {
+    let args = parse_scan(&[]);
+    assert_eq!(args.rollout.max_new_patches, None);
+}
+
+#[test]
+#[serial_test::serial]
+fn max_new_patches_takes_a_count_or_none() {
+    use socket_patch_cli::commands::scan::rollout_args::MaxNewPatches;
+    for (raw, want) in [
+        ("5", Some(5)),
+        ("0", Some(0)),
+        ("4294967295", Some(u32::MAX)),
+        ("none", None),
+        ("NONE", None),
+    ] {
+        let args = parse_scan(&["--max-new-patches", raw]);
+        assert_eq!(args.rollout.max_new_patches, Some(MaxNewPatches(want)), "{raw}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn max_new_patches_rejects_malformed_values() {
+    for raw in ["-1", "4294967296", "five", "", "all"] {
+        let err = match try_parse_scan(&[&format!("--max-new-patches={raw}")]) {
+            Ok(_) => panic!("{raw:?} must not parse"),
+            Err(e) => e,
+        };
+        assert_eq!(err.exit_code(), 2, "{raw:?}: usage error");
+    }
+}
+
+#[test]
+fn max_new_patches_env_is_read_at_run_time() {
+    // The env binding is resolved by `RolloutArgs::resolve` (the rollout
+    // block reports flag vs env), not by clap: empty is unset, malformed is
+    // a usage error, and the flag wins.
+    use socket_patch_cli::commands::scan::rollout_args::{MaxNewPatches, RolloutArgs};
+    use socket_patch_core::rollout::MaxNewSource;
+    let unset = RolloutArgs::default();
+    let got = unset.resolve(Some("7"), None).unwrap();
+    assert_eq!((got.value, got.source), (Some(7), MaxNewSource::Env));
+    let got = unset.resolve(Some(""), None).unwrap();
+    assert_eq!((got.value, got.source), (None, MaxNewSource::Default));
+    assert!(unset.resolve(Some("x"), None).is_err());
+    let mut flag = RolloutArgs::default();
+    flag.max_new_patches = Some(MaxNewPatches(Some(1)));
+    let got = flag.resolve(Some("7"), None).unwrap();
+    assert_eq!((got.value, got.source), (Some(1), MaxNewSource::Flag));
+}

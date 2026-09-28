@@ -1687,7 +1687,7 @@ pub(crate) async fn run_redirect_selected(
                 .iter()
                 .any(|c| !gate.is_new(&c.sel_purl, &c.dep.patch_uuid))
     });
-    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
+    let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
         match acquire_hosted_lock(common, &mut scan_result) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
@@ -2414,6 +2414,8 @@ pub(crate) async fn run_redirect_selected(
             .filter(|(_, confirmed)| *confirmed)
             .map(|(c, _)| (c.sel_purl.clone(), c.dep.patch_uuid.clone()))
             .collect();
+        let texts: Vec<&str> = files.values().map(String::as_str).collect();
+        super::rollout::mark_pinned(&mut gate.rows, &texts);
         let unknown = gate.stage.reference_failed.is_some();
         gate.stage.plan(&gate.rows, |row| {
             unknown || eligible.contains(&(row.writer.purl.clone(), row.writer.uuid.clone()))
@@ -2426,7 +2428,16 @@ pub(crate) async fn run_redirect_selected(
             overrides = candidates.iter().map(|c| c.dep.clone()).collect();
             (files, rewrite) = rewrite_candidates(files, &overrides, &inputs).await;
         }
+        // A row that turned out to be pinned already still gets written: take
+        // the lock skipped above (no takeover ran without it).
+        if lock.is_none() && !common.dry_run && !candidates.is_empty() {
+            match acquire_hosted_lock(common, &mut scan_result) {
+                Ok(guard) => lock = Some(guard),
+                Err(code) => return code,
+            }
+        }
     }
+    let _lock = lock;
 
     // Unknown installer → the modern `file` shape was chosen; say so only
     // when the lock was (or, on --dry-run, would be) rewritten.

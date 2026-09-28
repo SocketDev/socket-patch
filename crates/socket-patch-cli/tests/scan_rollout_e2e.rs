@@ -1,0 +1,737 @@
+//! `scan --max-new-patches` end to end (staged rollout, work item B): a
+//! project with nine patchable packages and a cap of three rolls forward
+//! three packages per run, most severe first, in hosted, agent and vendored
+//! mode; a fourth run changes nothing. Mock API, the built binary.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path, path_regex};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+const ORG: &str = "test-org";
+const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
+const HOST: &str = "http://patch.test";
+
+/// `(name, severities)`: one advisory per severity; none = unknown.
+const PACKAGES: [(&str, &[&str]); 9] = [
+    ("roll-a", &["low"]),
+    ("roll-b", &["critical"]),
+    ("roll-c", &["high"]),
+    ("roll-d", &["medium"]),
+    ("roll-e", &["critical", "high"]),
+    ("roll-f", &[]),
+    ("roll-g", &["high", "low", "low"]),
+    ("roll-h", &["medium"]),
+    ("roll-i", &["low"]),
+];
+
+/// The rollout order: severity, then advisory count, then name.
+const ORDER: [&str; 9] = [
+    "roll-e", "roll-b", "roll-g", "roll-c", "roll-d", "roll-h", "roll-a", "roll-i", "roll-f",
+];
+
+fn binary() -> PathBuf {
+    env!("CARGO_BIN_EXE_socket-patch").into()
+}
+
+fn uuid(name: &str) -> String {
+    let n = PACKAGES.iter().position(|(p, _)| *p == name).unwrap() + 1;
+    format!("{n:08x}-1111-4111-8111-{n:012x}")
+}
+
+fn purl(name: &str) -> String {
+    format!("pkg:npm/{name}@1.0.0")
+}
+
+fn hosted_url(name: &str) -> String {
+    format!(
+        "{HOST}/patch/npm/{name}/1.0.0/{TOKEN}/{}/{name}-1.0.0.tgz",
+        uuid(name)
+    )
+}
+
+fn before(name: &str) -> Vec<u8> {
+    format!("module.exports = '{name} before';\n").into_bytes()
+}
+
+fn after(name: &str) -> Vec<u8> {
+    format!("module.exports = '{name} after';\n").into_bytes()
+}
+
+fn git_sha256(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("blob {}\0", content.len()).as_bytes());
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn vulns(name: &str, severities: &[&str]) -> Value {
+    let mut map = serde_json::Map::new();
+    for (i, sev) in severities.iter().enumerate() {
+        map.insert(
+            format!("GHSA-{name}-{i}"),
+            json!({ "cves": [], "summary": "s", "severity": sev, "description": "d" }),
+        );
+    }
+    Value::Object(map)
+}
+
+/// A v3 npm project in `dir` with `names` installed and locked.
+fn write_project(dir: &Path, names: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    let deps: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|n| (n.to_string(), json!("1.0.0")))
+        .collect();
+    std::fs::write(
+        dir.join("package.json"),
+        serde_json::to_vec_pretty(&json!({
+            "name": "rollout-consumer", "version": "0.0.0", "dependencies": deps
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut packages = serde_json::Map::new();
+    packages.insert(
+        String::new(),
+        json!({ "name": "rollout-consumer", "version": "0.0.0", "dependencies": deps }),
+    );
+    for name in names {
+        packages.insert(
+            format!("node_modules/{name}"),
+            json!({
+                "version": "1.0.0",
+                "resolved": format!("https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz"),
+                "integrity": "sha512-UPSTREAMupstream==",
+                "license": "MIT"
+            }),
+        );
+        let pkg = dir.join("node_modules").join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), before(name)).unwrap();
+    }
+    let mut lock = serde_json::to_vec_pretty(&json!({
+        "name": "rollout-consumer",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": packages,
+    }))
+    .unwrap();
+    lock.push(b'\n');
+    std::fs::write(dir.join("package-lock.json"), lock).unwrap();
+}
+
+/// How the mock answers one package's reference grant.
+#[derive(Clone, Copy, PartialEq)]
+enum Grant {
+    Granted,
+    Withdrawn,
+    BadPurl,
+}
+
+/// Batch, by-package, view and reference mocks for every package.
+async fn mount_api(mock: &MockServer, grant: impl Fn(&str) -> Grant) {
+    let batch: Vec<Value> = PACKAGES
+        .iter()
+        .map(|(name, sevs)| {
+            json!({
+                "purl": purl(name),
+                "patches": [{
+                    "uuid": uuid(name), "purl": purl(name), "tier": "free",
+                    "cveIds": [],
+                    "ghsaIds": (0..sevs.len()).map(|i| format!("GHSA-{name}-{i}")).collect::<Vec<_>>(),
+                    "severity": sevs.first().copied(),
+                    "title": name,
+                }]
+            })
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "packages": batch, "canAccessPaidPatches": false })),
+        )
+        .mount(mock)
+        .await;
+    let mut results = serde_json::Map::new();
+    for (name, sevs) in PACKAGES {
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*{name}(%40|@)1\\.0\\.0$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [{
+                    "uuid": uuid(name), "purl": purl(name),
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "description": name, "license": "MIT", "tier": "free",
+                    "vulnerabilities": vulns(name, sevs),
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{}", uuid(name))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "uuid": uuid(name), "purl": purl(name),
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": git_sha256(&before(name)),
+                    "afterHash": git_sha256(&after(name)),
+                    "blobContent": b64(&after(name)),
+                }},
+                "vulnerabilities": vulns(name, sevs),
+                "description": name, "license": "MIT", "tier": "free",
+            })))
+            .mount(mock)
+            .await;
+        let entry = match grant(name) {
+            Grant::Granted => json!({
+                "status": "granted",
+                "url": hosted_url(name),
+                "purl": purl(name),
+                "artifacts": [{
+                    "kind": "tarball", "url": hosted_url(name),
+                    "integrity": { "sha512": format!("sha512-PATCHED{name}==") }
+                }],
+                "registryOverride": null
+            }),
+            Grant::Withdrawn => json!({ "status": "withdrawn" }),
+            Grant::BadPurl => json!({
+                "status": "granted", "url": hosted_url(name), "purl": "garbage",
+                "artifacts": [], "registryOverride": null
+            }),
+        };
+        results.insert(uuid(name), entry);
+    }
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": results })))
+        .mount(mock)
+        .await;
+}
+
+fn run(root: &Path, mock: &MockServer, args: &[&str]) -> (i32, String, String) {
+    let uri = mock.uri();
+    let mut argv = vec![
+        "scan",
+        "--yes",
+        "--api-url",
+        uri.as_str(),
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG,
+    ];
+    argv.extend_from_slice(args);
+    let mut cmd = Command::new(binary());
+    cmd.args(&argv).current_dir(root);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn run_json(root: &Path, mock: &MockServer, args: &[&str]) -> Value {
+    let mut all = vec!["--json"];
+    all.extend_from_slice(args);
+    let (code, stdout, stderr) = run(root, mock, &all);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout}"))
+}
+
+/// The packages whose hosted artifact the lockfile pins.
+fn pinned(root: &Path) -> Vec<String> {
+    let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+    ORDER
+        .iter()
+        .filter(|n| lock.contains(&hosted_url(n)))
+        .map(|n| n.to_string())
+        .collect()
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+fn deferred_names(v: &Value) -> Vec<String> {
+    v["rollout"]["deferred"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            d["purl"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("pkg:npm/")
+                .trim_end_matches("@1.0.0")
+                .to_string()
+        })
+        .collect()
+}
+
+fn counts(v: &Value) -> (u64, u64, u64, u64) {
+    let c = &v["rollout"]["counts"];
+    (
+        c["new"].as_u64().unwrap(),
+        c["deferred"].as_u64().unwrap(),
+        c["upgrade"].as_u64().unwrap(),
+        c["already"].as_u64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn hosted_cap_rolls_nine_packages_forward_three_per_run() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let args = [
+        "--mode",
+        "hosted",
+        "--max-new-patches",
+        "3",
+        "--patch-server-url",
+        HOST,
+    ];
+
+    // The dry run predicts exactly what the wet run does.
+    let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let mut dry_args = args.to_vec();
+    dry_args.push("--dry-run");
+    let dry = run_json(tmp.path(), &mock, &dry_args);
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before,
+        "a dry run writes nothing"
+    );
+
+    let mut previous_lock = lock_before;
+    for run_no in 0..3 {
+        let v = run_json(tmp.path(), &mock, &args);
+        if run_no == 0 {
+            assert_eq!(dry["rollout"], v["rollout"], "dry run == wet run");
+            assert_eq!(dry["redirect"]["skipped"], v["redirect"]["skipped"]);
+        }
+        assert_eq!(
+            v["rollout"]["maxNewPatches"],
+            json!({ "value": 3, "source": "flag" })
+        );
+        let done = 3 * run_no as u64;
+        assert_eq!(
+            counts(&v),
+            (3, 6 - done, 0, done),
+            "run {}: {v}",
+            run_no + 1
+        );
+        assert_eq!(
+            pinned(tmp.path()),
+            names(&ORDER[..3 * (run_no + 1)]),
+            "run {} pins the next three, most severe first",
+            run_no + 1
+        );
+        assert_eq!(deferred_names(&v), names(&ORDER[3 * (run_no + 1)..]));
+        let ranks: Vec<u64> = v["rollout"]["deferred"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["rank"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ranks, (4..4 + ranks.len() as u64).collect::<Vec<_>>());
+        let skipped: Vec<&str> = v["redirect"]["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["reason"].as_str().unwrap())
+            .collect();
+        assert!(skipped.iter().all(|r| *r == "rollout_deferred"));
+        assert_eq!(skipped.len() as u64, 6 - done);
+        assert_eq!(v["redirect"]["redirected"], 3 * (run_no as u64 + 1));
+        previous_lock = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    }
+
+    let v = run_json(tmp.path(), &mock, &args);
+    assert_eq!(counts(&v), (0, 0, 0, 9), "a fourth run adds nothing: {v}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        previous_lock,
+        "a converged run is byte-stable"
+    );
+}
+
+#[tokio::test]
+async fn hosted_converges_even_when_the_patch_server_is_not_configured() {
+    // Without --patch-server-url discovery does not recognize the test
+    // host's pins; the rollout still treats a lockfile that names the
+    // selected patch as recorded, so it never re-spends a slot on it.
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    for run_no in 1..=3 {
+        run_json(
+            tmp.path(),
+            &mock,
+            &["--mode", "hosted", "--max-new-patches", "3"],
+        );
+        assert_eq!(pinned(tmp.path()), names(&ORDER[..3 * run_no]));
+    }
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &["--mode", "hosted", "--max-new-patches", "3"],
+    );
+    assert_eq!(counts(&v), (0, 0, 0, 9));
+}
+
+#[tokio::test]
+async fn hosted_ineligible_top_ranked_patches_hold_no_slot() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |name| match name {
+        "roll-e" => Grant::Withdrawn,
+        "roll-b" => Grant::BadPurl,
+        _ => Grant::Granted,
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &[
+            "--mode",
+            "hosted",
+            "--max-new-patches",
+            "2",
+            "--patch-server-url",
+            HOST,
+        ],
+    );
+    assert_eq!(pinned(tmp.path()), names(&["roll-g", "roll-c"]), "{v}");
+    assert_eq!(counts(&v), (2, 5, 0, 0));
+    assert_eq!(
+        deferred_names(&v),
+        names(&["roll-d", "roll-h", "roll-a", "roll-i", "roll-f"])
+    );
+    assert_eq!(
+        v["rollout"]["deferred"][0]["rank"], 3,
+        "ranks count eligible rows only"
+    );
+    let reasons: Vec<(&str, &str)> = v["redirect"]["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["purl"].as_str().unwrap(), s["reason"].as_str().unwrap()))
+        .collect();
+    assert!(
+        reasons.contains(&("pkg:npm/roll-e@1.0.0", "withdrawn")),
+        "{reasons:?}"
+    );
+    assert!(reasons.contains(&("garbage", "bad_purl")), "{reasons:?}");
+}
+
+#[tokio::test]
+async fn a_failed_detail_lookup_admits_nothing_new_under_a_cap() {
+    let mock = MockServer::start().await;
+    // Mounted first, so it wins over the per-package mock below.
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.*roll-i(%40|@)1\\.0\\.0$"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &[
+            "--mode",
+            "hosted",
+            "--max-new-patches",
+            "3",
+            "--patch-server-url",
+            HOST,
+        ],
+    );
+    assert_eq!(counts(&v), (0, 8, 0, 0), "{v}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before
+    );
+    let codes: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"rollout_incomplete_lookup"), "{codes:?}");
+    assert!(codes.contains(&"patch_details_failed"), "{codes:?}");
+}
+
+#[tokio::test]
+async fn agent_cap_rolls_forward_and_upgrades_ignore_the_cap() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let recorded = |root: &Path| -> Vec<String> {
+        let m: Value = serde_json::from_slice(
+            &std::fs::read(root.join(".socket/manifest.json")).unwrap_or_else(|_| b"{}".to_vec()),
+        )
+        .unwrap();
+        ORDER
+            .iter()
+            .filter(|n| m["patches"].get(purl(n)).is_some())
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let args = ["--mode", "agent", "--max-new-patches", "3"];
+    let dry = {
+        let mut a = args.to_vec();
+        a.push("--dry-run");
+        run_json(tmp.path(), &mock, &a)
+    };
+    for run_no in 1..=3 {
+        let v = run_json(tmp.path(), &mock, &args);
+        if run_no == 1 {
+            assert_eq!(dry["rollout"], v["rollout"], "dry run == wet run");
+            let added: Vec<&str> = dry["apply"]["patches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["purl"].as_str().unwrap())
+                .collect();
+            assert_eq!(added.len(), 3, "{dry}");
+        }
+        assert_eq!(recorded(tmp.path()), names(&ORDER[..3 * run_no]), "{v}");
+        for name in &ORDER[..3 * run_no] {
+            assert_eq!(
+                std::fs::read(tmp.path().join("node_modules").join(name).join("index.js")).unwrap(),
+                after(name)
+            );
+        }
+        for name in &ORDER[3 * run_no..] {
+            assert_eq!(
+                std::fs::read(tmp.path().join("node_modules").join(name).join("index.js")).unwrap(),
+                before(name),
+                "a deferred package is not touched"
+            );
+        }
+    }
+    let v = run_json(tmp.path(), &mock, &args);
+    assert_eq!(counts(&v), (0, 0, 0, 9));
+
+    // A newer patch for an applied package is an UPGRADE: it lands even
+    // with `--max-new-patches 0`, and is reported in `updates[]`.
+    mock.reset().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let newer = "0000000a-1111-4111-8111-00000000000a";
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.*roll-a(%40|@)1\\.0\\.0$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "patches": [
+                { "uuid": newer, "purl": purl("roll-a"), "publishedAt": "2026-06-01T00:00:00Z",
+                  "description": "newer", "license": "MIT", "tier": "free",
+                  "vulnerabilities": vulns("roll-a", &["low"]) },
+                { "uuid": uuid("roll-a"), "purl": purl("roll-a"), "publishedAt": "2026-01-01T00:00:00Z",
+                  "description": "roll-a", "license": "MIT", "tier": "free",
+                  "vulnerabilities": vulns("roll-a", &["low"]) }
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{newer}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": newer, "purl": purl("roll-a"), "publishedAt": "2026-06-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": git_sha256(&before("roll-a")),
+                "afterHash": git_sha256(&after("roll-a")),
+                "blobContent": b64(&after("roll-a")),
+            }},
+            "vulnerabilities": vulns("roll-a", &["low"]),
+            "description": "newer", "license": "MIT", "tier": "free",
+        })))
+        .mount(&mock)
+        .await;
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &["--mode", "agent", "--max-new-patches", "0"],
+    );
+    assert_eq!(counts(&v), (0, 0, 1, 8), "{v}");
+    assert_eq!(
+        v["updates"],
+        json!([{ "purl": purl("roll-a"), "oldUuid": uuid("roll-a"), "newUuid": newer }])
+    );
+    let m: Value =
+        serde_json::from_slice(&std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(m["patches"][purl("roll-a")]["uuid"], newer);
+}
+
+#[tokio::test]
+async fn vendored_cap_rolls_forward_three_per_run() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let vendored = |root: &Path| -> Vec<String> {
+        let state: Value = std::fs::read(root.join(".socket/vendor/state.json"))
+            .ok()
+            .map(|b| serde_json::from_slice(&b).unwrap())
+            .unwrap_or(json!({}));
+        ORDER
+            .iter()
+            .filter(|n| state["entries"].get(purl(n)).is_some())
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let args = ["--mode", "vendored", "--max-new-patches", "3"];
+    let dry = {
+        let mut a = args.to_vec();
+        a.push("--dry-run");
+        run_json(tmp.path(), &mock, &a)
+    };
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a dry run writes nothing"
+    );
+    for run_no in 1..=3 {
+        let v = run_json(tmp.path(), &mock, &args);
+        if run_no == 1 {
+            assert_eq!(dry["rollout"], v["rollout"], "dry run == wet run");
+            assert_eq!(dry["vendor"]["patches"].as_array().unwrap().len(), 3);
+        }
+        assert_eq!(vendored(tmp.path()), names(&ORDER[..3 * run_no]), "{v}");
+    }
+    let lock = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let v = run_json(tmp.path(), &mock, &args);
+    assert_eq!(counts(&v), (0, 0, 0, 9));
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock
+    );
+}
+
+#[tokio::test]
+async fn project_directories_share_one_budget_in_sorted_order() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // `a/` sorts first and spends two slots; `b/` gets the one left, and
+    // its copy of roll-b rides free (already admitted in `a/`).
+    write_project(&tmp.path().join("a"), &["roll-a", "roll-b"]);
+    write_project(
+        &tmp.path().join("b"),
+        &["roll-b", "roll-c", "roll-e", "roll-h"],
+    );
+    let (code, stdout, stderr) = run(
+        tmp.path(),
+        &mock,
+        &[
+            "--mode",
+            "hosted",
+            "--max-new-patches",
+            "3",
+            "--patch-server-url",
+            HOST,
+            "a",
+            "b",
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(pinned(&tmp.path().join("a")), names(&["roll-b", "roll-a"]));
+    assert_eq!(pinned(&tmp.path().join("b")), names(&["roll-e", "roll-b"]));
+    assert!(
+        stdout.contains(
+            "Rollout: 2 of 2 new patches applied (maxNewPatches=3 from --max-new-patches)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Rollout: 2 of 4 new patches applied"),
+        "b/ admits roll-b free and roll-e with the last slot: {stdout}"
+    );
+    assert!(
+        stdout.contains("Next up: roll-c@1.0.0 (high), roll-h@1.0.0 (medium)"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_env_cap_is_a_usage_error_and_the_flag_wins() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path(), &["roll-a", "roll-b"]);
+    let mut cmd = Command::new(binary());
+    cmd.args(["scan", "--json", "--api-url"])
+        .arg(mock.uri())
+        .args(["--api-token", "t", "--org", ORG])
+        .current_dir(tmp.path());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SOCKET_MAX_NEW_PATCHES", "lots");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("SOCKET_MAX_NEW_PATCHES"));
+
+    cmd.env("SOCKET_MAX_NEW_PATCHES", "1");
+    let out = cmd.output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["rollout"]["maxNewPatches"],
+        json!({ "value": 1, "source": "env" })
+    );
+    assert_eq!(v["rollout"]["counts"]["new"], 1);
+
+    cmd.args(["--max-new-patches", "none"]);
+    let out = cmd.output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["rollout"]["maxNewPatches"],
+        json!({ "value": null, "source": "flag" })
+    );
+}

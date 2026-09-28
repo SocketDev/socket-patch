@@ -203,6 +203,22 @@ pub(crate) fn lookup_incomplete(
             .any(|purl| recorded.is_none_or(|m| recorded_uuids(m, purl).is_empty()))
 }
 
+/// Mark NEW rows whose selected uuid the project's lockfile texts already
+/// mention as ALREADY. A hosted pin on a patch server discovery does not
+/// recognize (an origin missing from `--patch-server-url`) would otherwise
+/// read as NEW on every run and hold its slot forever; patch uuids are
+/// unique, so a mention is a pin.
+pub(crate) fn mark_pinned(rows: &mut [Row], texts: &[&str]) {
+    for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
+        if texts
+            .iter()
+            .any(|t| t.contains(row.candidate.uuid.as_str()))
+        {
+            row.candidate.recorded = Recorded::Same;
+        }
+    }
+}
+
 /// The rows the hosted engine plans (§9.0 step 7 inside the engine, after
 /// its eligibility checks) and the stage that records the plan.
 pub(crate) struct Gate<'a> {
