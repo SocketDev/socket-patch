@@ -1,6 +1,9 @@
 //! Real Bun binary-lock acceptance tests. The CLI must never invoke a Bun
 //! conversion or replace bun.lockb with text. Every terminal mode is checked
-//! with an empty-cache frozen install, and rollback restores the exact input.
+//! with an empty-cache frozen install, and rollback restores the exact input
+//! (v5: a hosted pin in a binary lock is refused by rollback and by a vendor
+//! takeover — only bun can re-encode its upstream entry — and restored from
+//! version control instead).
 //!
 //! Run scripts/backtest-bun-lockb.py for the writer/reader release matrix.
 //! SOCKET_PATCH_BUN_LOCKB_REQUIRED=1 makes missing tools a hard error;
@@ -82,6 +85,59 @@ fn cli(project: &Path, args: &[&str]) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+/// [`cli`] for a run expected to fail: `(exit code, envelope)`.
+fn cli_code(project: &Path, args: &[&str]) -> (i32, Value) {
+    let output = command(env!("CARGO_BIN_EXE_socket-patch"), project)
+        .args(args)
+        .args([
+            "--cwd",
+            project.to_str().unwrap(),
+            "--json",
+            "--no-telemetry",
+        ])
+        .output()
+        .unwrap();
+    let envelope = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code().unwrap_or(-1), envelope)
+}
+
+/// v5 keeps no hosted ledger, so undoing a hosted pin means restoring the
+/// entry's upstream registry form — which a binary `bun.lockb` cannot get
+/// from socket-patch (only bun can re-encode it). `rollback` therefore
+/// REFUSES the pin, naming the checkout remedy, and leaves the lock exactly
+/// as found; the test then applies that remedy (`git checkout --
+/// bun.lockb`, here: the original bytes written back).
+fn rollback_refuses_binary_hosted_pin_then_checkout(fixture: &Fixture, server: &MockServer) {
+    let hosted_lock = fixture.lock();
+    let uri = server.uri();
+    let (code, env) = cli_code(
+        &fixture.project,
+        &["rollback", "--yes", "--patch-server-url", &uri],
+    );
+    assert_eq!(code, 1, "a binary hosted pin cannot be restored: {env}");
+    assert_eq!(env["status"], "partial_failure", "{env}");
+    let failed = env["hosted"]["failed"].as_array().cloned().unwrap_or_default();
+    assert!(
+        failed.iter().any(|f| f["purl"] == PURL
+            && f["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("git checkout -- bun.lockb"))),
+        "the refusal names the checkout remedy: {env}"
+    );
+    assert_eq!(fixture.lock(), hosted_lock, "a refused restore writes nothing");
+    assert!(
+        !fixture.project.join(".socket/vendor/redirect-state.json").exists(),
+        "no hosted ledger exists"
+    );
+    std::fs::write(fixture.project.join("bun.lockb"), &fixture.original_lock).unwrap();
 }
 
 fn scan(project: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> Value {
@@ -670,10 +726,44 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         "hosted rerun: {repeat}"
     );
     assert_eq!(fixture.lock(), hosted_lock);
+    assert!(
+        !project.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
+    );
     std::fs::rename(&modules, project.join("node_modules")).unwrap();
 
-    // Hosted -> vendored, including truthful dry run and exact rerun state.
+    // Hosted -> vendored: v5 restores a hosted pin's upstream entry before
+    // vendoring over it, which a binary bun.lockb cannot get — the takeover
+    // is REFUSED (dry and wet alike, nothing written) with the checkout
+    // remedy. After `git checkout -- bun.lockb` the vendor proceeds, with a
+    // truthful dry run and exact rerun state.
     fixture.stage();
+    let uri = server.uri();
+    let before = snapshot(project);
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let mut args = vec!["vendor", "--offline", "--patch-server-url", &uri];
+        args.extend_from_slice(extra);
+        let (code, refused) = cli_code(project, &args);
+        assert_eq!(code, 1, "vendor {extra:?} over a binary hosted pin: {refused}");
+        let failed = refused["events"]
+            .as_array()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|e| e["errorCode"] == "redirect_revert_failed")
+            })
+            .unwrap_or_else(|| panic!("expected redirect_revert_failed: {refused}"));
+        assert_eq!(failed["purl"], PURL, "{refused}");
+        assert!(
+            failed["error"].as_str().is_some_and(|e| {
+                e.contains("cannot vendor over the live hosted pin")
+                    && e.contains("git checkout -- bun.lockb")
+            }),
+            "{refused}"
+        );
+        assert_eq!(snapshot(project), before, "refused vendor {extra:?} wrote nothing");
+    }
+    std::fs::write(project.join("bun.lockb"), &fixture.original_lock).unwrap();
     let before = snapshot(project);
     let preview = cli(project, &["vendor", "--offline", "--dry-run"]);
     assert_eq!(snapshot(project), before, "vendor dry run: {preview}");
@@ -767,8 +857,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     );
     fixture.frozen("hosted-again", &fixture.patched, "minimist");
     fixture.manifestless_vex("hosted-again", bun_vex::BunMode::Hosted, &server.uri());
-    let reverted = cli(project, &["rollback", "--yes"]);
-    assert_eq!(reverted["status"], "success", "rollback: {reverted}");
+    rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
     fixture.pristine();
     fixture.frozen("rolled-back", &fixture.original, "minimist");
 }
@@ -847,7 +936,7 @@ async fn native_binary_alias_and_transitive() {
             bun_vex::BunMode::Hosted,
             &server.uri(),
         );
-        cli(&fixture.project, &["rollback", "--yes"]);
+        rollback_refuses_binary_hosted_pin_then_checkout(&fixture, &server);
         fixture.pristine();
         fixture.stage();
         let result = cli(&fixture.project, &["vendor", "--offline"]);
