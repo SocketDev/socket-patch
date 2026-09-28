@@ -89,6 +89,142 @@ impl HostedPin {
     }
 }
 
+/// Hosted wiring the lockfiles mention that is NOT an attributable pin: a
+/// Socket-hosted patch identity discovery recognized in `files` but could
+/// not tie to one package version (a lock another lock contradicts, a
+/// malformed or unattributable reference, a lockless registry pin). It is
+/// still hosted state — management commands must refuse around it, never
+/// read it as "no hosted patches".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContestedWiring {
+    /// The hosted patch uuid the files name.
+    pub uuid: String,
+    /// Root-relative files naming it, sorted and deduplicated.
+    pub files: Vec<String>,
+    /// Discovery's own findings for those files (`code: detail`), if any.
+    pub details: Vec<String>,
+}
+
+/// The project's hosted state as raw wiring: the attributable pins (what
+/// restores and ejects act on) and the contested wiring (what they must
+/// refuse around). VEX eligibility is a separate judgment over the same
+/// discovery; this inventory keeps everything the lockfiles wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostedInventory {
+    pub pins: Vec<HostedPin>,
+    pub contested: Vec<ContestedWiring>,
+}
+
+impl HostedInventory {
+    pub fn of(discovery: &Discovery) -> Self {
+        let pins = HostedPin::all(discovery);
+        let norm = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let pinned: BTreeSet<&str> = pins.iter().map(|p| p.uuid.as_str()).collect();
+        // A hosted URL also carries its grant token as a uuid-shaped
+        // segment, so an unpinned recognized uuid in a file that DOES carry
+        // pins is contested only when discovery flagged that file.
+        let pinned_files: BTreeSet<&str> = pins
+            .iter()
+            .flat_map(|p| p.files.iter().map(String::as_str))
+            .collect();
+        let flagged_files: BTreeSet<String> = discovery
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code,
+                    crate::vex::discover::DIAG_REF_INVALID
+                        | crate::vex::discover::DIAG_REF_UNATTRIBUTABLE
+                )
+            })
+            .map(|d| norm(&d.file))
+            .collect();
+        let mut contested: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for r in &discovery.recognized {
+            let file = norm(&r.file);
+            if r.mode == WiringMode::Hosted
+                && !pinned.contains(r.uuid.as_str())
+                && (!pinned_files.contains(file.as_str()) || flagged_files.contains(&file))
+            {
+                contested
+                    .entry(r.uuid.clone())
+                    .or_default()
+                    .insert(norm(&r.file));
+            }
+        }
+        for pin in &discovery.unlocked_pins {
+            if !pinned.contains(pin.uuid.as_str()) {
+                contested
+                    .entry(pin.uuid.clone())
+                    .or_default()
+                    .insert(norm(&pin.file));
+            }
+        }
+        let contested = contested
+            .into_iter()
+            .map(|(uuid, files)| {
+                let details = discovery
+                    .diagnostics
+                    .iter()
+                    .filter(|d| files.contains(&norm(&d.file)))
+                    .map(|d| format!("{}: {}", d.code, d.detail))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                ContestedWiring {
+                    uuid,
+                    files: files.into_iter().collect(),
+                    details,
+                }
+            })
+            .collect();
+        HostedInventory { pins, contested }
+    }
+
+    /// Whether the lockfiles wire any hosted patch at all.
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty() && self.contested.is_empty()
+    }
+
+    /// The refusal a management command raises while contested wiring
+    /// exists: which files, why, and the remedy. `None` when uncontested.
+    pub fn contested_refusal(&self) -> Option<String> {
+        if self.contested.is_empty() {
+            return None;
+        }
+        let files: BTreeSet<&str> = self
+            .contested
+            .iter()
+            .flat_map(|c| c.files.iter().map(String::as_str))
+            .collect();
+        let files: Vec<&str> = files.into_iter().collect();
+        let details: Vec<&str> = self
+            .contested
+            .iter()
+            .flat_map(|c| c.details.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Files, not uuids: a hosted URL also carries its grant token as a
+        // uuid-shaped segment, so the recognized set over-names patches.
+        let mut msg = format!(
+            "{} wire(s) Socket-hosted patches that cannot be attributed to one package \
+             version (the lockfiles disagree, or the reference is malformed), so socket-patch \
+             cannot manage them safely",
+            files.join(", ")
+        );
+        if !details.is_empty() {
+            msg.push_str(&format!(" ({})", details.join("; ")));
+        }
+        msg.push_str(&format!(
+            "; reconcile the lockfiles (re-run `socket-patch scan --mode hosted`) or restore \
+             them from version control (`git checkout -- {}`)",
+            files.join(" ")
+        ));
+        Some(msg)
+    }
+}
+
 /// Knobs for [`restore_upstream`].
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {

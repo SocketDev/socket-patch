@@ -660,8 +660,28 @@ pub async fn run(args: VendorArgs) -> i32 {
         // A hosted project (no manifest, hosted pins in its lockfiles)
         // ejects: its patch set is the lockfiles' hosted pins.
         if !args.common.is_global() {
-            let pins = hosted_pins_in_scope(&args.common).await;
+            let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
+            // Contested hosted wiring: the patch set cannot be read off the
+            // lockfiles, and a "nothing to vendor" answer would hide it.
+            if let Some(refusal) = inventory.contested_refusal() {
+                return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
+            }
+            let pins = hosted_pins_in_scope(&args.common, inventory.pins);
             if !pins.is_empty() {
+                // Eject needs every patch record from the API: an offline
+                // run (or dry run) refuses before any request.
+                if args.common.offline {
+                    return emit_eject_refusal(
+                        &args.common,
+                        "offline_eject_unavailable",
+                        &format!(
+                            "ejecting {} needs {} patch record(s) from the Socket API, and this \
+                             run is offline; re-run without --offline",
+                            plural(pins.len(), "hosted package", "hosted packages"),
+                            pins.len()
+                        ),
+                    );
+                }
                 return run_eject(&args, pins).await;
             }
         }
@@ -855,10 +875,23 @@ pub async fn run(args: VendorArgs) -> i32 {
     exit
 }
 
-/// The lockfiles' hosted pins whose ecosystem `--ecosystems` selects.
-async fn hosted_pins_in_scope(common: &GlobalArgs) -> Vec<HostedPin> {
-    HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
-        .into_iter()
+/// A refused eject: the JSON error envelope (`status: error`) or an
+/// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
+fn emit_eject_refusal(common: &GlobalArgs, code: &'static str, message: &str) -> i32 {
+    if common.json {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = common.dry_run;
+        env.mark_error(EnvelopeError::new(code, message.to_string()));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("Error ({code}): {message}");
+    }
+    1
+}
+
+/// The hosted pins whose ecosystem `--ecosystems` selects.
+fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<HostedPin> {
+    pins.into_iter()
         .filter(|pin| {
             socket_patch_core::utils::purl::purl_parts(&pin.purl)
                 .is_some_and(|(eco, _, _)| ecosystem_in_scope(common, &eco))

@@ -425,10 +425,21 @@ pub async fn run(args: ListArgs) -> i32 {
                 None
             }
         };
-    let hosted = HostedListing::from_pins(
-        &HostedPin::all(&crate::commands::discover_wiring(&args.common, &project_root).await),
-        legacy_redirect.as_ref(),
-    );
+    let inventory = crate::commands::hosted_inventory(&args.common, &project_root).await;
+    let hosted = HostedListing::from_pins(&inventory.pins, legacy_redirect.as_ref());
+    // Contested hosted wiring cannot be listed as patches, but it is hosted
+    // state: surface it (stderr / `warnings[]`), never hide it.
+    let contested = inventory.contested_refusal();
+    if let Some(detail) = &contested {
+        if args.common.json {
+            warnings.push(RunWarning {
+                code: "hosted_wiring_contested".to_string(),
+                detail: detail.clone(),
+            });
+        } else if !args.common.silent {
+            eprintln!("Warning (hosted_wiring_contested): {detail}");
+        }
+    }
     let vendor_state =
         crate::commands::load_vendor_state_lenient(&project_root, args.common.silent).await;
 
@@ -441,6 +452,10 @@ pub async fn run(args: ListArgs) -> i32 {
         vendor_state.as_ref().map(|s| &s.entries),
     );
     if manifest.is_none() && entries.is_empty() {
+        if let Some(detail) = contested {
+            emit_error(&args, "hosted_wiring_contested", detail, warnings);
+            return 1;
+        }
         // No manifest AND no ledger records: nothing is listable anywhere.
         emit_error(
             &args,

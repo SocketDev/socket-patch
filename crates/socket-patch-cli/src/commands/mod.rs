@@ -59,6 +59,21 @@ pub(crate) async fn discover_wiring(
     socket_patch_core::vex::discover_patched_refs_with(root, &opts).await
 }
 
+/// The project's hosted wiring as raw inventory (core
+/// [`HostedInventory`]): the attributable pins management commands act on,
+/// and the contested wiring they must refuse around. VEX eligibility is a
+/// separate judgment over the same discovery.
+///
+/// [`HostedInventory`]: socket_patch_core::patch::redirect::upstream::HostedInventory
+pub(crate) async fn hosted_inventory(
+    common: &crate::args::GlobalArgs,
+    root: &Path,
+) -> socket_patch_core::patch::redirect::upstream::HostedInventory {
+    socket_patch_core::patch::redirect::upstream::HostedInventory::of(
+        &discover_wiring(common, root).await,
+    )
+}
+
 /// The project's hosted state, v5-style: v5 hosted mode keeps no ledger,
 /// so the hosted pins [`discover_wiring`] finds in the lockfiles are the
 /// whole record. Shaped as a [`RedirectState`] for the readers that classify

@@ -347,13 +347,24 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // is loaded under the lock below; the hosted pins come from read-only
     // lockfile discovery (the restore re-reads every file under the lock).
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
-    let hosted_pins: Vec<HostedPin> =
-        HostedPin::all(&crate::commands::discover_wiring(&args.common, cwd).await);
+    let hosted_inventory = crate::commands::hosted_inventory(&args.common, cwd).await;
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
     if manifest_missing {
         let vendor_ledger_exists = tokio::fs::metadata(cwd.join(VENDOR_STATE_REL))
             .await
             .is_ok();
         if !vendor_ledger_exists && hosted_pins.is_empty() {
+            // Contested hosted wiring is still hosted state: name it
+            // instead of reporting a bare project.
+            if let Some(refusal) = hosted_inventory.contested_refusal() {
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    "hosted_wiring_contested",
+                    refusal,
+                );
+                return 1;
+            }
             emit_error_envelope(
                 args.common.json,
                 args.common.dry_run,

@@ -1206,10 +1206,16 @@ pub async fn run(args: RollbackArgs) -> i32 {
         .is_ok();
     // The hosted pins the lockfiles wire (read-only discovery; the restore
     // re-reads every file under the lock before it writes).
-    let hosted_pins: Vec<HostedPin> =
-        HostedPin::all(&crate::commands::discover_wiring(&args.common, &cwd).await);
+    let hosted_inventory = crate::commands::hosted_inventory(&args.common, &cwd).await;
+    let hosted_pins: Vec<HostedPin> = hosted_inventory.pins.clone();
 
     if manifest_missing && !vendor_ledger_exists && hosted_pins.is_empty() {
+        // Hosted wiring the lockfiles name but cannot attribute is still
+        // hosted state: refuse, naming it, instead of "Manifest not found".
+        if let Some(refusal) = hosted_inventory.contested_refusal() {
+            emit_rollback_error(args.common.json, &refusal);
+            return 1;
+        }
         // Only a pre-v5 hosted ledger left: no lockfile pins it any more,
         // so there is nothing to restore — retire the stale file (a wet run
         // only) instead of failing on the missing manifest.
@@ -1611,7 +1617,20 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|pin| hosted_scope.contains(&pin.purl))
                 .cloned()
                 .collect();
-            let hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            let mut hosted_leg = run_hosted_leg(&args.common, &in_scope).await;
+            // An unscoped rollback promises to unwind EVERY hosted patch:
+            // contested wiring it cannot restore fails the leg (a scoped run
+            // names its own targets and leaves unrelated wiring alone).
+            if !scoped {
+                if let Some(refusal) = hosted_inventory.contested_refusal() {
+                    if !args.common.json {
+                        eprintln!("Error: {}", capitalize_first(&refusal));
+                    }
+                    hosted_leg
+                        .failed
+                        .push(("hosted_wiring_contested".to_string(), refusal));
+                }
+            }
             if hosted_leg.failed.is_empty() {
                 if let Some(warning) = retire_legacy_redirect_ledger(&args.common).await {
                     run_warnings.push(warning);

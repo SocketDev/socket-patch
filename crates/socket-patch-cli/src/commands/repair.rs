@@ -90,10 +90,9 @@ pub async fn run(args: RepairArgs) -> i32 {
                 .cwd
                 .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
             let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
-                || !socket_patch_core::patch::redirect::upstream::HostedPin::all(
-                    &crate::commands::discover_wiring(&args.common, &args.common.cwd).await,
-                )
-                .is_empty();
+                || !crate::commands::hosted_inventory(&args.common, &args.common.cwd)
+                    .await
+                    .is_empty();
             if hosted {
                 let msg = HOSTED_ONLY_REASON;
                 if args.common.json {
