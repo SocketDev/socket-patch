@@ -131,17 +131,32 @@ fn sorted_keys<V>(map: &HashMap<String, V>) -> Vec<&String> {
 }
 
 impl<'a> Ledgers<'a> {
-    /// The vendored entry manifest key `key` claims (rule 1 of the module
-    /// docs): the entry filed under `key`, else the lowest-keyed entry
-    /// whose `base_purl` is `key`.
-    pub fn claimed_entry(&self, key: &str) -> Option<(&'a String, &'a VendorEntry)> {
-        let entries = &self.vendor?.entries;
-        entries.get_key_value(key).or_else(|| {
-            entries
-                .iter()
-                .filter(|(_, e)| e.base_purl == key)
-                .min_by(|a, b| a.0.cmp(b.0))
-        })
+    /// Every vendored entry grouped under the manifest key that claims it
+    /// (rule 1 of the module docs), each group sorted by ledger key. Built
+    /// in one pass over the sorted ledger, so the views stay O(V log V + M).
+    fn claims(&self) -> HashMap<&'a str, Vec<(&'a String, &'a VendorEntry)>> {
+        let mut claims: HashMap<&'a str, Vec<(&'a String, &'a VendorEntry)>> = HashMap::new();
+        if let Some(vendor) = self.vendor {
+            for key in sorted_keys(&vendor.entries) {
+                let entry = &vendor.entries[key];
+                if let Some(owner) = self.claimant(key, entry) {
+                    claims.entry(owner).or_default().push((key, entry));
+                }
+            }
+        }
+        claims
+    }
+
+    /// A claim group's representative entry: the one filed under the
+    /// manifest key itself, else the lowest-keyed.
+    fn primary<'c>(
+        key: &str,
+        group: &'c [(&'a String, &'a VendorEntry)],
+    ) -> Option<&'c (&'a String, &'a VendorEntry)> {
+        group
+            .iter()
+            .find(|(k, _)| k.as_str() == key)
+            .or_else(|| group.first())
     }
 
     /// The manifest key that claims the vendored entry filed under `key`
@@ -169,26 +184,24 @@ impl<'a> Ledgers<'a> {
         let hosted_records = self.redirect.map(|r| &r.records);
         let hosted_record = |key: &str| hosted_records.and_then(|r| r.get(key));
         let mut out: Vec<Owned<'a>> = Vec::new();
+        let claims = self.claims();
         if let Some(manifest) = self.manifest {
             for key in sorted_keys(&manifest.patches) {
                 let record = &manifest.patches[key];
-                let vendor = self.claimed_entry(key);
+                let group = claims
+                    .get(key.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let vendor = Self::primary(key, group).copied();
                 let mut alts: Vec<&'a PatchRecord> = Vec::new();
                 alts.extend(vendor.and_then(|(_, e)| e.record.as_ref()));
                 // Any further entry this key claims (another variant of
                 // the same base purl) is a fallback copy too.
                 alts.extend(
-                    self.vendor
-                        .map(|v| sorted_keys(&v.entries))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|k| vendor.is_none_or(|(vk, _)| vk != *k))
-                        .filter_map(|k| {
-                            let e = &self.vendor?.entries[k];
-                            (self.claimant(k, e) == Some(key.as_str()))
-                                .then_some(e.record.as_ref())
-                                .flatten()
-                        }),
+                    group
+                        .iter()
+                        .filter(|(k, _)| vendor.is_none_or(|(vk, _)| vk != *k))
+                        .filter_map(|(_, e)| e.record.as_ref()),
                 );
                 alts.extend(hosted_record(key));
                 out.push(Owned {
