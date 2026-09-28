@@ -102,6 +102,31 @@ fn hosted_shapes_match_each_lock_generations_installer() {
     let doc: toml_edit::DocumentMut = lock10.parse().unwrap();
     assert!(doc["package"][0]["files"].is_array(), "{lock10}");
 
+    // A legacy entry that listed files is replaced one file per line (as
+    // Poetry renders it), an empty `[]` one inline: the layout is how the
+    // hosted rollback tells which to put back.
+    let populated = original("1.0.10").replace(
+        "urllib3 = []",
+        "urllib3 = [\n    {file = \"urllib3-1.26.18.tar.gz\", hash = \"sha256:f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0\"},\n]",
+    );
+    let lock10_populated = rewrite_registry_redirect(
+        &BTreeMap::from([("poetry.lock".to_string(), populated)]),
+        &[patch()],
+    )
+    .files["poetry.lock"]
+        .clone();
+    assert!(
+        lock10_populated.contains(&format!(
+            "urllib3 = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{sha}\"}},\n]"
+        )),
+        "{lock10_populated}"
+    );
+    let rerun = rewrite_registry_redirect(
+        &BTreeMap::from([("poetry.lock".to_string(), lock10_populated)]),
+        &[patch()],
+    );
+    assert!(rerun.files.is_empty() && rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+
     let lock11 = rewrite_registry_redirect(
         &BTreeMap::from([("poetry.lock".to_string(), original("1.2.2"))]),
         &[patch()],

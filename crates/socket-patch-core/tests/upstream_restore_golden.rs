@@ -1145,6 +1145,27 @@ async fn poetry_every_lock_generation_round_trips() {
     }
 }
 
+/// The backtest's `direct` and `crlf` shapes (`scripts/backtest-poetry.py`):
+/// every native lock exactly as its Poetry wrote it — the 1.0/1.1 ones with
+/// the empty `urllib3 = []` today's PyPI leaves them — LF and CRLF, through
+/// the real hosted rewriter and back.
+#[tokio::test]
+#[serial]
+async fn poetry_native_lock_generations_round_trip_byte_exactly() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    for version in [
+        "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.5.1", "1.6.1", "1.7.1", "1.8.5", "2.0.1",
+        "2.1.4", "2.2.1", "2.3.4", "2.4.3",
+    ] {
+        let lock = fixture(&format!("poetry/{version}/poetry.lock")).replace("\r\n", "\n");
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[("poetry.lock", lock.replace('\n', eol))]);
+            let label = format!("poetry {version} native {eol:?}");
+            assert_pypi_round_trip(&label, &input, &[urllib3_dep()], None).await;
+        }
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn poetry_multi_package_lock_restores_only_the_pin() {

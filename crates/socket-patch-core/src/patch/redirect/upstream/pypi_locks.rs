@@ -8,6 +8,15 @@
 //!   `files` no Poetry 1.x lock carries. The restore drops the source table
 //!   (a package without one is a PyPI package — the rewriter refuses every
 //!   pre-existing source) and re-derives every release file from PyPI.
+//!   A 1.0/1.1 `[metadata.files]` entry is either every release file (a
+//!   lock written while PyPI's JSON API still fed old Poetry its files) or
+//!   `[]` (what Poetry 1.0/1.1 record against today's PyPI), and the
+//!   registry cannot say which. The rewriter keeps that bit in the patched
+//!   entry's layout (`utils::poetry_lock::legacy_files_entry`): one file
+//!   per line, as Poetry renders a non-empty entry, when the original listed
+//!   files; inline when it was `[]`. The restore reads the layout back and
+//!   writes the full release list or `[]`, so every generation round-trips
+//!   byte-exactly.
 //! * `pdm.lock` (`utils::pdm_lock::rewrite_pdm_lock`): the rewrite adds a
 //!   package `url` and replaces its files, inline or in the lock_version 2
 //!   `[metadata.files]."<name>[extras] <version>"` table, in every extras
@@ -30,6 +39,7 @@ use super::pypi::{
 };
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::utils::poetry_lock::is_multiline_array;
 use crate::utils::python_lock::preserve_line_endings;
 
 /// One hosted package entry of a TOML lock.
@@ -258,7 +268,16 @@ pub(crate) async fn restore_poetry(
                     );
                     continue;
                 };
-                set_value(table, &key, value.clone());
+                // The rewriter lays the patched entry out one file per line
+                // only when the original listed files; an inline one
+                // replaced Poetry's empty `[]`.
+                let listed = table.get(&key).is_some_and(is_multiline_array);
+                let entry = if listed {
+                    value.clone()
+                } else {
+                    toml_edit::Value::Array(toml_edit::Array::new())
+                };
+                set_value(table, &key, entry);
             }
             let Some(package) = doc
                 .get_mut("package")
