@@ -1025,3 +1025,50 @@ change), README (recipe R5, `--max-new-patches`), CHANGELOG
   the docs, to keep validators from drifting.
 - Recognizing a dependency version bump of an already-patched package as
   exempt from the cap (needs state hosted mode does not keep).
+
+## 11. Implementation notes (work item B)
+
+Where the plan left a gap, work item B made the smallest decision that
+keeps its rules intact:
+
+- **`updates[]` without by-package data.** A `--json` report-only run
+  (`--prune` / `--global` with no mode) fetches no by-package records, so
+  its `updates[]` stays on the batch rungs (`batch_supersedes`). In every
+  other run `updates[]` is the UPGRADE rows, plus the batch-derived entry
+  for a package the by-package lookup returned no offer for (nothing was
+  selected there to disagree with).
+- **Report-only and empty scans** carry the `rollout` block with zero
+  counts: they plan nothing.
+- **Unrecognized hosted pins.** Discovery only treats URLs on
+  `patch.socket.dev` or a `--patch-server-url` origin as hosted pins. A
+  scan against another server without that flag would read every pin as
+  NEW and re-spend the same N slots forever. The hosted gate therefore
+  also counts a NEW row as ALREADY when a lockfile names its selected
+  uuid (uuids are unique; one linear scan per file).
+- **In-memory recorded view.** The engine has no disk discovery, so a
+  root's hosted pins are the offered uuids of each purl that its own
+  files mention (nested roots' files excluded), merged with the tree's
+  `.socket/manifest.json` (now selected by `selectHostedScanPaths`) and
+  `.socket/vendor/state.json` at the disk precedence. A pin to a patch
+  the API no longer offers reads as NEW: it costs one slot once, and the
+  next run sees the new pin.
+- **Option source.** The in-memory `maxNewPatches` option reports
+  `source: "flag"` (it is the caller's explicit layer); `maxNewPatchesCap`
+  reports `cap` when it tightens the value.
+- **Key 6 across a base purl's rows.** Rows are sorted with
+  `rollout_cmp` and a base purl takes the rank of its first row, which is
+  the "minimum key over its rows" of 5.2; the uuid key only orders rows of
+  one base purl, which are admitted or deferred together.
+- **Reference failures.** On disk the reference lookup is one call; when
+  it fails in a capped run whose rows are all NEW, the rows are deferred
+  with `rollout_reference_failed` and `rollout_incomplete_lookup` instead
+  of failing the run. In memory the same rule applies per root.
+- **Human output.** The `Rollout:` line prints only when a cap is set.
+  Hosted mode appends the deferred lines to its existing next steps;
+  agent and vendored mode print them under a `Next steps:` heading.
+- **Lock.** A wet hosted run whose only candidates are NEW rows it cannot
+  admit (budget 0, or incomplete data) takes no apply lock and writes
+  nothing, `.socket/` included.
+- **socket.yml layer.** B resolves the cap as flag > env > file >
+  unlimited through `resolve_max_new`; the file value is passed once A
+  loads the policy in `scan` (9.3).

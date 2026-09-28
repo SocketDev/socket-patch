@@ -562,6 +562,24 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **`scan --max-new-patches <N|none>` rolls patches out gradually**
+  (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches`). Each
+  run adds at most N patches to packages that had none, most severe first
+  (then by how many advisories a patch fixes), and defers the rest to the
+  next run; upgrades of packages that are already patched are never
+  capped, and `0` means upgrades only. Repeated scans on an unchanged repo
+  add the same packages in the same order and stop once everything is
+  patched. A patch that cannot land (not granted, refused by a preflight,
+  nothing in the lockfile to pin) never holds a slot, and a failed lookup
+  admits nothing new that run (`rollout_incomplete_lookup`). The project
+  directories of one scan share the budget. Works in hosted, vendored and
+  agent mode, `--dry-run` included; `scan --json` gains a top-level
+  `rollout` block (`maxNewPatches`, `counts`, ranked `deferred[]`) and
+  hosted mode lists deferred rows in `redirect.skipped[]` as
+  `rollout_deferred`. The in-memory engine (napi, `hosted-bundle`) takes
+  `maxNewPatches`, `maxNewPatchesCap` and `inFlightPatches`, spends one
+  budget across every project root, and reports a session `rollout` block
+  and `ProjectResult.deferred[]`.
 - **`scan --package <name|purl>`** (repeatable or comma-separated, env
   `SOCKET_SCAN_PACKAGES`) scopes a scan to the named packages: a name
   (`lodash`, `@scope/pkg`, `group:artifact`) or a purl with or without its
@@ -1786,6 +1804,15 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **`scan` keeps a patch you already have unless the new one supersedes
+  it.** A package whose recorded patch (agent manifest, hosted lockfile
+  pin or vendor ledger) still ranks level with the top offer on every
+  meaningful rung (merged state, severity, a later publish date) keeps
+  its recorded patch instead of switching on the tier or uuid tiebreak,
+  so re-running `scan` never swaps patches. `updates[]` and the
+  `[UPDATE]` marker now use the per-package records the selection itself
+  uses, so they list exactly the upgrades the run applies; a JSON
+  report-only run still reads the batch records.
 - **The npm crawl skips tagged cache directories.** The walk that finds
   workspace `node_modules` trees no longer descends into a directory that
   carries a [Cache Directory Tagging](https://bford.info/cachedir/)

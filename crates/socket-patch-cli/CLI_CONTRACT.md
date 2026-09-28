@@ -87,6 +87,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `scan` | `--package <name\|purl>` (repeatable or comma-separated) | `SOCKET_SCAN_PACKAGES` | (v5.0) Only scan these packages: a name (`lodash`, `@scope/pkg`, `requests`, `group:artifact`; matched against the full name or its last segment, case-insensitively) or a purl with or without a version (`pkg:npm/lodash` matches every version, `pkg:pypi/requests@2.31.0` only that one). Qualifiers are ignored. Filters the crawl like `--ecosystems`, after the prune universe is captured, so `--prune` still judges the full crawl |
 | `scan` | `--vendor` / `--detached` | — | Vendor every patched dependency instead of applying in place (`--vendor` == `--mode vendored`; conflicts with `--apply`/`--sync`, combines with `--prune`). Vendored mode is manifest-free (v5.0): the vendor ledger embeds the patch records and `.socket/manifest.json` is never written. `--detached` — the former opt-in for exactly that — is **hidden** and retained for compatibility as a no-op; it is still a usage error (exit 2) without vendored mode in either spelling |
 | `scan` | `--batch-size` | `SOCKET_BATCH_SIZE` | API batch chunk size. Unset (v5.0): `500` on the authenticated API (the server's per-request maximum), `100` on the public proxy; a given value applies on either endpoint (`0` is floored to `1`). A chunk whose request body would exceed 256 KiB (the public proxy's body cap) is split into consecutive smaller chunks, deterministically (greedy, in crawl order). A mid-run downgrade to the proxy keeps the chunks already formed |
+| `scan` | `--max-new-patches <N\|none>` | `SOCKET_MAX_NEW_PATCHES` | (v5.0) Per-run cap on NEW patches (packages with no recorded patch in the project), most severe first; the rest are deferred to the next scan. `0` admits upgrades only, `none` (case-insensitive) is unlimited, absent is unlimited unless socket.yml sets `patches.maxNewPatches`. Precedence: flag > env > socket.yml > unlimited. The env value is read at run time (the `rollout` block reports `flag` vs `env`): empty is unset, malformed is a usage error (exit 2, before any network access). Upgrades and already-applied patches are never capped. See "Per-run limit on new patches" below |
 | `get`, `scan` | `--all-releases` | `SOCKET_ALL_RELEASES` | Download patches for every release/distribution variant of a matched package — PyPI wheel/sdist (`artifact_id`), RubyGems (`platform`), Maven (`classifier`) — not just the one(s) matching the locally-installed distribution. On `scan` this makes the stored manifest portable across environments (e.g. cross-platform CI caches). On `get` (v3.6) it ALSO disables the coarse installed-**version** narrowing of CVE/GHSA fan-outs (see "get --mode and installed narrowing"): every found version's patch is fetched, installed or not |
 | `get` | positional `identifier`; `--id` / `--cve` / `--ghsa` / `--package` (`-p`); `--save-only` (alias `--no-apply`); `--one-off` (hidden from `--help`: always fails "not yet implemented"); `--mode <hosted\|vendored\|agent>` | `SOCKET_SAVE_ONLY`, `SOCKET_ONE_OFF` | Patch lookup + consumption mode (v3.6). `--mode` reuses scan's value enum (same hidden value aliases `host`/`redirect`/`vendor`; deliberately no env binding, matching scan). Default (v5.0): `hosted`, like scan; `agent` (save + apply in place) when `--save-only` or `--global`/`--global-prefix` is given. An explicit `--save-only` conflicts with `--mode hosted\|vendored` — rejected with **exit 1** via get's established self-enforced-conflict style (unlike scan's exit-2 mode conflicts; see the exit-code table) |
 | `remove` | positional `identifier`; `--skip-rollback`; `--preserve-state` (v5.0) | `SOCKET_SKIP_ROLLBACK`, `SOCKET_PRESERVE_STATE` | Manifest entry removal. `--preserve-state` is the single-patch twin of `rollback --preserve-state`: restore the tree and unwind the identifier's vendored/hosted wiring, but keep the manifest entry, the vendored artifact + ledger entry, and skip all GC. Combining it with `--skip-rollback` is a self-enforced usage error (exit 2): one flag keeps the tree and drops the state, the other restores the tree and keeps the state — together they select the do-nothing quadrant ("the combination would be a no-op: nothing would change"). The conflict fires whether either flag is spelled on the command line or sourced from its env var |
@@ -175,6 +176,49 @@ The hidden alias `--no-apply` on `get --save-only` is **part of the contract** �
 `repair` keeps its `gc` visible alias.
 
 **Python stale-install guard**: after a hosted redirect, `scan` / `get` use the Python crawler to inspect every matching installed package, including Poetry's out-of-tree virtualenvs and `--global-prefix`. A readable file that differs from the patch's `afterHash` emits `redirect_pypi_stale_install` in JSON `redirect.warnings[]` and human stderr. The probe changes no installed files, re-runs on idempotent scans, and falls back to persisted patch records when fresh record fetching fails. Missing/unreadable files alone do not prove staleness; lock-only checkouts stay quiet. Dry runs skip the probe. Same-run VEX excludes positively stale Python packages (qualifier-insensitive), even with `--vex-no-verify` or a healthy copy in another interpreter; if nothing remains to attest, the command exits 1 with `no_applicable_patches`. Reinstall from the rewritten lock in the affected interpreter and verify with `socket-patch vex`.
+
+### Per-run limit on new patches (`scan --max-new-patches`, v5.0)
+
+`scan --max-new-patches <N|none>` (env `SOCKET_MAX_NEW_PATCHES`, socket.yml `patches.maxNewPatches`) paces a rollout: each run adds at most N patches to packages that had none, the most critical first, and defers the rest to the next run. It applies to `scan` in hosted, vendored and agent mode, wet and `--dry-run`, and to the in-memory engine (napi `maxNewPatches`, `hosted-bundle`); `get` is explicit intent and ignores it. Design: `docs/design/staged-rollout.md` §5.
+
+**Classification.** After per-package selection, each selected `(project, purl)` row is compared with the project's **recorded view** — the merged manifest > hosted lockfile pins > vendor ledger that `updates[]` reads (§5.1):
+
+| Class | Rule | Capped | The writer gets |
+|---|---|---|---|
+| ALREADY | the recorded uuid is the selected one, or the selection does not supersede it | no | the **recorded** uuid (re-confirmed idempotently, never swapped) |
+| UPGRADE | the selection supersedes the recorded uuid (`ranking::search_result_supersedes`), or the recorded uuid is no longer offered | no | the selected uuid |
+| NEW | nothing recorded for the base purl in this project | **yes** | the selected uuid, if admitted |
+
+Supersession is judged on the by-package records the selection itself uses, so a scan with or without a cap never replaces an applied patch with an equal sibling (the tier and uuid tiebreaks and a missing date never count). When the lockfiles of a project pin a purl to several uuids, the recorded uuid is the selected one if it is among them, else the smallest. A hosted pin on a patch server that discovery does not recognize (an origin missing from `--patch-server-url`) still counts as ALREADY when a lockfile names the selected uuid, so the cap can never stall on it.
+
+**Eligibility.** A NEW row is eligible only if every check the mode can decide without writing passes: the tier filter; the agent partition (vendor-owned and not-installed packages); the vendored Bun / vlt preflight; a `granted` hosted reference with a usable purl and url; the vlt artifact preflight; the vendored-to-hosted takeover refusals; wheel metadata; and a hosted rewrite whose confirmation probe shows a lockfile edit that pins it. Ineligible rows keep their own skip reasons and never hold a slot. References are fetched for every row before the budget is spent, and `--dry-run` fetches them too, so a dry run makes exactly the wet run's decisions.
+
+**Unit and order.** The budget counts distinct **base purls** (ecosystem + name + version, qualifiers stripped, percent-decoded; qualifier twins are one package): admitting one admits all of its eligible rows and costs one slot. Eligible NEW base purls are ranked by, ascending: in-flight first (in-memory `inFlightPatches` only); severity of the selected patch (critical, high, medium, low, unknown — the worst advisory it fixes); advisory count, descending; ecosystem name; base purl (bytewise); uuid. The order is total and has no time-dependent key (publish dates still pick the patch within a package, never the package order).
+
+**Budget scope.** Disk: one budget per invocation. The project directories a hosted or vendored scan's PATHs name are visited in sorted order; each spends what is left in rank order, and a base purl admitted in an earlier directory is admitted free in a later one. `scan --json` takes one directory, so a CI job per directory gets N per directory. In memory: one budget across every project root (roots are collected, planned once, then applied). The two therefore rank a multi-root repo differently, by design.
+
+**Incomplete data.** With a finite cap, a failed batch query, or a failed detail query for a package with no recorded patch, admits no NEW row that run (they are all deferred) and adds warning `rollout_incomplete_lookup`: a missing package must not let lower-ranked ones take its slot. ALREADY and UPGRADE rows proceed as usual. A failed hosted reference lookup that could only affect NEW rows of a capped run is warning `rollout_reference_failed` (the rows are deferred) instead of a run failure.
+
+**Convergence.** The limit is stateless: run k lands the top N, run k+1 finds them recorded and lands the next N, so M waiting patches take at most ceil(M/N) *committed* runs. A newly published or re-scored more severe patch moves ahead of the queue (intended: most critical first), and low-severity patches can wait while more severe ones keep arriving. A CI job that does not commit the scan's changes never advances: there a cap means "only the top N, every run" — commit the changes (or use a PR bot), or set no cap in such jobs. A write failure after admission still spends its slot (no backfill within a run). Known limits: a dependency that moves to a new version is NEW again (its hosted pin stays with the old lock entry); a qualifier twin that lands on a later run joins its package as ALREADY / UPGRADE, uncapped.
+
+**Output.** Every successful `scan --json` result carries an additive top-level `rollout` block (MINOR), zero counts when the run planned nothing (report-only and empty scans):
+
+```json
+"rollout": {
+  "maxNewPatches": {"value": 5, "source": "flag"},
+  "counts": {"new": 5, "deferred": 9, "upgrade": 1, "already": 12},
+  "deferred": [
+    {"purl": "pkg:npm/minimist@1.2.5", "uuids": ["…"], "severity": "critical",
+     "advisoryCount": 1, "projects": [""], "rank": 6}
+  ]
+}
+```
+
+`maxNewPatches.value` is `null` for unlimited; `source` is `flag`, `env`, `file`, `default` or `cap` (the in-memory `maxNewPatchesCap` tightened it; the in-memory `maxNewPatches` option reports `flag`). `counts.new` / `counts.deferred` count base purls, `counts.upgrade` / `counts.already` count `(project, purl)` rows. `deferred[]` is in rank order: `purl` is the base purl, `uuids` the distinct selected uuids across its rows, `projects` the repo-relative project directories (`""` is the scanned directory), `rank` 1-based among eligible NEW base purls. Deferred rows are never written, downloaded or vendored: hosted mode mirrors each into `redirect.skipped[]` as `{purl, uuid, reason: "rollout_deferred", detail}`, the in-memory engine lists them in `ProjectResult.deferred[]` (`{purl, uuid, severity, rank}`) and `skipped[]`, and agent / vendored mode leave them out of `apply.patches[]` / `vendor`. Warnings (`rollout_incomplete_lookup`, `rollout_reference_failed`) go to the top-level `warnings[]`. Exit codes are unchanged: deferring is not a failure.
+
+Human output adds, when a cap is set, `Rollout: 3 of 9 new patches applied (maxNewPatches=3 from --max-new-patches); 0 upgrades, 0 already applied.` and next steps naming the deferred patches (`6 new patches deferred; commit these changes and run scan again to apply the next 3.`, `Next up: minimist@1.2.5 (critical), …`).
+
+CI recipe: `socket-patch scan --json --max-new-patches 5 | jq '.rollout.counts.deferred'`.
 
 ### Embedded VEX (`apply --vex` / `scan --vex` / `vendor --vex`)
 
@@ -1082,6 +1126,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_FORCE` | `apply --force` / `-f`, `vendor --force` / `-f`, `--update --force` | `false` | Local to `apply`, `vendor` and `--update`. |
 | `SOCKET_PATCH_VERSION` | `--update <VERSION>` | (latest) | Local to `--update`; the same pin `install.sh` and the gem launcher honor. Not one of the deprecated legacy `SOCKET_PATCH_*` trio. |
 | `SOCKET_BATCH_SIZE` | `scan --batch-size` | `500` authenticated / `100` proxy | Local to `scan`. |
+| `SOCKET_MAX_NEW_PATCHES` | `scan --max-new-patches` | (unlimited) | Local to `scan` (v5.0): a count or `none`; empty is unset, malformed exits 2. |
 | `SOCKET_SCAN_PACKAGES` | `scan --package` | (none) | Local to `scan` (v5.0); comma-separated names or purls. |
 | `SOCKET_SAVE_ONLY` | `get --save-only` | `false` | Local to `get`. |
 | `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. Both are **not yet implemented**: the flag parses (boolishly, empty-tolerant) and the command fails up front with a "not yet implemented" error, before any network or disk activity (on `rollback`, with no identifier-shaped target it instead fails "requires an identifier", equally up front). |
@@ -1530,10 +1575,24 @@ excluded before ranking for callers whose `canAccessPaidPatches` is
 false, so the winner is the best patch the account can download.
 
 `scan`'s `[UPDATE]` marker and `updates[]` use the same order
-(`ranking::batch_supersedes`): a candidate supersedes the applied patch
-only on a meaningful rung — merged over unmerged, higher severity between
-unmerged patches, or a real, strictly later publish date. The tier and
-uuid tiebreaks and a missing date never count.
+(`ranking::search_result_supersedes`, v5.0): a candidate supersedes the
+applied patch only on a meaningful rung — merged over unmerged, higher
+severity between unmerged patches, or a real, strictly later publish
+date. The tier and uuid tiebreaks and a missing date never count. Every
+mode that fetches the by-package records (hosted, vendored, agent, and
+every human run with a downloadable patch) judges this on those records,
+so `updates[]` lists exactly the UPGRADE rows the run acts on; a package
+the by-package lookup returns no offer for, and a JSON report-only run
+(which fetches no by-package records), fall back to the batch records
+(`ranking::batch_supersedes`). When the selection does not supersede the
+recorded patch, scan keeps the recorded one (v5.0): a re-scan never swaps
+an applied patch for an equal sibling.
+
+This order picks one patch **per package**. Which packages a capped scan
+patches first is a separate, cross-package order (`rollout::rollout_cmp`,
+see "Per-run limit on new patches"): severity of the selected patch, then
+advisory count, then ecosystem, base purl and uuid — never the publish
+date.
 
 #### Merge state is inferred, not reported
 
@@ -1571,8 +1630,8 @@ supplies it (the public-proxy fallback path fills it in from the
 per-package results).
 
 > **Known gap — batch responses without `publishedAt`.** `scan`'s
-> discovery (`packages[]`, the table, `updates[]`) is built from the
-> **batch** endpoint, whose response shape currently omits `publishedAt`;
+> discovery (`packages[]`, and `updates[]` on a JSON report-only run) is
+> built from the **batch** endpoint, whose response shape currently omits `publishedAt`;
 > the selection that `--apply` performs is built from the **by-package**
 > endpoint, which carries it. The two diverge wherever the date decides —
 > between merged patches, or between unmerged patches of equal severity —
@@ -1590,6 +1649,14 @@ per-package results).
 > the batch endpoint emits it.
 
 ### `jq` recipes for PR-comment bots
+
+Deferred by the per-run cap (`scan --max-new-patches`), most urgent first:
+
+```bash
+socket-patch scan --json --max-new-patches 5 | jq -r '
+  .rollout.deferred[] | "\(.rank). \(.purl) (\(.severity))"
+'
+```
 
 Applied + updated patches (envelope shape):
 
