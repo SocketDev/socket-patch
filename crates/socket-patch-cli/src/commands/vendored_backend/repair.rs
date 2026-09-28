@@ -46,6 +46,7 @@ use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
 use crate::ui::plural;
 
 /// One broken vendored unit queued for re-vendoring.
+#[derive(Clone)]
 struct Candidate {
     purl: String,
     entry: VendorEntry,
@@ -109,33 +110,7 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
         }
     }
 
-    let mut files: Vec<String> = WIRING_FILES
-        .iter()
-        .map(|file| (*file).to_string())
-        .collect();
-    files.extend(vendor::vlt_lock::vlt_importer_package_jsons(project_root).await);
-    if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {
-        for path in paths {
-            if let Some(script) =
-                socket_patch_core::utils::python_lock::script_of_lock(&path).map(str::to_string)
-            {
-                files.push(script);
-            }
-            files.push(path);
-        }
-    }
-    // The requirements planner writes a vendored pin where the original pin
-    // was — possibly inside a `-r` include — so the root requirements.txt
-    // alone would miss it (and the orphan sweep, which reuses this scan,
-    // would delete the include-referenced wheel). An unreadable include
-    // tree degrades to the root file, matching the per-file tolerance
-    // below.
-    if let Ok(includes) = socket_patch_core::vendor::requirements_include_names(project_root).await
-    {
-        files.extend(includes);
-    }
-    files.sort();
-    files.dedup();
+    let files = wiring_files(project_root).await;
     for file in files {
         // FIFO-safe: a pipe under a wiring-file name must be skipped, not
         // waited on forever in open(2).
@@ -168,6 +143,41 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
     }
     out.sort();
     out
+}
+
+/// Every wiring-bearing file name the vendor backends may rewrite, relative
+/// to `project_root`: [`WIRING_FILES`], vlt importer manifests, the Python
+/// locks the root lists (and their scripts) and the requirements `-r`
+/// include tree. Sorted and deduplicated; entries need not exist.
+async fn wiring_files(project_root: &Path) -> Vec<String> {
+    let mut files: Vec<String> = WIRING_FILES
+        .iter()
+        .map(|file| (*file).to_string())
+        .collect();
+    files.extend(vendor::vlt_lock::vlt_importer_package_jsons(project_root).await);
+    if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {
+        for path in paths {
+            if let Some(script) =
+                socket_patch_core::utils::python_lock::script_of_lock(&path).map(str::to_string)
+            {
+                files.push(script);
+            }
+            files.push(path);
+        }
+    }
+    // The requirements planner writes a vendored pin where the original pin
+    // was — possibly inside a `-r` include — so the root requirements.txt
+    // alone would miss it (and the orphan sweep, which reuses this scan,
+    // would delete the include-referenced wheel). An unreadable include
+    // tree degrades to the root file, matching the per-file tolerance
+    // below.
+    if let Ok(includes) = socket_patch_core::vendor::requirements_include_names(project_root).await
+    {
+        files.extend(includes);
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// Record one artifact that cannot be repaired. An error, so the line
@@ -714,6 +724,23 @@ impl VendoredBackend<'_> {
         }
 
         // ── Re-vendor through the shared apply engine ────────────────────
+        // Repair restores the RECORDED artifact; it never re-vendors. The
+        // engine runs with the lockfiles and ledger snapshotted and put back
+        // afterwards, and every candidate is verified against its original
+        // ledger entry, so a source that produces different bytes (a service
+        // archive re-gzipped since vendoring) can never be committed.
+        //
+        // The afterHash-verified members of a corrupt artifact are harvested
+        // first: they are patch content staging can use offline, and the
+        // move-aside below takes the artifact out of the path staging reads.
+        let candidate_records: HashMap<String, PatchRecord> = candidates
+            .iter()
+            .map(|c| (c.purl.clone(), c.record.clone()))
+            .collect();
+        let seed =
+            vendor::harvest_artifact_blobs_from(&common.cwd, &state.entries, &candidate_records)
+                .await;
+        let snapshot = snapshot_wiring(&common.cwd, &candidates).await;
         // A corrupt artifact is moved aside so the engine's
         // rebuild-on-missing path fires; it goes back if nothing replaced
         // it. A missing one has nothing to keep.
@@ -744,52 +771,66 @@ impl VendoredBackend<'_> {
         let mut engine_common = common.clone();
         engine_common.json = true;
         engine_common.silent = true;
-        let engine = VendoredBackend::new(&engine_common, Some(&service));
         let mut scratch = Envelope::new(crate::json_envelope::Command::Vendor);
-        let mut no_source = false;
-        for detached in [false, true] {
-            let records: HashMap<String, PatchRecord> = candidates
-                .iter()
-                .filter(|c| c.detached == detached)
-                .map(|c| (c.purl.clone(), c.record.clone()))
-                .collect();
-            if records.is_empty() {
-                continue;
+        let mut no_source = run_engine(
+            &engine_common,
+            Some(&service),
+            &candidates,
+            &seed,
+            req.socket_dir,
+            &mut scratch,
+        )
+        .await;
+
+        // A service archive that is not the recorded artifact: undo what
+        // the engine wired for it and rebuild locally (deterministic), then
+        // verify again.
+        let mut retry: Vec<Candidate> = Vec::new();
+        for c in &candidates {
+            let from_service = scratch.events.iter().any(|e| {
+                e.purl.as_deref() == Some(c.purl.as_str())
+                    && e.error_code.as_deref() == Some("vendor_prebuilt_downloaded")
+            });
+            if from_service
+                && !keeps_identity(&check_vendored_artifact(&common.cwd, &c.entry, &c.record).await)
+            {
+                undo_candidate(&common.cwd, c, &snapshot).await;
+                remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
+                retry.push(c.clone());
             }
-            let manifest = records_manifest(records);
-            // The ledger as the previous group left it.
-            let ledger = load_state(&common.cwd).await;
-            let applied = engine
-                .apply(
-                    ApplyRequest {
-                        manifest: &manifest,
-                        socket_dir: req.socket_dir,
-                        ledger,
-                        seed: HashMap::new(),
-                        detached,
-                        force: false,
-                        prior: None,
-                    },
-                    &mut scratch,
-                )
-                .await;
-            no_source |= applied.is_err();
         }
-        // The engine persisted each rebuilt entry; post-verify against the
-        // ledger as it is now.
+        if !retry.is_empty() {
+            scratch
+                .events
+                .retain(|e| !retry.iter().any(|c| e.purl.as_deref() == Some(c.purl.as_str())));
+            no_source |= run_engine(
+                &engine_common,
+                None,
+                &retry,
+                &seed,
+                req.socket_dir,
+                &mut scratch,
+            )
+            .await;
+        }
         let mut state = load_state(&common.cwd).await.unwrap_or(state);
 
         for c in candidates {
             let kept = aside.remove(&c.purl);
             let outcome = EngineOutcome::of(&scratch, &c.purl);
             forward_advisories(env, common, &scratch, &c.purl);
+            // Verified against the ORIGINAL entry: the recorded identity is
+            // the target, never a fingerprint this run just wrote.
+            let mut health = check_vendored_artifact(&common.cwd, &c.entry, &c.record).await;
+            // The entry to keep: the backend's (a tagged cargo rebuild
+            // re-records its wiring) when it rebuilt the recorded artifact,
+            // else the original.
             let mut entry = state
                 .entries
                 .get(&c.purl)
+                .filter(|e| e.uuid == c.entry.uuid)
                 .cloned()
                 .unwrap_or_else(|| c.entry.clone());
-            let mut health = check_vendored_artifact(&common.cwd, &entry, &c.record).await;
-            let mut inventory_refreshed = false;
             // A dir-shaped rebuild whose PATCHED members verify but whose
             // tree differs from an inventory the backend carried over
             // unchanged (the cargo backend records none of its own): the
@@ -797,8 +838,7 @@ impl VendoredBackend<'_> {
             // service's prebuilt artifact). Failing would delete a verified
             // rebuild and re-fail every later repair, so refresh the
             // inventory from the rebuild instead, loudly.
-            if entry.artifact.file_inventory.is_some()
-                && entry.artifact.file_inventory == c.entry.artifact.file_inventory
+            if c.entry.artifact.file_inventory.is_some()
                 && matches!(&health, ArtifactHealth::Corrupt { reason }
                     if reason == "vendor_inventory_mismatch")
             {
@@ -840,7 +880,6 @@ impl VendoredBackend<'_> {
                         }
                         entry = refreshed;
                         health = ArtifactHealth::Healthy;
-                        inventory_refreshed = true;
                     }
                 }
             }
@@ -858,23 +897,6 @@ impl VendoredBackend<'_> {
                         record_warning(env, &c.purl, &w, common);
                     }
                     let _ = remove_tree(kept).await;
-                }
-                // A carried inventory that the re-vendor replaced: the
-                // entry was built elsewhere (the patch service) and this
-                // run's source produced a different, member-verified tree.
-                if !inventory_refreshed
-                    && c.entry.artifact.file_inventory.is_some()
-                    && entry.artifact.file_inventory != c.entry.artifact.file_inventory
-                {
-                    record_warning(
-                        env,
-                        &c.purl,
-                        &VendorWarning::new(
-                            "vendor_inventory_refreshed",
-                            INVENTORY_REFRESHED_DETAIL,
-                        ),
-                        common,
-                    );
                 }
                 if !quiet {
                     println!(
@@ -894,11 +916,14 @@ impl VendoredBackend<'_> {
                 repaired += 1;
                 continue;
             }
+            // Not the recorded artifact: put back the wiring and ledger entry
+            // the engine may have rewritten for it.
+            undo_candidate(&common.cwd, &c, &snapshot).await;
             if produced {
                 // The re-vendor did not reproduce the recorded artifact
                 // (e.g. a tampered ledger sha): remove it rather than leave
                 // unverifiable bytes behind.
-                remove_vendor_dir(&common.cwd, &entry.ecosystem, &entry.uuid).await;
+                remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
                 if let Some((_, kept)) = &kept {
                     let _ = remove_tree(kept).await;
                 }
@@ -978,6 +1003,110 @@ const INVENTORY_REFRESHED_DETAIL: &str = "the re-vendored artifact's patched fil
      different source, such as the patch service's prebuilt artifact); the inventory was \
      refreshed from the verified rebuild — run `socket-patch vendor` to restore the \
      service-built tree";
+
+/// Run the vendor engine over `candidates` (manifest-owned and detached
+/// groups separately) into `scratch`. `service: None` is a build-only run.
+/// `true` when staging obtained no patch content for a group.
+async fn run_engine(
+    engine_common: &GlobalArgs,
+    service: Option<&vendor::VendorServiceConfig>,
+    candidates: &[Candidate],
+    seed: &HashMap<String, Vec<u8>>,
+    socket_dir: &Path,
+    scratch: &mut Envelope,
+) -> bool {
+    let engine = VendoredBackend::new(engine_common, service);
+    let mut no_source = false;
+    for detached in [false, true] {
+        let records: HashMap<String, PatchRecord> = candidates
+            .iter()
+            .filter(|c| c.detached == detached)
+            .map(|c| (c.purl.clone(), c.record.clone()))
+            .collect();
+        if records.is_empty() {
+            continue;
+        }
+        let manifest = records_manifest(records);
+        let applied = engine
+            .apply(
+                ApplyRequest {
+                    manifest: &manifest,
+                    socket_dir,
+                    ledger: load_state(&engine_common.cwd).await,
+                    seed: seed.clone(),
+                    detached,
+                    force: false,
+                    prior: None,
+                },
+                scratch,
+            )
+            .await;
+        no_source |= applied.is_err();
+    }
+    no_source
+}
+
+/// The bytes of each candidate's recorded wiring files — what a re-vendor
+/// may rewrite for it. `None` records a file that did not exist.
+async fn snapshot_wiring(cwd: &Path, candidates: &[Candidate]) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut rels: Vec<String> = Vec::new();
+    for c in candidates {
+        rels.extend(c.entry.wiring.iter().map(|w| w.file.clone()));
+    }
+    rels.sort();
+    rels.dedup();
+    let mut out = Vec::with_capacity(rels.len());
+    for rel in rels {
+        let path = cwd.join(&rel);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.is_file() => {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    out.push((path, Some(bytes)));
+                }
+            }
+            Ok(_) => {}
+            Err(_) => out.push((path, None)),
+        }
+    }
+    out
+}
+
+/// Whether a rebuilt artifact still is the recorded one: healthy against
+/// the original entry, or (dir-shaped) its patched members verify and only
+/// the recorded whole-tree inventory differs — the inventory-refresh case.
+fn keeps_identity(health: &ArtifactHealth) -> bool {
+    match health {
+        ArtifactHealth::Healthy => true,
+        ArtifactHealth::Corrupt { reason } => reason == "vendor_inventory_mismatch",
+        _ => false,
+    }
+}
+
+/// Undo what a re-vendor may have written for `c`: its recorded wiring
+/// files go back to their snapshotted bytes and its ledger entry to the
+/// original. Other candidates' files are left alone.
+async fn undo_candidate(cwd: &Path, c: &Candidate, snapshot: &[(PathBuf, Option<Vec<u8>>)]) {
+    let wired: HashSet<PathBuf> = c.entry.wiring.iter().map(|w| cwd.join(&w.file)).collect();
+    for (path, bytes) in snapshot.iter().filter(|(p, _)| wired.contains(p)) {
+        if tokio::fs::read(path).await.ok().as_ref() == bytes.as_ref() {
+            continue;
+        }
+        match bytes {
+            Some(bytes) => {
+                let _ = tokio::fs::write(path, bytes).await;
+            }
+            None => {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+    }
+    if let Ok(mut state) = load_state(cwd).await {
+        if state.entries.get(&c.purl) != Some(&c.entry) {
+            state.entries.insert(c.purl.clone(), c.entry.clone());
+            let _ = vendor::save_state(cwd, &state).await;
+        }
+    }
+}
 
 /// One candidate's outcome in the engine's scratch envelope.
 struct EngineOutcome {
