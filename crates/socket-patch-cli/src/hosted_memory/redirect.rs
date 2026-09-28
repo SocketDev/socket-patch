@@ -178,7 +178,7 @@ fn file_ecosystem(rel: &str) -> Option<&'static str> {
         | "pyproject.toml" | "hatch.toml" => "pypi",
         "Cargo.toml" | "Cargo.lock" | "config.toml" | "config" => "cargo",
         "composer.lock" => "composer",
-        "nuget.config" | "packages.lock.json" => "nuget",
+        "nuget.config" | "NuGet.config" | "NuGet.Config" | "packages.lock.json" => "nuget",
         "Gemfile" | "Gemfile.lock" | "gems.rb" | "gems.locked" => "gem",
         "go.mod" | "go.sum" => "golang",
         "pom.xml" | "maven.config" | "checksums.sha256" => "maven",

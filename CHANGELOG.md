@@ -914,6 +914,16 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **NuGet redirects and vendoring edit the config NuGet actually reads.**
+  Hosted mode only looked for `nuget.config`, and vendored mode missed
+  `NuGet.config`, so on a case-sensitive filesystem a project configured
+  through `NuGet.config` or `NuGet.Config` got a NEW `nuget.config` that
+  shadowed it (NuGet reads that spelling first), losing the project's own
+  sources, mappings and credentials. Both modes now edit the first of
+  `nuget.config`, `NuGet.config`, `NuGet.Config` present, in NuGet's own
+  order, and record that file name in their ledgers; `nuget.config` is
+  created only when the project has none.
+
 - **Hosted NuGet redirects to a local http patch server restore on .NET
   9+.** NuGet 6.12+ refuses plain-http sources (NU1302), so a
   `--patch-server-url http://localhost:…` redirect needed a hand edit. A

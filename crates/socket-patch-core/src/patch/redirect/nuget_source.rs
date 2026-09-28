@@ -7,9 +7,12 @@
 //! the lock pins the patched contentHash (NU1403). Entries land after the
 //! section's last `<clear/>`, or right after its open tag when it has none.
 
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
+
+use crate::vendor::nuget_config::CONFIG_NAMES;
 
 /// `<clear/>` in either form NuGet accepts (self-closing, or an empty
 /// open/close pair), any whitespace.
@@ -83,10 +86,20 @@ fn is_http_loopback(url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// The project's nuget.config to edit: the first of NuGet's per-directory
+/// spellings present in `files` (the order NuGet itself reads them in), so
+/// the edit lands in the file NuGet reads instead of a new `nuget.config`
+/// shadowing it on a case-sensitive filesystem. `nuget.config` when the
+/// project has none (the rewriter then creates it).
+pub(super) fn config_rel<V>(files: &BTreeMap<String, V>) -> &'static str {
+    CONFIG_NAMES
+        .into_iter()
+        .find(|name| files.contains_key(*name))
+        .unwrap_or(CONFIG_NAMES[0])
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::super::{rewrite_registry_redirect, DepOverride};
     use super::*;
 
@@ -147,6 +160,47 @@ mod tests {
             .rfind("<add key=\"socket-patch-")
             .expect("socket source");
         assert!(socket > clear, "{out}");
+    }
+
+    #[test]
+    fn config_rel_follows_nugets_read_order() {
+        let files = |names: &[&str]| -> BTreeMap<String, ()> {
+            names.iter().map(|n| (n.to_string(), ())).collect()
+        };
+        assert_eq!(config_rel(&files(&[])), "nuget.config");
+        assert_eq!(config_rel(&files(&["NuGet.Config"])), "NuGet.Config");
+        assert_eq!(
+            config_rel(&files(&["NuGet.Config", "NuGet.config"])),
+            "NuGet.config"
+        );
+        assert_eq!(
+            config_rel(&files(&["NuGet.Config", "nuget.config", "NuGet.config"])),
+            "nuget.config"
+        );
+    }
+
+    /// With several spellings present only the one NuGet reads is edited,
+    /// and no `nuget.config` is created beside it.
+    #[test]
+    fn only_the_config_nuget_reads_is_rewritten() {
+        let case = "spelling-mixed-case";
+        let mut files = BTreeMap::new();
+        files.insert(
+            "NuGet.config".to_string(),
+            fixture(case, "input/NuGet.config"),
+        );
+        files.insert(
+            "NuGet.Config".to_string(),
+            "<configuration />\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides(case));
+        let changed: Vec<&str> = r.files.keys().map(String::as_str).collect();
+        assert_eq!(changed, ["NuGet.config"]);
+        assert!(r
+            .edits
+            .iter()
+            .filter(|e| e.kind == "redirect_nuget_source")
+            .all(|e| e.path == "NuGet.config" && e.action == "rewritten"));
     }
 
     #[test]

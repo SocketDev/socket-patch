@@ -1140,10 +1140,13 @@ struct ConfigEdit {
     mapping_fragment: String,
 }
 
-/// Resolve the existing `nuget.config` (prefer lowercase `nuget.config`, then
-/// `NuGet.Config`), or `None` when the project has none.
+/// Resolve the existing config: the first of NuGet's per-directory spellings
+/// present, in the order NuGet reads them (`nuget.config`, `NuGet.config`,
+/// `NuGet.Config`), or `None` when the project has none. Editing any other
+/// spelling, or creating `nuget.config` beside one, would wire a file NuGet
+/// never reads (or shadow the user's config on a case-sensitive filesystem).
 async fn existing_config_path(project_root: &Path) -> Option<PathBuf> {
-    for name in ["nuget.config", "NuGet.Config"] {
+    for name in super::nuget_config::CONFIG_NAMES {
         let p = project_root.join(name);
         // Answers from a group-committed run's capture: a config an earlier
         // package of this run created is not on disk yet.
@@ -2533,6 +2536,61 @@ mod tests {
             orig_cfg,
             "pre-existing nuget.config restored byte-identically"
         );
+    }
+
+    /// A project whose config is spelled `NuGet.config` (with a later
+    /// `NuGet.Config` NuGet never reads beside it) is wired in place: no
+    /// `nuget.config` is created to shadow it, the ledger names the file
+    /// edited, and revert restores it byte-identically. Linux only: the
+    /// three spellings are one file on a case-insensitive filesystem.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn existing_config_spelling_is_edited_in_place() {
+        let orig_cfg = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                        <configuration>\n\
+                        \x20 <packageSources>\n\
+                        \x20   <add key=\"corp\" value=\"https://nuget.corp.example/v3/index.json\" />\n\
+                        \x20 </packageSources>\n\
+                        </configuration>\n";
+        let unread = "<configuration />\n";
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        tokio::fs::write(root.join("NuGet.config"), orig_cfg)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("NuGet.Config"), unread)
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert!(!root.join("nuget.config").exists(), "no shadowing config");
+        let wired = tokio::fs::read_to_string(root.join("NuGet.config"))
+            .await
+            .unwrap();
+        assert!(wired.contains(&format!("socket-patch-{UUID}")), "{wired}");
+        assert!(wired.contains("<packageSource key=\"corp\">"), "{wired}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("NuGet.Config"))
+                .await
+                .unwrap(),
+            unread
+        );
+        assert_eq!(entry.wiring[0].file, "NuGet.config");
+        assert_eq!(entry.wiring[0].action, WiringAction::Rewritten);
+        assert_eq!(entry.wiring[1].file, "NuGet.config");
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("NuGet.config"))
+                .await
+                .unwrap(),
+            orig_cfg
+        );
+        assert!(!root.join("nuget.config").exists());
     }
 
     #[tokio::test]

@@ -651,6 +651,81 @@ async fn nuget_hosted_wires_source_mapping_and_lock_hash() {
         .unwrap();
 }
 
+/// A project whose only config is spelled `NuGet.Config` (Visual Studio's
+/// spelling) is wired in place: on a case-sensitive filesystem a new
+/// `nuget.config` would shadow it (NuGet reads `nuget.config` first) and
+/// drop the user's sources. The ledger names the file actually edited.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial]
+async fn nuget_hosted_edits_existing_config_spelling_in_place() {
+    const UUID: &str = "c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4";
+    const PURL: &str = "pkg:nuget/Newtonsoft.Json@13.0.3";
+    let index_url = format!("http://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/index.json");
+    let url = format!(
+        "http://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+    );
+    let server = MockServer::start().await;
+    mock_view(&server, UUID, PURL).await;
+    mock_reference(
+        &server,
+        UUID,
+        PURL,
+        &url,
+        serde_json::json!({ "sha512": "sha512-NUGETPATCHEDspellingAA==" }),
+        serde_json::json!({
+            "kind": "nuget-v3",
+            "indexUrl": index_url,
+            "identifiers": {
+                "name": "Newtonsoft.Json",
+                "version": "13.0.3",
+                "nugetIdLower": "newtonsoft.json",
+                "nugetVersionNorm": "13.0.3",
+            }
+        }),
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("NuGet.Config"),
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="corp-feed" value="https://nuget.corp.example/v3/index.json" />
+  </packageSources>
+</configuration>
+"#,
+    )
+    .unwrap();
+
+    let code =
+        socket_patch_cli::commands::get::run(get_hosted_args(UUID, tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "get <uuid> --mode hosted (nuget) should succeed");
+
+    assert!(
+        !tmp.path().join("nuget.config").exists(),
+        "no nuget.config may be created to shadow NuGet.Config"
+    );
+    let config = std::fs::read_to_string(tmp.path().join("NuGet.Config")).unwrap();
+    assert!(
+        config.contains(&format!(
+            r#"<add key="socket-patch-{UUID}" value="{index_url}" />"#
+        )) && config.contains(r#"<packageSource key="corp-feed">"#),
+        "NuGet.Config wired in place, keeping the corp feed; got:\n{config}"
+    );
+    let ledger = read_ledger(tmp.path());
+    assert!(
+        ledger["edits"].as_array().unwrap().iter().any(|e| {
+            e["path"] == "NuGet.Config"
+                && e["kind"] == "redirect_nuget_source"
+                && e["action"] == "rewritten"
+        }),
+        "the ledger names the edited NuGet.Config; got:\n{ledger}"
+    );
+}
+
 /// The manifest-less VEX steps for a nuget hosted checkout `get` wired
 /// (`http://patch.test` is the configured patch-server origin; nothing is
 /// installed, so the lock's re-pinned `contentHash` is the evidence):

@@ -281,8 +281,20 @@ const REGISTRY_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<conf
 /// `dotnet restore` writing packages.lock.json and extracting the package
 /// into `store`. Returns the registry `(nuget.config, packages.lock.json)`.
 fn restore_fixture(dn: &Dotnet, sb: &Sandbox, dir: &Path, store: &Path) -> (String, String) {
+    restore_fixture_with(dn, sb, dir, store, "nuget.config", REGISTRY_CONFIG)
+}
+
+/// [`restore_fixture`] with the registry config under `config_name`.
+fn restore_fixture_with(
+    dn: &Dotnet,
+    sb: &Sandbox,
+    dir: &Path,
+    store: &Path,
+    config_name: &str,
+    config: &str,
+) -> (String, String) {
     std::fs::write(dir.join("app.csproj"), dn.csproj()).unwrap();
-    std::fs::write(dir.join("nuget.config"), REGISTRY_CONFIG).unwrap();
+    std::fs::write(dir.join(config_name), config).unwrap();
     dn.restore_ok(sb, dir, store, &[], "fixture restore from nuget.org");
     let lock = std::fs::read_to_string(dir.join("packages.lock.json"))
         .expect("the fixture restore writes packages.lock.json");
@@ -292,7 +304,7 @@ fn restore_fixture(dn: &Dotnet, sb: &Sandbox, dir: &Path, store: &Path) -> (Stri
     );
     let license = pkg_dir(store).join(FILE_KEY);
     assert!(license.is_file(), "{} missing", license.display());
-    (REGISTRY_CONFIG.to_string(), lock)
+    (config.to_string(), lock)
 }
 
 fn pkg_dir(store: &Path) -> PathBuf {
@@ -303,8 +315,13 @@ fn pkg_dir(store: &Path) -> PathBuf {
 /// config, lock and `.socket/` — never `obj/` or a package cache — then
 /// drop the manifest and blobs (what a hosted / vendored checkout commits).
 fn fresh_checkout(from: &Path, to: &Path) {
-    for f in ["app.csproj", "nuget.config", "packages.lock.json"] {
+    for f in ["app.csproj", "packages.lock.json"] {
         std::fs::copy(from.join(f), to.join(f)).unwrap_or_else(|e| panic!("copy {f}: {e}"));
+    }
+    for f in ["nuget.config", "NuGet.config", "NuGet.Config"] {
+        if from.join(f).is_file() {
+            std::fs::copy(from.join(f), to.join(f)).unwrap_or_else(|e| panic!("copy {f}: {e}"));
+        }
     }
     copy_tree(&from.join(".socket"), &to.join(".socket"));
     strip_manifest(to);
@@ -815,6 +832,112 @@ fn nuget_hosted_dotnet_restore_then_manifestless_vex() {
         &patched,
         &registry,
         Some(&uri),
+    );
+}
+
+/// A `NuGet.Config` (Visual Studio's spelling) that starts its sources with
+/// `<clear/>`: the hosted rewrite must edit it in place (a new
+/// `nuget.config` would shadow it on Linux) and land the Socket source and
+/// mapping after the clear, or the locked restore fails NU1100 / NU1403.
+#[test]
+#[ignore = "real .NET SDK + nuget.org: run with --ignored (CI e2e matrix pins each SDK major)"]
+fn nuget_hosted_dotnet_restore_title_case_config_with_clear() {
+    const CONFIG_NAME: &str = "NuGet.Config";
+    const CLEARED_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  \
+        <packageSources>\n    <clear />\n    \
+        <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+        </packageSources>\n  <packageSourceMapping>\n    <clear />\n    \
+        <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    \
+        </packageSource>\n  </packageSourceMapping>\n</configuration>\n";
+    let sb = Sandbox::new();
+    let Some(dn) = Dotnet::probe("hosted-clear", &sb) else {
+        return;
+    };
+    let sdk = dn.version.clone();
+    let fixture = sb.dir("fixture");
+    let store_fx = sb.dir("store-fixture");
+    restore_fixture_with(&dn, &sb, &fixture, &store_fx, CONFIG_NAME, CLEARED_CONFIG);
+
+    let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(HOSTED_UUID, &pristine, &patched, Some(&nupkg));
+    let uri = backend.uri();
+
+    let (code, env, stderr) = socket_patch(
+        &fixture,
+        &store_fx,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake-token",
+            "--patch-server-url",
+            &uri,
+        ],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "SDK {sdk} scan --mode hosted: {env:#}\n{stderr}"
+    );
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let listing: Vec<String> = std::fs::read_dir(&fixture)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.eq_ignore_ascii_case("nuget.config"))
+        .collect();
+    assert_eq!(listing, [CONFIG_NAME], "no second config file is created");
+    let config = std::fs::read_to_string(fixture.join(CONFIG_NAME)).unwrap();
+    let socket_key = format!("<add key=\"socket-patch-{HOSTED_UUID}\"");
+    assert!(
+        config.find("<clear />").expect("the clear is kept")
+            < config
+                .find(&socket_key)
+                .expect("the Socket source is added"),
+        "the Socket source lands after the <clear/>: {config}"
+    );
+    let ledger: Value = serde_json::from_slice(
+        &std::fs::read(fixture.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ledger["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == CONFIG_NAME && e["kind"] == "redirect_nuget_source"),
+        "the ledger names {CONFIG_NAME}: {ledger:#}"
+    );
+
+    let checkout = sb.dir("checkout");
+    fresh_checkout(&fixture, &checkout);
+    let store_co = sb.dir("store-checkout");
+    dn.restore_ok(
+        &sb,
+        &checkout,
+        &store_co,
+        &["--locked-mode"],
+        "hosted fresh restore (NuGet.Config + <clear/>)",
+    );
+    assert_eq!(
+        std::fs::read(pkg_dir(&store_co).join(FILE_KEY)).unwrap(),
+        patched,
+        "SDK {sdk}: the hosted restore installed the PATCHED {FILE_KEY}"
+    );
+    assert!(
+        backend.hits(&format!("/{NUPKG_NAME}")) >= 1,
+        "SDK {sdk}: the nupkg came from the Socket feed stand-in"
     );
 }
 

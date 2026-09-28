@@ -5301,13 +5301,14 @@ fn rewrite_nuget(
     if nuget.is_empty() {
         return;
     }
+    let config_rel = nuget_source::config_rel(files);
     let mut config = files
-        .get("nuget.config")
+        .get(config_rel)
         .cloned()
         .unwrap_or_else(default_nuget_config);
     // A config this run authors from scratch records its source edits as
     // `added` — the spelling every other rewriter uses for a created file.
-    let source_action = if files.contains_key("nuget.config") {
+    let source_action = if files.contains_key(config_rel) {
         "rewritten"
     } else {
         "added"
@@ -5376,7 +5377,7 @@ fn rewrite_nuget(
                 result.warnings.push(RewriteWarning {
                     code: "redirect_nuget_config_unwritable".into(),
                     detail: format!(
-                        "nuget.config has no <configuration> element to wire {} into; \
+                        "{config_rel} has no <configuration> element to wire {} into; \
                          not redirected",
                         dep.name
                     ),
@@ -5386,7 +5387,7 @@ fn rewrite_nuget(
             config = updated;
             config_changed = true;
             result.edits.push(FileEdit {
-                path: "nuget.config".into(),
+                path: config_rel.into(),
                 kind: "redirect_nuget_source".into(),
                 action: source_action.into(),
                 key: Some(reg.clone()),
@@ -5449,7 +5450,7 @@ fn rewrite_nuget(
     }
 
     if config_changed {
-        result.files.insert("nuget.config".into(), config);
+        result.files.insert(config_rel.into(), config);
     }
     if lock_changed {
         if let Some(lock_val) = lock {
