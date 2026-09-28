@@ -25,7 +25,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
-use super::pnpm_lock_legacy::PnpmLockGrammar;
+use crate::formats::pnpm::PnpmLockGrammar;
 use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
@@ -215,7 +215,7 @@ pub(crate) async fn detect_npm_lock_flavor(
         //    anything else refuses with the sniff's version-aware remedy.
         if exists(PNPM_LOCK).await {
             let text = read_lock(project_root, PNPM_LOCK).await?;
-            match pnpm_lock_legacy::sniff_lock_grammar(&text) {
+            match crate::formats::pnpm::sniff_lock_grammar(&text) {
                 Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
                 Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
                     break 'flavor NpmLockFlavor::PnpmLegacy
@@ -852,9 +852,9 @@ mod lock_text_refusal_tests {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn probe_lockfile_names_match_the_shared_npm_family_table() {
-        // Drift guard: the probe's wiring families and the shared
-        // constants::npm_family table must agree on which file names the
+    fn probe_lockfile_names_match_the_format_registry() {
+        // Drift guard: the probe's wiring families and the format
+        // registry's npm PROBE rows must agree on which file names the
         // vendor probe recognizes. A new lockfile spelling added in one
         // place must show up in the other (and in every other consumer's
         // guard test) instead of drifting silently.
@@ -863,7 +863,7 @@ mod tests {
             .flat_map(|(_, names)| names.iter().copied())
             .collect();
         from_families.sort_unstable();
-        let mut from_table = crate::constants::npm_family::names_with(|r| r.vendor_probe);
+        let mut from_table = crate::formats::registry::probe_paths("npm");
         from_table.sort_unstable();
         assert_eq!(from_families, from_table);
     }

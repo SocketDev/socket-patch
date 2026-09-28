@@ -1,7 +1,9 @@
-//! Read model of a Bundler lockfile (`Gemfile.lock` / `gems.locked`),
-//! shared by every reader of one: the lock inventory (the registry gems a
-//! lock resolves, their `CHECKSUMS` pins and remotes) and lockfile discovery
-//! (`vex::discover::gem`: the Socket-wired `GEM` / `PATH` sections). One
+//! A Bundler lockfile (`Gemfile.lock` / `gems.locked`): the ONE read model
+//! of the format, shared by every reader of one: the lock inventory
+//! ([`GemfileLock::entries`]: the registry gems a lock resolves, their
+//! `CHECKSUMS` pins and remotes), ledger recovery's remote set and lockfile
+//! discovery (`vex::discover::gem`: the Socket-wired `GEM` / `PATH`
+//! sections). One
 //! parse means both agree on which section a spec belongs to, which remote
 //! serves it and which checksum pins it.
 //!
@@ -16,10 +18,15 @@
 //! section at all) is collected in [`GemfileLock::problems`] for the
 //! readers that must refuse such a lock.
 
+pub(crate) mod hosted;
+
 use std::collections::{BTreeSet, HashMap};
 
 use crate::utils::digest::sha256_hex;
-use crate::vendor::lock_inventory::LockIntegrity;
+use crate::utils::purl::simple_purl;
+use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry, SourceKind};
+
+use super::LockModel;
 
 /// The Bundler lockfiles, legacy spelling first: `Gemfile.lock` and
 /// `gems.locked` (what bundler writes instead when the manifest is
@@ -141,6 +148,71 @@ impl<'t> GemfileLock<'t> {
         self.checksum(name, token)
             .map(|sha| LockIntegrity::Sha256Hex(sha.to_string()))
     }
+}
+
+impl<'t> GemfileLock<'t> {
+    /// Parse a lock text ([`parse`]).
+    pub fn parse(text: &'t str) -> Self {
+        parse(text)
+    }
+
+    /// The registry inventory: `GEM`-section `specs:` entries plus the
+    /// bundler >= 2.6 `CHECKSUMS` sha256 pins when present (older locks stay
+    /// discovery-only). Platform-suffixed specs are skipped (platform gems
+    /// are unsupported for vendoring). Each spec resolves against its OWN
+    /// section's remote (bundler >= 2 emits one GEM section per source); a
+    /// section with several distinct remotes (a legacy bundler 1.x
+    /// multisource lock) leaves its specs without a resolved URL, fail
+    /// closed. What bundler would refuse (`problems`) still inventories
+    /// whatever parsed. `None` when nothing is inventoried.
+    pub fn entries(&self) -> Option<Vec<LockfileEntry>> {
+        let gem_sections: Vec<&Section<'_>> = self.gem_sections().collect();
+        let mut out = Vec::new();
+        for section in &gem_sections {
+            let remotes: Vec<&str> = section.remote_bases().collect();
+            for spec in section.specs.iter().filter_map(|line| line.parsed) {
+                if spec.platform.is_some() {
+                    continue;
+                }
+                let Some(purl) = simple_purl("gem", spec.name, spec.version) else {
+                    continue;
+                };
+                let (name, version) = (spec.name, spec.version);
+                let integrity = self.integrity(name, version).unwrap_or(LockIntegrity::None);
+                let resolved = match remotes.as_slice() {
+                    [base] => gem_download_url(base, name, version),
+                    // No remote (a missing `remote:` line defaults to rubygems.org
+                    // ONLY when the whole lock has one remote-less GEM section —
+                    // the pre-multisource shape) or several remotes: fail closed.
+                    [] if gem_sections.len() == 1 => {
+                        gem_download_url("https://rubygems.org", name, version)
+                    }
+                    _ => None,
+                };
+                out.push(LockfileEntry {
+                    ecosystem: "gem",
+                    source_kind: SourceKind::Unspecified,
+                    purl,
+                    resolved,
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    integrity,
+                });
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+impl LockModel for GemfileLock<'_> {
+    const FORMAT: &'static str = "Gemfile.lock";
+}
+
+/// Where a rubygems-compatible registry at `base` (no trailing `/`) serves
+/// `name`-`version`'s `.gem` — the inventory's resolved URL and ledger
+/// recovery's fetch URL. `None` for a non-http(s) base.
+pub(crate) fn gem_download_url(base: &str, name: &str, version: &str) -> Option<String> {
+    http_url(&format!("{base}/downloads/{name}-{version}.gem"))
 }
 
 /// Parse a Bundler lock (see the module docs).

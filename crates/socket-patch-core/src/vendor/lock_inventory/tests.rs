@@ -2419,7 +2419,7 @@ fn pnpm_resolution_tokens_cover_maps_the_grammar_refuses() {
     let lock = format!(
         "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      tarball: {url}\n      nested:\n        a: b\n\n  y@1.0.0:\n    resolution: {{integrity: sha512-a}}\n    resolution: {{tarball: '{url}'}}\n\n  z@1.0.0:\n    resolution: {{integrity: sha512-z,\n      tarball: \"{url}\"}}\n\n  ok@1.0.0:\n    resolution: {{integrity: sha512-ok}}\n"
     );
-    let packages = super::pnpm::pnpm_packages(&lock);
+    let packages = crate::formats::pnpm::pnpm_packages(&lock);
     let by_key = |key: &str| packages.iter().find(|p| p.key == key).unwrap();
     for key in ["x@1.0.0", "y@1.0.0", "z@1.0.0"] {
         let package = by_key(key);

@@ -16,7 +16,7 @@ use crate::utils::fs::{
     read_regular_to_bytes, read_regular_to_string, read_regular_to_string_sync,
 };
 use crate::vendor::npm_flavor::NpmLockFlavor;
-use crate::vendor::pnpm_lock_legacy::{sniff_lock_grammar, PnpmLockGrammar};
+use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
 use crate::vendor::VendorWarning;
 
 /// One in-memory file.

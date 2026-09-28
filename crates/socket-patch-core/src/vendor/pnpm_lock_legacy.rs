@@ -73,9 +73,12 @@ use super::npm_common::{
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
     apply_pkg_override, check_lock_override, classify_pkg_override, commit_surfaces, drifted,
-    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line,
-    revert_overrides_line, revert_pkg_record, section_bounds, split_lines, value_lines,
-    vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
+    guard_unwired_revert, lines_value, overrides_record, revert_overrides_line,
+    revert_pkg_record, value_lines, vendor_value_is_for, KIND_LOCK_OVERRIDES,
+};
+use crate::formats::pnpm::{sniff_lock_grammar, PnpmLock, PnpmLockGrammar};
+use crate::formats::pnpm::lines::{
+    next_block, parse_key_line, section_bounds, split_lines, yaml_key, yaml_key_like,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -161,67 +164,6 @@ pub fn normalize_canonical_root(path: &str) -> String {
         path.replace('\\', "/")
     } else {
         path.to_string()
-    }
-}
-
-// ───────────────────────────── grammar sniff ──────────────────────────────
-
-/// Which pnpm lock grammar a `pnpm-lock.yaml` head declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PnpmLockGrammar {
-    /// `lockfileVersion: '9.0'` — the [`super::pnpm_lock`] backend.
-    V9,
-    /// `lockfileVersion: 5.4` (pnpm 7, bare float spelling).
-    V54,
-    /// `lockfileVersion: '6.0'` (pnpm 8).
-    V60,
-}
-
-/// The full vendor allowlist sniff (5.4 / 6.0 / 9.0) the flavor router
-/// uses; anything else refuses with a version-aware remedy: pre-allowlist
-/// versions (pnpm <= 6's 5.x line) are fixed by upgrading pnpm, but a
-/// FUTURE version means the user's pnpm already outgrew this build —
-/// looping them back to "re-lock with pnpm >= 9" would hand them the lock
-/// they have.
-pub(crate) fn sniff_lock_grammar(text: &str) -> Result<PnpmLockGrammar, String> {
-    let version = text
-        .lines()
-        .take(5)
-        .find_map(|line| line.strip_prefix("lockfileVersion:"))
-        .map(|rest| rest.trim().trim_matches(['\'', '"']).to_string());
-    match version.as_deref() {
-        Some("9.0") => Ok(PnpmLockGrammar::V9),
-        Some("5.4") => Ok(PnpmLockGrammar::V54),
-        Some("6.0") => Ok(PnpmLockGrammar::V60),
-        Some(v) => {
-            let major = v.split('.').next().and_then(|m| m.parse::<u32>().ok());
-            Err(match major {
-                Some(m) if m < 9 => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; supported versions are 5.4 \
-                     (pnpm 7), 6.0 (pnpm 8), and 9.0 (pnpm >= 9) — re-lock with pnpm >= 9"
-                ),
-                _ => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; this socket-patch build supports \
-                     lockfileVersions 5.4, 6.0, and 9.0 — re-lock with a pnpm release that \
-                     emits one of them, or update socket-patch"
-                ),
-            })
-        }
-        None => Err(format!(
-            "{PNPM_LOCK} has no lockfileVersion in its head; supported versions are 5.4, \
-             6.0, and 9.0 — re-lock with pnpm >= 9"
-        )),
-    }
-}
-
-impl PnpmLockGrammar {
-    /// Human name for diagnostics (`pnpm 7 (lockfileVersion 5.4)`).
-    fn describe(self) -> &'static str {
-        match self {
-            PnpmLockGrammar::V9 => "pnpm >= 9 (lockfileVersion 9.0)",
-            PnpmLockGrammar::V54 => "pnpm 7 (lockfileVersion 5.4)",
-            PnpmLockGrammar::V60 => "pnpm 8 (lockfileVersion 6.0)",
-        }
     }
 }
 
@@ -795,27 +737,7 @@ pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) 
         Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {}
         _ => return None,
     }
-    // CRLF (a Windows autocrlf checkout) breaks every structural probe
-    // below: the scan would find nothing and call a lock that still
-    // resolves through the artifact "provably orphaned" — undeterminable,
-    // keep (the unwired-revert guard then refuses, fail-closed).
-    if text.contains('\r') {
-        return None;
-    }
-    let lines = split_lines(&text);
-    let Some((start, end)) = section_bounds(&lines, "packages") else {
-        return Some(false);
-    };
-    let mut i = start + 1;
-    while let Some(block) = next_block(&lines, i, end) {
-        let ours =
-            parse_vendor_path(&block.key).is_some_and(|p| p.eco == "npm" && p.uuid == entry.uuid);
-        if ours {
-            return Some(true);
-        }
-        i = block.end;
-    }
-    Some(false)
+    PnpmLock::parse(&text).vendored_in_use(&entry.uuid)
 }
 
 // ─────────────────────────── pre-flight checks ───────────────────────────
