@@ -419,6 +419,9 @@ socket-patch scan 'services/*'                                   # directory glo
 hosted and vendored mode each PATH is a project directory, scanned as if it were
 `--cwd` under an `== <dir> ==` header; the worst exit code wins.
 
+To make the choice stick for everyone who runs `scan` in the repo (CI and the Socket
+autopatch bot included), put it in `socket.yml` instead — see
+[Roll out gradually](#roll-out-gradually-with-socketyml).
 ### Add a few new patches per run
 
 ```bash
@@ -438,8 +441,8 @@ visited in sorted order; `--json` takes one directory, so a CI job per directory
 its own N.
 
 To drip patches in through a PR bot, set the cap once in the repo's `socket.yml`
-(read together with the rest of the socket.yml `patches:` policy; until your
-socket-patch reads that policy, use the flag or `SOCKET_MAX_NEW_PATCHES`):
+(part of its [`patches:` policy](#roll-out-gradually-with-socketyml); the flag and
+`SOCKET_MAX_NEW_PATCHES` override it, and `--no-socket-yml` ignores it):
 
 ```yaml
 # Weekly drip with the depscan autopatch PR
@@ -689,6 +692,8 @@ socket-patch scan [PATHS]... [options]
 | `--sync` | — | Shorthand for `--mode agent --prune`: the one-flag agent-mode auto-update run. |
 | `--max-new-patches <N\|none>` | `SOCKET_MAX_NEW_PATCHES` | Add at most N patches to packages that have none yet, most severe first; the rest are deferred to the next scan and listed in the output. Upgrades of already-patched packages are not capped. `0` adds no new patches, `none` means no cap (it also lifts a `socket.yml` `patches.maxNewPatches`). See [Add a few new patches per run](#add-a-few-new-patches-per-run). |
 | `--batch-size <n>` | `SOCKET_BATCH_SIZE` | Packages per API request (default: `500` on the authenticated API, `100` on the public proxy). A request whose body would exceed 256 KiB is split into smaller ones. |
+| `--min-severity <level>` | `SOCKET_MIN_SEVERITY` | Only patch packages whose patch fixes an advisory of at least `critical`, `high`, `medium` (or `moderate`) or `low`; `none` lifts the floor. Overrides `patches.minSeverity` in socket.yml. Patches of unknown severity are skipped whenever a floor is set. |
+| `--no-socket-yml` | `SOCKET_NO_SOCKET_YML` | Ignore the repo's socket.yml patch policy for this run (the built-in test/fixture directory ignores still apply). |
 | `--all-releases` | `SOCKET_ALL_RELEASES` | Store patches for every release/distribution variant, not just the installed one — PyPI wheel/sdist, RubyGems platform, Maven classifier. Makes the manifest portable across environments (e.g. cross-platform CI caches). |
 | `--vex <path>` | `SOCKET_VEX` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX](#inline-vex-on-apply--scan--vendor). |
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_*` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
@@ -737,6 +742,72 @@ socket-patch scan --vex socket.vex.json
 > Already-vendored packages are **skipped by an agent-mode scan** (the committed
 > artifact is the patch); a newer available patch still appears in `updates[]` — re-run
 > `scan --mode vendored` to take it.
+
+#### Roll out gradually with socket.yml
+
+A `patches` block in the repo-root `socket.yml` (the file the Socket scanner already
+reads; keep `version: 2`) narrows what `scan` may patch, for every mode and for the
+in-memory engine behind the Socket autopatch bot. It can only narrow: nothing in it can
+name an endpoint or token, pick a mode, or turn off a safety check.
+
+```yaml
+# Critical first: widen by editing one line
+version: 2
+patches:
+  minSeverity: critical   # later: high, then low, then remove the key
+                          # (low still skips patches whose severity is unknown)
+```
+
+```yaml
+# One directory first (monorepo)
+version: 2
+patches:
+  includePaths:
+    - "/services/payments/"
+    # add "/services/checkout/" next sprint
+```
+
+```yaml
+# One ecosystem, hold one package
+version: 2
+patches:
+  ecosystems: [npm]
+  ignorePackages: ["pkg:npm/left-pad"]
+```
+
+```yaml
+# Pause: report only; existing patches stay in place
+version: 2
+patches:
+  enabled: false
+```
+
+- Paths are gitignore patterns (the same rules as `projectIgnorePaths`, which scan now
+  honors too), matched against each project's lockfiles: `"/services/payments/"`,
+  `"**/yarn.lock"`, `"examples/**"`. `test/`, `tests/`, `fixtures/`, `__fixtures__/`
+  and `testdata/` directories are skipped by default when scan discovers projects
+  (a directory glob such as `scan 'services/*'`); re-include one with a negation
+  (`ignorePaths: ["!/e2e/tests/"]`). A directory you name yourself is always scanned.
+  (The autopatch bot's tree listing skips those directories before it reads
+  socket.yml, so there a negation cannot bring one back.)
+- `packages` / `ignorePackages` take `--package` specs; prefer purls (`pkg:npm/core`),
+  because a bare name also matches other ecosystems and scoped packages (`core`
+  matches `@babel/core`).
+- Narrowing never removes a patch: a package that already carries one and is now
+  filtered out is left exactly as it is (reported under `policy.retained[]`). Use
+  `rollback` or `remove` to take a patch out.
+- A broken file fails the scan (exit 1, `errorCode: socket_yml_invalid`) before anything
+  is written, with the key and the fix in the message — a typo never widens the
+  rollout. `--no-socket-yml` ignores the file for one run.
+- `scan --json` reports what the policy did in a top-level `policy` block
+  (`jq '.policy.counts'`); the human output adds a `Policy (socket.yml): …` line that
+  names every skipped project and every critical/high patch the severity floor held
+  back (`--verbose` lists everything). `get` ignores the policy (explicit
+  intent) and warns `policy_bypassed`.
+
+Every key: `enabled`, `includePaths`, `ignorePaths`, `ecosystems`, `packages`,
+`ignorePackages`, `minSeverity`, `maxNewPatches` — see CLI_CONTRACT.md "socket.yml patch
+policy" for the full grammar, precedence and validation rules.
 
 ### `vex`
 

@@ -100,6 +100,17 @@ pub struct HostedScanOptions {
     pub request_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<HostedScanLimits>,
+    /// Ignore the repo's socket.yml (`--no-socket-yml`); default false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_socket_yml: Option<bool>,
+    /// `critical|high|medium|moderate|low|none`; beats the file's
+    /// `patches.minSeverity` (`--min-severity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_severity: Option<String>,
+    /// The `policyPaths` path selection returned: each must arrive with
+    /// content, or the session fails with `policyError`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_paths: Option<Vec<String>>,
     /// The run-wide cap on NEW patches (`scan --max-new-patches`); absent
     /// or `"none"` is unlimited, 0 admits upgrades only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,10 +365,29 @@ pub struct HostedScanOutput {
     pub changed_binary_files: Vec<ChangedBinaryFile>,
     pub deleted_files: Vec<String>,
     pub warnings: Vec<EngineWarning>,
-    /// The session-level `rollout` block, the CLI `--json` shape.
+    /// The session-level `rollout` block, the CLI `--json` shape; absent
+    /// when the session failed on its socket.yml (`policyError`).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub rollout: serde_json::Value,
     pub stats: EngineStats,
     pub engine_version: String,
+    /// The session-level `policy` block (the CLI's `policy` JSON shape);
+    /// absent on a `policyError`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<serde_json::Value>,
+    /// A socket.yml that cannot be honored: no root was processed and no
+    /// file changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_error: Option<PolicyErrorInfo>,
+}
+
+/// `HostedScanResult.policyError`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyErrorInfo {
+    /// `socket_yml_invalid` or `socket_yml_ambiguous`.
+    pub code: String,
+    pub detail: String,
 }
 
 /// `TreeEntryInput`.
@@ -401,6 +431,10 @@ pub struct PathSelection {
     pub ignored_count: u64,
     /// At most [`super::select::IGNORED_SAMPLE_MAX`] entries.
     pub ignored_sample: Vec<IgnoredPath>,
+    /// The root socket.yml / socket.yaml the tree lists (pass them back as
+    /// the session's `policyPaths`).
+    #[serde(default)]
+    pub policy_paths: Vec<String>,
 }
 
 /// Engine failure (`finish()` rejection codes).

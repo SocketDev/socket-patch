@@ -384,8 +384,8 @@ impl Ctx<'_> {
     fn err(&self, key: impl Into<String>, message: impl Into<String>) -> PolicyError {
         PolicyError::Invalid {
             file: self.file.to_string(),
-            key: key.into(),
-            message: message.into(),
+            key: sanitize(&key.into()),
+            message: super::strip_unsafe(&message.into()),
         }
     }
 }
@@ -486,8 +486,7 @@ pub(crate) fn package_spec_error(spec: &str) -> Option<&'static str> {
     if spec.is_empty() {
         return Some("package spec is empty");
     }
-    if spec.len() >= 4 && spec[..4].eq_ignore_ascii_case("pkg:") {
-        let rest = &spec[4..];
+    if let Some(rest) = spec.get(..4).filter(|p| p.eq_ignore_ascii_case("pkg:")).map(|_| &spec[4..]) {
         let valid = rest.split_once('/').is_some_and(|(ty, name)| {
             !ty.is_empty() && !name.trim_matches('/').is_empty() && !name.starts_with('@')
         });
@@ -753,9 +752,19 @@ pub(crate) fn parse_file(
     let mut patches: Option<&Node> = None;
     let mut ignore_paths: Option<&Node> = None;
     for (key, value) in pairs {
+        // A merge key or an aliased key could carry a `patches` block that
+        // other YAML readers apply; refuse rather than read "no policy".
+        if key.is_merge_key() || matches!(key.kind, Kind::Alias) || key.anchored {
+            return Err(ctx.err(
+                "",
+                "top-level merge keys (`<<`) and aliased keys are not supported; write the keys out",
+            ));
+        }
         let Some(name) = key.as_str() else { continue };
         let lower = name.to_ascii_lowercase();
-        if (lower == "patch" || lower == "patches") && name != "patches" {
+        let near_patches = (lower.starts_with("pat") || lower.starts_with("pac"))
+            && edit_distance(&lower, "patches") <= 2;
+        if (lower == "patch" || lower == "patches" || near_patches) && name != "patches" {
             return Err(ctx.err(
                 sanitize(name),
                 "looks like a misspelled `patches` block; the key must be exactly `patches`",
@@ -776,7 +785,7 @@ pub(crate) fn parse_file(
             Some(Err((key, message))) => {
                 warnings.push(PolicyWarning {
                     code: super::SOCKET_YML_IGNORED_VALUE,
-                    detail: format!("{file}: {key} {message}; the key is ignored"),
+                    detail: super::strip_unsafe(&format!("{file}: {key} {message}; the key is ignored")),
                 });
                 Vec::new()
             }
@@ -887,17 +896,80 @@ mod tests {
 
     #[test]
     fn encoding_errors() {
-        for bytes in [
-            &b"\xFF\xFEv\0e\0r\0"[..],
-            &b"\xFE\xFF\0v\0e"[..],
-            &b"version: 2\0\n"[..],
-            &b"version: \xC3\x28\n"[..],
+        for (bytes, expected) in [
+            (&b"\xFF\xFEv\0e\0r\0"[..], "UTF-16"),
+            (&b"\xFE\xFF\0v\0e"[..], "UTF-16"),
+            (&b"version: 2\0\n"[..], "NUL"),
+            (&b"version: \xC3\x28\n"[..], "not valid UTF-8"),
         ] {
-            assert!(
-                parse_file("socket.yml", bytes, &mut Vec::new()).is_err(),
-                "{bytes:?}"
-            );
+            match parse_file("socket.yml", bytes, &mut Vec::new()) {
+                Err(PolicyError::Invalid { message, .. }) => {
+                    assert!(message.contains(expected), "{message}")
+                }
+                other => panic!("{bytes:?}: {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn checks_run_in_order() {
+        // YAML beats everything; the case variant beats the version gate;
+        // the version gate beats the keys.
+        assert_eq!(err_key("patches: {minSeverty: x}\n").0, "version");
+        assert!(err_key("Patches: {}\npatches: {minSeverty: x}\n").1.contains("misspelled"));
+        assert!(err_key("patches: {minSeverty: x\n").1.contains("invalid YAML"));
+    }
+
+    #[test]
+    fn top_level_typos_merge_keys_and_aliases_fail_closed() {
+        for text in [
+            "version: 2\npatchs: {enabled: false}\n",
+            "version: 2\npacthes: {}\n",
+            "version: 2\npatches_: {}\n",
+        ] {
+            assert!(err_key(text).1.contains("misspelled"), "{text:?}");
+        }
+        for text in [
+            "base: &b {patches: {enabled: false}}\n<<: *b\nversion: 2\n",
+            "k: &k patches\nversion: 2\n*k : {enabled: false}\n",
+        ] {
+            assert!(err_key(text).1.contains("merge keys"), "{text:?}");
+        }
+        // Unrelated scanner keys are fine.
+        assert!(parse(
+            "version: 2\ntriggerPaths: [a]\nissueRules: {x: true}\ngithubApp: {enabled: true}\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn non_ascii_specs_and_escapes_never_panic_or_leak() {
+        for spec in ["abc\u{e9}", "ab\u{20ac}", "p\u{e9}g:npm/x", "\u{1F600}"] {
+            let text = format!("version: 2\npatches:\n  ignorePackages: [\"{spec}\"]\n");
+            assert!(parse(&text).is_ok(), "{spec:?}");
+        }
+        let text = "version: 2\npatches:\n  ignorePaths: [\"\\e]0;pwned\\a\\e[2J[x\u{202E}\"]\n";
+        let err = parse(text).unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            !shown.chars().any(|c| c.is_control() || c == '\u{202E}'),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn nesting_limit_boundary() {
+        // The top-level mapping is level 1: 31 nested lists reach 32 levels.
+        let at_limit = format!("a: {}{}\n", "[".repeat(31), "]".repeat(31));
+        assert!(parse(&at_limit).is_ok());
+        let over = format!("a: {}{}\n", "[".repeat(32), "]".repeat(32));
+        assert!(err_key(&over).1.contains("deeper than 32"));
+    }
+
+    #[test]
+    fn project_ignore_paths_string_without_patches_block() {
+        let parsed = parse("version: 2\nprojectIgnorePaths: \"examples/**\"\n").unwrap();
+        assert_eq!(parsed.project_ignore_paths, vec!["examples/**".to_string()]);
     }
 
     #[test]
@@ -911,7 +983,17 @@ mod tests {
             "a: 1\n---\nb: 2\n",
             "projectIgnorePaths:\n  - **\n",
         ] {
-            assert!(parse(text).is_err(), "{text:?} must fail");
+            let (key, message) = err_key(text);
+            assert_eq!(key, "", "{text:?}");
+            assert!(
+                [
+                    "invalid YAML",
+                    "top level must be a mapping",
+                ]
+                .iter()
+                .any(|m| message.contains(m)),
+                "{text:?}: {message}"
+            );
         }
     }
 

@@ -47,11 +47,24 @@ pub const POLICY_BYPASSED: &str = "policy_bypassed";
 /// Longest file-derived string copied into output.
 const MAX_OUTPUT_CHARS: usize = 200;
 
-/// Make a file-derived string safe to print: control characters dropped,
-/// at most 200 characters.
+/// Characters never copied into output: controls (terminal escapes) and
+/// the invisible formatting characters that can reorder or hide text
+/// (bidi overrides and isolates, zero-width characters, BOM).
+fn unsafe_for_output(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// [`sanitize`] without the length cap, for whole messages.
+pub fn strip_unsafe(s: &str) -> String {
+    s.chars().filter(|c| !unsafe_for_output(*c)).collect()
+}
+
+/// Make a file-derived string safe to print: control and invisible
+/// formatting characters dropped, at most 200 characters.
 pub fn sanitize(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !unsafe_for_output(*c))
         .take(MAX_OUTPUT_CHARS)
         .collect()
 }
@@ -154,8 +167,12 @@ impl PolicyError {
     /// The message without the remedy.
     pub fn detail(&self) -> String {
         match self {
-            PolicyError::Invalid { file, key, message } if key.is_empty() => format!("{file}: {message}"),
-            PolicyError::Invalid { file, key, message } => format!("{file}: {key}: {message}"),
+            PolicyError::Invalid { file, key, message } if key.is_empty() => {
+                format!("{file}: {}", strip_unsafe(message))
+            }
+            PolicyError::Invalid { file, key, message } => {
+                format!("{file}: {}: {}", sanitize(key), strip_unsafe(message))
+            }
             PolicyError::Ambiguous { files } => format!(
                 "{} and {} both exist and their `patches`/`projectIgnorePaths` differ; keep one file",
                 files[0], files[1]
@@ -223,10 +240,10 @@ impl DiskPolicyFs {
 fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     // O_NONBLOCK: opening a FIFO must not wait for a writer; the handle's
-    // metadata then refuses it.
+    // metadata then refuses it. O_NOFOLLOW: the path was resolved already.
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)
 }
 
@@ -244,16 +261,15 @@ impl PolicyFs for DiskPolicyFs {
         if !self.entry_names().iter().any(|n| n == name) {
             return Ok(RootFile::Absent);
         }
-        let path = self.root.join(name);
-        let link_meta = std::fs::symlink_metadata(&path)?;
-        if link_meta.file_type().is_symlink() {
-            let target = std::fs::canonicalize(&path)?;
-            let root = std::fs::canonicalize(&self.root)?;
-            if !target.starts_with(&root) {
-                return Err(io_other("symlink resolves outside the repository root"));
-            }
+        // Resolve first, confine, then open the resolved path without
+        // following a final symlink: a link swapped in after the check is
+        // refused instead of followed out of the repository.
+        let root = std::fs::canonicalize(&self.root)?;
+        let target = std::fs::canonicalize(self.root.join(name))?;
+        if !target.starts_with(&root) {
+            return Err(io_other("symlink resolves outside the repository root"));
         }
-        let file = open_nonblocking(&path)?;
+        let file = open_nonblocking(&target)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(io_other("not a regular file"));
@@ -424,40 +440,58 @@ fn defaults_list() -> Vec<String> {
     DEFAULT_IGNORE_PATHS.iter().map(|s| s.to_string()).collect()
 }
 
-fn compile(lists: &[(&'static str, &[String])]) -> PathMatcher {
-    // Every list was compiled once during validation, so this cannot fail;
-    // an empty matcher would only ever admit more, which the validation
-    // already ruled out.
-    PathMatcher::new(lists)
-        .unwrap_or_else(|_| PathMatcher::new(&[]).expect("an empty pattern list always compiles"))
+/// Compile a combined list. Each list was validated on its own, but the
+/// combination can still exceed the glob engine's size limit; that is an
+/// error (fail closed), never an empty matcher.
+fn compile(file: &str, lists: &[(&'static str, &[String])]) -> Result<PathMatcher, PolicyError> {
+    PathMatcher::new(lists).map_err(|(list, _, message)| PolicyError::Invalid {
+        file: file.to_string(),
+        key: list.to_string(),
+        message: format!("the path patterns cannot be compiled together: {message}"),
+    })
+}
+
+/// The built-in defaults, compiled once (for callers that only need the
+/// default path ignores, e.g. tree-listing root detection).
+pub fn builtin_defaults() -> &'static SelectionPolicy {
+    static DEFAULTS: std::sync::LazyLock<SelectionPolicy> = std::sync::LazyLock::new(SelectionPolicy::unrestricted);
+    &DEFAULTS
 }
 
 impl SelectionPolicy {
     /// No file: only the built-in default ignores.
     pub fn unrestricted() -> Self {
-        Self::from_parts(PolicySource::None, &[], &PatchesBlock::default())
+        Self::from_parts("", PolicySource::None, &[], &PatchesBlock::default())
+            .expect("the built-in default ignores always compile")
     }
 
     fn from_parts(
+        file: &str,
         source: PolicySource,
         project_ignore_paths: &[String],
         block: &PatchesBlock,
-    ) -> Self {
+    ) -> Result<Self, PolicyError> {
         let defaults = defaults_list();
-        let ignore_discovered = compile(&[
-            (DEFAULT_IGNORE_LIST, &defaults),
-            ("projectIgnorePaths", project_ignore_paths),
-            ("patches.ignorePaths", &block.ignore_paths),
-        ]);
-        let ignore_explicit = compile(&[
-            ("projectIgnorePaths", project_ignore_paths),
-            ("patches.ignorePaths", &block.ignore_paths),
-        ]);
-        let include = block
-            .include_paths
-            .as_ref()
-            .map(|list| compile(&[("patches.includePaths", list)]));
-        Self {
+        let ignore_discovered = compile(
+            file,
+            &[
+                (DEFAULT_IGNORE_LIST, &defaults),
+                ("projectIgnorePaths", project_ignore_paths),
+                ("patches.ignorePaths", &block.ignore_paths),
+            ],
+        )?;
+        let ignore_explicit = compile(
+            file,
+            &[
+                ("projectIgnorePaths", project_ignore_paths),
+                ("patches.ignorePaths", &block.ignore_paths),
+            ],
+        )?;
+        let include = match block.include_paths.as_ref() {
+            Some(list) => Some(compile(file, &[("patches.includePaths", list)])?),
+            None => None,
+        };
+        Ok(Self {
             source,
             enabled: block.enabled.unwrap_or(true),
             ignore_discovered,
@@ -473,7 +507,7 @@ impl SelectionPolicy {
                 SeveritySource::Default
             },
             max_new_patches: block.max_new_patches,
-        }
+        })
     }
 
     fn apply_overrides(&mut self, overrides: &PolicyOverrides) {
@@ -493,8 +527,8 @@ impl SelectionPolicy {
     ) -> Result<(Self, Vec<PolicyWarning>), PolicyError> {
         let mut warnings = Vec::new();
         if overrides.bypass {
-            let mut policy =
-                Self::from_parts(PolicySource::Bypassed, &[], &PatchesBlock::default());
+            let mut policy = Self::unrestricted();
+            policy.source = PolicySource::Bypassed;
             policy.apply_overrides(overrides);
             return Ok((policy, warnings));
         }
@@ -546,7 +580,7 @@ impl SelectionPolicy {
                     sha256: hex::encode(Sha256::digest(&bytes)),
                 };
                 let block = parsed.patches.clone().unwrap_or_default();
-                Self::from_parts(source, &parsed.project_ignore_paths, &block)
+                Self::from_parts(name, source, &parsed.project_ignore_paths, &block)?
             }
             _ => Self::unrestricted(),
         };
@@ -764,13 +798,19 @@ fn ceiling_dirs() -> Vec<PathBuf> {
 #[cfg(unix)]
 fn trusted_owner(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
+    let sudo_uid = std::env::var("SUDO_UID").ok().and_then(|v| v.trim().parse::<u32>().ok());
     // SAFETY: geteuid has no preconditions and cannot fail.
-    owner_trusted(meta.uid(), unsafe { libc::geteuid() })
+    owner_trusted(meta.uid(), unsafe { libc::geteuid() }, sudo_uid)
 }
 
+/// `.git` is trusted when it belongs to the invoking user, to root, or
+/// (under sudo) to the user sudo ran for. Root trusts every owner: a root
+/// process is exposed to the whole filesystem anyway, and CI containers
+/// commonly run as root over a checkout owned by another uid, where
+/// distrust would silently drop the repo's policy (which only narrows).
 #[cfg(unix)]
-fn owner_trusted(owner: u32, euid: u32) -> bool {
-    owner == euid || owner == 0
+fn owner_trusted(owner: u32, euid: u32, sudo_uid: Option<u32>) -> bool {
+    euid == 0 || owner == euid || owner == 0 || sudo_uid == Some(owner)
 }
 
 #[cfg(not(unix))]
@@ -781,7 +821,8 @@ fn trusted_owner(_meta: &std::fs::Metadata) -> bool {
 /// The repo root for `cwd` (4.5) with the lookup's warnings: the nearest
 /// ancestor (inclusive) holding a `.git` directory or file, not walking
 /// past `GIT_CEILING_DIRECTORIES` or into the home directory, and (Unix)
-/// only when `.git` belongs to the current user or root. Otherwise `cwd`.
+/// only when `.git` belongs to a trusted owner ([`owner_trusted`]).
+/// Otherwise `cwd`.
 pub fn find_repo_root_with_warnings(cwd: &Path) -> (PathBuf, Vec<PolicyWarning>) {
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let ceilings = ceiling_dirs();
@@ -792,7 +833,8 @@ pub fn find_repo_root_with_warnings(cwd: &Path) -> (PathBuf, Vec<PolicyWarning>)
         if dir != cwd && home.as_deref() == Some(dir) {
             break;
         }
-        if let Ok(meta) = std::fs::symlink_metadata(dir.join(".git")) {
+        // `metadata` follows a `.git` symlink, as git does.
+        if let Ok(meta) = std::fs::metadata(dir.join(".git")) {
             if meta.is_dir() || meta.is_file() {
                 if trusted_owner(&meta) {
                     return (dir.to_path_buf(), warnings);

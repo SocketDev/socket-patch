@@ -9,8 +9,10 @@
 //!
 //! Stdin: `{"files": {path: text}, "binaryFiles"?: {path: base64},
 //! "presentOnly"?: [path], "symlinks"?: [path], "projectRoots"?: [dir],
-//! "pipenvMajor"?: n, "batchSize"?: n, "maxNewPatches"?: n | "none",
-//! "maxNewPatchesCap"?: n, "inFlightPatches"?: [purl]}`. Stdout: the engine result
+//! "pipenvMajor"?: n, "batchSize"?: n, "noSocketYml"?: bool,
+//! "minSeverity"?: severity, "policyPaths"?: [path],
+//! "maxNewPatches"?: n | "none", "maxNewPatchesCap"?: n,
+//! "inFlightPatches"?: [purl]}`. Stdout: the engine result
 //! (`HostedScanResult`, binary contents base64), or
 //! `{"status":"error","error":{"code","message"}}` with exit 2 for bad
 //! credentials/bundle input, or exit 1 for an engine failure.
@@ -54,6 +56,12 @@ struct Bundle {
     pipenv_major: Option<u32>,
     #[serde(default)]
     batch_size: Option<u32>,
+    #[serde(default)]
+    no_socket_yml: Option<bool>,
+    #[serde(default)]
+    min_severity: Option<String>,
+    #[serde(default)]
+    policy_paths: Option<Vec<String>>,
     #[serde(default)]
     max_new_patches: Option<crate::hosted_memory::MaxNewPatchesOption>,
     #[serde(default)]
@@ -128,6 +136,9 @@ pub async fn run(args: HostedBundleArgs) -> i32 {
         trust_lockfile_config: Some(!common.no_trust_lockfile_config),
         npm_allow_remote_config: Some(!common.no_npm_allow_remote_config),
         project_roots: bundle.project_roots.clone(),
+        no_socket_yml: bundle.no_socket_yml,
+        min_severity: bundle.min_severity.clone(),
+        policy_paths: bundle.policy_paths.clone(),
         max_new_patches: bundle.max_new_patches,
         max_new_patches_cap: bundle.max_new_patches_cap,
         in_flight_patches: bundle.in_flight_patches.clone(),

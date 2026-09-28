@@ -315,6 +315,18 @@ pub fn run_disk(server: &MockServer, files: &BTreeMap<String, Vec<u8>>, dry_run:
     run_disk_with(server, files, dry_run, &[])
 }
 
+/// [`run_disk`] with `--cwd` at the repo-relative `cwd_rel` of a checkout
+/// (a `.git` directory marks the repo root, so a root `socket.yml`
+/// applies); `changed` stays relative to the repo root.
+pub fn run_disk_in(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    cwd_rel: &str,
+    dry_run: bool,
+) -> DiskRun {
+    run_disk_in_with(server, files, cwd_rel, dry_run, &[])
+}
+
 /// A human (non-`--json`) disk scan with `args`: exit code, stdout, and the
 /// files it changed.
 pub fn run_disk_args(
@@ -322,11 +334,11 @@ pub fn run_disk_args(
     files: &BTreeMap<String, Vec<u8>>,
     args: &[&str],
 ) -> (i32, String, BTreeMap<String, Vec<u8>>) {
-    let (project, _home, mut cmd) = disk_command(server, files);
+    let (checkout, _home, mut cmd) = disk_command(server, files, "");
     cmd.args(args);
     let output = cmd.output().expect("spawn socket-patch");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let after = read_tree(project.path());
+    let after = read_tree(checkout.path());
     let changed = after
         .into_iter()
         .filter(|(rel, bytes)| files.get(rel) != Some(bytes))
@@ -341,7 +353,17 @@ pub fn run_disk_with(
     dry_run: bool,
     extra: &[&str],
 ) -> DiskRun {
-    let (project, _home, mut cmd) = disk_command(server, files);
+    run_disk_in_with(server, files, "", dry_run, extra)
+}
+
+fn run_disk_in_with(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    cwd_rel: &str,
+    dry_run: bool,
+    extra: &[&str],
+) -> DiskRun {
+    let (checkout, _home, mut cmd) = disk_command(server, files, cwd_rel);
     cmd.arg("--json");
     if dry_run {
         cmd.arg("--dry-run");
@@ -352,7 +374,7 @@ pub fn run_disk_with(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let envelope: Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("disk --json output is not JSON ({e}):\n{stdout}\n{stderr}"));
-    let after = read_tree(project.path());
+    let after = read_tree(checkout.path());
     let changed = after
         .into_iter()
         .filter(|(rel, bytes)| files.get(rel) != Some(bytes))
@@ -364,19 +386,24 @@ pub fn run_disk_with(
     }
 }
 
-/// The scrubbed `scan --mode hosted` command over a copy of `files` (the
-/// returned tempdirs, the project and `HOME`, must outlive the run).
+/// The scrubbed `scan --mode hosted` command over a checkout of `files`,
+/// run at `cwd_rel` (the returned tempdirs, the checkout and `HOME`, must
+/// outlive the run).
 fn disk_command(
     server: &MockServer,
     files: &BTreeMap<String, Vec<u8>>,
+    cwd_rel: &str,
 ) -> (tempfile::TempDir, tempfile::TempDir, std::process::Command) {
-    let project = tempfile::tempdir().unwrap();
+    let checkout = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     for (rel, bytes) in files {
-        let path = project.path().join(rel);
+        let path = checkout.path().join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
     }
+    // The checkout is its own repo: no socket.yml above the temp dir applies.
+    std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
+    let cwd = checkout.path().join(cwd_rel);
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.env_clear();
     for keep in [
@@ -413,7 +440,7 @@ fn disk_command(
         "hosted",
         "--yes",
         "--cwd",
-        project.path().to_str().unwrap(),
+        cwd.to_str().unwrap(),
         "--org",
         ORG,
         "--api-token",
@@ -421,7 +448,7 @@ fn disk_command(
         "--api-url",
         &server.uri(),
     ]);
-    (project, home, cmd)
+    (checkout, home, cmd)
 }
 
 /// The engine's changed files (text and binary) as bytes.

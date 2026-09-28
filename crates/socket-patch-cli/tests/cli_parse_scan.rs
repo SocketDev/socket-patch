@@ -46,6 +46,8 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_LOCK_TIMEOUT",
     "SOCKET_MANIFEST_PATH",
     "SOCKET_MAX_NEW_PATCHES",
+    "SOCKET_MIN_SEVERITY",
+    "SOCKET_NO_SOCKET_YML",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
@@ -474,6 +476,8 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // sub-object onto the hosted default path fails loudly.
     let bin = env!("CARGO_BIN_EXE_socket-patch");
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Its own repo root, so no socket.yml above the temp dir leaks in.
+    std::fs::create_dir(tmp.path().join(".git")).expect(".git");
     let mut cmd = std::process::Command::new(bin);
     cmd.args(["scan", "--json", "--cwd"]).arg(tmp.path());
     // Strip *every* SOCKET_* override the child would otherwise inherit.
@@ -532,6 +536,18 @@ fn scan_json_empty_cwd_emits_updates_key() {
             "skipped": [],
             "warnings": [],
             "dryRun": false
+        },
+        // v5: the socket.yml patch policy block rides every successful
+        // scan (no file here: the built-in defaults).
+        "policy": {
+            "source": "none",
+            "path": null,
+            "sha256": null,
+            "enabled": true,
+            "minSeverity": { "value": null, "source": "default" },
+            "counts": { "filtered": 0, "retained": 0 },
+            "filtered": [],
+            "retained": []
         },
     });
     assert_eq!(
@@ -1044,3 +1060,77 @@ fn max_new_patches_env_is_read_at_run_time() {
     let got = flag.resolve(Some("7"), None).unwrap();
     assert_eq!((got.value, got.source), (Some(1), MaxNewSource::Flag));
 }
+/// Parse `scan` under a clean env plus `env`, restoring it afterwards.
+fn parse_scan_with_env(extra: &[&str], env: &[(&str, &str)]) -> Result<ScanArgs, clap::Error> {
+    with_clean_env(|| {
+        for (k, v) in env {
+            std::env::set_var(k, v);
+        }
+        let mut argv = vec!["socket-patch", "scan"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(&argv);
+        for (k, _) in env {
+            std::env::remove_var(k);
+        }
+        cli.map(|c| match c.command {
+            Commands::Scan(a) => a,
+            _ => panic!("expected Scan"),
+        })
+    })
+}
+
+/// `--no-socket-yml` / `SOCKET_NO_SOCKET_YML`: a bool with the repo-wide
+/// vocabulary; empty is unset; garbage is a parse error.
+#[test]
+#[serial_test::serial]
+fn no_socket_yml_flag_and_env() {
+    assert!(!parse_scan(&[]).socket_yml.no_socket_yml);
+    assert!(parse_scan(&["--no-socket-yml"]).socket_yml.no_socket_yml);
+    for (value, expected) in [("1", true), ("true", true), ("0", false), ("", false)] {
+        let args = parse_scan_with_env(&[], &[("SOCKET_NO_SOCKET_YML", value)]).expect("parse");
+        assert_eq!(args.socket_yml.no_socket_yml, expected, "{value:?}");
+    }
+    assert!(parse_scan_with_env(&[], &[("SOCKET_NO_SOCKET_YML", "garbage")]).is_err());
+}
+
+/// `--min-severity` / `SOCKET_MIN_SEVERITY`: the flag beats the env, the
+/// layer is recorded, `none` lifts the floor, empty env is unset, and a
+/// malformed value is a usage error (the flag at parse time, the env when
+/// the overrides are resolved; scan exits 2 either way).
+#[test]
+#[serial_test::serial]
+fn min_severity_flag_and_env() {
+    use socket_patch_core::policy::OverrideSource;
+    let overrides = |extra: &[&str], env: &[(&str, &str)]| {
+        let args = parse_scan_with_env(extra, env).expect("parse");
+        with_clean_env(|| {
+            for (k, v) in env {
+                std::env::set_var(k, v);
+            }
+            let out = args.socket_yml.overrides();
+            for (k, _) in env {
+                std::env::remove_var(k);
+            }
+            out
+        })
+    };
+    assert_eq!(parse_scan(&[]).socket_yml.min_severity, None);
+    assert_eq!(overrides(&[], &[]).unwrap().min_severity, None);
+    assert_eq!(
+        overrides(&["--min-severity", "High"], &[]).unwrap().min_severity,
+        Some((Some(1), OverrideSource::Flag))
+    );
+    assert_eq!(
+        overrides(&["--min-severity", "none"], &[("SOCKET_MIN_SEVERITY", "critical")]).unwrap().min_severity,
+        Some((None, OverrideSource::Flag))
+    );
+    assert_eq!(
+        overrides(&[], &[("SOCKET_MIN_SEVERITY", "moderate")]).unwrap().min_severity,
+        Some((Some(2), OverrideSource::Env))
+    );
+    assert_eq!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "")]).unwrap().min_severity, None);
+    assert!(overrides(&[], &[("SOCKET_MIN_SEVERITY", "severe")]).is_err());
+    assert!(try_parse_scan(&["--min-severity", "severe"]).is_err());
+    assert!(overrides(&["--no-socket-yml"], &[]).unwrap().bypass);
+}
+

@@ -9,6 +9,7 @@ export interface PathSelection {
   symlinks: string[]           // candidate paths that are symlinks (mode 120000) — refuse-to-write
   ignoredCount: number
   ignoredSample: { path: string; reason: string }[]   // ≤100
+  policyPaths: string[]        // root socket.yml / socket.yaml the tree lists (also in fetchText or symlinks); pass back as the session's policyPaths
 }
 export function selectHostedScanPaths(entries: TreeEntryInput[], options?: { projectRoots?: string[]; ecosystems?: Ecosystem[] }): PathSelection
 export function hostedScanCandidateFiles(): string[]    // debug listing only
@@ -51,6 +52,9 @@ export interface HostedScanSessionOptions {
   maxNewPatches?: number | 'none'  // run-wide cap on NEW patches, most severe first; 0 = upgrades only; absent/'none' = unlimited
   maxNewPatchesCap?: number        // server ceiling: tightens maxNewPatches (including 'none'), never loosens it
   inFlightPatches?: string[]       // base purls already in the open rollout PR: ranked first
+  noSocketYml?: boolean            // ignore the repo's socket.yml (built-in test/fixture ignores still apply); default false
+  minSeverity?: 'critical' | 'high' | 'medium' | 'moderate' | 'low' | 'none'   // beats socket.yml patches.minSeverity
+  policyPaths?: string[]           // selectHostedScanPaths' policyPaths; each must be streamed with content or the session returns policyError
 }
 export class HostedScanSession {
   constructor(options: HostedScanSessionOptions, provider: PatchProvider)
@@ -66,7 +70,7 @@ export interface ProjectResult {
   redirect: Record<string, unknown>                   // same shape as CLI `--json` `redirect` block
   summary: { scannedPackages: number; packagesWithPatches: number; totalPatches: number; freePatches: number; paidPatches: number; canAccessPaidPatches: boolean }
   redirected: { purl: string; uuid: string }[]
-  skipped: { purl: string; uuid: string; reason: string; detail?: string }[]   // deferred rows also appear here as `rollout_deferred`
+  skipped: { purl: string; uuid: string; reason: string; detail?: string }[]   // reasons include the policy_* codes; deferred rows appear as `rollout_deferred`
   deferred: DeferredPatch[]                           // NEW patches over the maxNewPatches budget, rank order
   error?: { code: string; message: string }           // project-level failure (e.g. corrupt_ledger, patch_lookup_failed)
 }
@@ -82,9 +86,22 @@ export interface HostedScanResult {
   changedBinaryFiles: { path: string; content: Buffer }[]
   deletedFiles: string[]
   warnings: EngineWarning[]
-  rollout: RolloutBlock                               // session-level: one budget across every project
+  rollout?: RolloutBlock                              // session-level: one budget across every project; absent only with policyError
   stats: { projects: number; filesInput: number; bytesInput: number; packagesScanned: number; packagesWithPatches: number; patchesSelected: number; patchesRedirected: number; filesChanged: number; providerCalls: Record<string, number>; phaseMs: Record<string, number> }
   engineVersion: string
+  policy?: PolicyBlock                                         // absent only with policyError
+  policyError?: { code: 'socket_yml_invalid' | 'socket_yml_ambiguous'; detail: string }   // no root processed, no file changed
+}
+export type PolicyReason = 'policy_disabled' | 'policy_path_excluded' | 'policy_path_not_included' | 'policy_ecosystem' | 'policy_package_not_listed' | 'policy_package_ignored' | 'policy_severity'
+export interface PolicyBlock {
+  source: 'none' | 'file' | 'bypassed'
+  path: string | null
+  sha256: string | null
+  enabled: boolean
+  minSeverity: { value: 'critical' | 'high' | 'medium' | 'low' | null; source: 'flag' | 'env' | 'file' | 'default' }
+  counts: { filtered: number; retained: number }
+  filtered: { purl: string | null; uuid: string | null; project: string; reason: PolicyReason; detail: string }[]
+  retained: { purl: string; project: string; recordedUuid: string; reason: PolicyReason; detail: string; upgradeAvailable: boolean }[]
 }
 
 export class SocketPatchAddonUnavailableError extends Error {

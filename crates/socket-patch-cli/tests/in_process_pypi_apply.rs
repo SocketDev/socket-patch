@@ -248,6 +248,7 @@ async fn pypi_install_scan_sync_patches_real_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let mut args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -326,6 +327,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
 
     // 1. scan --sync to write the manifest + blob.
     let scan_args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -437,6 +439,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let scan_args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -568,6 +571,7 @@ async fn pypi_crawler_finds_real_installed_six() {
         .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {

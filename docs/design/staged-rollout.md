@@ -1015,6 +1015,81 @@ change), README (recipe R5, `--max-new-patches`), CHANGELOG
 - If B is ready before A merges, B ships with the file layer passed as
   `None` and wires it in a follow-up commit on its branch once A lands.
 
+### 9.4 Work item A: decisions made while building
+
+Gaps and contradictions A resolved with the smallest reasonable decision
+(each is also in A's PR description):
+
+1. **YAML crate.** `serde-saphyr` 1.3.0 (maintained, YAML 1.2), driven
+   through its re-exported event parser (`serde_saphyr::granit_parser`, no
+   extra dependency) into a small node tree. Aliases are never expanded, so
+   an alias bomb anywhere costs nothing, and anchors / aliases / merge keys /
+   custom tags are refused only inside `patches` and `projectIgnorePaths`
+   (an anchor in `issueRules` keeps working). Duplicate keys and the depth
+   bound are enforced while building the tree. `serde_norway` was not
+   picked: its libyaml core expands aliases with only a global repetition
+   limit and cannot refuse them per subtree. Unit tests prove each property.
+2. **Disk markers** are the in-memory engine's lock markers (plus the
+   Maven/NuGet markers disk scans support); manifests are not markers.
+   With `package.json` as a disk marker, `ignorePaths: ["**/package-lock.json"]`
+   would never exclude a disk root while excluding the same root in memory.
+3. **Whole-file errors.** YAML syntax, duplicate keys, a non-mapping top
+   level, depth and a second document are errors even without a `patches`
+   block (the file cannot be known not to have one). `patches: null` counts
+   as present for the version gate; a key under `patches` with no value is an
+   error, never "default".
+4. **`enabled: false`** reports recorded packages under `retained[]`
+   (`policy_disabled`) and every other candidate under `filtered[]`.
+5. **Floor vs recorded patch** (until B's `search_result_supersedes`): a
+   recorded package keeps its recorded patch when it outranks every
+   floor-admitted patch in the canonical ranking, or when nothing passes the
+   floor; otherwise the admitted winner is selected, exactly as without a
+   floor.
+6. **Retained packages** stay in the batch query (so `upgradeAvailable` can
+   be reported) but never reach selection or a writer.
+7. **PATH-glob matches under a default ignore** are still visited as roots
+   and root-filtered (one `purl: null` entry), so a recorded patch there is
+   reported as retained.
+8. **In-memory engine gaps until B lands its recorded view**: `retained[]`
+   is empty and the floor rule of item 5 cannot see recorded pins (filtered
+   packages' pins stay byte-identical regardless: the rewriters only touch
+   selected dependencies). `selectHostedScanPaths` applies the built-in
+   default ignores (the file's content is unknown at selection time), so a
+   socket.yml negation re-includes an in-memory root only when the host
+   streamed its files anyway; the session itself detects roots without the
+   defaults and applies the full policy. A root named in `projectRoots` is
+   explicit and skips the defaults. There
+   is no case-variant warning in memory (selection streams exact names
+   only). `ProjectResult.skipped[]` carries the post-lookup policy reasons
+   (severity, disabled); the pre-lookup ones are in the session `policy`
+   block only.
+9. **Session option `policyPaths`** (selection's list, handed back like
+   `projectRoots`) is how the session tells "listed but never sent" from
+   absent.
+10. **Env layer of `--min-severity`** is read by scan, not clap, so the
+    `policy` block can say `source: "env"`; a malformed env value exits 2 at
+    run time, a malformed flag at parse time.
+11. **README recipes**: R2-R4 and R6 ship without `maxNewPatches` lines (A
+    validates the key but does not enforce the cap); R1 and R5 come with B.
+12. **`get`'s `policy_bypassed`** is one warning per package; the severity
+    reason fires only when none of the package's patches passes the floor.
+13. **Repo-root trust** (review follow-up): root trusts every `.git` owner
+    and `SUDO_UID`'s user is trusted, so a root CI container over a checkout
+    owned by another uid still applies the policy (distrust would drop a
+    policy that only narrows). A `.git` symlink counts, as in git.
+14. **A disk root with no lockfile** uses its manifests as markers, so
+    `includePaths: ["/*", "!/*/"]` can match a lockfile-less repo root.
+15. **Top-level typos and merge keys fail closed**: a key within two edits
+    of `patches` starting `pat`/`pac`, and a top-level `<<` or aliased key,
+    are errors (another YAML reader could see a `patches` block there).
+16. **Report-only `--json`** fetches patch details only when a floor or
+    `enabled: false` could withhold something, so its `filtered[]` matches
+    the human output.
+17. **What the floor reports**: the top-ranked patch it withheld, when the
+    package ends up unpatched or held at its recorded patch; not when a
+    lower-ranked admitted patch wins. A kept recorded patch that is itself
+    below the floor is not a skip.
+
 ## 10. Open questions (decided by default, revisit with evidence)
 
 - A separate upgrade cap (`maxUpgrades`) if server-side republishes rotate
@@ -1088,5 +1163,10 @@ keeps its rules intact:
   vlt-withheld top-ranked row; it takes the same ineligible path as the
   withdrawn and `bad_purl` rows the e2e tests cover.
 - **socket.yml layer.** B resolves the cap as flag > env > file >
-  unlimited through `resolve_max_new`; the file value is passed once A
-  loads the policy in `scan` (9.3).
+  unlimited through `resolve_max_new`; the file value is A's
+  `SelectionPolicy::max_new_patches()` (none when bypassed). The rollout
+  classifies what A's selection keeps: a retained package is neither NEW
+  nor an UPGRADE, and a severity floor removes a NEW row before it can
+  take a slot (9.3). The in-memory engine resolves the cap after the
+  session's socket.yml loads; a session that fails on it has no
+  `rollout` block.

@@ -360,6 +360,99 @@ async fn two_roots_spend_one_budget_in_memory_and_one_per_directory_on_disk() {
     );
 }
 
+/// The socket.yml policy and the cap together (§9.3): `includePaths`
+/// keeps `legacy/` out, `minSeverity: high` leaves only e, b and c
+/// eligible, and `maxNewPatches: 2` paces them; both engines converge in
+/// two runs. `--no-socket-yml` then drops the file's floor, paths and cap
+/// but keeps a flag cap, and each engine spends it in its own scope.
+#[tokio::test]
+async fn socket_yml_policy_and_cap_converge_on_disk_and_in_memory() {
+    let server = MockServer::start().await;
+    mount(&server).await;
+    let mut files = BTreeMap::new();
+    files.insert(
+        "socket.yml".to_string(),
+        b"version: 2\npatches:\n  includePaths: [\"/apps/\"]\n  minSeverity: high\n  maxNewPatches: 2\n"
+            .to_vec(),
+    );
+    lock(&mut files, "apps/one", &["mem-a", "mem-b", "mem-c", "mem-d", "mem-e"]);
+    lock(&mut files, "apps/two", &["mem-b", "mem-c", "mem-d"]);
+    lock(&mut files, "legacy", &["mem-b", "mem-e"]);
+    let dirs = ["apps/one", "apps/two", "legacy"];
+    let pins = |f: &BTreeMap<String, Vec<u8>>| -> Vec<Vec<&'static str>> {
+        dirs.iter()
+            .map(|d| pinned(f, &format!("{d}/package-lock.json")))
+            .collect()
+    };
+    let expected: [Vec<Vec<&str>>; 3] = [
+        vec![vec!["mem-e", "mem-b"], vec!["mem-b"], vec![]],
+        vec![vec!["mem-e", "mem-b", "mem-c"], vec!["mem-b", "mem-c"], vec![]],
+        vec![vec!["mem-e", "mem-b", "mem-c"], vec!["mem-b", "mem-c"], vec![]],
+    ];
+
+    let mut mem_files = files.clone();
+    let mut disk_files = files.clone();
+    for (run, want) in expected.iter().enumerate() {
+        let mem = memory(&server, &mem_files, options(None)).await;
+        assert_eq!(
+            mem.rollout["maxNewPatches"],
+            json!({ "value": 2, "source": "file" }),
+            "run {}",
+            run + 1
+        );
+        assert_eq!(mem.policy.as_ref().map(|p| p["source"].clone()), Some(json!("file")));
+        mem_files = apply(&mem_files, &mem);
+        assert_eq!(&pins(&mem_files), want, "memory run {}", run + 1);
+
+        let (code, stdout, changed) = run_disk_args(&server, &disk_files, &dirs);
+        assert_eq!(code, 0, "{stdout}");
+        assert!(
+            stdout.contains("maxNewPatches=2 from socket.yml"),
+            "disk run {}: {stdout}",
+            run + 1
+        );
+        disk_files.extend(changed);
+        assert_eq!(&pins(&disk_files), want, "disk run {}: {stdout}", run + 1);
+    }
+
+    // Disk visits the directories in sorted order: `apps/one` spends the
+    // one slot on d, `apps/two` gets d free, and `legacy` defers e and b.
+    let (code, stdout, changed) = run_disk_args(
+        &server,
+        &disk_files,
+        &["--no-socket-yml", "--max-new-patches", "1", "apps/one", "apps/two", "legacy"],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    disk_files.extend(changed);
+    assert_eq!(
+        pins(&disk_files),
+        [
+            vec!["mem-e", "mem-b", "mem-c", "mem-d"],
+            vec!["mem-b", "mem-c", "mem-d"],
+            vec![],
+        ],
+        "{stdout}"
+    );
+
+    // Memory ranks every root in one queue: legacy's critical e goes first.
+    let mut o = options(Some(1));
+    o.no_socket_yml = Some(true);
+    let mem = memory(&server, &mem_files, o).await;
+    assert_eq!(
+        mem.rollout["maxNewPatches"],
+        json!({ "value": 1, "source": "flag" })
+    );
+    mem_files = apply(&mem_files, &mem);
+    assert_eq!(
+        pins(&mem_files),
+        [
+            vec!["mem-e", "mem-b", "mem-c"],
+            vec!["mem-b", "mem-c"],
+            vec!["mem-e"],
+        ]
+    );
+}
+
 #[tokio::test]
 async fn memory_counts_a_committed_manifest_vendor_entry_or_pin_as_recorded() {
     let server = MockServer::start().await;
