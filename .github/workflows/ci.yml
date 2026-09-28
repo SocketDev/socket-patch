@@ -765,7 +765,7 @@ jobs:
           retention-days: 3
 
   e2e:
-    needs: [test, e2e-build]
+    needs: [e2e-build]
     strategy:
       fail-fast: false
       matrix:
@@ -1455,7 +1455,7 @@ jobs:
   # the nightly schedule and dispatch run them with the `e2e` steps.
   e2e-full:
     if: github.event_name != 'pull_request'
-    needs: [test, e2e-build]
+    needs: [e2e-build]
     strategy:
       fail-fast: false
       matrix:
@@ -1689,7 +1689,7 @@ jobs:
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    needs: [test, e2e-build]
+    needs: [e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -1760,7 +1760,7 @@ jobs:
   cargo-vex-matrix-full:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     if: github.event_name != 'pull_request'
-    needs: [test, e2e-build]
+    needs: [e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
