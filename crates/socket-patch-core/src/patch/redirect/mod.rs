@@ -4705,7 +4705,7 @@ fn rewrite_gem(
     // `default_gemfile` tries gems.rb first — verified on bundler 4.0.15,
     // which warns "Multiple gemfiles (gems.rb and Gemfile) detected ...
     // bundler is ignoring them in favor of gems.rb and gems.locked"; same
-    // order as `setup::gem::discover_bundler_project`). DIVERGING spellings
+    // order as the ruby crawler's manifest probe). DIVERGING spellings
     // are ambiguous — the redirect would land in the file bundler reads while
     // tooling pinned to the other keeps resolving upstream — so fail closed
     // on the whole gem set. Divergence is judged on the redirect-footprint

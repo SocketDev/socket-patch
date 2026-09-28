@@ -346,10 +346,8 @@ fn deno_jsr_agent_patch_attests_only_with_the_manifest() {
     let (key, before, after) = files()[0];
     put(&pkg, key.strip_prefix("package/").unwrap(), before);
     let rec = record(UUID);
-    let mut manifest = serde_json::json!({
+    let manifest = serde_json::json!({
         "patches": { JSR_PURL: serde_json::to_value(&rec).unwrap() },
-        // Deno has no install hook: declare it manual (property 7).
-        "setup": { "manual": ["deno"] },
     });
     fx.put(".socket/manifest.json", manifest.to_string());
     fx.put(
@@ -404,13 +402,4 @@ fn deno_jsr_agent_patch_attests_only_with_the_manifest() {
         assert_nothing_to_attest(&out, &[JSR_PURL], &format!("no manifest {extra:?}"));
     }
     quiet.assert_no_requests();
-
-    // And a manifest WITHOUT the `setup.manual` declaration keeps the
-    // pre-existing property-7 omission (unchanged by manifest-less VEX:
-    // the Deno patch is not lockfile-persisted, so it does not bypass it).
-    manifest["setup"] = serde_json::json!({});
-    fx.put(".socket/manifest.json", manifest.to_string());
-    let out = fx.vex(&["--offline"]);
-    assert_eq!(out.code, Some(1), "undeclared deno ecosystem: {out}");
-    assert_absent(out.doc.as_ref(), JSR_PURL);
 }

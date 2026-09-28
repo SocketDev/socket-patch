@@ -339,11 +339,15 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
     lines.join("\n")
 }
 
+/// The human line for a project with nothing to list (an empty manifest, or
+/// no manifest and no ledger records at all).
+const NO_PATCHES: &str = "No patches in this project. Run `socket-patch scan`.";
+
 /// The whole human listing for stdout: a count header, then the entries
 /// separated by one blank line (none after the last).
 fn format_listing(entries: &[ListEntry<'_>], color: bool) -> String {
     if entries.is_empty() {
-        return "No patches found in manifest.".to_string();
+        return NO_PATCHES.to_string();
     }
     let mut out = format!(
         "Found {}:\n\n",
@@ -427,7 +431,7 @@ pub async fn run(args: ListArgs) -> i32 {
                 detail: detail.clone(),
             });
         } else if !args.common.silent {
-            eprintln!("Warning (hosted_wiring_contested): {detail}");
+            eprintln!("Warning: {}", crate::commands::rollback::capitalize_first(detail));
         }
     }
     let vendor_state = crate::commands::vendor_state_lenient(&loaded.vendor, args.common.silent);
@@ -441,17 +445,12 @@ pub async fn run(args: ListArgs) -> i32 {
             emit_error(&args, "hosted_wiring_contested", detail, warnings);
             return 1;
         }
-        // No manifest AND no ledger records: nothing is listable anywhere.
-        emit_error(
-            &args,
-            "manifest_not_found",
-            format!("Manifest not found at {}", manifest_path.display()),
-            warnings,
-        );
-        return 1;
     }
 
-    // Records found (any store) ⇒ a successful list, exit 0.
+    // A successful list, exit 0, with or without records. No manifest
+    // and no ledger record is just an empty project (normal for hosted
+    // mode, which writes no manifest); only an unreadable or invalid
+    // manifest or contested hosted wiring fails.
     //
     // Telemetry: `patch_listed`'s `patches_count` means "manifest patches"
     // to its consumers, so it counts the manifest ONLY (0 on a ledger-only
@@ -1082,7 +1081,7 @@ mod tests {
 
     #[test]
     fn format_listing_counts_and_separates_entries() {
-        assert_eq!(format_listing(&[], false), "No patches found in manifest.");
+        assert_eq!(format_listing(&[], false), NO_PATCHES);
         let manifest = sample_manifest();
         let one = combined_entries(Some(&manifest), &[], None);
         let out = format_listing(&one, false);

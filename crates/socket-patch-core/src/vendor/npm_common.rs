@@ -287,7 +287,7 @@ pub(super) async fn stage_patch_pack(
         // bundled-deps refusal below.
         let text = String::from_utf8_lossy(&bytes);
         if let Ok(pkg) =
-            serde_json::from_str::<Value>(crate::package_json::detect::strip_bom(&text))
+            serde_json::from_str::<Value>(crate::utils::serde::strip_bom(&text))
         {
             if declares_bundled_deps(&pkg) {
                 return Err(Box::new(refused(

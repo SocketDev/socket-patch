@@ -894,7 +894,7 @@ async fn run_vendored_leg(
     {
         for w in &warnings {
             if loud {
-                eprintln!("Warning ({}): {}", w.code, w.detail);
+                eprintln!("Warning: {}", w.detail);
             }
             out.warnings.push((w.code.to_string(), w.detail.clone()));
         }
@@ -1110,7 +1110,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
         } else {
             eprintln!("Error: {msg}");
         }
-        return 1;
+        // A usage error (v5.0: exit 2, like every other one).
+        return 2;
     }
 
     // An unparseable glob is a usage error — same exit-2 stderr shape as
@@ -1185,8 +1186,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     }))
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
-            } else if let Some((code, detail)) = &warning {
-                eprintln!("Warning ({code}): {}", capitalize_first(detail));
+            } else if let Some((_, detail)) = &warning {
+                eprintln!("Warning: {}", capitalize_first(detail));
             } else if !args.common.silent {
                 println!(
                     "{} the pre-v5 hosted ledger {}: no lockfile pins a hosted patch.",
@@ -1502,7 +1503,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         let prompt = rollback_prompt(manifest_scope.len(), vendor_scope.len(), hosted_scope.len());
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !args.common.json && !args.common.silent {
-                println!("Rollback cancelled.");
+                println!("{}", crate::ui::CANCELLED);
             }
             return 0;
         }
@@ -1635,7 +1636,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
             // The manifest is rewritten only when an entry actually leaves
             // it; an emptied manifest stays on disk as `{"patches": {}}`
-            // (it carries the setup block and `list`/`apply`/`repair`'s
+            // (it carries any legacy setup block and `list`/`apply`/`repair`'s
             // empty-vs-missing exit codes) — never deleted.
             let mut removed: Vec<String> = Vec::new();
             let mut updated_manifest = manifest.clone();
@@ -2015,8 +2016,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // failures, hosted replay notes, ...): the JSON envelope's
             // `warnings[]`, one stderr line each here.
             if !args.common.json && !args.common.silent {
-                for (code, detail) in &human_warnings {
-                    eprintln!("Warning ({code}): {detail}");
+                for (_, detail) in &human_warnings {
+                    eprintln!("Warning: {detail}");
                 }
             }
 
@@ -4594,8 +4595,8 @@ mod tests {
         assert_eq!(capitalize_first("can't, really"), "Can't, really");
         // Values the user may copy back are never altered.
         assert_eq!(
-            capitalize_first("pkg:npm/a@1 matches only hosted redirect records"),
-            "pkg:npm/a@1 matches only hosted redirect records"
+            capitalize_first("pkg:npm/a@1 matches only hosted records"),
+            "pkg:npm/a@1 matches only hosted records"
         );
         assert_eq!(
             capitalize_first("a1b2c3d4-0000-4000-8000-000000000000 matches nothing"),

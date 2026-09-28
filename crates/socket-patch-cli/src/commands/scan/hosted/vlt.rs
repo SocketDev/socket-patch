@@ -169,7 +169,7 @@ fn with_optional_kept(mut detail: String, optional_left: usize, held: &str) -> S
 }
 
 const VLT_UPDATE_NOTE: &str =
-    " Note: `vlt update` re-resolves from the registry and drops these redirects.";
+    " Note: `vlt update` re-resolves from the registry and drops these hosted patches.";
 
 fn reinstall_detail(tally: &HealTally) -> String {
     let held = "unpatched copies of optional dependencies";

@@ -870,17 +870,14 @@ fn format_all_narrowed(skips: &[serde_json::Value]) -> String {
     }
 }
 
-/// The confirmation question for `n` selected patches.
-fn format_confirm_prompt(mode: super::scan::ScanMode, n: usize, save_only: bool) -> String {
+/// The agent-mode confirmation question for `n` selected patches (hosted
+/// and vendored `get` never prompt).
+fn format_confirm_prompt(save_only: bool, n: usize) -> String {
     let patches = crate::ui::plural(n, "patch", "patches");
-    match mode {
-        super::scan::ScanMode::Agent if save_only => format!("Download {patches}?"),
-        super::scan::ScanMode::Agent => format!("Download and apply {patches}?"),
-        super::scan::ScanMode::Vendored => format!("Download and vendor {patches}?"),
-        super::scan::ScanMode::Hosted => format!(
-            "Redirect {} to the hosted patch server?",
-            crate::ui::plural(n, "package", "packages")
-        ),
+    if save_only {
+        format!("Download {patches}?")
+    } else {
+        format!("Download and apply {patches}?")
     }
 }
 
@@ -903,9 +900,8 @@ fn no_packages_message(global: bool) -> String {
 /// `patch` names it (a purl, or the uuid when the purl is unknown).
 fn format_paid_required(patch: &str) -> String {
     format!(
-        "This patch requires a paid subscription to download.\n  \
-         Patch: {patch}\n  \
-         Upgrade at: https://socket.dev/pricing"
+        "This patch requires a paid Socket plan.\n  Patch: {patch}\n{}",
+        crate::ui::PAID_UPGRADE
     )
 }
 
@@ -1104,7 +1100,7 @@ pub(crate) fn select_patches(
                     return Err(1);
                 }
                 Err(SelectError::Cancelled) => {
-                    eprintln!("Selection cancelled.");
+                    eprintln!("{}", crate::ui::CANCELLED);
                     return Err(0);
                 }
             }
@@ -2567,19 +2563,18 @@ pub async fn run(args: GetArgs) -> i32 {
             args.common.json,
             "Only one of --id, --cve, --ghsa, or --package can be specified",
         );
-        return 1;
+        return 2;
     }
     if args.one_off && args.save_only {
         report_error(
             args.common.json,
             "--one-off and --save-only cannot be used together",
         );
-        return 1;
+        return 2;
     }
     // v5: hosted by default, like scan. `--save-only` (records a manifest
     // entry) and global installs (no project lockfile) mean agent mode.
-    // Conflicts use get's exit-1 report_error style (scan's self-enforced
-    // conflicts exit 2 — documented carve-out in CLI_CONTRACT.md).
+    // Usage errors exit 2, like clap's and scan's (v5.0).
     let mode = args.mode.unwrap_or(if args.save_only || args.common.is_global() {
         super::scan::ScanMode::Agent
     } else {
@@ -2595,7 +2590,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 mode.cli_name()
             ),
         );
-        return 1;
+        return 2;
     }
     if args.one_off {
         // The flag parses but is not implemented: fail loudly rather than
@@ -2603,7 +2598,7 @@ pub async fn run(args: GetArgs) -> i32 {
         // not-yet-implemented contract; rejected before any network or disk
         // activity.
         report_error(args.common.json, "One-off get mode is not yet implemented");
-        return 1;
+        return 2;
     }
     // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
     // network; operations that need remote data fail loudly). Every `get`
@@ -2637,7 +2632,7 @@ pub async fn run(args: GetArgs) -> i32 {
     if args.id || args.cve || args.ghsa {
         if let Some(err) = forced_identifier_error(&args.identifier, id_type) {
             report_error(args.common.json, err);
-            return 1;
+            return 2;
         }
     }
 
@@ -2949,8 +2944,8 @@ pub async fn run(args: GetArgs) -> i32 {
                 "{}",
                 format_search_results(&all, search_response.can_access_paid_patches, color)
             );
-            println!("All available patches require a paid subscription.");
-            println!("  Upgrade at: https://socket.dev/pricing");
+            println!("All available patches require a paid Socket plan.");
+            println!("{}", crate::ui::PAID_UPGRADE);
         }
         return 0;
     }
@@ -2997,8 +2992,8 @@ pub async fn run(args: GetArgs) -> i32 {
     // by --json (stderr; the envelope carries them too) — but --silent
     // mutes them like scan does.
     if !args.common.silent {
-        for (code, detail) in &narrow_warnings {
-            eprintln!("Warning ({code}): {detail}");
+        for (_, detail) in &narrow_warnings {
+            eprintln!("Warning: {detail}");
         }
     }
     if accessible.is_empty() {
@@ -3056,10 +3051,18 @@ pub async fn run(args: GetArgs) -> i32 {
     // Smart patch selection: pick one patch per PURL. `accessible` is
     // non-empty here and every entry passes the selector's tier filter, so
     // the selection is never empty (one patch per purl group, or `Err`).
+    // Hosted and vendored `get` never prompt (v5.0): like `scan`, they take
+    // the top-ranked accessible patch per package, in JSON mode too.
+    let auto_pick = mode != super::scan::ScanMode::Agent;
+    let select_common = if auto_pick {
+        super::scan::selection_args(&args.common)
+    } else {
+        args.common.clone()
+    };
     let selected = match select_patches(
         &accessible,
-        search_response.can_access_paid_patches,
-        &args.common,
+        auto_pick || search_response.can_access_paid_patches,
+        &select_common,
     ) {
         Ok(s) => s,
         Err(code) => return code,
@@ -3074,7 +3077,7 @@ pub async fn run(args: GetArgs) -> i32 {
         && !selection_prompted(
             &accessible,
             search_response.can_access_paid_patches,
-            &args.common,
+            &select_common,
         )
     {
         print!("{}", format_selected_patches(&selected, color));
@@ -3103,14 +3106,17 @@ pub async fn run(args: GetArgs) -> i32 {
         return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
     }
 
-    // Confirm before acting (default YES), with mode-appropriate wording.
-    // Dry runs skip the prompt: nothing mutates, so nothing to confirm.
-    let prompt = format_confirm_prompt(mode, selected.len(), args.save_only);
-    if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
-        if !quiet {
-            eprintln!("Cancelled; no changes made.");
+    // Agent mode confirms before acting (default YES). Dry runs skip the
+    // prompt: nothing mutates, so nothing to confirm. Hosted and vendored
+    // runs never prompt (v5.0), like `scan`.
+    if mode == super::scan::ScanMode::Agent && !args.common.dry_run {
+        let prompt = format_confirm_prompt(args.save_only, selected.len());
+        if !crate::ui::confirm(&prompt, true, &args.common) {
+            if !quiet {
+                eprintln!("{}", crate::ui::CANCELLED);
+            }
+            return 0;
         }
-        return 0;
     }
 
     match mode {
@@ -5333,32 +5339,10 @@ mod tests {
     }
 
     #[test]
-    fn confirm_prompts_per_mode() {
-        use super::super::scan::ScanMode;
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Agent, 1, false),
-            "Download and apply 1 patch?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Agent, 2, false),
-            "Download and apply 2 patches?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Agent, 1, true),
-            "Download 1 patch?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Vendored, 3, false),
-            "Download and vendor 3 patches?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Hosted, 1, false),
-            "Redirect 1 package to the hosted patch server?"
-        );
-        assert_eq!(
-            format_confirm_prompt(ScanMode::Hosted, 0, false),
-            "Redirect 0 packages to the hosted patch server?"
-        );
+    fn confirm_prompts_agent_mode() {
+        assert_eq!(format_confirm_prompt(false, 1), "Download and apply 1 patch?");
+        assert_eq!(format_confirm_prompt(false, 2), "Download and apply 2 patches?");
+        assert_eq!(format_confirm_prompt(true, 1), "Download 1 patch?");
     }
 
     #[test]
@@ -5386,9 +5370,9 @@ mod tests {
     fn paid_required_text() {
         assert_eq!(
             format_paid_required("pkg:npm/a@1"),
-            "This patch requires a paid subscription to download.\n  \
-             Patch: pkg:npm/a@1\n  \
-             Upgrade at: https://socket.dev/pricing"
+            "This patch requires a paid Socket plan.\n  \
+             Patch: pkg:npm/a@1\n\
+             Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing"
         );
     }
 

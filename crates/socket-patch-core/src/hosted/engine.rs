@@ -812,7 +812,7 @@ pub async fn rewrite(
             "redirect_rush_repo_state_stale",
             "pnpm-lock.yaml was edited outside `rush update`; if \
                  preventManualShrinkwrapChanges is enabled, `rush install` fails until \
-                 `rush update` refreshes repo-state.json (the redirect survives `rush \
+                 `rush update` refreshes repo-state.json (the hosted wiring survives `rush \
                  update`)",
         ));
     }
@@ -1428,8 +1428,8 @@ pub fn record_fetch_failed_warning(purl: &str) -> RewriteWarning {
     warning(
         "record_fetch_failed",
         format!(
-            "{purl} redirected, but its patch record could not be fetched; \
-             this run's VEX attestation omits it (`socket-patch vex` \
+            "{purl} was switched to hosted, but its patch record could not be \
+             fetched; this run's VEX attestation omits it (`socket-patch vex` \
              fetches it again once the API answers)"
         ),
     )

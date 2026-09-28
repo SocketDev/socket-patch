@@ -2332,7 +2332,7 @@ mod interactive {
     }
 
     /// Declining the rollback confirm prompt cancels cleanly: the composed
-    /// manifest clause renders with the `[Y/n]` hint, "Rollback cancelled."
+    /// manifest clause renders with the `[Y/n]` hint, "Cancelled; no changes made."
     /// prints, the run exits 0, and nothing is mutated.
     #[test]
     fn rollback_interactive_decline_cancels() {
@@ -2367,7 +2367,7 @@ mod interactive {
             "the PTY run must take the interactive branch; got: {output}"
         );
         assert!(
-            output.contains("Rollback cancelled."),
+            output.contains("Cancelled; no changes made."),
             "the decline must be acknowledged; got: {output}"
         );
         assert_eq!(
@@ -3380,7 +3380,7 @@ fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     );
     assert!(
         stderr.contains(
-            "Warning (redirect_vlt_reinstall_required): restored registry pins for 1 packages; \
+            "Warning: restored registry pins for 1 packages; \
              removed the patched installed copies"
         ),
         "{stderr}"

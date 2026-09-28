@@ -930,7 +930,7 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
     let (code, stdout, stderr) = run_remove_online(tmp.path(), &[NPM_PURL, "--yes"], &registry);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("The following hosted redirect will be unwound and removed:"),
+        stderr.contains("The following hosted patch will be unwound and removed:"),
         "the hosted-only listing must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -1835,7 +1835,7 @@ mod pty {
     }
 
     /// Declining the hosted-only confirm prompt must cancel cleanly (exit
-    /// 0, "Removal cancelled.") with the lock byte-identical and no
+    /// 0, "Cancelled; no changes made.") with the lock byte-identical and no
     /// `.socket/` state written.
     #[test]
     fn remove_hosted_only_interactive_n_cancels() {
@@ -1856,7 +1856,7 @@ mod pty {
         );
         // Vacuity guard: the hosted-only confirm prompt MUST have run.
         assert!(
-            output.contains("Remove 1 hosted redirect and unwind its lockfile wiring?"),
+            output.contains("Remove 1 hosted patch and unwind its lockfile wiring?"),
             "the hosted-only confirm prompt must have shown; got: {output}"
         );
         assert!(
@@ -1864,7 +1864,7 @@ mod pty {
             "must NOT have taken the non-interactive branch in a PTY; got: {output}"
         );
         assert!(
-            output.contains("Removal cancelled"),
+            output.contains("Cancelled; no changes made."),
             "'n' must report cancellation; got: {output}"
         );
         // Declined: nothing moved.

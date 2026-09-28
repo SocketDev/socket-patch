@@ -122,14 +122,6 @@
         "persistence_survives",
         "persistence_reverted_by_reinstall",
         "reruns_and_vex"
-      ],
-      "setup": [
-        "hook_fires_per_reify",
-        "root_scripts_advisory",
-        "workspace_root_only",
-        "twice_no_duplicate",
-        "hook_failure",
-        "hook_abort_leaves_no_staging"
       ]
     },
     "e2e_hosted_production": {
@@ -256,14 +248,6 @@
       "persistence_survives",
       "persistence_reverted_by_reinstall",
       "reruns_and_vex"
-    ],
-    "setup": [
-      "hook_fires_per_reify",
-      "root_scripts_advisory",
-      "workspace_root_only",
-      "twice_no_duplicate",
-      "hook_failure",
-      "hook_abort_leaves_no_staging"
     ],
     "production": [
       "hosted_install_proof",
@@ -891,55 +875,6 @@
       },
       "conditions": [],
       "reason": "non-hermetic-registry"
-    },
-    {
-      "boundary": "root `pre*`/`post*` scripts run without an `install` script",
-      "suite": "setup",
-      "legs": [
-        "hook_fires_per_reify",
-        "workspace_root_only",
-        "hook_failure"
-      ],
-      "except": [],
-      "versions": {
-        "op": "<",
-        "a": "1.0.0-rc.13"
-      },
-      "conditions": [],
-      "reason": "root-postinstall-not-run"
-    },
-    {
-      "boundary": "a failing hook's abort on Windows (rollback EBUSY fix from 1.0.5)",
-      "suite": "setup",
-      "legs": [
-        "hook_abort_leaves_no_staging"
-      ],
-      "except": [],
-      "versions": {
-        "op": "all"
-      },
-      "conditions": [
-        {
-          "key": "os",
-          "op": "!=",
-          "value": "windows"
-        }
-      ],
-      "reason": "windows-only"
-    },
-    {
-      "boundary": "as above",
-      "suite": "setup",
-      "legs": [
-        "hook_abort_leaves_no_staging"
-      ],
-      "except": [],
-      "versions": {
-        "op": "<",
-        "a": "1.0.5"
-      },
-      "conditions": [],
-      "reason": "pre-ebusy-fix"
     }
   ],
   "supported": [

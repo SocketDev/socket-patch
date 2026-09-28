@@ -1222,7 +1222,7 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
         "the annotation names the purl; stdout={stdout}"
     );
     assert!(
-        stderr.contains("vendor_content_mismatch_overwritten"),
+        stderr.contains("vendored the patched content anyway"),
         "overwrite warning surfaced; stderr={stderr}"
     );
     // Vendored despite the mismatch.

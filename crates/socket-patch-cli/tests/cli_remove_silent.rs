@@ -357,7 +357,7 @@ fn remove_silent_suppresses_detached_revert_output() {
 }
 
 /// Backend revert warnings are chatter, not errors: `vendor --revert`
-/// gates the identical "Warning (code): detail" stderr line on
+/// gates the identical "Warning: detail" stderr line on
 /// `!silent && !json` (`record_warning`), but remove's vendor block
 /// printed it under `--silent` (gated on `!json` alone).
 #[test]
@@ -384,7 +384,7 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
         "the drift-kept error must print even under --silent; got {stderr:?}"
     );
     assert!(
-        !stderr.contains("Warning ("),
+        !stderr.contains("Warning:"),
         "--silent must suppress backend revert warnings; got {stderr:?}"
     );
 
@@ -395,7 +395,7 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
     let (loud_code, _loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
     assert_eq!(loud_code, 1);
     assert!(
-        loud_stderr.contains("Warning (vendor_lock_entry_drifted)"),
+        loud_stderr.contains("Warning: "),
         "non-silent run must print the backend warning; got {loud_stderr:?}"
     );
     // The drift-keep must leave BOTH stores intact: ledger entry and
@@ -527,7 +527,7 @@ fn remove_silent_suppresses_detached_revert_warnings() {
         "an all-kept detached remove is a partial failure; stderr={stderr:?}"
     );
     assert!(
-        !stderr.contains("Warning ("),
+        !stderr.contains("Warning:"),
         "--silent must suppress detached revert warnings; got {stderr:?}"
     );
     assert!(
@@ -549,7 +549,7 @@ fn remove_silent_suppresses_detached_revert_warnings() {
     let (loud_code, _loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
     assert_eq!(loud_code, 1);
     assert!(
-        loud_stderr.contains("Warning (vendor_lock_entry_drifted)"),
+        loud_stderr.contains("Warning: "),
         "non-silent detached run must print the backend warning; got {loud_stderr:?}"
     );
     assert!(

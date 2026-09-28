@@ -43,7 +43,7 @@ pub const PNPM_TRUST_TRADEOFF_AND_CAUTION: &str =
      (minimumReleaseAge / trustPolicy re-checks) for ALL lockfile entries, \
      not just the patched ones — the per-entry sha512 integrity pins are \
      still enforced. Do NOT follow pnpm's advice to rebuild the lockfile \
-     (`pnpm clean --lockfile`): that silently discards the redirect and \
+     (`pnpm clean --lockfile`): that silently discards the hosted patches and \
      reinstalls the vulnerable upstream artifact. pnpm <=10 ignores the \
      setting and installs work unchanged";
 
@@ -66,7 +66,7 @@ pub fn pnpm_trust_manual_guidance(server: &str) -> String {
          `trustLockfile: true` in pnpm-workspace.yaml so every install \
          accepts the patched artifacts. Do NOT follow pnpm's advice to \
          rebuild the lockfile (`pnpm clean --lockfile`): that silently \
-         discards the redirect and reinstalls the vulnerable upstream \
+         discards the hosted patches and reinstalls the vulnerable upstream \
          artifact. pnpm <=10 installs work unchanged",
         pnpm_trust_policy_preamble(server),
     )
@@ -84,10 +84,10 @@ pub fn pnpm_trust_legacy_detail(server: &str) -> String {
          lock read by pnpm 1–8, which have no \
          lockfile trust policy: no trust step exists or is needed. Do NOT regenerate the lockfile \
          (deleting it, or re-resolving on a newer pnpm): that silently \
-         discards the redirect and reinstalls the vulnerable upstream \
+         discards the hosted patches and reinstalls the vulnerable upstream \
          artifact. If the project later moves to pnpm >=9, re-run \
          `socket-patch scan --mode hosted` so the regenerated lock is \
-         redirected (and trust-configured) again"
+         switched to hosted (and trust-configured) again"
     )
 }
 
@@ -104,7 +104,7 @@ pub fn pnpm_trust_workspace_unreadable_detail(server: &str, err: &std::io::Error
          or add `trustLockfile: true` to it yourself so every install \
          accepts the patched artifacts. Do NOT follow pnpm's advice to \
          rebuild the lockfile (`pnpm clean --lockfile`): that silently \
-         discards the redirect and reinstalls the vulnerable upstream \
+         discards the hosted patches and reinstalls the vulnerable upstream \
          artifact. pnpm <=10 installs work unchanged",
         pnpm_trust_policy_preamble(server),
     )

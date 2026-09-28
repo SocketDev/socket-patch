@@ -395,7 +395,7 @@ async fn dispatch_find(
 /// Collapse a multi-copy map to one representative path per PURL (the
 /// first-discovered — root-copy-first for npm). Consumers that only need
 /// "is it installed / where is a representative copy" (`vendor`, `vex`,
-/// `setup`, `get`, `repair vendor`) use the collapsing wrappers below
+/// `get`, `repair vendor`) use the collapsing wrappers below
 /// (`HashMap<String, PathBuf>`). `apply` and
 /// `rollback` — which must touch EVERY copy — use the `_all` variants.
 pub(crate) fn collapse_to_first(multi: HashMap<String, Vec<PathBuf>>) -> HashMap<String, PathBuf> {
@@ -582,9 +582,9 @@ pub(crate) fn npm_paths_by_identity_in(
     out
 }
 
-/// Resolve manifest PURLs to their installed on-disk paths (partition,
-/// build crawler options from the global args, dispatch). Uses the
-/// rollback (qualified-aware) resolver, never a base-keyed collapse of
+/// Resolve manifest PURLs to every installed on-disk copy (crawl order;
+/// partition, build crawler options from the global args, dispatch). Uses
+/// the rollback (qualified-aware) resolver, never a base-keyed collapse of
 /// [`find_all_packages_for_purls`]: release-variant ecosystems (PyPI /
 /// RubyGems / Maven) key the manifest by *qualified* PURLs
 /// (`?artifact_id=`, `?platform=`, `?classifier=&ext=`), but the crawler
@@ -593,30 +593,11 @@ pub(crate) fn npm_paths_by_identity_in(
 /// patch would silently resolve as `package_not_found`. The rollback
 /// variant fans each base path back out to every qualified manifest PURL
 /// — the same mapping the manifest was written with (`get` uses the same
-/// resolver).
-pub async fn find_manifest_package_paths(
-    purls: &[String],
-    common: &GlobalArgs,
-    quiet: bool,
-) -> HashMap<String, PathBuf> {
-    collapse_to_first(find_manifest_package_copies(purls, common, quiet).await)
-}
-
-/// [`find_manifest_package_paths`] keeping EVERY installed copy of each
-/// purl (crawl order): one lookup a caller can take both the first-copy
-/// view and the every-copy view from (`vex` hashes the first copy of a
-/// manifest purl and every copy of a hosted one), so the tree is crawled —
-/// and a `--global` run's "Using … at:" banner printed — once.
-pub async fn find_manifest_package_copies(
-    purls: &[String],
-    common: &GlobalArgs,
-    quiet: bool,
-) -> HashMap<String, Vec<PathBuf>> {
-    find_manifest_package_copies_reusing(purls, common, quiet, None).await
-}
-
-/// [`find_manifest_package_copies`], taking the npm `node_modules` roots
-/// from `prior` (a crawl of the same options earlier in this process, over
+/// resolver). `vex` hashes the first copy of a manifest purl and every copy
+/// of a hosted one from this one lookup.
+///
+/// With `prior`, the npm `node_modules` roots come
+/// from it (a crawl of the same options earlier in this process, over
 /// a tree whose directories nothing has touched since) instead of walking
 /// the tree for them again — the every-copy twin of
 /// [`find_packages_for_rollback_reusing`]. Only the root discovery is

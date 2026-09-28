@@ -94,7 +94,7 @@ async fn emit_not_found(
     }
 }
 
-/// Print the hosted leg's run-level advisories (`Warning (<code>): …`) on
+/// Print the hosted leg's run-level advisories (`Warning: …`) on
 /// stderr — never under `--silent` / `--json` (JSON carries them in the
 /// envelope's `warnings[]`). Printed as soon as the leg returns, so a
 /// human run that then fails still says what it did to the files.
@@ -102,8 +102,8 @@ fn print_hosted_leg_warnings(common: &GlobalArgs, warnings: &[(String, String)])
     if common.silent || common.json {
         return;
     }
-    for (code, detail) in warnings {
-        eprintln!("Warning ({code}): {detail}");
+    for (_, detail) in warnings {
+        eprintln!("Warning: {detail}");
     }
 }
 
@@ -181,7 +181,7 @@ fn remove_prompt(
     if hosted > 0 {
         clauses.push(format!(
             "unwind {}",
-            plural(hosted, "hosted redirect", "hosted redirects")
+            plural(hosted, "hosted patch", "hosted patches")
         ));
     }
     let question = super::rollback::as_question(&super::rollback::join_clauses(&clauses));
@@ -541,7 +541,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         );
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if loud {
-                println!("Removal cancelled.");
+                println!("{}", crate::ui::CANCELLED);
             }
             return 0;
         }
@@ -814,7 +814,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the blob sweep below can still preview against the post-removal
     // reference set. `--preserve-state` deliberately touches neither the
     // manifest nor the blobs. An emptied manifest stays on disk as
-    // `{"patches": {}}` — it carries the setup block and the
+    // `{"patches": {}}` — it carries any legacy setup block and the
     // empty-vs-missing exit codes of `list`/`apply`/`repair`.
     let mut updated_manifest = manifest.clone();
     let removed = if args.preserve_state {
@@ -1166,7 +1166,7 @@ async fn revert_vendored_matches(
     {
         for w in &warnings {
             if loud {
-                eprintln!("Warning ({}): {}", w.code, w.detail);
+                eprintln!("Warning: {}", w.detail);
             }
             leg.skipped.push(
                 PatchEvent::new(PatchAction::Skipped, key.clone())
@@ -1358,9 +1358,9 @@ async fn remove_hosted_only(
         eprintln!(
             "The following {} {} unwound and removed:",
             if hosted_matches.len() == 1 {
-                "hosted redirect"
+                "hosted patch"
             } else {
-                "hosted redirects"
+                "hosted patches"
             },
             if args.common.dry_run {
                 "would be"
@@ -1376,7 +1376,7 @@ async fn remove_hosted_only(
     // `--dry-run` previews without mutating — nothing to confirm.
     let prompt = format!(
         "Remove {} and unwind {} lockfile wiring?",
-        plural(hosted_matches.len(), "hosted redirect", "hosted redirects"),
+        plural(hosted_matches.len(), "hosted patch", "hosted patches"),
         if hosted_matches.len() == 1 {
             "its"
         } else {
@@ -1385,7 +1385,7 @@ async fn remove_hosted_only(
     );
     if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
         if loud {
-            println!("Removal cancelled.");
+            println!("{}", crate::ui::CANCELLED);
         }
         return 0;
     }
@@ -1502,7 +1502,7 @@ async fn remove_ledger_only(
     };
     if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
         if loud {
-            println!("Removal cancelled.");
+            println!("{}", crate::ui::CANCELLED);
         }
         return 0;
     }
@@ -1783,12 +1783,12 @@ mod tests {
         );
         assert_eq!(
             remove_prompt(1, false, false, 0, 1),
-            "Remove 1 patch, roll back its files, and unwind 1 hosted redirect?"
+            "Remove 1 patch, roll back its files, and unwind 1 hosted patch?"
         );
         assert_eq!(
             remove_prompt(1, false, false, 2, 1),
             "Remove 1 patch, roll back its files, revert 2 vendored artifacts, and unwind 1 \
-             hosted redirect?"
+             hosted patch?"
         );
         assert_eq!(
             remove_prompt(1, true, false, 1, 0),

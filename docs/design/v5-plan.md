@@ -173,6 +173,18 @@ patch-UI review.
   `socket-patch-hook` wheel publishing (or mark them deprecated/unpublished;
   confirm with owner before deleting release workflows). Keep `apply`.
   Docs: agent mode = `scan --mode agent` + `socket-patch apply` in CI.
+- **Status (branch `v5/remove-setup-and-ui`):** subcommand, core `setup/` +
+  `package_json/`, setup tests, `setup-e2e` feature, setup-matrix CI job,
+  `tests/setup_matrix/`, `scripts/setup-matrix.sh` and the setup-only
+  `Dockerfile.gem-b1`/`gem-b4` are deleted. vex's "Property 7" filter went
+  with it (agent patches attest on verification; `setup.manual` is parsed
+  but ignored). The `socket-patch-hook` wheel and `socket-patch-bundler` gem
+  are out of `publish-pypi.yml` / `publish-rubygems.yml`,
+  `build-pypi-wheels.py` and `version-sync.sh`, and the `socket-patch[hook]`
+  extra is dropped. **Owner decision pending:** `pypi/socket-patch-hook/`
+  and `gem/socket-patch-bundler/` sources are kept (frozen, README marked
+  deprecated) — delete them, and optionally yank/deprecate the published
+  packages and remove their PyPI/RubyGems trusted publishers, once confirmed.
 
 ### WS8 — Patch UI streamlining  *(branch `v5/ui`)*
 - `-h` shows ~8 options (hide_short_help for the rest); hide deprecated
@@ -182,6 +194,18 @@ patch-UI review.
   manifest says "No patches in this project"; unify cancel/upsell strings;
   exit 2 for all usage errors; scan/get JSON onto `json_envelope`.
 - Full item list: 22 findings from the UI review (sizes S/M/L, contract flags).
+- **Status (branch `v5/remove-setup-and-ui`):** done — short `-h`
+  (`cli_command()` hides the rest; `--help` unchanged), hidden
+  `scan --apply/--vendor`, one-line npm allow-remote note (`--verbose`/JSON
+  keep the detail), code-free `Warning:`/`GC: skipped:` lines (error lines keep their code),
+  "hosted" wording in human text, `ui::next_steps` shared by hosted and
+  vendored, prompt-free hosted/vendored `get` (JSON too), `list`'s
+  `No patches in this project.` line (exit 0, empty success envelope in JSON; was 1 missing,
+  0 empty), `ui::CANCELLED` / `ui::PAID_UPGRADE`, exit 2 for `get` and
+  `rollback --one-off` usage errors. **Not done:** scan/get JSON onto
+  `json_envelope` (larger contract change; deferred). Per-row
+  `[error] <purl> (<code>)` / `[would-refuse]` lines keep their codes
+  (grep-able under `--silent`).
 
 ### WS9 — Staged patch rollout  *(branches `v5/rollout-policy` (A), `v5/rollout-limit` (B))*
 - Added 2026-09-28 at the owner's request. `socket.yml` `patches:` policy
@@ -191,6 +215,10 @@ patch-UI review.
   `docs/design/staged-rollout.md`. Merge order A then B.
 
 ## Remaining small follow-ups
+*(All done on `v5/remove-setup-and-ui`: the vacuous rows are dropped,
+GEM_PATCHES has both patches, `tool_command` and the deprecated aliases —
+plus the CI grep that guarded them — are removed, and the backtest label is
+retired.)*
 - ci.yml `e2e_cargo`/`e2e_golang` rows select `--ignored` but have no ignored
   tests (vacuous legs) → give them `--include-ignored` or drop the rows.
 - `e2e_vendored_production` GEM_PATCHES lacks merged `01019627` (v5 ranking
