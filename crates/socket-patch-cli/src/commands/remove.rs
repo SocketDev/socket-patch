@@ -1304,7 +1304,7 @@ async fn unwind_hosted(
 /// Error code + message for a stopped hosted unwind.
 fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'static str, String) {
     // `why` already names the pin (the restore's refusal) or the write
-    // that failed, with its remedy; `what` is only the leg's failure key.
+    // that failed, with its remedy.
     let HostedUnwindError { why } = err;
     (
         "hosted_revert_failed",
