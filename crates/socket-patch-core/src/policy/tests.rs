@@ -585,3 +585,18 @@ mod disk {
         assert_eq!(warnings[0].code, "socket_yml_repo_untrusted");
     }
 }
+
+#[test]
+fn this_repos_socket_yml_loads_and_excludes_its_fixtures() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let (policy, warnings) =
+        SelectionPolicy::load(&DiskPolicyFs::new(&repo), &PolicyOverrides::default()).expect("valid");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(matches!(policy.source(), PolicySource::File { path, .. } if path == "socket.yml"));
+    let lock = strings(&["package-lock.json"]);
+    let err = policy
+        .admits_root(&root("crates/socket-patch-core/tests/fixtures/redirect/npm", &lock, true))
+        .unwrap_err();
+    assert_eq!(err.detail(), "crates/socket-patch-core/tests/fixtures/** (projectIgnorePaths)");
+    assert!(policy.admits_root(&root("", &lock, true)).is_ok());
+}

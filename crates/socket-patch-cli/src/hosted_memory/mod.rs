@@ -60,6 +60,12 @@ pub use types::*;
 
 use discover::Provider;
 use redirect::{Planned, Refused, Rewritten, StageOptions};
+use socket_patch_core::policy::{
+    patch_severity_order, FilterReason, MemoryPolicyFs, Root, RootFile, SelectionPolicy, PATCHES_DISABLED,
+    POLICY_FILE_NAMES,
+};
+
+use crate::commands::scan::policy::{policy_block, FilteredEntry};
 
 /// `"<crate version>+<git sha or 'unknown'>"`; the sha comes from the
 /// `SOCKET_PATCH_GIT_SHA` build-time variable.
@@ -113,6 +119,8 @@ struct RootState {
     packages: Vec<socket_patch_core::api::types::BatchPackagePatches>,
     selected: Vec<(String, String)>,
     skipped: Vec<SkippedPatch>,
+    /// Candidates the socket.yml policy withheld (`policy_*` reasons).
+    policy_skipped: Vec<SkippedPatch>,
     error: Option<ProjectError>,
 }
 
@@ -328,6 +336,7 @@ fn unrooted_unsupported_warnings<'a>(
             || dir
                 .split('/')
                 .any(|seg| roots::EXCLUDED_ROOT_SEGMENTS.contains(&seg))
+            || roots::default_ignored_dir(dir)
         {
             continue;
         }
@@ -372,10 +381,58 @@ async fn engine(
     let ecosystems = options.ecosystems.as_deref();
     let provider = Provider::new(api, options.request_timeout, options.provider_concurrency);
 
+    // The repo's socket.yml policy, before any root is processed: a file
+    // that cannot be honored fails the whole session closed.
+    let (policy, policy_warnings) =
+        match SelectionPolicy::load(&memory_policy_fs(&files, &options.policy_paths), &options.policy_overrides) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return Ok(policy_error_output(&error, warnings, files_input, bytes_input));
+            }
+        };
+    for w in policy_warnings {
+        warnings.push(EngineWarning::new(w.code, w.detail, None));
+    }
+    if !policy.enabled() {
+        warnings.push(EngineWarning::new(
+            PATCHES_DISABLED,
+            "patches.enabled is false in socket.yml: report only, nothing is written",
+            None,
+        ));
+    }
+    let mut policy_filtered: Vec<FilteredEntry> = Vec::new();
+
     let root_list: Vec<String> = match &options.project_roots {
         Some(roots) => roots.clone(),
         None => roots::detect_roots(files.keys().map(String::as_str), ecosystems).0,
     };
+    // The full policy (paths from the file too) judges every root before
+    // the project limit; roots named in `projectRoots` are explicit.
+    let explicit_roots = options.project_roots.is_some();
+    let detected_roots = root_list.clone();
+    let root_list: Vec<String> = root_list
+        .into_iter()
+        .filter(|root| {
+            let markers = roots::root_markers(root, files.keys().map(String::as_str));
+            match policy.admits_root(&Root {
+                rel_dir: root,
+                markers: &markers,
+                explicit: explicit_roots,
+            }) {
+                Ok(()) => true,
+                Err(reason) => {
+                    policy_filtered.push(FilteredEntry {
+                        purl: None,
+                        uuid: None,
+                        project: root.clone(),
+                        reason,
+                        severity: None,
+                    });
+                    false
+                }
+            }
+        })
+        .collect();
     if root_list.len() as u64 > options.limits.max_projects {
         return Err(EngineError::limit(
             "max_projects",
@@ -388,7 +445,7 @@ async fn engine(
     }
     unrooted_unsupported_warnings(
         files.keys().map(String::as_str),
-        &root_list,
+        &detected_roots,
         ecosystems,
         &mut warnings,
     );
@@ -407,6 +464,7 @@ async fn engine(
             packages: Vec::new(),
             selected: Vec::new(),
             skipped: Vec::new(),
+            policy_skipped: Vec::new(),
             error: None,
         })
         .collect();
@@ -430,7 +488,20 @@ async fn engine(
             .filter_map(|e| discover::supplement_purl(&e.purl))
             .filter(|p| ecosystem_allowed(ecosystems, p))
             .collect();
-        state.purls = purls.into_iter().collect();
+        let mut admitted: Vec<String> = Vec::with_capacity(purls.len());
+        for purl in purls {
+            match policy.admits_purl(&purl) {
+                Ok(()) => admitted.push(purl),
+                Err(reason) => policy_filtered.push(FilteredEntry {
+                    purl: Some(purl),
+                    uuid: None,
+                    project: state.root.clone(),
+                    reason,
+                    severity: None,
+                }),
+            }
+        }
+        state.purls = admitted;
         state.summary.scanned_packages = state.purls.len() as u64;
     }
     let union_purls: BTreeSet<&str> = states
@@ -534,7 +605,14 @@ async fn engine(
                 Some(&state.root),
             ));
         }
-        state.selected = discover::select_top_ranked(&results, can_access_paid);
+        state.selected = select_with_policy(
+            &policy,
+            results,
+            can_access_paid,
+            &state.root,
+            &mut policy_filtered,
+            &mut state.policy_skipped,
+        );
     }
     phases.mark("details");
 
@@ -628,7 +706,7 @@ async fn engine(
     let mut results: BTreeMap<usize, ProjectResult> = BTreeMap::new();
     for (index, done) in rewritten {
         let state = &mut states[index];
-        let result = finish_root(
+        let mut result = finish_root(
             state,
             done,
             &records,
@@ -637,6 +715,7 @@ async fn engine(
             &mut changed_binary,
             &mut warnings,
         );
+        result.skipped.extend(state.policy_skipped.iter().cloned());
         results.insert(index, result);
     }
     let mut projects: Vec<ProjectResult> = Vec::with_capacity(states.len());
@@ -655,12 +734,14 @@ async fn engine(
                 options.dry_run,
             ),
         };
+        let mut skipped = state.skipped.clone();
+        skipped.extend(state.policy_skipped.iter().cloned());
         projects.push(ProjectResult {
             root: state.root.clone(),
             redirect,
             summary: state.summary.clone(),
             redirected: Vec::new(),
-            skipped: state.skipped.clone(),
+            skipped,
             error: state.error.clone(),
         });
     }
@@ -697,7 +778,111 @@ async fn engine(
         warnings,
         stats,
         engine_version: engine_version(),
+        policy: Some(policy_block(&policy, &policy_filtered, &[])),
+        policy_error: None,
     })
+}
+
+/// The root policy files as the session received them. A path selection
+/// listed but the host never sent is present without content (never
+/// absent: it may narrow the scan).
+fn memory_policy_fs(files: &BTreeMap<String, SharedFile>, listed: &[String]) -> MemoryPolicyFs {
+    let mut fs = MemoryPolicyFs::default();
+    for name in POLICY_FILE_NAMES {
+        let file = match files.get(name).map(|f| &f.entry) {
+            Some(MemoryEntry::Text(text)) => RootFile::Present(text.as_bytes().to_vec()),
+            Some(MemoryEntry::Binary(bytes)) => RootFile::Present(bytes.to_vec()),
+            Some(_) => RootFile::PresentWithoutContent,
+            None if listed.iter().any(|l| l == name) => RootFile::PresentWithoutContent,
+            None => continue,
+        };
+        fs.files.insert(name.to_string(), file);
+        fs.root_names.push(name.to_string());
+    }
+    fs
+}
+
+/// The session result for a policy file that cannot be honored: no root
+/// processed, no file changed.
+fn policy_error_output(
+    error: &socket_patch_core::policy::PolicyError,
+    warnings: Vec<EngineWarning>,
+    files_input: u64,
+    bytes_input: u64,
+) -> HostedScanOutput {
+    HostedScanOutput {
+        projects: Vec::new(),
+        changed_files: Vec::new(),
+        changed_binary_files: Vec::new(),
+        deleted_files: Vec::new(),
+        warnings,
+        stats: EngineStats {
+            files_input,
+            bytes_input,
+            ..EngineStats::default()
+        },
+        engine_version: engine_version(),
+        policy: None,
+        policy_error: Some(PolicyErrorInfo {
+            code: error.code().to_string(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
+/// The tier filter, the severity floor and the per-package ranking (the
+/// disk `ScanPolicy::select` without a recorded view, which the in-memory
+/// engine does not read yet). With `patches.enabled: false` nothing is
+/// selected and every candidate is reported `policy_disabled`.
+fn select_with_policy(
+    policy: &SelectionPolicy,
+    results: Vec<PatchSearchResult>,
+    can_access_paid: bool,
+    root: &str,
+    filtered: &mut Vec<FilteredEntry>,
+    skipped: &mut Vec<SkippedPatch>,
+) -> Vec<(String, String)> {
+    let accessible: Vec<PatchSearchResult> = results
+        .into_iter()
+        .filter(|p| can_access_paid || p.tier == "free")
+        .collect();
+    let (admitted, dropped) = if policy.enabled() {
+        policy.floor_filter(accessible)
+    } else {
+        (
+            Vec::new(),
+            accessible
+                .into_iter()
+                .map(|p| (p, FilterReason::Disabled))
+                .collect(),
+        )
+    };
+    let selected = discover::select_top_ranked(&admitted, true);
+    let chosen: BTreeSet<&str> = selected.iter().map(|(purl, _)| purl.as_str()).collect();
+    let mut by_purl: BTreeMap<String, Vec<(PatchSearchResult, FilterReason)>> = BTreeMap::new();
+    for (patch, reason) in dropped {
+        if !chosen.contains(patch.purl.as_str()) {
+            by_purl.entry(patch.purl.clone()).or_default().push((patch, reason));
+        }
+    }
+    for (purl, mut group) in by_purl {
+        group.sort_by(|a, b| socket_patch_core::api::ranking::cmp_search_results(&a.0, &b.0));
+        let (winner, reason) = group.swap_remove(0);
+        skipped.push(SkippedPatch {
+            purl: purl.clone(),
+            uuid: winner.uuid.clone(),
+            reason: reason.code().to_string(),
+            detail: Some(reason.detail()),
+        });
+        filtered.push(FilteredEntry {
+            purl: Some(purl),
+            uuid: Some(winner.uuid.clone()),
+            project: root.to_string(),
+            severity: Some(patch_severity_order(&winner)),
+            reason,
+        });
+    }
+    selected
 }
 
 /// Records → the project's result and changed files.
@@ -857,6 +1042,7 @@ mod tests {
             packages: Vec::new(),
             selected: Vec::new(),
             skipped: Vec::new(),
+            policy_skipped: Vec::new(),
             error: None,
         }
     }

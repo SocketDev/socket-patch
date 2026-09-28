@@ -432,6 +432,13 @@ fn compile(lists: &[(&'static str, &[String])]) -> PathMatcher {
         .unwrap_or_else(|_| PathMatcher::new(&[]).expect("an empty pattern list always compiles"))
 }
 
+/// The built-in defaults, compiled once (for callers that only need the
+/// default path ignores, e.g. tree-listing root detection).
+pub fn builtin_defaults() -> &'static SelectionPolicy {
+    static DEFAULTS: std::sync::LazyLock<SelectionPolicy> = std::sync::LazyLock::new(SelectionPolicy::unrestricted);
+    &DEFAULTS
+}
+
 impl SelectionPolicy {
     /// No file: only the built-in default ignores.
     pub fn unrestricted() -> Self {

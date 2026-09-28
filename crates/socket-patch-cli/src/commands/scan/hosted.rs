@@ -1041,6 +1041,7 @@ fn gem_sha_key(purl: &str) -> (String, String) {
 /// then rewrite ONLY those dependencies' lockfile/registry-config entries to
 /// point at the hosted vendored patches (the byte-identical counterpart of the
 /// GitHub-app registry mode). No artifact bytes land in the repo.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_redirect(
     args: &ScanArgs,
     api_client: &socket_patch_core::api::client::ApiClient,

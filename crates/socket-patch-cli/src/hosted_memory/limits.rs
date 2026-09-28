@@ -27,6 +27,8 @@ pub(crate) struct ResolvedOptions {
     pub(crate) provider_concurrency: usize,
     pub(crate) request_timeout: std::time::Duration,
     pub(crate) limits: ResolvedLimits,
+    pub(crate) policy_overrides: socket_patch_core::policy::PolicyOverrides,
+    pub(crate) policy_paths: Vec<String>,
 }
 
 pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOptions, EngineError> {
@@ -53,6 +55,28 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
                 format!("unknown ecosystem `{bad}`"),
             ));
         }
+    }
+    let min_severity = match options.min_severity.as_deref() {
+        None => None,
+        Some(value) => Some((
+            socket_patch_core::policy::parse_min_severity(value)
+                .map_err(|e| EngineError::invalid("invalid_min_severity", format!("minSeverity: {e}")))?,
+            socket_patch_core::policy::OverrideSource::Flag,
+        )),
+    };
+    let policy_overrides = socket_patch_core::policy::PolicyOverrides {
+        bypass: options.no_socket_yml.unwrap_or(false),
+        min_severity,
+    };
+    let mut policy_paths: Vec<String> = Vec::new();
+    for path in options.policy_paths.iter().flatten() {
+        if !socket_patch_core::policy::POLICY_FILE_NAMES.contains(&path.as_str()) {
+            return Err(EngineError::invalid(
+                "invalid_policy_path",
+                format!("policyPaths entry `{path}` is not a root socket.yml or socket.yaml"),
+            ));
+        }
+        policy_paths.push(path.clone());
     }
     let project_roots = match &options.project_roots {
         Some(roots) => {
@@ -103,6 +127,8 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
         provider_concurrency: provider_concurrency.min(MAX_PROVIDER_CONCURRENCY) as usize,
         request_timeout: std::time::Duration::from_millis(timeout_ms),
         limits: options.limits.clone().unwrap_or_default().resolve(),
+        policy_overrides,
+        policy_paths,
     })
 }
 

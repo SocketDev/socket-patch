@@ -819,3 +819,45 @@ async fn vendored_dry_run_previews_only_admitted_patches() {
     assert_eq!(filtered_reason(&doc, "pkg:npm/alpha@1.0.0")["reason"], "policy_package_not_listed");
     assert_eq!(filtered_reason(&doc, "pkg:npm/beta@1.0.0")["reason"], "policy_severity");
 }
+
+// ---------------------------------------------------------------------------
+// get
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn get_bypasses_the_policy_with_a_warning() {
+    let server = MockServer::start().await;
+    mount_api(&server, catalog()).await;
+    let repo = Repo::new(Some("version: 2\npatches:\n  ignorePackages: [alpha]\n"));
+    let web = repo.dir("services/web");
+    let args = [
+        "get",
+        "pkg:npm/alpha@1.0.0",
+        "--json",
+        "--yes",
+        "--dry-run",
+        "--cwd",
+        web.to_str().unwrap(),
+        "--api-url",
+        &server.uri(),
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let (code, stdout, stderr) = run_cli(&web, &args, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let warnings: Vec<&str> = doc["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(
+        warnings.iter().any(|w| w.starts_with("(policy_bypassed)") && w.contains("alpha")),
+        "{doc:#}"
+    );
+
+    // An invalid file never fails `get`; it only drops the warning.
+    std::fs::write(repo.root.join("socket.yml"), "version: 2\npatches: [\n").unwrap();
+    let (code, stdout, stderr) = run_cli(&web, &args, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.contains("policy_bypassed"), "{stdout}");
+}

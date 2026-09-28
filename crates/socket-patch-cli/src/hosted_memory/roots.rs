@@ -52,19 +52,40 @@ pub(crate) const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
 ];
 
 /// Directory names whose subtrees never hold a project root: installed
-/// trees, VCS and tool state, vendored dependencies, and test fixtures.
-pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 10] = [
-    "node_modules",
-    ".git",
-    ".socket",
-    ".yarn",
-    "vendor",
-    "test",
-    "tests",
-    "fixtures",
-    "__fixtures__",
-    "testdata",
-];
+/// trees, VCS and tool state, and vendored dependencies. Structural, so no
+/// policy can negate them. (Test and fixture trees are the socket.yml
+/// policy's overridable built-in ignores: [`default_ignored_dir`].)
+pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 5] = ["node_modules", ".git", ".socket", ".yarn", "vendor"];
+
+/// Whether `dir` (repo-relative) is under a built-in default ignore of the
+/// socket.yml policy (`test/`, `tests/`, `fixtures/`, …, any case).
+pub(crate) fn default_ignored_dir(dir: &str) -> bool {
+    !dir.is_empty()
+        && socket_patch_core::policy::builtin_defaults()
+            .admits_root(&socket_patch_core::policy::Root {
+                rel_dir: dir,
+                markers: &[],
+                explicit: false,
+            })
+            .is_err()
+}
+
+/// The marker basenames of `root` among `paths` (the files the policy's
+/// path filters test for that root).
+pub(crate) fn root_markers<'a>(root: &str, paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let (dir, base) = split_path(path);
+            let marker = marker_ecosystem(base).is_some()
+                || UNSUPPORTED_MARKERS.iter().any(|(_, names)| names.contains(&base));
+            (dir == root && marker).then(|| base.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
 
 /// The ecosystem a root marker basename belongs to.
 pub(crate) fn marker_ecosystem(base: &str) -> Option<&'static str> {
@@ -151,6 +172,19 @@ pub(crate) fn detect_roots<'a>(
         .collect();
     let mut roots: Vec<String> = Vec::new();
     for dir in markers.keys() {
+        let marker_names: Vec<String> = marker_paths
+            .get(dir)
+            .into_iter()
+            .flatten()
+            .map(|p| split_path(p).1.to_string())
+            .collect();
+        let default_ignored = socket_patch_core::policy::builtin_defaults()
+            .admits_root(&socket_patch_core::policy::Root {
+                rel_dir: dir,
+                markers: &marker_names,
+                explicit: false,
+            })
+            .is_err();
         let rush_internal = rush_roots.iter().any(|r| {
             let internal = |sub: &str| join_root(r, sub);
             *dir == internal("common/config/rush")
@@ -158,7 +192,9 @@ pub(crate) fn detect_roots<'a>(
                 || *dir == internal("common/temp")
                 || dir.starts_with(&format!("{}/", internal("common/temp")))
         });
-        let reason = if rush_internal {
+        let reason = if default_ignored {
+            Some("policy_path_excluded")
+        } else if rush_internal {
             Some("rush_internal")
         } else {
             None
@@ -217,7 +253,28 @@ mod tests {
         );
         assert_eq!(found, vec!["docs"]);
         assert_eq!(ignored.len(), 4);
-        assert!(ignored.iter().all(|i| i.reason == "excluded_dir"));
+        let reason = |path: &str| ignored.iter().find(|i| i.path == path).unwrap().reason.clone();
+        assert_eq!(reason("node_modules/x/package-lock.json"), "excluded_dir");
+        assert_eq!(reason("a/vendor/b/composer.lock"), "excluded_dir");
+        assert_eq!(reason(".socket/vendor/npm/package-lock.json"), "excluded_dir");
+        // Test/fixture trees are the policy's overridable built-in ignores.
+        assert_eq!(reason("test/fixtures/yarn.lock"), "policy_path_excluded");
+    }
+
+    #[test]
+    fn default_ignores_are_case_insensitive_and_marker_based() {
+        let (found, _) = detect_roots(
+            ["Tests/app/yarn.lock", "e2e/testdata/go.mod", "apps/testing/package-lock.json"],
+            None,
+        );
+        assert_eq!(found, vec!["apps/testing"]);
+        assert!(default_ignored_dir("a/__fixtures__"));
+        assert!(!default_ignored_dir(""));
+        assert!(!default_ignored_dir("apps/testing"));
+        assert_eq!(
+            root_markers("a", ["a/yarn.lock", "a/package.json", "a/b/yarn.lock", "a/pom.xml"]),
+            vec!["pom.xml".to_string(), "yarn.lock".to_string()]
+        );
     }
 
     #[test]

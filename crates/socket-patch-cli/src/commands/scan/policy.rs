@@ -90,19 +90,77 @@ pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
     markers
 }
 
+/// One `policy.filtered[]` entry.
 #[derive(Debug, Clone)]
-struct FilteredEntry {
-    purl: Option<String>,
-    uuid: Option<String>,
-    reason: FilterReason,
-    severity: Option<u8>,
+pub(crate) struct FilteredEntry {
+    pub purl: Option<String>,
+    pub uuid: Option<String>,
+    pub project: String,
+    pub reason: FilterReason,
+    /// The would-be patch's severity order, when a patch was looked up.
+    pub severity: Option<u8>,
 }
 
+/// One `policy.retained[]` entry.
 #[derive(Debug, Clone)]
-struct RetainedEntry {
-    purl: String,
-    recorded_uuid: String,
-    reason: FilterReason,
+pub(crate) struct RetainedEntry {
+    pub purl: String,
+    pub project: String,
+    pub recorded_uuid: String,
+    pub reason: FilterReason,
+    pub upgrade_available: bool,
+}
+
+/// The top-level `policy` block (4.7), shared by disk scans and the
+/// in-memory engine.
+pub(crate) fn policy_block(
+    policy: &SelectionPolicy,
+    filtered: &[FilteredEntry],
+    retained: &[RetainedEntry],
+) -> serde_json::Value {
+    let (path, sha256) = match policy.source() {
+        PolicySource::File { path, sha256 } => (serde_json::json!(path), serde_json::json!(sha256)),
+        _ => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+    let (floor, floor_source) = policy.min_severity();
+    let filtered: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "purl": f.purl,
+                "uuid": f.uuid,
+                "project": f.project,
+                "reason": f.reason.code(),
+                "detail": f.reason.detail(),
+            })
+        })
+        .collect();
+    let retained: Vec<serde_json::Value> = retained
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "purl": r.purl,
+                "project": r.project,
+                "recordedUuid": r.recorded_uuid,
+                "reason": r.reason.code(),
+                "detail": r.reason.detail(),
+                "upgradeAvailable": r.upgrade_available,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "source": policy.source().as_str(),
+        "path": path,
+        "sha256": sha256,
+        "enabled": policy.enabled(),
+        "minSeverity": {
+            "value": floor.and_then(severity_name),
+            "source": floor_source.as_str(),
+        },
+        "counts": { "filtered": filtered.len(), "retained": retained.len() },
+        "filtered": filtered,
+        "retained": retained,
+    })
 }
 
 #[derive(Default)]
@@ -204,8 +262,10 @@ impl ScanPolicy {
             if report.retained_purls.insert(key.clone()) {
                 report.retained.push(RetainedEntry {
                     purl: key,
+                    project: self.project.clone(),
                     recorded_uuid: uuid.to_string(),
                     reason,
+                    upgrade_available: false,
                 });
             }
             return true;
@@ -215,6 +275,7 @@ impl ScanPolicy {
                 report.filtered.push(FilteredEntry {
                     purl: None,
                     uuid: None,
+                    project: self.project.clone(),
                     reason,
                     severity: None,
                 });
@@ -223,6 +284,7 @@ impl ScanPolicy {
             report.filtered.push(FilteredEntry {
                 purl: Some(canon(purl)),
                 uuid: None,
+                project: self.project.clone(),
                 reason,
                 severity: None,
             });
@@ -271,14 +333,17 @@ impl ScanPolicy {
                         if report.retained_purls.insert(key.clone()) {
                             report.retained.push(RetainedEntry {
                                 purl: key,
+                                project: self.project.clone(),
                                 recorded_uuid: uuid,
                                 reason,
+                                upgrade_available: false,
                             });
                         }
                     }
                     None => report.filtered.push(FilteredEntry {
                         purl: Some(purl.clone()),
                         uuid: Some(group[0].uuid.clone()),
+                        project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
                         reason,
                     }),
@@ -302,6 +367,7 @@ impl ScanPolicy {
                     report.filtered.push(FilteredEntry {
                         purl: Some(purl.clone()),
                         uuid: Some(group[0].uuid.clone()),
+                        project: self.project.clone(),
                         severity: Some(patch_severity_order(&group[0])),
                         reason: self
                             .policy
@@ -322,51 +388,15 @@ impl ScanPolicy {
     /// The top-level `policy` block (4.7).
     pub(crate) fn json(&self) -> serde_json::Value {
         let report = self.report();
-        let (path, sha256) = match self.policy.source() {
-            PolicySource::File { path, sha256 } => (serde_json::json!(path), serde_json::json!(sha256)),
-            _ => (serde_json::Value::Null, serde_json::Value::Null),
-        };
-        let (floor, floor_source) = self.policy.min_severity();
-        let filtered: Vec<serde_json::Value> = report
-            .filtered
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "purl": f.purl,
-                    "uuid": f.uuid,
-                    "project": self.project,
-                    "reason": f.reason.code(),
-                    "detail": f.reason.detail(),
-                })
-            })
-            .collect();
-        let retained: Vec<serde_json::Value> = report
+        let retained: Vec<RetainedEntry> = report
             .retained
             .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "purl": r.purl,
-                    "project": self.project,
-                    "recordedUuid": r.recorded_uuid,
-                    "reason": r.reason.code(),
-                    "detail": r.reason.detail(),
-                    "upgradeAvailable": report.update_purls.contains(&r.purl),
-                })
+            .map(|r| RetainedEntry {
+                upgrade_available: report.update_purls.contains(&r.purl),
+                ..r.clone()
             })
             .collect();
-        serde_json::json!({
-            "source": self.policy.source().as_str(),
-            "path": path,
-            "sha256": sha256,
-            "enabled": self.policy.enabled(),
-            "minSeverity": {
-                "value": floor.and_then(severity_name),
-                "source": floor_source.as_str(),
-            },
-            "counts": { "filtered": filtered.len(), "retained": retained.len() },
-            "filtered": filtered,
-            "retained": retained,
-        })
+        policy_block(&self.policy, &report.filtered, &retained)
     }
 
     /// Put the `policy` block and the policy warnings on a scan `--json`
@@ -479,4 +509,70 @@ pub(crate) fn policy_error_json(err: &PolicyError, paths: &[String]) -> serde_js
         "updates": [],
         "paths": paths,
     })
+}
+
+/// `get`'s `policy_bypassed` warnings: `get` is explicit intent, so it
+/// ignores the policy, but says when the repo's socket.yml would have
+/// filtered what it is about to patch. Never fails: an unreadable or
+/// invalid file just yields no warning.
+pub(crate) fn policy_bypass_warnings(
+    common: &crate::args::GlobalArgs,
+    patches: &[PatchSearchResult],
+) -> Vec<(String, String)> {
+    if common.is_global() || patches.is_empty() {
+        return Vec::new();
+    }
+    let cwd = std::fs::canonicalize(&common.cwd).unwrap_or_else(|_| common.cwd.clone());
+    let (repo_root, _) = find_repo_root_with_warnings(&cwd);
+    let Ok((policy, _)) = SelectionPolicy::load(
+        &DiskPolicyFs::new(&repo_root),
+        &socket_patch_core::policy::PolicyOverrides::default(),
+    ) else {
+        return Vec::new();
+    };
+    if !matches!(policy.source(), PolicySource::File { .. }) {
+        return Vec::new();
+    }
+    let project = repo_relative_checked(&repo_root, &cwd).unwrap_or_default();
+    let markers = dir_markers(&cwd);
+    let root_verdict = policy.admits_root(&Root {
+        rel_dir: &project,
+        markers: &markers,
+        explicit: true,
+    });
+    let mut by_purl: BTreeMap<&str, Vec<&PatchSearchResult>> = BTreeMap::new();
+    for patch in patches {
+        by_purl.entry(patch.purl.as_str()).or_default().push(patch);
+    }
+    let mut out = Vec::new();
+    for (purl, mut group) in by_purl {
+        group.sort_by(|a, b| cmp_search_results(a, b));
+        let verdict = if !policy.enabled() {
+            Err(FilterReason::Disabled)
+        } else {
+            root_verdict.clone().and_then(|()| policy.admits_purl(purl)).and_then(|()| {
+                // The floor only hides a package when none of its patches pass.
+                match group
+                    .iter()
+                    .map(|p| policy.admits_severity(patch_severity_order(p)))
+                    .find(Result::is_ok)
+                {
+                    Some(ok) => ok,
+                    None => policy.admits_severity(patch_severity_order(group[0])),
+                }
+            })
+        };
+        if let Err(reason) = verdict {
+            out.push((
+                socket_patch_core::policy::POLICY_BYPASSED.to_string(),
+                format!(
+                    "{} would be skipped by socket.yml ({}: {}); get patches it anyway",
+                    normalize_purl(purl),
+                    reason.code(),
+                    reason.detail()
+                ),
+            ));
+        }
+    }
+    out
 }

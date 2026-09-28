@@ -255,14 +255,26 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
                 && !dir
                     .split('/')
                     .any(|seg| EXCLUDED_ROOT_SEGMENTS.contains(&seg))
+                && !super::roots::default_ignored_dir(dir)
         });
         if let Some(path) = first {
             needs.entry(path.clone()).or_insert(Need::Present);
         }
     }
 
+    // The repo-root policy files: always streamed when listed (a symlinked
+    // one lands in `symlinks`, and the session then fails closed on it).
+    let mut policy_paths: Vec<String> = Vec::new();
+    for name in socket_patch_core::policy::POLICY_FILE_NAMES {
+        if blobs.contains_key(name) {
+            needs.entry(name.to_string()).or_insert(Need::Text);
+            policy_paths.push(name.to_string());
+        }
+    }
+
     let mut selection = PathSelection {
         roots,
+        policy_paths,
         ..PathSelection::default()
     };
     for (path, need) in needs {
