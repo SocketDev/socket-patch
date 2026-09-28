@@ -44,14 +44,18 @@ struct LockHit {
 /// The `files` array value Poetry / PDM write for `release`: one
 /// `{<key> = …, hash = "sha256:…"}` per file.
 fn files_value(release: &[PypiFile], by_url: bool) -> Option<toml_edit::Value> {
-    let entries: Vec<String> = release
+    let key = if by_url { "url" } else { "file" };
+    let mut located: Vec<(&str, &PypiFile)> = release
         .iter()
-        .map(|f| {
-            let (key, location) = if by_url {
-                ("url", &f.url)
-            } else {
-                ("file", &f.filename)
-            };
+        .map(|f| (if by_url { f.url.as_str() } else { f.filename.as_str() }, f))
+        .collect();
+    // PDM orders each entry's files by the location it writes: a `static_urls`
+    // lock by URL (so an sdist under `0c/…` precedes a wheel under `b0/…`),
+    // a plain lock by filename.
+    located.sort_by(|a, b| a.0.cmp(b.0));
+    let entries: Vec<String> = located
+        .iter()
+        .map(|(location, f)| {
             format!(
                 "{{{key} = {}, hash = {}}}",
                 toml_quote(location),

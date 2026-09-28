@@ -234,6 +234,8 @@ class DownloadError(RuntimeError):
     """A release asset arrived but failed verification (truncated / tampered)."""
 
 
+USER_AGENT = 'SocketPatchCLI-backtest/1.0'
+
 RETRYABLE = (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException)
 
 
@@ -242,7 +244,8 @@ def fetch(url, dest, attempts=5):
     stalls retry; any other HTTP error is final."""
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(url, timeout=60) as response, open(dest, 'wb') as out:
+            request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+            with urllib.request.urlopen(request, timeout=60) as response, open(dest, 'wb') as out:
                 shutil.copyfileobj(response, out)
             return
         except RETRYABLE as error:
@@ -575,7 +578,7 @@ def published_record(uuid):
         url = f'{PUBLIC_PATCH_API}/patch/view/{uuid}'
         for attempt in range(1, 6):
             try:
-                request = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'SocketPatchCLI-backtest/1.0'})
+                request = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': USER_AGENT})
                 with urllib.request.urlopen(request, timeout=60) as response:
                     _PUBLISHED_RECORDS[uuid] = json.loads(response.read().decode('utf-8'))
                 break
@@ -635,7 +638,8 @@ def hosted_lockb_digest(lockb):
     if match is None:
         raise RuntimeError('the hosted bun.lockb names no patch.socket.dev tarball')
     url = match.group(0).decode('ascii')
-    with urllib.request.urlopen(url, timeout=60) as response:
+    request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(request, timeout=60) as response:
         return hashlib.sha512(response.read()).digest()
 
 

@@ -933,8 +933,11 @@ fn urllib3_dep() -> DepOverride {
 }
 
 /// The mock PyPI URL of a release file.
+/// PyPI's blake2b-bucketed file URLs, with real urllib3 1.26.18's buckets: the
+/// sdist sorts before the wheel by URL, the reverse of filename order.
 fn pypi_file_url(filename: &str) -> String {
-    format!("https://files.pythonhosted.org/packages/ab/cd/{filename}")
+    let bucket = if filename.ends_with(".tar.gz") { "0c/39" } else { "b0/53" };
+    format!("https://files.pythonhosted.org/packages/{bucket}/{filename}")
 }
 
 /// One PyPI JSON API release: name, version, `(filename, sha256, size,
@@ -1198,7 +1201,14 @@ async fn pdm_static_urls_round_trip() {
             &format!("{{file = \"{URLLIB3_SDIST}\""),
             &format!("{{url = \"{}\"", pypi_file_url(URLLIB3_SDIST)),
         );
-    assert!(lock.contains("{url = \"https://files.pythonhosted.org"));
+    // PDM writes a static_urls entry's files in URL order (sdist first here).
+    let wheel_line = format!("    {{url = \"{}\", hash = \"sha256:{URLLIB3_WHEEL_SHA}\"}},\n", pypi_file_url(URLLIB3_WHEEL));
+    assert!(lock.contains(&wheel_line), "{lock}");
+    let lock = lock.replacen(&wheel_line, "", 1).replacen("\n]\n", &format!("\n{wheel_line}]\n"), 1);
+    assert!(
+        lock.find(URLLIB3_SDIST).unwrap() < lock.find(URLLIB3_WHEEL).unwrap(),
+        "{lock}"
+    );
     let input = tree(&[("pdm.lock", lock)]);
     assert_pypi_round_trip("pdm static_urls", &input, &[urllib3_dep()], None).await;
 }
