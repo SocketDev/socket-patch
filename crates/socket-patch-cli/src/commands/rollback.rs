@@ -848,7 +848,14 @@ pub(crate) async fn sweep_unused_artifacts(
     ArtifactSweep {
         blobs: cleanup_unused_blobs(reference, &socket_dir.join("blobs"), dry_run).await,
         diffs: cleanup_unused_archives(reference, &socket_dir.join("diffs"), dry_run).await,
-        packages: cleanup_unused_archives(reference, &socket_dir.join("packages"), dry_run).await,
+        // Nothing writes or reads `.socket/packages/` any more; sweep the
+        // leftover directory whole.
+        packages: cleanup_unused_archives(
+            &PatchManifest::default(),
+            &socket_dir.join("packages"),
+            dry_run,
+        )
+        .await,
     }
 }
 

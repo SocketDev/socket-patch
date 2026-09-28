@@ -2172,7 +2172,6 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
 
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -2282,7 +2281,6 @@ async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
     );
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -3082,7 +3080,6 @@ async fn vlt_apply(
     use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
     let sources = PatchSources {
         blobs_path: &patch.blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
