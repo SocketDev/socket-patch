@@ -1082,7 +1082,7 @@ mod tests {
             )
         );
         assert!(
-            next[0].starts_with("4 new patches deferred: maxNewPatches=0"),
+            next[0].starts_with("4 new patches would be deferred: maxNewPatches=0"),
             "{next:?}"
         );
         assert_eq!(next[1], "Next up: a@1 (high), b@1 (high), c@1 (high), …");
