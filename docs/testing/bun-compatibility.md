@@ -23,12 +23,12 @@ does not list as lagging — the cases authored Rust-first here lag until
 `bun.ts` is ported, see [depscan TS parity](#depscan-ts-parity); refusal
 fixtures pin their warning code through `expected-warnings.json`) and by
 hermetic CLI suites that
-need no Bun binary (`tests/in_process_vendor_bun.rs`,
+need no Bun binary (`tests/vendor/in_process_vendor_bun.rs`,
 `tests/in_process_vendor_bun_takeover.rs`, the bun cases of
 `tests/in_process_redirect.rs`, `tests/covgap_commands_scan_hosted.rs`,
 `tests/covgap_commands_scan_mod.rs`, `tests/covgap_commands_rollback.rs`,
-`tests/scan_vendor_e2e.rs`, `tests/get_modes_e2e.rs`,
-`tests/repair_vendor_flavors_e2e.rs`). The
+`tests/scan_vendor_e2e.rs`, `tests/get/get_modes_e2e.rs`,
+`tests/repair/repair_vendor_flavors_e2e.rs`). The
 [machine contract](../../crates/socket-patch-cli/CLI_CONTRACT.md) is the
 authority on envelopes and codes; this page is the measured matrix behind it.
 See the [ecosystem matrix](../ecosystems.md#mode--ecosystem-matrix) for the

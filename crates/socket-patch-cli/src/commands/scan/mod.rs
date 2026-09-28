@@ -3282,7 +3282,7 @@ mod tests {
 
     // ---- redirectState envelope block (read-only cross-mode visibility) ----
     // The end-to-end envelope placement (report-only + agent runs carry it,
-    // hosted/vendored runs don't) is pinned by `tests/scan_invariants.rs`;
+    // hosted/vendored runs don't) is pinned by `tests/scan/scan_invariants.rs`;
     // these pin the block builder's own gates and shape.
 
     /// Pins present ⇒ the block exists with each pin's canonical purl +

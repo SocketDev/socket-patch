@@ -757,7 +757,7 @@ land, because WS5 rewrites vendor.rs by ±318 lines.
 | vendor.rs pristine ladder: `fetch_pristine_package`, `missing_local_rung`, `MissingRung::Fetch` | `commands/vendor.rs` | ~147 | — |
 | `VendorSource::Build` outside maven/nuget, args plumbing | `vendor/mod.rs`, `args.rs` | ~30 | — |
 | `berry_zip_url` plumbing (F33; re-measure on #280, which adds another `berry_zip_url: None` site at upstream/bun_lockb.rs:154) | redirect/hosted | ~3 | 41 |
-| Pristine fetch-order e2e | `tests/vendor_pristine_fetch_order_e2e.rs` | — | 228 |
+| Pristine fetch-order e2e | `tests/vendor/vendor_pristine_fetch_order_e2e.rs` | — | 228 |
 | **Total (CLI)** | | **~2,050** | **~1,260** |
 
 Rewritten, not deleted or counted:
