@@ -483,9 +483,6 @@ fn deno_hosted_and_vendored_never_attest_manifest_mode_unchanged() {
                 } },
                 "description": "deno agent-mode patch", "license": "MIT", "tier": "free",
             } },
-            // Deno projects run no npm install hook: declare the ecosystem
-            // manual so agent-mode statements are emitted (property 7).
-            "setup": { "manual": ["npm"] },
         }))
         .unwrap(),
     )

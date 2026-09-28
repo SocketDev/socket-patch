@@ -91,7 +91,7 @@ pub(crate) const PNPM_TRUST_TRADEOFF_AND_CAUTION: &str =
      (minimumReleaseAge / trustPolicy re-checks) for ALL lockfile entries, \
      not just the patched ones — the per-entry sha512 integrity pins are \
      still enforced. Do NOT follow pnpm's advice to rebuild the lockfile \
-     (`pnpm clean --lockfile`): that silently discards the redirect and \
+     (`pnpm clean --lockfile`): that silently discards the hosted patches and \
      reinstalls the vulnerable upstream artifact. pnpm <=10 ignores the \
      setting and installs work unchanged";
 
@@ -114,7 +114,7 @@ pub(crate) fn pnpm_trust_manual_guidance(server: &str) -> String {
          `trustLockfile: true` in pnpm-workspace.yaml so every install \
          accepts the patched artifacts. Do NOT follow pnpm's advice to \
          rebuild the lockfile (`pnpm clean --lockfile`): that silently \
-         discards the redirect and reinstalls the vulnerable upstream \
+         discards the hosted patches and reinstalls the vulnerable upstream \
          artifact. pnpm <=10 installs work unchanged",
         pnpm_trust_policy_preamble(server),
     )
@@ -132,10 +132,10 @@ pub(crate) fn pnpm_trust_legacy_detail(server: &str) -> String {
          lock read by pnpm 1–8, which have no \
          lockfile trust policy: no trust step exists or is needed. Do NOT regenerate the lockfile \
          (deleting it, or re-resolving on a newer pnpm): that silently \
-         discards the redirect and reinstalls the vulnerable upstream \
+         discards the hosted patches and reinstalls the vulnerable upstream \
          artifact. If the project later moves to pnpm >=9, re-run \
          `socket-patch scan --mode hosted` so the regenerated lock is \
-         redirected (and trust-configured) again"
+         switched to hosted (and trust-configured) again"
     )
 }
 
@@ -152,7 +152,7 @@ pub(crate) fn pnpm_trust_workspace_unreadable_detail(server: &str, err: &std::io
          or add `trustLockfile: true` to it yourself so every install \
          accepts the patched artifacts. Do NOT follow pnpm's advice to \
          rebuild the lockfile (`pnpm clean --lockfile`): that silently \
-         discards the redirect and reinstalls the vulnerable upstream \
+         discards the hosted patches and reinstalls the vulnerable upstream \
          artifact. pnpm <=10 installs work unchanged",
         pnpm_trust_policy_preamble(server),
     )
@@ -315,6 +315,38 @@ const NPM_ALLOW_REMOTE_TRADEOFF: &str =
      integrity pins are still enforced. `allow-remote=root` only admits direct \
      dependencies. npm <=11 installs work unchanged (npm 11 already defaults to \
      `all`; npm <=10 has no such setting)";
+
+/// The default human form of a `redirect_npm_allow_remote` warning: one
+/// line saying whether the project `.npmrc` now carries `allow-remote=all`
+/// or the user must set it. `detail` is one of the `npm_allow_remote_*`
+/// texts below; `--verbose` and `--json` show it in full.
+pub(crate) fn npm_allow_remote_one_line(detail: &str) -> String {
+    const MORE: &str = "(details: --verbose)";
+    if detail.contains("`allow-remote=all` was written to a new")
+        || detail.contains("`allow-remote=all` was appended to the existing")
+    {
+        format!(
+            "Note: set `allow-remote=all` in .npmrc so npm >=12 installs the hosted \
+             patches; commit it with the lockfile {MORE}."
+        )
+    } else if detail.contains("`allow-remote=all` would be") {
+        format!(
+            "Note: would set `allow-remote=all` in .npmrc so npm >=12 installs the \
+             hosted patches {MORE}."
+        )
+    } else if detail.contains("already sets `allow-remote=all`") {
+        format!(
+            "Note: .npmrc already sets `allow-remote=all`, so npm >=12 installs the \
+             hosted patches; keep it committed {MORE}."
+        )
+    } else {
+        format!(
+            "Warning: npm >=12 refuses the hosted patches until `allow-remote=all` is \
+             set (in .npmrc, or `npm ci --allow-remote=all`); it was not set \
+             automatically {MORE}."
+        )
+    }
+}
 
 /// The policy preamble shared by every `allow-remote` warning variant: what
 /// was repointed, and how npm >= 12 fails without the setting.
@@ -649,7 +681,7 @@ fn gem_stale_install_warning(
     let list = paths.join(", ");
     let detail = if gem_dir.starts_with(cwd) {
         format!(
-            "{purl} was redirected to the Socket patch registry, but a stale \
+            "{purl} was switched to its hosted patch, but a stale \
              UNPATCHED install is already materialized at {} — `bundle install` \
              reuses the installed gem (and its cached .gem) without refetching, \
              and `--force`/`--redownload` reinstall from the stale cache, so \
@@ -660,7 +692,7 @@ fn gem_stale_install_warning(
         )
     } else {
         format!(
-            "{purl} was redirected to the Socket patch registry, but a stale \
+            "{purl} was switched to its hosted patch, but a stale \
              UNPATCHED install is materialized in the shared gem home at {} — \
              `bundle install` reuses it without refetching, so the vulnerable \
              upstream code stays live. That gem home is shared by every \
@@ -683,7 +715,7 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
     serde_json::json!({
         "code": "redirect_gem_stale_install",
         "detail": format!(
-            "{purl} was redirected to the Socket patch registry, but the \
+            "{purl} was switched to its hosted patch, but the \
              project's committed bundler cache still holds an UNPATCHED \
              archive at {} — bundler installs from vendor/cache in preference \
              to fetching, so installs (fresh checkouts included) keep \
@@ -1008,7 +1040,7 @@ pub(super) async fn run_redirect(
             } else if code == 0 && !args.common.silent {
                 // Unreachable from scan (it never prompts, so selection
                 // cannot be cancelled); kept for a code-0 selection error.
-                eprintln!("Nothing was redirected.");
+                eprintln!("No changes made.");
             }
             return code;
         }
@@ -1877,7 +1909,7 @@ pub(crate) async fn run_redirect_selected(
                             "code": "redirect_vendored_revert_failed",
                             "detail": format!(
                                 "{purl} is vendored and its vendored state could not be \
-                                 reverted ({}); NOT redirected — run `socket-patch vendor \
+                                 reverted ({}); NOT switched to hosted — run `socket-patch vendor \
                                  --revert` to clean up, then re-run `scan --mode hosted`",
                                 outcome.error.as_deref().unwrap_or("unknown error")
                             ),
@@ -1887,9 +1919,9 @@ pub(crate) async fn run_redirect_selected(
                     takeover_pre_warnings.push(serde_json::json!({
                         "code": "redirect_would_revert_vendored",
                         "detail": format!(
-                            "{purl} is currently vendored; the hosted redirect will \
+                            "{purl} is currently vendored; the hosted wiring will \
                              revert its vendored wiring, ledger entry, and committed \
-                             artifact first, then redirect (mode takeover)"
+                             artifact first, then switch to hosted (mode takeover)"
                         ),
                     }));
                     dry_run_takeover.push((purl.clone(), uuid.clone()));
@@ -1909,7 +1941,7 @@ pub(crate) async fn run_redirect_selected(
                         "code": "redirect_vendored_revert_failed",
                         "detail": format!(
                             "{purl} is vendored and its vendored state could not be \
-                             reverted ({}); NOT redirected — run `socket-patch vendor \
+                             reverted ({}); NOT switched to hosted — run `socket-patch vendor \
                              --revert` to clean up, then re-run `scan --mode hosted`",
                             outcome.error.as_deref().unwrap_or("unknown error")
                         ),
@@ -1936,7 +1968,7 @@ pub(crate) async fn run_redirect_selected(
                         "code": "redirect_vendored_revert_failed",
                         "detail": format!(
                             "{purl}: vendored wiring reverted but the vendored ledger \
-                             could not be updated ({e}); NOT redirected — fix \
+                             could not be updated ({e}); NOT switched to hosted — fix \
                              .socket/vendor/state.json and re-run"
                         ),
                     }));
@@ -1946,7 +1978,7 @@ pub(crate) async fn run_redirect_selected(
                     "code": "redirect_takeover_reverted_vendored",
                     "detail": format!(
                         "{purl} was vendored; reverted its vendored wiring, ledger \
-                         entry, and committed artifact before redirecting (mode \
+                         entry, and committed artifact before switching to hosted (mode \
                          takeover: the project is now fully hosted for this package)"
                     ),
                 }));
@@ -2394,7 +2426,7 @@ pub(crate) async fn run_redirect_selected(
             "detail":
                 "pnpm-lock.yaml was edited outside `rush update`; if \
                  preventManualShrinkwrapChanges is enabled, `rush install` fails until \
-                 `rush update` refreshes repo-state.json (the redirect survives `rush \
+                 `rush update` refreshes repo-state.json (the hosted wiring survives `rush \
                  update`)",
         }));
     }
@@ -2844,8 +2876,8 @@ pub(crate) async fn run_redirect_selected(
                     record_warnings.push(serde_json::json!({
                         "code": "record_fetch_failed",
                         "detail": format!(
-                            "{purl} redirected, but its patch record could not be fetched; \
-                             this run's VEX attestation omits it (`socket-patch vex` \
+                            "{purl} was switched to hosted, but its patch record could not be \
+                             fetched; this run's VEX attestation omits it (`socket-patch vex` \
                              fetches it again once the API answers)"
                         ),
                     }));
@@ -3202,7 +3234,13 @@ pub(crate) async fn run_redirect_selected(
                 eprintln!("{line}");
             }
             for (code, detail) in &human_warnings {
-                let detail = if *code == "redirect_pnpm_trust_lockfile" && pnpm_rerun_only {
+                let detail = if *code == "redirect_npm_allow_remote" && !common.verbose {
+                    // One line by default; the full policy text (the
+                    // tradeoff, every manual recovery) is in `--json` and
+                    // `--verbose`.
+                    eprintln!("{}", npm_allow_remote_one_line(detail));
+                    continue;
+                } else if *code == "redirect_pnpm_trust_lockfile" && pnpm_rerun_only {
                     pnpm_trust_rerun_reminder()
                 } else {
                     detail
@@ -3211,7 +3249,7 @@ pub(crate) async fn run_redirect_selected(
             }
             if let Some(statements) = vex_statements {
                 eprintln!(
-                    "Wrote OpenVEX document with {} to {} (redirected patches are attested \
+                    "Wrote OpenVEX document with {} to {} (hosted patches are attested \
                      from their patch records, not hash-verified — their bytes are fetched at install \
                      time; run `socket-patch vex` after installing to verify against the \
                      installed tree).",
@@ -3224,7 +3262,7 @@ pub(crate) async fn run_redirect_selected(
             } else if vex.vex.is_some() && common.dry_run {
                 eprintln!(
                     "{}",
-                    crate::commands::vex::format_vex_dry_run_skip("redirected")
+                    crate::commands::vex::format_vex_dry_run_skip("rewritten")
                 );
             }
             let (rollout_line, deferred_steps) = match &rollout {
@@ -3373,13 +3411,13 @@ fn split_sentences(text: &str) -> Vec<String> {
     out
 }
 
-/// One human warning: `Warning (<code>): <detail>`. The pnpm trustLockfile
-/// guidance is a paragraph of separate instructions, so it renders as a
+/// One human warning: `Warning: <detail>` (the code is JSON-only). The pnpm
+/// trustLockfile guidance is a paragraph of separate instructions, so it renders as a
 /// headline plus one `  - ` bullet per sentence. With `width` (stderr is a
 /// terminal) every line is word-wrapped; without it (a pipe or a CI log)
 /// each sentence stays on one line so the text remains greppable.
 fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
-    let prefix = format!("Warning ({code}): ");
+    let prefix = "Warning: ";
     let detail = sentence_case(detail.trim());
     let (headline, bullets) = if code == "redirect_pnpm_trust_lockfile" {
         let mut sentences = split_sentences(&detail).into_iter();
@@ -3391,7 +3429,7 @@ fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
     let mut lines: Vec<String> = Vec::new();
     match width {
         Some(w) => {
-            lines.extend(wrap_words(&headline, w, &prefix, "  "));
+            lines.extend(wrap_words(&headline, w, prefix, "  "));
             for b in &bullets {
                 lines.extend(wrap_words(b, w, "  - ", "    "));
             }
@@ -3409,9 +3447,9 @@ fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
 /// lock was redirected and trust configured by an earlier run, whose
 /// output carried the full text; `--json` still carries it every time).
 fn pnpm_trust_rerun_reminder() -> &'static str {
-    "pnpm-lock.yaml is already redirected and pnpm-workspace.yaml already sets \
+    "pnpm-lock.yaml already uses hosted patches and pnpm-workspace.yaml already sets \
      `trustLockfile: true`; keep both committed, and never rebuild the lockfile \
-     (`pnpm clean --lockfile`), which discards the redirect"
+     (`pnpm clean --lockfile`), which discards the hosted patches"
 }
 
 /// The stdout summary line.
@@ -3424,16 +3462,16 @@ fn format_redirect_summary(redirected: usize, files: usize, dry_run: bool) -> St
     use crate::ui::plural;
     if redirected > 0 && files == 0 {
         return format!(
-            "{} already redirected; nothing to rewrite.",
+            "{} already on hosted patches; nothing to rewrite.",
             plural(redirected, "package is", "packages are")
         );
     }
     let pkgs = plural(redirected, "package", "packages");
     let files = plural(files, "file", "files");
     if dry_run {
-        format!("Would redirect {pkgs} and rewrite {files} (--dry-run: nothing was changed).")
+        format!("Would switch {pkgs} to hosted patches and rewrite {files} (--dry-run: nothing was changed).")
     } else {
-        format!("Redirected {pkgs}; rewrote {files}.")
+        format!("Switched {pkgs} to hosted patches; rewrote {files}.")
     }
 }
 
@@ -3491,11 +3529,11 @@ fn format_unredirected(
     let (skip_lead, unpinned_lead) = if nothing_redirected {
         ("  ", "  ")
     } else {
-        ("Skipped ", "Not redirected ")
+        ("Skipped ", "Not hosted ")
     };
     let mut lines = Vec::new();
     if nothing_redirected {
-        lines.push("No patches could be redirected:".to_string());
+        lines.push("No patches could be switched to hosted:".to_string());
     }
     for (purl, reason) in skipped {
         lines.push(format!(
@@ -3505,7 +3543,7 @@ fn format_unredirected(
     }
     for purl in unconfirmed {
         lines.push(format!(
-            "{unpinned_lead}{purl}: no lockfile entry pinning it could be redirected{see}"
+            "{unpinned_lead}{purl}: no lockfile entry pinning it could be rewritten{see}"
         ));
     }
     lines
@@ -3562,20 +3600,21 @@ fn format_next_steps(files: &[String], vendored_removed: bool) -> Vec<String> {
         .iter()
         .any(|f| f == "package-lock.json" || f == "npm-shrinkwrap.json");
     let hint = if npm { " (e.g. `npm ci`)" } else { "" };
-    let mut steps = vec![
-        format!("Commit {} to keep the redirect.", join_names(&commit, 6)),
-        format!(
-            "Reinstall from the updated lockfile{hint} so the installed packages pick up the \
-             patched artifacts, then run `socket-patch vex` to verify them."
-        ),
-    ];
+    let mut extra = Vec::new();
     if files
         .iter()
         .any(|f| f == socket_patch_core::constants::npm_family::VLT_LOCK)
     {
-        steps.push("vlt: commit vlt-lock.json; CI should run `vlt ci`".to_string());
+        extra.push("vlt: commit vlt-lock.json; CI should run `vlt ci`.".to_string());
     }
-    steps
+    crate::ui::next_steps(
+        &format!("{} to keep the hosted patches", join_names(&commit, 6)),
+        &format!(
+            "Reinstall from the updated lockfile{hint} so the installed packages pick up the \
+             patched artifacts"
+        ),
+        &extra,
+    )
 }
 
 /// Transient-frame boxed constructor for [`run_redirect_selected`] — the
@@ -4903,27 +4942,27 @@ mod tests {
     fn redirect_summary_singular_plural_and_dry_run() {
         assert_eq!(
             format_redirect_summary(1, 1, false),
-            "Redirected 1 package; rewrote 1 file."
+            "Switched 1 package to hosted patches; rewrote 1 file."
         );
         assert_eq!(
             format_redirect_summary(2, 3, false),
-            "Redirected 2 packages; rewrote 3 files."
+            "Switched 2 packages to hosted patches; rewrote 3 files."
         );
         assert_eq!(
             format_redirect_summary(0, 0, false),
-            "Redirected 0 packages; rewrote 0 files."
+            "Switched 0 packages to hosted patches; rewrote 0 files."
         );
         assert_eq!(
             format_redirect_summary(1, 1, true),
-            "Would redirect 1 package and rewrite 1 file (--dry-run: nothing was changed)."
+            "Would switch 1 package to hosted patches and rewrite 1 file (--dry-run: nothing was changed)."
         );
         assert_eq!(
             format_redirect_summary(0, 0, true),
-            "Would redirect 0 packages and rewrite 0 files (--dry-run: nothing was changed)."
+            "Would switch 0 packages to hosted patches and rewrite 0 files (--dry-run: nothing was changed)."
         );
         assert_eq!(
             format_redirect_summary(2, 5, true),
-            "Would redirect 2 packages and rewrite 5 files (--dry-run: nothing was changed)."
+            "Would switch 2 packages to hosted patches and rewrite 5 files (--dry-run: nothing was changed)."
         );
     }
 
@@ -4934,11 +4973,11 @@ mod tests {
         for dry in [false, true] {
             assert_eq!(
                 format_redirect_summary(1, 0, dry),
-                "1 package is already redirected; nothing to rewrite."
+                "1 package is already on hosted patches; nothing to rewrite."
             );
             assert_eq!(
                 format_redirect_summary(3, 0, dry),
-                "3 packages are already redirected; nothing to rewrite."
+                "3 packages are already on hosted patches; nothing to rewrite."
             );
         }
     }
@@ -5004,31 +5043,31 @@ mod tests {
                 "Skipped pkg:npm/lodash@4.17.20: not entitled to this patch (paid plan or no \
                  org access)"
                     .to_string(),
-                "Not redirected pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be \
-                 redirected (see the warning below)"
+                "Not hosted pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be \
+                 rewritten (see the warning below)"
                     .to_string(),
             ]
         );
         assert_eq!(
             format_unredirected(&[], &unconfirmed, false, 2),
             vec![
-                "Not redirected pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be \
-                 redirected (see the warnings below)"
+                "Not hosted pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be \
+                 rewritten (see the warnings below)"
                     .to_string(),
             ]
         );
         assert_eq!(
             format_unredirected(&[], &unconfirmed, true, 0),
             vec![
-                "No patches could be redirected:".to_string(),
-                "  pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be redirected"
+                "No patches could be switched to hosted:".to_string(),
+                "  pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be rewritten"
                     .to_string(),
             ]
         );
         assert_eq!(
             format_unredirected(&skipped, &[], true, 0),
             vec![
-                "No patches could be redirected:".to_string(),
+                "No patches could be switched to hosted:".to_string(),
                 "  pkg:npm/lodash@4.17.20: not entitled to this patch (paid plan or no org \
                  access)"
                     .to_string(),
@@ -5060,8 +5099,8 @@ mod tests {
             "Failed to write x: y"
         );
         assert_eq!(
-            sentence_case("the redirect ledger ./a is malformed"),
-            "The redirect ledger ./a is malformed"
+            sentence_case("the hosted ledger ./a is malformed"),
+            "The hosted ledger ./a is malformed"
         );
         assert_eq!(sentence_case("pnpm >=11 rejects"), "pnpm >=11 rejects");
         for tool in ["vlt", "vlx", "vlr"] {
@@ -5104,7 +5143,7 @@ mod tests {
         // Counts characters, not bytes.
         let lines = wrap_words("ééé ééé ééé", 8, "", "");
         assert_eq!(lines, vec!["ééé ééé", "ééé"]);
-        for line in wrap_words(&"word ".repeat(50), 30, "Warning (x): ", "  ") {
+        for line in wrap_words(&"word ".repeat(50), 30, "Warning: ", "  ") {
             assert!(line.chars().count() <= 30, "{line}");
         }
     }
@@ -5166,7 +5205,7 @@ mod tests {
                 "no package-lock.json present",
                 None
             ),
-            "Warning (redirect_npm_no_lockfile): No package-lock.json present"
+            "Warning: No package-lock.json present"
         );
         let long = "word ".repeat(40);
         let wrapped = format_warning("c", &long, Some(40));
@@ -5175,7 +5214,7 @@ mod tests {
             wrapped.lines().all(|l| l.chars().count() <= 40),
             "{wrapped}"
         );
-        assert!(wrapped.starts_with("Warning (c): Word word"), "{wrapped}");
+        assert!(wrapped.starts_with("Warning: Word word"), "{wrapped}");
         assert!(
             wrapped.lines().skip(1).all(|l| l.starts_with("  ")),
             "{wrapped}"
@@ -5188,7 +5227,7 @@ mod tests {
                       Do NOT rebuild the lockfile. Run `socket-patch vex` after installation.";
         assert_eq!(
             format_warning("redirect_pnpm_trust_lockfile", detail, None),
-            "Warning (redirect_pnpm_trust_lockfile): pnpm-lock.yaml was repointed at the \
+            "Warning: pnpm-lock.yaml was repointed at the \
              server; so it goes.\n  - Note: a tradeoff.\n  - Do NOT rebuild the lockfile.\n  \
              - Run `socket-patch vex` after installation."
         );
@@ -5198,15 +5237,15 @@ mod tests {
         }
         assert_eq!(
             wrapped,
-            "Warning (redirect_pnpm_trust_lockfile): pnpm-lock.yaml was\n  \
-             repointed at the server; so it goes.\n  - Note: a tradeoff.\n  - Do NOT \
+            "Warning: pnpm-lock.yaml was repointed at the server; so it\n  \
+             goes.\n  - Note: a tradeoff.\n  - Do NOT \
              rebuild the lockfile.\n  - Run `socket-patch vex` after installation."
         );
         // Continuation lines of a long bullet are indented under its text.
         let bullet = "Head. Do NOT follow the advice to rebuild the lockfile, which discards it.";
         assert_eq!(
             format_warning("redirect_pnpm_trust_lockfile", bullet, Some(40)),
-            "Warning (redirect_pnpm_trust_lockfile): Head.\n  - Do NOT follow the advice to \
+            "Warning: Head.\n  - Do NOT follow the advice to \
              rebuild\n    the lockfile, which discards it."
         );
     }
@@ -5247,9 +5286,11 @@ mod tests {
         assert_eq!(
             format_next_steps(&["package-lock.json".to_string()], false),
             vec![
-                "Commit package-lock.json to keep the redirect.".to_string(),
-                "Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages \
-                 pick up the patched artifacts, then run `socket-patch vex` to verify them."
+                "Next steps:".to_string(),
+                "  1. Commit package-lock.json to keep the hosted patches.".to_string(),
+                "  2. Reinstall from the updated lockfile (e.g. `npm ci`) so the installed \
+                 packages pick up the patched artifacts, then run `socket-patch vex` to verify \
+                 the installed patches."
                     .to_string(),
             ]
         );
@@ -5261,10 +5302,10 @@ mod tests {
             false,
         );
         assert_eq!(
-            steps[0],
-            "Commit pnpm-lock.yaml and pnpm-workspace.yaml to keep the redirect."
+            steps[1],
+            "  1. Commit pnpm-lock.yaml and pnpm-workspace.yaml to keep the hosted patches."
         );
-        assert!(!steps[1].contains("npm ci"), "{}", steps[1]);
+        assert!(!steps[2].contains("npm ci"), "{}", steps[2]);
     }
 
     #[test]
@@ -5272,21 +5313,21 @@ mod tests {
         let steps = format_next_steps(&["vlt-lock.json".to_string()], false);
         assert_eq!(
             steps.last().map(String::as_str),
-            Some("vlt: commit vlt-lock.json; CI should run `vlt ci`")
+            Some("  3. vlt: commit vlt-lock.json; CI should run `vlt ci`.")
         );
         assert!(
             !format_next_steps(&["package-lock.json".to_string()], false)
                 .iter()
-                .any(|s| s.starts_with("vlt:"))
+                .any(|s| s.contains("vlt:"))
         );
     }
 
     #[test]
     fn next_steps_after_a_takeover_name_the_removed_vendored_state() {
         assert_eq!(
-            format_next_steps(&["pnpm-lock.yaml".to_string()], true)[0],
-            "Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
-             pnpm-lock.yaml to keep the redirect."
+            format_next_steps(&["pnpm-lock.yaml".to_string()], true)[1],
+            "  1. Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
+             pnpm-lock.yaml to keep the hosted patches."
         );
     }
 
@@ -5425,10 +5466,29 @@ mod tests {
                 .contains("symbolic link"));
         }
     }
+
+    #[test]
+    fn npm_allow_remote_one_line_covers_every_variant() {
+        use super::npm_allow_remote_one_line;
+        let hosts = ["patch.socket.dev"];
+        let cases = [
+            (npm_allow_remote_configured_detail(&hosts, true, false), "Note: set"),
+            (npm_allow_remote_configured_detail(&hosts, false, false), "Note: set"),
+            (npm_allow_remote_configured_detail(&hosts, true, true), "Note: would set"),
+            (npm_allow_remote_already_detail(&hosts), "Note: .npmrc already"),
+            (npm_allow_remote_user_set_detail(&hosts, "none"), "Warning: npm >=12"),
+            (npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"), "Warning: npm >=12"),
+            (npm_allow_remote_manual_detail(&hosts), "Warning: npm >=12"),
+            (npm_allow_remote_unreadable_detail(&hosts, "is a symlink"), "Warning: npm >=12"),
+        ];
+        for (detail, start) in cases {
+            let line = npm_allow_remote_one_line(&detail);
+            assert!(line.starts_with(start), "{line}");
+            assert!(!line.contains('\n') && line.ends_with("(details: --verbose)."), "{line}");
+        }
+    }
 }
 
-/// The one-pass multi-needle confirmation probe answers exactly what the
-/// per-candidate `any()` oracle answers.
 #[cfg(test)]
 mod probe_equivalence_tests {
     use super::{candidate_presence_needles, candidate_present_oracle, npm_lock_url_needles};
@@ -5593,4 +5653,5 @@ mod probe_equivalence_tests {
             }
         }
     }
+
 }

@@ -481,7 +481,10 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
         let out = scan_output(tmp.path(), &server, &[]).await;
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{stderr}");
-        assert!(stderr.contains("record_fetch_failed"), "{stderr}");
+        assert!(
+            stderr.contains("was switched to hosted, but its patch record could not be fetched"),
+            "{stderr}"
+        );
         assert_eq!(
             std::fs::read(installed).unwrap(),
             bytes,

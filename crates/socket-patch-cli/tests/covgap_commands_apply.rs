@@ -479,7 +479,7 @@ async fn online_mismatch_prefetch_prints_download_line_in_human_mode() {
         "the human progress line must print before the prefetch; stderr={stderr}"
     );
     assert!(
-        stderr.contains("content_mismatch_overwritten"),
+        stderr.contains("did not match the patch's expected original content"),
         "the overwrite must be surfaced as the mismatch warning; stderr={stderr}"
     );
     assert_eq!(
@@ -988,7 +988,7 @@ mod gem_fallback_home_human {
             "a mismatched fallback-home copy must not fail the run; stderr={stderr}"
         );
         assert!(
-            stderr.contains("Warning (gem_fallback_home_skipped):"),
+            stderr.contains("Warning: ") && stderr.contains("was not patched"),
             "the best-effort skip must print its human warning; stderr={stderr}"
         );
         assert!(

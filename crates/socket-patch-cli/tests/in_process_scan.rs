@@ -1487,8 +1487,7 @@ async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
 
     // A manifest whose sole record WOULD attest successfully: vulnerability
-    // metadata for the statement, `setup.manual: ["npm"]` to pass the
-    // property-7 ecosystem filter, and `--vex-no-verify` below to skip the
+    // metadata for the statement and `--vex-no-verify` below to skip the
     // on-disk hash check, so only the dry-run gate keeps the document off
     // disk.
     let socket = tmp.path().join(".socket");
@@ -1506,7 +1505,7 @@ async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
                 }},
                 "description": "x", "license": "MIT", "tier": "free"
             }
-        }, "setup": { "manual": ["npm"] } }"#,
+        } }"#,
     )
     .unwrap();
     let before = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
@@ -1583,7 +1582,7 @@ async fn scan_apply_json_dry_run_with_vex_does_not_write_attestation() {
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
 
     // Attestable manifest (same fixture as the vendor twin above): metadata
-    // for the statement, `setup.manual: ["npm"]`, `--vex-no-verify` below.
+    // for the statement, `--vex-no-verify` below.
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(
@@ -1599,7 +1598,7 @@ async fn scan_apply_json_dry_run_with_vex_does_not_write_attestation() {
                 }},
                 "description": "x", "license": "MIT", "tier": "free"
             }
-        }, "setup": { "manual": ["npm"] } }"#,
+        } }"#,
     )
     .unwrap();
 

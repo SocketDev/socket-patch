@@ -17,13 +17,8 @@ use std::process::Command;
 use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
-
-/// Declare every ecosystem `manual` in fixtures so the property-7 setup-state
-/// filter doesn't drop these patches — these tests exercise embedded-VEX
-/// generation, not setup state.
-const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
@@ -58,14 +53,9 @@ fn cli() -> Command {
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut m = manifest.clone();
-    m.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: ALL_MANUAL.iter().map(|s| s.to_string()).collect(),
-    });
     std::fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
+        serde_json::to_string_pretty(manifest).unwrap(),
     )
     .unwrap();
 }
@@ -274,10 +264,9 @@ fn apply_vex_writes_document_on_success() {
 }
 
 /// vlt: agent `apply --vex` patches every `.vlt` store copy (a peer
-/// variant included) and attests it, with the ecosystem declared manual
-/// under its package-manager name `vlt`.
+/// variant included) and attests it.
 #[test]
-fn apply_vex_attests_a_vlt_store_install_declared_manual_as_vlt() {
+fn apply_vex_attests_a_vlt_store_install() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let before = b"before contents\n";
@@ -316,10 +305,6 @@ fn apply_vex_attests_a_vlt_store_install_declared_manual_as_vlt() {
             &["CVE-2024-0001"],
         ),
     );
-    manifest.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: vec!["vlt".to_string()],
-    });
     let socket = cwd.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
     std::fs::write(

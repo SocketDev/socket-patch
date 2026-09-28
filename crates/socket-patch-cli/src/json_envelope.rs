@@ -3,7 +3,7 @@
 //! The `--json` output of `apply`, `list`, `remove`, `repair`/`gc`,
 //! `vendor`, `self-update` and `vex --json --output` (and every command's
 //! lock-contention error) uses this top-level shape; `scan`, `get`,
-//! `rollback` and `setup` still emit their legacy shapes (see
+//! and `rollback` still emit their legacy shapes (see
 //! CLI_CONTRACT.md's migration status):
 //!
 //! ```json
@@ -374,7 +374,6 @@ pub enum Command {
     Apply,
     Vex,
     Vendor,
-    Setup,
     Rollback,
     Get,
     List,
@@ -910,7 +909,6 @@ mod tests {
             (Command::Apply, "apply"),
             (Command::Vex, "vex"),
             (Command::Vendor, "vendor"),
-            (Command::Setup, "setup"),
             (Command::Rollback, "rollback"),
             (Command::Get, "get"),
             (Command::List, "list"),

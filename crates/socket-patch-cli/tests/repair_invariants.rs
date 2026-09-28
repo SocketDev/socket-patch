@@ -251,7 +251,7 @@ fn repair_redirect_only_project_human_mode_prints_note() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Hosted redirects need no local repair"),
+        stdout.contains("Hosted patches need no local repair"),
         "human mode must print the informational note; got stdout=\n{stdout}"
     );
 }

@@ -293,9 +293,9 @@ pub struct ScanArgs {
     #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE")]
     pub batch_size: Option<usize>,
 
-    /// Deprecated spelling of `--mode agent`: download the selected patches
-    /// and apply them in place
-    #[arg(long, default_value_t = false)]
+    // Hidden, deprecated spelling of `--mode agent`: download the selected
+    // patches and apply them in place.
+    #[arg(long, default_value_t = false, hide = true)]
     pub apply: bool,
 
     /// Garbage-collect after the scan: prune manifest entries for
@@ -313,13 +313,10 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    /// Deprecated spelling of `--mode vendored`: vendor every patched
-    /// dependency the scan selects into the committable `.socket/vendor/`
-    /// tree instead of applying patches in place. The patch records live in
-    /// the vendor ledger (`.socket/vendor/state.json`), never in
-    /// `.socket/manifest.json`; a package vendored at an older patch is
-    /// re-vendored. Combine with `--prune` to garbage-collect stale state
-    #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync"])]
+    // Hidden, deprecated spelling of `--mode vendored`: vendor every
+    // patched dependency the scan selects into the committable
+    // `.socket/vendor/` tree instead of applying patches in place.
+    #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync"])]
     pub vendor: bool,
 
     /// Accepted for compatibility; has no effect
@@ -337,10 +334,10 @@ pub struct ScanArgs {
     pub redirect: bool,
 
     /// How discovered patches are consumed [default: hosted]. A `--prune`
-    /// or `--global` scan with no mode only reports. `--vendor` and
-    /// `--apply` are older spellings of `--mode vendored` and `--mode agent`
-    // Each mode is equivalent to one boolean flag (hosted == the hidden
-    // `--redirect`, vendored == `--vendor`, agent == `--apply`/`--sync`).
+    /// or `--global` scan with no mode only reports
+    // The hidden `--vendor` and `--apply` are older spellings of
+    // `--mode vendored` and `--mode agent`. Each mode is equivalent to one
+    // boolean flag (hosted == the hidden `--redirect`, vendored == `--vendor`, agent == `--apply`/`--sync`).
     // Combining `--mode` with a boolean from a DIFFERENT mode is rejected in
     // `resolve_mode_flags`; the same mode spelled both ways is accepted.
     #[arg(long = "mode", value_enum)]
@@ -622,6 +619,17 @@ fn classified_rows(
         result["updates"] = serde_json::Value::Array(updates_json(&updates));
     }
     rows
+}
+
+/// `common` for `select_patches`: scan never prompts, so it always takes
+/// the top-ranked patch, and with `json` off it never gets
+/// `selection_required` (scan has no "re-run with the chosen UUID" path).
+pub(crate) fn selection_args(common: &GlobalArgs) -> GlobalArgs {
+    GlobalArgs {
+        json: false,
+        yes: true,
+        ..common.clone()
+    }
 }
 
 /// `updates[]` from the by-package records (see [`rollout::merge_updates`]).
@@ -1080,7 +1088,7 @@ pub(super) fn mode_takeover_detail(superseded: &[String]) -> String {
     // package including the ones still live in the lockfile — `remove
     // <purl>` is the per-package equivalent.
     format!(
-        "hosted redirect superseded the vendored ledger for: {list}. \
+        "hosted wiring superseded the vendored ledger for: {list}. \
          `.socket/vendor/state.json` still claims these package(s) and their \
          committed artifacts under `.socket/vendor/` are now orphaned — the \
          lockfile points at the hosted patch server, not the vendored files. \
@@ -1110,7 +1118,7 @@ pub(super) fn push_run_warning(
     detail: String,
 ) {
     if !common.silent && !common.json {
-        eprintln!("Warning ({code}): {detail}");
+        eprintln!("Warning: {detail}");
     }
     env.warnings.push(crate::json_envelope::RunWarning {
         code: code.to_string(),
@@ -1233,7 +1241,7 @@ pub(super) async fn hosted_wiring_retained_purls(
 pub(super) fn hosted_wiring_retained_detail(retained: &[String]) -> String {
     let list = retained.join(", ");
     format!(
-        "agent-mode scan left the hosted redirect wiring live for: {list}. \
+        "agent-mode scan left the hosted wiring live for: {list}. \
          The lockfile still resolves these package(s) to the hosted patch \
          server — an agent run patches installed files in place but does \
          NOT unwind hosted lockfile wiring, so installs keep fetching \
@@ -1572,7 +1580,7 @@ async fn run_scan(
     // Hosted mode runs no GC: say so once up front on the human path. The
     // `--json` path carries it in `redirect.warnings[]`.
     if hosted && prune && !args.common.json && !args.common.silent {
-        eprintln!("Warning ({REDIRECT_PRUNE_IGNORED}): {REDIRECT_PRUNE_IGNORED_DETAIL}");
+        eprintln!("Warning: {REDIRECT_PRUNE_IGNORED_DETAIL}");
     }
 
     // Resolved up-front (rather than at the GC site) because the embedded
@@ -1787,8 +1795,8 @@ async fn run_scan(
     if package_count == 0 {
         status.finish();
         if human {
-            for (code, detail) in &layout_refusals {
-                eprintln!("Warning ({code}): {detail}");
+            for (_, detail) in &layout_refusals {
+                eprintln!("Warning: {detail}");
             }
             policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
@@ -1919,8 +1927,8 @@ async fn run_scan(
         if !lockfile_only.purls.is_empty() {
             eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
         }
-        for (code, detail) in &layout_refusals {
-            eprintln!("Warning ({code}): {detail}");
+        for (_, detail) in &layout_refusals {
+            eprintln!("Warning: {detail}");
         }
         policy.print_warnings(args.common.silent);
     }
@@ -2349,14 +2357,14 @@ async fn run_scan(
             if !vendored_skip_purls.is_empty() {
                 let detail = vendored_ownership_retained_detail(&vendored_skip_purls);
                 if !args.common.silent {
-                    eprintln!("Warning ({VENDORED_OWNERSHIP_RETAINED}): {detail}");
+                    eprintln!("Warning: {detail}");
                 }
                 push_scan_json_warning(&mut result, VENDORED_OWNERSHIP_RETAINED, &detail);
             }
             if !hosted_retained.is_empty() {
                 let detail = hosted_wiring_retained_detail(&hosted_retained);
                 if !args.common.silent {
-                    eprintln!("Warning ({HOSTED_WIRING_RETAINED}): {detail}");
+                    eprintln!("Warning: {detail}");
                 }
                 push_scan_json_warning(&mut result, HOSTED_WIRING_RETAINED, &detail);
             }
@@ -2633,9 +2641,7 @@ async fn run_scan(
                     "{}",
                     ui::paint(&render::paid_extra_line(paid_patches), "33", use_color),
                 );
-                println!(
-                    "\nUpgrade to Socket's paid plan to access all patches: https://socket.dev/pricing"
-                );
+                println!("\n{}", ui::PAID_UPGRADE);
             }
         }
 
@@ -2649,7 +2655,7 @@ async fn run_scan(
 
     if downloadable_count == 0 {
         if !silent {
-            println!("\nNo downloadable patches (paid subscription required).");
+            println!("\nNo downloadable patches: every patch found requires a paid Socket plan.");
         }
         return finish_human(0).await;
     }
@@ -2936,7 +2942,7 @@ async fn run_scan(
             hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await;
         if !hosted_retained.is_empty() {
             eprintln!(
-                "Warning ({HOSTED_WIRING_RETAINED}): {}",
+                "Warning: {}",
                 hosted_wiring_retained_detail(&hosted_retained)
             );
         }

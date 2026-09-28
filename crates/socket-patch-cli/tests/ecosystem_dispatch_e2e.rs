@@ -827,8 +827,7 @@ fn rollback_dispatch_branch_composer() {
 // The scan macro in `ecosystem_dispatch` prints "Using <X> at: <path>" on
 // global crawls (`--global` / `--global-prefix`); it goes to stderr so it
 // can never reach a `--json` envelope or a VEX document on stdout. These
-// tests pin that stdout stays pure at the `vex` and `setup --check` call
-// sites. `--global-prefix` makes the check deterministic: the npm crawler returns
+// tests pin that stdout stays pure at the `vex` call site. `--global-prefix` makes the check deterministic: the npm crawler returns
 // the prefix verbatim as a node_modules root, so `paths` is never empty.
 // ---------------------------------------------------------------------------
 
@@ -850,7 +849,6 @@ fn run_scrubbed(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         "SOCKET_VEX_NO_VERIFY",
         "SOCKET_VEX_DOC_ID",
         "SOCKET_VEX_COMPACT",
-        "SOCKET_SETUP_EXCLUDE",
     ] {
         cmd.env_remove(var);
     }
@@ -947,39 +945,6 @@ fn vex_doc_to_stdout_global_prefix_emits_no_chrome_on_stdout() {
         "vex doc-to-stdout mode must keep stdout empty when no document is emitted — \
          the dispatch's 'Using <X> at:' chrome leaked: {stdout:?}"
     );
-}
-
-/// `setup --check --json` prints its JSON report to stdout after the patch
-/// consistency pass, which crawls via the dispatch. The chrome line must
-/// not precede (and corrupt) the report.
-#[test]
-fn setup_check_json_global_prefix_stdout_is_pure_json() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_root_package_json(tmp.path());
-    write_manifest(tmp.path(), "pkg:npm/__dispatch_test__@1.0.0");
-    let gp = tmp.path().join("gprefix");
-    std::fs::create_dir_all(&gp).unwrap();
-
-    let (_code, stdout, stderr) = run_scrubbed(
-        tmp.path(),
-        &[
-            "setup",
-            "--check",
-            "--json",
-            "--global-prefix",
-            gp.to_str().unwrap(),
-        ],
-    );
-
-    let report: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "setup --check --json stdout must be exactly the JSON report — the \
-             dispatch's 'Using <X> at:' chrome must not leak onto stdout ({e}); \
-             stdout={stdout:?} stderr={stderr:?}"
-        )
-    });
-    assert!(report["status"].is_string(), "stdout={stdout:?}");
-    assert!(report["files"].is_array(), "stdout={stdout:?}");
 }
 
 #[test]

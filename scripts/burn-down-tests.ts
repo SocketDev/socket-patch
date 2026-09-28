@@ -33,7 +33,7 @@
  *   --features <csv>          cargo features for the suite + single-test runs
  *                             (default: none — every ecosystem is unconditional;
  *                             intentionally NOT --all-features, which would pull
- *                             in the infra-gated docker-e2e / setup-e2e suites).
+ *                             in the infra-gated docker-e2e suites).
  *   --test-cmd <cmd>          Override the full-suite enumeration command
  *                             (default: cargo test --workspace --features <csv>
  *                             --no-fail-fast).
