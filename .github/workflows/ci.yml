@@ -723,7 +723,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # Windows compiles the same ~240 targets ~1.6x slower (see `test`).
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 45 }}
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
@@ -1057,11 +1058,12 @@ jobs:
           # `--ignored`.
           # Real-Poetry hosted + vendored capstones (#[ignore]-gated,
           # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
-          # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.x (lock 2.1; 2.0.1 is in
-          # e2e-full).
+          # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.0 (first lock 2.1 writer),
+          # current.
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.0.10'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.1.15'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.8.5'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
           - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
           # Real PDM / Hatch capstones (wiremock Socket API that also serves
@@ -1120,6 +1122,11 @@ jobs:
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
     # hatch), hence more than the 25 minutes the older legs needed.
     timeout-minutes: 40
+    # What .cargo/config.toml's [env] gives processes cargo launches; these
+    # legs launch the test binaries themselves.
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
     # e2e-full runs these same steps over its rows.
     steps: &e2e-steps
       - name: Checkout
@@ -1440,7 +1447,7 @@ jobs:
           exit "$status"
 
   # The PM-version legs with no boundary of their own: the middle uv lines,
-  # Pipenv releases and .NET SDK majors, Poetry 2.0 and bundler 2.7. Skipped
+  # Pipenv releases and .NET SDK majors, and bundler 2.7. Skipped
   # on pull_request (the `e2e` rows keep every named boundary, the oldest
   # and newest release of each tool and every vlt era there); main pushes,
   # the nightly schedule and dispatch run them with the `e2e` steps.
@@ -1475,7 +1482,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.9.30', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.10.12', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.11.33', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2023.12.1'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2024.4.1'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2025.1.3'}
@@ -1484,6 +1490,11 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '9'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    # What .cargo/config.toml's [env] gives processes cargo launches; these
+    # legs launch the test binaries themselves.
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
     steps: *e2e-steps
 
   # ----------------------------------------------------------------------
@@ -1668,7 +1679,8 @@ jobs:
   # Every toolchain and every lock re-encoding at least once on PRs (the
   # toolchain's own lock is re-encoded as v1-v4 before socket-patch touches
   # it, the committed-lockfile case; '' keeps the toolchain's own format),
-  # plus macOS and Windows. cargo-vex-matrix-full runs the rest of the
+  # plus macOS and Windows; 1.93.1 with its own lock is the pinned
+  # rust-toolchain.toml cell. cargo-vex-matrix-full runs the rest of the
   # toolchain x lock cross off pull_request. Each leg also runs
   # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
@@ -1676,11 +1688,16 @@ jobs:
     needs: [test, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    # What .cargo/config.toml's [env] gives processes cargo launches; these
+    # legs launch the test binaries themselves.
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, toolchain: '1.82.0', lock: ''}
+          - {os: ubuntu-latest, toolchain: '1.93.1', lock: ''}
           - {os: ubuntu-latest, toolchain: '1.93.1', lock: '1'}
           - {os: ubuntu-latest, toolchain: stable, lock: '2'}
           - {os: ubuntu-latest, toolchain: '1.82.0', lock: '3'}
@@ -1740,6 +1757,11 @@ jobs:
     needs: [test, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    # What .cargo/config.toml's [env] gives processes cargo launches; these
+    # legs launch the test binaries themselves.
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -1747,7 +1769,7 @@ jobs:
           - {os: ubuntu-latest, toolchain: '1.82.0', lock: '1'}
           - {os: ubuntu-latest, toolchain: '1.82.0', lock: '2'}
           - {os: ubuntu-latest, toolchain: '1.82.0', lock: '4'}
-          - {os: ubuntu-latest, toolchain: '1.93.1', lock: ''}
+          - {os: ubuntu-latest, toolchain: '1.82.0', lock: ''}
           - {os: ubuntu-latest, toolchain: '1.93.1', lock: '2'}
           - {os: ubuntu-latest, toolchain: '1.93.1', lock: '3'}
           - {os: ubuntu-latest, toolchain: stable, lock: ''}

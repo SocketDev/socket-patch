@@ -16,6 +16,7 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'rust-toolchain.toml'
+      - '.cargo/config.toml'
       - '.github/workflows/npm-compatibility.yml'
       - 'docs/testing/npm-compatibility.md'
       - 'crates/**'
@@ -27,6 +28,7 @@ on:
       - 'crates/socket-patch-cli/tests/e2e_redirect_npm_build.rs'
       - 'crates/socket-patch-cli/tests/e2e_vendor_npm_build.rs'
       - 'crates/socket-patch-cli/tests/npm_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/common/cache_env.rs'
   push:
     branches: [main]
   workflow_dispatch:

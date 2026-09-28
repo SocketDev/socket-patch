@@ -340,6 +340,9 @@ jobs:
               --node "$NODE_PIN" --linker "${SOCKET_PATCH_VLT_E2E_STORE_LINKER:-}" \
               --cache-root "${SOCKET_PATCH_VLT_E2E_CACHE_ROOT:-}" $VLT_SUITES | tr -d '\r') || exit 1
           fi
+          if [ -z "$VLT_SUITES" ]; then
+            echo "::notice::every capstone of this cell runs in ci.yml's e2e rows; nothing left to run here"
+          fi
           status=0
           for suite in $VLT_SUITES; do
             echo "::group::$suite"
