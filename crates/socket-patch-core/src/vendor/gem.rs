@@ -70,7 +70,7 @@ use super::common::{
     prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
-use super::gemfile_lock::{is_plain_gem_token, split_checksum_entry, split_entry};
+use crate::formats::gem::{is_plain_gem_token, split_checksum_entry, split_entry};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::service_fetch::{

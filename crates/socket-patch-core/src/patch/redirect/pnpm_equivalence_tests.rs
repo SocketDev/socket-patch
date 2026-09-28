@@ -1,7 +1,7 @@
 //! Equivalence oracle for the indexed pnpm hosted rewriter: the previous
 //! implementation (re-parse every lock per dep, splice per dep) is kept here
 //! verbatim as `rewrite_pnpm_lock_oracle`, and the production
-//! `rewrite_pnpm_lock` must produce the identical `RewriteResult` — output
+//! `plan_hosted` must produce the identical `RewriteResult` — output
 //! bytes, the FileEdit list (order and `original` fragments), warnings and
 //! refusals — on depscan-sized synthetic locks and on randomized mixes of
 //! every lock flavor the grammar handles.
@@ -14,7 +14,7 @@ fn assert_equivalent(files: &BTreeMap<String, String>, overrides: &[DepOverride]
     let mut want = RewriteResult::default();
     rewrite_pnpm_lock_oracle(files, overrides, &mut want);
     let mut got = RewriteResult::default();
-    rewrite_pnpm_lock(files, overrides, &mut got);
+    plan_hosted(files, overrides, &mut got);
     assert_same(&want, &got, "pnpm");
     got
 }

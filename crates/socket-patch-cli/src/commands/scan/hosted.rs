@@ -9,6 +9,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
+use socket_patch_core::formats::registry;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
 use socket_patch_core::utils::concurrent::{
@@ -27,71 +28,11 @@ pub(crate) use vlt::rollback_heal as vlt_rollback_heal;
 pub(crate) use vlt::takeover_heal as vlt_takeover_heal;
 
 /// Candidate lockfiles / registry configs the redirect rewriters may touch —
-/// read from the project when present and handed to `rewrite_registry_redirect`.
-pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "pnpm-lock.yaml",
-    // pnpm <=2 uses the same package identities under the old filename.
-    "shrinkwrap.yaml",
-    "node_modules/.modules.yaml",
-    "yarn.lock",
-    // A berry lock's cache-config gate reads `.yarnrc.yml`; bun's text lock is
-    // `bun.lock`; binary locks are read separately below.
-    ".yarnrc.yml",
-    "bun.lock",
-    "bun.lockb",
-    // vlt: the lock is rewritten, vlt.json is read-only (the old-lockfile
-    // advisory), and the hidden lock is only stat'ed as the install-state
-    // sentinel.
-    "vlt-lock.json",
-    "vlt.json",
-    "node_modules/.vlt-lock.json",
-    "requirements.txt",
-    "uv.lock",
-    "poetry.lock",
-    "pdm.lock",
-    "Pipfile.lock",
-    "pyproject.toml",
-    "hatch.toml",
-    "Cargo.toml",
-    "Cargo.lock",
-    ".cargo/config.toml",
-    // The LEGACY extensionless spelling: cargo reads `.cargo/config` in
-    // preference to `config.toml` when both exist, so the rewriter must see
-    // it (it wires the managed registry into whichever one is present) —
-    // otherwise the `[registries.…]` block lands in a file cargo ignores.
-    ".cargo/config",
-    "composer.lock",
-    "nuget.config",
-    "packages.lock.json",
-    "Gemfile",
-    "Gemfile.lock",
-    // Bundler's modern manifest spelling — preferred over Gemfile when both
-    // exist (the gem rewriter picks the pair bundler reads and fails closed
-    // on diverging spellings).
-    "gems.rb",
-    "gems.locked",
-    // The golang rewriter edits the main module's go.mod (fork-style
-    // `replace`) and go.sum (the socket module's two h1: lines). go.sum may
-    // legitimately be absent — the rewriter creates it in that case.
-    "go.mod",
-    "go.sum",
-    "pom.xml",
-    // Maven Trusted Checksums files the fail-closed maven rewriter merges into
-    // (read so an existing user config / checksum set is preserved, not
-    // clobbered).
-    ".mvn/maven.config",
-    ".mvn/checksums/checksums.sha256",
-    // Gradle build scripts are never edited — their presence only feeds the
-    // maven rewriter's paste-able `exclusiveContent` snippet warning.
-    "settings.gradle",
-    "settings.gradle.kts",
-    "build.gradle",
-    "build.gradle.kts",
-    // deno.lock is deliberately absent: no redirect rewriter edits its
-    // integrity entries.
-];
+/// read from the project when present and handed to
+/// `rewrite_registry_redirect`: the [`registry::HOSTED`] rows of the format
+/// registry, in its read order.
+pub(crate) static REDIRECT_CANDIDATE_FILES: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| registry::paths_with(registry::HOSTED));
 
 /// Most hosted wheel-metadata downloads in flight at once, below the patch
 /// API's own in-flight cap: each one buffers a whole wheel (up to
@@ -304,41 +245,11 @@ pub(crate) fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run:
     )
 }
 
-/// `lockfileVersion` major sniffed from a pnpm-lock.yaml head. pnpm 9-12
-/// emit `lockfileVersion: '9.0'` (single doc, first line); pnpm 8 emits
-/// `'6.0'`, pnpm 7 an unquoted `5.4`. `None` when no parseable version line
-/// exists — callers treat that as "not trust-policy era" and stay
-/// hands-off (fail closed: never write config for a lock we can't read).
-pub(crate) fn pnpm_lock_version_major(lock_text: &str) -> Option<u32> {
-    lock_text.lines().find_map(|line| {
-        let rest = line.strip_prefix("lockfileVersion:")?;
-        let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-        value.split('.').next()?.parse::<u32>().ok()
-    })
-}
-
-/// Whether a pnpm lock may belong to pnpm 1–4, which spell the store flag
-/// `--store` (pnpm 1–3 can silently ignore `--store-dir`; early pnpm 4
-/// rejects it): a `shrinkwrapVersion` lock (pnpm 1–2) or lockfileVersion
-/// 5.0–5.2 (pnpm 3–5). Later locks never get the `--store` note.
-pub(crate) fn pnpm_lock_may_need_store_flag(lock_text: &str) -> bool {
-    lock_text.lines().any(|line| {
-        if line.starts_with("shrinkwrapVersion:") {
-            return true;
-        }
-        let Some(rest) = line.strip_prefix("lockfileVersion:") else {
-            return false;
-        };
-        let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-        let mut parts = value.split('.');
-        let major = parts.next().and_then(|m| m.parse::<u32>().ok());
-        let minor = parts
-            .next()
-            .and_then(|m| m.parse::<u32>().ok())
-            .unwrap_or(0);
-        major == Some(5) && minor <= 2
-    })
-}
+// The pnpm lock-version sniffs live with the format's model.
+pub(crate) use socket_patch_core::formats::pnpm::{
+    lock_version_major as pnpm_lock_version_major,
+    may_need_store_flag as pnpm_lock_may_need_store_flag,
+};
 
 /// The planned pnpm-workspace.yaml `trustLockfile: true` edit.
 pub(crate) enum TrustPlan {
@@ -1881,7 +1792,7 @@ pub(crate) async fn run_redirect_selected(
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
     let mut rush_lock_keys: Vec<String> = Vec::new();
     if !candidates.is_empty() || !dry_run_takeover_urls.is_empty() {
-        for name in REDIRECT_CANDIDATE_FILES {
+        for name in REDIRECT_CANDIDATE_FILES.iter() {
             if *name == "bun.lockb" {
                 continue;
             }
@@ -3567,7 +3478,6 @@ mod tests {
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
-    use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
 
@@ -4790,25 +4700,54 @@ mod tests {
     }
 
     #[test]
-    fn redirect_candidates_match_the_shared_npm_family_table() {
-        // Drift guard, both directions, without classifying the non-npm
-        // rows: every table row flagged redirect_candidate must be in the
-        // candidate list, and no npm-family row NOT so flagged may appear
-        // (binary candidates are read separately).
-        for name in npm_family::names_with(|r| r.redirect_candidate) {
-            assert!(
-                REDIRECT_CANDIDATE_FILES.contains(&name),
-                "{name} is flagged redirect_candidate but missing from \
-                 REDIRECT_CANDIDATE_FILES"
-            );
-        }
-        for name in npm_family::names_with(|r| !r.redirect_candidate) {
-            assert!(
-                !REDIRECT_CANDIDATE_FILES.contains(&name),
-                "{name} is deliberately NOT a redirect candidate (see the \
-                 npm_family table) but appears in REDIRECT_CANDIDATE_FILES"
-            );
-        }
+    fn redirect_candidates_are_pinned_by_value() {
+        // Hardcoded on purpose: the candidate list is derived from the
+        // format registry, so a row dropped (or a HOSTED flag lost) there
+        // must fail here instead of silently shrinking what hosted reads.
+        assert_eq!(
+            *REDIRECT_CANDIDATE_FILES,
+            [
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "pnpm-lock.yaml",
+                "shrinkwrap.yaml",
+                "node_modules/.modules.yaml",
+                "yarn.lock",
+                ".yarnrc.yml",
+                "bun.lock",
+                "bun.lockb",
+                "vlt-lock.json",
+                "vlt.json",
+                "node_modules/.vlt-lock.json",
+                "requirements.txt",
+                "uv.lock",
+                "poetry.lock",
+                "pdm.lock",
+                "Pipfile.lock",
+                "pyproject.toml",
+                "hatch.toml",
+                "Cargo.toml",
+                "Cargo.lock",
+                ".cargo/config.toml",
+                ".cargo/config",
+                "composer.lock",
+                "nuget.config",
+                "packages.lock.json",
+                "Gemfile",
+                "Gemfile.lock",
+                "gems.rb",
+                "gems.locked",
+                "go.mod",
+                "go.sum",
+                "pom.xml",
+                ".mvn/maven.config",
+                ".mvn/checksums/checksums.sha256",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "build.gradle",
+                "build.gradle.kts",
+            ]
+        );
     }
     // ── Human-output formatting ────────────────────────────────────────────
 

@@ -37,13 +37,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha512};
 
 use crate::constants::SOCKET_DIR;
+use crate::formats::bun::{BunTextError, BunTextLock};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
-    check_lock_version, decode_json_string, has_workspace_packages, lock_version, packages_bounds,
-    parse_entry_line, parse_packages_section, split_name_spec, BunEntry,
+    decode_json_string, has_workspace_packages, lock_version, packages_bounds,
+    parse_entry_line, split_name_spec, BunEntry,
 };
 
 use super::common::{already_patched_result, refused};
@@ -216,10 +217,9 @@ pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, 
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
     };
-    check_lock_version(&text).map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
-    let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
-    let entries = parse_packages_section(&lines)
-        .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
+    let entries = BunTextLock::parse(&text)
+        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?
+        .entries;
     check_workspace_compatibility(&text, &entries)
 }
 
@@ -288,10 +288,9 @@ pub async fn wired_instances_all_ours(
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
     };
-    check_lock_version(&text).map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
-    let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
-    let entries = parse_packages_section(&lines)
-        .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
+    let entries = BunTextLock::parse(&text)
+        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?
+        .entries;
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(&name, &version);
     let mut matched = 0usize;
@@ -659,16 +658,15 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BunProject, Box<
             )));
         }
     };
-    if let Err(detail) = check_lock_version(&lock_text) {
-        return Err(Box::new(refused(
-            "vendor_lockfile_version_unsupported",
-            detail,
-        )));
-    }
-    let lines: Vec<String> = lock_text.split('\n').map(str::to_string).collect();
-    let entries = match parse_packages_section(&lines) {
-        Ok(entries) => entries,
-        Err(detail) => {
+    let (lines, entries) = match BunTextLock::parse(&lock_text) {
+        Ok(lock) => (lock.lines, lock.entries),
+        Err(BunTextError::Version(detail)) => {
+            return Err(Box::new(refused(
+                "vendor_lockfile_version_unsupported",
+                detail,
+            )));
+        }
+        Err(BunTextError::Packages(detail)) => {
             // SECURITY/fail-closed: never line-splice a lock whose packages
             // section does not match the pinned single-line grammar.
             return Err(Box::new(refused(
