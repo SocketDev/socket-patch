@@ -306,7 +306,10 @@ fn fresh_checkout(from: &Path, to: &Path) {
     for f in ["app.csproj", "nuget.config", "packages.lock.json"] {
         std::fs::copy(from.join(f), to.join(f)).unwrap_or_else(|e| panic!("copy {f}: {e}"));
     }
-    copy_tree(&from.join(".socket"), &to.join(".socket"));
+    // v5 hosted mode writes no `.socket/`: the lock pins are its whole state.
+    if from.join(".socket").is_dir() {
+        copy_tree(&from.join(".socket"), &to.join(".socket"));
+    }
     strip_manifest(to);
     let blobs = to.join(".socket/blobs");
     if blobs.exists() {
