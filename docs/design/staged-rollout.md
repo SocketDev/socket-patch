@@ -1069,6 +1069,24 @@ keeps its rules intact:
 - **Lock.** A wet hosted run whose only candidates are NEW rows it cannot
   admit (budget 0, or incomplete data) takes no apply lock and writes
   nothing, `.socket/` included.
+- **Folding.** `canonical_base_purl` is discovery's, so a nuget or
+  composer pin (lowercased) and a pypi pin (PEP 503 name) match the API's
+  spelling, and a package in two spellings is one budget unit. Every hosted
+  pin joins the recorded index, not just the first per key, so both pinned
+  qualifier twins read ALREADY.
+- **Flag over env.** An explicit `--max-new-patches` wins without parsing
+  `SOCKET_MAX_NEW_PATCHES`; whitespace-only env values are unset.
+- **Known limits.** (1) In memory, the symlink / unreadable-file refusals
+  run inside the first rewrite, before the plan, so a candidate file that
+  only a deferred NEW row would rewrite still refuses its root (disk runs
+  its symlink guard after the gate). (2) On disk, a project directory that
+  fails outright spends nothing and does not freeze later directories. (3)
+  A NEW row that `mark_pinned` turns ALREADY in a run that could admit no
+  NEW row takes the apply lock only after its files were read. (4) Memory
+  pin evidence is any fetched text file of the root; disk's is its
+  discovery plus the candidate files. (5) No e2e case covers a
+  vlt-withheld top-ranked row; it takes the same ineligible path as the
+  withdrawn and `bad_purl` rows the e2e tests cover.
 - **socket.yml layer.** B resolves the cap as flag > env > file >
   unlimited through `resolve_max_new`; the file value is passed once A
   loads the policy in `scan` (9.3).

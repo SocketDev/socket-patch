@@ -263,6 +263,16 @@ fn run_json(root: &Path, mock: &MockServer, args: &[&str]) -> Value {
     serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout}"))
 }
 
+/// How many times the mock served `view/{uuid}`.
+async fn view_fetches(mock: &MockServer, uuid: &str) -> usize {
+    mock.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with(&format!("/patches/view/{uuid}")))
+        .count()
+}
+
 /// The packages whose hosted artifact the lockfile pins.
 fn pinned(root: &Path) -> Vec<String> {
     let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
@@ -331,11 +341,44 @@ async fn hosted_cap_rolls_nine_packages_forward_three_per_run() {
     );
 
     let mut previous_lock = lock_before;
+    let mut dry = dry;
     for run_no in 0..3 {
         let v = run_json(tmp.path(), &mock, &args);
+        // The dry run before each wet run predicts it exactly.
+        // (Warning details switch tense: "would be written" / "was written".)
+        let decisions = |block: &Value| -> Value {
+            let mut block = block.clone();
+            let obj = block.as_object_mut().unwrap();
+            obj.remove("dryRun");
+            let codes: Vec<Value> = obj["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["code"].clone())
+                .collect();
+            obj.insert("warnings".into(), Value::Array(codes));
+            block
+        };
+        let (predicted, actual) = (decisions(&dry["redirect"]), decisions(&v["redirect"]));
+        assert_eq!(
+            dry["rollout"],
+            v["rollout"],
+            "run {}: dry run == wet run",
+            run_no + 1
+        );
+        assert_eq!(predicted, actual, "run {}: dry run == wet run", run_no + 1);
         if run_no == 0 {
-            assert_eq!(dry["rollout"], v["rollout"], "dry run == wet run");
-            assert_eq!(dry["redirect"]["skipped"], v["redirect"]["skipped"]);
+            assert_eq!(
+                v["rollout"]["deferred"][0],
+                json!({
+                    "purl": "pkg:npm/roll-c@1.0.0",
+                    "uuids": [uuid("roll-c")],
+                    "severity": "high",
+                    "advisoryCount": 1,
+                    "projects": [""],
+                    "rank": 4,
+                })
+            );
         }
         assert_eq!(
             v["rollout"]["maxNewPatches"],
@@ -372,6 +415,9 @@ async fn hosted_cap_rolls_nine_packages_forward_three_per_run() {
         assert_eq!(skipped.len() as u64, 6 - done);
         assert_eq!(v["redirect"]["redirected"], 3 * (run_no as u64 + 1));
         previous_lock = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+        let mut next_dry = args.to_vec();
+        next_dry.push("--dry-run");
+        dry = run_json(tmp.path(), &mock, &next_dry);
     }
 
     let v = run_json(tmp.path(), &mock, &args);
@@ -548,10 +594,21 @@ async fn agent_cap_rolls_forward_and_upgrades_ignore_the_cap() {
                 before(name),
                 "a deferred package is not touched"
             );
+            assert_eq!(
+                view_fetches(&mock, &uuid(name)).await,
+                0,
+                "a deferred patch is never downloaded: {name}"
+            );
         }
     }
+    let manifest = std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap();
     let v = run_json(tmp.path(), &mock, &args);
     assert_eq!(counts(&v), (0, 0, 0, 9));
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
+        manifest,
+        "a converged run is byte-stable"
+    );
 
     // A newer patch for an applied package is an UPGRADE: it lands even
     // with `--max-new-patches 0`, and is reported in `updates[]`.
@@ -673,8 +730,9 @@ async fn project_directories_share_one_budget_in_sorted_order() {
             "3",
             "--patch-server-url",
             HOST,
-            "a",
+            // Given out of order: the directories are still visited sorted.
             "b",
+            "a",
         ],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
@@ -682,12 +740,16 @@ async fn project_directories_share_one_budget_in_sorted_order() {
     assert_eq!(pinned(&tmp.path().join("b")), names(&["roll-e", "roll-b"]));
     assert!(
         stdout.contains(
-            "Rollout: 2 of 2 new patches applied (maxNewPatches=3 from --max-new-patches)"
+            "Rollout: 2 of 2 new patches applied (maxNewPatches=3 from --max-new-patches, \
+             shared by this run's directories, 1 left)"
         ),
         "{stdout}"
     );
     assert!(
-        stdout.contains("Rollout: 2 of 4 new patches applied"),
+        stdout.contains(
+            "Rollout: 2 of 4 new patches applied (maxNewPatches=3 from --max-new-patches, \
+             shared by this run's directories, 0 left)"
+        ),
         "b/ admits roll-b free and roll-e with the last slot: {stdout}"
     );
     assert!(
@@ -697,7 +759,7 @@ async fn project_directories_share_one_budget_in_sorted_order() {
 }
 
 #[tokio::test]
-async fn a_malformed_env_cap_is_a_usage_error_and_the_flag_wins() {
+async fn a_malformed_env_cap_is_a_usage_error_unless_the_flag_overrides_it() {
     let mock = MockServer::start().await;
     mount_api(&mock, |_| Grant::Granted).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -718,6 +780,41 @@ async fn a_malformed_env_cap_is_a_usage_error_and_the_flag_wins() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("SOCKET_MAX_NEW_PATCHES"));
 
+    // A flag overrides the env value without reading it.
+    let mut with_flag = Command::new(binary());
+    with_flag
+        .args([
+            "scan",
+            "--json",
+            "--dry-run",
+            "--max-new-patches",
+            "1",
+            "--api-url",
+        ])
+        .arg(mock.uri())
+        .args(["--api-token", "t", "--org", ORG])
+        .current_dir(tmp.path());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SOCKET_") {
+            with_flag.env_remove(&key);
+        }
+    }
+    with_flag
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SOCKET_MAX_NEW_PATCHES", "lots");
+    let out = with_flag.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["rollout"]["maxNewPatches"],
+        json!({ "value": 1, "source": "flag" })
+    );
+
     cmd.env("SOCKET_MAX_NEW_PATCHES", "1");
     let out = cmd.output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -733,5 +830,209 @@ async fn a_malformed_env_cap_is_a_usage_error_and_the_flag_wins() {
     assert_eq!(
         v["rollout"]["maxNewPatches"],
         json!({ "value": null, "source": "flag" })
+    );
+    assert_eq!(
+        v["rollout"]["counts"]["new"], 1,
+        "roll-b landed on the capped run; roll-a now"
+    );
+}
+
+/// Mount, ahead of `mount_api`'s answers, a newer superseding patch for
+/// `name`: offered first by-package, granted, and viewable.
+async fn mount_newer(mock: &MockServer, name: &str, newer: &str) {
+    let sevs = PACKAGES.iter().find(|(n, _)| *n == name).unwrap().1;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.*{name}(%40|@)1\\.0\\.0$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "patches": [
+                { "uuid": newer, "purl": purl(name), "publishedAt": "2026-06-01T00:00:00Z",
+                  "description": "newer", "license": "MIT", "tier": "free",
+                  "vulnerabilities": vulns(name, sevs) },
+                { "uuid": uuid(name), "purl": purl(name), "publishedAt": "2026-01-01T00:00:00Z",
+                  "description": name, "license": "MIT", "tier": "free",
+                  "vulnerabilities": vulns(name, sevs) }
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .with_priority(1)
+        .mount(mock)
+        .await;
+    let mut results = serde_json::Map::new();
+    for (n, _) in PACKAGES {
+        results.insert(
+            uuid(n),
+            json!({ "status": "granted", "url": hosted_url(n), "purl": purl(n),
+                "artifacts": [{ "kind": "tarball", "url": hosted_url(n),
+                    "integrity": { "sha512": format!("sha512-PATCHED{n}==") } }],
+                "registryOverride": null }),
+        );
+    }
+    let newer_url = hosted_url(name).replace(&uuid(name), newer);
+    results.insert(
+        newer.to_string(),
+        json!({ "status": "granted", "url": newer_url, "purl": purl(name),
+            "artifacts": [{ "kind": "tarball", "url": newer_url,
+                "integrity": { "sha512": "sha512-NEWER==" } }],
+            "registryOverride": null }),
+    );
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": results })))
+        .with_priority(1)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn hosted_upgrades_land_with_a_cap_of_zero() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let args = [
+        "--mode",
+        "hosted",
+        "--max-new-patches",
+        "3",
+        "--patch-server-url",
+        HOST,
+    ];
+    run_json(tmp.path(), &mock, &args);
+    assert_eq!(pinned(tmp.path()), names(&ORDER[..3]));
+
+    // roll-e (applied) gains a newer patch; six packages still wait.
+    let newer = "0000000e-1111-4111-8111-00000000000e";
+    mount_newer(&mock, "roll-e", newer).await;
+    let v = run_json(
+        tmp.path(),
+        &mock,
+        &[
+            "--mode",
+            "hosted",
+            "--max-new-patches",
+            "0",
+            "--patch-server-url",
+            HOST,
+        ],
+    );
+    assert_eq!(counts(&v), (0, 6, 1, 2), "{v}");
+    assert_eq!(
+        v["updates"],
+        json!([{ "purl": purl("roll-e"), "oldUuid": uuid("roll-e"), "newUuid": newer }])
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains(newer), "the upgrade landed: {lock}");
+    assert_eq!(
+        pinned(tmp.path()),
+        names(&["roll-b", "roll-g"]),
+        "nothing new was added"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_reference_lookup_defers_new_rows_instead_of_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let args = [
+        "--mode",
+        "hosted",
+        "--max-new-patches",
+        "3",
+        "--patch-server-url",
+        HOST,
+    ];
+
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&failing)
+        .await;
+    mount_api(&failing, |_| Grant::Granted).await;
+
+    // Every row is NEW: the failure only affects rows the incomplete lookup
+    // defers anyway, so the capped run succeeds and writes nothing.
+    let v = run_json(tmp.path(), &failing, &args);
+    assert_eq!(counts(&v), (0, 9, 0, 0), "{v}");
+    let codes: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"rollout_reference_failed"), "{codes:?}");
+    assert!(codes.contains(&"rollout_incomplete_lookup"), "{codes:?}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before
+    );
+    assert!(!tmp.path().join(".socket").exists(), "no lock, no state");
+
+    // Without a cap the failure is the run's, as before.
+    let (code, stdout, _) = run(tmp.path(), &failing, &["--json", "--mode", "hosted"]);
+    assert_eq!(code, 1, "{stdout}");
+    let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["status"], "error");
+    assert!(
+        v.get("rollout").is_none(),
+        "no rollout block on an error envelope"
+    );
+
+    // With applied rows the failure affects them too: the run fails.
+    let ok = MockServer::start().await;
+    mount_api(&ok, |_| Grant::Granted).await;
+    run_json(tmp.path(), &ok, &args);
+    let mut failing_args = vec!["--json"];
+    failing_args.extend_from_slice(&args);
+    let (code, stdout, _) = run(tmp.path(), &failing, &failing_args);
+    assert_eq!(code, 1, "{stdout}");
+}
+
+#[tokio::test]
+async fn a_failed_detail_lookup_for_an_applied_package_does_not_freeze_new_rows() {
+    let mock = MockServer::start().await;
+    mount_api(&mock, |_| Grant::Granted).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    write_project(tmp.path(), &names9);
+    let args = [
+        "--mode",
+        "hosted",
+        "--max-new-patches",
+        "3",
+        "--patch-server-url",
+        HOST,
+    ];
+    run_json(tmp.path(), &mock, &args);
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.*roll-e(%40|@)1\\.0\\.0$"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    let v = run_json(tmp.path(), &mock, &args);
+    assert_eq!(
+        counts(&v).0,
+        3,
+        "roll-e is recorded, so the next three land: {v}"
+    );
+    let codes: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(!codes.contains(&"rollout_incomplete_lookup"), "{codes:?}");
+    assert!(
+        pinned(tmp.path()).contains(&"roll-e".to_string()),
+        "the pin stays"
     );
 }

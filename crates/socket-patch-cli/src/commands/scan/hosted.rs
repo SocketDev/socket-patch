@@ -563,6 +563,10 @@ fn emit_json_error_with_code(
     let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "error" }));
     result["status"] = serde_json::json!("error");
     result["error"] = serde_json::json!(message);
+    // The rollout block describes a successful run only.
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("rollout");
+    }
     if let Some(code) = code {
         result["errorCode"] = serde_json::json!(code);
     }
@@ -1062,7 +1066,7 @@ pub(super) async fn run_redirect(
     // The merged recorded view (manifest > hosted pins > vendor ledger) the
     // rollout classifies against, whether a batch failed, and the stage
     // that holds this directory's budget.
-    recorded: Option<&socket_patch_core::manifest::schema::PatchManifest>,
+    recorded: &super::rollout::RecordedState<'_>,
     batch_failed: bool,
     stage: &mut super::rollout::Stage,
 ) -> i32 {
@@ -1121,7 +1125,7 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
-        Some(super::rollout::Gate { stage, rows }),
+        Some(super::rollout::Gate::new(stage, rows)),
     )
     .await
 }
@@ -1494,7 +1498,11 @@ pub(crate) async fn run_redirect_selected(
             // a warning instead of failing the run.
             Err(e)
                 if rollout.as_ref().is_some_and(|gate| {
-                    gate.stage.capped() && selected.iter().all(|(p, u)| gate.is_new(p, u))
+                    let new = gate.new_keys();
+                    gate.stage.capped()
+                        && selected
+                            .iter()
+                            .all(|(p, u)| new.contains(&(p.clone(), u.clone())))
                 }) =>
             {
                 if let Some(gate) = rollout.as_mut() {
@@ -1682,10 +1690,11 @@ pub(crate) async fn run_redirect_selected(
     // A capped run whose only candidates are NEW rows it cannot admit
     // (budget 0, or incomplete data) writes nothing: take no lock either.
     let may_write = rollout.as_ref().is_none_or(|gate| {
-        gate.stage.may_admit_new()
-            || candidates
-                .iter()
-                .any(|c| !gate.is_new(&c.sel_purl, &c.dep.patch_uuid))
+        let new = gate.new_keys();
+        candidates.iter().any(|c| {
+            !new.contains(&(c.sel_purl.clone(), c.dep.patch_uuid.clone()))
+                || gate.may_admit(&c.sel_purl)
+        })
     });
     let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
         match acquire_hosted_lock(common, &mut scan_result) {
@@ -2428,8 +2437,9 @@ pub(crate) async fn run_redirect_selected(
             overrides = candidates.iter().map(|c| c.dep.clone()).collect();
             (files, rewrite) = rewrite_candidates(files, &overrides, &inputs).await;
         }
-        // A row that turned out to be pinned already still gets written: take
-        // the lock skipped above (no takeover ran without it).
+        // A row that turned out to be pinned already (`mark_pinned`: a pin
+        // discovery did not recognize) still gets written: take the lock
+        // skipped above. Only NEW rows ran without it, so no takeover did.
         if lock.is_none() && !common.dry_run && !candidates.is_empty() {
             match acquire_hosted_lock(common, &mut scan_result) {
                 Ok(guard) => lock = Some(guard),
@@ -3215,8 +3225,9 @@ pub(crate) async fn run_redirect_selected(
             human_files.extend(takeover_files.iter().cloned());
             human_files.sort();
             human_files.dedup();
-            // The one stdout line: scripts read it, so it stays on stdout;
-            // everything below is on stderr and names its package itself.
+            // The summary line: scripts read it, so it stays on stdout, as do
+            // the rollout line and the next steps; the warnings below are on
+            // stderr and name their package themselves.
             println!(
                 "{}",
                 format_redirect_summary(confirmed.len(), human_files.len(), common.dry_run)

@@ -20,7 +20,7 @@
 use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
@@ -477,7 +477,7 @@ async fn run_vendor_json_path(
     use_public_proxy: bool,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
-    recorded: Option<&PatchManifest>,
+    recorded: &super::rollout::RecordedState<'_>,
     batch_failed: bool,
     stage: &mut Stage,
     result: &mut serde_json::Value,
@@ -603,6 +603,9 @@ async fn run_vendor_json_path(
                 "code": code,
                 "message": message,
             });
+            if let Some(obj) = result.as_object_mut() {
+                obj.remove("rollout");
+            }
             print_json(result);
             return 1;
         }
@@ -827,7 +830,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     use_public_proxy: bool,
     all_packages_with_patches: &'a [BatchPackagePatches],
     can_access_paid_patches: bool,
-    recorded: Option<&'a PatchManifest>,
+    recorded: &'a super::rollout::RecordedState<'a>,
     batch_failed: bool,
     stage: &'a mut Stage,
     result: &'a mut serde_json::Value,

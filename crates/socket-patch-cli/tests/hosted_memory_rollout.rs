@@ -277,6 +277,13 @@ async fn one_root_disk_and_memory_admit_and_defer_the_same_rows_until_converged(
             run + 1
         );
         let next = apply(&files, &mem);
+        let memory_changed: Vec<&String> = mem.changed_files.iter().map(|f| &f.path).collect();
+        assert_eq!(
+            memory_changed,
+            disk.changed.keys().collect::<Vec<_>>(),
+            "run {}: the same files change",
+            run + 1
+        );
         for (rel, bytes) in &disk.changed {
             assert_eq!(
                 String::from_utf8_lossy(&next[rel]),
@@ -324,11 +331,12 @@ async fn two_roots_spend_one_budget_in_memory_and_one_per_directory_on_disk() {
     let next = apply(&files, &mem);
     assert_eq!(pinned(&next, "a/package-lock.json"), ["mem-b"]);
     assert_eq!(pinned(&next, "b/package-lock.json"), ["mem-e"]);
-    let ranks: Vec<(String, u32)> = mem
+    let mut ranks: Vec<(String, u32)> = mem
         .projects
         .iter()
         .flat_map(|p| p.deferred.iter().map(|d| (d.purl.clone(), d.rank)))
         .collect();
+    ranks.sort();
     assert_eq!(
         ranks,
         [(purl("mem-a"), 5), (purl("mem-c"), 3), (purl("mem-d"), 4)],
@@ -381,14 +389,59 @@ async fn memory_counts_a_committed_manifest_vendor_entry_or_pin_as_recorded() {
         .unwrap(),
     );
     let mem = memory(&server, &files, options(Some(1))).await;
-    let counts = &mem.rollout["counts"];
-    assert_eq!(counts["new"], 1, "{:#}", mem.rollout);
-    assert_eq!(counts["already"], 2, "{:#}", mem.rollout);
-    let next = apply(&files, &mem);
-    assert!(
-        pinned(&next, "package-lock.json").contains(&"mem-c"),
+    assert_eq!(
+        mem.rollout["counts"],
+        json!({ "new": 1, "deferred": 2, "upgrade": 0, "already": 2 }),
         "{:#}",
         mem.rollout
+    );
+    let deferred: Vec<&str> = mem.projects[0]
+        .deferred
+        .iter()
+        .map(|d| d.purl.as_str())
+        .collect();
+    assert_eq!(deferred, [purl("mem-d"), purl("mem-a")]);
+    // mem-e (manifest) re-confirms its pin; mem-b (vendored) is refused as a
+    // takeover; mem-c is the one NEW patch admitted.
+    let next = apply(&files, &mem);
+    assert_eq!(pinned(&next, "package-lock.json"), ["mem-e", "mem-c"]);
+    // The rerun lands the next one.
+    let again = memory(&server, &next, options(Some(1))).await;
+    assert_eq!(
+        again.rollout["counts"],
+        json!({ "new": 1, "deferred": 1, "upgrade": 0, "already": 3 })
+    );
+    assert_eq!(
+        pinned(&apply(&next, &again), "package-lock.json"),
+        ["mem-e", "mem-c", "mem-d"]
+    );
+}
+
+#[tokio::test]
+async fn memory_defers_new_rows_when_the_reference_lookup_fails_under_a_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount(&server).await;
+    let mut files = BTreeMap::new();
+    let names: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
+    lock(&mut files, "", &names);
+    let mem = memory(&server, &files, options(Some(2))).await;
+    let project = &mem.projects[0];
+    assert!(project.error.is_none(), "{:?}", project.error);
+    assert_eq!(project.deferred.len(), 5);
+    assert!(mem.changed_files.is_empty());
+    let codes: Vec<&str> = mem.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert!(codes.contains(&"rollout_reference_failed"), "{codes:?}");
+    // Uncapped, the failure is the root's.
+    let mem = memory(&server, &files, options(None)).await;
+    assert_eq!(
+        mem.projects[0].error.as_ref().map(|e| e.code.as_str()),
+        Some("reference_lookup_failed")
     );
 }
 

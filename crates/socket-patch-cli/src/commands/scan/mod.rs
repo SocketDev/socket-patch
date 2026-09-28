@@ -596,14 +596,14 @@ fn updates_json(updates: &[discovery::UpdateInfo]) -> Vec<serde_json::Value> {
 fn classified_rows(
     stage: &mut rollout::Stage,
     discovered: &Discovered,
-    recorded: Option<&PatchManifest>,
+    recorded: &rollout::RecordedState<'_>,
     batch_failed: bool,
     packages: &[BatchPackagePatches],
     result: Option<&mut serde_json::Value>,
 ) -> Vec<rollout::Row> {
     let failed: Vec<String> = discovered.failed.iter().map(|(purl, _)| purl.clone()).collect();
-    stage.incomplete = rollout::lookup_incomplete(recorded, &failed, batch_failed);
-    let rows = rollout::classify(&discovered.offers, recorded, &stage.project);
+    stage.incomplete = rollout::lookup_incomplete(&recorded.index, &failed, batch_failed);
+    let rows = rollout::classify(&discovered.offers, &recorded.index, &stage.project);
     if let Some(result) = result {
         let updates = offer_updates(&rows, discovered, recorded, packages);
         result["updates"] = serde_json::Value::Array(updates_json(&updates));
@@ -615,7 +615,7 @@ fn classified_rows(
 fn offer_updates(
     rows: &[rollout::Row],
     discovered: &Discovered,
-    recorded: Option<&PatchManifest>,
+    recorded: &rollout::RecordedState<'_>,
     packages: &[BatchPackagePatches],
 ) -> Vec<discovery::UpdateInfo> {
     let purls: Vec<String> = packages.iter().map(|p| p.purl.clone()).collect();
@@ -623,7 +623,7 @@ fn offer_updates(
         rows,
         &discovered.offers,
         &purls,
-        detect_updates(recorded, packages),
+        detect_updates(recorded.manifest, packages),
     )
 }
 
@@ -759,6 +759,9 @@ async fn fetch_patch_details(
 fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
     result["status"] = serde_json::json!("error");
     result["error"] = serde_json::json!(message);
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("rollout");
+    }
     print_json(result);
 }
 
@@ -2006,6 +2009,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         &hosted_pins,
     );
     let mut updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
+    let recorded = rollout::RecordedState {
+        manifest: update_manifest.as_deref(),
+        index: rollout::RecordedIndex::new(update_manifest.as_deref(), &hosted_pins),
+    };
 
     // The hosted-wiring probes below take `all_purls` (POST-filter: only
     // packages this run covered), unlike the PRE-filter `scanned_purls`
@@ -2064,7 +2071,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 Some(result),
                 telemetry,
                 npm_crawl.as_ref(),
-                update_manifest.as_deref(),
+                &recorded,
                 batch_error_count > 0,
                 &mut stage,
             )
@@ -2113,7 +2120,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             let rows = classified_rows(
                 &mut stage,
                 &discovered,
-                update_manifest.as_deref(),
+                &recorded,
                 batch_error_count > 0,
                 &all_packages_with_patches,
                 Some(&mut result),
@@ -2226,7 +2233,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 use_public_proxy,
                 &all_packages_with_patches,
                 can_access_paid_patches,
-                update_manifest.as_deref(),
+                &recorded,
                 batch_error_count > 0,
                 &mut stage,
                 &mut result,
@@ -2354,7 +2361,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 let rows = classified_rows(
                     &mut stage,
                     &discovered,
-                    update_manifest.as_deref(),
+                    &recorded,
                     batch_error_count > 0,
                     &all_packages_with_patches,
                     None,
@@ -2362,7 +2369,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 updates = offer_updates(
                     &rows,
                     &discovered,
-                    update_manifest.as_deref(),
+                    &recorded,
                     &all_packages_with_patches,
                 );
                 rows
@@ -2525,10 +2532,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(rollout::Gate {
-                stage: &mut stage,
-                rows,
-            }),
+            Some(rollout::Gate::new(&mut stage, rows)),
         )
         .await;
     }
@@ -2605,7 +2609,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         if !silent {
             open_paragraph(&mut skip_paragraph);
             if !stage.deferred_keys().is_empty() {
-                println!("No new patches admitted this run.");
+                if args.common.dry_run {
+                    println!("No new patches would be added this run.");
+                } else {
+                    println!("No new patches added this run.");
+                }
             } else if already_recorded.is_empty() {
                 println!("No patches selected.");
             } else {
@@ -2791,7 +2799,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
     }
 
-    print_rollout_human(&stage, false, silent);
+    // The deferred next steps assume a run that landed.
+    print_rollout_human(&stage, false, silent || code != 0);
 
     // Post-apply GC: only with `--prune` or `--sync`; otherwise an agent
     // apply leaves every other manifest entry alone (`socket-patch repair`

@@ -563,7 +563,8 @@ into the new version's section — see docs/releasing.md.
 ### Added
 
 - **`scan --max-new-patches <N|none>` rolls patches out gradually**
-  (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches`). Each
+  (env `SOCKET_MAX_NEW_PATCHES`; socket.yml `patches.maxNewPatches` with
+  the socket.yml patch policy). Each
   run adds at most N patches to packages that had none, most severe first
   (then by how many advisories a patch fixes), and defers the rest to the
   next run; upgrades of packages that are already patched are never
@@ -576,7 +577,9 @@ into the new version's section — see docs/releasing.md.
   agent mode, `--dry-run` included; `scan --json` gains a top-level
   `rollout` block (`maxNewPatches`, `counts`, ranked `deferred[]`) and
   hosted mode lists deferred rows in `redirect.skipped[]` as
-  `rollout_deferred`. The in-memory engine (napi, `hosted-bundle`) takes
+  `rollout_deferred`.
+- **The in-memory hosted engine paces rollouts too.** It (napi,
+  `hosted-bundle`) takes
   `maxNewPatches`, `maxNewPatchesCap` and `inFlightPatches`, spends one
   budget across every project root, and reports a session `rollout` block
   and `ProjectResult.deferred[]`.

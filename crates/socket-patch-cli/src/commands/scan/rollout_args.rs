@@ -20,6 +20,9 @@ pub struct MaxNewPatches(pub Option<u32>);
 /// `N` (0..=4294967295) or `none`, case-insensitive.
 pub fn parse_max_new_patches(s: &str) -> Result<MaxNewPatches, String> {
     let s = s.trim();
+    if s.is_empty() {
+        return Err("a number of patches (0 to 4294967295) or `none` is required".to_string());
+    }
     if s.eq_ignore_ascii_case("none") {
         return Ok(MaxNewPatches(None));
     }
@@ -32,7 +35,8 @@ pub fn parse_max_new_patches(s: &str) -> Result<MaxNewPatches, String> {
 pub struct RolloutArgs {
     /// Add at most N patches to packages that have none yet, most severe
     /// first; the rest are deferred to the next scan. Upgrades of patched
-    /// packages are not capped. `none` lifts a cap set in socket.yml
+    /// packages are not capped, and `0` adds only upgrades. `none` means no
+    /// cap. Also read from SOCKET_MAX_NEW_PATCHES
     #[arg(
         long = "max-new-patches",
         value_name = "N|none",
@@ -50,7 +54,9 @@ impl RolloutArgs {
     /// [`MAX_NEW_PATCHES_ENV`] value; empty is unset), then the socket.yml
     /// value, then unlimited. A malformed env value is a usage error.
     pub fn resolve(&self, env: Option<&str>, file: Option<u32>) -> Result<MaxNew, String> {
-        let env = match env.filter(|v| !v.is_empty()) {
+        // The flag wins outright: an env value it overrides is never read.
+        let env = env.filter(|_| self.max_new_patches.is_none());
+        let env = match env.filter(|v| !v.trim().is_empty()) {
             Some(raw) => Some(
                 parse_max_new_patches(raw)
                     .map_err(|e| format!("{MAX_NEW_PATCHES_ENV}: {e}"))?
@@ -141,5 +147,13 @@ mod tests {
         assert_eq!((got.value, got.source), (None, MaxNewSource::Default));
         let err = none.resolve(Some("lots"), None).unwrap_err();
         assert!(err.starts_with("SOCKET_MAX_NEW_PATCHES: "), "{err}");
+        let got = none.resolve(Some("  "), Some(3)).unwrap();
+        assert_eq!(got.source, MaxNewSource::File, "whitespace is unset");
+        let got = flag.resolve(Some("lots"), None).unwrap();
+        assert_eq!(
+            got.source,
+            MaxNewSource::Flag,
+            "an overridden env value is not parsed"
+        );
     }
 }

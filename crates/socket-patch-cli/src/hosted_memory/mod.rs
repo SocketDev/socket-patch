@@ -59,7 +59,8 @@ pub use select::{candidate_files, safe_repo_path, select_paths};
 pub use types::*;
 
 use crate::commands::scan::rollout::{
-    classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, Row, Stage,
+    classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
+    Stage,
     ROLLOUT_DEFERRED,
 };
 use discover::Provider;
@@ -373,7 +374,7 @@ fn memory_recorded(
     root: &str,
     roots: &[String],
     offers: &Offers,
-) -> Option<socket_patch_core::manifest::schema::PatchManifest> {
+) -> RecordedIndex {
     let manifest = project
         .text(select::MANIFEST_REL)
         .and_then(|text| serde_json::from_str(text).ok());
@@ -404,8 +405,12 @@ fn memory_recorded(
                 .map(|p| (purl.clone(), p.uuid.clone()))
         })
         .collect();
-    crate::commands::scan::merge_ledger_records_for_updates(manifest.as_ref(), vendor.as_ref(), &pins)
-        .map(std::borrow::Cow::into_owned)
+    let merged = crate::commands::scan::merge_ledger_records_for_updates(
+        manifest.as_ref(),
+        vendor.as_ref(),
+        &pins,
+    );
+    RecordedIndex::new(merged.as_deref(), &pins)
 }
 
 async fn engine(
@@ -613,6 +618,11 @@ async fn engine(
     // lockfiles name. ALREADY rows carry the recorded uuid, so a re-scan
     // re-confirms a pin instead of swapping it.
     let mut stage = Stage::new(options.max_new, None, std::path::Path::new(""));
+    // A root whose every lookup failed hides packages that could have been
+    // NEW: a capped run then admits none anywhere (§5.2).
+    stage.incomplete |= states
+        .iter()
+        .any(|s| s.error.as_ref().is_some_and(|e| e.code == "patch_lookup_failed"));
     let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
     for state in states.iter_mut().filter(|s| s.error.is_none()) {
         let Some(project) = state.project.as_ref() else {
@@ -620,11 +630,11 @@ async fn engine(
         };
         let recorded = memory_recorded(project, &state.root, &roots_by_path, &state.offers);
         stage.incomplete |= lookup_incomplete(
-            recorded.as_ref(),
+            &recorded,
             &state.failed_details,
             batch_failed,
         );
-        let mut rows = classify(&state.offers, recorded.as_ref(), &state.root);
+        let mut rows = classify(&state.offers, &recorded, &state.root);
         for row in &mut rows {
             row.candidate.in_flight = options.in_flight.contains(&row.candidate.base_purl);
         }
@@ -663,6 +673,7 @@ async fn engine(
                 state.selected.clear();
                 continue;
             }
+            stage.incomplete = true;
             state.fail(
                 "reference_lookup_failed",
                 format!("failed to resolve patch references: {error}"),
@@ -743,11 +754,16 @@ async fn engine(
     let deferred_rows: Vec<(socket_patch_core::rollout::Candidate, u32)> =
         stage.plan.as_ref().map(|p| p.deferred.clone()).unwrap_or_default();
     if !deferred_rows.is_empty() {
+        let root_index: BTreeMap<String, usize> = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.root.clone(), i))
+            .collect();
         for (row, rank) in &deferred_rows {
-            let Some(state) = states.iter_mut().find(|s| s.root == row.project) else {
+            let Some(&i) = root_index.get(&row.project) else {
                 continue;
             };
-            state.deferred.push(DeferredPatch {
+            states[i].deferred.push(DeferredPatch {
                 purl: row.purl.clone(),
                 uuid: row.uuid.clone(),
                 severity: socket_patch_core::rollout::severity_label(row.severity_order).into(),
@@ -775,8 +791,10 @@ async fn engine(
                 continue;
             }
             checkpoint(&cancel).await?;
+            // The first pass's skips stay (wheel metadata the rewrite could
+            // not fetch): its candidates are already gone, so the second
+            // pass cannot report them again.
             let mut plan = done.planned;
-            plan.skipped = skipped_before.remove(&index).unwrap_or_default();
             plan.candidates
                 .retain(|c| !root_deferred.contains(&c.dep.patch_uuid));
             plan.skipped
@@ -794,7 +812,7 @@ async fn engine(
         // Roots that never reached the rewrite (unknown eligibility) list
         // their deferred rows as skipped too.
         for state in states.iter_mut() {
-            if unknown_roots.contains(&state.root) {
+            if unknown_roots.contains(&state.root) && state.error.is_none() {
                 let extra: Vec<SkippedPatch> = state.deferred.iter().map(deferred_skip).collect();
                 state.skipped.extend(extra);
             }

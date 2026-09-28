@@ -14,8 +14,6 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::utils::purl::canonical_purl;
-
 /// What the recorded state (manifest > hosted pins > vendor ledger) says
 /// about one selected row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,11 +132,14 @@ pub fn resolve_max_new(
     }
 }
 
-/// The budget unit: ecosystem + name + version, qualifiers stripped and
-/// percent-decoded, so qualifier twins (a wheel and its sdist, gem
-/// platforms) and the API's encoded spelling are one package.
+/// The budget unit: ecosystem + name + version, qualifiers stripped,
+/// percent-decoded and case-folded where the ecosystem is case-insensitive
+/// (discovery's [`crate::vex::discover::canonical_base_purl`], the key
+/// hosted pins carry), so qualifier twins (a wheel and its sdist, gem
+/// platforms), the API's encoded spelling and a lockfile's `Newtonsoft.Json`
+/// vs a pin's `newtonsoft.json` are one package.
 pub fn canonical_base_purl(purl: &str) -> String {
-    canonical_purl(purl)
+    crate::vex::discover::canonical_base_purl(purl)
 }
 
 /// Rollout order, most urgent first: in-flight, severity, advisory count
@@ -567,6 +568,14 @@ mod tests {
             canonical_base_purl("pkg:npm/%40scope/x@1.0.0"),
             "pkg:npm/@scope/x@1.0.0"
         );
+        assert_eq!(
+            canonical_base_purl("pkg:nuget/Newtonsoft.Json@13.0.3"),
+            canonical_base_purl("pkg:nuget/newtonsoft.json@13.0.3")
+        );
+        assert_eq!(
+            canonical_base_purl("pkg:pypi/Foo_Bar@1.0"),
+            canonical_base_purl("pkg:pypi/foo-bar@1.0")
+        );
         let rows = vec![
             row("", "pkg:pypi/foo@1.0?artifact_id=whl", "u2", 1, 1),
             row("", "pkg:pypi/foo@1.0?artifact_id=sdist", "u1", 1, 1),
@@ -584,8 +593,10 @@ mod tests {
         assert_eq!(plan.counts.deferred, 1);
     }
 
+    // The ecosystem key agrees with the purl type prefix of the base purl
+    // key below it; the test pins the combined order.
     #[test]
-    fn ties_across_ecosystems_break_by_ecosystem_name() {
+    fn ties_across_ecosystems_break_by_ecosystem_then_name() {
         let rows = vec![
             row("", "pkg:npm/x@1", "u1", 1, 1),
             row("", "pkg:cargo/x@1", "u2", 1, 1),
