@@ -1025,9 +1025,9 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
 // artifact instead of driving composer, so they need neither the toolchain
 // nor the network and run in the normal `test` job (no `#[ignore]`).
 
-/// `repair`-reconstructed ledger entry: recovered from the lockfile path, so
-/// it owns the artifact but records NO pre-vendor wiring (see
-/// `repair_vendor.rs`'s `synth_entry`).
+/// A ledger entry with NO pre-vendor wiring (the shape a pre-v5 `repair`
+/// reconstructed from the lockfile path): it owns the artifact but has
+/// nothing to replay.
 const UUID_RECONSTRUCTED: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 /// Un-ledgered artifact dir that composer.lock still points at.
 const UUID_ORPHAN_WIRED: &str = "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e";
