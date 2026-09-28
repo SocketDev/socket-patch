@@ -23,12 +23,13 @@ on:
 permissions:
   contents: read
 
-# Supersede stale runs on force-push / rapid PR updates. The `main` guard is
-# load-bearing: main runs are the ONLY rust-cache writers (save-if), so they
-# must never be cancelled mid-save.
+# A newer push to the same PR supersedes its older run; nothing else is
+# cancelled. Push, dispatch and schedule runs always finish: main runs are
+# the ONLY rust-cache writers (save-if) and must not die mid-save, and a
+# dispatched base-branch run is the base's only CI verdict.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   clippy:
