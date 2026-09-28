@@ -340,8 +340,9 @@ jobs:
     # default features): ~25m on main with ~240 test binaries, so 30m left
     # no headroom as suites grow. The manifest-less VEX suites share two
     # multi-module binaries (tests/e2e_vex_lockfile/, tests/e2e_vex_build/)
-    # to keep the count down; the extra 10m covers the rest.
-    timeout-minutes: 40
+    # to keep the count down. With no cache on PR runs the job takes ~38m
+    # before any new crate or suite, so 50m keeps headroom.
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
