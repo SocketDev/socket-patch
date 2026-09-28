@@ -1277,7 +1277,6 @@ async fn revert_vendored_matches(
 /// write failure). Each caller renders its own message (the
 /// manifest-backed path adds that the manifest was not touched).
 struct HostedUnwindError {
-    what: String,
     why: String,
 }
 
@@ -1293,8 +1292,8 @@ async fn unwind_hosted(
     // Printed as soon as the leg returns, so a human run that then fails
     // still says what it did to the files.
     print_hosted_leg_warnings(common, &leg.warnings);
-    if let Some((what, why)) = leg.failed.first().cloned() {
-        return Err(HostedUnwindError { what, why });
+    if let Some((_, why)) = leg.failed.first().cloned() {
+        return Err(HostedUnwindError { why });
     }
     if let Some(warning) = super::rollback::retire_legacy_redirect_ledger(common).await {
         print_hosted_leg_warnings(common, std::slice::from_ref(&warning));
@@ -1306,7 +1305,7 @@ async fn unwind_hosted(
 fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'static str, String) {
     // `why` already names the pin (the restore's refusal) or the write
     // that failed, with its remedy; `what` is only the leg's failure key.
-    let HostedUnwindError { what: _, why } = err;
+    let HostedUnwindError { why } = err;
     (
         "hosted_revert_failed",
         if manifest_backed {

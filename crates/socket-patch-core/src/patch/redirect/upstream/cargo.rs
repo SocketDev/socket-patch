@@ -322,16 +322,45 @@ fn remove_registry_block(config: &str, reg: &str) -> Option<String> {
         end -= 1;
     }
     let fragment = format!("{}\n", lines[i..end].join("\n"));
-    let removed = super::super::replay::remove_appended_cargo_block(&lf, &fragment)
+    let removed = remove_appended_cargo_block(&lf, &fragment)
         .or_else(|| {
             // The block ends the file with no final newline.
-            super::super::replay::remove_appended_cargo_block(&lf, fragment.trim_end_matches('\n'))
+            remove_appended_cargo_block(&lf, fragment.trim_end_matches('\n'))
         })?;
     Some(if crlf {
         removed.replace('\n', "\r\n")
     } else {
         removed
     })
+}
+
+/// Invert the cargo rewriter's append of a `[registries.…]` block: it wrote
+/// `config + "\n" + block` (just `block` into an empty config), or
+/// `config + "\n\n" + block` when the config lacked a final newline.
+/// Removing the block plus the one newline before it restores the config's
+/// exact bytes, a missing final newline or trailing blank lines included,
+/// and anything the user appended after the block kept. An all-CRLF file is
+/// inverted as LF and written back CRLF. `None` when the block is not in
+/// the file.
+fn remove_appended_cargo_block(content: &str, fragment: &str) -> Option<String> {
+    if !content.is_empty() && content.matches('\n').count() == content.matches("\r\n").count() {
+        return remove_appended_cargo_block(
+            &content.replace("\r\n", "\n"),
+            &fragment.replace("\r\n", "\n"),
+        )
+        .map(|lf| lf.replace('\n', "\r\n"));
+    }
+    let lf_fragment = fragment.replace("\r\n", "\n");
+    let (pos, len) = match content.find(fragment) {
+        Some(pos) => (pos, fragment.len()),
+        None => (content.find(&lf_fragment)?, lf_fragment.len()),
+    };
+    let before = &content[..pos];
+    let before = before
+        .strip_suffix("\r\n")
+        .or_else(|| before.strip_suffix('\n'))
+        .unwrap_or(before);
+    Some(format!("{before}{}", &content[pos + len..]))
 }
 
 #[cfg(test)]

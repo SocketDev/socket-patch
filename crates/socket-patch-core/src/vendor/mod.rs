@@ -107,6 +107,7 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
+#[cfg(test)]
 pub(crate) use pypi_lock::restore_document as restore_python_document;
 pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
 // `vex::discover` validates lockfile-recorded npm names with the same rule the
