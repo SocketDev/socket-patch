@@ -2,8 +2,12 @@
 //! each `"name"` occurrence's value before walking its object, walks objects
 //! byte-wise, and splices each edit into the lock in place instead of
 //! re-allocating the whole lock per edit. The previous implementation is kept
-//! here verbatim and the production rewriter must produce the identical
-//! output bytes, FileEdit list and warnings on randomized locks.
+//! here (char walk, walk-then-test name match, fresh copy per edit) and the
+//! production rewriter must produce the identical output bytes, FileEdit list
+//! and warnings on randomized locks. Its composer SEMANTICS track production:
+//! release-identity version matching, and the entry's `source` / the dist's
+//! `mirrors` dropped through the shared `composer_source` helper, so the two
+//! differ only in the mechanics the in-place rewrite changed.
 
 use super::*;
 
@@ -47,7 +51,7 @@ fn find_composer_entry_oracle(content: &str, pkg: &str, version: &str) -> Compos
         let Some(locked) = json_string_field(entry, "version") else {
             continue;
         };
-        if normalize_version(locked) == normalize_version(version) {
+        if composer_versions_equivalent(locked, version) {
             return ComposerEntry::Found(name_idx, end);
         }
         mismatched = Some(locked.to_string());
@@ -56,18 +60,6 @@ fn find_composer_entry_oracle(content: &str, pkg: &str, version: &str) -> Compos
         Some(locked) => ComposerEntry::VersionMismatch(locked),
         None => ComposerEntry::NotFound,
     }
-}
-
-fn composer_source_before_dist_oracle(
-    content: &str,
-    entry_start: usize,
-    dist_start: usize,
-) -> Option<usize> {
-    const SOURCE_KEY: &str = "\"source\": {";
-    let source_start = entry_start + content[entry_start..dist_start].rfind(SOURCE_KEY)?;
-    let source_end = json_object_end_from_oracle(content, source_start + SOURCE_KEY.len())?;
-    (source_end < dist_start && content[source_end + 1..dist_start].trim() == ",")
-        .then_some(source_start)
 }
 
 fn rewrite_composer_lock_oracle(
@@ -155,14 +147,17 @@ fn rewrite_composer_lock_oracle(
             });
             continue;
         };
-        let block = content[dist_start..=dist_end].to_string();
-        // Already redirected (either slash spelling): recording an edit whose
-        // `original` IS the hosted url would grow the ledger on every re-run
-        // and poison a future revert.
-        if artifact_url_present(&block, &dep.artifact_url) && block.contains(&sha1) {
-            continue;
-        }
-        if !block.contains("\"url\": \"") {
+        // The dist's own members only: a `mirrors` entry listed before the
+        // dist `url` would otherwise take the redirected url.
+        let current = &content[dist_start..=dist_end];
+        let block =
+            composer_source::strip_dist_mirrors(current).unwrap_or_else(|| current.to_string());
+        // Already redirected (either slash spelling): only the source/mirrors
+        // heal applies, so a re-run over a healed lock records no edit and
+        // the ledger never grows.
+        let already_redirected =
+            artifact_url_present(&block, &dep.artifact_url) && block.contains(&sha1);
+        if !already_redirected && !block.contains("\"url\": \"") {
             result.warnings.push(RewriteWarning {
                 code: "redirect_composer_no_dist_url".into(),
                 detail: format!("{composer_name}'s dist block has no url to redirect"),
@@ -183,50 +178,27 @@ fn rewrite_composer_lock_oracle(
         } else {
             append_composer_shasum(&rewritten, &sha1)
         };
-        // Drop the entry's `source` (the vendored backend does the same):
-        // when the dist download fails — checksum mismatch, an expired grant
-        // token, a patch-server outage — composer 1 and composer 2 before its
-        // source-fallback cutoff (2.2 LTS included) print "Now trying to
-        // download from source" and silently install the PRISTINE upstream
-        // commit from git, and `--prefer-source` / `preferred-install:
-        // source` always does. With the source gone the hosted archive is
-        // the only way to install the package, so a failed fetch fails the
-        // install instead of shipping the vulnerable code. The edit then
-        // spans `"source": {…},\n<indent>"dist": {…}`, so the ledger's
-        // fragment revert puts both blocks back byte-for-byte.
-        let (edit_start, original) =
-            match composer_source_before_dist_oracle(&content, entry_start, dist_start) {
-                Some(source_start) => (source_start, content[source_start..=dist_end].to_string()),
-                None => {
-                    if content[entry_start..=entry_end].contains("\"source\": {") {
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_composer_source_kept".into(),
-                            detail: format!(
-                                "{composer_name}'s source block does not directly precede its \
-                                 dist and was left in place; a failed hosted download may fall \
-                                 back to it"
-                            ),
-                        });
-                    }
-                    (dist_start, block.clone())
-                }
-            };
-        if rewritten != original {
-            content = format!(
-                "{}{}{}",
-                &content[..edit_start],
-                rewritten,
-                &content[dist_end + 1..]
-            );
+        let rewritten = (!already_redirected).then_some(rewritten);
+        // The source/mirrors drop is the one helper both rewriters share
+        // (`composer_source::apply_dist_edit`); the oracle keeps its
+        // fresh-copy-per-edit shape around it.
+        let span = composer_source::DistSpan {
+            entry_start,
+            entry_end,
+            dist_start,
+            dist_end,
+        };
+        let mut next = content.clone();
+        if let Some(edit) = composer_source::apply_dist_edit(
+            &mut next,
+            span,
+            rewritten.as_deref(),
+            &composer_name,
+            &mut result.warnings,
+        ) {
+            content = next;
             changed = true;
-            result.edits.push(FileEdit {
-                path: "composer.lock".into(),
-                kind: "redirect_composer_dist".into(),
-                action: "rewritten".into(),
-                key: Some(composer_name),
-                original: Some(Value::String(original)),
-                new: Some(Value::String(rewritten)),
-            });
+            result.edits.push(edit);
         }
     }
     if changed {
@@ -322,8 +294,13 @@ fn dist_block(i: usize, rng: &mut Rng) -> String {
         2 => fields.push("\"shasum\": \"0123456789abcdef0123456789abcdef01234567\"".into()),
         _ => fields.push("\"shasum\": \"ffffffffffffffffffffffffffffffffffffffff\"".into()),
     }
-    if rng.chance(10) {
-        fields.push("\"mirrors\": [{ \"url\": \"https://m/{x}\", \"preferred\": true }]".into());
+    // Mirrors after the url, before it (the mirror's own `url` then comes
+    // first in the block), or as the dist's only url.
+    let mirrors = "\"mirrors\": [{ \"url\": \"https://m/{x}\", \"preferred\": true }]";
+    match rng.below(20) {
+        0 | 1 => fields.push(mirrors.into()),
+        2 => fields.insert(1, mirrors.into()),
+        _ => {}
     }
     format!(
         "\"dist\": {{\n{I}    {}\n{I}}}",
@@ -336,9 +313,14 @@ fn entry(i: usize, rng: &mut Rng) -> String {
         format!("\"name\": \"{}\"", pkg(i, rng)),
         format!("\"version\": \"{}\"", version(rng)),
     ];
-    let layout = rng.below(8);
+    let layout = rng.below(9);
     match layout {
         0 => fields.push(source_block(i)),
+        // A key-sorted or hand-edited lock can put `source` before `name`.
+        8 => {
+            fields.insert(0, source_block(i));
+            fields.push(dist_block(i, rng));
+        }
         1 => fields.push(dist_block(i, rng)),
         2 => {
             fields.push(dist_block(i, rng));
@@ -415,7 +397,12 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
         ecosystem: if rng.chance(5) { "npm" } else { "composer" }.into(),
         name: bare,
         namespace,
-        version: version(rng).trim_start_matches('v').to_string(),
+        // The bare, `v`-prefixed or padded spelling of the locked release.
+        version: match rng.below(4) {
+            0 => format!("{}.0", version(rng).trim_start_matches('v')),
+            1 => version(rng).to_string(),
+            _ => version(rng).trim_start_matches('v').to_string(),
+        },
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
         artifact_url: url,
@@ -438,6 +425,7 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
 fn in_place_composer_rewrite_matches_oracle() {
     let mut rewritten = 0;
     let mut edits = 0;
+    let mut reverted = 0;
     let mut codes = std::collections::BTreeSet::new();
     for seed in 1..=3000u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -457,6 +445,27 @@ fn in_place_composer_rewrite_matches_oracle() {
             overrides.push(again);
         }
         let got = run_both(&files, &overrides, &format!("seed {seed}"));
+        // The ledger's fragment revert: undoing every edit, newest first,
+        // restores the input byte for byte (checked when each fragment is
+        // unambiguous in the text it is undone from).
+        if let (Some(out), Some(input)) =
+            (got.files.get("composer.lock"), files.get("composer.lock"))
+        {
+            let mut text = out.clone();
+            let mut unique = true;
+            for edit in got.edits.iter().rev() {
+                let (original, new) = (
+                    edit.original.as_ref().and_then(Value::as_str).unwrap(),
+                    edit.new.as_ref().and_then(Value::as_str).unwrap(),
+                );
+                unique &= text.matches(new).count() == 1;
+                text = text.replacen(new, original, 1);
+            }
+            if unique {
+                assert_eq!(&text, input, "seed {seed}: fragment revert");
+                reverted += 1;
+            }
+        }
         let mut rerun = files.clone();
         rerun.extend(got.files.clone());
         run_both(&rerun, &overrides, &format!("seed {seed} re-run"));
@@ -466,6 +475,7 @@ fn in_place_composer_rewrite_matches_oracle() {
     }
     assert!(rewritten > 800, "only {rewritten} rewritten locks");
     assert!(edits > 1500, "only {edits} edits");
+    assert!(reverted > 600, "only {reverted} locks revert-checked");
     for code in [
         "redirect_composer_no_lockfile",
         "redirect_composer_missing_sha1",
@@ -473,7 +483,7 @@ fn in_place_composer_rewrite_matches_oracle() {
         "redirect_composer_pkg_not_found",
         "redirect_composer_no_dist",
         "redirect_composer_no_dist_url",
-        "redirect_composer_source_kept",
+        "redirect_composer_dist_mirrors_removed",
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }

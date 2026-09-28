@@ -30,6 +30,8 @@ pub(crate) struct ComposerLockPackage<'a> {
     /// The `dist` object: what composer's default `--prefer-dist` install
     /// consumes, and the block both backends rewrite.
     pub(crate) dist: Option<&'a Value>,
+    /// The `source` member, whatever its shape.
+    pub(crate) source: Option<&'a Value>,
 }
 
 impl ComposerLockPackage<'_> {
@@ -75,6 +77,7 @@ pub(crate) fn composer_lock_packages(doc: &Value) -> Vec<ComposerLockPackage<'_>
                 name: pkg.get("name").and_then(Value::as_str),
                 version: pkg.get("version").and_then(Value::as_str),
                 dist: pkg.get("dist"),
+                source: pkg.get("source"),
             });
         }
     }

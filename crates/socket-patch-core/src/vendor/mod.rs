@@ -113,8 +113,8 @@ pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
 pub(crate) use npm_common::is_safe_npm_name;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
-    carry_forward_wiring, load_state, lookup_entry, save_state, save_state_shared, VendorEntry,
-    VendorState, VENDOR_STATE_REL,
+    carry_forward_wiring, load_state, lookup_entry, purl_keys_cover, save_state, save_state_shared,
+    VendorEntry, VendorState, VENDOR_STATE_REL,
 };
 // The hosted→vendored takeover refuses a berry project the backend would
 // refuse BEFORE it reverts the hosted redirect.

@@ -77,6 +77,7 @@ use socket_patch_core::api::client::{
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
+use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::state::{lookup_entry_kv, VendorArtifact, VendorEntry, VendorState};
@@ -248,7 +249,7 @@ impl Cand {
         let vendor_entry = vendor
             .entries
             .values()
-            .find(|e| e.uuid == r.uuid && canonical_base_purl(&e.base_purl) == r.purl)
+            .find(|e| e.uuid == r.uuid && same_package(&canonical_base_purl(&e.base_purl), &r.purl))
             .cloned();
         Cand {
             key: r.purl.clone(),
@@ -296,7 +297,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         let mut conflicted_keys: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         cands.retain(|c| {
             let pkg = canonical_base_purl(&c.key);
-            match conflicts.get_key_value(pkg.as_str()) {
+            match conflicts.iter().find(|(k, _)| same_package(k, &pkg)) {
                 Some((k, _)) => {
                     conflicted_keys
                         .entry(k.as_str())
@@ -424,7 +425,9 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         }
         let expected_pkg = expected_package(cand);
         match local_record_by_uuid(&cand.uuid, &manifest, &redirect_records, &vendor) {
-            Some((found_key, record)) if canonical_base_purl(&found_key) == expected_pkg => {
+            Some((found_key, record))
+                if same_package(&canonical_base_purl(&found_key), &expected_pkg) =>
+            {
                 if cand.lockfile_only {
                     cand.key = found_key;
                 }
@@ -449,7 +452,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
         match fetched.get(&cand.uuid) {
             Some((api_purl, record))
                 if record.uuid == cand.uuid
-                    && canonical_base_purl(api_purl) == expected_package(cand) =>
+                    && same_package(&canonical_base_purl(api_purl), &expected_package(cand)) =>
             {
                 if cand.lockfile_only {
                     cand.key = api_purl.clone();
@@ -545,6 +548,13 @@ fn failed(purl: &str, reason: &str) -> FailedPatch {
         purl: purl.to_string(),
         reason: reason.to_string(),
     }
+}
+
+/// Whether two [`canonical_base_purl`] spellings name one package release:
+/// equal, or composer spellings of the same release (a lock's `@3.0.2`, a
+/// patch purl's padded `@3.0.2.0`).
+fn same_package(a: &str, b: &str) -> bool {
+    a == b || composer_purls_equivalent(a, b)
 }
 
 /// The package a candidate's record must name (canonical form).
@@ -680,7 +690,7 @@ fn attach_discovered(
     let mut superseded = Vec::new();
     for (pkg, refs) in groups {
         let idxs: Vec<usize> = (0..cands.len())
-            .filter(|&i| canonical_base_purl(&cands[i].key) == pkg)
+            .filter(|&i| same_package(&canonical_base_purl(&cands[i].key), pkg))
             .collect();
         // Pass 1: the candidate already attests the wired uuid.
         let mut unmatched: Vec<&PatchedRef> = Vec::new();

@@ -17,6 +17,7 @@ use socket_patch_core::patch::redirect::golang_local::{
 use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::vendor::purl_keys_cover;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -246,11 +247,10 @@ async fn mismatch_blob_gaps(
             .iter()
             .filter(|(key, _)| *key == purl || strip_purl_qualifiers(key) == stripped)
             .collect();
-        if vendored_purls.contains(purl.as_str())
-            || vendored_purls.contains(stripped)
+        if purl_keys_cover(vendored_purls, purl)
             || records
                 .iter()
-                .any(|(key, _)| vendored_purls.contains(key.as_str()))
+                .any(|(key, _)| purl_keys_cover(vendored_purls, key))
         {
             continue;
         }
@@ -1305,8 +1305,7 @@ fn synthesize_vendor_owned_results(
     target_manifest_purls: &HashSet<String>,
     vendored_purls: &HashSet<String>,
 ) -> (Vec<ApplyResult>, HashSet<String>, HashSet<String>) {
-    let is_vendored =
-        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+    let is_vendored = |p: &str| purl_keys_cover(vendored_purls, p);
     let mut results: Vec<ApplyResult> = Vec::new();
     let mut matched: HashSet<String> = HashSet::new();
     let mut vendored_targets: Vec<String> = target_manifest_purls
@@ -1722,8 +1721,7 @@ async fn apply_patches_inner(
     // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
     // unreadable state degrades to "nothing vendored" (fail-open).
     let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
-    let is_vendored =
-        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+    let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
 

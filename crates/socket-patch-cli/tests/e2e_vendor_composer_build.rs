@@ -1244,3 +1244,387 @@ fn orphan_sweep_keeps_lock_referenced_dir_when_ledger_is_gone() {
         "fixture path convention"
     );
 }
+
+// ── S1: Composer's path-mirror filters ─────────────────────────────────
+
+/// Every regular file under `root`, relative, `/`-separated, sorted.
+fn tree_files(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &child, out);
+            } else {
+                out.push(child);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, "", &mut out);
+    out.sort();
+    out
+}
+
+/// Filter files that make Composer's path mirror skip real psr/log files
+/// (the patched one included): `.gitignore` (Composer ≤ 2.1),
+/// `.gitattributes` export-ignore (every version), `.hgignore` (Composer 1).
+fn plant_mirror_filters(dir: &Path) {
+    std::fs::write(
+        dir.join(".gitignore"),
+        "/src/LoggerInterface.php\n/src/NullLogger.php\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".gitattributes"),
+        "* text=auto\n/src/LoggerTrait.php export-ignore\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".hgignore"),
+        "syntax: glob\nsrc/AbstractLogger.php\n",
+    )
+    .unwrap();
+}
+
+/// A fresh checkout of `proj` installs every file of the vendored copy
+/// byte-for-byte (the patched `src/LoggerInterface.php` included).
+fn assert_fresh_install_mirrors_whole_copy(
+    tmp: &Path,
+    proj: &Path,
+    copy_rel: &str,
+    patched: &[u8],
+) {
+    let fresh = assert_fresh_checkout_installs_patched(tmp, proj, patched);
+    let copy = proj.join(copy_rel);
+    let installed = fresh.join("vendor/psr/log");
+    let copied = tree_files(&copy);
+    for rel in [
+        "src/NullLogger.php",
+        "src/LoggerTrait.php",
+        "src/AbstractLogger.php",
+    ] {
+        assert!(
+            copied.iter().any(|f| f == rel),
+            "fixture lost {rel}: {copied:?}"
+        );
+    }
+    for rel in &copied {
+        assert_eq!(
+            std::fs::read(installed.join(rel)).ok(),
+            Some(std::fs::read(copy.join(rel)).unwrap()),
+            "composer's path mirror dropped or changed {rel} (installed: {:?})",
+            tree_files(&installed)
+        );
+    }
+}
+
+/// A package whose own `.gitignore` / `.gitattributes` / `.hgignore` match
+/// real files still installs every file from the vendored copy: the filters
+/// are neutralized in the copy (warned, human mode), and the human output
+/// names the composer reinstall steps.
+#[test]
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn composer_vendor_keeps_files_mirror_filters_would_drop() {
+    let suite = "e2e_vendor_composer_build(mirror-filters)";
+    let Some(major) = composer_e2e_common::composer_major(suite) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let home = tmp.path().join("composer-home");
+    let cache = tmp.path().join("composer-cache");
+    if !setup_composer_project(&proj, &home, &cache, "(mirror-filters)", major) {
+        return;
+    }
+    let lock_path = proj.join("composer.lock");
+    let version = locked_composer_version(&lock_path, DEP).expect("psr/log locked");
+    let installed = proj.join("vendor/psr/log");
+    plant_mirror_filters(&installed);
+    let orig = std::fs::read(installed.join("src/LoggerInterface.php")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), b"\n// SOCKET-PATCH-MIRROR-FILTER-MARKER\n"].concat();
+    let purl = format!("pkg:composer/{DEP}@{version}");
+    stage_patch_with_vuln(&proj, &purl, "src/LoggerInterface.php", &orig, &patched);
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--offline", "--cwd", proj.to_str().unwrap()],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Warning (vendor_composer_mirror_filters_neutralized)"),
+        "the neutralization is surfaced:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Run `composer install` to update vendor/"),
+        "the composer reinstall hint is printed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Composer 1 does not reinstall")
+            && stdout.contains("remove vendor/psr/log first"),
+        "the Composer 1 hint names the package dir:\n{stdout}"
+    );
+
+    let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
+    let copy = proj.join(&copy_rel);
+    assert_eq!(std::fs::read(copy.join(".gitignore")).unwrap(), b"");
+    assert_eq!(std::fs::read(copy.join(".hgignore")).unwrap(), b"");
+    assert_eq!(
+        std::fs::read(copy.join(".gitattributes")).unwrap(),
+        b"* text=auto\n"
+    );
+    assert_eq!(
+        std::fs::read(installed.join(".gitignore")).unwrap(),
+        b"/src/LoggerInterface.php\n/src/NullLogger.php\n",
+        "the installed tree is never touched"
+    );
+    assert_fresh_install_mirrors_whole_copy(tmp.path(), &proj, &copy_rel, &patched);
+}
+
+/// A copy vendored by a CLI that predates the neutralization (filter files
+/// intact in the committed copy) is healed by the idempotent re-run: the
+/// lock stays byte-identical, the heal is warned, and a fresh checkout then
+/// installs every file.
+#[test]
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn composer_vendor_fast_path_heals_legacy_copy() {
+    let suite = "e2e_vendor_composer_build(legacy-copy)";
+    let Some(major) = composer_e2e_common::composer_major(suite) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let home = tmp.path().join("composer-home");
+    let cache = tmp.path().join("composer-cache");
+    if !setup_composer_project(&proj, &home, &cache, "(legacy-copy)", major) {
+        return;
+    }
+    let lock_path = proj.join("composer.lock");
+    let version = locked_composer_version(&lock_path, DEP).expect("psr/log locked");
+    let orig = std::fs::read(proj.join("vendor/psr/log/src/LoggerInterface.php")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), b"\n// SOCKET-PATCH-LEGACY-COPY-MARKER\n"].concat();
+    let purl = format!("pkg:composer/{DEP}@{version}");
+    stage_patch_with_vuln(&proj, &purl, "src/LoggerInterface.php", &orig, &patched);
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
+    let copy = proj.join(&copy_rel);
+    plant_mirror_filters(&copy);
+    let lock_wired = std::fs::read(&lock_path).unwrap();
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+    assert!(
+        env["events"].as_array().unwrap().iter().any(|e| {
+            e["errorCode"] == "vendor_composer_mirror_filters_neutralized"
+                && e["purl"] == purl.as_str()
+        }),
+        "the heal is surfaced: {env}"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_wired,
+        "composer.lock untouched"
+    );
+    assert_eq!(std::fs::read(copy.join(".gitignore")).unwrap(), b"");
+    assert_eq!(
+        std::fs::read(copy.join("src/LoggerInterface.php")).unwrap(),
+        patched,
+        "the patched file is untouched by the heal"
+    );
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "second re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert!(
+        !env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_composer_mirror_filters_neutralized"),
+        "a healed copy has nothing left to neutralize: {env}"
+    );
+    assert_fresh_install_mirrors_whole_copy(tmp.path(), &proj, &copy_rel, &patched);
+}
+
+// ── S8: a `v`-tagged release ───────────────────────────────────────────
+
+/// symfony/deprecation-contracts `v3.5.1` (PHP ≥ 8.1) or `v2.5.4` (older
+/// PHP): a release whose lock version carries the `v` tag. Composer picks
+/// the one its PHP can run; Composer 1 resolves it from an inline package
+/// repository (packagist no longer serves Composer 1).
+const VTAG_DEP: &str = "symfony/deprecation-contracts";
+const VTAG_FILE: &str = "function.php";
+
+fn vtag_composer_json(major: u32) -> String {
+    let release = |version: &str, reference: &str, php: &str| {
+        serde_json::json!({
+            "name": VTAG_DEP,
+            "version": version,
+            "type": "library",
+            "dist": {
+                "type": "zip",
+                "url": format!("https://api.github.com/repos/symfony/deprecation-contracts/zipball/{reference}"),
+                "reference": reference,
+            },
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/deprecation-contracts.git",
+                "reference": reference,
+            },
+            "require": { "php": php },
+            "autoload": { "files": ["function.php"] },
+        })
+    };
+    let mut doc = serde_json::json!({
+        "name": "socket/composer-vtag-capstone",
+        "require": { VTAG_DEP: "3.5.1 || 2.5.4" },
+    });
+    if major < 2 {
+        doc["repositories"] = serde_json::json!([
+            { "packagist.org": false },
+            { "type": "package", "package": release("v3.5.1", "74c71c939a79f7d5bf3c1ce9f5ea37ba0114c6f6", ">=8.1") },
+            { "type": "package", "package": release("v2.5.4", "605389f2a7e5625f273b53960dc46aeaf9c62918", ">=7.1") },
+        ]);
+    }
+    format!("{}\n", serde_json::to_string_pretty(&doc).unwrap())
+}
+
+/// `vendor` of a `v`-tagged release: the lock keeps its `v3.5.1` spelling,
+/// the copy's leaf carries the bare purl version, and a fresh checkout
+/// installs the patched bytes with the uuid in installed.json.
+#[test]
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn composer_vendor_v_tagged_fresh_checkout_install() {
+    let suite = "e2e_vendor_composer_build(v-tagged)";
+    let Some(major) = composer_e2e_common::composer_major(suite) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let home = tmp.path().join("composer-home");
+    let cache = tmp.path().join("composer-cache");
+    std::fs::write(proj.join("composer.json"), vtag_composer_json(major)).unwrap();
+    let update = composer(&proj, &["update"], &home, &cache);
+    if !update.status.success() {
+        composer_e2e_common::skip::<()>(
+            suite,
+            &format!(
+                "`composer update` failed:\n{}\n{}",
+                String::from_utf8_lossy(&update.stdout),
+                String::from_utf8_lossy(&update.stderr)
+            ),
+        );
+        return;
+    }
+    let lock_path = proj.join("composer.lock");
+    let pretty = lock_entry(&lock_path, VTAG_DEP)["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(pretty == "v3.5.1" || pretty == "v2.5.4", "locked {pretty}");
+    let version = pretty.trim_start_matches('v').to_string();
+    let installed = proj.join("vendor").join(VTAG_DEP).join(VTAG_FILE);
+    let orig = std::fs::read(&installed).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), b"\n// SOCKET-PATCH-VTAG-MARKER\n"].concat();
+    let purl = format!("pkg:composer/{VTAG_DEP}@{version}");
+    stage_patch_with_vuln(&proj, &purl, VTAG_FILE, &orig, &patched);
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let entry = lock_entry(&lock_path, VTAG_DEP);
+    let copy_rel = format!(".socket/vendor/composer/{UUID}/{VTAG_DEP}@{version}");
+    assert_eq!(
+        entry["version"],
+        pretty.as_str(),
+        "the lock keeps its tag: {entry}"
+    );
+    assert_eq!(entry["dist"]["url"], copy_rel.as_str(), "{entry}");
+    assert_eq!(entry["dist"]["reference"], UUID, "{entry}");
+    assert!(entry.get("source").is_none(), "{entry}");
+
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            VEX_PRODUCT,
+        ],
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+    assert_eq!(doc["statements"].as_array().unwrap().len(), 1, "{doc}");
+    assert_eq!(
+        doc["statements"][0]["products"][0]["subcomponents"][0]["@id"],
+        purl.as_str()
+    );
+
+    let fresh = tmp.path().join("fresh");
+    composer_e2e_common::fresh_checkout(&proj, &fresh);
+    let install = composer(
+        &fresh,
+        &["install"],
+        &tmp.path().join("cold-home"),
+        &tmp.path().join("cold-cache"),
+    );
+    assert!(
+        install.status.success(),
+        "cold install from the vendored path dist:\n{}\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("vendor").join(VTAG_DEP).join(VTAG_FILE)).unwrap(),
+        patched
+    );
+    let installed_entry = composer_e2e_common::installed_packages(&fresh)
+        .into_iter()
+        .find(|p| p["name"] == VTAG_DEP)
+        .expect("installed.json names the package");
+    assert_eq!(
+        installed_entry["dist"]["reference"], UUID,
+        "{installed_entry}"
+    );
+    assert_eq!(
+        installed_entry["version"],
+        pretty.as_str(),
+        "{installed_entry}"
+    );
+}

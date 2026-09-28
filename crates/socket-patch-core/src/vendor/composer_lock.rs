@@ -1,12 +1,13 @@
 //! Composer vendor backend: lock-only `dist` surgery pointing at a committed
 //! patched copy.
 //!
-//! Spike-verified mechanism (composer 2.10 — `spikes/PHASE0-FINDINGS.txt`):
+//! Mechanism (verified against real Composer 1.10 through 2.10 — see
+//! `docs/testing/composer-compatibility.md`):
 //! edit ONLY `composer.lock`. `composer.json` is never touched, and the lock's
 //! `content-hash` covers composer.json alone, so the surgery triggers no
 //! "lock file out of date" warning. The package's lock entry is rewritten to:
 //!
-//! * `dist` → `{"type": "path", "url": "<rel copy dir>", "reference": null}`
+//! * `dist` → `{"type": "path", "url": "<rel copy dir>", "reference": "<patch-uuid>"}`
 //!   (replaced IN ITS ORIGINAL SLOT so the entry's key order is stable);
 //! * `source` REMOVED entirely — left in place, `--prefer-source` could
 //!   git-clone the unpatched upstream; with it removed the spike confirmed
@@ -14,18 +15,26 @@
 //! * `"transport-options": {"symlink": false}` inserted right after `dist` —
 //!   LOAD-BEARING: composer's default path-repo strategy symlinks, and a
 //!   symlink into `.socket/vendor/` would defeat the real-copy guarantee.
-//!   `symlink: false` forces the 'Mirroring' (copy) strategy.
+//!   `symlink: false` forces the 'Mirroring' (copy) strategy, whose file
+//!   finder skips whatever the copy's `.gitignore` / `.hgignore` /
+//!   `.gitattributes` `export-ignore` rules match — so those rules are
+//!   neutralized in the copy first (`mirror_filters`).
 //!
 //! Lock names are matched CASE-INSENSITIVELY (locks are normally lowercase,
 //! but hand-written mixed-case locks exist and install fine) while the dist
 //! URL we write always uses the lowercase canonical `<vendor>/<name>` — the
-//! casing of the directory this backend creates. Versions are matched through
-//! the leading-`v` normalization (locks carry the pretty `v6.4.1`, PURLs the
-//! bare `6.4.1`) but the lock's own `version` string is never rewritten.
+//! casing of the directory this backend creates. Versions are matched by
+//! composer release identity (locks carry the pretty `v6.4.1` / `3.0.2`, a
+//! patch purl the bare `6.4.1` or padded `3.0.2.0`) but the lock's own
+//! `version` string is never rewritten.
 //!
-//! Serialization mirrors composer's own writer: 4-space indent
-//! (`JSON_PRETTY_PRINT`) + trailing newline; serde_json does not escape `/`
-//! (matching `JSON_UNESCAPED_SLASHES`).
+//! Only the rewritten entry's text is replaced (`lock_text`), rendered in
+//! the indentation, line terminator and escaping of the text it replaces, so
+//! every other byte of the lock is untouched and `--revert` restores it
+//! byte for byte. A lock whose entry is not on lines of its own (compact
+//! JSON) is re-serialized whole the way composer writes it: 4-space indent
+//! (`JSON_PRETTY_PRINT`) + trailing newline, `/` unescaped
+//! (`JSON_UNESCAPED_SLASHES`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -34,12 +43,13 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use crate::constants::SOCKET_DIR;
-use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::LineEndings;
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
@@ -58,6 +68,9 @@ use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+
+mod lock_text;
+mod mirror_filters;
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
@@ -88,6 +101,9 @@ struct ComposerPrelude {
     uuid_dir: PathBuf,
     copy_dir: PathBuf,
     lock_path: PathBuf,
+    /// The lock bytes `lock` was parsed from: the writes keep their line
+    /// endings.
+    lock_text: String,
     lock: Arc<Value>,
     section: &'static str,
     idx: usize,
@@ -193,6 +209,7 @@ async fn composer_prelude(
         uuid_dir,
         copy_dir,
         lock_path,
+        lock_text,
         lock,
         section,
         idx,
@@ -261,6 +278,7 @@ pub async fn vendor_composer<'a>(
         uuid_dir,
         copy_dir,
         lock_path,
+        lock_text,
         lock,
         section,
         idx,
@@ -279,8 +297,12 @@ pub async fn vendor_composer<'a>(
     // verbatim pre-vendor original, and re-recording here would clobber it.
     if wired {
         if in_sync {
+            let mut warnings = Vec::new();
+            if !dry_run {
+                mirror_filters::heal_or_warn(&copy_dir, record, &pkg, &mut warnings).await;
+            }
             let result = already_patched_result(purl, &copy_dir, &record.files);
-            return done(result, None, Vec::new());
+            return done(result, None, warnings);
         }
         // Wired but the committed copy is missing/stale: rebuild the
         // ARTIFACT only. The lock is already correct and the first run's
@@ -327,6 +349,7 @@ pub async fn vendor_composer<'a>(
                     }
                 }
             };
+            mirror_filters::heal_or_warn(&copy_dir, record, &pkg, &mut warnings).await;
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
                 format!(
@@ -411,6 +434,13 @@ pub async fn vendor_composer<'a>(
                 }
             }
         };
+    if let Err(detail) =
+        mirror_filters::neutralize_or_conflict(&copy_dir, record, &pkg, &mut warnings).await
+    {
+        let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_dirs(&copy_dir).await;
+        return refused("vendor_composer_mirror_filter_conflict", detail);
+    }
 
     // ── lock rewrite ─────────────────────────────────────────────────────
     // The memo hands the parse out shared; this is the one branch that
@@ -439,12 +469,12 @@ pub async fn vendor_composer<'a>(
         .is_some_and(|p| p.eco == "composer");
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
-    let write_result = match composer_json_bytes(&lock) {
+    let write_result = match lock_bytes_with_entry(&lock, &lock_text, section, idx) {
         Ok(bytes) => match atomic_write_bytes_preserving_mode(&lock_path, &bytes).await {
             // The bytes now on disk and the doc they came from: the next
             // package in this run reads them back and skips the parse.
             Ok(()) => {
-                LOCK_MEMO.store(bytes, lock);
+                reseed_lock_memo(bytes, lock);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -891,15 +921,15 @@ async fn composer_service_copy(
 }
 
 /// Locate the package's entry: `packages[]` first, then `packages-dev[]`.
-/// Names are compared case-insensitively, versions through the `v`-prefix
-/// normalization (see module doc).
+/// Names are compared case-insensitively, versions by composer release
+/// identity (see module doc).
 fn find_lock_entry(lock: &Value, pkg_lc: &str, version: &str) -> Option<(&'static str, usize)> {
     composer_lock_packages(lock)
         .into_iter()
         .find(|p| {
             p.name.is_some_and(|n| n.eq_ignore_ascii_case(pkg_lc))
                 && p.version
-                    .is_some_and(|v| normalize_version(v) == normalize_version(version))
+                    .is_some_and(|v| composer_versions_equivalent(v, version))
         })
         .map(|p| (p.section, p.index))
 }
@@ -977,6 +1007,54 @@ pub(crate) fn rewrite_lock_entry(
 /// matching `JSON_UNESCAPED_SLASHES`.
 fn composer_json_bytes(value: &Value) -> std::io::Result<Vec<u8>> {
     serialize_json(value, "    ")
+}
+
+/// [`composer_json_bytes`] in the line endings of `current`, the lock text
+/// being replaced: a CRLF lock (a Windows checkout) is written back CRLF,
+/// so vendor then `--revert` is byte-identical. serde_json escapes every
+/// newline inside a string, so each raw `\n` is a line break.
+fn composer_lock_bytes(value: &Value, current: &str) -> std::io::Result<Vec<u8>> {
+    let bytes = composer_json_bytes(value)?;
+    if LineEndings::of(current) != LineEndings::Crlf {
+        return Ok(bytes);
+    }
+    let lf = String::from_utf8(bytes).map_err(std::io::Error::other)?;
+    Ok(LineEndings::Crlf.restore(&lf).into_owned().into_bytes())
+}
+
+/// Re-seed [`LOCK_MEMO`] with the lock this run just wrote, but only when
+/// `bytes` are exactly `lock`'s canonical render: the memo then answers the
+/// next package's read with the very document those bytes parse to. Any
+/// other bytes (a CRLF lock written back CRLF, a spliced entry) leave the
+/// memo empty, so the next read parses what is actually on disk.
+fn reseed_lock_memo(bytes: Vec<u8>, lock: Value) {
+    reseed_memo(&LOCK_MEMO, bytes, lock);
+}
+
+/// [`reseed_lock_memo`] over any memo (the tests use their own).
+fn reseed_memo(memo: &ParseMemo<Value>, bytes: Vec<u8>, lock: Value) {
+    match composer_json_bytes(&lock) {
+        Ok(render) if render == bytes => {
+            memo.store(bytes, lock);
+        }
+        _ => memo.invalidate(),
+    }
+}
+
+/// The lock bytes after `lock[section][idx]` (already set in `lock`)
+/// replaced the entry at that position of `current`, the text on disk: a
+/// splice of that entry alone, or the whole document when the entry cannot
+/// be located on its own lines.
+fn lock_bytes_with_entry(
+    lock: &Value,
+    current: &str,
+    section: &str,
+    idx: usize,
+) -> std::io::Result<Vec<u8>> {
+    match lock_text::replace_entry(current, section, idx, &lock[section][idx]) {
+        Some(text) => Ok(text.into_bytes()),
+        None => composer_lock_bytes(lock, current),
+    }
 }
 
 /// The `<section>:<lowercase pkg>` keys this entry can actually put back:
@@ -1073,13 +1151,14 @@ async fn restore_lock_entry(
     if !dry_run {
         let mut lock = (*lock).clone();
         lock[section][idx] = original;
-        let bytes = composer_json_bytes(&lock).map_err(|e| e.to_string())?;
+        let bytes =
+            lock_bytes_with_entry(&lock, &lock_text, section, idx).map_err(|e| e.to_string())?;
         atomic_write_bytes_preserving_mode(lock_path, &bytes)
             .await
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
         // Re-seeded the same way the vendor path does, so the next record's
         // restore reads back its own write for free.
-        LOCK_MEMO.store(bytes, lock);
+        reseed_lock_memo(bytes, lock);
     }
     Ok(true)
 }
@@ -1946,6 +2025,173 @@ mod tests {
                 .join(format!(".socket/vendor/composer/{UUID}"))
                 .exists(),
             "uuid dir removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_crlf_lock_stays_crlf_and_reverts_byte_identical() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let lf = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        let crlf_bytes = lf.replace('\n', "\r\n").into_bytes();
+        tokio::fs::write(root.join(COMPOSER_LOCK), &crlf_bytes)
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let vendored = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        assert_eq!(
+            LineEndings::of(&vendored),
+            LineEndings::Crlf,
+            "{vendored:?}"
+        );
+        let wired: Value = serde_json::from_str(&vendored).unwrap();
+        assert_eq!(wired["packages"][0]["dist"]["type"], "path");
+
+        let (rerun, _, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(rerun.success, "{:?}", rerun.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+            vendored,
+            "an in-sync re-vendor leaves the CRLF lock untouched"
+        );
+
+        let outcome = revert_composer(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            crlf_bytes,
+            "CRLF lock restored byte-identically"
+        );
+    }
+
+    /// The memo is re-seeded only with bytes that ARE the doc's render; a
+    /// CRLF write-back or a spliced entry (whose bytes differ) leaves it
+    /// empty, so the next read parses what is on disk.
+    #[test]
+    fn memo_is_reseeded_only_with_the_docs_own_render() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let render = composer_json_bytes(&lock).unwrap();
+        let memo: ParseMemo<Value> = ParseMemo::new();
+        reseed_memo(&memo, render.clone(), lock.clone());
+        assert_eq!(memo.get(&render).as_deref(), Some(&lock));
+
+        let crlf = String::from_utf8(render.clone())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+        reseed_memo(&memo, crlf.clone(), lock.clone());
+        assert!(memo.get(&crlf).is_none(), "CRLF bytes are not the render");
+        assert!(memo.get(&render).is_none(), "the stale slot is dropped");
+
+        let escaped = String::from_utf8(render.clone())
+            .unwrap()
+            .replace('/', "\\/")
+            .into_bytes();
+        reseed_memo(&memo, render.clone(), lock.clone());
+        reseed_memo(&memo, escaped.clone(), lock);
+        assert!(memo.get(&escaped).is_none());
+        assert!(memo.get(&render).is_none());
+    }
+
+    /// Vendor then `--revert` on `lock_bytes`, asserting the revert
+    /// restores them byte for byte; returns the vendored lock text.
+    async fn vendor_and_revert_round_trip(lock: &Value, lock_bytes: &[u8]) -> String {
+        let (dir, blobs, installed, record) = fixture(lock).await;
+        let root = dir.path();
+        tokio::fs::write(root.join(COMPOSER_LOCK), lock_bytes)
+            .await
+            .unwrap();
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let vendored = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        let wired: Value = serde_json::from_str(&vendored).unwrap();
+        assert_eq!(wired["packages"][0]["dist"]["type"], "path");
+        let outcome = revert_composer(&entry.unwrap(), root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "lock restored byte-identically"
+        );
+        vendored
+    }
+
+    /// A lock that spells slashes `\/` (older writers) keeps that spelling
+    /// on every line, the vendored entry's included, and reverts
+    /// byte-identically.
+    #[tokio::test]
+    async fn escaped_slash_lock_keeps_its_escaping_and_reverts_byte_identical() {
+        let mut lock = lock_value("psr/log", "3.0.2", false);
+        lock["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(psr_log_entry("monolog/monolog", "2.9.1"));
+        let text = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        let escaped = text.replace('/', "\\/");
+        let vendored = vendor_and_revert_round_trip(&lock, escaped.as_bytes()).await;
+        assert!(
+            !vendored.replace("\\/", "").contains('/'),
+            "every slash stays escaped: {vendored}"
+        );
+        assert!(
+            vendored.contains(&format!(
+                "\".socket\\/vendor\\/composer\\/{UUID}\\/psr\\/log@3.0.2\""
+            )),
+            "{vendored}"
+        );
+        let bystander = &escaped[escaped.find("\"name\": \"monolog").unwrap()..];
+        assert!(
+            vendored.ends_with(bystander),
+            "untouched entries keep their bytes"
+        );
+    }
+
+    /// A lock mixing CRLF and LF keeps every line outside the vendored
+    /// entry as it was, and reverts byte-identically.
+    #[tokio::test]
+    async fn mixed_line_ending_lock_keeps_untouched_lines_and_reverts_byte_identical() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let text = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        let packages = text.find("\"packages\"").unwrap();
+        let mixed = format!(
+            "{}{}",
+            text[..packages].replace('\n', "\r\n"),
+            &text[packages..]
+        );
+        assert_eq!(LineEndings::of(&mixed), LineEndings::Mixed);
+        let vendored = vendor_and_revert_round_trip(&lock, mixed.as_bytes()).await;
+        assert!(vendored.starts_with(&mixed[..packages]), "{vendored:?}");
+        assert_eq!(LineEndings::of(&vendored), LineEndings::Mixed);
+    }
+
+    #[test]
+    fn composer_lock_bytes_follows_the_replaced_text() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let lf = composer_json_bytes(&lock).unwrap();
+        let crlf = String::from_utf8(lf.clone())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+        assert_eq!(composer_lock_bytes(&lock, "{\r\n}\r\n").unwrap(), crlf);
+        assert_eq!(composer_lock_bytes(&lock, "{\n}\n").unwrap(), lf);
+        assert_eq!(composer_lock_bytes(&lock, "{}").unwrap(), lf);
+        assert_eq!(
+            composer_lock_bytes(&lock, "{\r\n\n}").unwrap(),
+            lf,
+            "mixed endings have no single style to restore"
         );
     }
 
@@ -3189,6 +3435,47 @@ mod tests {
         );
     }
 
+    /// The patch purl's version may be composer's padded spelling of the
+    /// release the lock records prettily (`3.0.2.0` for `3.0.2` / `v3.0.2`,
+    /// `1.0.0.0` for `1.0`, `8.1.0.0-RC1` for `v8.1.0-rc.1`); other releases
+    /// never match.
+    #[test]
+    fn test_find_lock_entry_matches_equivalent_composer_versions() {
+        let lock = json!({
+            "packages": [
+                { "name": "psr/log", "version": "3.0.20" },
+                { "name": "psr/log", "version": "3.0.2" },
+                { "name": "psr/cache", "version": "v3.0.2" },
+                { "name": "psr/container", "version": "1.0" }
+            ],
+            "packages-dev": [
+                { "name": "symfony/http-kernel", "version": "v8.1.0-rc.1" }
+            ]
+        });
+        for (pkg, version, want) in [
+            ("psr/log", "3.0.2.0", Some(("packages", 1))),
+            ("psr/log", "v3.0.2", Some(("packages", 1))),
+            ("psr/log", "3.0.2", Some(("packages", 1))),
+            ("psr/log", "3.0.20.0", Some(("packages", 0))),
+            ("psr/cache", "3.0.2.0", Some(("packages", 2))),
+            ("psr/container", "1.0.0.0", Some(("packages", 3))),
+            (
+                "symfony/http-kernel",
+                "8.1.0.0-RC1",
+                Some(("packages-dev", 0)),
+            ),
+            ("psr/log", "3.0.2.1", None),
+            ("psr/container", "1.0.1", None),
+            ("symfony/http-kernel", "8.1.0", None),
+        ] {
+            assert_eq!(
+                find_lock_entry(&lock, pkg, version),
+                want,
+                "{pkg}@{version}"
+            );
+        }
+    }
+
     /// A source-only entry (no `dist`) gets `dist` + `transport-options`
     /// appended at the end; a pre-existing `transport-options` (wherever it
     /// sits) is superseded by ours, never duplicated.
@@ -4069,6 +4356,153 @@ mod tests {
         assert_eq!(
             tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
             lock_before
+        );
+    }
+
+    /// The vendored copy ships filter files Composer's path mirror honours:
+    /// they are neutralized before the lock is wired, and warned about.
+    #[tokio::test]
+    async fn fresh_vendor_neutralizes_mirror_filters() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        tokio::fs::write(installed.join(".gitignore"), "/src\n")
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join(".gitattributes"), "/src export-ignore\n")
+            .await
+            .unwrap();
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_composer_mirror_filters_neutralized"),
+            "{warnings:?}"
+        );
+        let copy = root.join(copy_rel());
+        assert_eq!(tokio::fs::read(copy.join(".gitignore")).await.unwrap(), b"");
+        assert_eq!(
+            tokio::fs::read(copy.join(".gitattributes")).await.unwrap(),
+            b""
+        );
+        assert_eq!(
+            tokio::fs::read(installed.join(".gitignore")).await.unwrap(),
+            b"/src\n",
+            "the installed tree is never touched"
+        );
+    }
+
+    /// A patch that itself rewrites a filter file needing a change cannot be
+    /// made mirror-safe: the fresh vendor refuses and leaves nothing behind.
+    #[tokio::test]
+    async fn fresh_vendor_refuses_a_patched_filter_file() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, mut record) = fixture(&lock).await;
+        let root = dir.path();
+        let attrs = b"/tests export-ignore\n";
+        tokio::fs::write(installed.join(".gitattributes"), attrs)
+            .await
+            .unwrap();
+        let hash = compute_git_sha256_from_bytes(attrs);
+        tokio::fs::write(blobs.join(&hash), attrs).await.unwrap();
+        record.files.insert(
+            ".gitattributes".to_string(),
+            PatchFileInfo {
+                before_hash: hash.clone(),
+                after_hash: hash,
+            },
+        );
+        let lock_before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert_eq!(code, "vendor_composer_mirror_filter_conflict", "{detail}");
+        assert!(detail.contains(".gitattributes"), "{detail}");
+        assert!(!root.join(".socket/vendor/composer").exists());
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_before
+        );
+    }
+
+    /// A copy vendored by an older CLI (filter files intact) is healed by the
+    /// idempotent re-run without touching the lock or the patched file.
+    #[tokio::test]
+    async fn idempotent_rerun_heals_a_legacy_copy() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        let copy = root.join(copy_rel());
+        tokio::fs::write(copy.join(".hgignore"), "src\n")
+            .await
+            .unwrap();
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let (_, dry_entry, dry_warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, true).await);
+        assert!(
+            dry_entry.is_none() && dry_warnings.is_empty(),
+            "{dry_warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(copy.join(".hgignore")).await.unwrap(),
+            b"src\n"
+        );
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        assert!(entry.is_none(), "the hot path never re-records");
+        assert_eq!(
+            warnings.iter().map(|w| w.code).collect::<Vec<_>>(),
+            vec!["vendor_composer_mirror_filters_neutralized"]
+        );
+        assert_eq!(tokio::fs::read(copy.join(".hgignore")).await.unwrap(), b"");
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes
+        );
+        let (_, _, again) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(
+            again.is_empty(),
+            "healed copy: nothing left to warn {again:?}"
+        );
+    }
+
+    /// The artifact-only rebuild of a wired package neutralizes the rebuilt
+    /// copy's filters too.
+    #[tokio::test]
+    async fn artifact_rebuild_neutralizes_mirror_filters() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join(".gitignore"), "/src\n")
+            .await
+            .unwrap();
+        let (result, _, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let codes: Vec<&str> = warnings.iter().map(|w| w.code).collect();
+        assert_eq!(
+            codes,
+            vec![
+                "vendor_composer_mirror_filters_neutralized",
+                "vendor_artifact_rebuilt"
+            ]
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join(".gitignore"))
+                .await
+                .unwrap(),
+            b""
         );
     }
 }

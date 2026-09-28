@@ -3426,9 +3426,12 @@ pub(crate) async fn run_redirect_selected(
                 );
             }
             if !common.dry_run {
-                for line in
-                    format_next_steps(&human_files, ledger_written, !takeover_migrated.is_empty())
-                {
+                for line in format_next_steps(
+                    &human_files,
+                    &rewrite.edits,
+                    ledger_written,
+                    !takeover_migrated.is_empty(),
+                ) {
                     println!("{line}");
                 }
             }
@@ -3736,6 +3739,7 @@ fn join_names(names: &[String], max: usize) -> String {
 /// `.socket/vendor/` directory is named instead of the redirect ledger.
 fn format_next_steps(
     files: &[String],
+    edits: &[socket_patch_core::patch::redirect::FileEdit],
     ledger_written: bool,
     vendored_removed: bool,
 ) -> Vec<String> {
@@ -3758,7 +3762,11 @@ fn format_next_steps(
     let npm = files
         .iter()
         .any(|f| f == "package-lock.json" || f == "npm-shrinkwrap.json");
-    let hint = if npm { " (e.g. `npm ci`)" } else { "" };
+    let hint = if npm {
+        " (e.g. `npm ci`)".to_string()
+    } else {
+        crate::commands::composer_hints::hosted_reinstall_hint(files, edits).unwrap_or_default()
+    };
     let mut steps = vec![
         format!("Commit {} to keep the redirect.", join_names(&commit, 6)),
         format!(
@@ -5510,9 +5518,9 @@ mod tests {
 
     #[test]
     fn next_steps_name_the_ledger_files_and_reinstall() {
-        assert!(format_next_steps(&[], true, false).is_empty());
+        assert!(format_next_steps(&[], &[], true, false).is_empty());
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], true, false),
+            format_next_steps(&["package-lock.json".to_string()], &[], true, false),
             vec![
                 "Commit .socket/vendor/redirect-state.json and package-lock.json to keep the \
                  redirect."
@@ -5527,6 +5535,7 @@ mod tests {
                 "pnpm-lock.yaml".to_string(),
                 "pnpm-workspace.yaml".to_string(),
             ],
+            &[],
             false,
             false,
         );
@@ -5539,13 +5548,13 @@ mod tests {
 
     #[test]
     fn next_steps_add_the_vlt_ci_line_only_for_a_rewritten_vlt_lock() {
-        let steps = format_next_steps(&["vlt-lock.json".to_string()], true, false);
+        let steps = format_next_steps(&["vlt-lock.json".to_string()], &[], true, false);
         assert_eq!(
             steps.last().map(String::as_str),
             Some("vlt: commit vlt-lock.json; CI should run `vlt ci`")
         );
         assert!(
-            !format_next_steps(&["package-lock.json".to_string()], true, false)
+            !format_next_steps(&["package-lock.json".to_string()], &[], true, false)
                 .iter()
                 .any(|s| s.starts_with("vlt:"))
         );
@@ -5723,12 +5732,12 @@ mod tests {
     #[test]
     fn next_steps_after_a_takeover_name_the_removed_vendored_state() {
         assert_eq!(
-            format_next_steps(&["package-lock.json".to_string()], true, true)[0],
+            format_next_steps(&["package-lock.json".to_string()], &[], true, true)[0],
             "Commit .socket/vendor/ (the redirect ledger, plus the removed vendored ledger \
              entries and artifacts) and package-lock.json to keep the redirect."
         );
         assert_eq!(
-            format_next_steps(&["pnpm-lock.yaml".to_string()], false, true)[0],
+            format_next_steps(&["pnpm-lock.yaml".to_string()], &[], false, true)[0],
             "Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
              pnpm-lock.yaml to keep the redirect."
         );

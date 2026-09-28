@@ -58,20 +58,35 @@ pub fn cov_docker_args() -> Vec<String> {
 /// reports `ok`. Build locally with
 /// `docker build -f tests/docker/Dockerfile.<eco> -t <image> .`
 /// (after `Dockerfile.base` → `socket-patch-test-base:latest`).
+///
+/// With `SOCKET_PATCH_DOCKER_E2E_REQUIRED=1` (a CI job that built the image
+/// itself) a missing docker or image fails the test instead, so a tag
+/// mismatch cannot pass the job with zero assertions.
 #[must_use]
 pub fn skip_if_no_image(image: &str) -> bool {
-    let Ok(out) = Command::new("docker")
+    skip_or_require_image(
+        image,
+        std::env::var("SOCKET_PATCH_DOCKER_E2E_REQUIRED").is_ok_and(|v| v == "1"),
+    )
+}
+
+/// [`skip_if_no_image`] with the required switch passed in.
+#[must_use]
+pub fn skip_or_require_image(image: &str, required: bool) -> bool {
+    let reason = match Command::new("docker")
         .args(["image", "inspect", image])
         .output()
-    else {
-        eprintln!("skipping: `docker` not on PATH");
-        return true;
+    {
+        Err(_) => "`docker` not on PATH".to_string(),
+        Ok(out) if !out.status.success() => format!("docker image `{image}` not present"),
+        Ok(_) => return false,
     };
-    if !out.status.success() {
-        eprintln!("skipping: docker image `{image}` not present");
-        return true;
-    }
-    false
+    assert!(
+        !required,
+        "{reason}; SOCKET_PATCH_DOCKER_E2E_REQUIRED=1 forbids skipping"
+    );
+    eprintln!("skipping: {reason}");
+    true
 }
 
 fn docker_run(image: &str, host_dir: &Path, script: &str, extra: &[&str]) -> Output {
