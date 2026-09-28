@@ -8,7 +8,9 @@
 //! per-purl takeover (`vendor` with the patch record staged) and the eject
 //! (`vendor` in a manifest-less hosted project). Each vendors, records the
 //! REGISTRY record as the vendor ledger's pre-vendor original, and
-//! `vendor --revert` returns the exact pre-hosted bytes. `rollback` of the
+//! `vendor --revert` returns the exact pre-hosted bytes (a format-1 lock the
+//! hosted rewrite promoted is demoted back; a lock whose workspace behaviors
+//! it normalized is refused with the checkout remedy). `rollback` of the
 //! hosted pin still refuses with the `git checkout -- bun.lockb` remedy, as
 //! does an offline vendor (the registry cannot be asked).
 //!
@@ -251,12 +253,14 @@ fn assert_vendored(p: &Project, env: &Value) {
     assert_eq!(original["integrity"], UPSTREAM_INTEGRITY, "{original}");
 }
 
-/// Bun 0.8.1 (uninitialized record padding), 1.1.38 (the last binary-only
-/// writer) and 1.2.0 (the legacy lock Bun 1.2 keeps): the takeover vendors
-/// over the hosted pin, and the revert gives back the pre-hosted bytes.
+/// Bun 0.1.1 / 0.1.6 (binary format 1, which the hosted rewrite promotes to
+/// format 2 and the takeover's restore demotes again), 0.8.1 (uninitialized
+/// record padding), 1.1.38 (the last binary-only writer) and 1.2.0 (the
+/// legacy lock Bun 1.2 keeps): the takeover vendors over the hosted pin, and
+/// the revert gives back the pre-hosted bytes.
 #[tokio::test]
 async fn takeover_vendors_over_a_hosted_bun_lockb_and_reverts_exactly() {
-    for writer in ["0.8.1", "1.1.38", "1.2.0"] {
+    for writer in ["0.1.1", "0.1.6", "0.8.1", "1.1.38", "1.2.0"] {
         let p = hosted_project(writer).await;
         stage_record(p.root());
         let hosted = p.lock();
@@ -309,6 +313,38 @@ async fn eject_vendors_a_hosted_bun_lockb_and_reverts_exactly() {
     let (code, env) = p.run_json(&["vendor", "--revert"]);
     assert_eq!(code, 0, "revert: {env:#}");
     assert!(p.lock() == p.pristine, "exact pre-hosted bytes");
+}
+
+/// A hosted lock whose workspace dependency behaviors the rewrite had to
+/// normalize cannot be given back byte for byte: the takeover refuses with
+/// the checkout remedy (dry and wet alike) and writes nothing.
+#[tokio::test]
+async fn takeover_refuses_a_workspace_normalized_hosted_bun_lockb() {
+    let p = hosted_project("1.1.45-extensions").await;
+    stage_record(p.root());
+    let hosted = p.lock();
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let mut args = vec!["vendor"];
+        args.extend_from_slice(extra);
+        let (code, env) = p.run_json(&args);
+        assert_eq!(code, 1, "{extra:?}: {env:#}");
+        let refused = env["events"]
+            .as_array()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|e| e["errorCode"] == "redirect_revert_failed")
+            })
+            .unwrap_or_else(|| panic!("expected redirect_revert_failed: {env:#}"));
+        assert!(
+            refused["error"].as_str().is_some_and(|e| e
+                .contains("workspace dependency behaviors")
+                && e.contains("git checkout -- bun.lockb")),
+            "{env:#}"
+        );
+        assert_eq!(p.lock(), hosted, "{extra:?}: a refused vendor writes nothing");
+        assert!(!p.root().join(".socket/vendor").exists());
+    }
 }
 
 /// `rollback` of the hosted pin, and a vendor that cannot reach the

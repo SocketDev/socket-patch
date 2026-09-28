@@ -116,8 +116,8 @@ fn cli_code(project: &Path, args: &[&str]) -> (i32, Value) {
 }
 
 /// v5 keeps no hosted ledger, so undoing a hosted pin means restoring the
-/// entry's upstream registry form. For a binary `bun.lockb` that rebuilt
-/// record is not byte-exact for every lock (format 1, workspace locks), so
+/// entry's upstream registry form. For a binary `bun.lockb` only a vendor
+/// takeover rebuilds that record (it refuses a workspace-normalized lock), so
 /// `rollback` REFUSES the pin, naming the checkout remedy, and leaves the
 /// lock exactly as found; the test then applies that remedy (`git checkout --
 /// bun.lockb`, here: the original bytes written back).

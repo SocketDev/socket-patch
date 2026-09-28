@@ -240,9 +240,9 @@ pub struct RestoreOptions {
     pub patch_server_origins: Vec<String>,
     /// Restore hosted pins in a binary `bun.lockb` by rebuilding the npm
     /// registry record (see `bun_lockb`). Off, they are refused with the
-    /// checkout remedy. The rebuild is exact for a record the hosted rewrite
-    /// wrote, but not for every lock (a format-1 lock stays promoted, a
-    /// workspace lock keeps its normalized dependency behaviors), so only a
+    /// checkout remedy. The rebuild is exact for a lock the hosted rewrite
+    /// wrote (a promoted format-1 lock is demoted back; a lock whose
+    /// workspace dependency behaviors it normalized is refused), but only a
     /// vendor takeover — which re-records the rebuilt record as its own
     /// pre-vendor original — opts in; `rollback` keeps refusing.
     pub bun_lockb: bool,

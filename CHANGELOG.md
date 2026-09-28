@@ -194,11 +194,14 @@ into the new version's section — see docs/releasing.md.
   pre-hosted lock. The hosted rewrite now keeps the registry record's
   inactive bytes (padding, semver) in the tarball record it writes, and a
   re-pin to a later grant's URL drops the superseded URL from the string
-  pool, so the rebuild is byte-exact — early writers' uninitialized padding included —
-  except for a binary format 1 lock (kept promoted to format 2) and a
-  workspace lock (dependency behaviors kept normalized). Those exceptions
-  keep `rollback` / `remove` refusing a hosted `bun.lockb` pin with the
-  `git checkout -- bun.lockb` remedy; an `--offline` vendor still refuses.
+  pool, so the rebuild is byte-exact — early writers' uninitialized padding included.
+  Where the hosted rewrite had to normalize the lock it marks it (in the
+  root package's resolution bytes, which no Bun reader reads): a binary
+  format 1 lock (Bun 0.1.1-0.1.6), promoted to format 2, is demoted back to
+  its exact format-1 bytes, and a lock whose workspace dependency behaviors
+  were normalized is refused with the `git checkout -- bun.lockb` remedy
+  instead of taken over non-exactly. `rollback` / `remove` keep refusing a
+  hosted `bun.lockb` pin with that remedy; an `--offline` vendor still refuses.
 - **`vendor_supersedes_redirect` is removed.** The vendored flows no longer
   warn about (or auto-reconcile, or unwind the `.npmrc` for) a stale hosted
   ledger record: once the lock routes a package to `.socket/vendor/`, no

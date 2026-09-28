@@ -20,6 +20,19 @@ const HEADER: &[u8] = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
 const TOTAL_AT: usize = HEADER.len() + 4 + 32;
 const PACKAGES_AT: usize = TOTAL_AT + 8;
 const INTEGRITY_LEN: usize = 65;
+/// Written by this codec in the last eight bytes of the root package's
+/// resolution (its value union, which a root resolution never reads — early
+/// writers leave uninitialized bytes there, and every supported reader
+/// ignores them) when an edit had to normalize the lock: seven magic bytes,
+/// then a [`NORMALIZED_FORMAT_1`] / [`NORMALIZED_WORKSPACE`] flag byte. v5
+/// hosted mode keeps no ledger, so this is how a later upstream restore knows
+/// the lock's pre-rewrite bytes differ from its registry form.
+const NORMALIZED_MAGIC: &[u8; 7] = b"sktpnrm";
+/// The lock was promoted from binary format 1 ([`BunLockb::demote_legacy_format`]
+/// inverts it exactly).
+pub(crate) const NORMALIZED_FORMAT_1: u8 = 1;
+/// Workspace dependency behaviors were normalized (not invertible).
+pub(crate) const NORMALIZED_WORKSPACE: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BinaryPackage {
@@ -692,17 +705,24 @@ impl BunLockb {
     // Some writers also persist the unexpanded workspace:* literal while their
     // binary loader expects its resolved path. Canonical path literals (used by
     // older writers) compare correctly in every supported binary reader.
+    // Either change is lossy, so the lock is marked NORMALIZED_WORKSPACE: an
+    // upstream restore then refuses instead of returning a non-exact lock.
     fn normalize_workspace_behaviors(&mut self) -> Result<(), String> {
         let changes = self.workspace_literal_changes()?;
         let dependencies = self.dependency_array()?;
+        let mut changed = !changes.is_empty();
         for dep in self.data[dependencies.data].chunks_exact_mut(26) {
             if dep[16] & 0x20 != 0 && dep[16] & 0x1e != 0 {
                 dep[16] &= !0x20;
+                changed = true;
             }
         }
         for (at, path) in changes {
             let pointer = self.intern(&path)?;
             self.data[at..at + 8].copy_from_slice(&pointer);
+        }
+        if changed {
+            self.mark_normalized(NORMALIZED_WORKSPACE)?;
         }
         Ok(())
     }
@@ -977,7 +997,103 @@ impl BunLockb {
             let at = self.resolution_at(id);
             self.data[at + 8..at + 16].copy_from_slice(&pointer);
         }
+        // The root's last eight resolution bytes are new here (format 1 has
+        // 56), so the mark overwrites nothing the original lock held.
+        self.mark_normalized(NORMALIZED_FORMAT_1)
+    }
+
+    /// Where [`NORMALIZED_MAGIC`] lives: the root package's (id 0, tag 1)
+    /// last eight resolution bytes.
+    fn normalized_mark_at(&self) -> Option<usize> {
+        (self.count > 0 && self.data[self.resolution_at(0)] == 1)
+            .then(|| self.resolution_at(0) + self.resolution_size - 8)
+    }
+
+    fn mark_normalized(&mut self, flag: u8) -> Result<(), String> {
+        let at = self
+            .normalized_mark_at()
+            .ok_or("bun.lockb: the lock has no root package record")?;
+        let flags = self.normalized_flags() | flag;
+        self.data[at..at + 7].copy_from_slice(NORMALIZED_MAGIC);
+        self.data[at + 7] = flags;
         Ok(())
+    }
+
+    /// The [`NORMALIZED_FORMAT_1`] / [`NORMALIZED_WORKSPACE`] flags a
+    /// previous edit by this codec recorded (0 for a lock Bun wrote).
+    pub(crate) fn normalized_flags(&self) -> u8 {
+        match self.normalized_mark_at() {
+            Some(at) if &self.data[at..at + 7] == NORMALIZED_MAGIC => self.data[at + 7],
+            _ => 0,
+        }
+    }
+
+    /// The exact format-1 lock [`Self::promote_legacy_format`] made this one
+    /// from, or `None` when this lock was not promoted by it. Verified: the
+    /// result promotes back to exactly these bytes, so any other edit since
+    /// (a record still hosted, Bun re-saving the lock) is an error rather
+    /// than a guess.
+    pub(crate) fn demote_legacy_format(&self) -> Result<Option<Self>, String> {
+        let flags = self.normalized_flags();
+        if self.format != 2 || flags & NORMALIZED_FORMAT_1 == 0 {
+            return Ok(None);
+        }
+        let not_exact = || "bun.lockb: the lock's original binary format-1 bytes cannot be rebuilt";
+        if flags != NORMALIZED_FORMAT_1 {
+            return Err(not_exact().into());
+        }
+        self.check_editable()?;
+        let resolution_start = self.package_start + self.count * 16;
+        let resolution_end = resolution_start + self.count * 64;
+        let package_end =
+            self.package_start + self.count * (204 + if self.fields == 8 { 49 } else { 0 });
+        let delta = self.count * 8;
+        let mut arrays = Vec::new();
+        let mut pos = package_end;
+        for _ in 0..6 {
+            let array = read_array(&self.data, pos, self.total)?;
+            pos = array.data.end;
+            arrays.push(array);
+        }
+        let mut data = Vec::with_capacity(self.data.len() - delta);
+        data.extend_from_slice(&self.data[..resolution_start]);
+        let mut url_offsets = Vec::new();
+        for id in 0..self.count {
+            let record = &self.data[resolution_start + id * 64..resolution_start + (id + 1) * 64];
+            if record[0] == 2 {
+                if record[15] & 0x80 != 0 {
+                    url_offsets.push(u32_at(record, 8)? as usize);
+                }
+                data.extend_from_slice(&record[..8]);
+                data.extend_from_slice(&record[16..]);
+            } else {
+                data.extend_from_slice(&record[..56]);
+            }
+        }
+        data.extend_from_slice(&self.data[resolution_end..]);
+        data[HEADER.len()..HEADER.len() + 4].copy_from_slice(&1u32.to_le_bytes());
+        put_u64(&mut data, PACKAGES_AT + 32, package_end - delta);
+        for array in arrays.iter().chain(self.extensions.iter()) {
+            let at = array.descriptor - delta;
+            put_u64(&mut data, at, array.data.start - delta);
+            put_u64(&mut data, at + 8, array.data.end - delta);
+        }
+        put_u64(&mut data, TOTAL_AT, self.total - delta);
+        let demoted = Self::parse(&data).map_err(|_| not_exact())?;
+        // The promotion appended the registry URLs it interned to the pool;
+        // try each place their run can start (the earliest first).
+        url_offsets.sort_unstable();
+        url_offsets.dedup();
+        let pool = demoted.strings.data.len();
+        for start in url_offsets.into_iter().filter(|s| *s <= pool).chain([pool]) {
+            let mut candidate = demoted.clone();
+            candidate.resize_pool(start, &[])?;
+            let mut promoted = candidate.clone();
+            if promoted.promote_legacy_format().is_ok() && promoted.data == self.data {
+                return Ok(Some(candidate));
+            }
+        }
+        Err(not_exact().into())
     }
 
     fn update_hash(&mut self, style: (bool, bool)) -> Result<(), String> {
@@ -1689,9 +1805,15 @@ mod tests {
             assert_eq!(restored.version.as_deref(), Some("1.2.2"), "{version}");
             assert_eq!(restored.resolution, package.resolution, "{version}");
             assert_eq!(restored.integrity, package.integrity, "{version}");
-            // Format 1 stays promoted to format 2; every other writer's
-            // bytes come back exactly.
-            if !matches!(version, "0.1.1" | "0.1.6") {
+            // Format 1 stays promoted to format 2 (marked so), and demotes
+            // back to its exact bytes; every other writer's come back as is.
+            if matches!(version, "0.1.1" | "0.1.6") {
+                assert_eq!(lock.normalized_flags(), NORMALIZED_FORMAT_1, "{version}");
+                let demoted = lock.demote_legacy_format().unwrap().expect("promoted");
+                assert!(demoted.bytes() == original, "exact demotion: {version}");
+            } else {
+                assert_eq!(lock.normalized_flags(), 0, "{version}");
+                assert!(lock.demote_legacy_format().unwrap().is_none(), "{version}");
                 assert!(lock.bytes() == original, "exact rebuild: {version}");
             }
         }

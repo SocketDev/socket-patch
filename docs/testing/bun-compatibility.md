@@ -101,9 +101,12 @@ rollback or mode switch to restore one package while keeping other packages wire
 Hosted mode (v5.0) keeps no ledger. The hosted → vendored takeover (and the
 eject) rebuild a hosted `bun.lockb` entry as Bun's npm registry record from the
 registry's `dist.tarball` / `dist.integrity`; the hosted rewrite keeps the
-registry record's inactive bytes, so that rebuild is byte-exact for every lock
-it wired except format 1 (kept promoted) and workspace locks (kept normalized).
-Because of those exceptions, `rollback` and `remove` refuse a hosted
+registry record's inactive bytes, so that rebuild is byte-exact. A lock the
+rewrite had to normalize is marked in the root package's resolution value
+bytes (never read for a root resolution): a format-1 lock it promoted is
+demoted back to its exact format-1 bytes (verified by promoting again), and a
+lock whose workspace dependency behaviors it normalized is refused with the
+checkout remedy. `rollback` and `remove` refuse a hosted
 `bun.lockb` entry instead (restore `bun.lockb` from version control). Scoped rollback restores package
 resolutions and may retain equivalent binary normalization; if Bun itself has
 subsequently upgraded the binary schema, rollback preserves that schema and
