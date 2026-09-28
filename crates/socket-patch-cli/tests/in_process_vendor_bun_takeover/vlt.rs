@@ -1,13 +1,15 @@
 //! vlt mode takeovers (DESIGN §4.10) through the built binary:
 //!
 //! 1. hosted → vendored by `scan --mode vendored` and by `vendor`: the
-//!    takeover restores the pristine registry node from the redirect
-//!    ledger, the vendor ledger records REGISTRY originals (never the
+//!    takeover restores the pristine registry node (v5: re-resolved from
+//!    the registry — a wiremock mirror here — with no ledger), the vendor
+//!    ledger records REGISTRY originals (never the
 //!    hosted URL), the store copy vlt installed from the hosted pin is
 //!    invalidated, and `vendor --revert` lands on the registry lock;
 //! 2. vendored → hosted by `scan --mode hosted` and `get <uuid> --mode
 //!    hosted`: the vlt revert restores node, edges and package.json before
-//!    the hosted rewrite, and `rollback` lands on the registry lock;
+//!    the hosted rewrite, and `rollback` (the upstream restore) lands on
+//!    the registry lock;
 //! 3. refusals fire BEFORE the other mode is reverted: the complete vlt
 //!    vendored preflight in front of a hosted revert, and the hosted
 //!    artifact preflight in front of a vendored revert.
@@ -22,9 +24,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::vlt_hosted_common as hosted;
 use hosted::{ORG, PATCHED, PRISTINE, PURL, TILDE_ID, UUID};
 
+/// The registry lock as vlt rc.33+ writes it: `options.registries` recorded
+/// and the registry node carrying its tarball URL in slot [3]. The v5
+/// upstream restore re-derives slot [3] from the lock's own convention
+/// (see core `patch::redirect::upstream::vlt`), which the recorded
+/// `registries` pins — so the unwinds below land on these exact bytes.
 fn registry_lock() -> String {
     format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    {}\n  }},\n  \
+        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\n    \"registries\": {{\n      \
+         \"npm\": \"https://registry.npmjs.org/\"\n    }}\n  }},\n  \"nodes\": {{\n    {}\n  }},\n  \
          \"edges\": {{\n    \"file~_d left-pad\": \"prod 1.3.0 {TILDE_ID}\"\n  }}\n}}\n",
         hosted::registry_node(TILDE_ID)
     )
@@ -72,6 +80,38 @@ async fn mock_api(server: &MockServer) {
     hosted::mock_discovery(server).await;
     hosted::mock_reference(server).await;
     hosted::mock_artifact(server).await;
+    mock_registry(server).await;
+}
+
+/// The npm registry's version document the v5 upstream restore reads for
+/// the hosted node (`SOCKET_NPM_REGISTRY` = `<server>/registry`): the
+/// pristine node's integrity and tarball.
+async fn mock_registry(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/registry/{}/{}", hosted::NAME, hosted::VERSION)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": hosted::NAME,
+            "version": hosted::VERSION,
+            "dist": { "tarball": hosted::REGISTRY_URL, "integrity": hosted::UPSTREAM_SHA512 }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The env naming `server` the patch server (its artifact URLs are hosted
+/// pins — v5 keeps no ledger to vouch for them) and its `/registry` the npm
+/// registry the upstream restore reads.
+fn online_env(server: &MockServer) -> [(&'static str, String); 2] {
+    [
+        ("SOCKET_PATCH_SERVER_URL", server.uri()),
+        ("SOCKET_NPM_REGISTRY", format!("{}/registry", server.uri())),
+    ]
+}
+
+fn run_online(root: &Path, argv: &[&str], server: &MockServer) -> (i32, Value, String) {
+    let env = online_env(server);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    hosted::run_json(root, argv, &env)
 }
 
 fn args<'a>(root: &'a str, uri: &'a str, head: &[&'a str]) -> Vec<&'a str> {
@@ -95,14 +135,24 @@ fn scan(root: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> (i32, V
     let uri = server.uri();
     let mut argv = args(&cwd, &uri, &["scan", "--mode", mode]);
     argv.extend_from_slice(extra);
-    hosted::run_json(root, &argv, &[])
+    run_online(root, &argv, server)
 }
 
+/// `vendor --offline`: nothing hosted to restore.
 fn vendor(root: &Path, extra: &[&str]) -> (i32, Value, String) {
     let cwd = root.to_str().unwrap().to_string();
     let mut argv = vec!["vendor", "--offline", "--cwd", &cwd];
     argv.extend_from_slice(extra);
     hosted::run_json(root, &argv, &[])
+}
+
+/// `vendor` over a hosted pin on `server`: online, the takeover's upstream
+/// restore reads the registry mirror.
+fn vendor_online(root: &Path, server: &MockServer, extra: &[&str]) -> (i32, Value, String) {
+    let cwd = root.to_str().unwrap().to_string();
+    let mut argv = vec!["vendor", "--cwd", &cwd];
+    argv.extend_from_slice(extra);
+    run_online(root, &argv, server)
 }
 
 fn all_codes(env: &Value) -> Vec<String> {
@@ -154,10 +204,12 @@ fn rel() -> String {
     format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad")
 }
 
-fn redirect_ledger(root: &Path) -> Option<Value> {
-    std::fs::read(hosted::ledger_path(root))
-        .ok()
-        .map(|b| serde_json::from_slice(&b).unwrap())
+/// v5 hosted mode keeps no ledger: none may ever appear.
+fn assert_no_redirect_ledger(root: &Path) {
+    assert!(
+        !hosted::ledger_path(root).exists(),
+        "no hosted ledger may exist"
+    );
 }
 
 fn vendor_entry(root: &Path) -> Option<Value> {
@@ -202,13 +254,7 @@ fn assert_vendored_from_registry(root: &Path) {
         hosted::registry_node(TILDE_ID),
         "the vendor ledger records the REGISTRY node: {node:#}"
     );
-    let ledger = redirect_ledger(root);
-    assert!(
-        ledger.as_ref().is_none_or(|l| l["records"]
-            .as_object()
-            .is_none_or(|r| !r.contains_key(PURL))),
-        "the redirect record is dropped: {ledger:#?}"
-    );
+    assert_no_redirect_ledger(root);
     assert!(
         !hosted::store_dir(root, TILDE_ID).exists(),
         "the hosted store copy is invalidated"
@@ -257,9 +303,9 @@ async fn vlt_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
     mock_api(&server).await;
     let hosted_lock = hosted_project(root, &server).await;
     seed_manifest(root);
-    let ledger = std::fs::read(hosted::ledger_path(root)).unwrap();
+    assert_no_redirect_ledger(root);
 
-    let (code, env, stderr) = vendor(root, &["--dry-run"]);
+    let (code, env, stderr) = vendor_online(root, &server, &["--dry-run"]);
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     let codes = all_codes(&env);
     assert!(
@@ -271,13 +317,13 @@ async fn vlt_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
         "the hosted node is registry-shaped: {env:#}"
     );
     assert_eq!(hosted::read(root, "vlt-lock.json"), hosted_lock);
-    assert_eq!(std::fs::read(hosted::ledger_path(root)).unwrap(), ledger);
+    assert_no_redirect_ledger(root);
     assert!(
         hosted::store_dir(root, TILDE_ID).exists(),
         "a dry run heals nothing"
     );
 
-    let (code, env, stderr) = vendor(root, &[]);
+    let (code, env, stderr) = vendor_online(root, &server, &[]);
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     assert!(
         all_codes(&env).contains(&"vendor_takeover_reverted_redirect".to_string()),
@@ -306,7 +352,7 @@ async fn vendored_then_hosted(driver: &str) {
         let cwd = root.to_str().unwrap().to_string();
         let uri = server.uri();
         let argv = args(&cwd, &uri, &["get", UUID, "--mode", "hosted"]);
-        hosted::run_json(root, &argv, &[])
+        run_online(root, &argv, &server)
     };
     assert_eq!(code, 0, "[{driver}] {env:#}\n{stderr}");
     let lock = hosted::read(root, "vlt-lock.json");
@@ -331,8 +377,11 @@ async fn vendored_then_hosted(driver: &str) {
         !root.join(format!(".socket/vendor/npm/{UUID}")).exists(),
         "[{driver}] the vendored artifact is removed"
     );
+    assert_no_redirect_ledger(root);
+    // The upstream restore: online against the registry mirror, with the
+    // mock origin named hosted so the pin is found.
     let cwd = root.to_str().unwrap().to_string();
-    let (code, env, stderr) = hosted::run_json(root, &["rollback", "--cwd", &cwd], &[]);
+    let (code, env, stderr) = run_online(root, &["rollback", "--cwd", &cwd], &server);
     assert_eq!(code, 0, "[{driver}] rollback: {env:#}\n{stderr}");
     assert_eq!(
         hosted::read(root, "vlt-lock.json"),
@@ -363,21 +412,16 @@ async fn vlt_vendored_preflight_refuses_before_the_hosted_revert() {
     // so no driver may strip the live hosted pin on its behalf.
     let pkg = "{\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  },\n  \"devDependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
     std::fs::write(root.join("package.json"), pkg).unwrap();
-    let ledger = std::fs::read(hosted::ledger_path(root)).unwrap();
     let assert_intact = |what: &str| {
         assert_eq!(hosted::read(root, "vlt-lock.json"), hosted_lock, "[{what}]");
         assert_eq!(hosted::read(root, "package.json"), pkg, "[{what}]");
-        assert_eq!(
-            std::fs::read(hosted::ledger_path(root)).unwrap(),
-            ledger,
-            "[{what}]"
-        );
+        assert_no_redirect_ledger(root);
         assert!(vendor_entry(root).is_none(), "[{what}]");
         assert!(hosted::store_dir(root, TILDE_ID).exists(), "[{what}]");
     };
     for (what, dry) in [("vendor --dry-run", true), ("vendor", false)] {
         let extra: &[&str] = if dry { &["--dry-run"] } else { &[] };
-        let (code, env, stderr) = vendor(root, extra);
+        let (code, env, stderr) = vendor_online(root, &server, extra);
         assert_eq!(code, 1, "[{what}] {env:#}\n{stderr}");
         assert!(
             detail_of(&env, "vendor_lock_entry_unsupported").contains("multiple dependency fields"),
@@ -443,10 +487,10 @@ async fn vlt_hosted_artifact_preflight_refuses_before_the_vendored_revert() {
     assert!(root.join(rel()).join("index.js").is_file());
 }
 
-/// A vendor that fails after the takeover revert was persisted (here a
-/// patch-service artifact failing its integrity check) still heals the
-/// hosted store copy against the restored registry pin: the redirect
-/// record is gone, so no later run could find it again.
+/// A vendor that fails after the takeover's upstream restore was persisted
+/// (here a patch-service artifact failing its integrity check) still heals
+/// the hosted store copy against the restored registry pin: the lock no
+/// longer pins anything hosted, so no later run could find it again.
 #[tokio::test(flavor = "multi_thread")]
 async fn vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store() {
     let tmp = tempfile::tempdir().unwrap();
@@ -479,7 +523,7 @@ async fn vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store() {
         "--api-token",
         "fake",
     ];
-    let (code, env, stderr) = hosted::run_json(root, &argv, &[]);
+    let (code, env, stderr) = run_online(root, &argv, &server);
     assert_eq!(code, 1, "{env:#}\n{stderr}");
     let codes = all_codes(&env);
     assert!(
@@ -498,12 +542,7 @@ async fn vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store() {
     assert_eq!(hosted::read(root, "vlt-lock.json"), registry_lock());
     assert_eq!(hosted::read(root, "package.json"), PACKAGE_JSON);
     assert!(vendor_entry(root).is_none());
-    assert!(
-        redirect_ledger(root).is_none_or(|l| l["records"]
-            .as_object()
-            .is_none_or(|r| !r.contains_key(PURL))),
-        "the redirect record is dropped"
-    );
+    assert_no_redirect_ledger(root);
     assert!(
         !hosted::store_dir(root, TILDE_ID).exists(),
         "the hosted store copy is invalidated"
