@@ -772,7 +772,7 @@ def main():
         url = f"https://patches-api.socket.dev/patch/view/{uuid}"
         for attempt in range(1, 6):
             try:
-                req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SocketPatchCLI-backtest/1.0"})
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except (urllib.error.URLError, TimeoutError, ConnectionError):

@@ -575,7 +575,7 @@ def published_record(uuid):
         url = f'{PUBLIC_PATCH_API}/patch/view/{uuid}'
         for attempt in range(1, 6):
             try:
-                request = urllib.request.Request(url, headers={'Accept': 'application/json'})
+                request = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'SocketPatchCLI-backtest/1.0'})
                 with urllib.request.urlopen(request, timeout=60) as response:
                     _PUBLISHED_RECORDS[uuid] = json.loads(response.read().decode('utf-8'))
                 break
