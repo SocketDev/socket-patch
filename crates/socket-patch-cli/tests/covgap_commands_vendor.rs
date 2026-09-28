@@ -1431,7 +1431,7 @@ fn human_classic_migration_risk_prints_stderr_warning() {
         "the revert itself is the calm no-op: {stdout}"
     );
     assert!(
-        stderr.contains("Warning (yarn_classic_berry_migration_risk)"),
+        stderr.contains("Warning: yarn.lock is yarn-classic"),
         "the run-level advisory prints for humans: {stderr}"
     );
 }

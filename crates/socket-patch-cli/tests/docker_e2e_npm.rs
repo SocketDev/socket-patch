@@ -226,14 +226,10 @@ mkdir -p /workspace/proj && cd /workspace/proj
 echo '{{ "name": "e2e-proj", "version": "0.0.0" }}' > package.json
 npm install --silent --no-audit --no-fund minimist@1.2.2
 
-# Pre-seed setup.manual so the agent-mode VEX leg (step 5b) keeps the npm
-# patch through property 7: this project isn't `socket-patch setup`-configured,
-# and an agent patch is applied by hand/CI — exactly what `manual` declares.
-# scan --sync merges the downloaded patch into this manifest and preserves the
-# setup block, so the manifest the VEX leg reads carries both.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # 2. scan --json: must discover the patch via the real batch API. A
@@ -835,10 +831,10 @@ yarn install >/tmp/yi.out 2>/tmp/yi.err || {{ echo "FAIL: yarn berry install"; c
 TARGET=node_modules/minimist/index.js
 [ -f "$TARGET" ] || {{ echo "FAIL: $TARGET missing after berry install (PnP layout?)" >&2; ls -la node_modules >&2; exit 1; }}
 
-# Pre-seed setup.manual so the patch survives property-7 filtering.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # 2. scan --sync then forced offline apply (placeholder beforeHash fixture).
@@ -1038,9 +1034,8 @@ async fn npm_berry_vendor_frozen_install_chain() {
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
 }
 
-/// The npm image carries vlt 1.2.0 for the setup-matrix `pm: vlt` cases
-/// (a non-gating extra: the gating vlt assertions are the real-vlt
-/// capstones).
+/// The npm image carries vlt 1.2.0 (a non-gating extra: the gating vlt
+/// assertions are the real-vlt capstones).
 #[test]
 fn npm_image_vlt_smoke() {
     let out = if host_mode() {

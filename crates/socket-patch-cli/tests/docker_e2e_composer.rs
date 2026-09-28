@@ -235,13 +235,10 @@ PHP_FILE="vendor/monolog/monolog/src/Monolog/Logger.php"
 [ -f "$PHP_FILE" ] || {{ echo "FAIL: $PHP_FILE missing" >&2; ls vendor/monolog/monolog/src/Monolog/ >&2 || true; exit 1; }}
 echo "Installed to: $PHP_FILE" >&2
 
-# Pre-seed setup.manual so the agent-mode VEX leg keeps the composer patch
-# through property 7 (this project isn't `socket-patch setup`-configured; agent
-# patches are applied by hand/CI — exactly what `manual` declares). scan --sync
-# merges the downloaded patch into this manifest and preserves the setup block.
+# Pre-seed an empty manifest; scan --sync merges the downloaded patch into it.
 mkdir -p .socket
 cat > .socket/manifest.json <<'MANIFEST'
-{{ "patches": {{}}, "setup": {{ "manual": ["composer"] }} }}
+{{ "patches": {{}} }}
 MANIFEST
 
 # pristine pre-check: the freshly-installed upstream file must NOT already

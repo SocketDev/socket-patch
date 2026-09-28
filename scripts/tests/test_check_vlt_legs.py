@@ -165,8 +165,6 @@ class Checking(unittest.TestCase):
         self.assertEqual(es("vendored", "absent_version_refused", "0.0.0-16"), "ran")
         self.assertEqual(es("vendored", "absent_version_refused", "1.2.0"), "skip:lockfile-version-present")
         self.assertEqual(es("safety", "agent_rollback", "1.1.1"), "skip:no-global-store")
-        self.assertEqual(es("setup", "hook_fires_per_reify", "1.0.0-rc.12"), "skip:root-postinstall-not-run")
-        self.assertEqual(es("setup", "hook_fires_per_reify", "1.0.0-rc.13"), "ran")
 
     def test_knobs_select_the_safety_legs(self):
         m = self.manifest

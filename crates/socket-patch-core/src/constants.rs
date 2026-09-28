@@ -105,8 +105,4 @@ pub mod npm_family {
     pub const VLT_STORE_DIR: &str = "node_modules/.vlt";
     /// Workspace globs of vlt <= 0.0.0-12 (`{"packages": ...}`).
     pub const VLT_LEGACY_WORKSPACES: &str = "vlt-workspaces.json";
-    /// Any one in the cwd makes setup treat the project as vlt's
-    /// (`VLT_STORE_DIR` only as a directory).
-    pub const VLT_SETUP_MARKERS: [&str; 4] =
-        [VLT_LOCK, VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_STORE_DIR];
 }

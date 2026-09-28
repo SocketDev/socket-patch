@@ -599,7 +599,7 @@ fn check_declarations(
                 format!("{pkg_rel} is missing; run `vlt install` first"),
             )
         })?;
-        let value: Value = serde_json::from_str(crate::package_json::detect::strip_bom(text))
+        let value: Value = serde_json::from_str(crate::utils::serde::strip_bom(text))
             .map_err(|_| (OUT_OF_SYNC, format!("{pkg_rel} is not valid JSON")))?;
         let declared = ["dependencies", "devDependencies", "optionalDependencies"]
             .iter()
@@ -732,7 +732,7 @@ pub async fn vlt_vendor_preflight(
         .join(PACKAGE_JSON);
     if let Ok(text) = read_regular_to_string(&store).await {
         if let Ok(pkg) =
-            serde_json::from_str::<Value>(crate::package_json::detect::strip_bom(&text))
+            serde_json::from_str::<Value>(crate::utils::serde::strip_bom(&text))
         {
             if super::npm_common::declares_bundled_deps(&pkg) {
                 return Err((

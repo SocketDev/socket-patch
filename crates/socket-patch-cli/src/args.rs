@@ -91,7 +91,7 @@ pub(crate) fn parse_bool_flag(s: &str) -> Result<bool, String> {
 /// flags (listed first, under "Options") are not buried among the ~24 shared
 /// ones. Set per-arg rather than as the struct's `next_help_heading`: that
 /// would leak onto the subcommand-local flags declared after the flatten.
-const GLOBAL_OPTIONS: &str = "Global options";
+pub(crate) const GLOBAL_OPTIONS: &str = "Global options";
 
 // Arguments inherited by every subcommand via `#[command(flatten)]`.
 //
@@ -303,7 +303,7 @@ pub struct GlobalArgs {
     /// backoff until the lock frees or the budget elapses. Only meaningful
     /// for the commands that take the lock (`apply`, `rollback`, `repair`,
     /// `remove`, `vendor`, `get` and `scan` when they record, apply,
-    /// vendor or redirect patches, and `setup --exclude`'s manifest write);
+    /// vendor or host patches);
     /// other commands accept it silently. Every holder removes the lock file on exit, so a leftover
     /// from a crashed run never contends.
     #[arg(help_heading = GLOBAL_OPTIONS, long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
@@ -364,7 +364,7 @@ pub struct GlobalArgs {
     pub no_npm_allow_remote_config: bool,
 
     /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
-    /// hosted redirects): do NOT remove stale vlt installed copies
+    /// hosted patches): do NOT remove stale vlt installed copies
     /// (`node_modules/.vlt-lock.json` and the stale `node_modules/.vlt`
     /// entries) after `vlt-lock.json` is repointed or restored. vlt never
     /// refreshes an installed copy on its own, so opting out means running
@@ -483,7 +483,7 @@ impl GlobalArgs {
     /// The `(api_token, org_slug)` telemetry is attributed with, resolved
     /// through the API client's own credential chain (flag → the
     /// `SOCKET_NO_API_TOKEN` veto → env → `socket login` config) WITHOUT
-    /// building a client. For the purely local commands (`list`, `setup`,
+    /// building a client. For the purely local commands (`list`,
     /// `vex`): a client would add the org-slug auto-resolve round-trip and
     /// the "No SOCKET_API_TOKEN set" advisory to a command that needs
     /// neither, while anything less than the full chain reported a
@@ -619,7 +619,6 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_SKIP_ROLLBACK",
     "SOCKET_PRESERVE_STATE",
     "SOCKET_DOWNLOAD_ONLY",
-    "SOCKET_SETUP_EXCLUDE",
     "SOCKET_VENDOR_REVERT",
     "SOCKET_BATCH_SIZE",
     "SOCKET_SCAN_PACKAGES",
@@ -1484,15 +1483,15 @@ mod tests {
     }
 
     /// The mirror only works if every subcommand's `run` actually calls
-    /// `apply_env_toggles`. `list` and `setup` fire telemetry
-    /// (`track_patch_listed` / `track_patch_setup`) whose kill-switch reads
+    /// `apply_env_toggles`. `list` fires telemetry
+    /// (`track_patch_listed`) whose kill-switch reads
     /// `SOCKET_TELEMETRY_DISABLED` / `SOCKET_OFFLINE` from the env only — a
     /// run entry point that skips the mirror silently ignores
     /// `--no-telemetry` and lets `--offline` (strict airgap: never contact
     /// the network) still fire the telemetry HTTP request.
     #[test]
     #[serial_test::serial]
-    fn list_and_setup_run_mirror_global_toggles_for_airgap() {
+    fn list_run_mirrors_global_toggles_for_airgap() {
         with_clean_socket_env(|| {
             with_clean_telemetry_env(|| {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -1521,28 +1520,6 @@ mod tests {
                     "`list --offline --no-telemetry` must mirror the toggles into the \
                      env — its telemetry kill-switch reads only SOCKET_OFFLINE / \
                      SOCKET_TELEMETRY_DISABLED",
-                );
-
-                // Reset the mirrored vars so setup can't pass on list's leftovers.
-                std::env::remove_var("SOCKET_OFFLINE");
-                std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-
-                let tmp = tempfile::tempdir().unwrap();
-                rt.block_on(crate::commands::setup::run(
-                    crate::commands::setup::SetupArgs {
-                        check: false,
-                        remove: false,
-                        exclude: Vec::new(),
-                        common: GlobalArgs {
-                            // `setup` must not write anything from a unit test.
-                            dry_run: true,
-                            ..toggles_on(tmp.path())
-                        },
-                    },
-                ));
-                assert!(
-                    socket_patch_core::telemetry::is_telemetry_disabled(),
-                    "`setup --offline --no-telemetry` must mirror the toggles into the env",
                 );
             });
         });
@@ -1607,7 +1584,7 @@ mod tests {
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "vex"]),
             ("SOCKET_VEX_COMPACT", &["socket-patch", "vex"]),
             // The embedded `--vex-*` twins share the same env vars and must
-            // not abort host commands (e.g. apply from a postinstall hook).
+            // not abort host commands (e.g. apply from a CI step).
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "apply"]),
             ("SOCKET_VEX_COMPACT", &["socket-patch", "scan"]),
         ];
@@ -1645,7 +1622,6 @@ mod tests {
             ("SOCKET_BATCH_SIZE", &["socket-patch", "scan"]),
             ("SOCKET_SCAN_PACKAGES", &["socket-patch", "scan"]),
             ("SOCKET_PATCH_VERSION", &["socket-patch", "self-update"]),
-            ("SOCKET_SETUP_EXCLUDE", &["socket-patch", "setup"]),
             ("SOCKET_VEX", &["socket-patch", "apply"]),
             ("SOCKET_VEX_OUTPUT", &["socket-patch", "vex"]),
             ("SOCKET_VEX_PRODUCT", &["socket-patch", "vex"]),

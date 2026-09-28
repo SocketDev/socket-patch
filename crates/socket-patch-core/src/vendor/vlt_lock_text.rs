@@ -1015,8 +1015,7 @@ mod tests {
     use super::*;
 
     use crate::constants::npm_family::{
-        VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LEGACY_WORKSPACES, VLT_LOCK, VLT_SETUP_MARKERS,
-        VLT_STORE_DIR,
+        VLT_CONFIG, VLT_HIDDEN_LOCK_REL, VLT_LEGACY_WORKSPACES, VLT_LOCK, VLT_STORE_DIR,
     };
 
     const UUID: &str = "0b1f6e2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b";
@@ -2523,15 +2522,6 @@ mod tests {
         assert_eq!(VLT_HIDDEN_LOCK_REL, "node_modules/.vlt-lock.json");
         assert_eq!(VLT_STORE_DIR, "node_modules/.vlt");
         assert_eq!(VLT_LEGACY_WORKSPACES, "vlt-workspaces.json");
-        assert_eq!(
-            VLT_SETUP_MARKERS,
-            [
-                "vlt-lock.json",
-                "vlt.json",
-                "node_modules/.vlt-lock.json",
-                "node_modules/.vlt"
-            ]
-        );
     }
 
     #[test]

@@ -49,7 +49,7 @@ three every run and fails first with the offending PURL named.
 |-----------|------|------------|-----------------------------|
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | one of three (picked by the CLI's `api::ranking`; the suite accepts any) | `Socket Community Patch` header |
-| RubyGems | `pkg:gem/activestorage@6.0.3` | any of the `GEM_PATCHES` table (each patch marks a different file). The hosted doc lists 6 live UUIDs; `GEM_PATCHES` carries only the first 4 and lacks `9c2b4925` and the merged `01019627`, which v5 ranking now prefers | `Socket Community Patch` header |
+| RubyGems | `pkg:gem/activestorage@6.0.3` | any of the `GEM_PATCHES` table (each patch marks a different file): the same 6 live UUIDs as the hosted doc, including `9c2b4925` and the merged `01019627` that v5 ranking prefers | `Socket Community Patch` header |
 
 If a required patch is withdrawn, update the catalog constants at the top of
 `e2e_vendored_production.rs` **and** the table above (same procedure as the

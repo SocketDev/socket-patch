@@ -170,7 +170,7 @@ pub(crate) fn normalize_file_path(file_name: &str) -> &str {
 /// that stays inside the package directory when joined to it.
 ///
 /// SECURITY: manifest file keys come from a committed `.socket/manifest.json`,
-/// which the auto-running install hook applies without explicit user action. An
+/// which a CI `apply` step applies without explicit user action. An
 /// unvalidated key like `../../home/u/.bashrc` or `/etc/cron.d/x` would let a
 /// poisoned manifest write OUTSIDE site-packages (arbitrary-file write → code
 /// execution) via `pkg_path.join(key)` — `Path::join` discards the base on an
@@ -1083,7 +1083,7 @@ async fn resolve_from_diff(
 /// Strategy 3 (on-disk half) — read `blobs_path/<hash>` fail-closed.
 ///
 /// SECURITY: `hash` comes from a committed `.socket/manifest.json` that the
-/// install hook applies without user action, so it is validated as a blob
+/// CI `apply` step applies without user action, so it is validated as a blob
 /// hash before it is joined (no traversal, no absolute path), and the
 /// directory ENTRY must be a regular file ([`read_blob_entry`]): a symlink
 /// planted at `blobs/<hash>` must not carry the read out of the blobs

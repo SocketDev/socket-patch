@@ -1,8 +1,9 @@
 name: Publish PyPI
 run-name: "Publish PyPI ${{ inputs.version }}${{ inputs.distinct-id != '' && format(' [{0}]', inputs.distinct-id) || '' }}"
 
-# Publishes socket-patch (platform wheels) + socket-patch-hook (pure-python
-# .pth carrier) to PyPI for an existing v<version> release. Dispatched two
+# Publishes socket-patch (platform wheels) to PyPI for an existing
+# v<version> release. (The socket-patch-hook .pth wheel is no longer
+# published: `setup` was removed in v5.) Dispatched two
 # ways, both as a plain workflow_dispatch run:
 #   - by release.yml (scripts/dispatch-publish.sh), as one leg of the
 #     single-dispatch release fan-out — distinct-id carries the release
@@ -137,29 +138,14 @@ jobs:
       - name: Copy README for PyPI package
         run: cp README.md pypi/socket-patch/README.md
 
-      - name: Build wheels (platform socket-patch + pure-python socket-patch-hook)
+      - name: Build wheels (platform socket-patch)
         env:
           VERSION: ${{ inputs.version }}
-        run: |
-          # Builds the platform-tagged socket-patch wheels AND the pure-python
-          # socket-patch-hook wheel (the .pth carrier behind `socket-patch[hook]`).
-          python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
-          # socket-patch and socket-patch-hook are two distinct PyPI projects.
-          # Publish each from its own dir so trusted publishing mints an OIDC
-          # token scoped to the right project (one upload spanning both projects
-          # can be rejected). Each needs its own trusted publisher on PyPI.
-          mkdir -p dist-hook
-          mv dist/socket_patch_hook-*.whl dist-hook/
+        run: python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
 
       - name: Publish socket-patch to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist/
           # Idempotent for re-runs: already-uploaded files skip.
-          skip-existing: true
-
-      - name: Publish socket-patch-hook to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
-        with:
-          packages-dir: dist-hook/
           skip-existing: true
