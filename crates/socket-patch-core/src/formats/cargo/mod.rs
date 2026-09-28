@@ -18,7 +18,6 @@
 //!   line-grammar probes the hosted rewriter reads with;
 //! * the vendored planner (`vendor::cargo_lock`) edits the same document
 //!   with `toml_edit`;
-//! * [`LockModel::restore_upstream`] — the hosted-rollback hook.
 //!
 //! Everything here is pure; the callers own the reads.
 
@@ -31,7 +30,6 @@ use crate::utils::purl::simple_purl;
 use crate::vendor::cargo_tag;
 use crate::vendor::lock_inventory::{LockIntegrity, LockfileEntry, SourceKind};
 
-use super::LockModel;
 
 // ── entry model ──
 
@@ -324,6 +322,3 @@ impl CargoLock {
     }
 }
 
-impl LockModel for CargoLock {
-    const FORMAT: &'static str = "Cargo.lock";
-}

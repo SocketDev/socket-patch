@@ -12,8 +12,11 @@
 //!   `repair`'s trust anchors;
 //! * `plan_hosted()` / the vendored planners — the edits `scan --mode
 //!   hosted` and `vendor` make;
-//! * `in_use()` — whether a vendored artifact is still consumed;
-//! * [`LockModel::restore_upstream`] — the hosted-rollback hook.
+//! * `in_use()` — whether a vendored artifact is still consumed.
+//!
+//! Restoring a hosted pin to its upstream entry (hosted rollback) is the
+//! ledger-free-hosted workstream's; it lands on these models rather than
+//! beside them.
 //!
 //! Models are PURE: text (or a parsed document) in, answers out. Every read
 //! stays with the caller, so the disk engines and the in-memory hosted
@@ -32,52 +35,6 @@ pub mod registry;
 pub mod yarn;
 
 pub use registry::registry;
-
-/// The default upstream resolution a hosted pin is restored to: the
-/// registry artifact of `name@version` as the package manager itself
-/// would lock it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpstreamPin<'a> {
-    pub name: &'a str,
-    pub version: &'a str,
-    /// The registry artifact URL, when the format records one.
-    pub resolved: Option<&'a str>,
-    /// The format's content verifier for that artifact (an SRI, a hex
-    /// sha256, …).
-    pub integrity: Option<&'a str>,
-}
-
-/// What [`LockModel::restore_upstream`] did with a lock.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RestoreUpstream {
-    /// The lock text with every named pin restored.
-    Rewritten(String),
-    /// No entry of the lock is pinned to any of the named patches.
-    Unchanged,
-    /// The format cannot restore the pins in place; `remedy` tells the user
-    /// how to (`git checkout -- <lockfile>`, a re-lock).
-    Unsupported { remedy: String },
-}
-
-/// The contract every per-format model implements.
-pub trait LockModel {
-    /// The lock's canonical file name, for diagnostics.
-    const FORMAT: &'static str;
-
-    /// Rewrite every hosted pin of the named patches back to its default
-    /// upstream entry with the same writer the hosted planner uses. The
-    /// hosted-rollback workstream fills this in per format; until then
-    /// every format refuses with the checkout remedy.
-    fn restore_upstream(&self, _pins: &[UpstreamPin<'_>]) -> RestoreUpstream {
-        RestoreUpstream::Unsupported {
-            remedy: format!(
-                "restore {} from version control (`git checkout -- {}`)",
-                Self::FORMAT,
-                Self::FORMAT
-            ),
-        }
-    }
-}
 
 /// ARCHITECTURE GUARD (module docs): format models do no I/O and apply no
 /// host policy.

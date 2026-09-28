@@ -26,7 +26,6 @@ use crate::utils::digest::sha256_hex;
 use crate::utils::purl::simple_purl;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry, SourceKind};
 
-use super::LockModel;
 
 /// The Bundler lockfiles, legacy spelling first: `Gemfile.lock` and
 /// `gems.locked` (what bundler writes instead when the manifest is
@@ -204,9 +203,6 @@ impl<'t> GemfileLock<'t> {
     }
 }
 
-impl LockModel for GemfileLock<'_> {
-    const FORMAT: &'static str = "Gemfile.lock";
-}
 
 /// Where a rubygems-compatible registry at `base` (no trailing `/`) serves
 /// `name`-`version`'s `.gem` — the inventory's resolved URL and ledger

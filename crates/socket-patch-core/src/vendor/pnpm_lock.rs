@@ -73,7 +73,7 @@ use super::state::{
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
 use crate::formats::pnpm::{
-    check_v9_lock_version as check_lock_version, vendored_in_use_lines, vendored_npm_uuid,
+    check_v9_lock_version as check_lock_version, vendored_npm_uuids,
 };
 use crate::formats::pnpm::lines::{
     indent_of, next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
@@ -562,20 +562,12 @@ pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Opti
     if check_lock_version(&text).is_err() {
         return None;
     }
-    // CRLF is undeterminable (see `PnpmLock::vendored_in_use`).
-    if text.contains('\r') {
-        return None;
-    }
     // Every `packages:`/`snapshots:` block key resolving into
-    // `.socket/vendor/npm/<uuid>/`, collected once per lock bytes (see
-    // [`LockIndex`]) once these bytes are probed again; the first probe
-    // runs the model's per-call scan ([`vendored_in_use_lines`]).
-    let doc = LOCK_MEMO.parse_infallible(text.as_bytes(), || LockDoc::new(split_lines(&text)));
-    doc.note_probe();
-    Some(match doc.index() {
-        Some(index) => index.vendored_npm_uuids.contains(&entry.uuid),
-        None => vendored_in_use_lines(&doc.lines, &entry.uuid),
-    })
+    // `.socket/vendor/npm/<uuid>/` — the format model's one walk
+    // ([`vendored_npm_uuids`], CRLF read like LF), collected once per lock
+    // bytes: a revert pass probes once per ledger entry.
+    let vendored = IN_USE_MEMO.parse_infallible(text.as_bytes(), || vendored_npm_uuids(&text));
+    Some(vendored.contains(&entry.uuid))
 }
 
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
@@ -2232,6 +2224,9 @@ fn matching_blocks<L: EditLines>(
 /// is split afresh. The backend re-seeds the slot with the lock it wrote.
 static LOCK_MEMO: ParseMemo<LockDoc> = ParseMemo::new();
 
+/// [`pnpm_entry_in_use`]'s vendored-uuid set, per lock bytes.
+static IN_USE_MEMO: ParseMemo<HashSet<String>> = ParseMemo::new();
+
 /// One lock's lines plus their [`LockIndex`] — a pure function of the
 /// lines, so of the bytes the memo keys on — built only once the same lines
 /// are probed a second time ([`INDEX_AFTER_PROBES`]).
@@ -2482,9 +2477,6 @@ struct LockIndex {
     first_importer_ver_paren: HashMap<String, usize>,
     first_importer_dep_ver_paren: HashMap<(String, String), usize>,
     first_importer_catalog: HashMap<(String, String), usize>,
-    /// The uuid of every packages/snapshots key resolving into
-    /// `.socket/vendor/npm/<uuid>/` ([`pnpm_entry_in_use`]).
-    vendored_npm_uuids: HashSet<String>,
 }
 
 /// Every prefix of `s` that ends right before a `(`.
@@ -2591,14 +2583,6 @@ impl LockIndex {
                     k = f;
                 }
                 i = importer.end;
-            }
-        }
-
-        for section in [&index.packages, &index.snapshots] {
-            for block in &section.blocks {
-                if let Some(uuid) = vendored_npm_uuid(&block.key) {
-                    index.vendored_npm_uuids.insert(uuid);
-                }
             }
         }
         index
@@ -5677,13 +5661,13 @@ snapshots:
         );
     }
 
-    /// A CRLF lock breaks the packages/snapshots section probes, so the
-    /// in-use scan finds nothing and would call a still-referenced artifact
-    /// "provably orphaned" (`Some(false)`) — letting the unwired-revert
-    /// guard delete it out from under the lock. CRLF must be undeterminable
-    /// (`None`), which the guard refuses on while the lock exists.
+    /// A CRLF lock (a Windows autocrlf checkout) must never read as
+    /// "provably orphaned" while it still resolves through the artifact —
+    /// that would let the unwired-revert guard delete it out from under the
+    /// lock. The in-use walk reads CRLF like LF, so it answers `Some(true)`
+    /// and the guard refuses.
     #[tokio::test]
-    async fn crlf_lock_is_undeterminable_for_in_use_and_unwired_revert_refuses() {
+    async fn crlf_lock_reads_as_in_use_and_unwired_revert_refuses() {
         let (fx, entry) = reconstructed_fixture().await;
         let crlf_lock = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
         tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf_lock)
@@ -5692,8 +5676,8 @@ snapshots:
 
         assert_eq!(
             pnpm_entry_in_use(&entry, fx.root()).await,
-            None,
-            "a CRLF lock is undeterminable, never provably orphaned"
+            Some(true),
+            "a CRLF lock still consuming the artifact reads as in use"
         );
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(!outcome.success, "unwired revert must refuse: {outcome:?}");
@@ -8355,13 +8339,12 @@ snapshots:
                     "seed {seed} {name}"
                 );
             }
-            for uuid in [UUID, OTHER_UUID] {
-                assert_eq!(
-                    index.vendored_npm_uuids.contains(uuid),
-                    vendored_in_use_lines(&lines, uuid),
-                    "seed {seed} in-use {uuid}"
-                );
-            }
+            // The in-use walk reads a CRLF lock like its LF twin.
+            assert_eq!(
+                vendored_npm_uuids(&text),
+                vendored_npm_uuids(&text.replace('\n', "\r\n")),
+                "seed {seed} in-use"
+            );
             for name in NAMES {
                 for version in VERSIONS {
                     let scan = check_rewritable_refs_with(&lines, name, version, None);

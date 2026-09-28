@@ -20,7 +20,6 @@
 //! * the vendored planners (`vendor::pnpm_lock` for lockfileVersion 9.0,
 //!   `vendor::pnpm_lock_legacy` for 5.4 / 6.0) splice with [`lines`] and
 //!   route on [`sniff_lock_grammar`];
-//! * [`LockModel::restore_upstream`] — the hosted-rollback hook.
 //!
 //! Everything here is pure (text in, answers out); the callers own the
 //! reads.
@@ -32,12 +31,13 @@ pub(crate) mod lines;
 pub(crate) use grammar::{entry_field, is_pnpm_lock_text, Entry, Resolution};
 pub(crate) use hosted::plan_hosted;
 
+use std::collections::HashSet;
+
 use crate::constants::npm_family::PNPM_LOCK;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry};
 use crate::vendor::path::parse_vendor_path;
 
-use super::LockModel;
 
 // ── entry model ──
 
@@ -349,6 +349,8 @@ pub(crate) fn check_v9_lock_version(text: &str) -> Result<(), String> {
 pub struct PnpmLock<'t> {
     text: &'t str,
     packages: Vec<PnpmPackage<'t>>,
+    /// [`vendored_npm_uuids`] of the text.
+    vendored: HashSet<String>,
 }
 
 /// One `packages:` entry whose resolution names a tarball — a candidate
@@ -366,6 +368,7 @@ impl<'t> PnpmLock<'t> {
         PnpmLock {
             text,
             packages: pnpm_packages(text),
+            vendored: vendored_npm_uuids(text),
         }
     }
 
@@ -459,44 +462,39 @@ impl<'t> PnpmLock<'t> {
     }
 
     /// Is the vendored npm artifact of patch `uuid` still consumed by this
-    /// lock? `Some(true)` when a `packages:` / `snapshots:` block is keyed
-    /// by it ([`vendored_npm_uuid`] — v9's `name@file:` and legacy's bare
-    /// `file:` keys alike); `Some(false)` when the lock carries none (the
-    /// `overrides:` declaration alone never counts: pnpm keeps it mirrored
-    /// from package.json even when nothing matches it); `None` when
-    /// undeterminable — a CRLF lock (a Windows autocrlf checkout) defeats
-    /// the line grammar, so the scan would find nothing and call a lock
-    /// that still resolves through the artifact provably orphaned. Callers
-    /// keep the entry on `None`, fail-safe.
-    pub fn vendored_in_use(&self, uuid: &str) -> Option<bool> {
-        if self.text.contains('\r') {
-            return None;
-        }
-        Some(vendored_in_use_lines(&lines::split_lines(self.text), uuid))
+    /// lock? `true` when a `packages:` / `snapshots:` block is keyed by it
+    /// ([`vendored_npm_uuid`] — v9's `name@file:` and legacy's bare `file:`
+    /// keys alike); `false` when the lock carries none (the `overrides:`
+    /// declaration alone never counts: pnpm keeps it mirrored from
+    /// package.json even when nothing matches it). CRLF locks read like LF
+    /// ones.
+    pub fn vendored_in_use(&self, uuid: &str) -> bool {
+        self.vendored.contains(uuid)
     }
 }
 
-/// [`PnpmLock::vendored_in_use`] over already-split (LF) lines — the
-/// per-probe scan the v9 planner's lock index answers for when it has not
-/// been built.
-pub(crate) fn vendored_in_use_lines(lines: &[String], uuid: &str) -> bool {
-    for section in ["packages", "snapshots"] {
-        let Some((start, end)) = lines::section_bounds(lines, section) else {
+/// The uuid of every `packages:` / `snapshots:` block key that resolves
+/// into `.socket/vendor/npm/<uuid>/` — the block-key grammar the vendored
+/// planners splice with ([`lines::parse_key_line`] at two-space indent),
+/// read in one walk with each line's `\r` dropped, so a CRLF lock (a
+/// Windows autocrlf checkout) answers like its LF twin.
+pub(crate) fn vendored_npm_uuids(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut in_section = false;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !line.is_empty() && !line.starts_with(' ') {
+            in_section = line == "packages:" || line == "snapshots:";
             continue;
-        };
-        let mut i = start + 1;
-        while let Some(block) = lines::next_block(lines, i, end) {
-            if vendored_npm_uuid(&block.key).is_some_and(|u| u == uuid) {
-                return true;
-            }
-            i = block.end;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(uuid) = lines::parse_key_line(line, 2).and_then(|(key, _, _)| vendored_npm_uuid(key)) {
+            out.insert(uuid);
         }
     }
-    false
-}
-
-impl LockModel for PnpmLock<'_> {
-    const FORMAT: &'static str = "pnpm-lock.yaml";
+    out
 }
 
 #[cfg(test)]
@@ -543,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn vendored_in_use_reads_v9_and_legacy_keys_and_refuses_crlf() {
+    fn vendored_in_use_reads_v9_and_legacy_keys_and_crlf() {
         let v9 = format!(
             "lockfileVersion: '9.0'\n\npackages:\n\n  a@file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz}}\n    version: 1.0.0\n"
         );
@@ -554,17 +552,17 @@ mod tests {
             "lockfileVersion: '9.0'\n\nsnapshots:\n\n  a@file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz: {{}}\n"
         );
         for text in [&v9, &legacy, &snapshot] {
-            assert_eq!(PnpmLock::parse(text).vendored_in_use(UUID), Some(true), "{text}");
+            assert!(PnpmLock::parse(text).vendored_in_use(UUID), "{text}");
             let other = "22222222-2222-4222-8222-222222222222";
-            assert_eq!(PnpmLock::parse(text).vendored_in_use(other), Some(false));
+            assert!(!PnpmLock::parse(text).vendored_in_use(other));
             let crlf = text.replace('\n', "\r\n");
-            assert_eq!(PnpmLock::parse(&crlf).vendored_in_use(UUID), None);
+            assert!(PnpmLock::parse(&crlf).vendored_in_use(UUID), "CRLF reads like LF");
         }
         // An overrides declaration alone is not usage.
         let overrides = format!(
             "lockfileVersion: '9.0'\n\noverrides:\n  a@1.0.0: file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz\n"
         );
-        assert_eq!(PnpmLock::parse(&overrides).vendored_in_use(UUID), Some(false));
+        assert!(!PnpmLock::parse(&overrides).vendored_in_use(UUID));
     }
 
     #[test]

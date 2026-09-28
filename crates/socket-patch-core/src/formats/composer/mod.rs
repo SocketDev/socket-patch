@@ -10,7 +10,6 @@
 //!   the vendored backend (`vendor::composer_lock`) indexes its edits and
 //!   its ownership gate ([`ComposerLockPackage::wired_to`]) by;
 //! * [`hosted::rewrite_composer_lock`] — the hosted planner's byte splice;
-//! * [`LockModel::restore_upstream`] — the hosted-rollback hook.
 
 pub(crate) mod hosted;
 
@@ -22,7 +21,6 @@ use crate::utils::digest::sha1_hex;
 use crate::vendor::lock_inventory::{http_url, LockIntegrity, LockfileEntry, SourceKind};
 use crate::vendor::path::{parse_vendor_path, VendorPathParts};
 
-use super::LockModel;
 
 // ── entry model ──
 
@@ -176,6 +174,3 @@ impl<'a> ComposerLock<'a> {
     }
 }
 
-impl LockModel for ComposerLock<'_> {
-    const FORMAT: &'static str = "composer.lock";
-}

@@ -737,7 +737,7 @@ pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) 
         Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {}
         _ => return None,
     }
-    PnpmLock::parse(&text).vendored_in_use(&entry.uuid)
+    Some(PnpmLock::parse(&text).vendored_in_use(&entry.uuid))
 }
 
 // ─────────────────────────── pre-flight checks ───────────────────────────
@@ -2993,13 +2993,12 @@ packages:
         assert_eq!(pnpm_legacy_entry_in_use(&entry, fx.root()).await, None);
     }
 
-    /// A CRLF-converted lock (a Windows autocrlf checkout) is UNDETERMINABLE
-    /// for the in-use probe — `sniff_lock_grammar` tolerates the `\r` (its
-    /// `trim()` eats it) but every LF-exact section probe misses, so without
-    /// the guard the probe calls a lock that still resolves through the
-    /// artifact "provably orphaned" and the unwired-revert guard deletes it.
+    /// A CRLF-converted lock (a Windows autocrlf checkout) must never read
+    /// as "provably orphaned" while it still resolves through the artifact
+    /// (the unwired-revert guard would delete it): the in-use walk reads
+    /// CRLF like LF and answers `Some(true)`.
     #[tokio::test]
-    async fn crlf_lock_is_undeterminable_for_in_use_and_unwired_revert_refuses() {
+    async fn crlf_lock_reads_as_in_use_and_unwired_revert_refuses() {
         let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let mut entry = entry.unwrap();
@@ -3010,8 +3009,8 @@ packages:
 
         assert_eq!(
             pnpm_legacy_entry_in_use(&entry, fx.root()).await,
-            None,
-            "a CRLF lock is undeterminable, never provably orphaned"
+            Some(true),
+            "a CRLF lock still consuming the artifact reads as in use"
         );
 
         // The empty-wiring (repair-reconstructed) revert rides that verdict.
