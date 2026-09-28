@@ -178,3 +178,141 @@ async fn offline_eject_refuses_before_any_request() {
         received.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
     );
 }
+
+// ── eject is one transaction ────────────────────────────────────────────────
+
+const ORG: &str = "test-org";
+const MOCK_PATCH: &str = "33333333-3333-4333-8333-333333333333";
+
+/// A fresh hosted checkout: package.json + a package-lock.json pinning
+/// left-pad to the mock patch server, and NOTHING installed.
+fn write_fresh_hosted_checkout(root: &Path, patch_origin: &str) -> String {
+    write_package_json(root);
+    let lock = lock(
+        &format!(
+            "{patch_origin}/patch/npm/left-pad/1.3.0/{GRANT}/{MOCK_PATCH}/left-pad-1.3.0.tgz"
+        ),
+        "sha512-patched==",
+    );
+    std::fs::write(root.join("package-lock.json"), &lock).unwrap();
+    lock
+}
+
+async fn mount_view_and_registry(server: &MockServer, tarball_status: u16) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{MOCK_PATCH}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": MOCK_PATCH,
+            "purl": "pkg:npm/left-pad@1.3.0",
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": { "package/index.js": { "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64) } },
+            "vulnerabilities": {},
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/npm-registry/left-pad/1.3.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "left-pad",
+            "version": "1.3.0",
+            "dist": {
+                "tarball": format!("{}/npm-registry/left-pad/-/left-pad-1.3.0.tgz", server.uri()),
+                "integrity": "sha512-upstream==",
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/npm-registry/left-pad/-/left-pad-1.3.0.tgz"))
+        .respond_with(ResponseTemplate::new(tarball_status))
+        .mount(server)
+        .await;
+}
+
+fn eject_cmd(server: &MockServer, cwd: &Path, dry: bool) -> Command {
+    let mut cmd = cli();
+    cmd.args(["vendor", "--json", "--org", ORG, "--api-token", "fake"])
+        .args(["--vendor-source", "build"])
+        .arg("--api-url")
+        .arg(server.uri())
+        .arg("--patch-server-url")
+        .arg(server.uri())
+        .arg("--cwd")
+        .arg(cwd)
+        .env("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
+    if dry {
+        cmd.arg("--dry-run");
+    }
+    cmd
+}
+
+/// Failure injection: the pristine tarball cannot be fetched, so vendoring
+/// fails AFTER the upstream restore landed — the eject rolls everything
+/// back and the project stays hosted, byte for byte.
+#[tokio::test]
+async fn failed_eject_rolls_back_and_keeps_the_project_hosted() {
+    let server = MockServer::start().await;
+    mount_view_and_registry(&server, 404).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let hosted = write_fresh_hosted_checkout(tmp.path(), &server.uri());
+    let out = eject_cmd(&server, tmp.path(), false).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(out.status.code(), Some(1), "{v}");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "eject_rolled_back")),
+        "the rollback is announced: {v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
+        hosted,
+        "the hosted pin survives a failed eject"
+    );
+    assert!(
+        !tmp.path().join(".socket/vendor").exists()
+            || std::fs::read_dir(tmp.path().join(".socket/vendor"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "no vendored residue"
+    );
+    assert!(
+        !tmp.path().join(".npmrc").exists(),
+        "the restore's side-config cleanup is rolled back with the rest"
+    );
+}
+
+/// A dry-run eject verifies the plan (records, upstream restore) and writes
+/// nothing.
+#[tokio::test]
+async fn dry_run_eject_verifies_the_plan_and_writes_nothing() {
+    let server = MockServer::start().await;
+    mount_view_and_registry(&server, 200).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let hosted = write_fresh_hosted_checkout(tmp.path(), &server.uri());
+    let out = eject_cmd(&server, tmp.path(), true).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    assert_eq!(v["dryRun"], true, "{v}");
+    assert!(
+        v["events"]
+            .as_array()
+            .is_some_and(|e| e.iter().any(|e| e["purl"] == "pkg:npm/left-pad@1.3.0")),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
+        hosted
+    );
+    assert!(!tmp.path().join(".socket").exists(), "a dry run creates no .socket/");
+}

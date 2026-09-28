@@ -899,6 +899,126 @@ fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<Hosted
         .collect()
 }
 
+/// What a wet eject can touch, captured before it touches anything: every
+/// regular file directly in the project root, the hosted pins' files and
+/// the restore's files (nested locks included), the project's cargo and
+/// maven config files, the vendor ledger, and the set of vendored uuid
+/// directories. [`EjectSnapshot::restore`] puts all of it back and removes
+/// what the eject created.
+struct EjectSnapshot {
+    root: std::path::PathBuf,
+    files: Vec<(String, Option<Vec<u8>>)>,
+    root_files: std::collections::BTreeSet<String>,
+    vendor_dirs: std::collections::BTreeSet<std::path::PathBuf>,
+}
+
+impl EjectSnapshot {
+    const EXTRA: [&'static str; 5] = [
+        ".cargo/config",
+        ".cargo/config.toml",
+        ".mvn/maven.config",
+        ".mvn/checksums/checksums.sha256",
+        socket_patch_core::vendor::VENDOR_STATE_REL,
+    ];
+
+    async fn root_file_names(root: &Path) -> std::io::Result<std::collections::BTreeSet<String>> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut dir = tokio::fs::read_dir(root).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                out.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    fn vendor_dir_set(root: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let base = root.join(".socket/vendor");
+        let mut out = std::collections::BTreeSet::new();
+        for eco in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+            if eco.file_type().is_ok_and(|t| t.is_dir()) {
+                for unit in std::fs::read_dir(eco.path()).into_iter().flatten().flatten() {
+                    out.insert(unit.path());
+                }
+            }
+        }
+        out
+    }
+
+    async fn take(root: &Path, touched: &[String]) -> std::io::Result<Self> {
+        let root_files = Self::root_file_names(root).await?;
+        let mut rels: std::collections::BTreeSet<String> = root_files.clone();
+        rels.extend(touched.iter().cloned());
+        rels.extend(Self::EXTRA.iter().map(|s| s.to_string()));
+        let mut files = Vec::with_capacity(rels.len());
+        for rel in rels {
+            let bytes = match tokio::fs::read(root.join(&rel)).await {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            files.push((rel, bytes));
+        }
+        Ok(EjectSnapshot {
+            root: root.to_path_buf(),
+            files,
+            root_files,
+            vendor_dirs: Self::vendor_dir_set(root),
+        })
+    }
+
+    async fn restore(&self) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+        for (rel, bytes) in &self.files {
+            let path = self.root.join(rel);
+            let result = match bytes {
+                Some(bytes) => {
+                    socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
+                }
+                None => match tokio::fs::remove_file(&path).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            };
+            if let Err(e) = result {
+                errors.push(format!("{rel}: {e}"));
+            }
+        }
+        // Root files the eject created.
+        if let Ok(now) = Self::root_file_names(&self.root).await {
+            for name in now.difference(&self.root_files) {
+                if self.files.iter().any(|(rel, _)| rel == name) {
+                    continue;
+                }
+                if let Err(e) = tokio::fs::remove_file(self.root.join(name)).await {
+                    errors.push(format!("{name}: {e}"));
+                }
+            }
+        }
+        // Vendored uuid dirs the eject created.
+        for dir in Self::vendor_dir_set(&self.root).difference(&self.vendor_dirs) {
+            if let Err(e) = remove_tree_and_prune(dir, &self.root.join(SOCKET_DIR)).await {
+                errors.push(format!("{}: {e}", dir.display()));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// The project files for the manual remedy.
+    fn files_hint(&self) -> String {
+        self.files
+            .iter()
+            .filter(|(_, bytes)| bytes.is_some())
+            .map(|(rel, _)| rel.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Standalone `vendor` in a hosted project — no manifest, hosted pins in the
 /// lockfiles: EJECT. The patch set is the pins themselves (purl + the uuid
 /// in each hosted URL); each record is fetched from the API, vendored into
@@ -967,45 +1087,218 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             )),
         }
     }
-    for (purl, detail) in &fetch_failures {
-        report_vendor_failure(common, purl, detail);
-    }
 
-    let step = crate::commands::scan::boxed_scan_vendor_step(
-        common,
-        records,
-        blobs,
-        client.clone(),
-        use_public_proxy,
-    )
-    .await;
-    let (mut exit, mut env) = match step {
-        Ok((has_errors, env)) => (i32::from(has_errors), env),
-        Err((code, message, env)) => {
-            let mut env = env.map(|e| *e).unwrap_or_else(|| {
-                let mut env = Envelope::new(Command::Vendor);
-                env.dry_run = common.dry_run;
-                env
-            });
-            env.mark_error(EnvelopeError::new(code, message.clone()));
-            if !common.json {
-                eprintln!(
-                    "{}",
-                    crate::commands::scan::vendor_flow::format_vendor_step_error(code, &message)
-                );
-            }
-            (1, env)
-        }
-    };
+    // All or nothing: a record the API cannot serve refuses the whole eject
+    // before anything is touched, so every package stays hosted.
     if !fetch_failures.is_empty() {
-        for (purl, detail) in fetch_failures {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = common.dry_run;
+        for (purl, detail) in &fetch_failures {
+            report_vendor_failure(common, purl, detail);
             env.record(
-                PatchEvent::new(PatchAction::Failed, purl).with_error("patch_fetch_failed", detail),
+                PatchEvent::new(PatchAction::Failed, purl.clone())
+                    .with_error("patch_fetch_failed", detail.clone()),
             );
         }
-        env.mark_partial_failure();
-        exit = 1;
+        env.mark_error(EnvelopeError::new(
+            "eject_refused",
+            "not every hosted patch record could be fetched; nothing was changed",
+        ));
+        if common.json {
+            println!("{}", env.to_pretty_json());
+        }
+        track_outcomes_for_vendor(true, &env, common.dry_run, api_token.as_deref(), org_slug.as_deref())
+            .await;
+        return 1;
     }
+
+    // Plan the upstream restore before touching anything: every pin must
+    // re-resolve to its registry entry (a dry resolve), or the eject is
+    // refused whole with each pin's remedy.
+    let origins = crate::commands::rollback::patch_server_origins(common);
+    let plan = socket_patch_core::patch::redirect::upstream::restore_upstream(
+        &common.cwd,
+        &pins,
+        &socket_patch_core::patch::redirect::upstream::RestoreOptions {
+            dry_run: true,
+            offline: common.offline,
+            patch_server_origins: origins.clone(),
+        },
+    )
+    .await;
+    let refused: Vec<(String, String)> = plan
+        .refused()
+        .map(|(pin, why)| (pin.purl.clone(), why.to_string()))
+        .collect();
+    if !refused.is_empty() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = common.dry_run;
+        for (purl, why) in &refused {
+            report_vendor_failure(common, purl, why);
+            env.record(
+                PatchEvent::new(PatchAction::Failed, purl.clone())
+                    .with_error("redirect_revert_failed", why.clone()),
+            );
+        }
+        env.mark_error(EnvelopeError::new(
+            "eject_refused",
+            "not every hosted pin can be restored to its upstream registry entry; nothing was \
+             changed",
+        ));
+        if common.json {
+            println!("{}", env.to_pretty_json());
+        }
+        track_outcomes_for_vendor(true, &env, common.dry_run, api_token.as_deref(), org_slug.as_deref())
+            .await;
+        return 1;
+    }
+
+    // A dry run stops at the verified plan: restoring the live lock to
+    // preview the vendor step would be a write.
+    if common.dry_run {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = true;
+        for pin in &pins {
+            env.record(PatchEvent::new(PatchAction::Applied, pin.purl.clone()).with_reason(
+                "eject_planned",
+                format!(
+                    "would restore the upstream registry entry ({}) and vendor the patch",
+                    pin.files.join(", ")
+                ),
+            ));
+            if !common.json && !common.silent {
+                println!(
+                    "Would eject {} (restore {}, then vendor into .socket/vendor/)",
+                    pin.purl,
+                    pin.files.join(", ")
+                );
+            }
+        }
+        if args.vex.vex.is_some() && !common.json && !common.silent {
+            println!("{}", crate::commands::vex::format_vex_dry_run_skip("vendored"));
+        }
+        if common.json {
+            println!("{}", env.to_pretty_json());
+        }
+        track_outcomes_for_vendor(false, &env, true, api_token.as_deref(), org_slug.as_deref()).await;
+        return 0;
+    }
+
+    // One transaction under one apply lock: snapshot what the eject can
+    // touch, restore every pin upstream (so the vendor engine resolves the
+    // pristine registry package even in a fresh checkout with nothing
+    // installed), vendor, and on ANY failure put the snapshot back — a
+    // failed eject leaves the project hosted, exactly as it was.
+    let socket_dir = common.socket_dir();
+    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
+    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let (code, message) = crate::commands::lock_cli::lock_failure(&e, timeout);
+            return emit_eject_refusal(common, code, &message);
+        }
+    };
+    let touched: Vec<String> = pins
+        .iter()
+        .flat_map(|p| p.files.iter().cloned())
+        .chain(plan.reverted_files.iter().cloned())
+        .collect();
+    let snapshot = match EjectSnapshot::take(&common.cwd, &touched).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            drop(guard);
+            return emit_eject_refusal(
+                common,
+                "eject_refused",
+                &format!("could not snapshot the project before ejecting: {e}"),
+            );
+        }
+    };
+    let mut env = Envelope::new(Command::Vendor);
+    let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
+        &common.cwd,
+        &pins,
+        &socket_patch_core::patch::redirect::upstream::RestoreOptions {
+            dry_run: false,
+            offline: common.offline,
+            patch_server_origins: origins,
+        },
+    )
+    .await;
+    let restore_failure = restore
+        .refused()
+        .map(|(_, why)| why.to_string())
+        .next()
+        .or_else(|| restore.flush_error.clone());
+    let mut exit: i32;
+    if let Some(why) = restore_failure {
+        env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
+        if !common.json {
+            eprintln!("Error: {}", crate::commands::rollback::capitalize_first(&why));
+        }
+        exit = 1;
+    } else {
+        for (code, detail) in &restore.warnings {
+            env.warnings.push(RunWarning {
+                code: code.to_string(),
+                detail: detail.clone(),
+            });
+        }
+        let manifest = PatchManifest {
+            patches: records,
+            setup: None,
+        };
+        match crate::commands::scan::vendor_flow::stage_and_vendor(
+            common,
+            &socket_dir,
+            &manifest,
+            blobs,
+            client.clone(),
+            use_public_proxy,
+            &mut env,
+            None,
+        )
+        .await
+        {
+            Ok(has_errors) => exit = i32::from(has_errors),
+            Err((code, message)) => {
+                env.mark_error(EnvelopeError::new(code, message.clone()));
+                if !common.json {
+                    eprintln!(
+                        "{}",
+                        crate::commands::scan::vendor_flow::format_vendor_step_error(code, &message)
+                    );
+                }
+                exit = 1;
+            }
+        }
+    }
+    if exit != 0 {
+        match snapshot.restore().await {
+            Ok(()) => env.warnings.push(RunWarning {
+                code: "eject_rolled_back".to_string(),
+                detail: "the eject did not complete, so every file it touched was restored: the \
+                         project is still hosted, exactly as before"
+                    .to_string(),
+            }),
+            Err(e) => {
+                let detail = format!(
+                    "the eject did not complete and restoring the pre-eject files failed ({e}); \
+                     restore them from version control (`git checkout -- {}`)",
+                    snapshot.files_hint()
+                );
+                if !common.json {
+                    eprintln!("Error: {detail}");
+                }
+                env.mark_error(EnvelopeError::new("eject_rollback_failed", detail));
+            }
+        }
+        if env.error.is_none() {
+            env.mark_partial_failure();
+        }
+    }
+    note_classic_migration_risk(&mut env, &common.cwd, common);
+    drop(guard);
 
     // Embedded VEX: same contract as the manifest-driven arm — only on
     // success, never on a dry run, and a requested-but-failed VEX flips the

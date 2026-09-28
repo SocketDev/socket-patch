@@ -239,7 +239,7 @@ async fn run_scan_vendor_step(
 /// `no_local_source` fold (staging could not obtain the patch content —
 /// offline, or the view fetch failed).
 #[allow(clippy::too_many_arguments)]
-async fn stage_and_vendor(
+pub(crate) async fn stage_and_vendor(
     common: &GlobalArgs,
     socket_dir: &Path,
     manifest: &PatchManifest,
