@@ -222,7 +222,12 @@ async fn eject_vendors_hosted_pins_and_revert_returns_to_upstream() {
     assert_eq!(code, 0, "eject must succeed: {env:#}");
     let applied = find_event(&env, "applied", None);
     assert_eq!(applied["purl"], PURL, "{env:#}");
-    find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+    // The eject restores upstream as its own planned step before vendoring,
+    // so the per-purl takeover warning never fires.
+    assert!(
+        !env.to_string().contains("vendor_takeover_reverted_redirect"),
+        "{env:#}"
+    );
     assert!(
         p.artifact().is_file(),
         "the artifact lands in .socket/vendor/"
