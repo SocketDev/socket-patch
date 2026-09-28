@@ -431,7 +431,10 @@ records and registry entries cannot be fetched offline — making zero network r
 included). A hosted wiring that discovery cannot attribute (a lock mentioning a recognized hosted
 uuid it rejected, or a pin with no lockfile) is refused with `hosted_wiring_contested` (exit 1,
 nothing touched) rather than ejecting a partial set; `rollback`, `remove` and `list` refuse the same
-way (`list` degrades to a warning when it can still list). `--vex` works as on the manifest-driven
+way (`list` degrades to a warning when it can still list). The grant token of an attributed pin's
+own URL is never contested wiring where the same file also names that pin's patch uuid (a uv
+pin's paired `pyproject.toml` `[tool.uv.sources]` entry, a vlt pin in a `vlt-lock.json` whose pins
+are withheld from the lock basis); any other unattributed uuid still is. `--vex` works as on the manifest-driven
 path. Without hosted pins the no-manifest no-op below is unchanged.
 
 **Prebuilt vendor artifacts (`--vendor-source`)**: by default (`auto`) `vendor` first tries to
