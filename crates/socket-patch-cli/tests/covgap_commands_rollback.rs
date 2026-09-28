@@ -2248,8 +2248,8 @@ fn manifest_write_failure_warns_and_exits_one() {
     // And the entry's blobs must survive for a retry (the failed-write
     // fallback restores the in-memory reference before the GC).
     assert!(
-        fx.socket.join("blobs").join(&fx.before_hash).exists()
-            && fx.socket.join("blobs").join(&fx.after_hash).exists(),
+        fx.socket.join("blobs").join(git_sha256(fx.before)).exists()
+            && fx.socket.join("blobs").join(git_sha256(fx.after)).exists(),
         "the failed-cleanup entry's blobs must be pinned"
     );
 }
