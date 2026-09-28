@@ -30,7 +30,9 @@ use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
-use socket_patch_core::utils::fs::read_regular_to_string;
+use socket_patch_core::utils::fs::{
+    atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
+};
 use socket_patch_core::utils::purl::normalize_purl;
 use socket_patch_core::vendor::{
     self, artifact_is_file_shaped, check_vendored_artifact, load_state, parse_vendor_path,
@@ -800,9 +802,11 @@ impl VendoredBackend<'_> {
             }
         }
         if !retry.is_empty() {
-            scratch
-                .events
-                .retain(|e| !retry.iter().any(|c| e.purl.as_deref() == Some(c.purl.as_str())));
+            scratch.events.retain(|e| {
+                !retry
+                    .iter()
+                    .any(|c| e.purl.as_deref() == Some(c.purl.as_str()))
+            });
             no_source |= run_engine(
                 &engine_common,
                 None,
@@ -1046,9 +1050,18 @@ async fn run_engine(
     no_source
 }
 
-/// The bytes of each candidate's recorded wiring files — what a re-vendor
-/// may rewrite for it. `None` records a file that did not exist.
-async fn snapshot_wiring(cwd: &Path, candidates: &[Candidate]) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+/// One wiring file as it was before the re-vendor: its bytes (`None`: it
+/// did not exist) and, for a symlinked lockfile, the link text — lockfile
+/// writers rename over the path, which replaces a link with a file.
+struct WiringSnapshot {
+    path: PathBuf,
+    link: Option<PathBuf>,
+    bytes: Option<Vec<u8>>,
+}
+
+/// Snapshot each candidate's recorded wiring files — what a re-vendor may
+/// rewrite for it. Reads are FIFO-safe; a non-regular file is skipped.
+async fn snapshot_wiring(cwd: &Path, candidates: &[Candidate]) -> Vec<WiringSnapshot> {
     let mut rels: Vec<String> = Vec::new();
     for c in candidates {
         rels.extend(c.entry.wiring.iter().map(|w| w.file.clone()));
@@ -1058,15 +1071,13 @@ async fn snapshot_wiring(cwd: &Path, candidates: &[Candidate]) -> Vec<(PathBuf, 
     let mut out = Vec::with_capacity(rels.len());
     for rel in rels {
         let path = cwd.join(&rel);
-        match tokio::fs::symlink_metadata(&path).await {
-            Ok(meta) if meta.is_file() => {
-                if let Ok(bytes) = tokio::fs::read(&path).await {
-                    out.push((path, Some(bytes)));
-                }
-            }
-            Ok(_) => {}
-            Err(_) => out.push((path, None)),
-        }
+        let bytes = match read_regular_to_bytes(&path).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        let link = tokio::fs::read_link(&path).await.ok();
+        out.push(WiringSnapshot { path, link, bytes });
     }
     out
 }
@@ -1083,20 +1094,34 @@ fn keeps_identity(health: &ArtifactHealth) -> bool {
 }
 
 /// Undo what a re-vendor may have written for `c`: its recorded wiring
-/// files go back to their snapshotted bytes and its ledger entry to the
+/// files go back to their snapshotted bytes (a replaced symlink is
+/// re-linked and its target rewritten) and its ledger entry to the
 /// original. Other candidates' files are left alone.
-async fn undo_candidate(cwd: &Path, c: &Candidate, snapshot: &[(PathBuf, Option<Vec<u8>>)]) {
+async fn undo_candidate(cwd: &Path, c: &Candidate, snapshot: &[WiringSnapshot]) {
     let wired: HashSet<PathBuf> = c.entry.wiring.iter().map(|w| cwd.join(&w.file)).collect();
-    for (path, bytes) in snapshot.iter().filter(|(p, _)| wired.contains(p)) {
-        if tokio::fs::read(path).await.ok().as_ref() == bytes.as_ref() {
+    for snap in snapshot.iter().filter(|s| wired.contains(&s.path)) {
+        if let Some(link) = &snap.link {
+            if tokio::fs::read_link(&snap.path).await.ok().as_ref() != Some(link) {
+                let _ = tokio::fs::remove_file(&snap.path).await;
+                if relink(link, &snap.path).await.is_err() {
+                    continue;
+                }
+            }
+        }
+        if read_regular_to_bytes(&snap.path).await.ok() == snap.bytes {
             continue;
         }
-        match bytes {
+        match &snap.bytes {
+            // Staged, fsynced and renamed over the link's target (or the
+            // file itself), keeping its mode.
             Some(bytes) => {
-                let _ = tokio::fs::write(path, bytes).await;
+                let target = tokio::fs::canonicalize(&snap.path)
+                    .await
+                    .unwrap_or_else(|_| snap.path.clone());
+                let _ = atomic_write_bytes_preserving_mode(&target, bytes).await;
             }
             None => {
-                let _ = tokio::fs::remove_file(path).await;
+                let _ = tokio::fs::remove_file(&snap.path).await;
             }
         }
     }
@@ -1106,6 +1131,16 @@ async fn undo_candidate(cwd: &Path, c: &Candidate, snapshot: &[(PathBuf, Option<
             let _ = vendor::save_state(cwd, &state).await;
         }
     }
+}
+
+#[cfg(unix)]
+async fn relink(link: &Path, at: &Path) -> std::io::Result<()> {
+    tokio::fs::symlink(link, at).await
+}
+
+#[cfg(windows)]
+async fn relink(link: &Path, at: &Path) -> std::io::Result<()> {
+    tokio::fs::symlink_file(link, at).await
 }
 
 /// One candidate's outcome in the engine's scratch envelope.

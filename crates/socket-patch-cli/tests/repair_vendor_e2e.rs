@@ -1375,6 +1375,18 @@ async fn repair_offline_harvests_a_corrupt_artifacts_valid_members() {
 /// the recorded bytes, and leaves the lockfile and ledger byte-identical.
 #[tokio::test]
 async fn repair_never_rewires_to_different_service_bytes() {
+    identity_kept_over_different_service_bytes(false).await;
+}
+
+/// Same, with the wired `package-lock.json` a symlink to the real lock: the
+/// put-back rewrites the link's target and leaves the link in place.
+#[cfg(unix)]
+#[tokio::test]
+async fn repair_identity_undo_follows_a_symlinked_lockfile() {
+    identity_kept_over_different_service_bytes(true).await;
+}
+
+async fn identity_kept_over_different_service_bytes(symlinked_lock: bool) {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1384,6 +1396,13 @@ async fn repair_never_rewires_to_different_service_bytes() {
         "sha512-orig==",
     );
     let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    // The wired lock moved behind a symlink after vendoring.
+    #[cfg(unix)]
+    if symlinked_lock {
+        let lock = tmp.path().join("package-lock.json");
+        std::fs::rename(&lock, tmp.path().join("real-lock.json")).unwrap();
+        std::os::unix::fs::symlink("real-lock.json", &lock).unwrap();
+    }
     let tgz_bytes = std::fs::read(&tgz).unwrap();
     let lock1 = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
     let state1 = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
@@ -1426,4 +1445,8 @@ async fn repair_never_rewires_to_different_service_bytes() {
         state1,
         "ledger untouched"
     );
+    if symlinked_lock {
+        let meta = std::fs::symlink_metadata(tmp.path().join("package-lock.json")).unwrap();
+        assert!(meta.file_type().is_symlink(), "the lockfile link is kept");
+    }
 }
