@@ -566,13 +566,31 @@ pin hosted patches (not under `--global`; `--ecosystems` narrows the pins) takes
 those pins — each pin's purl plus the patch uuid in its hosted URL — fetches each record from the
 patch API (`GET …/patches/view/<uuid>`, the same client and public-proxy fallback as `get`), vendors
 into `.socket/vendor/` exactly like `scan --mode vendored`, and rewires each package from hosted to
-vendored through the takeover (the upstream registry entry is restored first, so a later
-`vendor --revert` returns the project to upstream, never to hosted). The human output opens with
+vendored (the upstream registry entry is restored first, so a later `vendor --revert` returns the
+project to upstream, never to hosted). The human output opens with
 `Ejecting N hosted package(s) into .socket/vendor/...` (`Would eject …` under `--dry-run`); the
-JSON is the vendor envelope. A record whose view fetch fails (or 404s) is a `failed` event with
-`errorCode: "patch_fetch_failed"` and the run exits 1 (`partial_failure`); `--vex` works as on the
-manifest-driven path. A pin whose upstream restore is refused fails `redirect_revert_failed` (see
-"Takeover reconciliation"). Without hosted pins the no-manifest no-op below is unchanged.
+JSON is the vendor envelope. It needs no installed `node_modules` / site-packages: the sources are
+fetched from the upstream registry, so a fresh hosted checkout ejects.
+
+The eject is ONE planned transition, all-or-nothing: (1) every record is fetched first — a failed
+(or 404) view fetch is a `failed` event with `errorCode: "patch_fetch_failed"` and the run stops
+with `status: "error"`, `errorCode: "eject_refused"`, exit 1, nothing touched; (2) the upstream
+restore of every pin is resolved against staged copies — a refused pin (offline registry, a
+non-derivable field, a binary `bun.lockb`) is `eject_refused` with the `git checkout -- <lockfile>`
+remedy, nothing touched; (3) `--dry-run` stops here and reports each pin as an `applied` event with
+reason `eject_planned` — no file is written and no `.socket/` is created; (4) the wet run snapshots
+every file the eject may touch under one `apply.lock`, restores upstream, then vendors. If any
+package then fails, the snapshot is put back — the project stays hosted exactly as before, with the
+`eject_rolled_back` warning and `partial_failure`, exit 1; if putting the snapshot back itself fails,
+the error is `eject_rollback_failed` naming the files to `git checkout`. The eject does not emit the
+per-purl `vendor_takeover_reverted_redirect` warning (the restore is its own planned step).
+`--offline` (or `SOCKET_OFFLINE`) refuses the eject up front with `offline_eject_unavailable` —
+records and registry entries cannot be fetched offline — making zero network requests (dry run
+included). A hosted wiring that discovery cannot attribute (a lock mentioning a recognized hosted
+uuid it rejected, or a pin with no lockfile) is refused with `hosted_wiring_contested` (exit 1,
+nothing touched) rather than ejecting a partial set; `rollback`, `remove` and `list` refuse the same
+way (`list` degrades to a warning when it can still list). `--vex` works as on the manifest-driven
+path. Without hosted pins the no-manifest no-op below is unchanged.
 
 **Prebuilt vendor artifacts (`--vendor-source`)**: by default (`auto`) `vendor` first tries to
 DOWNLOAD the already-built patched artifact + integrity from the patch.socket.dev vendoring service,
@@ -1285,6 +1303,13 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `cargo_manifest_unreadable` / `cargo_manifest_unparseable` / `cargo_manifest_symlink_unsupported` / `cargo_manifest_not_workspace_root` / `cargo_manifest_patch_source_alias` | `failed` | vendor / scan / get `--mode vendored` (cargo, v5.0): the workspace-root `Cargo.toml` cannot carry the vendored `[patch.crates-io]` entry (or cargo would ignore it there) — see the cargo caveat under "Vendored mode". Refused before any write. |
 | `vendor_would_revert_redirect` / `vendor_takeover_reverted_redirect` | `skipped` (advisory event) | vendor / scan / get `--mode vendored` over a hosted pin (every ecosystem, v5.0): dry run — the upstream restore was resolved (registry lookups included) and would succeed (for bun, only after the Bun vendored preflight accepted the lock; a refused lock is previewed as the wet run's `failed <code>` instead) / wet run — the pin's lock entries were restored to their upstream registry entry before vendoring (mode takeover; detail `<purl> was hosted; restored its upstream registry entry (<files>) before vendoring (mode takeover)`), so `vendor --revert` later returns to upstream. Fires on the run that takes over, not on re-runs. |
 | `redirect_revert_failed` | `failed` | vendor / scan / get `--mode vendored` (dry and wet): the upstream restore of a hosted pin was refused (`--offline`, a registry that does not answer, `bun.lockb`, a lock shape the restore refuses) — detail `cannot vendor over the live hosted pin: cannot restore <purl> to its upstream registry entry: <why>; restore it from version control instead (`git checkout -- <files>`)`; nothing vendored for the purl, hosted wiring left in place, exit 1 `partial_failure`. |
+| `patch_fetch_failed` (eject) | `failed` | vendor eject (v5.0): a hosted pin's patch record could not be fetched from `…/patches/view/<uuid>`; the whole eject is refused (`eject_refused`), nothing touched, exit 1. |
+| `eject_refused` | top-level `errorCode` (`status: "error"`) | vendor eject (v5.0): a record fetch failed or a pin's upstream restore was refused while planning; nothing was changed, exit 1. |
+| `eject_planned` | `applied` (reason) | vendor eject `--dry-run` (v5.0): the pin would be restored upstream and vendored; nothing written. |
+| `eject_rolled_back` | warning | vendor eject (v5.0): a package failed after the restore began; every touched file was put back from the pre-eject snapshot, so the project is still hosted; `partial_failure`, exit 1. |
+| `eject_rollback_failed` | top-level `errorCode` | vendor eject (v5.0): putting the pre-eject snapshot back failed; the detail names the files to `git checkout --`; exit 1. |
+| `offline_eject_unavailable` | top-level `errorCode` | vendor eject under `--offline` / `SOCKET_OFFLINE` (v5.0): records and registry entries cannot be fetched offline; zero network requests, nothing touched, exit 1. |
+| `hosted_wiring_contested` | top-level `errorCode` (list: warning when it can still list) | rollback / remove / vendor eject / list (v5.0): a lockfile mentions a recognized hosted patch uuid that discovery rejected (or a pin with no lockfile), so the hosted set is not known exactly; refused with nothing touched, exit 1. Remedy: fix or `git checkout` the named lockfile. |
 | `vendor_yarn_berry_cache_unsupported` | `failed` | vendor (yarn berry): lock `cacheKey ≠ 10c0` or non-default `.yarnrc.yml` `compressionLevel` — the cache-zip checksum is not reproducible. |
 | `vendor_yarn_berry_mixed_line_endings` | `failed` | vendor (yarn berry): `yarn.lock` or the root `package.json` mixes CRLF and LF line endings (or holds a bare CR) — no single ending can be kept, and yarn rewrites such a file wholesale on its next install (a mixed lock also fails `--immutable`, YN0028). Refused before any write; `yarn install` normalizes the files. A uniformly CRLF pair is vendored in CRLF. A hosted→vendored takeover (`vendor`, `scan`/`get --mode vendored`) raises this — and the berry `vendor_yarn_berry_cache_unsupported` gates — BEFORE restoring the hosted pin's upstream entry (dry run too), so a refused purl stays hosted. |
 | `vendor_override_conflict` | `failed`        | vendor (pnpm/yarn-berry): a user-authored override/resolution for the package already exists. |

@@ -146,9 +146,17 @@ into the new version's section — see docs/releasing.md.
   pins in the lockfiles takes its patch set from those pins, fetches each
   record from the patch API, vendors into `.socket/vendor/` and rewires
   hosted → vendored (`Ejecting N hosted packages into .socket/vendor/...`,
-  `Would eject …` on a dry run; a failed record fetch is a `failed`
-  `patch_fetch_failed` event, exit 1). Without hosted pins the no-manifest
-  no-op is unchanged. Every vendored flow (`vendor`, `scan` / `get --mode
+  `Would eject …` on a dry run). The eject is one planned, all-or-nothing
+  transition: every record is fetched and every upstream restore resolved
+  before anything is written (a failure is `eject_refused`, nothing
+  touched); a dry run writes nothing (`eject_planned`); the wet run
+  snapshots the files it touches and, if vendoring then fails, puts them
+  back so the project stays hosted (`eject_rolled_back`). It works from a
+  fresh checkout (no installed tree needed). `--offline` refuses it with
+  `offline_eject_unavailable` and makes no requests. A lock whose hosted
+  wiring discovery cannot attribute is refused with
+  `hosted_wiring_contested` by eject, `rollback` and `remove` (a warning in
+  `list`). Without hosted pins the no-manifest no-op is unchanged. Every vendored flow (`vendor`, `scan` / `get --mode
   vendored`) that meets a hosted pin — any ecosystem, no longer just cargo,
   golang and the npm family — first restores its upstream registry entry
   with the same restore as `rollback`, so the vendor ledger records the

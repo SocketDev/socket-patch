@@ -749,7 +749,9 @@ There are two ways in:
   `.socket/manifest.json`. With no manifest in a **hosted** project it **ejects**: it
   takes the patch set from the lockfiles' hosted pins, fetches each patch from the API,
   and vendors it (`Ejecting N hosted packages into .socket/vendor/...`). This is the way
-  to move a hosted project offline. With neither a manifest nor hosted pins (a
+  to move a hosted project offline (run it while online; it works from a fresh checkout).
+  The eject is all-or-nothing: if any patch can't be fetched or vendored, the project is
+  left hosted exactly as it was. With neither a manifest nor hosted pins (a
   `scan --mode vendored` project) it has nothing to vendor and says so; `vendor --revert`
   works either way.
 - **`socket-patch scan --mode vendored`** discovers, downloads and vendors in one pass,
