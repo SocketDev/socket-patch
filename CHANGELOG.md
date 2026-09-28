@@ -79,6 +79,32 @@ into the new version's section — see docs/releasing.md.
   `gem_setup` / `composer_setup` / `pth_hook` aliases are removed from
   `socket-patch-core`, along with the setup-only `npm_family` table column
   (`FileRow::detects_pnpm`) and `VLT_SETUP_MARKERS`.
+- **v3/v4 compatibility spellings are gone.**
+  - The v3.0 legacy env names `SOCKET_PATCH_PROXY_URL`, `SOCKET_PATCH_DEBUG`
+    and `SOCKET_PATCH_TELEMETRY_DISABLED` are no longer read and no longer
+    print a deprecation warning. Use `SOCKET_PROXY_URL`, `SOCKET_DEBUG` and
+    `SOCKET_TELEMETRY_DISABLED`.
+  - The hidden `scan --redirect` flag (use `--mode hosted`) and the hidden
+    no-op `scan --detached` flag (vendored mode is always manifest-free) are
+    removed. Both are now unknown-flag usage errors (exit 2).
+  - The hidden `--mode` values `host`, `redirect` and `vendor` on `scan` and
+    `get` are rejected; only `hosted`, `vendored` and `agent` are accepted.
+    The hidden `scan --apply` and `scan --vendor` spellings stay.
+- **`get --one-off` and `rollback --one-off`** (and `SOCKET_ONE_OFF`) are
+  removed. They were never implemented and only failed with a usage error;
+  `--one-off` is now an unknown-flag error (still exit 2) and
+  `SOCKET_ONE_OFF` is ignored.
+- **`.socket/packages/` package archives are no longer read.** Nothing has
+  written them for several releases. `apply`, `vendor` and `repair` stop
+  probing and staging the directory, and `apply`'s JSON `appliedVia` loses
+  its `"package"` value (`"diff"` or `"blob"` remain). The GC sweeps
+  (`scan --prune`, `rollback`, `remove`, `repair`) delete any leftover
+  `.socket/packages/` files whole, still counted as `removedPackageArchives`.
+- **Core crate:** removed uncalled public helpers
+  (`bun_lock::snapshot_binary_workspace_artifacts`, `vlt_lock_sniff_ok`,
+  and several `lock_inventory::view` accessors) and the never-read
+  `DepOverride::berry_zip_url` field (a `berryZipUrl` key in a patch
+  reference still parses).
 
 ### Changed (BREAKING): patch UI streamlining
 
@@ -96,10 +122,10 @@ into the new version's section — see docs/releasing.md.
   confirmation, in `--json` too (no `selection_required` outside agent
   mode). Agent-mode `get` keeps its picker and `Download and apply N
   patches?` prompt.
-- **`get` and `rollback` usage errors exit 2** (were 1): `get`'s
-  `--id`/`--cve`/`--ghsa`/`--package` multi-select, `--one-off --save-only`,
-  `--mode hosted|vendored --save-only`, `--one-off`, a malformed forced
-  identifier, and `rollback --one-off`. Every usage error now exits 2.
+- **`get` usage errors exit 2** (were 1): `get`'s
+  `--id`/`--cve`/`--ghsa`/`--package` multi-select,
+  `--mode hosted|vendored --save-only` and a malformed forced identifier.
+  Every usage error now exits 2.
 - **Human output:** warning lines no longer carry the `(code)` tag
   (`Warning: …`, `GC: skipped: …`); the codes stay in the JSON envelope.
   Error lines keep theirs (`Error (<code>): …`). Hosted mode is called "hosted", not "redirect", in human
@@ -502,9 +528,8 @@ into the new version's section — see docs/releasing.md.
   selected patch records are fetched into memory and every vendor-ledger entry
   carries `detached: true` plus the embedded `record` as its verification
   source, so a vendored project's footprint is `.socket/vendor/**` only. The
-  former `--detached` opt-in is now the only vendored posture — the flag is
-  hidden, accepted as a no-op for compatibility, and still a usage error
-  without vendored mode. JSON uses the detached download vocabulary for both
+  former `--detached` opt-in is now the only vendored posture, and the flag
+  itself is removed (see "Removed"). JSON uses the detached download vocabulary for both
   commands (`downloaded: N`, `detached: true`, `patches[].action` =
   `downloaded` | `skipped` | `failed`). The vendor step vendors exactly what
   discovery selected — the "whole manifest is vendored" re-vendor from a
