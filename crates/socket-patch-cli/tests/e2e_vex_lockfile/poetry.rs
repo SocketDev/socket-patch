@@ -1014,10 +1014,17 @@ fn every_hosted_pin_spelling_attests_and_a_pinless_entry_needs_an_install() {
         let api = api_for(Mode::Hosted);
         let files_line = format!("files = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]");
         let metadata_entry = format!("{PKG} = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]");
+        // A `[metadata.files]` entry that listed files before the rewrite
+        // keeps Poetry's one-file-per-line layout (rollback restores the full
+        // list from it; an inline entry means the original was `[]`).
+        let metadata_block = format!(
+            "{PKG} = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{sha}\"}},\n]"
+        );
         let fragment = format!("#sha256={sha}&");
         let spellings: Vec<(&str, &str)> = [
             ("package files", files_line.as_str()),
             ("metadata.files", metadata_entry.as_str()),
+            ("metadata.files block", metadata_block.as_str()),
             ("url fragment", fragment.as_str()),
         ]
         .into_iter()
@@ -1422,12 +1429,13 @@ fn embedded(p: &Proj, api: &PatchApi, via: VexVia, offline: bool, extra: &[&str]
 }
 
 /// `scan --redirect --vex` on a lock-only checkout (nothing installed)
-/// writes the hosted wiring + the redirect ledger and attests in-run; then,
-/// with no manifest:
-///   c. the ledger alone attests offline (standalone and `apply --vex`);
-///   b. without the ledger, offline is `record_unavailable` with no request;
-///   a. without the ledger, online attests (standalone and `apply --vex`);
-///   d. `rollback` unwinds the wiring; with the ledger put back it is dead.
+/// writes the hosted wiring — and NO ledger (v5) — and attests in-run from
+/// this run's records; then, with no manifest:
+///   b. offline is `record_unavailable` with no request (standalone and
+///      `apply --vex`): the lock is the only hosted state, it carries no
+///      record;
+///   a. online attests (standalone and `apply --vex`);
+///   d. the wiring reverted to the native files: nothing is discovered.
 ///
 /// Both a production `patch.socket.dev` artifact url (nothing is fetched
 /// from it) and a self-hosted patch server (the mock's own origin, which
@@ -1472,7 +1480,10 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
                 "{what}: lock not wired:\n{lock}"
             );
             assert!(lock.contains("type = \"url\""), "{what}:\n{lock}");
-            assert!(p.exists(".socket/vendor/redirect-state.json"), "{what}");
+            assert!(
+                !p.exists(".socket/vendor/redirect-state.json"),
+                "{what}: v5 hosted mode writes no ledger"
+            );
             assert!(
                 !p.exists(".socket/manifest.json"),
                 "{what}: hosted writes no manifest"
@@ -1487,19 +1498,7 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
             let origin: Vec<&str> = origin_flag.iter().map(String::as_str).collect();
             let api = api_for(Mode::Hosted);
 
-            // c. the writer's ledger attests offline.
-            let out = vex(&p, &api, true, &origin);
-            assert_attested(&format!("{what} ledger"), &out, Mode::Hosted, HOSTED_UUID);
-            let out = embedded(&p, &api, VexVia::Apply, true, &origin);
-            assert_eq!(out.code, Some(0), "{what} apply --vex ledger: {out}");
-            assert_eq!(out.envelope["status"], "noManifest", "{what}: {out}");
-            assert_eq!(out.envelope["vex"]["statements"], 1, "{what}: {out}");
-            api.assert_no_requests();
-
-            // b / a. no ledger.
-            let ledger_path = p.root.join(".socket/vendor/redirect-state.json");
-            let ledger = std::fs::read(&ledger_path).unwrap();
-            strip_ledgers(&p);
+            // b / a. the wiring alone (the writer left no ledger).
             let out = vex(&p, &api, true, &origin);
             assert_omitted(
                 &format!("{what} no ledger offline"),
@@ -1519,6 +1518,8 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
             );
             let out = embedded(&p, &api, VexVia::Apply, false, &origin);
             assert_eq!(out.code, Some(0), "{what} apply --vex online: {out}");
+            assert_eq!(out.envelope["status"], "noManifest", "{what}: {out}");
+            assert_eq!(out.envelope["vex"]["statements"], 1, "{what}: {out}");
             vex_e2e_common::assert_attested(
                 out.doc(),
                 &purl(),
@@ -1528,32 +1529,21 @@ fn scan_redirect_wiring_attests_without_manifest_or_ledger() {
             );
             assert_no_manifest_written(&p, &what);
 
-            // d. the real revert, then the ledger restored behind its back.
-            std::fs::write(&ledger_path, &ledger).unwrap();
-            let (code, env) = run_authed(&p, &scan, &["rollback"]);
-            assert_eq!(code, Some(0), "{what} rollback: {env}");
-            for (name, text) in native_files(release) {
-                assert_eq!(p.read(name), text, "{what}: rollback restores {name}");
-            }
-            // A fully reverted project keeps no `.socket/` at all: recreate
-            // the directory the stale ledger is planted back into.
-            std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
-            std::fs::write(&ledger_path, &ledger).unwrap();
+            // d. the wiring reverted to the native files: no hosted state
+            // is left anywhere, so nothing is discovered, offline or online.
+            p.write_files(&native_files(release));
             for extra in [&[][..], &["--no-verify"][..]] {
                 let mut args = origin.clone();
                 args.extend_from_slice(extra);
-                let out = vex(&p, &api, true, &args);
-                assert_omitted(
-                    &format!("{what} reverted {extra:?}"),
-                    &out,
-                    "redirect_unwired",
-                );
-                let out = vex(&p, &api, false, &args);
-                assert_omitted(
-                    &format!("{what} reverted online {extra:?}"),
-                    &out,
-                    "redirect_unwired",
-                );
+                for offline in [true, false] {
+                    let out = vex(&p, &api, offline, &args);
+                    let cell = format!("{what} reverted offline={offline} {extra:?}");
+                    assert_eq!(out.code, Some(2), "{cell}: {out}");
+                    assert_eq!(
+                        out.envelope["error"]["code"], "manifest_not_found",
+                        "{cell}: {out}"
+                    );
+                }
             }
             let _ = scan.requests();
         }

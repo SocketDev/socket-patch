@@ -2,7 +2,7 @@
 //! per root, the same root-relative candidate set the disk hosted flow
 //! reads (`REDIRECT_CANDIDATE_FILES`, Python lock / script pairs, Cargo
 //! member manifests, Rush locks, the install-policy configs, the
-//! Plug'n'Play markers and the two `.socket/vendor/` ledgers), plus one
+//! Plug'n'Play markers and the vendored ledger), plus one
 //! presence-only Maven / NuGet marker per ecosystem so a repo holding only
 //! those still gets its `ecosystem_unsupported_in_memory` warning.
 
@@ -12,7 +12,6 @@ use socket_patch_core::constants::npm_family::{
     BUN_LOCKB, PNP_MARKERS, RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR,
 };
 use socket_patch_core::patch::redirect::npmrc::NPMRC_REL;
-use socket_patch_core::patch::redirect::REDIRECT_STATE_REL;
 use socket_patch_core::utils::python_lock::is_python_lock_name;
 
 use super::roots::{
@@ -37,12 +36,7 @@ pub(crate) const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
 pub(crate) const RUSH_REPO_STATE_REL: &str = "common/config/rush/repo-state.json";
 
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
-const EXTRA_TEXT_FILES: [&str; 4] = [
-    PNPM_WORKSPACE_REL,
-    NPMRC_REL,
-    VENDOR_STATE_REL,
-    REDIRECT_STATE_REL,
-];
+const EXTRA_TEXT_FILES: [&str; 3] = [PNPM_WORKSPACE_REL, NPMRC_REL, VENDOR_STATE_REL];
 
 /// The one directory name the disk Cargo member walk never enters (it
 /// follows `members`, `exclude`, path dependencies and `[patch]` paths
@@ -363,7 +357,6 @@ mod tests {
             s.fetch_text,
             vec![
                 ".npmrc",
-                ".socket/vendor/redirect-state.json",
                 "package-lock.json",
                 "tool.py",
                 "tool.py.lock",
@@ -465,12 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn candidate_listing_is_sorted_and_names_the_ledgers() {
+    fn candidate_listing_is_sorted_and_names_the_vendored_ledger_only() {
         let listed = candidate_files();
         let mut sorted = listed.clone();
         sorted.sort();
         assert_eq!(listed, sorted);
-        assert!(listed
+        assert!(listed.iter().any(|f| f == ".socket/vendor/state.json"));
+        // v5 hosted mode keeps no ledger, so the pre-v5 one is never read.
+        assert!(!listed
             .iter()
             .any(|f| f == ".socket/vendor/redirect-state.json"));
         assert!(listed.iter().any(|f| f == "package-lock.json"));

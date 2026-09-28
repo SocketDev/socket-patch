@@ -5,12 +5,9 @@
 //! lockfile entry whose `resolved` tarball URL is not served by the
 //! configured registry — exactly what a hosted redirect writes. The hosted
 //! flow therefore ensures `allow-remote=all` in the project `.npmrc`
-//! (creating the file, or appending one line) and records the edit in the
-//! redirect ledger under [`NPMRC_ALLOW_REMOTE_EDIT_KIND`], so every unwind
-//! path (rollback / remove replay, the per-purl npm revert behind scoped
-//! rollback and the vendored takeover, the vendored-supersedes-hosted
-//! reconcile) removes exactly what was added once no redirected npm lock
-//! entry needs it any more.
+//! (creating the file, or appending one line) and reports the edit under
+//! [`NPMRC_ALLOW_REMOTE_EDIT_KIND`]. The upstream restore (`upstream::npm`)
+//! removes the line again once no hosted npm lock entry needs it.
 //!
 //! The `.npmrc` grammar here is npm's as MEASURED against npm 12.1.0
 //! (`npm config get allow-remote` plus a real EALLOWREMOTE/ENOTFOUND install
@@ -36,9 +33,7 @@
 //! and — when the project file is silent — the user / global / builtin
 //! config files ([`resolve_outer_allow_remote`]).
 
-use std::collections::HashSet;
 
-use super::FileEdit;
 
 /// Repo-relative path of the project `.npmrc` the auto-config edits.
 pub const NPMRC_REL: &str = ".npmrc";
@@ -57,11 +52,6 @@ pub const NPMRC_ALLOW_REMOTE_LINE: &str = "allow-remote=all";
 
 /// The exact `.npmrc` the auto-config CREATES when none existed.
 pub const NPMRC_CREATED: &str = "allow-remote=all\n";
-
-/// The ledger kinds that record a package-lock.json / npm-shrinkwrap.json
-/// hosted splice — the entries that NEED `allow-remote=all` on npm >= 12.
-/// While any of them remains in the ledger the `.npmrc` edit stays.
-pub const NPM_LOCK_EDIT_KINDS: [&str; 2] = ["redirect_npm_lock_entry", "redirect_npm_lock_dep"];
 
 const BOM: char = '\u{feff}';
 
@@ -637,302 +627,9 @@ pub fn plan_npmrc_allow_remote_with(existing: Option<&str>, outer: &OuterAllowRe
     NpmrcPlan::Append(format!("{bom}{}", lines.join("\n")))
 }
 
-/// What unwinding one recorded `.npmrc` edit does to the live file.
-#[derive(Debug, PartialEq)]
-pub enum NpmrcUnwind {
-    /// The file is gone, or no longer carries the line — already clean.
-    Unchanged,
-    /// Delete the file (a `created` edit whose file still holds exactly
-    /// [`NPMRC_CREATED`]).
-    Delete,
-    /// Write this content (the one line removed). `modified_created` is
-    /// set when a `created` file had grown other content: it is kept and
-    /// only the line goes, which callers surface as
-    /// `redirect_npmrc_allow_remote_modified`.
-    Write {
-        content: String,
-        modified_created: bool,
-    },
-}
-
-/// Is `line` (one `\n`-split element, maybe carrying a CRLF `\r` or the
-/// file's BOM) exactly the line the auto-config writes?
-fn is_our_line(line: &str) -> bool {
-    line.trim_start_matches(BOM).trim_end_matches('\r') == NPMRC_ALLOW_REMOTE_LINE
-}
-
-/// Unwind one recorded `.npmrc` edit (`action` `created` / `added`) against
-/// the live `content` (`None` = file absent). Exact inverse of
-/// [`plan_npmrc_allow_remote`]'s splice: the one matching line is removed
-/// with its line terminator, every other byte kept. Only TOP-LEVEL lines
-/// (before the first real ini `[section]` header — the scope the plan
-/// writes into and npm reads the key from) count: a copy under a section
-/// is inert user text, never ours. `Err` when the line appears more than
-/// once at top level (ambiguous — refuse rather than guess which copy the
-/// redirect owns).
-pub fn unwind_npmrc_allow_remote(
-    action: &str,
-    content: Option<&str>,
-) -> Result<NpmrcUnwind, String> {
-    let Some(content) = content else {
-        return Ok(NpmrcUnwind::Unchanged);
-    };
-    if action == "created" && content == NPMRC_CREATED {
-        return Ok(NpmrcUnwind::Delete);
-    }
-    let (bom, body) = match content.strip_prefix(BOM) {
-        Some(rest) => (&content[..BOM.len_utf8()], rest),
-        None => ("", content),
-    };
-    let mut lines: Vec<&str> = body.split('\n').collect();
-    let end = top_level_end(bom, &lines);
-    let hits: Vec<usize> = lines[..end]
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| is_our_line(l))
-        .map(|(i, _)| i)
-        .collect();
-    match hits.as_slice() {
-        [] => Ok(NpmrcUnwind::Unchanged),
-        [i] => {
-            lines.remove(*i);
-            let rest = lines.join("\n");
-            // A created file reduced to nothing but its BOM/whitespace is the
-            // redirect's own file: delete it rather than leave a husk.
-            if action == "created" && rest.trim().is_empty() {
-                return Ok(NpmrcUnwind::Delete);
-            }
-            Ok(NpmrcUnwind::Write {
-                content: format!("{bom}{rest}"),
-                modified_created: action == "created",
-            })
-        }
-        _ => Err(format!(
-            "{NPMRC_REL}: the `{NPMRC_ALLOW_REMOTE_LINE}` line appears more than once — \
-             ambiguous, refusing to guess which copy the hosted redirect added; remove the \
-             duplicate, then re-run"
-        )),
-    }
-}
-
-/// The advisory for a redirect-created `.npmrc` that was modified since.
-pub fn npmrc_modified_warning() -> (String, String) {
-    (
-        "redirect_npmrc_allow_remote_modified".to_string(),
-        format!(
-            "{NPMRC_REL} was created by the hosted redirect but has been modified since — kept \
-             the file and removed only the `{NPMRC_ALLOW_REMOTE_LINE}` line"
-        ),
-    )
-}
-
-/// The unwind of every recorded `.npmrc` edit once no redirected npm lock
-/// entry needs `allow-remote=all` any more.
-#[derive(Debug, Default)]
-pub struct NpmrcUnwindPlan {
-    /// Ledger indices of the `.npmrc` edits to drop.
-    pub indices: Vec<usize>,
-    /// `None` — the file needs no change; `Some(None)` — delete it;
-    /// `Some(Some(text))` — write `text`.
-    pub staged: Option<Option<String>>,
-    /// Advisory (code, detail) pairs.
-    pub warnings: Vec<(String, String)>,
-}
-
-/// Is an unwind of the recorded `.npmrc` edit(s) due once `dropping` (the
-/// ledger indices the caller is about to remove) is gone? True iff a
-/// [`NPMRC_ALLOW_REMOTE_EDIT_KIND`] edit survives while no
-/// [`NPM_LOCK_EDIT_KINDS`] edit does. Callers check this BEFORE reading the
-/// live `.npmrc`, so a file that merely has an odd shape never refuses an
-/// unrelated revert while the setting is still needed.
-pub fn npmrc_unwind_due(edits: &[FileEdit], dropping: &HashSet<usize>) -> bool {
-    let live = |kinds: &[&str]| {
-        edits
-            .iter()
-            .enumerate()
-            .any(|(i, e)| !dropping.contains(&i) && kinds.contains(&e.kind.as_str()))
-    };
-    live(&[NPMRC_ALLOW_REMOTE_EDIT_KIND]) && !live(&NPM_LOCK_EDIT_KINDS)
-}
-
-/// "Last one out turns off the lights" for the `.npmrc` auto-config: when
-/// no [`NPM_LOCK_EDIT_KINDS`] edit survives outside `dropping` (the indices
-/// the caller is about to remove), plan the unwind of every recorded
-/// [`NPMRC_ALLOW_REMOTE_EDIT_KIND`] edit, newest first, against `current`
-/// (the live `.npmrc`). `Ok(None)` when an npm lock edit still needs the
-/// setting, or there is no `.npmrc` edit to unwind. `Err` on an ambiguous
-/// file or a tampered ledger path (callers fail closed).
-pub fn plan_unneeded_npmrc_unwind(
-    edits: &[FileEdit],
-    dropping: &HashSet<usize>,
-    current: Option<String>,
-) -> Result<Option<NpmrcUnwindPlan>, String> {
-    let still_needed = edits
-        .iter()
-        .enumerate()
-        .any(|(i, e)| !dropping.contains(&i) && NPM_LOCK_EDIT_KINDS.contains(&e.kind.as_str()));
-    if still_needed {
-        return Ok(None);
-    }
-    let indices: Vec<usize> = edits
-        .iter()
-        .enumerate()
-        .filter(|(i, e)| !dropping.contains(i) && e.kind == NPMRC_ALLOW_REMOTE_EDIT_KIND)
-        .map(|(i, _)| i)
-        .collect();
-    if indices.is_empty() {
-        return Ok(None);
-    }
-    let mut plan = NpmrcUnwindPlan {
-        indices: indices.clone(),
-        ..NpmrcUnwindPlan::default()
-    };
-    let mut content = current;
-    for &i in indices.iter().rev() {
-        let edit = &edits[i];
-        if edit.path != NPMRC_REL {
-            return Err(format!(
-                "the redirect ledger records a {} edit for `{}` (expected `{NPMRC_REL}`); \
-                 refusing to touch it",
-                edit.kind, edit.path
-            ));
-        }
-        match unwind_npmrc_allow_remote(&edit.action, content.as_deref())? {
-            NpmrcUnwind::Unchanged => {}
-            NpmrcUnwind::Delete => {
-                content = None;
-                plan.staged = Some(None);
-            }
-            NpmrcUnwind::Write {
-                content: next,
-                modified_created,
-            } => {
-                if modified_created {
-                    plan.warnings.push(npmrc_modified_warning());
-                }
-                content = Some(next.clone());
-                plan.staged = Some(Some(next));
-            }
-        }
-    }
-    Ok(Some(plan))
-}
-
-/// Read the live project `.npmrc` for an unwind: `Ok(None)` when absent.
-/// Refuses (`Err`) a symlink or any non-regular file HERE, at plan time —
-/// [`flush_npmrc`] would refuse it too, but only after the caller's other
-/// staged files (the reverted lock) had already been written, leaving the
-/// lock unwound while the ledger still records the redirect. FIFO-safe
-/// (non-blocking open + fstat), so a planted FIFO refuses fast instead of
-/// wedging the run.
-pub fn read_project_npmrc(project_root: &std::path::Path) -> Result<Option<String>, String> {
-    let path = project_root.join(NPMRC_REL);
-    match std::fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("inspect {NPMRC_REL}: {e}")),
-        Ok(meta) if !meta.is_file() => {
-            return Err(format!(
-                "{NPMRC_REL} is not a regular file (a symlink, directory or special file); \
-                 socket-patch never writes through one — replace it with a regular file, \
-                 then re-run"
-            ))
-        }
-        Ok(_) => {}
-    }
-    match crate::utils::fs::read_regular_to_string_sync(&path) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("read {NPMRC_REL}: {e}")),
-    }
-}
-
-/// Write (or delete) a planned `.npmrc` unwind through the reverts' shared
-/// staged flush: it refuses a non-regular file (a symlink or FIFO planted at
-/// the path) instead of writing through it, and writes atomically keeping
-/// the file's mode.
-pub async fn flush_npmrc(
-    project_root: &std::path::Path,
-    staged: &Option<String>,
-) -> Result<(), String> {
-    let one = super::staged::Staged::from([(NPMRC_REL.to_string(), staged.clone())]);
-    super::staged::flush_staged(project_root, &one, &super::staged::StagedBytes::new()).await
-}
-
-/// What [`unwind_unneeded_npmrc`] did.
-#[derive(Debug, Default, PartialEq)]
-pub struct NpmrcStandaloneUnwind {
-    /// The `.npmrc` itself was (or, on a dry run, would be) rewritten or
-    /// deleted.
-    pub file_changed: bool,
-    /// At least one recorded `.npmrc` edit was dropped from the ledger.
-    pub edits_dropped: bool,
-    /// Advisory (code, detail) pairs (e.g.
-    /// `redirect_npmrc_allow_remote_modified`).
-    pub warnings: Vec<(String, String)>,
-}
-
-/// Standalone "last one out" pass over a ledger the caller has just pruned
-/// WITHOUT an on-disk revert (the vendored-supersedes-hosted reconcile):
-/// when no npm lock edit remains, unwind the recorded `.npmrc` edits on
-/// disk (unless `dry_run`) and drop them from `state`. Returns what changed
-/// plus the advisory warnings (the caller surfaces them); the caller
-/// persists `state`. The ledger is only consulted — and the file only
-/// read — when it records a `.npmrc` edit at all.
-pub async fn unwind_unneeded_npmrc(
-    project_root: &std::path::Path,
-    state: &mut super::RedirectState,
-    dry_run: bool,
-) -> Result<NpmrcStandaloneUnwind, String> {
-    if !npmrc_unwind_due(&state.edits, &HashSet::new()) {
-        // Nothing recorded, or still needed: no read, no refusal over the
-        // file's shape.
-        return Ok(NpmrcStandaloneUnwind::default());
-    }
-    let current = read_project_npmrc(project_root)?;
-    let Some(plan) = plan_unneeded_npmrc_unwind(&state.edits, &HashSet::new(), current)? else {
-        return Ok(NpmrcStandaloneUnwind::default());
-    };
-    if !dry_run {
-        if let Some(staged) = &plan.staged {
-            flush_npmrc(project_root, staged).await?;
-        }
-    }
-    let drop: HashSet<usize> = plan.indices.iter().copied().collect();
-    let mut idx = 0usize;
-    state.edits.retain(|_| {
-        let keep = !drop.contains(&idx);
-        idx += 1;
-        keep
-    });
-    Ok(NpmrcStandaloneUnwind {
-        file_changed: plan.staged.is_some(),
-        edits_dropped: !plan.indices.is_empty(),
-        warnings: plan.warnings,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn edit(kind: &str, action: &str) -> FileEdit {
-        FileEdit {
-            path: if kind == NPMRC_ALLOW_REMOTE_EDIT_KIND {
-                NPMRC_REL.into()
-            } else {
-                "package-lock.json".into()
-            },
-            kind: kind.into(),
-            action: action.into(),
-            key: Some(if kind == NPMRC_ALLOW_REMOTE_EDIT_KIND {
-                "allow-remote".into()
-            } else {
-                "node_modules/left-pad".into()
-            }),
-            original: None,
-            new: Some(serde_json::json!("all")),
-        }
-    }
 
     /// The measured npm 12.1.0 grammar (see the module doc): exact key
     /// spelling only, BOM / whitespace / CRLF / quotes / inline comments
@@ -1079,44 +776,6 @@ mod tests {
             panic!("append expected");
         };
         assert_eq!(text, "\u{feff}[x]\nallow-remote=all\n[sec]\ny=1\n");
-    }
-
-    /// `[sec]\nallow-remote=all\n` (inert under a section) plans a
-    /// top-level append, so the unwind must count only top-level lines,
-    /// like the plan — counting BOTH copies would refuse as ambiguous and
-    /// block rollback, remove, the vendored takeover and the reconcile over
-    /// a state our own writer created.
-    #[test]
-    fn unwind_ignores_section_scoped_copies() {
-        let before = "[sec]\nallow-remote=all\n";
-        let NpmrcPlan::Append(text) = plan_npmrc_allow_remote(Some(before)) else {
-            panic!("append expected");
-        };
-        assert_eq!(text, "allow-remote=all\n[sec]\nallow-remote=all\n");
-        assert_eq!(
-            unwind_npmrc_allow_remote("added", Some(&text)).unwrap(),
-            NpmrcUnwind::Write {
-                content: before.into(),
-                modified_created: false
-            }
-        );
-        // Only a section copy left: nothing of ours to remove.
-        assert_eq!(
-            unwind_npmrc_allow_remote("added", Some(before)).unwrap(),
-            NpmrcUnwind::Unchanged
-        );
-        // The ledger-level plan agrees (the per-purl revert / reconcile path).
-        let edits = vec![edit(NPMRC_ALLOW_REMOTE_EDIT_KIND, "added")];
-        let plan = plan_unneeded_npmrc_unwind(&edits, &HashSet::new(), Some(text))
-            .unwrap()
-            .expect("unwind planned");
-        assert_eq!(plan.staged, Some(Some(before.into())));
-        // Two TOP-LEVEL copies are still genuinely ambiguous.
-        assert!(unwind_npmrc_allow_remote(
-            "added",
-            Some("allow-remote=all\nallow-remote=all\n[sec]\nallow-remote=all\n")
-        )
-        .is_err());
     }
 
     fn cfg_env(vars: &[(&str, &str)]) -> NpmConfigEnv {
@@ -1445,83 +1104,11 @@ mod tests {
     }
 
     #[test]
-    fn unwind_due_only_when_no_npm_lock_edit_survives() {
-        let edits = vec![
-            edit("redirect_npm_lock_entry", "rewritten"),
-            edit(NPMRC_ALLOW_REMOTE_EDIT_KIND, "created"),
-        ];
-        assert!(!npmrc_unwind_due(&edits, &HashSet::new()));
-        assert!(npmrc_unwind_due(&edits, &HashSet::from([0])));
-        assert!(!npmrc_unwind_due(&edits, &HashSet::from([0, 1])));
-        assert!(!npmrc_unwind_due(&edits[..1], &HashSet::new()));
-    }
-
-    /// The read used while PLANNING refuses a symlinked `.npmrc`, so the
-    /// per-purl revert never learns it is unwritable only at flush time,
-    /// after the reverted lock had landed.
-    #[cfg(unix)]
-    #[test]
-    fn read_project_npmrc_refuses_a_symlink_at_plan_time() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_project_npmrc(dir.path()), Ok(None));
-        std::fs::write(dir.path().join("shared.npmrc"), "allow-remote=all\n").unwrap();
-        std::os::unix::fs::symlink("shared.npmrc", dir.path().join(".npmrc")).unwrap();
-        let err = read_project_npmrc(dir.path()).unwrap_err();
-        assert!(err.contains("not a regular file"), "{err}");
-        std::fs::remove_file(dir.path().join(".npmrc")).unwrap();
-        std::fs::create_dir(dir.path().join(".npmrc")).unwrap();
-        assert!(read_project_npmrc(dir.path()).is_err());
-    }
-
-    #[test]
     fn plan_creates_when_absent() {
         assert_eq!(
             plan_npmrc_allow_remote(None),
             NpmrcPlan::Create("allow-remote=all\n".into())
         );
-    }
-
-    #[test]
-    fn plan_appends_preserving_bytes_and_round_trips() {
-        let cases = [
-            (
-                "registry=https://r.example/\n",
-                "registry=https://r.example/\nallow-remote=all\n",
-            ),
-            ("a=1", "a=1\nallow-remote=all"),
-            ("a=1\n\n", "a=1\nallow-remote=all\n\n"),
-            ("a=1\r\nb=2\r\n", "a=1\r\nb=2\r\nallow-remote=all\r\n"),
-            ("\u{feff}a=1\n", "\u{feff}a=1\nallow-remote=all\n"),
-            ("", "allow-remote=all\n"),
-            ("\u{feff}", "\u{feff}allow-remote=all\n"),
-            ("\n", "allow-remote=all\n\n"),
-            ("; team config\n", "; team config\nallow-remote=all\n"),
-            // An `allow_remote` spelling npm ignores stays byte-identical.
-            ("allow_remote=all\n", "allow_remote=all\nallow-remote=all\n"),
-            // Never inside an ini section: before the first header.
-            ("a=1\n[sec]\nx=1\n", "a=1\nallow-remote=all\n[sec]\nx=1\n"),
-            ("[sec]\nx=1\n", "allow-remote=all\n[sec]\nx=1\n"),
-        ];
-        for (before, after) in cases {
-            let NpmrcPlan::Append(text) = plan_npmrc_allow_remote(Some(before)) else {
-                panic!("{before:?} must plan an append");
-            };
-            assert_eq!(text, after, "append into {before:?}");
-            assert_eq!(
-                npmrc_allow_remote(&text).as_deref(),
-                Some("all"),
-                "{text:?}"
-            );
-            // Exact inverse: the unwind restores the user's bytes.
-            assert_eq!(
-                unwind_npmrc_allow_remote("added", Some(&text)).unwrap(),
-                NpmrcUnwind::Write {
-                    content: before.to_string(),
-                    modified_created: false
-                },
-                "unwind of {text:?}"
-            );
-        }
     }
 
     #[test]
@@ -1551,110 +1138,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unwind_created_file() {
-        assert_eq!(
-            unwind_npmrc_allow_remote("created", Some(NPMRC_CREATED)).unwrap(),
-            NpmrcUnwind::Delete
-        );
-        assert_eq!(
-            unwind_npmrc_allow_remote("created", None).unwrap(),
-            NpmrcUnwind::Unchanged
-        );
-        // Grown since: keep the file, drop only our line, say so.
-        assert_eq!(
-            unwind_npmrc_allow_remote("created", Some("allow-remote=all\nfund=false\n")).unwrap(),
-            NpmrcUnwind::Write {
-                content: "fund=false\n".into(),
-                modified_created: true
-            }
-        );
-        // The user already removed our line: nothing to do.
-        assert_eq!(
-            unwind_npmrc_allow_remote("added", Some("fund=false\n")).unwrap(),
-            NpmrcUnwind::Unchanged
-        );
-        // A commented-out copy is not our line.
-        assert_eq!(
-            unwind_npmrc_allow_remote("added", Some("; allow-remote=all\n")).unwrap(),
-            NpmrcUnwind::Unchanged
-        );
-        // Ambiguous duplicates refuse.
-        assert!(
-            unwind_npmrc_allow_remote("added", Some("allow-remote=all\nallow-remote=all\n"))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn last_one_out_keeps_the_setting_while_npm_lock_edits_remain() {
-        let edits = vec![
-            edit("redirect_npm_lock_entry", "rewritten"),
-            edit(NPMRC_ALLOW_REMOTE_EDIT_KIND, "created"),
-        ];
-        // The lock edit survives: the setting is still needed.
-        assert!(
-            plan_unneeded_npmrc_unwind(&edits, &HashSet::new(), Some(NPMRC_CREATED.into()))
-                .unwrap()
-                .is_none()
-        );
-        // The lock edit is being dropped: unwind (delete the created file).
-        let plan =
-            plan_unneeded_npmrc_unwind(&edits, &HashSet::from([0]), Some(NPMRC_CREATED.into()))
-                .unwrap()
-                .expect("unwind planned");
-        assert_eq!(plan.indices, vec![1]);
-        assert_eq!(plan.staged, Some(None));
-        // A pnpm-only ledger with a stray `.npmrc` edit also unwinds.
-        let edits = vec![
-            edit("redirect_pnpm_resolution", "rewritten"),
-            edit(NPMRC_ALLOW_REMOTE_EDIT_KIND, "added"),
-        ];
-        let plan = plan_unneeded_npmrc_unwind(
-            &edits,
-            &HashSet::new(),
-            Some("a=1\nallow-remote=all\n".into()),
-        )
-        .unwrap()
-        .expect("unwind planned");
-        assert_eq!(plan.staged, Some(Some("a=1\n".into())));
-        // A tampered ledger path refuses.
-        let mut bad = edit(NPMRC_ALLOW_REMOTE_EDIT_KIND, "added");
-        bad.path = "../.npmrc".into();
-        assert!(plan_unneeded_npmrc_unwind(&[bad], &HashSet::new(), None).is_err());
-    }
-
-    #[tokio::test]
-    async fn standalone_unwind_removes_only_our_line_and_drops_the_edit() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".npmrc"),
-            "fund=false\r\nallow-remote=all\r\n",
-        )
-        .unwrap();
-        let mut state = super::super::RedirectState::new();
-        state
-            .edits
-            .push(edit(NPMRC_ALLOW_REMOTE_EDIT_KIND, "added"));
-        // Dry run: nothing written, edit still dropped from the (throwaway) state.
-        let mut probe = state.clone();
-        unwind_unneeded_npmrc(dir.path(), &mut probe, true)
-            .await
-            .unwrap();
-        assert!(probe.edits.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
-            "fund=false\r\nallow-remote=all\r\n"
-        );
-        let out = unwind_unneeded_npmrc(dir.path(), &mut state, false)
-            .await
-            .unwrap();
-        assert!(out.warnings.is_empty());
-        assert!(out.file_changed && out.edits_dropped, "{out:?}");
-        assert!(state.edits.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
-            "fund=false\r\n"
-        );
-    }
 }

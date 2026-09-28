@@ -129,8 +129,8 @@ fn repair_with_no_manifest_emits_manifest_not_found_envelope() {
     );
 }
 
-/// A project whose ONLY trace is the hosted-mode redirect ledger
-/// (`.socket/vendor/redirect-state.json`) — no manifest, no vendor
+/// A project whose ONLY trace is a PRE-V5 hosted-mode redirect ledger
+/// (`.socket/vendor/redirect-state.json`; v5 never writes one) — no manifest, no vendor
 /// `state.json`, no `.socket/vendor/...` lockfile references — is a no-op for
 /// repair, not a `manifest_not_found` error. Hosted redirects point at
 /// patch.socket.dev URLs and leave no local artifacts to rebuild or sweep, so
@@ -174,6 +174,60 @@ fn repair_redirect_only_project_is_informational_no_op() {
             .unwrap_or("")
             .contains("scan --mode hosted"),
         "skip reason must route to hosted mode; got {skip}"
+    );
+}
+
+/// The v5 shape of a hosted-only project: NO ledger at all, just a lockfile
+/// whose entry pins a hosted patch (v5 hosted mode writes only lockfile
+/// edits). Repair discovers the pin and takes the same informational
+/// `redirect_only_project` skip — never `manifest_not_found` — and writes
+/// nothing (no `.socket/` appears).
+#[test]
+fn repair_hosted_lockfile_pin_only_project_is_informational_no_op() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{
+  "name": "hosted-fixture",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "hosted-fixture", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "name": "left-pad",
+      "version": "1.3.0",
+      "resolved": "https://patch.socket.dev/patch/npm/left-pad/1.3.0/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz",
+      "integrity": "sha512-PATCHED=="
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(
+        code, 0,
+        "hosted-pin-only repair must succeed; stdout=\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["status"], "success", "{v}");
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "skipped" && e["errorCode"] == "redirect_only_project"),
+        "the hosted pin alone must take the redirect-only skip; got {v}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before,
+        "repair never touches hosted wiring"
+    );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a project with nothing to repair never grows .socket/"
     );
 }
 

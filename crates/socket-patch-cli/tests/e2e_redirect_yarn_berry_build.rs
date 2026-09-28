@@ -5,8 +5,9 @@
 //! `scan --mode hosted` never lands patched bytes in the repo: it rewrites
 //! `yarn.lock` so the patched dependency resolves via
 //! `npm:<v>::__archiveUrl=<hosted-tgz>` with `checksum: 10c0/<hex>` (yarn's
-//! cache-zip sha512), and records the patch in the redirect ledger. This test
-//! proves every link against the REAL `corepack yarn@4.12.0`:
+//! cache-zip sha512); v5 keeps no redirect ledger — the lock pin is the
+//! whole hosted state. This test proves every link against the REAL
+//! `corepack yarn@4.12.0`:
 //!
 //!   1. `yarn install` of left-pad@1.3.0 (network for fixture setup only,
 //!      private global cache, node-modules linker).
@@ -17,8 +18,8 @@
 //!      (yarn recomputes the same zip checksum whether the locator is `file:`
 //!      or `::__archiveUrl=`, so `--check-cache` will accept it).
 //!   3. `scan --mode hosted --json --vex` (the real binary): yarn.lock now
-//!      pins the hosted `__archiveUrl` + the `10c0` checksum, the ledger
-//!      embeds the record, the in-run VEX is the `(redirected)` attestation.
+//!      pins the hosted `__archiveUrl` + the `10c0` checksum, NO ledger is
+//!      written, the in-run VEX is the `(redirected)` attestation.
 //!   4. FRESH-CHECKOUT PROOF: only package.json + yarn.lock + .yarnrc.yml +
 //!      .socket/ travel; `yarn install --immutable --check-cache` (offline
 //!      from the registry, `unsafeHttpWhitelist` for the wiremock host) MUST
@@ -522,7 +523,7 @@ async fn berry_hosted_project(
         assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
         assert_eq!(
             env["vex"]["verified"], false,
-            "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
+            "in-run redirect VEX is attested from this run's fetched record, not hash-verified: {env}"
         );
         let vex_doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
@@ -565,10 +566,10 @@ async fn berry_hosted_project(
          ({checksum_line:?}); got:\n{lock}"
     );
 
-    let ledger = std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap();
+    // v5: hosted mode writes no ledger — the yarn.lock pin is the state.
     assert!(
-        ledger.contains("\"records\"") && ledger.contains(GHSA),
-        "redirect ledger must embed the patch record + vulnerability: {ledger}"
+        !proj.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode must not write the redirect ledger"
     );
 
     Some(BerryRedirectFixture {
@@ -606,7 +607,10 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
     // A fresh .yarnrc.yml: node-modules linker, no global cache, and the
     // wiremock host whitelisted for plain http (yarn refuses http otherwise).
     std::fs::write(fresh.join(".yarnrc.yml"), fresh_yarnrc(fx)).unwrap();
-    copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    // v5 hosted mode may leave no `.socket/` at all (no ledger, no manifest).
+    if fx.proj.join(".socket").is_dir() {
+        copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    }
     let fresh_global = fx.tmp.path().join("fresh-yarn-global");
     let ci = corepack(
         &fresh,

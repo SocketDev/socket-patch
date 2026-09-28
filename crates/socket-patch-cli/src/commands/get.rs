@@ -541,8 +541,8 @@ pub struct GetArgs {
     /// [default: hosted; agent with `--save-only` or `--global`]
     // agent = record in .socket/manifest.json + blobs and apply in place;
     // hosted = rewrite lockfiles so the patched deps resolve to Socket's
-    // hosted patch server (no manifest, no blobs; state lives in the
-    // redirect ledger); vendored = commit patched artifacts under
+    // hosted patch server (no manifest, no blobs, no ledger: the lockfile
+    // is the record); vendored = commit patched artifacts under
     // .socket/vendor/ and rewire the lockfile (no manifest, no blobs; the
     // vendor ledger carries the records). Hosted/vendored runs produce the
     // same on-disk result as `scan --mode hosted|vendored` selecting the
@@ -1222,6 +1222,9 @@ pub struct DownloadParams {
     /// `false`: their patch content is staged in memory and the committed
     /// artifact is the patch — nothing should land in `.socket/blobs`.
     pub persist_blobs: bool,
+    /// `--patch-server-url`: the extra origin whose URLs count as hosted
+    /// when lockfile discovery reads the project's hosted pins.
+    pub patch_server_url: Option<String>,
 }
 
 impl DownloadParams {
@@ -1851,10 +1854,9 @@ type LockRefusals = HashMap<String, (&'static str, String)>;
 /// classic / yarn berry gates and cargo's locked-version gate), over the
 /// patches the phase would otherwise fetch a view for — past the Bun
 /// refusal and the ledger's idempotency skip, which take precedence in the
-/// fetch loop. A purl the hosted redirect ledger claims is left to the
-/// vendor loop: its takeover reverts the hosted lock edits first, and the
-/// revert rewrites the very text the gates read. A redirect ledger that
-/// cannot be read leaves every purl to the loop.
+/// fetch loop. A purl the lockfiles pin hosted is left to the vendor loop:
+/// its takeover restores the upstream lock entry first, and the restore
+/// rewrites the very text the gates read.
 ///
 /// Only a package the vendor loop would hand to its backend is refused
 /// here (see [`crate::commands::vendor::lock_refusals_reaching_backend`]):
@@ -1872,11 +1874,23 @@ async fn lock_text_refusals_for(
 ) -> LockRefusals {
     let cwd = params.cwd.as_path();
     let claimed: Vec<String> =
-        match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
-            Ok(Some(state)) => state.records.keys().map(|k| canonical_purl(k)).collect(),
-            Ok(None) => Vec::new(),
-            Err(_) => return HashMap::new(),
-        };
+        socket_patch_core::patch::redirect::upstream::HostedPin::all(
+            &socket_patch_core::vex::discover_patched_refs_with(
+                cwd,
+                &socket_patch_core::vex::DiscoverOptions {
+                    patch_server_origins: params
+                        .patch_server_url
+                        .iter()
+                        .filter(|url| !url.trim().is_empty())
+                        .cloned()
+                        .collect(),
+                },
+            )
+            .await,
+        )
+        .into_iter()
+        .map(|pin| canonical_purl(&pin.purl))
+        .collect();
     let candidates: Vec<(&str, &str)> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -3663,12 +3677,13 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
+        patch_server_url: args.common.patch_server_url.clone(),
     }
 }
 
 /// `get … --mode hosted`: hand the selected (purl, uuid) pairs to scan's
 /// hosted engine ([`super::scan::boxed_run_redirect_selected`]) — lockfile
-/// rewrite + redirect ledger, no manifest, no blobs — so the on-disk result
+/// rewrite only, no manifest, no blobs, no ledger — so the on-disk result
 /// matches `scan --mode hosted` selecting the same patches. The engine owns
 /// all output (and honors `--dry-run` internally); in JSON mode it nests its
 /// `redirect` block into the get base envelope passed as `scan_result`.
@@ -5208,6 +5223,7 @@ mod tests {
             strict: false,
             ecosystems: None,
             persist_blobs: false,
+            patch_server_url: None,
         }
     }
 
@@ -5876,6 +5892,7 @@ mod tests {
             ecosystems: None,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
+            patch_server_url: None,
         }
     }
 

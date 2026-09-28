@@ -227,12 +227,12 @@ async fn requests_containing(server: &MockServer, fragment: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 /// `get <uuid> --mode hosted` must produce scan's hosted result: lockfile
-/// repointed at the hosted artifact with the patched integrity, a redirect
-/// ledger with the patch record — and NO manifest, NO blobs (the ledger IS
-/// the persistence; parity with `scan --mode hosted`).
+/// repointed at the hosted artifact with the patched integrity — and NO
+/// manifest, NO blobs, NO redirect ledger (v5: the lockfile pin IS the
+/// persistence; parity with `scan --mode hosted`).
 #[tokio::test]
 #[serial]
-async fn get_uuid_hosted_rewrites_lockfile_and_writes_ledger_not_manifest() {
+async fn get_uuid_hosted_rewrites_lockfile_and_writes_no_ledger_or_manifest() {
     let server = MockServer::start().await;
     mock_view(&server, UUID1, PURL1).await;
     mock_reference(&server).await;
@@ -259,14 +259,11 @@ async fn get_uuid_hosted_rewrites_lockfile_and_writes_ledger_not_manifest() {
         "upstream resolved/integrity must be replaced; got:\n{lock}"
     );
 
-    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
-    assert!(ledger_path.is_file(), "redirect ledger must be written");
-    let ledger: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
-    assert_eq!(ledger["mode"], "hosted");
-    assert_eq!(
-        ledger["records"][PURL1]["uuid"], UUID1,
-        "the ledger must record the redirected patch for VEX; got:\n{ledger}"
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "v5 hosted mode must NOT write the redirect ledger"
     );
 
     assert!(
@@ -281,8 +278,8 @@ async fn get_uuid_hosted_rewrites_lockfile_and_writes_ledger_not_manifest() {
 
 /// A GHSA fan-out across two versions must be narrowed to the INSTALLED
 /// version before the hosted engine runs: only its uuid is sent to the
-/// reference endpoint, only its lock entry is rewritten, and only its purl
-/// lands in the ledger.
+/// reference endpoint, only its lock entry is rewritten, and no ledger is
+/// written.
 #[tokio::test]
 #[serial]
 async fn get_ghsa_hosted_narrows_to_installed_version() {
@@ -321,14 +318,15 @@ async fn get_ghsa_hosted_narrows_to_installed_version() {
         reference_bodies[0]
     );
 
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(ledger["records"][PURL1].is_object());
     assert!(
-        ledger["records"][PURL2].is_null(),
-        "no record for the uninstalled version"
+        !lock.contains(UUID2) && !lock.contains(&format!("{NAME}-2.0.0")),
+        "the uninstalled version must not be pinned; got:\n{lock}"
+    );
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "v5 hosted mode must NOT write the redirect ledger"
     );
     assert!(!tmp.path().join(".socket/manifest.json").exists());
 }

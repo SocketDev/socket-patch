@@ -427,7 +427,7 @@ impl GlobalArgs {
     }
 
     /// The project root whose `.socket/` state stores — manifest, vendor
-    /// ledger, redirect ledger — belong together: the RESOLVED manifest's
+    /// ledger — belong together: the RESOLVED manifest's
     /// directory, stepping out of a standard `.socket/` layout when the
     /// manifest lives in one. For the default `<cwd>/.socket/manifest.json`
     /// this is exactly `cwd`; for a `--manifest-path` into another project

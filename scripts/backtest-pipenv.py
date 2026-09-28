@@ -51,6 +51,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,6 +238,38 @@ def vex_attests(rc, doc, purl_base, uuid, marker):
     return rc == 0 and bool(statements) and all(
         st.get("status") == "not_affected" and part in (st.get("impact_statement") or "") for st in statements
     )
+
+
+def hosted_uuid(text):
+    """The patch uuid of the first patch.socket.dev URL in `text` (the LAST
+    uuid-shaped path segment: an earlier one may be a grant token)."""
+    m = re.search(r"https://patch\.socket\.dev/[^\s\"'#]+", text)
+    if not m:
+        return None
+    uuids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", m[0])
+    return uuids[-1] if uuids else None
+
+
+def published_record(uuid):
+    """`GET https://patches-api.socket.dev/patch/view/<uuid>` (the public proxy):
+    v5 hosted mode keeps no ledger, so this is the record a hosted pin names."""
+    url = f"https://patches-api.socket.dev/patch/view/{uuid}"
+    for attempt in range(1, 6):
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SocketPatchCLI-backtest/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt == 5:
+                raise
+            time.sleep(10 * attempt)
+
+
+def vex_nothing_named(rc, envelope, doc, purl_base):
+    """A standalone `vex --json` run over a checkout that names the patch
+    nowhere (no manifest, no ledger, no wiring): `manifest_not_found`, exit 2."""
+    return (rc == 2 and not vex_statements_for(doc, purl_base)
+            and ((envelope or {}).get("error") or {}).get("code") == "manifest_not_found")
 
 
 def vex_omits(rc, envelope, doc, purl_base, reason):
@@ -608,7 +642,11 @@ def main():
 
     def record_hashes(project, mode):
         if mode == "hosted":
-            recs = json.loads((project / ".socket/vendor/redirect-state.json").read_text())["records"]
+            # v5 hosted mode keeps no ledger: the lock pin names the uuid.
+            uuid = hosted_uuid((project / "Pipfile.lock").read_text())
+            if uuid is None:
+                raise RuntimeError("the hosted Pipfile.lock pins no patch.socket.dev uuid")
+            recs = {PURL_BASE: published_record(uuid)}
         elif mode == "vendored":
             # Vendored mode never writes `.socket/manifest.json`: the ledger
             # entry embeds the patch record.
@@ -970,13 +1008,16 @@ def main():
         if mode == "hosted":
             expected_key = "path" if 7 <= major < 2018 else "file"
             check("lockHasPatchUrl", b"patch.socket.dev" in lock_after and b"#sha256=" in lock_after)
+            check("noLedger", not (project / ".socket/vendor/redirect-state.json").exists())
         else:
             has_extras = any(isinstance(e, dict) and e.get("extras") for _, _, e in lock_entries(pristine_lock.decode()))
             expected_key = "path" if has_extras else "file"
             check("lockHasVendoredRef", b".socket/vendor/pypi" in lock_after)
         check("expectedSourceKey", keys == [expected_key], {"expected": expected_key, "got": keys})
         pristine_entries = {(s, k): e for s, k, e in lock_entries(pristine_lock.decode())}
-        check("allCategoriesRewritten", entries and all(("file" in e or "path" in e) and "version" not in e and "index" not in e for _, _, e in entries) and {(s, k) for s, k, _ in entries} == set(pristine_entries), {"pristine": sorted(pristine_entries), "rewritten": sorted((s, k) for s, k, _ in entries)})
+        # Hosted keeps Pipenv's own `index` (rollback carries it back; nothing
+        # else can re-derive it); vendored drops it.
+        check("allCategoriesRewritten", entries and all(("file" in e or "path" in e) and "version" not in e and (e.get("index") == pristine_entries.get((s, k), {}).get("index") if mode == "hosted" else "index" not in e) for s, k, e in entries) and {(s, k) for s, k, _ in entries} == set(pristine_entries), {"pristine": sorted(pristine_entries), "rewritten": sorted((s, k) for s, k, _ in entries)})
         check("markersExtrasPreserved", all(e.get("markers") == pristine_entries.get((s, k), {}).get("markers") and e.get("extras") == pristine_entries.get((s, k), {}).get("extras") for s, k, e in entries))
         after, before, uuid = record_hashes(project, mode)
         info["uuid"] = uuid
@@ -1073,10 +1114,11 @@ def main():
         marker = b"patch.socket.dev" if mode == "hosted" else b".socket/vendor/pypi"
         info["relock"] = {"exit": rl.rc, "lockBytesUnchanged": relocked == lock_after, "patchSourceKept": marker in relocked, "pipfileUnchanged": (project / "Pipfile").read_bytes() == pristine_pipfile, "tail": rl.tail(300) if not rl.ok() else None}
         # A relock regenerated the entry: `rollback` must retire the redirect
-        # cleanly (exit 0, ledger cleared) instead of refusing forever — judged
-        # in a copy so the main flow keeps its state. Two relock outcomes exist:
-        # registry shape (the reference is gone; the relocked lock is the desired
-        # end state and must be kept) and the Pipenv 2023+ hybrid of a
+        # cleanly instead of refusing forever — judged in a copy so the main
+        # flow keeps its state. Two relock outcomes exist: registry shape (the
+        # reference is gone; the relocked lock is the desired end state and
+        # must be kept — hosted keeps no ledger in v5, so there is nothing
+        # left to roll back at all) and the Pipenv 2023+ hybrid of a
         # marker-excluded entry (our reference kept, upstream hashes + version
         # restored around it); that entry is still ours and must roll back to
         # the original registry entry, leaving no Socket reference behind.
@@ -1095,19 +1137,25 @@ def main():
                 lock_ok = marker not in post and urllib3_entries(post) == urllib3_entries(pristine_lock)
             else:
                 lock_ok = post == relocked
-            check("rollbackAfterRelockRetires", rrb.ok() and cleared and lock_ok, {"exit": rrb.rc, "cleared": cleared, "hybridRelock": hybrid, "lockKeptRelocked": post == relocked, "lockRestoredOriginal": post == pristine_lock, "referenceLeft": marker in post, "envelope": {k: erb2.get(k) for k in ("status", "hosted", "vendoredReverted", "failed") if k in erb2}, "tail": rrb.tail(400) if not rrb.ok() else None})
+            if mode == "hosted" and not hybrid:
+                # No pin, no ledger, no manifest: nothing to roll back.
+                retired = rrb.rc == 1 and erb2.get("error") == "Manifest not found"
+            else:
+                retired = rrb.ok()
+            check("rollbackAfterRelockRetires", retired and cleared and lock_ok, {"exit": rrb.rc, "cleared": cleared, "hybridRelock": hybrid, "lockKeptRelocked": post == relocked, "lockRestoredOriginal": post == pristine_lock, "referenceLeft": marker in post, "envelope": {k: erb2.get(k) for k in ("status", "hosted", "vendoredReverted", "failed") if k in erb2}, "tail": rrb.tail(400) if not rrb.ok() else None})
         (project / "Pipfile.lock").write_bytes(lock_after)
         (project / "Pipfile").write_bytes(pristine_pipfile)
 
-        # Rollback restores every byte and clears the ledgers.
+        # Rollback restores every byte (hosted: the upstream PyPI entry,
+        # re-resolved from the registry) and clears the ledgers.
         rb = cli_run(penv, "rollback", log="rollback.log")
         erb = rb.json_or_empty()
         check("rollbackExit0", rb.ok(), rb.tail(600) if not rb.ok() else None)
         check("rollbackRestoresLockBytes", (project / "Pipfile.lock").read_bytes() == pristine_lock)
         check("rollbackKeepsPipfile", (project / "Pipfile").read_bytes() == pristine_pipfile)
         if mode == "hosted":
-            ledger = project / ".socket/vendor/redirect-state.json"
-            check("rollbackClearsRedirectLedger", not ledger.exists() or not json.loads(ledger.read_text()).get("records"))
+            check("rollbackNoRedirectLedger", not (project / ".socket/vendor/redirect-state.json").exists())
+            check("rollbackRestoredUpstream", PURL_BASE in ((erb.get("hosted") or {}).get("reverted") or []), erb.get("hosted"))
         if mode == "vendored":
             check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists())
             state = project / ".socket/vendor/state.json"
@@ -1129,13 +1177,14 @@ def main():
 
     def manifestless_vex(case, fresh, penv, mode, uuid, pristine_lock, pristine_pipfile):
         """Manifest-less VEX over the installed fresh clone, each step on its
-        own copy: the manifest deleted (ledgers kept) attests; the ledgers
-        deleted too still attest (lockfile discovery + the public proxy's
-        record); `--offline` without a local record is `record_unavailable`;
-        the lock reverted to the registry (ledgers + artifacts kept) is not
-        attested, `--no-verify` included."""
+        own copy: the manifest deleted (vendor ledger kept; hosted keeps none
+        in v5) attests; the ledgers deleted too still attest (lockfile
+        discovery + the public proxy's record); `--offline` without a local
+        record is `record_unavailable`; the lock reverted to the registry
+        (vendor ledger + artifacts kept) is not attested, `--no-verify`
+        included — hosted then names the patch nowhere at all."""
         marker = "redirected" if mode == "hosted" else "vendored"
-        unwired = "redirect_unwired" if mode == "hosted" else "vendor_unwired"
+        unwired = "vendor_unwired"
         out = {}
 
         def copy(name, strip_ledgers=False):
@@ -1174,7 +1223,9 @@ def main():
         (d / "Pipfile").write_bytes(pristine_pipfile)
         for label, flags in (("reverted", ()), ("revertedNoVerify", ("--no-verify",))):
             rc, env_, doc, tail = vex(d, label, *flags)
-            out[label] = verdict(vex_omits(rc, env_, doc, PURL_BASE, unwired), rc, env_, tail)
+            dead = (vex_nothing_named(rc, env_, doc, PURL_BASE) if mode == "hosted"
+                    else vex_omits(rc, env_, doc, PURL_BASE, unwired))
+            out[label] = verdict(dead, rc, env_, tail)
         return out
 
     def vex_info(vx):

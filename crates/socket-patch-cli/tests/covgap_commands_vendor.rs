@@ -1,8 +1,9 @@
 //! Coverage-gap tests for `commands/vendor.rs`:
 //! the fail-closed ledger/manifest exit contracts, the fresh-clone
-//! committed-artifact staging error ladder, the redirect-ledger takeover
-//! guard, the human-mode (no `--json`) output surface, and the unix
-//! fault-injection paths for the two state-write failure events.
+//! committed-artifact staging error ladder, the hosted-pin takeover guard
+//! (v5: hosted state is the lockfile pins), the human-mode (no `--json`)
+//! output surface, and the unix fault-injection paths for the state-write
+//! failure events.
 //!
 //! Fixture + runner shapes mirror `in_process_vendor.rs` (which this suite
 //! deliberately does not touch): an offline, self-contained npm project with
@@ -427,58 +428,122 @@ fn missing_package_with_no_lock_and_no_ledger_is_calm_skip() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 3. redirect-ledger takeover guard
+// 3. hosted-pin takeover guard (v5: lockfile pins, no redirect ledger)
 // ─────────────────────────────────────────────────────────────────────
 
-/// A malformed redirect ledger makes a claimed purl indistinguishable from
-/// an unclaimed one, so every purl of a takeover-capable ecosystem (npm,
-/// cargo) fails CLOSED with the corruption surfaced — and nothing is
-/// vendored over the possibly-live hosted redirect.
+/// The mock patch-server origin the hosted pins below live on. Only
+/// `https://patch.socket.dev` and the `--patch-server-url` origin count as
+/// hosted, so every run over these pins passes that flag.
+const HOSTED_ORIGIN: &str = "http://patch.test";
+const HOSTED_INTEGRITY: &str = "sha512-HOSTEDpatchedHOSTEDpatched==";
+/// What the mock npm registry's version document hands back for the
+/// upstream restore.
+const UPSTREAM_INTEGRITY: &str = "sha512-UPSTREAMupstreamUPSTREAM==";
+
+fn hosted_url() -> String {
+    format!(
+        "{HOSTED_ORIGIN}/patch/npm/left-pad/1.3.0/55555555-5555-4555-8555-555555555555/{UUID}/left-pad-1.3.0.tgz"
+    )
+}
+
+/// Pin the fixture's left-pad entry to the hosted tarball (what `scan
+/// --mode hosted` leaves in package-lock.json) and return the lock bytes.
+fn pin_hosted(fx: &NpmFixture) -> Vec<u8> {
+    let mut lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
+    lock["packages"]["node_modules/left-pad"]["resolved"] = Value::String(hosted_url());
+    lock["packages"]["node_modules/left-pad"]["integrity"] =
+        Value::String(HOSTED_INTEGRITY.to_string());
+    let mut bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(fx.lock_path(), &bytes).unwrap();
+    bytes
+}
+
+/// A wiremock npm registry answering left-pad@1.3.0's version document.
+async fn mock_npm_registry() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/left-pad/1.3.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "left-pad",
+            "version": "1.3.0",
+            "dist": {
+                "tarball": format!("{}/left-pad/-/left-pad-1.3.0.tgz", server.uri()),
+                "integrity": UPSTREAM_INTEGRITY,
+                "shasum": "0000000000000000000000000000000000000000"
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// `vendor --json --patch-server-url <mock origin>` through the binary,
+/// ONLINE against the mock registry (the upstream restore needs it) but
+/// anonymous, so no other network path opens.
+fn vendor_online(fx: &NpmFixture, registry: &str, extra: &[&str]) -> (i32, Value) {
+    let root = fx.root().to_str().unwrap();
+    let mut args = vec![
+        "vendor",
+        "--json",
+        "--patch-server-url",
+        HOSTED_ORIGIN,
+        "--cwd",
+        root,
+    ];
+    args.extend_from_slice(extra);
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &args,
+        &[
+            ("SOCKET_NO_API_TOKEN", "1"),
+            ("SOCKET_NPM_REGISTRY", registry),
+        ],
+    );
+    let env: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+    (code, env)
+}
+
+/// A pre-v5 redirect ledger on disk (even a malformed one) is IGNORED:
+/// the vendor run neither reads nor rewrites it, vendors the purl as
+/// usual, and leaves the stale file byte-identical.
 #[test]
-fn corrupt_redirect_ledger_fails_takeover_capable_purl_closed() {
+fn corrupt_pre_v5_redirect_ledger_is_ignored_by_vendor() {
     let fx = npm_fixture();
     std::fs::create_dir_all(fx.vendor_dir()).unwrap();
     std::fs::write(fx.redirect_state_path(), b"garbage").unwrap();
 
     let (code, env) = vendor_cli(fx.root(), &[]);
-    assert_eq!(code, 1, "{env:#}");
-    let failed = find_event(&env, "failed", Some("redirect_ledger_corrupt"));
-    assert_eq!(failed["purl"], PURL);
+    assert_eq!(code, 0, "a stale ledger must not block vendoring: {env:#}");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], PURL);
     assert!(
-        failed["error"]
-            .as_str()
-            .is_some_and(|d| d.contains("cannot vendor over a possibly-live hosted redirect")),
-        "{env:#}"
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "redirect_ledger_corrupt"),
+        "the pre-v5 ledger is never read: {env:#}"
     );
+    assert!(fx.tgz_path().is_file(), "the purl is vendored");
+    assert_ne!(fx.lock_bytes(), fx.original_lock, "the lock is rewired");
     assert_eq!(
-        fx.lock_bytes(),
-        fx.original_lock,
-        "the lock must not be rewired while the redirect ledger is unreadable"
-    );
-    assert!(
-        !fx.tgz_path().exists(),
-        "no artifact may be produced for the refused purl"
+        std::fs::read(fx.redirect_state_path()).unwrap(),
+        b"garbage",
+        "the pre-v5 ledger is left untouched"
     );
 }
 
-/// Dry-run over a purl the redirect ledger still claims: the run must warn
+/// Dry run over a purl the lockfile pins hosted: the run warns
 /// `vendor_would_revert_redirect` (an UNCOUNTED advisory — dry/wet takeover
-/// parity) and leave both the redirect ledger and the lockfile untouched.
-#[test]
-fn dry_run_over_claimed_redirect_warns_and_writes_nothing() {
+/// parity) after resolving the upstream entry exactly like a wet run
+/// would, and writes nothing — no lock edit, no artifact, no ledger.
+#[tokio::test]
+async fn dry_run_over_hosted_pin_warns_and_writes_nothing() {
     let fx = npm_fixture();
-    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
-    let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
-    let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-    let ledger = json!({
-        "version": 1,
-        "mode": "hosted",
-        "records": { PURL: patch_record(&before_hash, &after_hash) }
-    });
-    let ledger_bytes = serde_json::to_vec_pretty(&ledger).unwrap();
-    std::fs::write(fx.redirect_state_path(), &ledger_bytes).unwrap();
+    let hosted_lock = pin_hosted(&fx);
+    let registry = mock_npm_registry().await;
 
-    let (code, env) = vendor_cli(fx.root(), &["--dry-run"]);
+    let (code, env) = vendor_online(&fx, &registry.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "the dry run itself succeeds: {env:#}");
     let warned = find_event(&env, "skipped", Some("vendor_would_revert_redirect"));
     assert_eq!(warned["purl"], PURL);
@@ -487,62 +552,114 @@ fn dry_run_over_claimed_redirect_warns_and_writes_nothing() {
         "the takeover advisory is uncounted: {env:#}"
     );
     assert_eq!(
-        std::fs::read(fx.redirect_state_path()).unwrap(),
-        ledger_bytes,
-        "a dry run must not touch the redirect ledger"
-    );
-    assert_eq!(
         fx.lock_bytes(),
-        fx.original_lock,
+        hosted_lock,
         "a dry run must not touch the lock"
+    );
+    assert!(!fx.tgz_path().exists(), "a dry run vendors nothing");
+    assert!(
+        !fx.state_path().exists(),
+        "a dry run writes no vendor ledger"
+    );
+    assert!(
+        !fx.redirect_state_path().exists(),
+        "no hosted ledger is ever written"
     );
 }
 
-/// A claimed redirect whose recorded edit cannot be reverted (no recorded
-/// original fragment) fails the purl CLOSED with `redirect_revert_failed`
-/// — vendoring over an unrevertable live redirect would strand the hosted
-/// edits forever.
-#[test]
-fn unrevertable_redirect_claim_fails_closed() {
+/// The wet twin: vendoring over the hosted pin first restores the upstream
+/// registry entry (`vendor_takeover_reverted_redirect`), then vendors; the
+/// vendor ledger records the UPSTREAM entry as the original, so `vendor
+/// --revert` lands on the registry entry — never back on the hosted URL.
+#[tokio::test]
+async fn vendor_over_hosted_pin_restores_upstream_then_revert_returns_to_registry() {
     let fx = npm_fixture();
-    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
-    let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
-    let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-    // A yarn-classic hosted edit claiming this purl, with NO original
-    // fragment recorded: the revert must refuse rather than guess.
-    let ledger = json!({
-        "version": 1,
-        "mode": "hosted",
-        "edits": [{
-            "path": "yarn.lock",
-            "kind": "redirect_yarn_classic_entry",
-            "action": "rewritten",
-            "key": "left-pad@1.3.0"
-        }],
-        "records": { PURL: patch_record(&before_hash, &after_hash) }
-    });
-    let ledger_bytes = serde_json::to_vec_pretty(&ledger).unwrap();
-    std::fs::write(fx.redirect_state_path(), &ledger_bytes).unwrap();
+    pin_hosted(&fx);
+    let registry = mock_npm_registry().await;
 
-    let (code, env) = vendor_cli(fx.root(), &[]);
+    let (code, env) = vendor_online(&fx, &registry.uri(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "applied", None);
+    let warned = find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+    assert!(
+        warned
+            .to_string()
+            .contains("restored its upstream registry entry (package-lock.json)"),
+        "the advisory names the restored lockfile: {warned:#}"
+    );
+    let lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
+    let entry = &lock["packages"]["node_modules/left-pad"];
+    assert!(
+        entry["resolved"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(".socket/vendor/"),
+        "the lock is vendored: {lock:#}"
+    );
+    assert!(!fx
+        .lock_bytes()
+        .windows(HOSTED_ORIGIN.len())
+        .any(|w| w == HOSTED_ORIGIN.as_bytes()));
+    assert!(!fx.redirect_state_path().exists(), "no hosted ledger");
+
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    let lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
+    let entry = &lock["packages"]["node_modules/left-pad"];
+    assert_eq!(
+        entry["resolved"],
+        format!("{}/left-pad/-/left-pad-1.3.0.tgz", registry.uri()),
+        "revert lands on the upstream registry tarball: {lock:#}"
+    );
+    assert_eq!(entry["integrity"], UPSTREAM_INTEGRITY, "{lock:#}");
+}
+
+/// A hosted pin whose upstream entry cannot be restored (here: `--offline`,
+/// so the registry lookup is impossible) fails the purl CLOSED with
+/// `redirect_revert_failed` naming the checkout remedy — vendoring over a
+/// live hosted pin would record the hosted fragment as the "original".
+#[test]
+fn unrestorable_hosted_pin_fails_closed() {
+    let fx = npm_fixture();
+    let hosted_lock = pin_hosted(&fx);
+
+    let (code, env) = vendor_cli(fx.root(), &["--patch-server-url", HOSTED_ORIGIN]);
     assert_eq!(code, 1, "{env:#}");
     let failed = find_event(&env, "failed", Some("redirect_revert_failed"));
     assert_eq!(failed["purl"], PURL);
+    let detail = failed["error"].as_str().unwrap_or_default();
     assert!(
-        failed["error"]
-            .as_str()
-            .is_some_and(|d| d.contains("cannot vendor over the live hosted redirect")),
+        detail.contains("cannot vendor over the live hosted pin")
+            && detail.contains("git checkout -- package-lock.json"),
         "{env:#}"
     );
     assert_eq!(
-        std::fs::read(fx.redirect_state_path()).unwrap(),
-        ledger_bytes,
-        "a refused takeover must leave the redirect ledger as it was"
+        fx.lock_bytes(),
+        hosted_lock,
+        "the hosted pin stays as found"
     );
-    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
     assert!(!fx.tgz_path().exists(), "no artifact for the refused purl");
+    assert!(!fx.state_path().exists(), "no vendor ledger entry");
+    assert!(!fx.redirect_state_path().exists());
 }
 
+/// Without `--patch-server-url` a URL on a non-Socket origin is NOT a
+/// hosted pin, so no takeover is attempted and no `redirect_revert_failed`
+/// can fire.
+#[test]
+fn hosted_url_on_unconfigured_origin_is_not_a_takeover() {
+    let fx = npm_fixture();
+    pin_hosted(&fx);
+
+    let (_code, env) = vendor_cli(fx.root(), &[]);
+    assert!(
+        events(&env).iter().all(|e| {
+            e["errorCode"] != "redirect_revert_failed"
+                && e["errorCode"] != "vendor_takeover_reverted_redirect"
+        }),
+        "an unrecognized origin is not hosted state: {env:#}"
+    );
+}
 // ─────────────────────────────────────────────────────────────────────
 // 4. revert-failure accounting on tampered ledger entries
 // ─────────────────────────────────────────────────────────────────────
@@ -993,61 +1110,6 @@ async fn vendor_state_write_failure_reports_failed_event() {
     );
 }
 
-/// A hosted redirect record whose revert succeeds but whose ledger update
-/// cannot be persisted (`.socket/vendor` read-only). The takeover's revert,
-/// its redirect-ledger drop, the vendor rewire and the vendor ledger are
-/// committed together, so the failed commit leaves ALL of them as found:
-/// the lock untouched, the redirect ledger byte-identical (still claiming
-/// only wiring that is still there), no vendor ledger — never a redirect
-/// ledger claiming reverted wiring. The run exits 1 with
-/// `vendor_commit_failed`. (Before the group commit the takeover persisted
-/// the redirect ledger on its own and failed the purl closed with
-/// `redirect_ledger_write_failed` before vendoring it.)
-#[cfg(unix)]
-#[test]
-fn redirect_ledger_write_failure_commits_nothing() {
-    let fx = npm_fixture();
-    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
-    let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
-    let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-    // A record claiming the purl with no edits left to unwind: the revert
-    // trivially succeeds, so the ledger persist is the step that fails.
-    let ledger = json!({
-        "version": 1,
-        "mode": "hosted",
-        "records": { PURL: patch_record(&before_hash, &after_hash) }
-    });
-    let ledger_bytes = serde_json::to_vec_pretty(&ledger).unwrap();
-    std::fs::write(fx.redirect_state_path(), &ledger_bytes).unwrap();
-    chmod(&fx.vendor_dir(), 0o555);
-    let _restore = RestorePerms(fx.vendor_dir());
-
-    let (code, env) = vendor_cli(fx.root(), &[]);
-    assert_eq!(code, 1, "{env:#}");
-    assert_eq!(env["error"]["code"], "vendor_commit_failed", "{env:#}");
-    assert!(
-        env["error"]["message"]
-            .as_str()
-            .is_some_and(|d| d.contains("could not commit")),
-        "{env:#}"
-    );
-    assert_eq!(
-        fx.lock_bytes(),
-        fx.original_lock,
-        "no vendor rewire is committed"
-    );
-    assert!(!fx.state_path().exists(), "no vendor ledger is committed");
-    assert_eq!(
-        std::fs::read(fx.redirect_state_path()).unwrap(),
-        ledger_bytes,
-        "the unpersistable ledger is left exactly as found"
-    );
-    assert!(
-        !fx.vendor_dir().join(".commit-journal.json").exists(),
-        "the failed commit leaves no journal behind"
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // 8. human-mode error/refusal stderr surfaces (no --json, no --silent)
 //
@@ -1157,65 +1219,52 @@ async fn human_fetch_failure_prints_fetch_failed() {
         "nothing may be vendored from a failed fetch"
     );
 }
-
-/// Human corrupt-redirect-ledger surface: the takeover-capable purl's
-/// fail-closed refusal prints `Cannot vendor …` with the corruption.
+/// Human stale-ledger surface: a malformed pre-v5 redirect ledger is
+/// ignored — the run vendors normally and prints no refusal.
 #[test]
-fn human_corrupt_redirect_ledger_prints_cannot_vendor() {
+fn human_corrupt_pre_v5_redirect_ledger_vendors_normally() {
     let fx = npm_fixture();
     std::fs::create_dir_all(fx.vendor_dir()).unwrap();
     std::fs::write(fx.redirect_state_path(), b"garbage").unwrap();
 
     let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Vendored 1 package."),
+        "the stale ledger does not block the run: {stdout}"
+    );
+    assert!(
+        !stderr.contains("Cannot vendor"),
+        "no refusal is printed: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(fx.redirect_state_path()).unwrap(),
+        b"garbage",
+        "the pre-v5 ledger is left untouched"
+    );
+}
+
+/// Human unrestorable-hosted-pin surface: an offline run over a hosted pin
+/// prints the `Cannot vendor …: cannot restore the upstream entry` line and
+/// counts the refusal.
+#[test]
+fn human_unrestorable_hosted_pin_prints_cannot_restore() {
+    let fx = npm_fixture();
+    let hosted_lock = pin_hosted(&fx);
+
+    let (code, stdout, stderr) = human_vendor(&fx, &["--patch-server-url", HOSTED_ORIGIN]);
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:"),
-        "stderr names the refused purl: {stderr}"
+        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:")
+            && stderr.contains("cannot restore the upstream entry"),
+        "the human takeover-refusal line: {stderr}"
     );
     assert!(
         stdout.contains("Vendored 0 packages; 1 failed."),
         "the fail-closed refusal is counted: {stdout}"
     );
-    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+    assert_eq!(fx.lock_bytes(), hosted_lock, "lock untouched");
 }
-
-/// Human unrevertable-redirect surface: a claimed purl whose hosted edits
-/// cannot be reverted prints the `cannot revert the hosted redirect` line.
-#[test]
-fn human_unrevertable_redirect_prints_cannot_revert() {
-    let fx = npm_fixture();
-    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
-    let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
-    let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-    // Same unrevertable shape as section 3: a rewritten hosted edit with
-    // NO recorded original fragment.
-    let ledger = json!({
-        "version": 1,
-        "mode": "hosted",
-        "edits": [{
-            "path": "yarn.lock",
-            "kind": "redirect_yarn_classic_entry",
-            "action": "rewritten",
-            "key": "left-pad@1.3.0"
-        }],
-        "records": { PURL: patch_record(&before_hash, &after_hash) }
-    });
-    std::fs::write(
-        fx.redirect_state_path(),
-        serde_json::to_vec_pretty(&ledger).unwrap(),
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = human_vendor(&fx, &[]);
-    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(
-        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:")
-            && stderr.contains("cannot revert the hosted redirect"),
-        "the human takeover-refusal line: {stderr}"
-    );
-    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
-}
-
 /// Human backend-refusal surface: an installed package with NO lockfile of
 /// any flavor is a non-benign `vendor_lockfile_missing` refusal — the
 /// `Cannot vendor …` stderr line carries the backend's remedy.
