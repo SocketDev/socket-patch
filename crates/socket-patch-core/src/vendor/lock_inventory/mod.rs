@@ -36,7 +36,7 @@
 //!    [`inventory_project_every_lock`] unions for ledger liveness).
 //!
 //! Formats whose reader a writer already owns keep the model there
-//! (`cargo_lock::locked_packages`, `gemfile_lock`, `utils::python_lock` /
+//! (`formats::cargo`, `formats::gem`, `utils::python_lock` /
 //! `poetry_lock`, `utils::requirements`), and only the registry view lives
 //! here. [`LockfileEntry::source_kind`] carries provenance a view knows
 //! positively (crates.io), which ledger liveness reads instead of inferring
@@ -70,11 +70,9 @@ pub mod view;
 pub(crate) mod wired;
 pub(crate) mod yarn;
 
-pub(crate) use self::composer::{composer_lock_packages, ComposerLockPackage};
 pub(crate) use self::npm::{npm_lock_nodes, NpmLockNode};
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
-pub(crate) use self::pnpm::pnpm_registry_key;
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
 pub use self::view::{MemoryEntry, MemoryProject, ProjectView};
@@ -173,7 +171,7 @@ pub struct LockfileEntry {
 }
 
 impl LockfileEntry {
-    fn npm(
+    pub(crate) fn npm(
         name: impl Into<String>,
         version: impl Into<String>,
         resolved: Option<String>,
@@ -364,7 +362,7 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
 /// (drops `git+…`, `file:…`, `link:…` — content the registry conventions
 /// cannot reproduce; such entries stay listed for discovery but the fetch
 /// layer's integrity rule decides fetchability).
-fn http_url(raw: &str) -> Option<String> {
+pub(crate) fn http_url(raw: &str) -> Option<String> {
     (raw.starts_with("https://") || raw.starts_with("http://")).then(|| raw.to_string())
 }
 
@@ -374,8 +372,8 @@ fn http_url(raw: &str) -> Option<String> {
 /// `// ── file selection ──` (stat / list only, never a content read), and
 /// `// ── registry view ──` (unrestricted) — so lockfile discovery can
 /// import the models without bypassing its recognizing ctx reads. The same
-/// rule covers the other readers discovery imports: `vendor::maven_pom`,
-/// `vendor::nuget_config`'s reader half, and the `// ── pure reader ──`
+/// rule covers the other readers discovery imports: `formats::maven`,
+/// `formats::nuget`, and the `// ── pure reader ──`
 /// regions of the writer-owned `go_mod_edit`, `go_sum_edit`,
 /// `cargo_config` and `cargo_manifest`.
 #[cfg(test)]
@@ -471,7 +469,7 @@ mod architecture_tests {
             check(name, &text);
         }
         // Vendor-side readers lockfile discovery imports.
-        for rel in ["vendor/nuget_config.rs", "vendor/maven_pom.rs"] {
+        for rel in ["formats/nuget/mod.rs", "formats/maven/mod.rs"] {
             let text = std::fs::read_to_string(src.join(rel)).expect("read reader module");
             check(rel, &text);
         }
@@ -483,8 +481,8 @@ mod architecture_tests {
             "vendor/go_sum_edit.rs",
             "vendor/cargo_config.rs",
             "vendor/cargo_manifest.rs",
-            "vendor/nuget_config.rs",
-            "vendor/maven_pom.rs",
+            "formats/nuget/mod.rs",
+            "formats/maven/mod.rs",
         ] {
             let text = std::fs::read_to_string(src.join(rel)).expect("read reader module");
             assert!(

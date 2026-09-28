@@ -388,7 +388,7 @@ impl UpstreamClient {
             if self.offline {
                 return Err(OFFLINE.to_string());
             }
-            if !crate::vendor::gemfile_lock::is_plain_gem_token(name) {
+            if !crate::formats::gem::is_plain_gem_token(name) {
                 return Err(format!("{name:?} is not a plain gem name"));
             }
             let url = format!("{}/info/{name}", rubygems_base());

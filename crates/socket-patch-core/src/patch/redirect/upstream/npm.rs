@@ -466,7 +466,7 @@ pub(crate) async fn restore_pnpm_locks(
     files: &[String],
     ctx: &Ctx<'_>,
 ) -> FormatResult {
-    use super::super::pnpm;
+    use crate::formats::pnpm::grammar as pnpm;
 
     let mut result = FormatResult::default();
     let pins = by_uuid(pins);
