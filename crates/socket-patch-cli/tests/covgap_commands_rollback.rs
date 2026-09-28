@@ -1352,7 +1352,6 @@ fn qualified_manifest_purl_removed_after_vendored_revert() {
 // retired once no hosted pin remains.
 
 const LP_PURL: &str = "pkg:npm/left-pad@1.2.3";
-const LP_UUID: &str = "55555555-5555-4555-8555-555555555555";
 const LP_HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
 const IO_PURL: &str = "pkg:npm/is-odd@3.0.1";
 const IO_HOSTED_URL: &str = "http://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
@@ -1412,11 +1411,7 @@ impl NpmRegistry {
 /// `common::run` with the mock patch host recognized as hosted
 /// (`--patch-server-url`) and, when given, the npm registry pointed at the
 /// mock.
-fn run_hosted(
-    cwd: &Path,
-    args: &[&str],
-    registry: Option<&NpmRegistry>,
-) -> (i32, String, String) {
+fn run_hosted(cwd: &Path, args: &[&str], registry: Option<&NpmRegistry>) -> (i32, String, String) {
     let mut full: Vec<&str> = args.to_vec();
     full.extend(["--patch-server-url", PATCH_SERVER]);
     match registry {
@@ -1471,7 +1466,12 @@ fn yarn_original_block() -> String {
 }
 
 fn yarn_redirected_block() -> String {
-    yarn_block_for("left-pad", "1.2.3", LP_HOSTED_URL, "sha512-PATCHEDpatched==")
+    yarn_block_for(
+        "left-pad",
+        "1.2.3",
+        LP_HOSTED_URL,
+        "sha512-PATCHEDpatched==",
+    )
 }
 
 fn yarn_lock_content(block: &str) -> String {
@@ -1513,7 +1513,9 @@ fn hosted_human_wet_announces_and_unwinds() {
          stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains(&format!("Restored {LP_PURL} to its upstream registry entry")),
+        stdout.contains(&format!(
+            "Restored {LP_PURL} to its upstream registry entry"
+        )),
         "the wet restore line must print; stdout=\n{stdout}"
     );
     assert!(
@@ -1525,7 +1527,10 @@ fn hosted_human_wet_announces_and_unwinds() {
         yarn_lock_content(&yarn_original_block()),
         "the lock entry must be restored to the upstream registry entry"
     );
-    assert!(!ledger_path(tmp.path()).exists(), "no ledger is ever written");
+    assert!(
+        !ledger_path(tmp.path()).exists(),
+        "no ledger is ever written"
+    );
     assert!(
         !tmp.path().join(".socket").exists(),
         "a fully restored hosted project keeps no .socket/ residue (apply.lock \
@@ -1546,7 +1551,9 @@ fn hosted_human_dry_run_previews() {
         run_hosted(tmp.path(), &["rollback", "--dry-run"], Some(&registry));
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains(&format!("Would restore {LP_PURL} to its upstream registry entry")),
+        stdout.contains(&format!(
+            "Would restore {LP_PURL} to its upstream registry entry"
+        )),
         "the dry-run restore preview must print; stdout=\n{stdout}"
     );
     assert!(
@@ -1658,11 +1665,8 @@ fn per_purl_revert_failure_prints_human_stderr_line() {
     write_single_npm_fixture(tmp.path());
     let registry = NpmRegistry::start(&[]);
 
-    let (code, stdout, stderr) = run_hosted(
-        tmp.path(),
-        &["rollback", "--yes", LP_PURL],
-        Some(&registry),
-    );
+    let (code, stdout, stderr) =
+        run_hosted(tmp.path(), &["rollback", "--yes", LP_PURL], Some(&registry));
     assert_eq!(
         code, 1,
         "a refused pin must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
@@ -1714,7 +1718,10 @@ fn legacy_ledger_edits_are_never_replayed_in_both_modes() {
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
     assert_eq!(v["legacyRedirectLedgerRemoved"], true, "stdout=\n{stdout}");
-    assert!(!ledger_path(&project).exists(), "the stale ledger is deleted");
+    assert!(
+        !ledger_path(&project).exists(),
+        "the stale ledger is deleted"
+    );
     assert_eq!(
         std::fs::read_to_string(&evil).unwrap(),
         yarn_lock_content(&yarn_redirected_block()),
@@ -1773,7 +1780,10 @@ fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
-    assert_eq!(v["hosted"]["failed"][0]["purl"], LP_PURL, "stdout=\n{stdout}");
+    assert_eq!(
+        v["hosted"]["failed"][0]["purl"], LP_PURL,
+        "stdout=\n{stdout}"
+    );
     assert_eq!(v["hosted"]["reverted"], json!([]), "stdout=\n{stdout}");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
@@ -1796,7 +1806,11 @@ fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
-    assert_eq!(v["hosted"]["reverted"], json!([LP_PURL]), "stdout=\n{stdout}");
+    assert_eq!(
+        v["hosted"]["reverted"],
+        json!([LP_PURL]),
+        "stdout=\n{stdout}"
+    );
     assert!(
         v["hosted"]["editedFiles"].as_u64().unwrap_or(0) >= 1,
         "the restore rewrote the lock; stdout=\n{stdout}"
@@ -1958,11 +1972,8 @@ fn hosted_restore_write_failure_lands_in_hosted_failed() {
     if !readonly_dir_enforced(&project) {
         return;
     }
-    let (code, stdout, stderr) = run_hosted(
-        &project,
-        &["rollback", "--json", "--yes"],
-        Some(&registry),
-    );
+    let (code, stdout, stderr) =
+        run_hosted(&project, &["rollback", "--json", "--yes"], Some(&registry));
     guard.restore();
 
     assert_eq!(
@@ -2035,7 +2046,11 @@ fn bun_lock(line: &str) -> String {
 #[test]
 fn bun_lock_pin_restores_to_the_registry_tuple() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join("bun.lock"), bun_lock(&bun_redirected_line())).unwrap();
+    std::fs::write(
+        tmp.path().join("bun.lock"),
+        bun_lock(&bun_redirected_line()),
+    )
+    .unwrap();
     let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
     let (code, stdout, stderr) = run_hosted(tmp.path(), &["rollback", "--yes"], Some(&registry));
@@ -2044,7 +2059,9 @@ fn bun_lock_pin_restores_to_the_registry_tuple() {
         "the bun.lock restore succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains(&format!("Restored {LP_PURL} to its upstream registry entry")),
+        stdout.contains(&format!(
+            "Restored {LP_PURL} to its upstream registry entry"
+        )),
         "the wet restore line must print; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -2060,7 +2077,11 @@ fn bun_lock_pin_restores_to_the_registry_tuple() {
 #[test]
 fn bun_lock_pin_dry_run_previews() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join("bun.lock"), bun_lock(&bun_redirected_line())).unwrap();
+    std::fs::write(
+        tmp.path().join("bun.lock"),
+        bun_lock(&bun_redirected_line()),
+    )
+    .unwrap();
     let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
     let (code, stdout, stderr) =
@@ -2070,7 +2091,9 @@ fn bun_lock_pin_dry_run_previews() {
         "the bun.lock dry run succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains(&format!("Would restore {LP_PURL} to its upstream registry entry")),
+        stdout.contains(&format!(
+            "Would restore {LP_PURL} to its upstream registry entry"
+        )),
         "the dry-run preview line must print; stdout=\n{stdout}"
     );
     assert_eq!(

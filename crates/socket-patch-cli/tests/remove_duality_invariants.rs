@@ -610,7 +610,7 @@ fn write_redirect_ledger_text(root: &Path, text: &str) -> PathBuf {
 /// detached-vendored convention). No ledger is involved, and no `.socket/`
 /// state is left behind.
 #[test]
-fn hosted_only_remove_without_manifest_unwinds_redirect() {
+fn hosted_only_remove_without_manifest_restores_upstream() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
@@ -654,7 +654,7 @@ fn hosted_only_remove_without_manifest_unwinds_redirect() {
 /// which is retired once no hosted pin remains — and the envelope carries
 /// the `hosted_reverted` event alongside the per-purl manifest removal.
 #[test]
-fn hosted_remove_with_manifest_entry_unwinds_redirect() {
+fn hosted_remove_with_manifest_entry_restores_upstream() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
@@ -724,7 +724,7 @@ fn hosted_remove_with_manifest_entry_unwinds_redirect() {
 /// naming the `git checkout` remedy, and the lock + manifest
 /// byte-identical.
 #[test]
-fn hosted_unsupported_ecosystem_remove_fails_closed() {
+fn hosted_refused_restore_remove_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
@@ -771,7 +771,7 @@ fn hosted_unsupported_ecosystem_remove_fails_closed() {
 /// upstream entry — fail closed with `hosted_revert_failed`, the lock
 /// untouched and no `.socket/` state written.
 #[test]
-fn hosted_only_unsupported_remove_without_manifest_fails_closed() {
+fn hosted_only_refused_restore_remove_without_manifest_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();

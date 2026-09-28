@@ -669,11 +669,7 @@ impl NpmRegistry {
 }
 
 /// `run_remove` with the npm registry pointed at `registry`.
-fn run_remove_online(
-    cwd: &Path,
-    args: &[&str],
-    registry: &NpmRegistry,
-) -> (i32, String, String) {
+fn run_remove_online(cwd: &Path, args: &[&str], registry: &NpmRegistry) -> (i32, String, String) {
     let base = registry.base();
     run_remove(cwd, args, &[("SOCKET_NPM_REGISTRY", base.as_str())])
 }
@@ -686,7 +682,7 @@ fn legacy_ledger_path(root: &Path) -> PathBuf {
 /// byte-identical (and write no ledger) while reporting the would-be
 /// restore as a Verified/hosted_reverted event.
 #[test]
-fn remove_hosted_dry_run_leaves_lock_and_ledger_untouched() {
+fn remove_hosted_dry_run_leaves_lock_untouched() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
@@ -820,7 +816,7 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
 /// lockfiles, so a manifest removal neither reads nor warns about it, the
 /// removal succeeds, and the file is left alone.
 #[test]
-fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
+fn remove_corrupt_legacy_hosted_ledger_is_ignored_human() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
     let socket =
@@ -858,7 +854,7 @@ fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
 /// JSON twin: the removal still succeeds with no warning, and the corrupt
 /// ledger is left alone.
 #[test]
-fn remove_corrupt_hosted_ledger_json_still_removes() {
+fn remove_corrupt_legacy_hosted_ledger_is_ignored_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
     write_manifest_files_empty(tmp.path(), purl, "77777777-7777-4777-8777-777777777777");
@@ -942,7 +938,9 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
         "the listing must name the purl; got:\n{stderr}"
     );
     assert!(
-        stdout.contains(&format!("Restored {NPM_PURL} to its upstream registry entry")),
+        stdout.contains(&format!(
+            "Restored {NPM_PURL} to its upstream registry entry"
+        )),
         "the restore line must print; got:\n{stdout}"
     );
     // The restore really ran: lock holds the registry's entry byte-exactly.
@@ -1036,7 +1034,7 @@ fn remove_hosted_only_revert_failure_fails_closed() {
 /// manifest untouched and the lock byte-identical.
 #[cfg(unix)]
 #[test]
-fn remove_hosted_ledger_persist_failure_fails_closed() {
+fn remove_hosted_lockfile_write_failure_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("project");
     std::fs::create_dir(&root).unwrap();
@@ -1069,13 +1067,17 @@ fn remove_hosted_ledger_persist_failure_fails_closed() {
         manifest_before,
         "the manifest mutation must not have happened"
     );
-    assert_eq!(read_bytes(&lock_path), lock_before, "the lock was never written");
+    assert_eq!(
+        read_bytes(&lock_path),
+        lock_before,
+        "the lock was never written"
+    );
 }
 
 /// Hosted-only twin of the write failure.
 #[cfg(unix)]
 #[test]
-fn remove_hosted_only_ledger_persist_failure_fails_closed() {
+fn remove_hosted_only_lockfile_write_failure_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("project");
     std::fs::create_dir(&root).unwrap();
@@ -1103,7 +1105,11 @@ fn remove_hosted_only_ledger_persist_failure_fails_closed() {
         msg.contains("writing the restored lockfiles failed"),
         "the error must name the write failure; got: {msg}"
     );
-    assert_eq!(read_bytes(&lock_path), lock_before, "the lock was never written");
+    assert_eq!(
+        read_bytes(&lock_path),
+        lock_before,
+        "the lock was never written"
+    );
 }
 
 // ---------------------------------------------------------------------------
