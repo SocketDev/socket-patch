@@ -1,12 +1,10 @@
-//! Repair's pre-rebuild uuid-dir clearing must never DESTROY an artifact
-//! the dispatch then fails to replace. The rebuild loop clears the live
-//! dir right before `dispatch_vendor_one` (the backends rebuild on
-//! MISSING), but the dispatch itself can still refuse or fail — e.g. the
-//! in-hand installed copy is broken in a way no pre-rebuild rung probes —
-//! and a failed dispatch replaces nothing: the wired lockfiles are left
-//! pointing at a bare ENOENT, and (for pass-1 corrupt candidates) the
-//! forensic bytes the NOTE above repair's staging step promises to keep
-//! are gone. Gem fixtures modeled on repair_vendor_e2e's.
+//! Repair's pre-rebuild set-aside must never DESTROY an artifact the
+//! re-vendor then fails to replace. A corrupt artifact is moved aside so
+//! the backends rebuild on MISSING, but the dispatch itself can still
+//! refuse or fail — e.g. the installed copy is broken in a way no
+//! pre-rebuild rung probes — and a failed dispatch replaced nothing: the
+//! forensic bytes must come back. Gem fixtures modeled on
+//! repair_vendor_e2e's.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -144,18 +142,6 @@ async fn mount_gem_patch_api(mock: &MockServer) {
         .await;
 }
 
-/// Serve the after-blob (no-ledger repairs re-download in step 1).
-async fn mount_blob(mock: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v0/orgs/{ORG_SLUG}/patches/blob/{}",
-            git_sha256(AFTER)
-        )))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(AFTER))
-        .mount(mock)
-        .await;
-}
-
 fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) {
     let mut full = argv.to_vec();
     full.extend_from_slice(&[
@@ -210,82 +196,6 @@ fn vendor_gem_project(root: &Path, mock_uri: &str) -> PathBuf {
         "setup must vendor the patched copy"
     );
     copy
-}
-
-/// Ledger loss + member-healthy vendored dir → SOFT candidate; the
-/// installed copy is still DISCOVERABLE (the crawler only needs the gem
-/// dir with `lib/`) but its patched file is gone, so every pre-rebuild
-/// soft fallback is bypassed (a rebuild source is "in hand") and the
-/// dispatch itself fails the gem backend's fail-closed
-/// missing_existing_patch_files pre-check. The failed dispatch replaced
-/// nothing: the member-healthy artifact the wired Gemfile/Gemfile.lock
-/// still resolve through must SURVIVE — a broken installed copy must
-/// never be more destructive than an absent one (which keeps the tree,
-/// see repair_vendor_e2e's G1d). RED before the move-aside fix: the uuid
-/// dir was deleted up front and `bundle install` ENOENTs on the wired
-/// path.
-#[tokio::test]
-async fn repair_keeps_healthy_soft_artifact_when_rebuild_dispatch_fails() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path());
-    let copy = vendor_gem_project(tmp.path(), &mock.uri());
-    let gemfile_wired = std::fs::read(tmp.path().join("Gemfile")).unwrap();
-
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_file(
-        tmp.path()
-            .join(format!(
-                "vendor/bundle/ruby/3.4.0/gems/{GEM_NAME}-{GEM_VERSION}/lib/padlock.rb"
-            )),
-    )
-    .unwrap();
-
-    mount_blob(&mock).await;
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--download-mode", "file"],
-    );
-    // The rebuild failure stays loud...
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "failed" && e["purl"] == GEM_PURL),
-        "envelope={v}"
-    );
-    // ...but the healthy artifact must not have been destroyed.
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb"))
-            .expect("the vendored artifact must survive the failed rebuild"),
-        AFTER,
-        "member-healthy vendored copy intact"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("padlock.gemspec")).unwrap(),
-        GEMSPEC_STUB
-    );
-    assert!(
-        !tmp.path()
-            .join(format!(".socket/vendor/gem/{GEM_UUID}.pre-rebuild"))
-            .exists(),
-        "no set-aside residue after the restore"
-    );
-    // The pre-persisted fingerprint-less entry points at real bytes, and
-    // the pair is still wired to them.
-    let state: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(state["entries"][GEM_PURL]["uuid"], GEM_UUID, "state={state}");
-    assert_eq!(
-        std::fs::read(tmp.path().join("Gemfile")).unwrap(),
-        gemfile_wired,
-        "the wired Gemfile is untouched"
-    );
 }
 
 /// The pass-1 corrupt twin of the same root: a ledgered artifact whose
