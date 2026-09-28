@@ -1,12 +1,12 @@
 # NuGet vendoring v2: unique-version fallback seed
 
-**Status:** draft, revision 3. Revision 2 added the four adversarial reviews (§16). Revision 3 records where the prototype on this branch overrides the design (§0).
+**Status:** draft, revision 3. Revision 2 added the four adversarial reviews (§16). Revision 3 records where the prototype overrides the design (§0). Vendored NuGet redesign stays future work for v5 (see `v5-plan.md`). This document lands on its own; the prototype code lives on the branch [`v5/nuget-vendoring-prototype`](https://github.com/SocketDev/socket-patch/tree/v5/nuget-vendoring-prototype) and is not merged.
 
 ---
 
 ## 0. Where the prototype overrides this design
 
-The prototype in this PR was built after the design review. Building it and testing it against real `dotnet` changed several decisions. When anything below conflicts with this table, **this table wins**. The full list is in §17.
+The prototype on the branch [`v5/nuget-vendoring-prototype`](https://github.com/SocketDev/socket-patch/tree/v5/nuget-vendoring-prototype) was built after the design review. Building it and testing it against real `dotnet` changed several decisions. When anything below conflicts with this table, **this table wins**. The full list is in §17.
 
 | Design text | Prototype (authoritative) | Why |
 |---|---|---|
@@ -814,7 +814,7 @@ Dispositions: **Fixed** (design changed), **Refused** (moved to refused shapes),
 | L-P1 | Prototype needs CLI hooks not in §15 | **Fixed:** §15 scope and module table extended (+30–40%) |
 | L-minor | User edits of the targets, submodules/templates, builder churn, dry run, directory `ledger_covers`, NU1903 | **Fixed:** render sha plus `targets_edited`; worktree bound plus skip; builder sticky; in-memory render; inventory intactness; S-M6 |
 
-## 17. Prototype on this branch: what was built and how it deviates
+## 17. Prototype (follow-up branch `v5/nuget-vendoring-prototype`): what was built and how it deviates
 
 **Code:** `crates/socket-patch-core/src/vendor/nuget_{version,seed,lock,targets,fallback}.rs`, plus small routing hooks in `vendor/mod.rs`, `commands/vendor.rs` and `commands/repair_vendor.rs`.
 

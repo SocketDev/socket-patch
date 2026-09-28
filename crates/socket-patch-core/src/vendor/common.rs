@@ -321,18 +321,6 @@ pub(crate) struct ArchiveMember {
     dropped: bool,
 }
 
-impl ArchiveMember {
-    /// The archive-relative name, exactly as stored.
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The decompressed bytes.
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
 /// The in-memory twin of an [`super::registry_fetch::extract_zip`] with
 /// `strip_first = false`:
 /// every member decompressed into memory, in archive order, with the LAST
@@ -454,7 +442,7 @@ const MAX_NAME_BYTES: usize = 512;
 /// or rejects, no component that a path walk re-spells (`.`, `..`, empty) or
 /// that Windows trims (a trailing `.` or space) or redirects (a DOS device
 /// name), and nothing longer than the filesystem would accept.
-pub(crate) fn is_plain_archive_name(name: &str) -> bool {
+fn is_plain_archive_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_NAME_BYTES {
         return false;
     }

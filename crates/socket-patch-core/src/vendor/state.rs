@@ -736,10 +736,6 @@ pub(crate) struct VendorMarker {
     /// RFC3339 timestamp supplied by the caller (the CLI formats it).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vendored_at: String,
-    /// The NuGet fallback layout's seed description (what its shared
-    /// `socket-patch.targets` render reads).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nuget: Option<super::nuget_targets::NugetSeedMarker>,
 }
 
 impl VendorMarker {
@@ -760,7 +756,6 @@ impl VendorMarker {
             ecosystem: ecosystem.to_string(),
             vulnerabilities,
             vendored_at: vendored_at.to_string(),
-            nuget: None,
         }
     }
 }
@@ -1780,7 +1775,6 @@ mod tests {
             ecosystem: "npm".into(),
             vulnerabilities: vec!["GHSA-xxxx-yyyy-zzzz".into()],
             vendored_at: "2026-06-09T00:00:00Z".into(),
-            nuget: None,
         };
         write_marker(dir, &marker).await.unwrap();
         let text = tokio::fs::read_to_string(dir.join(VENDOR_MARKER_FILE))

@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="Humanizer.Core" Version="2.14.1" />
-  </ItemGroup>
-</Project>

@@ -21,7 +21,6 @@
 //! | pypi     | rebuilt wheel       | per manifest flavor: uv, poetry, pdm, pipenv, requirements ([`pypi`] routes) |
 //! | maven    | rebuilt jar         | committed `file://` maven2 repo + pom `<repository>` ([`maven_repo`]) |
 //! | nuget    | rebuilt nupkg       | folder feed + `nuget.config` + `packages.lock.json` pin ([`nuget_feed`]) |
-//! | nuget (opt-in) | extracted seed at a Socket version | fallback folder + generated targets + `Directory.Build.props` + lock splices ([`nuget_fallback`]) |
 //!
 //! npm requests route through [`npm_flavor`], which content-sniffs the
 //! project's lockfile (not just file presence) and dispatches to the
@@ -77,12 +76,7 @@ pub mod npm_flavor;
 pub mod npm_lock;
 mod npm_pack;
 pub(crate) mod nuget_config;
-pub mod nuget_fallback;
 pub mod nuget_feed;
-pub(crate) mod nuget_lock;
-pub(crate) mod nuget_seed;
-pub(crate) mod nuget_targets;
-pub(crate) mod nuget_version;
 pub(crate) mod parse_memo;
 pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
@@ -935,9 +929,6 @@ pub async fn service_preflight(
         Some("gem") => gem::service_preflight(purl, source_path, project_root, record).await,
         Some("golang") => golang::service_preflight(purl, project_root, record).await,
         Some("maven") => maven_repo::service_preflight(purl, project_root, record).await,
-        Some("nuget") if nuget_fallback::fallback_layout_for(purl, project_root).await => {
-            nuget_fallback::service_preflight(purl, project_root, record).await
-        }
         Some("nuget") => nuget_feed::service_preflight(purl, project_root, record).await,
         Some("pypi") => {
             pypi::service_preflight(purl, project_root, record, pipenv_version, installed_sites)
