@@ -609,10 +609,7 @@ pub fn parse_bun_bin_output(stdout: &str) -> Option<String> {
 ///
 /// Production callers live inside `#[cfg(target_os = "macos")]` blocks of
 /// `get_global_node_modules_paths` (Homebrew/nvm/volta/fnm fallbacks).
-/// `#[allow(dead_code)]` keeps the function visible to the inline
-/// `#[cfg(test)] mod tests` callers on every target without tripping
-/// `-D dead_code` on non-macOS clippy runs.
-#[allow(dead_code)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
     if !base.is_dir() {
         return Vec::new();
