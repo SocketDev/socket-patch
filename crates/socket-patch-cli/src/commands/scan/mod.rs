@@ -2057,7 +2057,7 @@ async fn run_scan(
         // `enabled: false` still hides candidates; report them like the
         // human arm does (the detail fetch runs only then).
         if !apply && !vendor && policy.reports_selection() && !all_packages_with_patches.is_empty() {
-            let _ = discover_selected(
+            if let Err((code, message)) = discover_selected(
                 &api_client,
                 &all_packages_with_patches,
                 can_access_paid_patches,
@@ -2067,7 +2067,11 @@ async fn run_scan(
                 telemetry,
                 Some(&mut result),
             )
-            .await;
+            .await
+            {
+                emit_discovery_error_json(&mut result, &message);
+                return code;
+            }
         }
 
         // --- Apply path (if requested) -----------------------------------

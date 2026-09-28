@@ -480,7 +480,7 @@ impl ScanPolicy {
             return;
         }
         for w in &self.warnings {
-            eprintln!("Warning ({}): {}", w.code, w.detail);
+            eprintln!("Warning: {}", w.detail);
         }
     }
 
