@@ -5,6 +5,7 @@ pub mod hash;
 pub mod manifest;
 pub mod package_json;
 pub mod patch;
+pub mod policy;
 pub mod setup;
 pub mod telemetry;
 pub mod update;

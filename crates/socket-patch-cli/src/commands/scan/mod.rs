@@ -374,43 +374,7 @@ pub struct ScanArgs {
     pub vex: VexEmbedArgs,
 }
 
-/// Whether a `--package` spec names the package at `purl`: a purl spec
-/// matches the same purl, or any version of it when it carries none; a
-/// bare spec matches the package's full name (`@scope/pkg`, `group/name`)
-/// or its last segment. Qualifiers are ignored and names compare
-/// case-insensitively (PyPI, NuGet and Composer names are case-insensitive;
-/// npm forbids uppercase).
-pub(crate) fn package_spec_matches(spec: &str, purl: &str) -> bool {
-    let decoded = normalize_purl(strip_purl_qualifiers(purl)).to_lowercase();
-    let spec = spec.trim().to_lowercase();
-    if spec.is_empty() {
-        return false;
-    }
-    let Some(rest) = decoded.strip_prefix("pkg:") else {
-        return false;
-    };
-    let Some((_eco, name_version)) = rest.split_once('/') else {
-        return false;
-    };
-    let name = match name_version.rfind('@').filter(|&i| i > 0) {
-        Some(at) => &name_version[..at],
-        None => name_version,
-    };
-    if let Some(spec_rest) = spec.strip_prefix("pkg:") {
-        let spec_purl = normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase();
-        let spec_rest = &spec_purl[4..];
-        let has_version = spec_rest
-            .split_once('/')
-            .is_some_and(|(_, nv)| nv.rfind('@').is_some_and(|i| i > 0));
-        return if has_version {
-            decoded == spec_purl
-        } else {
-            decoded.strip_prefix(&spec_purl).is_some_and(|tail| tail.starts_with('@'))
-        };
-    }
-    let spec = spec.replace(':', "/");
-    name == spec || name.rsplit('/').next() == Some(spec.as_str())
-}
+pub(crate) use socket_patch_core::policy::package_spec_matches;
 
 /// Embedded-VEX side-effect for `scan`'s JSON terminal returns. When
 /// `--vex` was requested and `base_code` is 0, generate the OpenVEX
