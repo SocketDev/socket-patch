@@ -51,7 +51,8 @@ into the new version's section — see docs/releasing.md.
   "socket-patch"` Gemfile block, and Composer `post-install-cmd` /
   `post-update-cmd` entries. Hooks already committed keep working, since
   they only call `socket-patch apply`, which stays; delete them by hand to
-  stop them. Agent mode is now `socket-patch scan --mode agent` once
+  stop them. The README's "Upgrading from `setup`" section lists each hook
+  and the commands to move to hosted mode or keep agent mode. Agent mode is now `socket-patch scan --mode agent` once
   (commit `.socket/`), then `socket-patch apply` in CI after every install.
   Hosted and vendored mode never needed a hook.
 - **The `socket-patch-hook` PyPI wheel and the `socket-patch-bundler` gem
@@ -73,6 +74,15 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed (BREAKING): patch UI streamlining
 
+- **`list` on an empty project exits 0.** A project with no manifest and
+  no ledger record (normal for hosted mode) used to exit 1 with
+  `manifest_not_found`; it now prints `No patches in this project. Run
+  \`socket-patch scan\`.` (human) or the success envelope with
+  `events: []` (`--json`). Only an unreadable or invalid manifest fails.
+- **Help is grouped by task**: patch (`scan`, `get`, `list`), undo
+  (`remove`, `rollback`), ship (`vex`, `vendor`), and agent mode
+  (`apply`, `repair`). `-h` keeps `--cwd`, `--ecosystems` and
+  `--offline`; `scan --prune` moves to `--help`.
 - **Hosted and vendored `get` never prompt.** Like `scan`, they take the
   top-ranked accessible patch per package with no picker and no
   confirmation, in `--json` too (no `selection_required` outside agent
@@ -82,11 +92,6 @@ into the new version's section — see docs/releasing.md.
   `--id`/`--cve`/`--ghsa`/`--package` multi-select, `--one-off --save-only`,
   `--mode hosted|vendored --save-only`, `--one-off`, a malformed forced
   identifier, and `rollback --one-off`. Every usage error now exits 2.
-- **`list` in a project with no patches** prints `No patches in this
-  project. Run \`socket-patch scan\`.` (stdout) instead of `Error: Manifest
-  not found at …` / `No patches found in manifest.`. Exit codes are
-  unchanged (1 with no manifest and no ledger record, 0 for an empty
-  manifest); `--json` keeps the `manifest_not_found` envelope.
 - **Human output:** warning lines no longer carry the `(code)` tag
   (`Warning: …`, `GC: skipped: …`); the codes stay in the JSON envelope.
   Error lines keep theirs (`Error (<code>): …`). Hosted mode is called "hosted", not "redirect", in human
@@ -96,8 +101,8 @@ into the new version's section — see docs/releasing.md.
   block. Every declined prompt prints `Cancelled; no changes made.`, and
   scan/get share one paid-plan upsell line.
 - **`-h` is short**: about eight options per command (`--json`,
-  `--verbose`, `--dry-run`, `--yes` where the command prompts, and the
-  command's main flags); `--help` still lists everything. The deprecated
+  `--dry-run`, `--cwd`, `--ecosystems`, `--offline`, `--yes` where the
+  command prompts, and the command's main flags); `--help` still lists everything. The deprecated
   `scan --apply` / `--vendor` spellings are hidden from both (still
   accepted).
 

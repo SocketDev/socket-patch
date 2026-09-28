@@ -5,6 +5,8 @@
 > wheel is no longer built or published; the `socket-patch[hook]` extra is
 > gone too. In agent mode, run `socket-patch apply` in CI after install
 > instead. The source is kept for reference only.
+> To remove the hook from a project, see
+> [Upgrading from `setup`](https://github.com/SocketDev/socket-patch#upgrading-from-setup).
 
 A tiny, package-manager-agnostic **post-install hook** for
 [`socket-patch`](https://pypi.org/project/socket-patch/).

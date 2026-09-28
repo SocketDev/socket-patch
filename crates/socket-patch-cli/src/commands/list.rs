@@ -380,28 +380,10 @@ pub async fn run(args: ListArgs) -> i32 {
         redirect_state.as_ref(),
         vendor_state.as_ref().map(|s| &s.entries),
     );
-    if manifest.is_none() && entries.is_empty() {
-        // No manifest AND no ledger records: nothing is listable anywhere.
-        // Exit 1 (unchanged), so scripts can tell "nothing here" from a
-        // listing; humans get the plain empty-project line, JSON keeps the
-        // `manifest_not_found` envelope.
-        if args.common.json {
-            emit_error(
-                &args,
-                "manifest_not_found",
-                format!("Manifest not found at {}", manifest_path.display()),
-                warnings,
-            );
-        } else if args.common.silent {
-            // `--silent` is "errors only", and this run exits 1: say why.
-            eprintln!("{NO_PATCHES}");
-        } else {
-            println!("{NO_PATCHES}");
-        }
-        return 1;
-    }
-
-    // Records found (any store) ⇒ a successful list, exit 0.
+    // A successful list, exit 0, with or without records. No manifest
+    // and no ledger record is just an empty project (normal for hosted
+    // mode, which writes no manifest); only an unreadable or invalid
+    // manifest fails.
     //
     // Telemetry: `patch_listed`'s `patches_count` means "manifest patches"
     // to its consumers, so it counts the manifest ONLY (0 on a ledger-only

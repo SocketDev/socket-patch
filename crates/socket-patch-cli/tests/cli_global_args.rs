@@ -758,16 +758,16 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         "blank env vars must not abort the clap parse.\nstderr: {stderr}",
     );
     // The command must reach normal execution: with the blanks treated as
-    // unset, `list --json` in an empty temp dir resolves the default manifest
-    // path and emits the manifest_not_found envelope (exit 1).
+    // unset, `list --json` in an empty temp dir lists an empty project
+    // (success envelope, exit 0).
     let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!("expected a JSON envelope on stdout, got {e}.\nstdout: {stdout}\nstderr: {stderr}")
     });
     assert_eq!(
-        envelope["error"]["code"], "manifest_not_found",
+        envelope["status"], "success",
         "blank env vars must fall back to defaults: {envelope}",
     );
-    assert_eq!(out.status.code(), Some(1), "manifest_not_found exits 1");
+    assert_eq!(out.status.code(), Some(0), "an empty project lists with exit 0");
 }
 
 /// `save_and_clear_global_env` must clear **every** env var `GlobalArgs`
