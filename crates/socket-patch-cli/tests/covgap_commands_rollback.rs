@@ -149,8 +149,6 @@ struct PatchedFixture {
     purl: &'static str,
     before: &'static [u8],
     after: &'static [u8],
-    before_hash: String,
-    after_hash: String,
 }
 
 fn patched_fixture() -> PatchedFixture {
@@ -179,8 +177,6 @@ fn patched_fixture() -> PatchedFixture {
         purl,
         before,
         after,
-        before_hash,
-        after_hash,
     }
 }
 
