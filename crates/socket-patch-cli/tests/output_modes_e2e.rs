@@ -267,19 +267,19 @@ fn list_empty_manifest_non_json() {
     let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("No patches found"),
+        stdout.contains("No patches in this project."),
         "empty manifest non-JSON message; got: {stdout}"
     );
 }
 
 #[test]
-fn list_no_manifest_non_json_prints_error_to_stderr() {
+fn list_no_manifest_non_json_prints_the_empty_project_line() {
     let tmp = tempfile::tempdir().unwrap();
-    let (code, _stdout, stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
+    let (code, stdout, stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
     assert_eq!(code, 1);
     assert!(
-        stderr.contains("Manifest not found") || stderr.contains("not found"),
-        "non-JSON list-without-manifest must print to stderr; got: {stderr}"
+        stdout.contains("No patches in this project. Run `socket-patch scan`."),
+        "non-JSON list-without-manifest names the next step; got: {stdout} / {stderr}"
     );
 }
 
@@ -648,49 +648,6 @@ fn get_with_explicit_package_flag_works() {
 }
 
 // ---------------------------------------------------------------------------
-// setup — non-JSON paths
-// ---------------------------------------------------------------------------
-
-#[test]
-fn setup_no_files_non_json_prints_friendly_message() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["setup"], &[]);
-    assert_eq!(code, 0);
-    assert!(
-        stdout.contains("No package.json"),
-        "non-JSON setup must report missing package.json; got: {stdout}"
-    );
-}
-
-#[test]
-fn setup_dry_run_non_json_prints_preview() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        tmp.path().join("package.json"),
-        r#"{ "name": "p", "version": "1.0.0" }"#,
-    )
-    .unwrap();
-    let before = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
-    let (code, stdout, _stderr) =
-        common::run_with_env(tmp.path(), &["setup", "--dry-run", "--yes"], &[]);
-    assert_eq!(code, 0);
-    assert!(
-        stdout.contains("would be updated") && stdout.contains("postinstall"),
-        "non-JSON setup dry-run should preview the postinstall hook; got: {stdout}"
-    );
-    // Dry-run must NOT actually write the postinstall hook into the file.
-    let after = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
-    assert_eq!(
-        before, after,
-        "setup --dry-run must leave package.json untouched"
-    );
-    assert!(
-        !after.contains("postinstall"),
-        "setup --dry-run must not write a postinstall hook; got: {after}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Bare-UUID fallback — `socket-patch <UUID>` rewrites to `get <UUID>`
 // ---------------------------------------------------------------------------
 
@@ -737,7 +694,7 @@ fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
 fn each_subcommand_help_prints_usage() {
     let tmp = tempfile::tempdir().unwrap();
     let subcommands = [
-        "apply", "rollback", "get", "scan", "list", "remove", "setup", "repair", "gc",
+        "apply", "rollback", "get", "scan", "list", "remove", "repair", "gc",
     ];
     for sub in subcommands {
         let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &[sub, "--help"], &[]);
@@ -755,7 +712,7 @@ fn top_level_help_prints_all_subcommands() {
     let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["--help"], &[]);
     assert_eq!(code, 0);
     for sub in [
-        "apply", "rollback", "get", "scan", "list", "remove", "setup", "repair",
+        "apply", "rollback", "get", "scan", "list", "remove", "repair",
     ] {
         assert!(
             stdout.contains(sub),

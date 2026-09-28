@@ -31,7 +31,7 @@ use clap::{Parser, Subcommand};
         socket-patch vex       Emit an OpenVEX document for your vulnerability scanner\n  \
         socket-patch vendor    Eject the patches into .socket/vendor/ for offline installs\n  \
         socket-patch list      Show the patches in this project\n\n\
-        get, apply, setup, rollback, remove and repair are the older agent-mode commands."
+        get, apply, rollback, remove and repair are the older agent-mode commands."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -81,10 +81,6 @@ pub enum Commands {
 
     /// Agent mode: apply the patches in `.socket/manifest.json` in place
     Apply(commands::apply::ApplyArgs),
-
-    /// Agent mode: wire install hooks (npm, Python, Bundler, Composer) that
-    /// re-apply patches after install
-    Setup(commands::setup::SetupArgs),
 
     /// Undo patches: restore original files and unwind hosted or vendored
     /// lockfile wiring
@@ -136,7 +132,6 @@ impl Commands {
             Commands::Apply(a) => &a.common,
             Commands::Vex(a) => &a.common,
             Commands::Vendor(a) => &a.common,
-            Commands::Setup(a) => &a.common,
             Commands::Rollback(a) => &a.common,
             Commands::Get(a) => &a.common,
             Commands::List(a) => &a.common,
@@ -146,6 +141,86 @@ impl Commands {
             Commands::HostedBundle(a) => &a.common,
         }
     }
+}
+
+/// Global options every subcommand's short help (`-h`) still lists; the
+/// rest move to `--help` only.
+const SHORT_HELP_GLOBALS: &[&str] = &["json", "dry_run", "verbose"];
+
+/// Per-subcommand arguments shown in `-h` on top of its own (non-global)
+/// ones: the commands that prompt keep `--yes`.
+fn short_help_extra_globals(sub: &str) -> &'static [&'static str] {
+    match sub {
+        "get" | "rollback" | "remove" | "self-update" => &["yes"],
+        _ => &[],
+    }
+}
+
+/// Command-specific arguments left out of a subcommand's `-h` (still in
+/// `--help`), so each short help stays at about eight options.
+fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
+    match sub {
+        "scan" => &[
+            "batch_size",
+            "sync",
+            "all_releases",
+            "vex_product",
+            "vex_no_verify",
+            "vex_doc_id",
+            "vex_compact",
+        ],
+        "get" => &["id", "cve", "ghsa", "package", "save_only", "one_off", "all_releases"],
+        "vex" => &["doc_id", "compact"],
+        "apply" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],
+        "vendor" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],
+        _ => &[],
+    }
+}
+
+/// The `socket-patch` command as it parses and renders: [`Cli`]'s derived
+/// command with the short help (`-h`) trimmed to the common options. Every
+/// argument stays in `--help` and parses exactly as before.
+pub fn cli_command() -> clap::Command {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let subs: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    for name in subs {
+        cmd = cmd.mut_subcommand(&name, |mut sub| {
+            let hidden_own = short_help_hidden_own(&name);
+            let extra = short_help_extra_globals(&name);
+            let ids: Vec<(String, bool)> = sub
+                .get_arguments()
+                .map(|a| {
+                    (
+                        a.get_id().to_string(),
+                        a.get_help_heading() == Some(args::GLOBAL_OPTIONS),
+                    )
+                })
+                .collect();
+            for (id, global) in ids {
+                let keep = if global {
+                    SHORT_HELP_GLOBALS.contains(&id.as_str()) || extra.contains(&id.as_str())
+                } else {
+                    !hidden_own.contains(&id.as_str())
+                };
+                if !keep {
+                    sub = sub.mut_arg(&id, |a| a.hide_short_help(true));
+                }
+            }
+            sub
+        });
+    }
+    cmd
+}
+
+/// Parse `argv` against [`cli_command`].
+pub fn try_parse_cli(argv: &[String]) -> Result<Cli, clap::Error> {
+    use clap::FromArgMatches;
+    let mut matches = cli_command().try_get_matches_from(argv)?;
+    Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cli_command()))
 }
 
 /// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).
@@ -173,7 +248,7 @@ pub(crate) fn looks_like_uuid(s: &str) -> bool {
 ///
 /// Pulled out of `main.rs` so the fallback paths are unit-testable.
 pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> {
-    match Cli::try_parse_from(&argv) {
+    match try_parse_cli(&argv) {
         Ok(cli) => Ok(cli),
         Err(err) => {
             // Root `--update` never parses Ok on its own (the subcommand
@@ -220,7 +295,7 @@ pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> 
                     new_args.push(version.to_string());
                 }
                 new_args.extend_from_slice(&argv[pos + 1..]);
-                return match Cli::try_parse_from(&new_args) {
+                return match try_parse_cli(&new_args) {
                     Ok(cli) => Ok(cli),
                     Err(rewrite_err) if pos == 1 || !rewrite_err.use_stderr() => Err(rewrite_err),
                     Err(_) => Err(err),
@@ -229,7 +304,7 @@ pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> 
             if argv.len() >= 2 && looks_like_uuid(&argv[1]) {
                 let mut new_args = vec![argv[0].clone(), "get".into()];
                 new_args.extend_from_slice(&argv[1..]);
-                match Cli::try_parse_from(&new_args) {
+                match try_parse_cli(&new_args) {
                     Ok(cli) => Ok(cli),
                     // clap models `--help`/`--version` as `Err`, but they are
                     // display requests, not parse failures. For those the

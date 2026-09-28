@@ -29,7 +29,7 @@ pub const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt 
      project that declares only optional dependencies, so there both commands remove the \
      installed copy: upgrade vlt to 1.0.5 or later first.";
 pub const VLT_UPDATE_NOTE: &str =
-    " Note: `vlt update` re-resolves from the registry and drops these redirects.";
+    " Note: `vlt update` re-resolves from the registry and drops these hosted patches.";
 
 pub fn invalidated_head(n: usize) -> String {
     format!(

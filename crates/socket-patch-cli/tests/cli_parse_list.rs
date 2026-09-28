@@ -561,7 +561,7 @@ fn empty_manifest_plain_says_no_patches_via_binary() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "empty list must exit 0");
     assert!(
-        stdout.contains("No patches found in manifest."),
+        stdout.contains("No patches in this project. Run `socket-patch scan`."),
         "empty manifest must report no patches, got: {stdout}"
     );
     // Guard against a regression that prints a record anyway.
@@ -948,8 +948,8 @@ fn silent_keeps_missing_manifest_error_on_stderr_via_binary() {
     let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
     assert_eq!(out.status.code(), Some(1), "missing manifest must exit 1");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("Manifest not found"),
-        "error output must NOT be muted by --silent"
+        String::from_utf8_lossy(&out.stderr).contains("No patches in this project."),
+        "the exit-1 reason must NOT be muted by --silent"
     );
 }
 
@@ -1203,12 +1203,16 @@ fn missing_manifest_with_corrupt_ledger_keeps_warning_in_error_envelope_via_bina
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Human mode: the warning still reaches stderr ahead of the error.
+    // Human mode: the warning still reaches stderr; the empty-project line
+    // is on stdout (v5.0).
     let out = run_list_binary(tmp.path(), &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr.contains("Warning: "), "stderr={stderr}");
-    assert!(stderr.contains("Error: Manifest not found at "), "stderr={stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("No patches in this project."),
+        "stderr={stderr}"
+    );
 }
 
 #[test]

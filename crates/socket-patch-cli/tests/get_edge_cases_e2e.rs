@@ -77,7 +77,7 @@ fn get_one_off_and_save_only_together_errors() {
             ORG_SLUG,
         ],
     );
-    assert_eq!(code, 1);
+    assert_eq!(code, 2, "a usage error (v5.0)");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "error");
     let err = v["error"].as_str().expect("error message");

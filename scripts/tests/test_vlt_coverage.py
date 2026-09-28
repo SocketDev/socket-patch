@@ -22,7 +22,7 @@ CODES = [
     "redirect_vlt_sibling_lockfiles", "redirect_vlt_no_lockfile", "redirect_vlt_artifact_unverifiable",
     "redirect_vlt_reinstall_required", "vendor_vlt_transitive_unsupported",
     "vendor_vlt_lock_out_of_sync", "vendor_vlt_legacy_lockfile", "vendor_vlt_reinstall_required",
-    "vendor_flavor_changed", "vendor_artifact_gitignored", "vlt_root_scripts_not_run",
+    "vendor_flavor_changed", "vendor_artifact_gitignored",
 ]
 MODE_COMMANDS = [
     "hosted/scan", "hosted/get", "hosted/rollback", "hosted/remove", "hosted/vex",
@@ -30,7 +30,6 @@ MODE_COMMANDS = [
     "vendored/revert", "vendored/repair", "vendored/remove", "vendored/list", "vendored/vex",
     "vendored/takeover (hosted to vendored)", "vendored/scan --prune", "agent/scan", "agent/get",
     "agent/apply", "agent/rollback", "agent/remove", "agent/list", "agent/vex", "agent/crawl",
-    "setup",
 ]
 FN = re.compile(r"^(?P<indent>\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?fn\s+(?P<name>[A-Za-z0-9_]+)")
 ASSERTS = re.compile(r"assert|expect|\.contains\(|matches!")
@@ -155,8 +154,7 @@ class VltCoverageMap(unittest.TestCase):
             self.assertIn(key.split(":", 1)[0], CODES, key)
             self.assertTrue(names, key)
             self.check_names(names)
-        for code in ("redirect_vlt_reinstall_required", "redirect_vlt_artifact_unverifiable",
-                     "vlt_root_scripts_not_run"):
+        for code in ("redirect_vlt_reinstall_required", "redirect_vlt_artifact_unverifiable"):
             self.assertTrue(any(k.startswith(code + ":") for k in variants), code)
 
     def test_every_mode_command_cell_maps_to_existing_tests(self):

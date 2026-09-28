@@ -39,14 +39,14 @@ pub const UNVERIFIABLE: &str = "redirect_vlt_artifact_unverifiable";
 
 pub const ADVISORY_NOTHING_STALE: &str = "vlt-lock.json pins Socket-patched packages; fresh \
      checkouts install them with `vlt ci` or `vlt install --frozen-lockfile`. Note: `vlt update` \
-     re-resolves from the registry and drops these redirects.";
+     re-resolves from the registry and drops these hosted patches.";
 
 pub fn advisory_invalidated(n: usize) -> String {
     format!(
         "vlt-lock.json pins Socket-patched packages; socket-patch removed {n} stale installed \
          copies (node_modules/.vlt-lock.json and node_modules/.vlt entries), so node_modules is \
          incomplete until you run `vlt install` (or `vlt ci`), which installs the patched \
-         packages. Note: `vlt update` re-resolves from the registry and drops these redirects."
+         packages. Note: `vlt update` re-resolves from the registry and drops these hosted patches."
     )
 }
 

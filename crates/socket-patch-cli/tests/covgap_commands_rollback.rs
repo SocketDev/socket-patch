@@ -1497,7 +1497,7 @@ fn write_two_record_fixture(root: &Path) {
 }
 
 /// Human wet run over a hosted-only (manifest-less) project: the wet
-/// "Unwound hosted redirect for {purl}" line and the reinstall note — with
+/// "Unwound the hosted patch for {purl}" line and the reinstall note — with
 /// the wiring actually unwound, the emptied ledger deleted and no
 /// `.socket/` residue. The unscoped "No patches found in manifest" line is
 /// reserved for a run with no work in ANY leg: a project whose patches are
@@ -1520,7 +1520,7 @@ fn hosted_human_wet_announces_and_unwinds() {
          stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains(&format!("Unwound hosted redirect for {LP_PURL}")),
+        stdout.contains(&format!("Unwound the hosted patch for {LP_PURL}")),
         "the wet unwind line must print; stdout=\n{stdout}"
     );
     assert!(
@@ -1543,7 +1543,7 @@ fn hosted_human_wet_announces_and_unwinds() {
     );
 }
 
-/// Human dry-run twin: "Would unwind hosted redirect for {purl}", nothing
+/// Human dry-run twin: "Would unwind the hosted patch for {purl}", nothing
 /// mutated.
 #[test]
 fn hosted_human_dry_run_previews() {
@@ -1554,7 +1554,7 @@ fn hosted_human_dry_run_previews() {
     let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--dry-run"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains(&format!("Would unwind hosted redirect for {LP_PURL}")),
+        stdout.contains(&format!("Would unwind the hosted patch for {LP_PURL}")),
         "the dry-run unwind preview must print; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -1584,7 +1584,7 @@ fn scoped_unsupported_ecosystem_prints_human_notice() {
         "a scoped unsupported hosted purl fails closed; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains(&format!("Cannot unwind hosted redirect for {GEM_PURL}"))
+        stderr.contains(&format!("Cannot unwind the hosted patch for {GEM_PURL}"))
             && stderr.contains("no per-purl revert exists"),
         "the human guidance must print on stderr; stderr=\n{stderr}"
     );
@@ -1711,7 +1711,7 @@ fn replay_refusal_reports_group_failures_in_both_modes() {
     let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes"]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("Cannot unwind hosted redirect edits (yarn)"),
+        stderr.contains("Cannot unwind hosted wiring edits (yarn)"),
         "the human refusal line must print on stderr; stderr=\n{stderr}"
     );
 }
@@ -1949,7 +1949,7 @@ fn hosted_persist_failure_lands_in_hosted_failed() {
         failed.iter().any(|f| f["purl"] == "ledger"
             && f["error"]
                 .as_str()
-                .is_some_and(|e| e.contains("failed to persist the hosted redirect ledger"))),
+                .is_some_and(|e| e.contains("failed to persist the hosted ledger"))),
         "the persist failure must be reported under the 'ledger' key; stdout=\n{stdout}"
     );
     // The replay itself ran before the persist: the wired file is restored.
@@ -2001,7 +2001,7 @@ fn bun_deferred_purl_unwinds_via_replay() {
         "the bun-deferred unwind succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains(&format!("Unwound hosted redirect for {LP_PURL}")),
+        stdout.contains(&format!("Unwound the hosted patch for {LP_PURL}")),
         "the deferred purl's wet unwind line must print; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -2245,7 +2245,7 @@ mod interactive {
     }
 
     /// Declining the rollback confirm prompt cancels cleanly: the composed
-    /// manifest clause renders with the `[Y/n]` hint, "Rollback cancelled."
+    /// manifest clause renders with the `[Y/n]` hint, "Cancelled; no changes made."
     /// prints, the run exits 0, and nothing is mutated.
     #[test]
     fn rollback_interactive_decline_cancels() {
@@ -2280,7 +2280,7 @@ mod interactive {
             "the PTY run must take the interactive branch; got: {output}"
         );
         assert!(
-            output.contains("Rollback cancelled."),
+            output.contains("Cancelled; no changes made."),
             "the decline must be acknowledged; got: {output}"
         );
         assert_eq!(
@@ -2364,7 +2364,7 @@ fn per_purl_revert_failure_prints_human_stderr_line() {
         "a failed per-purl revert must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains(&format!("Failed to unwind hosted redirect for {LP_PURL}:")),
+        stderr.contains(&format!("Failed to unwind the hosted patch for {LP_PURL}:")),
         "the human failure line must print on stderr; stderr=\n{stderr}"
     );
     assert_eq!(
@@ -2376,7 +2376,7 @@ fn per_purl_revert_failure_prints_human_stderr_line() {
 
 /// Dry-run twin of `bun_deferred_purl_unwinds_via_replay`: the deferred
 /// preview routes through the replay's dropped-records probe and prints
-/// "Would unwind hosted redirect for {purl}" — with bun.lock and the
+/// "Would unwind the hosted patch for {purl}" — with bun.lock and the
 /// ledger byte-identical afterwards.
 #[test]
 fn bun_deferred_purl_dry_run_previews_via_replay() {
@@ -2413,7 +2413,7 @@ fn bun_deferred_purl_dry_run_previews_via_replay() {
         "the bun-deferred dry run succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains(&format!("Would unwind hosted redirect for {LP_PURL}")),
+        stdout.contains(&format!("Would unwind the hosted patch for {LP_PURL}")),
         "the deferred purl's dry-run preview line must print; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -2531,7 +2531,7 @@ fn hosted_persist_failure_prints_human_error_line() {
         "a ledger persist failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Error: Failed to persist the hosted redirect ledger"),
+        stderr.contains("Error: Failed to persist the hosted ledger"),
         "the human persist-failure line must print on stderr; stderr=\n{stderr}"
     );
     assert_eq!(
@@ -3440,7 +3440,7 @@ fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     );
     assert!(
         stderr.contains(
-            "Warning (redirect_vlt_reinstall_required): restored registry pins for 1 packages; \
+            "Warning: restored registry pins for 1 packages; \
              removed the patched installed copies"
         ),
         "{stderr}"

@@ -286,9 +286,9 @@ pub struct ScanArgs {
     #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE")]
     pub batch_size: Option<usize>,
 
-    /// Deprecated spelling of `--mode agent`: download the selected patches
-    /// and apply them in place
-    #[arg(long, default_value_t = false)]
+    // Hidden, deprecated spelling of `--mode agent`: download the selected
+    // patches and apply them in place.
+    #[arg(long, default_value_t = false, hide = true)]
     pub apply: bool,
 
     /// Garbage-collect after the scan: prune manifest entries for
@@ -306,13 +306,10 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    /// Deprecated spelling of `--mode vendored`: vendor every patched
-    /// dependency the scan selects into the committable `.socket/vendor/`
-    /// tree instead of applying patches in place. The patch records live in
-    /// the vendor ledger (`.socket/vendor/state.json`), never in
-    /// `.socket/manifest.json`; a package vendored at an older patch is
-    /// re-vendored. Combine with `--prune` to garbage-collect stale state
-    #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync"])]
+    // Hidden, deprecated spelling of `--mode vendored`: vendor every
+    // patched dependency the scan selects into the committable
+    // `.socket/vendor/` tree instead of applying patches in place.
+    #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync"])]
     pub vendor: bool,
 
     /// Accepted for compatibility; has no effect
@@ -330,10 +327,10 @@ pub struct ScanArgs {
     pub redirect: bool,
 
     /// How discovered patches are consumed [default: hosted]. A `--prune`
-    /// or `--global` scan with no mode only reports. `--vendor` and
-    /// `--apply` are older spellings of `--mode vendored` and `--mode agent`
-    // Each mode is equivalent to one boolean flag (hosted == the hidden
-    // `--redirect`, vendored == `--vendor`, agent == `--apply`/`--sync`).
+    /// or `--global` scan with no mode only reports
+    // The hidden `--vendor` and `--apply` are older spellings of
+    // `--mode vendored` and `--mode agent`. Each mode is equivalent to one
+    // boolean flag (hosted == the hidden `--redirect`, vendored == `--vendor`, agent == `--apply`/`--sync`).
     // Combining `--mode` with a boolean from a DIFFERENT mode is rejected in
     // `resolve_mode_flags`; the same mode spelled both ways is accepted.
     #[arg(long = "mode", value_enum)]
@@ -612,7 +609,7 @@ async fn discover_selected(
 /// `common` for `select_patches`: scan never prompts, so it always takes
 /// the top-ranked patch, and with `json` off it never gets
 /// `selection_required` (scan has no "re-run with the chosen UUID" path).
-fn selection_args(common: &GlobalArgs) -> GlobalArgs {
+pub(crate) fn selection_args(common: &GlobalArgs) -> GlobalArgs {
     GlobalArgs {
         json: false,
         yes: true,
@@ -1050,7 +1047,7 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
         // EVERY vendored package including the ones still live in the
         // lockfile — `remove <purl>` is the per-package equivalent.
         format!(
-            "hosted redirect superseded the vendored ledger for: {list}. \
+            "hosted wiring superseded the vendored ledger for: {list}. \
              `.socket/vendor/state.json` still claims these package(s) and their \
              committed artifacts under `.socket/vendor/` are now orphaned — the \
              lockfile points at the hosted patch server, not the vendored files. \
@@ -1073,8 +1070,8 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
         // only revert data (FileEdit originals) and VEX records for OTHER
         // packages that are still hosted-redirected.
         format!(
-            "vendored artifacts superseded the hosted redirect ledger for: {list}. \
-             `.socket/vendor/redirect-state.json` still records a hosted redirect for \
+            "vendored artifacts superseded the hosted ledger for: {list}. \
+             `.socket/vendor/redirect-state.json` still records hosted wiring for \
              these package(s), but the lockfile now points at the committed \
              `.socket/vendor/` files. The vendored flows (`socket-patch vendor`, \
              `scan --mode vendored`) reconcile npm-family and cargo package(s) \
@@ -1086,7 +1083,7 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
              entries under `records` AND their matching entries under `edits`, \
              so audits and VEX do not read superseded wiring. \
              Both halves matter: the leftover `edits` are that package's stale \
-             pre-redirect originals, which a later redirect revert would replay \
+             pre-hosted originals, which a later hosted revert would replay \
              over the live vendored wiring — and an `edits` entry left behind \
              still names the package, so a ledger whose last record you just \
              deleted keeps reading as superseded and this warning keeps firing. \
@@ -1111,8 +1108,8 @@ pub(super) fn mode_takeover_reconciled_detail(
     // Only a run that actually unwound the hosted npm allow-remote
     // auto-config says so (with its npm >= 12 caveat).
     let npmrc = if npmrc_unwound {
-        " The hosted redirect's `.npmrc` `allow-remote=all` auto-config was \
-         unwound too (a redirect-created file deleted, an appended line \
+        " The hosted wiring's `.npmrc` `allow-remote=all` auto-config was \
+         unwound too (a created file deleted, an appended line \
          removed): the vendored `file:` specs do not need it. If you later \
          restore the hosted lock wiring with `vendor --revert`, npm >=12 \
          refuses it (EALLOWREMOTE) until `allow-remote=all` is back — re-run \
@@ -1122,7 +1119,7 @@ pub(super) fn mode_takeover_reconciled_detail(
         ""
     };
     format!(
-        "vendored artifacts superseded the hosted redirect ledger for: {list}; \
+        "vendored artifacts superseded the hosted ledger for: {list}; \
          reconciled automatically. Both halves of each superseded entry — the \
          package's `records` entry AND its matching `edits` — were dropped \
          from `.socket/vendor/redirect-state.json` (an emptied ledger is \
@@ -1185,7 +1182,7 @@ pub(super) fn push_run_warning(
     detail: String,
 ) {
     if !common.silent && !common.json {
-        eprintln!("Warning ({code}): {detail}");
+        eprintln!("Warning: {detail}");
     }
     env.warnings.push(crate::json_envelope::RunWarning {
         code: code.to_string(),
@@ -1387,7 +1384,7 @@ pub(super) async fn hosted_wiring_retained_purls(
 pub(super) fn hosted_wiring_retained_detail(retained: &[String]) -> String {
     let list = retained.join(", ");
     format!(
-        "agent-mode scan left the hosted redirect wiring live for: {list}. \
+        "agent-mode scan left the hosted wiring live for: {list}. \
          The lockfile still resolves these package(s) to the hosted patch \
          server and `.socket/vendor/redirect-state.json` still records the \
          redirect — an agent run patches installed files in place but does \
@@ -1396,11 +1393,11 @@ pub(super) fn hosted_wiring_retained_detail(retained: &[String]) -> String {
          in hosted mode (`scan --mode hosted`), migrate to committed \
          artifacts with `scan --mode vendored` (which takes these \
          package(s) over in the lockfile and reconciles the superseded \
-         redirect ledger entries), or unwind the redirects with \
+         hosted ledger entries), or unwind the hosted patches with \
          `socket-patch rollback`. Do not delete \
          `.socket/vendor/redirect-state.json` by hand: it holds the \
          recorded pre-redirect lockfile originals (the only revert data) \
-         and the redirect records VEX reads."
+         and the hosted records VEX reads."
     )
 }
 
@@ -1634,7 +1631,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Hosted mode runs no GC: say so once up front on the human path. The
     // `--json` path carries it in `redirect.warnings[]`.
     if hosted && prune && !args.common.json && !args.common.silent {
-        eprintln!("Warning ({REDIRECT_PRUNE_IGNORED}): {REDIRECT_PRUNE_IGNORED_DETAIL}");
+        eprintln!("Warning: {REDIRECT_PRUNE_IGNORED_DETAIL}");
     }
 
     // Resolved up-front (rather than at the GC site) because the embedded
@@ -1814,8 +1811,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     if package_count == 0 {
         status.finish();
         if human {
-            for (code, detail) in &layout_refusals {
-                eprintln!("Warning ({code}): {detail}");
+            for (_, detail) in &layout_refusals {
+                eprintln!("Warning: {detail}");
             }
             // Hosted mode already printed its own prune-ignored warning.
             if prune && !hosted {
@@ -1937,8 +1934,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         if !lockfile_only.purls.is_empty() {
             eprintln!("{}", render::lockfile_only_note(lockfile_only.purls.len()));
         }
-        for (code, detail) in &layout_refusals {
-            eprintln!("Warning ({code}): {detail}");
+        for (_, detail) in &layout_refusals {
+            eprintln!("Warning: {detail}");
         }
     }
 
@@ -2379,14 +2376,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             if !vendored_skip_purls.is_empty() {
                 let detail = vendored_ownership_retained_detail(&vendored_skip_purls);
                 if !args.common.silent {
-                    eprintln!("Warning ({VENDORED_OWNERSHIP_RETAINED}): {detail}");
+                    eprintln!("Warning: {detail}");
                 }
                 push_scan_json_warning(&mut result, VENDORED_OWNERSHIP_RETAINED, &detail);
             }
             if !hosted_retained.is_empty() {
                 let detail = hosted_wiring_retained_detail(&hosted_retained);
                 if !args.common.silent {
-                    eprintln!("Warning ({HOSTED_WIRING_RETAINED}): {detail}");
+                    eprintln!("Warning: {detail}");
                 }
                 push_scan_json_warning(&mut result, HOSTED_WIRING_RETAINED, &detail);
             }
@@ -2590,9 +2587,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     "{}",
                     ui::paint(&render::paid_extra_line(paid_patches), "33", use_color),
                 );
-                println!(
-                    "\nUpgrade to Socket's paid plan to access all patches: https://socket.dev/pricing"
-                );
+                println!("\n{}", ui::PAID_UPGRADE);
             }
         }
 
@@ -2618,7 +2613,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 
     if downloadable_count == 0 {
         if !silent {
-            println!("\nNo downloadable patches (paid subscription required).");
+            println!("\nNo downloadable patches: every patch found requires a paid Socket plan.");
         }
         warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
         return finish_human(0).await;
@@ -2914,7 +2909,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await;
         if !hosted_retained.is_empty() {
             eprintln!(
-                "Warning ({HOSTED_WIRING_RETAINED}): {}",
+                "Warning: {}",
                 hosted_wiring_retained_detail(&hosted_retained)
             );
         }
@@ -3286,8 +3281,8 @@ mod tests {
         assert!(vendored.contains("pkg:npm/minimist@1.2.2"));
         assert!(vendored.contains("redirect-state.json"));
         assert!(
-            !vendored.contains("Remove the stale redirect ledger"),
-            "must not advise deleting the redirect ledger: {vendored}"
+            !vendored.contains("Remove the stale hosted ledger"),
+            "must not advise deleting the hosted ledger: {vendored}"
         );
         assert!(
             vendored.contains("Do not delete"),
@@ -4081,7 +4076,7 @@ mod tests {
             "vendored remediation must be per-package: {vendored}"
         );
         assert!(
-            !vendored.contains("Remove the stale redirect ledger"),
+            !vendored.contains("Remove the stale hosted ledger"),
             "vendored remediation must not advise deleting the ledger: {vendored}"
         );
         assert!(
@@ -4170,13 +4165,13 @@ mod tests {
         assert_eq!(
             overlapping_ledger_purls(root).await,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
-            "an edits-only redirect ledger must still count as overlapping"
+            "an edits-only hosted ledger must still count as overlapping"
         );
         let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(
             takeover.vendored,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
-            "the vendored takeover of a degraded redirect ledger must be flagged"
+            "the vendored takeover of a degraded hosted ledger must be flagged"
         );
         assert!(takeover.redirect.is_empty(), "{takeover:?}");
     }
@@ -4621,7 +4616,7 @@ mod tests {
         // Both halves dropped; the emptied ledger is deleted outright.
         assert!(
             load_ledger(root).await.is_none(),
-            "an emptied redirect ledger must be deleted"
+            "an emptied hosted ledger must be deleted"
         );
 
         // Fires once: the reconciled project no longer overlaps.

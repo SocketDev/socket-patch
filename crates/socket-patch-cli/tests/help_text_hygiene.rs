@@ -151,8 +151,10 @@ fn root_command_list_uses_the_verb_form() {
         "{text}"
     );
     assert!(!text.contains("Rollback patches"), "{text}");
+    // v5 removed `setup`; its install-hook summary must not come back.
+    assert!(!text.contains("install hooks"), "{text}");
     assert!(
-        text.contains("Agent mode: wire install hooks (npm, Python, Bundler, Composer)"),
+        !text.lines().any(|l| l.trim_start().starts_with("setup ")),
         "{text}"
     );
 }
@@ -167,18 +169,14 @@ fn root_command_list_leads_with_the_v5_workflow() {
         .filter_map(|l| l.split_whitespace().next())
         .filter(|w| {
             [
-                "scan", "vex", "vendor", "list", "get", "apply", "setup", "rollback", "remove",
-                "repair",
+                "scan", "vex", "vendor", "list", "get", "apply", "rollback", "remove", "repair",
             ]
             .contains(w)
         })
         .collect();
     assert_eq!(
-        &order[..10],
-        [
-            "scan", "vex", "vendor", "list", "get", "apply", "setup", "rollback", "remove",
-            "repair"
-        ],
+        &order[..9],
+        ["scan", "vex", "vendor", "list", "get", "apply", "rollback", "remove", "repair"],
         "{text}"
     );
     assert!(text.contains("Typical workflow:"), "{text}");
@@ -230,7 +228,31 @@ fn lock_timeout_help_names_get_and_scan() {
     let text = long_help(&["list"]);
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flat.contains("`get` and `scan` when they record, apply, vendor or redirect patches"),
+        flat.contains("`get` and `scan` when they record, apply, vendor or host patches"),
         "{flat}"
     );
+}
+
+/// `-h` stays short (about eight options per page); `--help` still lists
+/// every option, and the deprecated `scan --apply`/`--vendor` spellings
+/// are in neither.
+#[test]
+fn short_help_lists_about_eight_options_and_long_help_lists_all() {
+    let mut cmd = socket_patch_cli::cli_command();
+    cmd.build();
+    for sub in cmd.get_subcommands_mut() {
+        if sub.is_hide_set() || sub.get_name() == "help" {
+            continue;
+        }
+        let name = sub.get_name().to_string();
+        let short = sub.render_help().to_string();
+        let long = sub.render_long_help().to_string();
+        let count = |t: &str| t.lines().filter(|l| l.trim_start().starts_with('-')).count();
+        assert!(count(&short) <= 9, "{name} -h lists {} options:\n{short}", count(&short));
+        assert!(count(&long) > count(&short), "{name} --help must list more than -h");
+        assert!(short.contains("--json") && long.contains("--cwd"), "{name}");
+    }
+    let scan = cmd.find_subcommand_mut("scan").expect("scan");
+    let long = scan.render_long_help().to_string();
+    assert!(!long.contains("--apply") && !long.contains("--vendor "), "{long}");
 }

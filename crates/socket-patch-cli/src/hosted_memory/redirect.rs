@@ -743,7 +743,7 @@ pub(crate) fn rewrite(
             "detail":
                 "pnpm-lock.yaml was edited outside `rush update`; if \
                  preventManualShrinkwrapChanges is enabled, `rush install` fails until \
-                 `rush update` refreshes repo-state.json (the redirect survives `rush \
+                 `rush update` refreshes repo-state.json (the hosted wiring survives `rush \
                  update`)",
         }));
     }

@@ -296,7 +296,7 @@ mod pty {
     }
 
     /// Declining the reinstall confirm must cancel with exit 1 and
-    /// "Reinstall cancelled.", leaving the installed binary byte-identical.
+    /// "Cancelled; no changes made.", leaving the installed binary byte-identical.
     /// The pin-to-current + `--force` combination reaches the confirm with
     /// ZERO network before the prompt (pinned skips latest-resolution,
     /// --force skips the already-there return), and the dead endpoint
@@ -334,7 +334,7 @@ mod pty {
             "update must NOT have taken the non-TTY auto-proceed branch in a PTY; got: {output}"
         );
         assert!(
-            output.contains("Reinstall cancelled."),
+            output.contains("Cancelled; no changes made."),
             "'n' must report cancellation, naming the reinstall; got: {output}"
         );
         assert_eq!(

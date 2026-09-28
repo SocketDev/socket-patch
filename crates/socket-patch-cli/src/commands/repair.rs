@@ -258,9 +258,9 @@ fn format_found_missing(n: usize, noun: ArtifactNoun) -> String {
 
 /// Why a hosted-only project has nothing to repair (the JSON skip
 /// reason; the human line adds the period).
-const HOSTED_ONLY_REASON: &str = "Hosted redirects need no local repair; re-run \
-    `scan --mode hosted` to refresh the lockfile redirects (it also re-checks for stale \
-    pre-redirect installs)";
+const HOSTED_ONLY_REASON: &str = "Hosted patches need no local repair; re-run \
+    `scan --mode hosted` to refresh the lockfile (it also re-checks for stale \
+    pre-hosted installs)";
 
 /// Step 1's line when no patch artifact is missing: why there is nothing
 /// to download (no manifest, as in a vendored-only project, or an empty
@@ -716,8 +716,8 @@ mod tests {
         );
         assert_eq!(
             HOSTED_ONLY_REASON,
-            "Hosted redirects need no local repair; re-run `scan --mode hosted` to refresh \
-             the lockfile redirects (it also re-checks for stale pre-redirect installs)"
+            "Hosted patches need no local repair; re-run `scan --mode hosted` to refresh \
+             the lockfile (it also re-checks for stale pre-hosted installs)"
         );
     }
 

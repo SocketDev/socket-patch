@@ -218,7 +218,7 @@ entries and drops the records.
 
 That's the whole loop: **scan → commit → reinstall → vex**, with `scan --mode vendored`
 when installs must be offline. The older *agent* mode, which patches installed files in
-place and re-applies them from an install hook, is still supported; the next section
+place and needs `socket-patch apply` after every install, is still supported; the next section
 compares the three.
 
 ## How Socket Patch works
@@ -270,7 +270,7 @@ Hosted and vendored mode never write `manifest.json`.
 > removes it. Nothing in the table is written until there is something to record: a
 > report-only `scan`, a `--dry-run`, or a run that changes nothing leaves no `.socket/` at
 > all, and a full [`rollback`](#rollback) removes everything it created (only the
-> zero-patch `manifest.json` and any [`setup`](#setup) files stay).
+> zero-patch `manifest.json` stays).
 
 ### Three patch modes
 
@@ -282,7 +282,7 @@ run; a bare `scan` is hosted.
 |------|----------------------|--------------------------|-----------|
 | **hosted** (default) — `scan` | Nowhere in your repo: the lockfile is rewritten so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages on `patch.socket.dev`; the edits and patch records are ledgered in `.socket/vendor/redirect-state.json` | Installs must be able to reach `patch.socket.dev` (no CLI, no install hook) | Smallest possible diff (lockfile + ledger); not for airgapped installs |
 | **vendored** — `scan --mode vendored` (or [`vendor`](#vendor)) | Patched packages committed under `.socket/vendor/`, with the lockfile rewired to consume them | **None** — the package manager installs the committed bytes | Fully airgapped and hermetic, at the cost of repo size |
-| **agent** (older) — `scan --mode agent`, [`get`](#get), [`apply`](#apply) | `.socket/manifest.json` + blobs, committed; the CLI patches installed files in place | The `socket-patch` CLI must run after every install (an install hook via [`setup`](#setup), or an `apply` step in CI) | No lockfile edits and a small repo footprint, but the only mode that needs CI / install-hook changes |
+| **agent** (older) — `scan --mode agent`, [`get`](#get), [`apply`](#apply) | `.socket/manifest.json` + blobs, committed; the CLI patches installed files in place | The `socket-patch` CLI must run after every install (an `apply` step in CI; see [Agent mode in CI](#agent-mode-in-ci)) | No lockfile edits and a small repo footprint, but the only mode that needs CI changes |
 
 Every mode pins the patched bytes: vendored and hosted modes lean on your package
 manager's own lockfile integrity checks (sha512 / sha256 / contentHash / CHECKSUMS) where
@@ -459,8 +459,6 @@ need the network and refuse to run with `--offline`.
 | [`scan --prune`](#scan) | Agent mode: **reconciles, doesn't reverse** — drops manifest entries for packages that have left the project and garbage-collects orphan blob/diff/archive files |
 | [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, re-vendors missing/corrupt vendored artifacts, and cleans up unused ones |
 
-And `setup --remove` reverts the install hooks that `setup` added.
-
 > If you revert a hosted edit by hand instead (e.g. `git checkout -- <lockfile>`), also
 > delete `.socket/vendor/redirect-state.json` — its recorded originals are then stale. A
 > leftover ledger does not make [`vex`](#vex) attest the removed redirects: a record
@@ -477,7 +475,6 @@ And `setup --remove` reverts the install hooks that `setup` added.
 | **Agent mode (older commands)** | |
 | [`get`](#get) | Fetch and apply one patch by UUID / CVE / GHSA / PURL / name (alias: `download`) |
 | [`apply`](#apply) | Apply the patches in `.socket/manifest.json` in place |
-| [`setup`](#setup) | Wire install hooks (npm, Python, Bundler, Composer) that re-apply patches after install |
 | [`rollback`](#rollback) | Undo patches in every mode: restore original files and unwind hosted or vendored lockfile wiring |
 | [`remove`](#remove) | Remove one patch by PURL or UUID (rolls back first) |
 | [`repair`](#repair) | Download missing patch artifacts, re-vendor broken vendored artifacts, clean up unused ones (alias: `gc`) |
@@ -517,8 +514,8 @@ settings, described in [Configuration sources](#configuration-sources) below.
 | `-v, --verbose` | `SOCKET_VERBOSE` | Show extra detail in human-readable output. |
 | `-s, --silent` | `SOCKET_SILENT` | Suppress non-error output. |
 | `--dry-run` | `SOCKET_DRY_RUN` | Preview the operation without making any mutations. |
-| `-y, --yes` | `SOCKET_YES` | Skip confirmation prompts (`get`, `rollback`, `remove`, `setup`, `--update`). `scan` never prompts, so it ignores this flag. |
-| `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for the commands that take the lock — `apply`, `rollback`, `repair`, `remove`, `vendor`, `setup` (while persisting `--exclude`), and `scan`/`get` whenever they write (agent-mode download + apply, vendored, hosted). The lock file exists only while a command runs. |
+| `-y, --yes` | `SOCKET_YES` | Skip confirmation prompts (`get`, `rollback`, `remove`, `--update`). `scan` never prompts, so it ignores this flag. |
+| `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for the commands that take the lock — `apply`, `rollback`, `repair`, `remove`, `vendor`, and `scan`/`get` whenever they write (agent-mode download + apply, vendored, hosted). The lock file exists only while a command runs. |
 | `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
 | `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
 | `--no-npm-allow-remote-config` | `SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG` | Hosted mode: don't write `allow-remote=all` to the project `.npmrc` (see [npm compatibility](#npm-hosted-mode-and-npm-12)). |
@@ -637,8 +634,8 @@ socket-patch scan [PATHS]... [options]
 | `--vex <path>` | `SOCKET_VEX` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX](#inline-vex-on-apply--scan--vendor). |
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_*` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
-> Deprecated spellings: `--apply` (== `--mode agent`) and `--vendor` (== `--mode
-> vendored`). `--detached` is a hidden no-op kept for compatibility (vendored mode is
+> Deprecated, hidden spellings (still accepted): `--apply` (== `--mode agent`) and
+> `--vendor` (== `--mode vendored`). `--detached` is a hidden no-op kept for compatibility (vendored mode is
 > always manifest-free); it is still an error without vendored mode.
 
 **Examples:**
@@ -766,7 +763,7 @@ it:
   lockfile is reverted and dropped); newer patches show up in `updates[]` as the signal
   to re-run `scan --mode vendored`.
 - [`vex`](#vex) attests vendored patches by verifying the **committed artifact** (marked
-  `(vendored)` in the impact statement) — no `setup` install hook needed.
+  `(vendored)` in the impact statement) — no install step needed.
 - Re-running either form is idempotent. Patches dropped from `.socket/manifest.json`
   are auto-reverted on the next `vendor` run; on a project vendored by
   `scan --mode vendored`, use [`repair`](#repair) to verify or rebuild the committed
@@ -798,9 +795,11 @@ socket-patch vendor --json
 
 ### `list`
 
-List the patches in this project: the hosted redirect ledger's records (labeled
+List the patches in this project: the hosted ledger's records (labeled
 `Mode: hosted`), the vendor ledger's (`Mode: vendored`), and any agent-mode entries in
-`.socket/manifest.json`.
+`.socket/manifest.json`. A project with none prints `No patches in this project. Run
+\`socket-patch scan\`.` (exit 1 when there is no manifest or ledger record at all, 0 for
+an empty manifest).
 
 **Usage:**
 ```bash
@@ -853,8 +852,9 @@ flag. Like `scan`, `get` defaults to hosted mode; pass `--mode vendored`, or
 `--mode agent` for the manifest + in-place apply (implied by `--save-only` and
 `--global`). When a package has
 several patches, `get` picks the same one `scan` does (see
-[Which patch is picked](#which-patch-is-picked)). Unlike `scan`, `get` prompts before
-applying (`--yes` or a non-TTY stdin accepts).
+[Which patch is picked](#which-patch-is-picked)). Hosted and vendored `get` never
+prompt, like `scan`; agent-mode `get` asks before applying (`--yes` or a non-TTY stdin
+accepts).
 
 Alias: `download`. And as a shortcut, `socket-patch <uuid>` with a bare patch UUID is
 rewritten to `socket-patch get <uuid>`.
@@ -954,129 +954,47 @@ socket-patch apply --vex socket.vex.json
 > committed vendored artifact is the patch, so there is nothing for `apply` to do — even
 > when the installed tree (e.g. `node_modules/`) is absent.
 
-### `setup`
+### Agent mode in CI
 
-Agent mode only. Configure your project so in-place patches are **re-applied
-automatically after install** — no manual `socket-patch apply` step in CI. (Hosted and
-vendored projects need no hook: the lockfile already names the patched packages.) `setup` is a one-time operation: run it, commit
-the change together with your `.socket/` patches, and every later install handles the
-rest. It is strictly **opt-in** — nothing is hooked unless you run `setup` and commit the
-result.
+Agent mode patches the installed files in place, so every fresh dependency install
+reverts the patches until `socket-patch apply` runs again. (Hosted and vendored projects
+need no such step: the lockfile already names the patched packages.) Commit
+`.socket/manifest.json` and its blobs, then run `apply` in CI after every install:
 
-What gets wired, per ecosystem:
+```bash
+# once, locally: record the patches (commit .socket/)
+socket-patch scan --mode agent
 
-- **npm / yarn / pnpm / bun / vlt** — writes `postinstall` and `dependencies` scripts into
-  `package.json` so any install — including `npm install <pkg>` — re-applies patches
-  (pnpm and vlt: root package only). vlt uses the same `npx` hook, runs it on every
-  install that changes the tree (never on a no-op install), and aborts the install when
-  it fails; vlt before 1.0.0-rc.13 never runs a root `postinstall`, which `setup` warns
-  about (`vlt_root_scripts_not_run`).
-- **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install
-  hook, so `setup` instead adds a **`socket-patch[hook]`** dependency to your manifest
-  (`pyproject.toml` / `requirements.txt`; for classic Poetry, the equivalent
-  `socket-patch = { extras = ["hook"] }`). Installing it lays down
-  a startup `.pth` (shipped by the small `socket-patch-hook` wheel) that re-applies your
-  committed `.socket/` patches the next time the interpreter runs. It is
-  package-manager-agnostic (it rides the interpreter, not any one installer) and
-  **fail-open** — a hook error can never break interpreter startup. Details below.
-- **RubyGems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile`
-  and generates an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies
-  patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch`
-  CLI on `PATH`, and **bundler >= 2.2**: bundler 1.x cannot load a `plugin ... path:`
-  directive — it resolves it as an ordinary gem and every later `bundle install` fails —
-  so `setup` refuses to wire a project whose lock or `bundle --version` reports an older
-  bundler, and `setup --check` red-flags a wired project that lands in that state.)
-- **Composer (PHP)** — appends `socket-patch apply` to `composer.json`'s
-  `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every
-  `composer install` / `composer update`. (Requires the `socket-patch` CLI on `PATH`.)
-- **Cargo & Go** — *apply-only, no `setup` hook.* A one-click auto-repatch-on-build isn't
-  possible for these, so `setup` skips them. Patch with `socket-patch apply` directly:
-  **cargo** patches the crate in place (in `vendor/` or the registry cache, rewriting
+# in CI, after `npm ci` / `pip install` / `bundle install` / ...
+socket-patch apply
+```
+
+> **v5.0: `setup` was removed.** It used to wire install hooks (npm `postinstall` /
+> `dependencies` scripts, the `socket-patch[hook]` Python `.pth` wheel, a Bundler plugin,
+> Composer script events) that ran `apply` for you. Hooks an earlier release committed
+> keep working — they call `socket-patch apply`, which still exists — until you delete
+> them by hand: the `package.json` scripts, the `socket-patch[hook]` dependency (the
+> `socket-patch-hook` wheel is no longer published; `pip uninstall socket-patch-hook`),
+> the managed `plugin "socket-patch"` Gemfile block and `.socket/bundler-plugin/`, and
+> the `composer.json` script entries.
+
+Per-ecosystem notes for in-place patching:
+
+- **Cargo** patches the crate in place (in `vendor/` or the registry cache, rewriting
   `.cargo-checksum.json` so `cargo build` accepts it) — note that a non-vendored crate
   patches the **shared** `$CARGO_HOME/registry` cache, which affects every project on
   the machine and is silently reset by `cargo clean` or a cache prune; vendor the
-  dependency (`--mode vendored`) for a project-local, committable patch. **go** writes a
-  project-local patched copy under `.socket/go-patches/` plus a `go.mod` `replace`
-  directive (the module cache is `go.sum`-verified, so in-place patching can't build);
-  commit `go.mod` + `.socket/go-patches/` so a clone builds the patched bytes. To have
-  [`vex`](#vex) still attest these hand-applied patches, add a `setup.manual` array to
-  `.socket/manifest.json` by hand (there is no CLI flag for it yet):
-  `"setup": { "manual": ["cargo", "golang"] }`.
-- **Maven / NuGet / Deno** — also apply-only: no native install hook exists to wire, so
-  `setup` reports `no_files`; patch them on demand with `socket-patch apply`, and declare
-  them in `setup.manual` (the same hand-edit as the Cargo & Go note above, e.g.
-  `"setup": { "manual": ["deno"] }`) so [`vex`](#vex) still attests the hand-applied
-  patches — this matters most for Deno, which has no vendored or hosted alternative.
-  For Maven
-  and NuGet, note that in-place patching leaves the caches' own checksum sidecars stale
+  dependency (`--mode vendored`) for a project-local, committable patch.
+- **Go** writes a project-local patched copy under `.socket/go-patches/` plus a `go.mod`
+  `replace` directive (the module cache is `go.sum`-verified, so in-place patching can't
+  build); commit `go.mod` + `.socket/go-patches/` so a clone builds the patched bytes.
+- **Maven / NuGet**: in-place patching leaves the caches' own checksum sidecars stale
   (NuGet's fixup deletes `.nupkg.metadata` and raises an advisory for the signed-package
   `.nupkg.sha512` marker; Maven's `.jar.sha1`/`.jar.md5` are left as-is) — the copy-out
   modes, `scan --mode vendored` and `scan --mode hosted`, never touch the caches and
   avoid the issue entirely. See
   [ecosystems.md](docs/ecosystems.md#maven--nuget-caveats).
-
-**Usage:**
-```bash
-socket-patch setup            # configure (interactive)
-socket-patch setup --check    # verify configured; non-zero exit if not (CI gate)
-socket-patch setup --remove   # revert what setup added
-```
-
-**Command-specific options** (plus all [Global options](#global-options) — `--dry-run`,
-`--yes`, `--json`, `--cwd` are the most relevant):
-| Flag | Env var | Description |
-|------|---------|-------------|
-| `--check` | — | Read-only verification that every manifest is configured **and** every installed patch is still applied on disk (each file matches its recorded `afterHash`); exits non-zero if any manifest still needs setup or a patch has drifted. Never writes (safe in CI). Conflicts with `--remove`. |
-| `--remove` | — | Revert every install hook `setup` added (npm `package.json` scripts, the Python `socket-patch[hook]` dependency, the gem Bundler plugin wiring — including bundler's machine-local `.bundle/plugin` registration, so later `bundle install`s don't warn about the unwired plugin — and the Composer `post-install-cmd`/`post-update-cmd` script entries). If the registration can't be cleared automatically (unexpected index format), the error names the fallback: `bundler plugin uninstall socket-patch`. |
-| `--exclude <paths>` | `SOCKET_SETUP_EXCLUDE` | Workspace-member path(s) to exclude from setup (comma-separated, relative to the repo root). The exclusion is persisted in `.socket/manifest.json`, so `setup --check` and a fresh clone honor it without re-passing the flag. |
-
-#### Disabling / opting out (Python hook)
-
-The Python hook is designed to be easy to skip or remove:
-
-- **Per interpreter / CI step:** set `SOCKET_PATCH_HOOK=off` (or `SOCKET_NO_HOOK=1`).
-  This is checked *before any hook code runs*, so it fully bypasses the hook for that
-  process.
-- **Remove from a project:** `socket-patch setup --remove`, then
-  `pip uninstall socket-patch-hook`.
-- **Never opted in:** if you don't run `setup`, there is no hook — it is opt-in by
-  design.
-
-#### What the Python hook does, and its safety model
-
-On interpreter startup, *only when the set of installed packages changed*, the hook runs
-`socket-patch apply --offline --ecosystems pypi` for the project that owns the current
-virtualenv, re-applying only the patches committed in that project's `.socket/`.
-Specifically:
-
-- It is **anchored to the virtualenv** it is installed in (not the working directory), so
-  a `python` started from an unrelated directory cannot pull in a foreign
-  `.socket/manifest.json`.
-- It **verifies each file's hash before patching** and **never writes outside the
-  installed package directory** (path-escaping manifest keys are refused).
-- It **prefers the binary shipped in the installed `socket-patch` package** over `PATH`,
-  so a binary planted earlier on `PATH` cannot shadow it; `PATH` is consulted only as a
-  fallback when that package isn't installed.
-- It runs **offline** (no network at startup) and is **fail-open** (any error is
-  swallowed; it can never abort the interpreter).
-
-**Examples:**
-```bash
-# Interactive setup (all detected ecosystems, auto-detected)
-socket-patch setup
-
-# Non-interactive
-socket-patch setup -y
-
-# Preview changes
-socket-patch setup --dry-run
-
-# Verify configuration in CI (exits non-zero if not set up or a patch has drifted)
-socket-patch setup --check
-
-# JSON output for scripting
-socket-patch setup --json -y
-```
+- **Deno** has no hosted or vendored mode, so agent mode is the only way to patch it.
 
 ### `rollback`
 
@@ -1229,8 +1147,7 @@ place — without bumping the package version.
    covers patches that are actually applied: agent patches against the installed tree,
    vendored patches against the **committed artifact** (marker `(vendored)`), and hosted
    patches against the installed copy the build consumes — or, before any install, against
-   the lockfile's integrity pin (marker `(redirected)`). Vendored and hosted patches need
-   no `setup` install hook to be attested. Whatever `--no-verify` says, a ledger record the
+   the lockfile's integrity pin (marker `(redirected)`). Whatever `--no-verify` says, a ledger record the
    lockfile no longer wires is never attested.
 3. Auto-detects the top-level **product** identifier (override with `--product`), probing
    in order:
@@ -1255,7 +1172,7 @@ Each statement's impact string records *how* the patch is persisted — one mark
 
 | Impact statement | Mode | What the evidence is | What a consumer should do |
 |---|---|---|---|
-| `Patched via Socket patch <uuid>` | agent | The installed tree: every patched file's hash was verified against the manifest's `afterHash` | Trust the statement as long as the agent install hook (or a CI `apply`) keeps re-applying; ecosystems without a hook must be declared in `setup.manual` |
+| `Patched via Socket patch <uuid>` | agent | The installed tree: every patched file's hash was verified against the manifest's `afterHash` | Trust the statement as long as a CI `apply` keeps re-applying after every install |
 | `Patched via Socket patch <uuid> (vendored)` | vendored | The **committed** `.socket/vendor/` artifact was hash-verified — no install hook needed; the lockfile wiring is the persistence mechanism | Trust it on any checkout; the committed bytes are the patch |
 | `Patched via Socket patch <uuid> (redirected)` | hosted | The lockfile's integrity pin points at the Socket-hosted patched package. A post-install `socket-patch vex` hash-verifies the installed copy; before any install it attests from the pin. When emitted in-run by a hosted `scan --vex`, the statement is attested **without hash verification** (the bytes are fetched at install time — the JSON `vex` summary carries `verified: false`) | Ensure installs still resolve from `patch.socket.dev` (the lockfile edit is intact), and run `socket-patch vex` **after installing** to have the redirected patches hash-verified against the installed tree |
 
@@ -1341,7 +1258,7 @@ Behavior worth knowing:
 | composer | `composer.lock` | `installed.json` and `COMPOSER=`-renamed locks are not read |
 | maven | `pom.xml` (+ `.mvn/` checksums) | Root pom only (no parents / submodules, no Gradle); legacy same-GAV hosted repositories cannot be attributed |
 | nuget | `nuget.config`, `packages.lock.json` | Hosted needs a `packages.lock.json` entry for the id (with no lock at all, an exclusive exact-id mapping still keeps the redirect ledger's record live); root config only |
-| deno | none | No hosted or vendored mode exists; Deno patches attest only through the manifest (agent mode + `setup.manual`) |
+| deno | none | No hosted or vendored mode exists; Deno patches attest only through the manifest (agent mode) |
 
 The full recognition rules are in
 [CLI_CONTRACT.md](crates/socket-patch-cli/CLI_CONTRACT.md) ("Manifest-less VEX").
@@ -1418,8 +1335,8 @@ socket-patch apply --json | jq '.status'
 # "success", "partialFailure", "noManifest", or "error"
 ```
 
-`scan` never prompts, so CI needs no `--yes` for it. The commands that do confirm
-(`get`, `rollback`, `remove`, `setup`) auto-proceed when stdin is not a TTY. Progress
+`scan` and hosted/vendored `get` never prompt, so CI needs no `--yes` for them. The
+commands that do confirm (agent-mode `get`, `rollback`, `remove`) auto-proceed when stdin is not a TTY. Progress
 indicators and ANSI colors are automatically suppressed when output is piped.
 
 The exact JSON shapes, exit codes, and stability guarantees are specified in
@@ -1460,11 +1377,9 @@ mode never write it):
 
 Patched file contents are in `.socket/blobs/` (named by git SHA256 hash).
 
-The manifest may also carry an optional top-level `"setup"` key persisting setup state —
-`"setup": { "manual": ["cargo"], "exclude": ["packages/legacy"] }` — where `manual`
-lists ecosystems you patch by hand so [`vex`](#vex) still attests them (see
-[`setup`](#setup)), and `exclude` lists workspace members excluded from setup (written
-by `setup --exclude`).
+A manifest written by an earlier release may also carry a top-level `"setup"` key
+(`manual`, `exclude`) from the removed `setup` command; v5 keeps it on rewrite but
+ignores it.
 
 ## Further reading
 

@@ -16,7 +16,7 @@ use std::process::Command;
 use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::vendor::state::{
     VendorArtifact, VendorEntry, VendorState, WiringAction, WiringRecord,
@@ -25,10 +25,6 @@ use socket_patch_core::vendor::state::{
 /// Canonical-grammar patch UUID (the vendored-artifact verifier validates
 /// the uuid path level, so fixtures must use the real shape).
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-
-/// Every setup-supported ecosystem, declared `manual` so the property-7
-/// setup-state filter doesn't interfere with tests that aren't about it.
-const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
 
 /// A prior successful run's minimal-but-recognizable OpenVEX document (the
 /// `@context` names openvex.dev, which is what `remove_stale_vex_doc` keys
@@ -56,19 +52,13 @@ fn cli() -> Command {
     cmd
 }
 
-/// Write `manifest` to `<cwd>/.socket/manifest.json`, declaring every
-/// setup-supported ecosystem `manual` so property 7 keeps the patches.
+/// Write `manifest` to `<cwd>/.socket/manifest.json`.
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut m = manifest.clone();
-    m.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: ALL_MANUAL.iter().map(|s| s.to_string()).collect(),
-    });
     std::fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
+        serde_json::to_string_pretty(manifest).unwrap(),
     )
     .unwrap();
 }
@@ -274,7 +264,7 @@ fn corrupt_redirect_ledger_hard_errors_in_human_mode() {
     assert!(out.stdout.is_empty(), "no document on a hard error");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("redirect ledger") && stderr.contains("malformed"),
+        stderr.contains("hosted ledger") && stderr.contains("malformed"),
         "the CorruptRedirectState message must reach stderr. got: {stderr}"
     );
     // Ordering: the ledger error fires before the missing-manifest check —

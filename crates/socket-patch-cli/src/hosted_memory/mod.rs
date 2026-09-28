@@ -744,7 +744,7 @@ fn finish_root(
                 _ => record_warnings.push(serde_json::json!({
                     "code": "record_fetch_failed",
                     "detail": format!(
-                        "{purl} redirected, but its patch record could not be fetched; \
+                        "{purl} was switched to hosted, but its patch record could not be fetched; \
                          it will be missing from VEX until `socket-patch scan --mode \
                          hosted` is re-run"
                     ),

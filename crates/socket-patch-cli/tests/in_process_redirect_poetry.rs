@@ -469,7 +469,7 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(String::from_utf8_lossy(&out.stderr).contains("redirect_pypi_stale_install"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("was switched to a hosted patch, but installed files"));
         assert_eq!(
             std::fs::read(installed).unwrap(),
             bytes,
