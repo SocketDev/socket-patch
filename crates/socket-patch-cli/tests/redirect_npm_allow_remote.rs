@@ -341,12 +341,20 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
     );
     assert_no_ledger(tmp.path());
 
-    // Human output: the `Warning (<code>): …` line on stderr; --silent mutes it.
+    // Human output: one line by default, the full text under --verbose;
+    // --silent mutes it.
     let (code, _, stderr) = scan_hosted(tmp.path(), &server.uri(), &[]);
     assert_eq!(code, 0, "{stderr}");
     assert!(
-        stderr.contains(&format!("Warning ({CODE}): ")) && stderr.contains("EALLOWREMOTE"),
+        stderr.contains("Note: .npmrc already sets `allow-remote=all`")
+            && !stderr.contains("EALLOWREMOTE"),
         "human stderr: {stderr}"
+    );
+    let (code, _, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--verbose"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("Warning: ") && stderr.contains("EALLOWREMOTE"),
+        "verbose human stderr: {stderr}"
     );
     let (code, _, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--silent"]);
     assert_eq!(code, 0, "{stderr}");
@@ -744,7 +752,7 @@ async fn outer_npm_config_layers_are_respected() {
     let (code, _, stderr) = scan_hosted_env(
         tmp.path(),
         &server.uri(),
-        &[],
+        &["--verbose"],
         &[("npm_config_allow_remote", "none")],
     );
     assert_eq!(code, 0, "{stderr}");
@@ -753,7 +761,7 @@ async fn outer_npm_config_layers_are_respected() {
     // `NPM_CONFIG_ALLOW_REMOTE` makes the child see that spelling there, so
     // match the name case-insensitively.
     assert!(
-        stderr.contains(&format!("Warning ({CODE}): "))
+        stderr.contains("Warning: ")
             && stderr
                 .to_ascii_lowercase()
                 .contains("npm_config_allow_remote=none")
@@ -823,11 +831,11 @@ async fn remove_surfaces_the_npmrc_modified_warning() {
                 "{doc:#}"
             );
             assert!(
-                !stderr.contains("Warning ("),
+                !stderr.contains("Warning:"),
                 "--json keeps stderr quiet: {stderr}"
             );
         } else {
-            assert!(stderr.contains(&format!("Warning ({LEFT}): ")), "{stderr}");
+            assert!(stderr.contains("Warning: "), "{stderr}");
         }
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),

@@ -132,7 +132,7 @@ pub(super) async fn stale_install_warnings(
             out.warnings.push(serde_json::json!({
                 "code": "redirect_pypi_stale_install",
                 "detail": format!(
-                    "{purl} was redirected to a hosted patch, but installed files in {} \
+                    "{purl} was switched to a hosted patch, but installed files in {} \
                      still differ from the patched hashes. {remedy} The installed files \
                      were left unchanged.",
                     site.display()

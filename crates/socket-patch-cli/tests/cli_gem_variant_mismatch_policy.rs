@@ -183,7 +183,7 @@ fn singleton_mismatch_default_warns_and_applies() {
         "the file must carry exactly the verified patched bytes"
     );
     assert!(
-        stderr.contains("content_mismatch_overwritten"),
+        stderr.contains("did not match the patch's expected original content"),
         "the overwrite must be surfaced as the npm-family mismatch warning; stderr={stderr}"
     );
     assert!(
@@ -246,7 +246,7 @@ fn singleton_mismatch_strict_refuses() {
          generic no-matching-variant miss; stderr={stderr}"
     );
     assert!(
-        !stderr.contains("content_mismatch_overwritten"),
+        !stderr.contains("did not match the patch's expected original content"),
         "--strict must not claim an overwrite happened; stderr={stderr}"
     );
 }
@@ -320,7 +320,7 @@ fn qualified_singleton_wrong_platform_fails_closed() {
         "the failure must stay the no-matching-variant error; stderr={stderr}"
     );
     assert!(
-        !stderr.contains("content_mismatch_overwritten"),
+        !stderr.contains("did not match the patch's expected original content"),
         "a wrong-distribution record must never be surfaced as a \
          local-modification overwrite; stderr={stderr}"
     );
@@ -395,7 +395,7 @@ fn multi_variant_mismatched_sibling_is_skipped_not_overwritten() {
         "the sibling distribution's bytes must never be written"
     );
     assert!(
-        !stderr.contains("content_mismatch_overwritten"),
+        !stderr.contains("did not match the patch's expected original content"),
         "a sibling-variant mismatch is a skip, not an overwrite warning; stderr={stderr}"
     );
 }

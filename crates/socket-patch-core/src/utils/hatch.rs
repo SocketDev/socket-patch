@@ -201,7 +201,7 @@ fn rewrite_project(
                     .any(|v| matches!(v.as_str(), Some("dependencies" | "optional-dependencies")))
             })
         {
-            return Err("dynamic project dependencies require the install hook".into());
+            return Err("dynamic project dependencies require agent mode".into());
         }
         if let Some(dependencies) = project
             .as_table_like_mut()
@@ -230,7 +230,7 @@ fn rewrite_project(
         {
             let group_matches = rewrite_array(dependencies, name, version, url)?;
             if group_matches > 0 && url.starts_with("{root:uri}") {
-                return Err("Hatch does not expand root placeholders in dependency groups; use environment dependencies or the install hook".into());
+                return Err("Hatch does not expand root placeholders in dependency groups; use environment dependencies or agent mode".into());
             }
             matched += group_matches;
         }
@@ -245,7 +245,7 @@ fn rewrite_environments(
     url: &str,
 ) -> Result<usize, String> {
     if hatch.get("sources").is_some() || hatch.get("env").is_some() {
-        return Err("Hatch sources and environment plugins require the install hook".into());
+        return Err("Hatch sources and environment plugins require agent mode".into());
     }
     let mut matched = 0;
     if let Some(environments) = hatch
@@ -265,7 +265,7 @@ fn rewrite_environments(
                     .is_some_and(|kind| kind != "virtual")
             {
                 return Err(
-                    "Hatch sources, overrides and custom environments require the install hook"
+                    "Hatch sources, overrides and custom environments require agent mode"
                         .into(),
                 );
             }
@@ -420,7 +420,7 @@ pub fn plan(
             .clone();
     }
     if matched == 0 {
-        return Err(format!("{name}=={version} has no explicit Hatch declaration; transitive-only dependencies require the install hook"));
+        return Err(format!("{name}=={version} has no explicit Hatch declaration; transitive-only dependencies require agent mode"));
     }
     let permission = if project_matched > 0 {
         let external = external_keys.iter().any(|key| key == "metadata");

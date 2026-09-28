@@ -60,7 +60,7 @@ use crate::ecosystem_dispatch::{
 /// Resolve [`HostedCopies`] for every hosted-basis purl of `hosted` (see the
 /// module docs), under the same crawler options and `--ecosystems` scope as
 /// the installed-tree lookup. `installed` is that lookup's every-copy
-/// result ([`crate::ecosystem_dispatch::find_manifest_package_copies`] over
+/// result ([`crate::ecosystem_dispatch::find_manifest_package_copies_reusing`] over
 /// the record view, which holds every hosted purl): the shared-location
 /// ecosystems read it instead of crawling the tree a second time. `prior`
 /// (embedded hosted `scan --vex` only) is scan's npm crawl of the same

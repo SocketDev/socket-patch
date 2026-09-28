@@ -33,7 +33,7 @@ module SocketPatch
         # Windows has no exec() that replaces the process cleanly for console
         # apps; spawn + wait and propagate the child's real exit status (a
         # blanket 1 would erase the CLI's meaningful non-zero codes, e.g.
-        # `setup --check`'s needs-configuration signal).
+        # `vex`'s usage-error 2 vs nothing-attested 1).
         ok = system(bin, *argv)
         raise LauncherError, "could not run #{bin}" if ok.nil?
         exit($?.exitstatus || 1)

@@ -125,7 +125,7 @@ fn populated_manifest() -> PatchManifest {
 }
 
 #[tokio::test]
-async fn missing_manifest_returns_1_plain() {
+async fn missing_manifest_returns_0_plain() {
     let tmp = tempfile::tempdir().unwrap();
     let args = ListArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -135,11 +135,11 @@ async fn missing_manifest_returns_1_plain() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
     };
-    assert_eq!(run(args).await, 1);
+    assert_eq!(run(args).await, 0);
 }
 
 #[tokio::test]
-async fn missing_manifest_returns_1_json() {
+async fn missing_manifest_returns_0_json() {
     let tmp = tempfile::tempdir().unwrap();
     let args = ListArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -149,7 +149,7 @@ async fn missing_manifest_returns_1_json() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
     };
-    assert_eq!(run(args).await, 1);
+    assert_eq!(run(args).await, 0);
 }
 
 #[tokio::test]
@@ -269,10 +269,9 @@ async fn absolute_manifest_path_wins_over_cwd() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn missing_manifest_json_status_is_error_via_binary() {
-    // Pins the new unified envelope shape for `list --json` when the
-    // manifest doesn't exist. Top-level keys: command, status, error
-    // (object with code + message), plus the usual envelope fields.
+fn missing_manifest_json_is_an_empty_success_via_binary() {
+    // No manifest and no ledger is an empty project (normal for hosted
+    // mode): `list --json` emits the success envelope with no events.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
         .args(["list", "--cwd", tmp.path().to_str().unwrap(), "--json"])
@@ -281,8 +280,8 @@ fn missing_manifest_json_status_is_error_via_binary() {
 
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "missing manifest must exit 1, stderr={}",
+        Some(0),
+        "an empty project must exit 0, stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -290,13 +289,10 @@ fn missing_manifest_json_status_is_error_via_binary() {
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
     assert_eq!(parsed["command"], "list");
-    assert_eq!(parsed["status"], "error");
-    assert_eq!(parsed["error"]["code"], "manifest_not_found");
-    let msg = parsed["error"]["message"].as_str().expect("error message");
-    assert!(
-        msg.contains("Manifest not found"),
-        "error.message must include 'Manifest not found', got: {msg}"
-    );
+    assert_eq!(parsed["status"], "success");
+    assert_eq!(parsed["summary"]["discovered"], 0);
+    assert_eq!(parsed["events"], serde_json::json!([]));
+    assert!(parsed.get("error").is_none(), "{parsed}");
 }
 
 // ---------------------------------------------------------------------------
@@ -365,26 +361,18 @@ fn empty_file_manifest_reports_manifest_invalid_via_binary() {
 }
 
 #[test]
-fn missing_manifest_under_valid_cwd_reports_manifest_not_found_via_binary() {
+fn missing_manifest_under_valid_cwd_is_not_an_error_via_binary() {
     // The common missing-manifest case: cwd exists, but `.socket/manifest.json`
-    // does not. `read_manifest` returns `Ok(None)` here, which must surface as
-    // `manifest_not_found` — NOT `manifest_invalid`, which would tell
-    // consumers a missing file was corrupt.
+    // does not. `read_manifest` returns `Ok(None)` here, which is an empty
+    // project — NOT `manifest_invalid`, which would tell consumers a missing
+    // file was corrupt.
     let tmp = tempfile::tempdir().unwrap();
     let out = run_list_binary(tmp.path(), &["--json"]);
     let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
         .expect("stdout must be valid JSON envelope");
-    assert_eq!(out.status.code(), Some(1), "missing manifest must exit 1");
-    assert_eq!(v["status"], "error");
-    assert_eq!(
-        v["error"]["code"], "manifest_not_found",
-        "missing manifest must be manifest_not_found, got envelope: {v}"
-    );
-    let msg = v["error"]["message"].as_str().expect("error message");
-    assert!(
-        msg.contains("Manifest not found"),
-        "message must name the missing manifest, got: {msg}"
-    );
+    assert_eq!(out.status.code(), Some(0), "missing manifest is an empty list");
+    assert_eq!(v["status"], "success", "envelope: {v}");
+    assert_eq!(v["summary"]["discovered"], 0, "envelope: {v}");
 }
 
 #[test]
@@ -561,7 +549,7 @@ fn empty_manifest_plain_says_no_patches_via_binary() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "empty list must exit 0");
     assert!(
-        stdout.contains("No patches found in manifest."),
+        stdout.contains("No patches in this project. Run `socket-patch scan`."),
         "empty manifest must report no patches, got: {stdout}"
     );
     // Guard against a regression that prints a record anyway.
@@ -941,16 +929,14 @@ fn silent_does_not_mute_json_envelope_via_binary() {
 }
 
 #[test]
-fn silent_keeps_missing_manifest_error_on_stderr_via_binary() {
-    // "Errors only": the missing-manifest diagnostic must survive --silent.
+fn silent_empty_project_prints_nothing_via_binary() {
+    // "Errors only": an empty project is not an error, so --silent prints
+    // nothing and exits 0.
     let tmp = tempfile::tempdir().unwrap();
 
     let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
-    assert_eq!(out.status.code(), Some(1), "missing manifest must exit 1");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("Manifest not found"),
-        "error output must NOT be muted by --silent"
-    );
+    assert_eq!(out.status.code(), Some(0), "an empty project exits 0");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,15 +1238,15 @@ fn manifest_and_hosted_pins_coexist_via_binary() {
 fn legacy_ledger_record_without_a_pin_is_not_listed_via_binary() {
     // A pre-v5 ledger whose record no lockfile wires any more (the lock was
     // re-resolved to the registry) asserts no live patch: with no manifest
-    // and no pin, `list` stays on the manifest_not_found path, and a
-    // manifest-backed listing does not pick the stale record up either.
+    // and no pin, `list` is an empty list, and a manifest-backed listing
+    // does not pick the stale record up either.
     let tmp = tempfile::tempdir().unwrap();
     common::write_redirect_ledger(tmp.path(), &[(HOSTED_PURL, hosted_record(HOSTED_UUID))]);
 
     let out = run_list_binary(tmp.path(), &["--json"]);
     let v = list_json(&out);
-    assert_eq!(out.status.code(), Some(1), "no pin anywhere: {v}");
-    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+    assert_eq!(out.status.code(), Some(0), "no pin anywhere: {v}");
+    assert_eq!(v["summary"]["discovered"], 0, "envelope={v}");
 
     write_manifest_in(tmp.path(), &populated_manifest());
     let out = run_list_binary(tmp.path(), &["--json"]);
@@ -1276,10 +1262,9 @@ fn legacy_ledger_record_without_a_pin_is_not_listed_via_binary() {
 }
 
 #[test]
-fn edits_only_ledger_without_manifest_still_manifest_not_found_via_binary() {
+fn edits_only_ledger_without_manifest_lists_nothing_via_binary() {
     // A pre-v5 ledger with recorded edits but NO records asserts no
-    // patches, so a manifest-less project stays on the manifest_not_found
-    // path.
+    // patches, so a manifest-less project is an empty list.
     let tmp = tempfile::tempdir().unwrap();
     let vendor_dir = tmp.path().join(".socket/vendor");
     std::fs::create_dir_all(&vendor_dir).unwrap();
@@ -1304,18 +1289,19 @@ fn edits_only_ledger_without_manifest_still_manifest_not_found_via_binary() {
     let v = list_json(&out);
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "no records anywhere must exit 1"
+        Some(0),
+        "no records anywhere is an empty list"
     );
-    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(v["summary"]["discovered"], 0, "envelope={v}");
 }
 
 #[test]
-fn missing_manifest_with_corrupt_ledger_keeps_warning_in_error_envelope_via_binary() {
-    // No manifest and a corrupt pre-v5 ledger: the run takes the
-    // manifest_not_found exit, but the ledger corruption must still reach
-    // a JSON consumer via the error envelope's `warnings[]` (stderr is not
-    // the machine channel), and nothing may leak onto stderr.
+fn missing_manifest_with_corrupt_ledger_keeps_warning_in_the_envelope_via_binary() {
+    // No manifest and a corrupt pre-v5 ledger: the run lists nothing, but
+    // the ledger corruption must still reach a JSON consumer via the
+    // envelope's `warnings[]` (stderr is not the machine channel), and
+    // nothing may leak onto stderr.
     let tmp = tempfile::tempdir().unwrap();
     let vendor_dir = tmp.path().join(".socket/vendor");
     std::fs::create_dir_all(&vendor_dir).unwrap();
@@ -1323,8 +1309,8 @@ fn missing_manifest_with_corrupt_ledger_keeps_warning_in_error_envelope_via_bina
 
     let out = run_list_binary(tmp.path(), &["--json"]);
     let v = list_json(&out);
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(v["status"], "success", "envelope={v}");
     let warnings = v["warnings"].as_array().expect("warnings[] present");
     assert_eq!(warnings.len(), 1, "envelope={v}");
     assert_eq!(warnings[0]["code"], "redirect_ledger_corrupt", "envelope={v}");
@@ -1334,12 +1320,16 @@ fn missing_manifest_with_corrupt_ledger_keeps_warning_in_error_envelope_via_bina
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Human mode: the warning still reaches stderr ahead of the error.
+    // Human mode: the warning still reaches stderr; the empty-project line
+    // is on stdout (v5.0).
     let out = run_list_binary(tmp.path(), &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(0));
     assert!(stderr.contains("Warning: "), "stderr={stderr}");
-    assert!(stderr.contains("Error: Manifest not found at "), "stderr={stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("No patches in this project."),
+        "stderr={stderr}"
+    );
 }
 
 #[test]
@@ -1493,9 +1483,9 @@ fn manifest_path_scopes_hosted_pins_to_target_project_via_binary() {
 }
 
 #[test]
-fn local_hosted_pins_never_suppress_flagged_manifest_not_found_via_binary() {
+fn local_hosted_pins_never_leak_into_the_flagged_project_via_binary() {
     // --manifest-path points at a project with NO manifest and NO pins;
-    // the cwd's local hosted lockfile must not turn that into a success.
+    // the cwd's local hosted lockfile must not be listed for it.
     let cwd = tempfile::tempdir().unwrap();
     write_hosted_lock(cwd.path(), &[(HOSTED_PURL, HOSTED_UUID)]);
     let target = tempfile::tempdir().unwrap();
@@ -1508,10 +1498,11 @@ fn local_hosted_pins_never_suppress_flagged_manifest_not_found_via_binary() {
     let v = list_json(&out);
     assert_eq!(
         out.status.code(),
-        Some(1),
+        Some(0),
         "the flagged project has no stores at all; envelope={v}"
     );
-    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+    assert_eq!(v["summary"]["discovered"], 0, "envelope={v}");
+    assert_eq!(v["events"], serde_json::json!([]), "envelope={v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,10 +1662,10 @@ fn manifest_hosted_pins_and_vendored_ledger_coexist_via_binary() {
 }
 
 #[test]
-fn record_less_vendor_entry_without_manifest_still_manifest_not_found_via_binary() {
+fn record_less_vendor_entry_without_manifest_lists_nothing_via_binary() {
     // A legacy manifest-tracked entry asserts no patch of its own: with no
-    // manifest and no other store, `list` stays on the manifest_not_found
-    // path (mirrors the edits-only pre-v5 redirect ledger).
+    // manifest and no other store, `list` is an empty list (mirrors the
+    // edits-only pre-v5 redirect ledger).
     let tmp = tempfile::tempdir().unwrap();
     write_vendor_ledger(tmp.path(), &[(VENDORED_PURL, None)]);
 
@@ -1683,10 +1674,11 @@ fn record_less_vendor_entry_without_manifest_still_manifest_not_found_via_binary
         .expect("stdout must be valid JSON");
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "no records anywhere must exit 1"
+        Some(0),
+        "no records anywhere is an empty list"
     );
-    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(v["summary"]["discovered"], 0, "envelope={v}");
 }
 
 #[test]

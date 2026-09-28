@@ -50,7 +50,6 @@ enum PatchTelemetryEventType {
     PatchListed,
     PatchRepaired,
     PatchRepairFailed,
-    PatchSetup,
     // OpenVEX attestation (added in #81)
     VexGenerated,
     VexFailed,
@@ -75,7 +74,6 @@ impl PatchTelemetryEventType {
             Self::PatchListed => "patch_listed",
             Self::PatchRepaired => "patch_repaired",
             Self::PatchRepairFailed => "patch_repair_failed",
-            Self::PatchSetup => "patch_setup",
             Self::VexGenerated => "vex_generated",
             Self::VexFailed => "vex_failed",
         }
@@ -790,7 +788,7 @@ pub async fn track_patch_fetch_failed(
 }
 
 // ---------------------------------------------------------------------------
-// Inspection / housekeeping trackers: list / repair / setup
+// Inspection / housekeeping trackers: list / repair
 // ---------------------------------------------------------------------------
 
 /// Track a successful `list`. Reports the number of patches surfaced.
@@ -844,22 +842,6 @@ pub async fn track_patch_repair_failed(
         "repair",
         serde_json::Value::Null,
         Some(error),
-        api_token,
-        org_slug,
-    )
-    .await;
-}
-
-/// Track a successful `setup`. Reports the detected package manager so
-/// we can tell which install hooks are exercised in the wild: the
-/// `+`-joined in-scope tags, where the npm-family tag is `npm`, `pnpm` or
-/// `vlt` (e.g. `vlt+pypi`), or `none`.
-pub async fn track_patch_setup(manager: &str, api_token: Option<&str>, org_slug: Option<&str>) {
-    fire(
-        PatchTelemetryEventType::PatchSetup,
-        "setup",
-        serde_json::json!({ "manager": manager }),
-        None::<&str>,
         api_token,
         org_slug,
     )
@@ -1252,7 +1234,6 @@ mod tests {
             PatchTelemetryEventType::PatchRepairFailed.as_str(),
             "patch_repair_failed"
         );
-        assert_eq!(PatchTelemetryEventType::PatchSetup.as_str(), "patch_setup");
         // OpenVEX
         assert_eq!(
             PatchTelemetryEventType::VexGenerated.as_str(),

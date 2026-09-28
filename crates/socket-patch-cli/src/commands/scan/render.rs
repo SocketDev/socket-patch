@@ -150,7 +150,7 @@ pub(super) fn summary_line(packages: usize, patches: usize, all_accessible: bool
 pub(super) fn paid_extra_line(paid: usize) -> String {
     let verb = if paid == 1 { "is" } else { "are" };
     format!(
-        "         + {} {verb} available with a paid subscription",
+        "         + {} {verb} available with a paid Socket plan",
         plural(paid, "additional patch", "additional patches")
     )
 }
@@ -649,11 +649,11 @@ mod tests {
     fn paid_extra_line_agrees_in_number() {
         assert_eq!(
             paid_extra_line(1),
-            "         + 1 additional patch is available with a paid subscription"
+            "         + 1 additional patch is available with a paid Socket plan"
         );
         assert_eq!(
             paid_extra_line(3),
-            "         + 3 additional patches are available with a paid subscription"
+            "         + 3 additional patches are available with a paid Socket plan"
         );
     }
 
