@@ -406,7 +406,20 @@ fn manifestless_agent_patch_is_not_attested(consumer: &Path, cargo_home: &Path) 
     let run = VexRun::online(&api).env("CARGO_HOME", cargo_home);
 
     // Baseline, manifest present: the applied, verified agent-mode patch
-    // attests.
+    // attests. The staged manifest carries no vulnerabilities (which alone
+    // would end `no_applicable_patches`), so give the entry one first.
+    let manifest_path = consumer.join(".socket/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][FIXTURE_PURL]["vulnerabilities"] = serde_json::json!({
+        "GHSA-cccc-cccc-cccc": {
+            "cves": ["CVE-2099-0001"],
+            "summary": "cargo safety vex vuln",
+            "severity": "high",
+            "description": "d"
+        }
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
     let out = run_vex(&bin, consumer, &run);
     assert_eq!(out.code, Some(0), "manifest-backed vex:\n{out}");
     assert!(
