@@ -21,11 +21,15 @@
 //!   `(redirected)` / `(vendored)` marker; exit 0; `verified` events.
 //! * b) `--offline` with no local record → `record_unavailable`, exit 1,
 //!   and the mock records ZERO requests.
-//! * c) ledger present, manifest absent → attests offline from the ledger's
-//!   embedded record (ledgers written by the REAL CLI: `scan --mode hosted`
-//!   / `scan --mode vendored`, whose embedded `--vex` is asserted too).
-//! * d) lock reverted to the registry while ledger + artifact remain →
-//!   `redirect_unwired` / `vendor_unwired`, including under `--no-verify`.
+//! * c) vendored: ledger present, manifest absent → attests offline from
+//!   the ledger's embedded record (written by the REAL CLI: `scan --mode
+//!   vendored`, whose embedded `--vex` is asserted too). Hosted: the REAL
+//!   `scan --mode hosted` writes no ledger (v5), so offline the wired lock
+//!   is `record_unavailable` and online it attests from the API.
+//! * d) lock reverted to the registry: vendored, while ledger + artifact
+//!   remain → `vendor_unwired`, including under `--no-verify`; hosted →
+//!   nothing is discovered (the lock was the only hosted state); a PRE-v5
+//!   redirect ledger left behind → `redirect_unwired`.
 //! * e) tampered installed tree (hosted) / tampered artifact member
 //!   (vendored) → `hash_mismatch` / `vendor_hash_mismatch`.
 //! * f) spoofs: a uuid on a non-Socket host (and look-alike hosts), a
@@ -723,12 +727,13 @@ fn b_api_without_the_record_is_record_unavailable() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// c) + d) + embedded: the ledgers written by the REAL CLI.
+// c) + d) + embedded: the state written by the REAL CLI.
 // ──────────────────────────────────────────────────────────────────────
 
 /// `scan --mode hosted --vex` on a lock-only checkout (nothing installed):
-/// the real engine rewires the lock to the mock server's hosted url, and
-/// the in-run VEX attests `(redirected)`. Returns the pre-scan lock bytes.
+/// the real engine rewires the lock to the mock server's hosted url, the
+/// in-run VEX attests `(redirected)` from this run's fetched records, and
+/// no ledger is written (v5). Returns the pre-scan lock bytes.
 fn scan_hosted(cwd: &Path, flavor: Flavor, api: &Api) -> Vec<u8> {
     write_lock(cwd, flavor, &Wiring::Registry);
     let registry_lock = std::fs::read(cwd.join(flavor.lock_file())).unwrap();
@@ -764,8 +769,8 @@ fn scan_hosted(cwd: &Path, flavor: Flavor, api: &Api) -> Vec<u8> {
         "{what}: the lock must be rewired"
     );
     assert!(
-        cwd.join(".socket/vendor/redirect-state.json").is_file(),
-        "{what}"
+        !cwd.join(".socket/vendor/redirect-state.json").exists(),
+        "{what}: v5 hosted mode writes no ledger"
     );
     assert!(!cwd.join(".socket/manifest.json").exists(), "{what}");
     registry_lock
@@ -830,7 +835,7 @@ fn drop_ledgers(cwd: &Path) {
 }
 
 #[test]
-fn c_d_hosted_ledger_from_real_scan_attests_offline_and_dies_with_the_lock() {
+fn c_d_hosted_real_scan_attests_online_only_and_dies_with_the_lock() {
     for flavor in FLAVORS {
         let what = format!("{flavor:?} hosted");
         let tmp = project();
@@ -841,49 +846,18 @@ fn c_d_hosted_ledger_from_real_scan_attests_offline_and_dies_with_the_lock() {
         let origin = api.uri();
         let psu = ["--patch-server-url", origin.as_str()];
 
-        // c) ledger present, manifest absent: offline, from the ledger.
+        // c) the scan left no local record (v5 keeps no hosted ledger):
+        // offline, the wired lock is `record_unavailable`.
         let (code, env) = vex(cwd, &[&["--offline"][..], &psu].concat());
-        assert_attested(cwd, code, &env, UUID, "hosted", &format!("{what} ledger"));
-
-        // The hosted url is on the operator's patch server, so without
-        // `--patch-server-url` it is not a discovered Socket reference.
-        // DELIBERATE (vex_sources' raw-text fallback, kept so staging
-        // servers keep working): an off-allowlist origin still proves the
-        // LEDGER claim live — but only a discovered pinned ref may attest
-        // from the lock, so with nothing installed the claim is
-        // `package_not_found`, never attested.
-        let (code, env) = vex(cwd, &["--offline"]);
         assert_omitted(
             cwd,
             code,
             &env,
-            "package_not_found",
-            &format!("{what} no psu"),
+            "record_unavailable",
+            &format!("{what} offline"),
         );
-        install(cwd, PATCHED);
-        let (code, env) = vex(cwd, &["--offline"]);
-        assert_attested(
-            cwd,
-            code,
-            &env,
-            UUID,
-            "hosted",
-            &format!("{what} no psu, installed"),
-        );
-        install(cwd, PRISTINE);
-        let (code, env) = vex(cwd, &["--offline"]);
-        assert_omitted(
-            cwd,
-            code,
-            &env,
-            "not_applied",
-            &format!("{what} no psu, pristine"),
-        );
-        std::fs::remove_dir_all(cwd.join("node_modules")).unwrap();
 
-        // a) no ledger either: the record comes from the API.
-        let saved = std::fs::read(cwd.join(".socket/vendor/redirect-state.json")).unwrap();
-        drop_ledgers(cwd);
+        // a) online: the record comes from the API.
         let (code, env) = vex_online(cwd, &api, &psu);
         assert_attested(
             cwd,
@@ -893,10 +867,19 @@ fn c_d_hosted_ledger_from_real_scan_attests_offline_and_dies_with_the_lock() {
             "hosted",
             &format!("{what} lock only"),
         );
-        std::fs::write(cwd.join(".socket/vendor/redirect-state.json"), &saved).unwrap();
 
-        // d) lock reverted to the registry, ledger left behind: never
-        // attested, not even under --no-verify, offline or online.
+        // The hosted url is on the operator's patch server, so without
+        // `--patch-server-url` it is not a Socket reference at all — and
+        // no ledger is left to vouch for it — installed or not.
+        let (code, env) = vex_online(cwd, &api, &[]);
+        assert_nothing_found(code, &env, &format!("{what} no psu"));
+        install(cwd, PATCHED);
+        let (code, env) = vex_online(cwd, &api, &[]);
+        assert_nothing_found(code, &env, &format!("{what} no psu, installed"));
+        std::fs::remove_dir_all(cwd.join("node_modules")).unwrap();
+
+        // d) lock reverted to the registry: no hosted state is left, so
+        // nothing is discovered — offline or online, --no-verify included.
         std::fs::write(cwd.join(flavor.lock_file()), &registry_lock).unwrap();
         for extra in [
             &["--offline"][..],
@@ -904,13 +887,7 @@ fn c_d_hosted_ledger_from_real_scan_attests_offline_and_dies_with_the_lock() {
             &[][..],
         ] {
             let (code, env) = vex_online(cwd, &api, &[extra, &psu].concat());
-            assert_omitted(
-                cwd,
-                code,
-                &env,
-                "redirect_unwired",
-                &format!("{what} reverted {extra:?}"),
-            );
+            assert_nothing_found(code, &env, &format!("{what} reverted {extra:?}"));
         }
     }
 }
