@@ -7,14 +7,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use socket_patch_core::formats::registry;
-use socket_patch_core::utils::python_lock::is_python_lock_name;
+use crate::formats::registry;
+use crate::utils::python_lock::is_python_lock_name;
 
 use super::types::IgnoredPath;
 
 /// Marker files of the ecosystems the in-memory engine cannot inventory
 /// (disk discovers them only through installed-tree crawlers).
-pub(crate) const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
+pub const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
     (
         "maven",
         &[
@@ -53,7 +53,7 @@ pub(crate) fn root_markers<'a>(root: &str, paths: impl IntoIterator<Item = &'a s
 
 /// The ecosystem a root marker basename belongs to: a [`registry::ROOT`]
 /// row (manifests alone never make a root) or a PEP 751 / PEP 723 lock.
-pub(crate) fn marker_ecosystem(base: &str) -> Option<&'static str> {
+pub fn marker_ecosystem(base: &str) -> Option<&'static str> {
     if let Some(row) = registry::root_marker(base) {
         return Some(row.ecosystem);
     }

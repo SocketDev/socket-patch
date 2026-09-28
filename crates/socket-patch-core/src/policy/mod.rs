@@ -8,6 +8,7 @@
 //! file fails closed ([`PolicyError`]) instead of meaning "no policy".
 
 pub mod paths;
+mod report;
 pub mod socket_yml;
 
 use std::collections::BTreeMap;
@@ -24,6 +25,7 @@ use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use self::paths::{PathHit, PathMatcher};
 use self::socket_yml::{parse_file, ParsedFile, PatchesBlock};
 
+pub use self::report::{canon, policy_block, FilteredEntry, RetainedEntry};
 pub use self::socket_yml::MAX_FILE_BYTES;
 
 /// Root file names, in the order they are read.

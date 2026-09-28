@@ -15,7 +15,6 @@ use socket_patch_core::api::client::{
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
@@ -55,7 +54,10 @@ use self::discovery::{
 // pinned entry into the hosted engine, the vendor step + its dry-run
 // preview, and the PnP layout-refusal warning mapping. `pub(crate)`
 // re-exports because the submodules themselves stay private to scan.
-pub(crate) use self::discovery::unsupported_layout_warnings;
+pub(crate) use self::discovery::{
+    lockfile_supplement as project_lockfile_supplement, unsupported_layout_warnings,
+    vendored_ledger_supplement as project_vendored_supplement,
+};
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
@@ -816,27 +818,12 @@ fn overlap_from_states(
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: &VendorState,
 ) -> Vec<String> {
-    let Some(redirect) = redirect else {
-        return Vec::new();
-    };
-    if vendor.entries.is_empty() || redirect.records.is_empty() {
-        return Vec::new();
+    socket_patch_core::ledgers::Ledgers {
+        manifest: None,
+        vendor: Some(vendor),
+        redirect,
     }
-    // Canonicalize both sides (drop qualifiers, percent-decode) so the
-    // hosted pin's purl matches the vendor entry's base purl — mirrors
-    // `vendored_ledger_supplement`.
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let mut vendor_purls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (key, entry) in &vendor.entries {
-        vendor_purls.insert(canon(key));
-        vendor_purls.insert(canon(&entry.base_purl));
-    }
-    let redirect_purls: std::collections::BTreeSet<String> =
-        redirect.records.keys().map(|p| canon(p)).collect();
-    redirect_purls
-        .intersection(&vendor_purls)
-        .cloned()
-        .collect()
+    .hosted_vendored_overlap()
 }
 
 /// The overlapping PURLs split by which mode the LIVE lockfile actually wires
@@ -1421,6 +1408,10 @@ async fn run_scan(
     // `--vex` side-effect reads the manifest at several terminal returns,
     // including the early "no packages" exit before the GC block.
     let manifest_path = args.common.resolved_manifest_path();
+    // The stores, lock set and wiring discovery this run reads before it
+    // writes anything, each loaded at most once (see `ProjectContext`).
+    let ctx =
+        crate::commands::context::ProjectContext::rooted(&args.common, args.common.cwd.clone());
     let socket_dir = args.common.socket_dir();
 
     let overrides = args.common.api_client_overrides();
@@ -1469,7 +1460,7 @@ async fn run_scan(
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery and are flagged "not yet installed". Scoped to the crawled
     // ecosystems.
-    let lockfile_only = lockfile_supplement(&args.common, &all_crawled, crawl_scope).await;
+    let lockfile_only = lockfile_supplement(&ctx, &all_crawled, crawl_scope).await;
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
@@ -1500,9 +1491,9 @@ async fn run_scan(
     // and update detection. Failure policies differ on purpose: the
     // supplement falls back to the committed artifacts (fail-closed for the
     // prune), the key set degrades to empty (fail-open).
-    let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let vendor_state = &ctx.loaded().await.vendor;
     let ledger_supplement =
-        vendored_ledger_supplement(&args.common, &all_crawled, &vendor_state).await;
+        vendored_ledger_supplement(&args.common, &all_crawled, vendor_state).await;
     for pkg in &ledger_supplement {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
@@ -1527,7 +1518,7 @@ async fn run_scan(
         .unwrap_or_default();
 
     // Read existing manifest once for update detection.
-    let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
+    let existing_manifest = ctx.ledgers().await.manifest;
     // Hosted mode records its patches ONLY in the lockfiles (v5 keeps no
     // hosted ledger) and vendored mode ONLY in its ledger, so the hosted
     // pins and the vendor ledger's purl→uuid records are folded into update
@@ -1537,18 +1528,17 @@ async fn run_scan(
         if args.common.is_global() {
             Vec::new()
         } else {
-            socket_patch_core::patch::redirect::upstream::HostedPin::all(
-                &crate::commands::discover_wiring(&args.common, &args.common.cwd).await,
-            )
+            socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
         };
-    let redirect_state = (!args.common.is_global())
+    let hosted_state = (!args.common.is_global())
         .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
+    let redirect_state = hosted_state.as_ref();
     let hosted_pins: Vec<(String, String)> = hosted_pin_list
         .iter()
         .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
         .collect();
     let update_manifest = merge_ledger_records_for_updates(
-        existing_manifest.as_ref(),
+        existing_manifest,
         vendor_state.as_ref().ok(),
         &hosted_pins,
     );
@@ -1699,11 +1689,11 @@ async fn run_scan(
                 // (same rule as the ≥1-package path). `wiringLive` is empty
                 // by construction: this run covered zero packages.
                 let redirect_state = (!args.common.is_global()).then_some(
-                    crate::commands::hosted_state_from_lockfiles(
-                        &args.common,
-                        &args.common.cwd,
-                    )
-                    .await,
+                    crate::commands::hosted_state_from_pins(
+                        &socket_patch_core::patch::redirect::upstream::HostedPin::all(
+                            ctx.discovery().await,
+                        ),
+                    ),
                 );
                 if let Some(state) = redirect_state_json(redirect_state.as_ref(), &[]) {
                     result["redirectState"] = state;
@@ -2042,10 +2032,10 @@ async fn run_scan(
         let hosted_retained = if vendor {
             Vec::new()
         } else {
-            hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await
+            hosted_wiring_retained_purls(&args.common, redirect_state, &all_purls).await
         };
         if !vendor {
-            if let Some(state) = redirect_state_json(redirect_state.as_ref(), &hosted_retained) {
+            if let Some(state) = redirect_state_json(redirect_state, &hosted_retained) {
                 result["redirectState"] = state;
             }
         }
@@ -2107,7 +2097,7 @@ async fn run_scan(
             if dry {
                 // Synthesize the per-patch outcome without touching disk.
                 let empty_manifest = PatchManifest::new();
-                let manifest_for_preview = existing_manifest.as_ref().unwrap_or(&empty_manifest);
+                let manifest_for_preview = existing_manifest.unwrap_or(&empty_manifest);
                 let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
@@ -2708,7 +2698,7 @@ async fn run_scan(
     // vendored-ownership counterpart is the `[skip]` lines above.)
     if !vendor && !silent {
         let hosted_retained =
-            hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await;
+            hosted_wiring_retained_purls(&args.common, redirect_state, &all_purls).await;
         if !hosted_retained.is_empty() {
             eprintln!(
                 "Warning: {}",
