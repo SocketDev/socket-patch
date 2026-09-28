@@ -7,7 +7,7 @@ pub mod list;
 pub(crate) mod lock_cli;
 pub mod remove;
 pub mod repair;
-pub(crate) mod repair_vendor;
+pub(crate) mod vendored_backend;
 pub mod rollback;
 pub mod scan;
 pub mod setup;

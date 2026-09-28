@@ -272,7 +272,7 @@
     ],
     "vendored/repair": [
       "vlt_repair_rebuilds_a_deleted_dir",
-      "vlt_repair_reconstructs_the_ledger_from_the_lock",
+      "vlt_repair_reports_a_missing_ledger",
       "vlt_pinned_matrix_vendored_repair_rebuilds"
     ],
     "vendored/remove": [
