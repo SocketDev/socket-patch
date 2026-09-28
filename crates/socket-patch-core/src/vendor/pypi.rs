@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::api::client::{ApiClient, DeferredAttempt};
+use crate::api::client::{wheel_filename_from_url, ApiClient, DeferredAttempt, PYPI_NOT_A_WHEEL};
 use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
@@ -1921,8 +1921,7 @@ async fn try_pypi_service_wheel(
                 return miss(
                     warnings,
                     "vendor_prebuilt_unavailable",
-                    "the prebuilt artifact is not a .whl (pypi vendoring is wheel-based)"
-                        .to_string(),
+                    PYPI_NOT_A_WHEEL.to_string(),
                 );
             };
             // The SRI proves only that the transfer is intact. A wheel's
@@ -2017,6 +2016,10 @@ async fn try_pypi_service_wheel(
             "vendor_prebuilt_pending",
             "prebuilt wheel is still building".to_string(),
         ),
+        // The client refused a non-wheel before downloading it.
+        ServiceArtifact::Unavailable(reason) if reason == PYPI_NOT_A_WHEEL => {
+            miss(warnings, "vendor_prebuilt_unavailable", reason)
+        }
         // Quiet under `auto` (the common "not built / free-only" case).
         ServiceArtifact::Unavailable(reason) => {
             if cfg.source.requires_service() {
@@ -2034,13 +2037,6 @@ async fn try_pypi_service_wheel(
             format!("patch service request failed ({reason})"),
         ),
     }
-}
-
-/// The last path segment of a serve URL, when it names a `.whl`.
-fn wheel_filename_from_url(url: &str) -> Option<String> {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let name = path.rsplit('/').next().unwrap_or("");
-    name.ends_with(".whl").then(|| name.to_string())
 }
 
 /// Derive `(platform_locked, display)` from a wheel filename's trailing tag
@@ -3232,6 +3228,21 @@ wheels = [
         let wheel_rel = format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}");
         assert_eq!(entry.artifact.path, wheel_rel);
         assert!(fx.root.join(&wheel_rel).exists());
+        assert_sdist_never_downloaded(&server).await;
+    }
+
+    /// The served sdist is refused from its reference alone: its bytes are
+    /// never requested.
+    async fn assert_sdist_never_downloaded(server: &wiremock::MockServer) {
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| r.method != wiremock::http::Method::GET),
+            "the sdist must not be downloaded: {:?}",
+            requests
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.url.path()))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// `service` mode + an sdist (non-wheel) artifact hard-fails.
@@ -3264,6 +3275,7 @@ wheels = [
             matches!(outcome, VendorOutcome::Refused { .. }),
             "service mode must refuse a non-wheel artifact, got {outcome:?}"
         );
+        assert_sdist_never_downloaded(&server).await;
     }
 
     /// `service` mode + an integrity mismatch hard-fails (nothing written).

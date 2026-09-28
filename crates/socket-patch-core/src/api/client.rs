@@ -335,6 +335,18 @@ type VendorAttemptError = (ApiError, Option<Option<Duration>>);
 /// Most UUIDs the package-reference endpoint takes in one request.
 pub(crate) const MAX_REFERENCE_BATCH: usize = 500;
 
+/// Why a pypi reference is refused before its download: the served
+/// artifact is not a wheel.
+pub(crate) const PYPI_NOT_A_WHEEL: &str =
+    "the prebuilt artifact is not a .whl (pypi vendoring is wheel-based)";
+
+/// The last path segment of a serve URL, when it names a `.whl`.
+pub(crate) fn wheel_filename_from_url(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or("");
+    name.ends_with(".whl").then(|| name.to_string())
+}
+
 /// Body payload for the batch search POST endpoint.
 #[derive(Serialize)]
 struct BatchSearchBody {
@@ -1314,6 +1326,16 @@ impl ApiClient {
             },
             None => download_url.to_string(),
         };
+        // pypi vendoring is wheel-based, so the sdist a qualifier-less pypi
+        // patch is served can never be used: refuse it before downloading.
+        if result
+            .purl
+            .as_deref()
+            .is_some_and(|purl| purl.starts_with("pkg:pypi/"))
+            && wheel_filename_from_url(&download_url).is_none()
+        {
+            return done(VendorServiceOutcome::Unavailable(PYPI_NOT_A_WHEEL.into()));
+        }
 
         // Surface the OTHER served artifacts (e.g. the gem path-source stub
         // gemspec) — their host-rewritten URL + normalized sha512 — so a
