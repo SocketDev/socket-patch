@@ -2482,6 +2482,80 @@ async fn wired_vendor_integrity_reads_rewired_yarn_classic_and_skips_bad_json_lo
     );
 }
 
+/// The yarn / bun branches of `wired_vendor_integrity` read the entry
+/// models lockfile discovery reads, not a line window: a berry block whose
+/// carried sections push `checksum:` far below the reference, yarn 4.0.x's
+/// bare-hex checksum, a CRLF classic lock, a shadowed classic block (yarn
+/// keeps the last one) and bun's digest-less re-save (which must never
+/// borrow the next tuple's sha512).
+#[tokio::test]
+async fn wired_vendor_integrity_reads_yarn_and_bun_entries_structurally() {
+    let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+    let hex = "ab".repeat(64);
+    let berry = |checksum: &str| {
+        format!(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"left-pad@file:./{rel}::locator=app%40workspace%3A.\":\n  \
+             version: 1.3.0\n  \
+             resolution: \"left-pad@file:./{rel}#./{rel}::hash=abc&locator=app%40workspace%3A.\"\n  \
+             dependencies:\n    a: \"npm:1.0.0\"\n    b: \"npm:1.0.0\"\n    c: \"npm:1.0.0\"\n    d: \"npm:1.0.0\"\n    e: \"npm:1.0.0\"\n  \
+             checksum: {checksum}\n  \
+             languageName: node\n  \
+             linkType: hard\n"
+        )
+    };
+    for (checksum, want) in [
+        (format!("10c0/{hex}"), format!("10c0/{hex}")),
+        (hex.clone(), format!("10c0/{hex}")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "yarn.lock", &berry(&checksum)).await;
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), rel).await,
+            Some(LockIntegrity::BerryChecksum(want)),
+            "{checksum}"
+        );
+    }
+
+    let classic = |key: &str, sri: &str| {
+        format!(
+            "{key}:\n  version \"1.3.0\"\n  resolved \"file:./{rel}#0000000000000000000000000000000000000000\"\n  integrity {sri}\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = format!(
+        "# yarn lockfile v1\n\n{}\n{}",
+        classic("left-pad@^1.3.0", "sha512-shadowed=="),
+        classic("left-pad@^1.3.0", "sha512-live==")
+    )
+    .replace('\n', "\r\n");
+    write(tmp.path(), "yarn.lock", &lock).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri("sha512-live==".into())),
+        "the live (last) block of a CRLF lock"
+    );
+
+    let bun = |ours: &str| {
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \"name\": \"app\",\n    }},\n  }},\n  \"packages\": {{\n    \"left-pad\": [\"left-pad@./{rel}\", {{}}{ours}],\n\n    \"right-pad\": [\"right-pad@1.0.0\", \"\", {{}}, \"sha512-theirs==\"],\n  }}\n}}\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", &bun(", \"sha512-ours==\"")).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        Some(LockIntegrity::Sri("sha512-ours==".into()))
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "bun.lock", &bun("")).await;
+    assert_eq!(
+        wired_vendor_integrity(tmp.path(), rel).await,
+        None,
+        "a digest-less re-save pins nothing"
+    );
+}
+
 /// `PnpmPackage::resolution_tokens` exposes the raw `resolution:` value the
 /// grammar refused (a nested map, a duplicate key, a wrapped flow map), so
 /// lockfile discovery can still tell a Socket-shaped entry from anything
@@ -2492,7 +2566,7 @@ fn pnpm_resolution_tokens_cover_maps_the_grammar_refuses() {
     let lock = format!(
         "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      tarball: {url}\n      nested:\n        a: b\n\n  y@1.0.0:\n    resolution: {{integrity: sha512-a}}\n    resolution: {{tarball: '{url}'}}\n\n  z@1.0.0:\n    resolution: {{integrity: sha512-z,\n      tarball: \"{url}\"}}\n\n  ok@1.0.0:\n    resolution: {{integrity: sha512-ok}}\n"
     );
-    let packages = super::pnpm::pnpm_packages(&lock);
+    let packages = crate::formats::pnpm::pnpm_packages(&lock);
     let by_key = |key: &str| packages.iter().find(|p| p.key == key).unwrap();
     for key in ["x@1.0.0", "y@1.0.0", "z@1.0.0"] {
         let package = by_key(key);

@@ -93,7 +93,7 @@ use crate::patch::redirect::{
 };
 use crate::utils::digest::sha256_hex;
 use crate::vendor::lock_inventory::LockIntegrity;
-use crate::vendor::maven_pom::{
+use crate::formats::maven::{
     is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
     PomRepo,
 };

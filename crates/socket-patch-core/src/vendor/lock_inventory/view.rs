@@ -16,7 +16,8 @@ use crate::utils::fs::{
     read_regular_to_bytes, read_regular_to_string, read_regular_to_string_sync,
 };
 use crate::vendor::npm_flavor::NpmLockFlavor;
-use crate::vendor::pnpm_lock_legacy::{sniff_lock_grammar, PnpmLockGrammar};
+use crate::formats::pnpm::{sniff_lock_grammar, PnpmLockGrammar};
+use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use crate::vendor::VendorWarning;
 
 /// One in-memory file.
@@ -289,10 +290,6 @@ impl ProjectView<'_> {
     }
 }
 
-/// How many head lines the yarn content sniff reads (mirrors the disk
-/// probe).
-const YARN_SNIFF_HEAD_LINES: usize = 30;
-
 /// [`crate::vendor::npm_flavor::detect_npm_lock_flavor`] over a
 /// [`ProjectView`]. The disk variant IS the disk probe; the memory variant
 /// follows the same decision table, with pnpm's own Plug'n'Play layout
@@ -350,24 +347,16 @@ pub(crate) async fn detect_npm_lock_flavor_in(
         }
         if exists("yarn.lock") {
             let text = read_lock("yarn.lock")?;
-            let head: Vec<&str> = text
-                .strip_prefix('\u{feff}')
-                .unwrap_or(&text)
-                .lines()
-                .take(YARN_SNIFF_HEAD_LINES)
-                .collect();
-            if head.iter().any(|l| l.starts_with("__metadata:")) {
-                break 'flavor NpmLockFlavor::YarnBerry;
+            match sniff_grammar(&text) {
+                Some(YarnLockGrammar::Berry) => break 'flavor NpmLockFlavor::YarnBerry,
+                Some(YarnLockGrammar::Classic) => break 'flavor NpmLockFlavor::YarnClassic,
+                None => {
+                    return Err((
+                        "vendor_lockfile_version_unsupported",
+                        UNIDENTIFIED_DETAIL.to_string(),
+                    ))
+                }
             }
-            if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
-                break 'flavor NpmLockFlavor::YarnClassic;
-            }
-            return Err((
-                "vendor_lockfile_version_unsupported",
-                "yarn.lock carries neither the `# yarn lockfile v1` header nor a berry \
-                 `__metadata:` key; cannot identify the lockfile version"
-                    .to_string(),
-            ));
         }
         if exists(NPM_LOCKS[0]) || exists(NPM_LOCKS[1]) {
             break 'flavor NpmLockFlavor::PackageLock;
