@@ -476,7 +476,7 @@ need the network and refuse to run with `--offline`.
 | [`remove`](#remove) | The single-patch form of `rollback`: restore, unwind, drop the record and GC for one PURL/UUID (a hosted patch is restored to upstream) |
 | [`vendor --revert`](#vendor) | **Un-vendors wholesale**: restores the recorded original lockfile fragments byte-for-byte and removes the `.socket/vendor/` artifacts (a package vendored over a hosted pin returns to upstream, not to hosted) |
 | [`scan --prune`](#scan) | Agent mode: **reconciles, doesn't reverse** — drops manifest entries for packages that have left the project and garbage-collects orphan blob/diff/archive files |
-| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, and cleans up unused ones |
+| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, re-vendors missing/corrupt vendored artifacts, and cleans up unused ones |
 
 And `setup --remove` reverts the install hooks that `setup` added.
 
@@ -497,7 +497,7 @@ And `setup --remove` reverts the install hooks that `setup` added.
 | [`setup`](#setup) | Wire install hooks (npm, Python, Bundler, Composer) that re-apply patches after install |
 | [`rollback`](#rollback) | Undo patches in every mode: restore original files, unwind vendored lockfile wiring, and restore hosted lockfile entries to upstream |
 | [`remove`](#remove) | Remove one patch by PURL or UUID (rolls back first) |
-| [`repair`](#repair) | Download missing patch artifacts, rebuild vendored artifacts, clean up unused ones (alias: `gc`) |
+| [`repair`](#repair) | Download missing patch artifacts, re-vendor broken vendored artifacts, clean up unused ones (alias: `gc`) |
 
 `socket-patch --update` updates the CLI itself (see [Updating](#updating)).
 
@@ -1215,14 +1215,18 @@ socket-patch remove "pkg:npm/lodash@4.17.20" --json
 
 ### `repair`
 
-Download missing blobs, rebuild missing or corrupt vendored artifacts, and clean up unused
+Download missing blobs, re-vendor missing or corrupt vendored artifacts, and clean up unused
 blobs.
 
 Alias: `gc`
 
 `repair` cleans up the `.socket/` directory without running a scan — useful when you've
 manually adjusted the manifest, recovered from a partial-failure state, or just want to
-free space. It also rebuilds missing or corrupt vendored artifacts. For the combined
+free space. It also re-vendors missing or corrupt vendored artifacts the same way `vendor`
+does (the patch service's prebuilt artifact first, a local build as the fallback), checked
+against `.socket/vendor/state.json`. `repair` does not recreate a lost `state.json`: if a
+lockfile points into `.socket/vendor/` and the ledger has no entry for it, `repair` fails with
+`vendor_ledger_missing` — restore `state.json` from version control. For the combined
 agent-mode workflow (discover + apply + GC in one pass), use `scan --sync` instead.
 
 Like every other mutating command, `repair` takes the `.socket/apply.lock` advisory lock
