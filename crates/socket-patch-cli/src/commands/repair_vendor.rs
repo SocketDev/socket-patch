@@ -208,6 +208,14 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
             rest = &rest[idx + ".socket".len()..];
         }
     }
+    // The NuGet fallback layout names its seeds only in the generated
+    // targets (`$(SocketPatchNuGetDir)<uuid>/…`), never by a
+    // `.socket/vendor/` path string.
+    for (uuid, path) in vendor::nuget_fallback::rendered_seed_references(project_root).await {
+        if seen.insert(("nuget".to_string(), uuid.clone())) {
+            out.push(("nuget".to_string(), uuid, path));
+        }
+    }
     out.sort();
     out
 }
@@ -254,6 +262,13 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
 /// routes to the package-lock backend, whose guard also fails closed on
 /// unwired entries.
 async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> Option<String> {
+    if eco == "nuget" {
+        let fallback = vendor::nuget_fallback::rendered_seed_references(project_root)
+            .await
+            .into_iter()
+            .any(|(u, _)| u == uuid);
+        return fallback.then(|| vendor::nuget_fallback::NUGET_FALLBACK_FLAVOR.to_string());
+    }
     if eco == "pypi" {
         let needle = format!(".socket/vendor/pypi/{uuid}/");
         let mut files =

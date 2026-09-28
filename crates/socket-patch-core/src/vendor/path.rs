@@ -26,7 +26,7 @@
 //! | composer | `<vendor>/<name>@<version>/`           |
 //! | gem      | `<name>-<version>/`                    |
 //! | pypi     | `<dist>-<version>-<tags>.whl` (PEP 427)|
-//! | nuget    | `<idLower>.<versionNorm>.nupkg`        |
+//! | nuget    | `<idLower>.<versionNorm>.nupkg`; fallback layout: `<idLower>/<V′>/` |
 //! | maven    | `<g-as-path>/<a>/<v>/<a>-<v>.jar`      |
 
 use std::path::{Path, PathBuf};
@@ -278,6 +278,19 @@ pub(crate) fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
             Some(format!("pkg:pypi/{dist}@{version}"))
         }
         "nuget" => {
+            // The fallback layout's seed dir: `<idLower>/<V′>` names the
+            // upstream version V inside V′.
+            if let Some((id, socket_version)) = leaf.split_once('/') {
+                let (version, _) =
+                    super::nuget_version::parse_socket_nuget_version(socket_version)?;
+                if !is_safe_single_segment(id)
+                    || !super::nuget_feed::is_plain_nuget_token(id)
+                    || socket_version.contains('/')
+                {
+                    return None;
+                }
+                return Some(format!("pkg:nuget/{id}@{version}"));
+            }
             let stem = leaf.strip_suffix(".nupkg")?;
             let (name, version) = split_nuget_leaf(stem)?;
             if !is_safe_single_segment(version) {
@@ -754,6 +767,12 @@ mod tests {
         // nested leaf whose recovered version would span a `/`.
         assert!(leaf_to_purl("nuget", ".1.2.3.nupkg").is_none());
         assert!(leaf_to_purl("nuget", "foo.1.0/evil.nupkg").is_none());
+        assert_eq!(
+            leaf_to_purl("nuget", "newtonsoft.json/13.0.1.1340506223").as_deref(),
+            Some("pkg:nuget/newtonsoft.json@13.0.1")
+        );
+        assert!(leaf_to_purl("nuget", "newtonsoft.json/13.0.1").is_none());
+        assert!(leaf_to_purl("nuget", "newtonsoft.json/13.0.1.1340506223/lib").is_none());
         // maven: an empty group component, and an unsafe group (colon).
         assert!(leaf_to_purl("maven", "/app/1.0.0/app-1.0.0.jar").is_none());
         assert!(leaf_to_purl("maven", "a:b/x/1.0/x-1.0.jar").is_none());

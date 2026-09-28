@@ -937,6 +937,54 @@ async fn materialise_patched_nupkg(
     }
 }
 
+/// The patched same-version `.nupkg` bytes [`materialise_patched_nupkg`]
+/// produces (service download first, local rebuild otherwise), built in a
+/// private stage instead of a committed feed dir — the NuGet fallback layout
+/// extracts its seed from them ([`super::nuget_fallback`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn patched_nupkg_bytes(
+    purl: &str,
+    installed_dir: &Path,
+    name: &str,
+    version: &str,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
+    let stage = match Stage::new() {
+        Ok(stage) => stage,
+        Err(e) => {
+            return Ok((
+                Vec::new(),
+                failed_result(purl, installed_dir, format!("cannot create stage dir: {e}")),
+            ))
+        }
+    };
+    let feed_dir = stage.path().join("feed");
+    let nupkg_path = feed_dir.join(nupkg_leaf(&name.to_lowercase(), version));
+    // `config_wired: true` only keeps a failed build from pruning the
+    // stage's parents; the whole stage is disposed of below either way.
+    let out = materialise_patched_nupkg(
+        purl,
+        installed_dir,
+        &feed_dir,
+        &nupkg_path,
+        name,
+        version,
+        record,
+        sources,
+        force,
+        service,
+        /*config_wired=*/ true,
+        warnings,
+    )
+    .await;
+    stage.dispose().await;
+    out
+}
+
 /// Local rebuild: locate the cached pristine `.nupkg` in `installed_dir`, read
 /// it for a private stage — only the paths the apply pipeline and the sidecar
 /// fixup resolve are materialised there, see [`prepare_memory_repack`] —

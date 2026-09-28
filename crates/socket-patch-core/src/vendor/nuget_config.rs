@@ -27,6 +27,8 @@ pub(crate) struct NugetConfig {
     pub(crate) mappings: Vec<(String, Vec<String>)>,
     /// Keys `configuration/disabledPackageSources` turns off.
     pub(crate) disabled: BTreeSet<String>,
+    /// `configuration/config/add[@key='signatureValidationMode']` `value`.
+    pub(crate) signature_validation_mode: Option<String>,
 }
 
 /// One open (or self-closing) tag.
@@ -98,6 +100,13 @@ fn visit(stack: &[&str], tag: &Tag<'_>, cfg: &mut NugetConfig, open_mapping: &mu
             if let (Some(key), Some(value)) = (tag.attr("key"), tag.attr("value")) {
                 if value.trim().eq_ignore_ascii_case("true") {
                     cfg.disabled.insert(key.to_string());
+                }
+            }
+        }
+        (["configuration", "config"], "add") => {
+            if let (Some(key), Some(value)) = (tag.attr("key"), tag.attr("value")) {
+                if key.trim().eq_ignore_ascii_case("signatureValidationMode") {
+                    cfg.signature_validation_mode = Some(value.trim().to_string());
                 }
             }
         }
@@ -245,6 +254,22 @@ pub(crate) async fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signature_validation_mode_is_read_from_config_section() {
+        let cfg = super::parse_config(
+            "<configuration><config><add key=\"signatureValidationMode\" value=\"require\" />\
+             </config></configuration>",
+        )
+        .unwrap();
+        assert_eq!(cfg.signature_validation_mode.as_deref(), Some("require"));
+        let cfg = super::parse_config(
+            "<configuration><packageSources><add key=\"signatureValidationMode\" \
+             value=\"require\" /></packageSources></configuration>",
+        )
+        .unwrap();
+        assert_eq!(cfg.signature_validation_mode, None);
+    }
+
     #[test]
     fn entity_decoding_is_minimal_and_safe() {
         assert_eq!(super::decode_entities("a&amp;b&lt;&#x2F;&#47;"), "a&b<//");

@@ -212,6 +212,11 @@ pub(crate) async fn dispatch_vendor_one(
         "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
         "golang" => vend!(vendor::golang::vendor_go_module),
         "composer" => vend!(vendor::composer_lock::vendor_composer),
+        // The opt-in fallback layout (`SOCKET_PATCH_NUGET_LAYOUT=fallback`, or
+        // a project that already carries fallback state).
+        "nuget" if vendor::nuget_fallback::fallback_layout_for(purl, project_root).await => {
+            vend_installed!(vendor::nuget_fallback::vendor_nuget_fallback)
+        }
         "nuget" => vend_installed!(vendor::nuget_feed::vendor_nuget),
         "maven" => vend_installed!(vendor::maven_repo::vendor_maven),
         _ => return None,
@@ -242,6 +247,9 @@ pub(crate) async fn dispatch_revert_one_opts(
         "cargo" => vendor::cargo::revert_cargo_vendor_opts(entry, project_root, opts).await,
         "golang" => vendor::golang::revert_go_vendor_opts(entry, project_root, opts).await,
         "composer" => vendor::composer_lock::revert_composer_opts(entry, project_root, opts).await,
+        "nuget" if vendor::nuget_fallback::is_fallback_entry(entry) => {
+            vendor::nuget_fallback::revert_nuget_fallback_opts(entry, project_root, opts).await
+        }
         "nuget" => vendor::nuget_feed::revert_nuget_opts(entry, project_root, opts).await,
         "maven" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
         other => RevertOutcome::failed(format!(
@@ -1102,6 +1110,18 @@ async fn sweep_stale_artifact(
         // within one ecosystem never empties it, but a re-vendor
         // that moved ecosystems would otherwise leave a husk).
         let _ = remove_tree_and_prune(&common.cwd.join(rel), &common.cwd.join(SOCKET_DIR)).await;
+        // The fallback layout's shared targets list every seed dir on disk:
+        // re-render them without the swept one.
+        if vendor::nuget_fallback::is_fallback_entry(&prev) {
+            if let Err(detail) = vendor::nuget_fallback::sync_shared(&common.cwd, false).await {
+                record_warning(
+                    env,
+                    &candidate,
+                    &VendorWarning::new("vendor_stale_artifact_kept", detail),
+                    common,
+                );
+            }
+        }
     }
     env.record(
         PatchEvent::new(PatchAction::Removed, candidate).with_reason(

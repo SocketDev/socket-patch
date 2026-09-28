@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net8.0": {
+      "lib": {
+        "type": "Project",
+        "dependencies": {
+          "Newtonsoft.Json": "[13.0.1.1340506223, )"
+        }
+      },
+      "Newtonsoft.Json": {
+        "type": "CentralTransitive",
+        "requested": "[13.0.1.1340506223, )",
+        "resolved": "13.0.1.1340506223",
+        "contentHash": "DDiM9JFGWawv1+fJNCo4t23ht/5mS7kCKb4PWYSQBB1w/Ku4Vrwbv1ATHzCbTv/3ZFPci1UuW5waP8K9SwKRBA=="
+      }
+    }
+  }
+}

@@ -1,8 +1,9 @@
 //! The on-disk form of the ledger's whole-file wiring snapshots.
 //!
 //! Several backends record a WHOLE file as a wiring record's `original` /
-//! `new` (maven's `pom.xml`, nuget's config, `pylock*.toml`, PEP 723
-//! scripts and hatch's project files — [`WHOLE_FILE_KINDS`]): revert
+//! `new` (maven's `pom.xml`, nuget's config and fallback-layout locks,
+//! `pylock*.toml`, PEP 723 scripts and hatch's project files —
+//! [`WHOLE_FILE_KINDS`]): revert
 //! restores the verbatim original when the live file is still exactly what
 //! vendoring wrote, and otherwise does a structural or fragment-level
 //! restore that needs both texts. A record's `new` is its `original` plus
@@ -56,6 +57,7 @@ pub(crate) const SNAPSHOT_MIN_BYTES: usize = 1024;
 pub(crate) const WHOLE_FILE_KINDS: &[&str] = &[
     "maven_pom_repository",
     "nuget_config_source",
+    "nuget_lock_file_v2",
     "python_lock_document",
     "python_script_metadata",
     "hatch_document",
