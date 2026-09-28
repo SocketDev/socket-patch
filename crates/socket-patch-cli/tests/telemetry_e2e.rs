@@ -967,16 +967,14 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stdout() {
     }
 }
 
-/// The stderr twin of the closed-stdout test above: a malformed hosted
-/// redirect ledger makes a non-hosted scan warn on stderr (the lenient
-/// read-only consult) right after the scan event fires, BEFORE any stdout
-/// write — so with stderr closed that warning is the run's first
-/// SIGPIPE-raising write, and the background send must be flushed ahead of
-/// it. The agent preview (`--mode agent --dry-run`) does no network work
-/// between the event and the warning, so without the flush the delayed send
-/// deterministically loses the race (a bare scan is hosted and reads the
-/// ledger strictly, so it is not a case here); the vendored arm is covered
-/// too (its warning also precedes `discover_selected`'s flush).
+/// The stderr twin of the closed-stdout test above: with stderr closed
+/// from the start, the agent preview (`--mode agent --dry-run`) and the
+/// vendored arm must still deliver the delayed `patch_scanned` event.
+/// Before v5 a malformed hosted redirect ledger made these arms warn on
+/// stderr right after the event fired; v5 scan never reads that ledger (a
+/// pre-v5 one is ignored), so the project below keeps one to pin that no
+/// warning is written in that window at all, and the run still reaches its
+/// flush with the send delivered.
 #[tokio::test]
 async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
     const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
@@ -1006,10 +1004,9 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
         let ledger_dir = tmp.path().join(".socket").join("vendor");
         std::fs::create_dir_all(&ledger_dir).expect("mkdir .socket/vendor");
         std::fs::write(ledger_dir.join("redirect-state.json"), "{ not json")
-            .expect("write malformed redirect ledger");
+            .expect("write malformed pre-v5 redirect ledger");
 
-        // Sanity: with stderr open the run does warn about the ledger, so
-        // the closed-stderr run below really has a write to die on.
+        // Sanity: with stderr open the pre-v5 ledger draws no warning.
         let out = build_cmd_with_token(
             WELL_SHAPED_TOKEN,
             tmp.path(),
@@ -1022,9 +1019,8 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
         .expect("run socket-patch");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.starts_with("Warning: ") && stderr.contains("redirect-state.json"),
-            "{label}: the malformed redirect ledger's warning must be the \
-             run's first stderr write; got: {stderr}"
+            !stderr.contains("Warning") && !stderr.contains("redirect-state.json"),
+            "{label}: a pre-v5 redirect ledger is never read by scan; got: {stderr}"
         );
         mock.reset().await;
         Mock::given(method("POST"))

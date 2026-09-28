@@ -10,23 +10,29 @@
 //! from the compatibility matrix captures, and the packages tuple grammar
 //! is identical on versions 0/1/2).
 //!
+//! v5: hosted mode keeps no ledger — the hosted state is the lock's URL
+//! 3-tuple alone. Every unwind of a hosted pin (the vendor takeover,
+//! `rollback`, `remove`) restores the registry 4-tuple, re-resolving the
+//! integrity from the npm registry: here one shared wiremock mirror
+//! ([`registry_uri`], `SOCKET_NPM_REGISTRY`) serving the pristine
+//! integrities, with the `http://patch.test` origin named hosted via
+//! `SOCKET_PATCH_SERVER_URL`.
+//!
 //! Scenarios:
-//!   1. `scan --mode hosted` → `scan --mode vendored`: the takeover reverts
-//!      the hosted line, drops the redirect-ledger record, vendors from the
-//!      pristine registry line (the vendor ledger's `original` is the
-//!      REGISTRY tuple, never the hosted URL), and `vendor --revert`
+//!   1. `scan --mode hosted` → `scan --mode vendored`: the takeover restores
+//!      the registry line, vendors from it (the vendor ledger's `original`
+//!      is the REGISTRY tuple, never the hosted URL), and `vendor --revert`
 //!      restores the pristine bytes.
-//!   2. `vendor --dry-run` over the live hosted redirect previews the
-//!      takeover (`vendor_would_revert_redirect`) with no false
+//!   2. `vendor --dry-run` over the live hosted pin previews the takeover
+//!      (`vendor_would_revert_redirect`) with no false
 //!      `vendor_lock_entry_not_found` follow-up and no writes; the wet
 //!      `vendor` then completes it.
-//!   3. Two hosted records: a SCOPED `rollback <purl>` (per-purl path, the
-//!      whole-ledger replay is not eligible) unwinds only the targeted line
-//!      and record; the sibling stays hosted.
-//!   4. Same ledger, `remove <purl>`.
+//!   3. Two hosted pins: a SCOPED `rollback <purl>` restores only the
+//!      targeted line; the sibling stays hosted.
+//!   4. Same project, `remove <purl>`.
 //!   5. A hosted-wired lockfileVersion-1 WORKSPACE lock (hosted accepts it,
 //!      the vendored backend refuses it): `vendor` — dry and wet — refuses
-//!      `vendor_bun_workspace_unsupported` BEFORE the takeover reverts
+//!      `vendor_bun_workspace_unsupported` BEFORE the takeover restores
 //!      anything, so the hosted wiring survives byte-for-byte; the v2 twin
 //!      still takes over.
 //!
@@ -68,7 +74,6 @@ const CVE: &str = "CVE-2026-5555";
 /// The second hosted record of the scoped-unwind scenarios.
 const OTHER_NAME: &str = "other";
 const OTHER_PURL: &str = "pkg:npm/other@1.0.0";
-const OTHER_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
 const OTHER_HOSTED_URL: &str = "http://patch.test/patch/npm/other/1.0.0/55555555-5555-4555-8555-555555555555/0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d/other-1.0.0.tgz";
 
 /// The registry 4-tuple lines exactly as bun 1.4.2 emits them (matrix
@@ -165,9 +170,8 @@ fn patch_record(uuid: &str) -> Value {
     })
 }
 
-/// `.socket/manifest.json` + the after-hash blob, so `vendor --offline`
-/// runs fully offline (hosted mode writes no manifest — its ledger is its
-/// store).
+/// `.socket/manifest.json` + the after-hash blob, so `vendor` needs no API
+/// (hosted mode writes no manifest).
 fn seed_manifest_and_blob(root: &Path) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
@@ -282,9 +286,63 @@ fn manifestless_vex(
 
 // ───────────────────────── subprocess runner ─────────────────────────
 
+/// The `sha512-…` integrity of a registry 4-tuple line (its last string).
+fn line_integrity(line: &str) -> String {
+    line.rsplit('"')
+        .nth(1)
+        .filter(|s| s.starts_with("sha512-"))
+        .unwrap_or_else(|| panic!("no integrity in {line}"))
+        .to_string()
+}
+
+/// One npm registry mirror shared by every test in this binary: the
+/// version documents of `left-pad@1.3.0` and `other@1.0.0` carrying the
+/// integrities of the pristine registry lines, which is all the v5 upstream
+/// restore of a bun.lock entry reads. It runs on its own thread + runtime
+/// for the life of the process (the per-test runtimes come and go).
+fn registry_uri() -> &'static str {
+    static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URI.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("registry mirror runtime");
+            rt.block_on(async move {
+                let server = MockServer::start().await;
+                for (name, version, line) in [
+                    (NAME, VERSION, LEFT_PAD_REGISTRY_LINE),
+                    (OTHER_NAME, "1.0.0", OTHER_REGISTRY_LINE),
+                ] {
+                    Mock::given(method("GET"))
+                        .and(path(format!("/{name}/{version}")))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                            "name": name,
+                            "version": version,
+                            "dist": {
+                                "tarball": format!(
+                                    "https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"
+                                ),
+                                "integrity": line_integrity(line)
+                            }
+                        })))
+                        .mount(&server)
+                        .await;
+                }
+                tx.send(server.uri()).expect("hand back the mirror uri");
+                std::future::pending::<()>().await;
+            });
+        });
+        rx.recv().expect("registry mirror started")
+    })
+}
+
 /// Run the built `socket-patch` binary with every ambient `SOCKET_*` var
 /// scrubbed (except the hermetic `SOCKET_NO_CONFIG`) and telemetry
-/// hard-disabled. Returns `(exit_code, stdout, stderr)`.
+/// hard-disabled; `http://patch.test` counts as the patch server
+/// (`SOCKET_PATCH_SERVER_URL`) and the registry is the shared mirror
+/// (`SOCKET_NPM_REGISTRY`). Returns `(exit_code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.args(args).current_dir(cwd);
@@ -293,7 +351,9 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
             cmd.env_remove(key);
         }
     }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SOCKET_PATCH_SERVER_URL", "http://patch.test")
+        .env("SOCKET_NPM_REGISTRY", registry_uri());
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -336,14 +396,10 @@ fn scan_mode(cwd: &Path, api_url: &str, mode: &str, extra: &[&str]) -> (i32, Val
     run_json(cwd, &args)
 }
 
+/// `vendor --json` — online: a takeover's upstream restore reads the
+/// registry mirror.
 fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
-    let mut args = vec![
-        "vendor",
-        "--json",
-        "--offline",
-        "--cwd",
-        cwd.to_str().unwrap(),
-    ];
+    let mut args = vec!["vendor", "--json", "--cwd", cwd.to_str().unwrap()];
     args.extend_from_slice(extra);
     run_json(cwd, &args)
 }
@@ -376,29 +432,14 @@ fn vendored_rel_tgz() -> String {
 }
 
 /// Assertions shared by the takeover scenarios once the wet vendored run
-/// has happened: the redirect ledger no longer claims the purl, bun.lock
-/// carries the local tuple and no hosted residue, and the vendor ledger's
-/// recorded `original` is the PRISTINE registry line.
+/// has happened: no hosted ledger exists, bun.lock carries the local tuple
+/// and no hosted residue, and the vendor ledger's recorded `original` is
+/// the PRISTINE registry line (the takeover's upstream restore).
 fn assert_pure_vendored(root: &Path) {
-    match std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")) {
-        Ok(text) => {
-            let ledger: Value = serde_json::from_str(&text).unwrap();
-            assert!(
-                ledger["records"].get(PURL).is_none(),
-                "the superseded redirect record must be dropped: {ledger:#}"
-            );
-            assert!(
-                ledger["edits"]
-                    .as_array()
-                    .is_none_or(|edits| edits.iter().all(|e| e["key"] != NAME)),
-                "the superseded bun.lock edit must be dropped: {ledger:#}"
-            );
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // An emptied ledger is deleted — the expected outcome here.
-        }
-        Err(e) => panic!("unreadable redirect ledger: {e}"),
-    }
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "no hosted ledger may exist"
+    );
 
     let lock = read(root, "bun.lock");
     assert!(
@@ -444,9 +485,7 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
     write_bun_project(root, &pristine_lock(), &[(NAME, VERSION)]);
     let pristine = std::fs::read(root.join("bun.lock")).unwrap();
 
-    // A: hosted redirect — registry 4-tuple → URL 3-tuple, ledger claims
-    //    the purl with one `redirect_bun_lock_package` edit whose original
-    //    is the registry line.
+    // A: hosted redirect — registry 4-tuple → URL 3-tuple; no ledger.
     let (code, env) = scan_mode(root, &server.uri(), "hosted", &[]);
     assert_eq!(code, 0, "scan --mode hosted must succeed: {env:#}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
@@ -456,18 +495,9 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
         hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512),
         "hosted URL 3-tuple written:\n{hosted_lock}"
     );
-    let ledger: Value =
-        serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json")).unwrap();
     assert!(
-        ledger["records"].get(PURL).is_some(),
-        "hosted run must record the purl: {ledger:#}\nhosted envelope: {env:#}"
-    );
-    let edit = &ledger["edits"][0];
-    assert_eq!(edit["kind"], "redirect_bun_lock_package", "{ledger:#}");
-    assert_eq!(
-        edit["original"],
-        json!(LEFT_PAD_REGISTRY_LINE),
-        "{ledger:#}"
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger: {env:#}"
     );
     let scratch = tempfile::tempdir().unwrap();
     manifestless_vex(
@@ -493,8 +523,8 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
         "a dry run must not create the vendor ledger"
     );
 
-    // B: vendored scan over the LIVE hosted redirect — the takeover. Used
-    //    to exit 1 with `redirect_revert_failed` ("cannot replay yet").
+    // B: vendored scan over the LIVE hosted pin — the takeover restores the
+    //    registry line first, then vendors.
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
     assert_eq!(
         code, 0,
@@ -695,15 +725,13 @@ async fn bun_digestless_vendored_line_is_taken_over_by_scan_hosted_and_rolls_bac
         !root.join(vendored_rel_tgz()).exists(),
         "the vendored artifact must be removed by the takeover"
     );
-    let ledger: Value =
-        serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json")).unwrap();
-    assert_eq!(
-        ledger["edits"][0]["original"],
-        json!(LEFT_PAD_REGISTRY_LINE),
-        "the hosted ledger records the PRISTINE registry line as its original: {ledger:#}"
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode writes no ledger"
     );
 
-    // Unscoped rollback of the hosted wiring lands on the pristine lock.
+    // Unscoped rollback of the hosted pin restores its upstream entry: the
+    // pristine lock.
     let (code, env) = run_json(
         root,
         &[
@@ -774,14 +802,15 @@ async fn bun_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
     assert_eq!(code, 0, "{env:#}");
     let hosted_lock = std::fs::read(root.join("bun.lock")).unwrap();
     let ledger_path = root.join(".socket/vendor/redirect-state.json");
-    let hosted_ledger = std::fs::read(&ledger_path).unwrap();
+    assert!(!ledger_path.exists(), "hosted mode writes no ledger");
 
-    // The manifest record `vendor` acts on (offline: the staged blob).
+    // The manifest record `vendor` acts on (the staged blob).
     seed_manifest_and_blob(root);
 
-    // Dry run: the takeover is PROBED (write-free) and previewed; the
-    // backend preview does not run against the still-hosted lock, so no
-    // false `vendor_lock_entry_not_found` and no refusal. Nothing written.
+    // Dry run: the takeover's upstream restore is resolved write-free and
+    // previewed; the backend preview does not run against the still-hosted
+    // lock, so no false `vendor_lock_entry_not_found` and no refusal.
+    // Nothing written.
     let (code, env) = vendor_cli(root, &["--dry-run"]);
     assert_eq!(code, 0, "vendor --dry-run must succeed: {env:#}");
     let advisory = find_event(&env, "skipped", Some("vendor_would_revert_redirect"));
@@ -797,11 +826,7 @@ async fn bun_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
         hosted_lock,
         "a dry run must not touch bun.lock"
     );
-    assert_eq!(
-        std::fs::read(&ledger_path).unwrap(),
-        hosted_ledger,
-        "a dry run must not touch the redirect ledger"
-    );
+    assert!(!ledger_path.exists(), "a dry run writes no hosted ledger");
     assert!(
         !root.join(".socket/vendor/state.json").exists(),
         "a dry run must not create the vendor ledger"
@@ -820,10 +845,9 @@ async fn bun_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
 // 3./4. scoped rollback / remove of ONE of two hosted bun records
 // ─────────────────────────────────────────────────────────────────────
 
-/// A hosted-live bun project with TWO redirect records, written exactly as
-/// the hosted flow leaves them (ledger edits = verbatim lines, lock = the
-/// URL 3-tuples). Two records make a scoped unwind of one purl ineligible
-/// for the whole-ledger replay, so it takes the per-purl revert.
+/// A hosted-live bun project with TWO hosted pins, written exactly as the
+/// v5 hosted flow leaves it: the lock's URL 3-tuples and nothing else (no
+/// ledger).
 fn write_two_record_hosted_project(root: &Path) -> String {
     let pristine = pristine_lock_two();
     write_bun_project(root, &pristine, &[(NAME, VERSION), (OTHER_NAME, "1.0.0")]);
@@ -839,43 +863,11 @@ fn write_two_record_hosted_project(root: &Path) -> String {
         .replace(OTHER_REGISTRY_LINE, &other_hosted);
     assert_ne!(hosted, pristine);
     std::fs::write(root.join("bun.lock"), &hosted).unwrap();
-    let ledger = json!({
-        "version": 1,
-        "mode": "hosted",
-        "edits": [
-            {
-                "path": "bun.lock",
-                "kind": "redirect_bun_lock_package",
-                "action": "rewritten",
-                "key": NAME,
-                "original": LEFT_PAD_REGISTRY_LINE,
-                "new": left_pad_hosted,
-            },
-            {
-                "path": "bun.lock",
-                "kind": "redirect_bun_lock_package",
-                "action": "rewritten",
-                "key": OTHER_NAME,
-                "original": OTHER_REGISTRY_LINE,
-                "new": other_hosted,
-            }
-        ],
-        "records": {
-            PURL: patch_record(UUID),
-            OTHER_PURL: patch_record(OTHER_UUID),
-        }
-    });
-    std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
-    std::fs::write(
-        root.join(".socket/vendor/redirect-state.json"),
-        serde_json::to_vec_pretty(&ledger).unwrap(),
-    )
-    .unwrap();
     pristine
 }
 
 /// After unwinding ONLY `left-pad`: its line is the registry tuple, `other`
-/// is still hosted, and the ledger keeps exactly `other`'s record + edit.
+/// is still hosted, and no ledger exists.
 fn assert_only_left_pad_unwound(root: &Path, pristine: &str) {
     let lock = read(root, "bun.lock");
     assert_eq!(
@@ -887,15 +879,10 @@ fn assert_only_left_pad_unwound(root: &Path, pristine: &str) {
         lock_line(&lock, OTHER_NAME).contains(OTHER_HOSTED_URL),
         "other must stay hosted:\n{lock}"
     );
-    let ledger: Value =
-        serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json")).unwrap();
     assert!(
-        ledger["records"].get(PURL).is_none() && ledger["records"].get(OTHER_PURL).is_some(),
-        "{ledger:#}"
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "no hosted ledger may exist"
     );
-    let edits = ledger["edits"].as_array().unwrap();
-    assert_eq!(edits.len(), 1, "{ledger:#}");
-    assert_eq!(edits[0]["key"], OTHER_NAME, "{ledger:#}");
 }
 
 #[test]
@@ -904,8 +891,8 @@ fn bun_scoped_rollback_of_one_of_two_hosted_records_unwinds_only_that_purl() {
     let root = tmp.path();
     let pristine = write_two_record_hosted_project(root);
 
-    // Scoped rollback: per-purl path (two records ⇒ the replay is not
-    // eligible). Used to exit 1 with hosted.failed = ["cannot replay yet"].
+    // Scoped rollback: only left-pad's pin is restored to its upstream
+    // registry line; `other` stays hosted.
     let (code, env) = run_json(
         root,
         &[
@@ -923,8 +910,7 @@ fn bun_scoped_rollback_of_one_of_two_hosted_records_unwinds_only_that_purl() {
     assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
     assert_only_left_pad_unwound(root, &pristine);
 
-    // The last record out: covers every record ⇒ whole-ledger replay;
-    // pristine lock, ledger deleted.
+    // The last pin out: pristine lock, no ledger anywhere.
     let (code, env) = run_json(
         root,
         &[
@@ -940,7 +926,7 @@ fn bun_scoped_rollback_of_one_of_two_hosted_records_unwinds_only_that_purl() {
     assert_eq!(read(root, "bun.lock"), pristine, "pristine lock restored");
     assert!(
         !root.join(".socket/vendor/redirect-state.json").exists(),
-        "emptied ledger deleted"
+        "no hosted ledger"
     );
 }
 
@@ -977,8 +963,8 @@ fn bun_scoped_remove_of_one_of_two_hosted_records_unwinds_only_that_purl() {
 // no path to resolve); the vendored backend refuses every pre-v2 workspace
 // lock (`vendor_bun_workspace_unsupported`). The Bun preflight runs inside
 // the engine loop before the takeover block, so a refused `vendor` (and its
-// dry run) never reverts the hosted line or drops the redirect-ledger
-// record first — which would leave the project unpatched in BOTH modes.
+// dry run) never restores the hosted line to upstream first — which would
+// leave the project unpatched in BOTH modes.
 
 const WS_CODE: &str = "vendor_bun_workspace_unsupported";
 
@@ -1047,7 +1033,6 @@ fn bun_vendor_silent_refusal_keeps_error_diagnosis() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let lock = write_hosted_workspace_project(root, 1);
-    let ledger = std::fs::read(root.join(".socket/vendor/redirect-state.json")).unwrap();
     for dry_run in [true, false] {
         let mut args = vec![
             "vendor",
@@ -1066,7 +1051,7 @@ fn bun_vendor_silent_refusal_keeps_error_diagnosis() {
             stderr.contains("Cannot vendor") && stderr.contains("lockfileVersion-1"),
             "{stderr}"
         );
-        assert_hosted_wiring_intact(root, &lock, &ledger);
+        assert_hosted_wiring_intact(root, &lock);
     }
 }
 
@@ -1080,8 +1065,9 @@ fn pristine_workspace_lock(version: u64) -> String {
     )
 }
 
-/// A hosted-live WORKSPACE bun project with ONE redirect record, written
-/// exactly as `scan --mode hosted` leaves it, plus the manifest record and
+/// A hosted-live WORKSPACE bun project with ONE hosted pin, written
+/// exactly as `scan --mode hosted` leaves it (no ledger), plus the manifest
+/// record and
 /// blob a default-mode `get`/`scan` adds — the shape the plain `vendor`
 /// command acts on (a hosted-only project is a `noManifest` no-op).
 /// Returns the hosted lock text.
@@ -1104,49 +1090,22 @@ fn write_hosted_workspace_project(root: &Path, version: u64) -> String {
     let hosted = pristine.replace(LEFT_PAD_REGISTRY_LINE, &left_pad_hosted);
     assert_ne!(hosted, pristine, "the hosted splice must hit");
     std::fs::write(root.join("bun.lock"), &hosted).unwrap();
-    let ledger = json!({
-        "version": 1,
-        "mode": "hosted",
-        "edits": [{
-            "path": "bun.lock",
-            "kind": "redirect_bun_lock_package",
-            "action": "rewritten",
-            "key": NAME,
-            "original": LEFT_PAD_REGISTRY_LINE,
-            "new": left_pad_hosted,
-        }],
-        "records": { PURL: patch_record(UUID) },
-    });
-    std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
-    std::fs::write(
-        root.join(".socket/vendor/redirect-state.json"),
-        serde_json::to_vec_pretty(&ledger).unwrap(),
-    )
-    .unwrap();
     seed_manifest_and_blob(root);
     hosted
 }
 
-/// Every byte of the hosted wiring must survive a refused run: the lock,
-/// the redirect ledger (record + edit), and no vendor ledger or artifact.
-fn assert_hosted_wiring_intact(root: &Path, hosted_lock: &str, hosted_ledger: &[u8]) {
+/// Every byte of the hosted wiring must survive a refused run: the lock
+/// (the only hosted state), and no vendor ledger or artifact.
+fn assert_hosted_wiring_intact(root: &Path, hosted_lock: &str) {
     assert_eq!(
         read(root, "bun.lock"),
         hosted_lock,
         "bun.lock must stay byte-identical to the hosted lock"
     );
-    let ledger_path = root.join(".socket/vendor/redirect-state.json");
-    assert_eq!(
-        std::fs::read(&ledger_path).unwrap(),
-        hosted_ledger,
-        "the redirect ledger must stay byte-identical"
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "no hosted ledger may appear"
     );
-    let ledger: Value =
-        serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json")).unwrap();
-    assert!(ledger["records"].get(PURL).is_some(), "{ledger:#}");
-    let edits = ledger["edits"].as_array().unwrap();
-    assert_eq!(edits.len(), 1, "{ledger:#}");
-    assert_eq!(edits[0]["key"], NAME, "{ledger:#}");
     assert!(
         !root.join(".socket/vendor/state.json").exists(),
         "a refused run must not create the vendor ledger"
@@ -1162,7 +1121,6 @@ fn bun_vendor_over_hosted_v1_workspace_lock_refuses_before_unhosting() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let hosted_lock = write_hosted_workspace_project(root, 1);
-    let hosted_ledger = std::fs::read(root.join(".socket/vendor/redirect-state.json")).unwrap();
 
     // Dry run: previews the REFUSAL, not the takeover, with the wet run's
     // exit code — and writes nothing.
@@ -1179,12 +1137,12 @@ fn bun_vendor_over_hosted_v1_workspace_lock_refuses_before_unhosting() {
     assert_no_event_code(&env, "vendor_would_revert_redirect");
     assert_no_event_code(&env, "vendor_takeover_reverted_redirect");
     assert_no_event_code(&env, "redirect_revert_failed");
-    assert_hosted_wiring_intact(root, &hosted_lock, &hosted_ledger);
+    assert_hosted_wiring_intact(root, &hosted_lock);
 
-    // Wet run: the same refusal, BEFORE any revert — hosted wiring intact.
+    // Wet run: the same refusal, BEFORE any restore — hosted wiring intact.
     // Used to: `skipped vendor_takeover_reverted_redirect` then `failed
     // vendor_bun_workspace_unsupported`, registry tuple back in the lock,
-    // redirect-state.json deleted, `.socket/vendor/` empty.
+    // `.socket/vendor/` empty.
     let (code, env) = vendor_cli(root, &[]);
     assert_eq!(code, 1, "the wet run refuses: {env:#}");
     assert_eq!(env["status"], "partialFailure", "{env:#}");
@@ -1201,7 +1159,7 @@ fn bun_vendor_over_hosted_v1_workspace_lock_refuses_before_unhosting() {
     assert_no_event_code(&env, "vendor_takeover_reverted_redirect");
     assert_no_event_code(&env, "vendor_would_revert_redirect");
     assert_no_event_code(&env, "redirect_revert_failed");
-    assert_hosted_wiring_intact(root, &hosted_lock, &hosted_ledger);
+    assert_hosted_wiring_intact(root, &hosted_lock);
 
     // The manifest record survives too (the recovery path — a networked
     // `scan --mode hosted` — needs nothing this run could have dropped).

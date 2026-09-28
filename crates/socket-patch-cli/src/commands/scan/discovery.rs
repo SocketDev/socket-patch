@@ -365,51 +365,55 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     (mismatched, views)
 }
 
-/// Fold both ledgers' patch records into the manifest view update detection
-/// consults. Hosted mode records purl→uuid ONLY in
-/// `.socket/vendor/redirect-state.json` and vendored mode ONLY in
-/// `.socket/vendor/state.json`, so without this fold a pure hosted or
-/// vendored project's `updates[]` would always be empty. One record per
-/// owner key under the shared rule
-/// ([`socket_patch_core::ledgers::Ledgers::owned`]: manifest > vendor
-/// ledger > redirect ledger), then the lockfile's hosted pins
-/// (`hosted_pins`, uuid only) for keys no store owns. Vendor entries are
-/// keyed by their ledger key (`detect_updates` bridges the spellings); a
-/// legacy entry without an embedded record contributes its uuid alone.
-/// Borrows the manifest untouched when nothing else contributes.
+/// Fold the hosted pins and the vendor ledger's patch records into the
+/// manifest view update detection consults. Hosted mode records purl→uuid
+/// ONLY in the lockfiles (`hosted_pins`, uuid only; v5 keeps no hosted
+/// ledger) and vendored mode ONLY in `.socket/vendor/state.json`, so without
+/// this fold a pure hosted or vendored project's `updates[]` would always
+/// be empty. Precedence on a collision: manifest > hosted pins > vendor
+/// ledger (the live lock over a possibly superseded vendored entry); the
+/// vendor entries fold under the shared owner rule
+/// ([`socket_patch_core::ledgers::Ledgers::owned`]), so one the manifest
+/// claims (its key or base purl) stays behind the manifest's record.
+/// Vendor entries are keyed by their ledger key (`detect_updates` bridges
+/// the spellings); a legacy entry without an embedded record contributes
+/// its uuid alone. Borrows the manifest untouched when nothing else
+/// contributes.
 pub(super) fn merge_ledger_records_for_updates<'a>(
     manifest: Option<&'a PatchManifest>,
-    redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: Option<&VendorState>,
     hosted_pins: &[(String, String)],
 ) -> Option<Cow<'a, PatchManifest>> {
     use socket_patch_core::ledgers::{uuid_only_record, Ledgers, Store};
-    let redirect = redirect.filter(|s| !s.records.is_empty());
     let vendor = vendor.filter(|s| !s.entries.is_empty());
-    if redirect.is_none() && vendor.is_none() && hosted_pins.is_empty() {
+    if vendor.is_none() && hosted_pins.is_empty() {
         return manifest.map(Cow::Borrowed);
     }
     let mut merged = manifest.cloned().unwrap_or_default();
-    let ledgers = Ledgers {
-        manifest,
-        vendor,
-        redirect,
-    };
-    for owned in ledgers.owned() {
-        if owned.store == Store::Manifest {
-            continue;
-        }
-        let record = owned
-            .record
-            .cloned()
-            .unwrap_or_else(|| uuid_only_record(owned.uuid));
-        merged.patches.insert(owned.key.to_string(), record);
-    }
     for (purl, uuid) in hosted_pins {
         merged
             .patches
             .entry(purl.clone())
             .or_insert_with(|| uuid_only_record(uuid));
+    }
+    let ledgers = Ledgers {
+        manifest,
+        vendor,
+        redirect: None,
+    };
+    for owned in ledgers.owned() {
+        if owned.store == Store::Manifest {
+            continue;
+        }
+        merged
+            .patches
+            .entry(owned.key.to_string())
+            .or_insert_with(|| {
+                owned
+                    .record
+                    .cloned()
+                    .unwrap_or_else(|| uuid_only_record(owned.uuid))
+            });
     }
     Some(Cow::Owned(merged))
 }
@@ -862,16 +866,16 @@ mod tests {
     }
 
     // ---- merge_ledger_records_for_updates -----------------------------------
-    // Hosted mode records patches ONLY in the redirect ledger and vendored
-    // mode ONLY in the vendor ledger — these pin that ledger-only projects
-    // still surface `updates[]` (the documented CI signal) through the
-    // merged manifest view.
+    // Hosted mode records patches ONLY in the lockfiles (the hosted pins) and
+    // vendored mode ONLY in the vendor ledger — these pin that manifest-less
+    // projects still surface `updates[]` (the documented CI signal) through
+    // the merged manifest view.
 
-    fn ledger_with(entries: &[(&str, &str)]) -> socket_patch_core::patch::redirect::RedirectState {
-        let mut state = socket_patch_core::patch::redirect::RedirectState::new();
-        let manifest = crate::commands::scan::tests::manifest_with(entries);
-        state.records.extend(manifest.patches);
-        state
+    fn pins(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(purl, uuid)| (purl.to_string(), uuid.to_string()))
+            .collect()
     }
 
     /// A vendor ledger with one entry per `(key, uuid, detached)`: detached
@@ -903,12 +907,12 @@ mod tests {
     }
 
     #[test]
-    fn ledger_only_project_reports_superseding_patch_in_updates() {
-        // Pure hosted project: NO .socket/manifest.json, one redirected patch
-        // recorded in the ledger; discovery now offers a different (newer)
-        // uuid. The merged view must make detect_updates flag it.
-        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-old")]);
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None, &[]);
+    fn hosted_only_project_reports_superseding_patch_in_updates() {
+        // Pure hosted project: NO .socket/manifest.json, one hosted pin in
+        // the lockfile; discovery now offers a different (newer) uuid. The
+        // merged view must make detect_updates flag it.
+        let hosted = pins(&[("pkg:npm/foo@1.0", "uuid-old")]);
+        let merged = merge_ledger_records_for_updates(None, None, &hosted);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
@@ -924,7 +928,7 @@ mod tests {
         // record still contributes its uuid — all detection reads.
         for detached in [true, false] {
             let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-old", detached)]);
-            let merged = merge_ledger_records_for_updates(None, None, Some(&vendor), &[]);
+            let merged = merge_ledger_records_for_updates(None, Some(&vendor), &[]);
             let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
             let updates = detect_updates(merged.as_deref(), &pkgs);
             assert_eq!(updates.len(), 1, "detached={detached}");
@@ -933,51 +937,50 @@ mod tests {
         }
         // Still the top offer — no nag.
         let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-a", true)]);
-        let merged = merge_ledger_records_for_updates(None, None, Some(&vendor), &[]);
+        let merged = merge_ledger_records_for_updates(None, Some(&vendor), &[]);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
         assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
     }
 
     #[test]
-    fn ledger_record_matching_the_candidate_is_not_an_update() {
-        // The redirected patch is still the top offer — no nag.
-        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None, &[]);
+    fn hosted_pin_matching_the_candidate_is_not_an_update() {
+        // The hosted patch is still the top offer — no nag.
+        let hosted = pins(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let merged = merge_ledger_records_for_updates(None, None, &hosted);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
         assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
     }
 
     #[test]
     fn manifest_entry_wins_a_collision_with_a_ledger_record() {
-        // A PURL present in every store is manifest-owned (the shared owner
-        // rule, `socket_patch_core::ledgers`): the manifest's uuid is the
-        // "old" side; between the ledgers, the vendor entry wins.
+        // A PURL present in every store is manifest-owned (same precedence as
+        // VEX's candidate merge): the manifest's uuid is the "old" side;
+        // between the other two, the live hosted pin wins over the vendor
+        // ledger's (possibly superseded) entry.
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-manifest")]);
-        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-ledger")]);
+        let hosted = pins(&[("pkg:npm/foo@1.0", "uuid-pin")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-vendor", true)]);
-        let merged =
-            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor), &[]);
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&vendor), &hosted);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].old_uuid, "uuid-manifest");
-        let merged = merge_ledger_records_for_updates(None, Some(&ledger), Some(&vendor), &[]);
+        let merged = merge_ledger_records_for_updates(None, Some(&vendor), &hosted);
         let updates = detect_updates(merged.as_deref(), &pkgs);
-        assert_eq!(updates[0].old_uuid, "uuid-vendor");
+        assert_eq!(updates[0].old_uuid, "uuid-pin");
     }
 
     #[test]
-    fn ledger_and_manifest_cover_disjoint_purls() {
-        // A mixed project (some deps applied via manifest, some hosted via
-        // the redirect ledger, some vendored) gets update detection across
-        // every store.
+    fn hosted_pins_and_manifest_cover_disjoint_purls() {
+        // A mixed project (some deps applied via manifest, some hosted in
+        // the lockfile, some vendored) gets update detection across every
+        // store.
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-f1")]);
-        let ledger = ledger_with(&[("pkg:npm/bar@2.0", "uuid-b1")]);
+        let hosted = pins(&[("pkg:npm/bar@2.0", "uuid-b1")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/baz@3.0", "uuid-z1", true)]);
-        let merged =
-            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor), &[]);
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&vendor), &hosted);
         let pkgs = vec![
             batch_with("pkg:npm/foo@1.0", &["uuid-f2"]),
             batch_with("pkg:npm/bar@2.0", &["uuid-b2"]),
@@ -992,28 +995,25 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_empty_ledgers_leave_the_manifest_view_untouched() {
-        assert!(merge_ledger_records_for_updates(None, None, None, &[]).is_none());
-        let pins = vec![("pkg:npm/foo@1.0.0".to_string(), "uuid-pin".to_string())];
-        let merged = merge_ledger_records_for_updates(None, None, None, &pins).expect("pinned");
+    fn absent_or_empty_stores_leave_the_manifest_view_untouched() {
+        assert!(merge_ledger_records_for_updates(None, None, &[]).is_none());
+        let hosted = pins(&[("pkg:npm/foo@1.0.0", "uuid-pin")]);
+        let merged = merge_ledger_records_for_updates(None, None, &hosted).expect("pinned");
         assert_eq!(merged.patches["pkg:npm/foo@1.0.0"].uuid, "uuid-pin");
-        let empty = socket_patch_core::patch::redirect::RedirectState::new();
         let empty_vendor = VendorState::new();
-        assert!(
-            merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor), &[]).is_none()
-        );
+        assert!(merge_ledger_records_for_updates(None, Some(&empty_vendor), &[]).is_none());
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty), None, &[])
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty_vendor), &[])
             .expect("manifest present");
         assert!(
             matches!(merged, Cow::Borrowed(_)),
-            "empty ledgers must not clone the manifest"
+            "empty stores must not clone the manifest"
         );
         assert_eq!(
             merged.patches.len(),
             manifest.patches.len(),
-            "an empty ledger adds nothing"
+            "an empty vendor ledger adds nothing"
         );
     }
 

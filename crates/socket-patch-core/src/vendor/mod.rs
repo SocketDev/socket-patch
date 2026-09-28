@@ -48,7 +48,7 @@
 pub mod path;
 pub mod state;
 
-mod berry_zip;
+pub(crate) mod berry_zip;
 mod bun_binary;
 pub mod bun_lock;
 pub(crate) mod bun_lock_text;
@@ -107,6 +107,7 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
+#[cfg(test)]
 pub(crate) use pypi_lock::restore_document as restore_python_document;
 pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
 // `vex::discover` validates lockfile-recorded npm names with the same rule the

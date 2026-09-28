@@ -26,6 +26,7 @@ use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
+use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
 use socket_patch_core::utils::group_commit::GroupCommit;
@@ -656,6 +657,34 @@ pub async fn run(args: VendorArgs) -> i32 {
     // vendored` projects have `.socket/` but never a manifest. Nothing is
     // locked or written on this path.
     if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
+        // A hosted project (no manifest, hosted pins in its lockfiles)
+        // ejects: its patch set is the lockfiles' hosted pins.
+        if !args.common.is_global() {
+            let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
+            // Contested hosted wiring: the patch set cannot be read off the
+            // lockfiles, and a "nothing to vendor" answer would hide it.
+            if let Some(refusal) = inventory.contested_refusal() {
+                return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
+            }
+            let pins = hosted_pins_in_scope(&args.common, inventory.pins);
+            if !pins.is_empty() {
+                // Eject needs every patch record from the API: an offline
+                // run (or dry run) refuses before any request.
+                if args.common.offline {
+                    return emit_eject_refusal(
+                        &args.common,
+                        "offline_eject_unavailable",
+                        &format!(
+                            "ejecting {} needs {} patch record(s) from the Socket API, and this \
+                             run is offline; re-run without --offline",
+                            plural(pins.len(), "hosted package", "hosted packages"),
+                            pins.len()
+                        ),
+                    );
+                }
+                return run_eject(&args, pins).await;
+            }
+        }
         // A requested `--vex` still attests what the `.socket/vendor`
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
@@ -823,13 +852,9 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
 
     note_classic_migration_risk(&mut env, &args.common.cwd, &args.common);
-    // Same cross-mode takeover advisory the scan-driven vendored flow emits:
-    // surface a redirect ledger that this run (or an earlier one) superseded.
-    super::scan::note_vendor_supersedes_redirect(&mut env, &args.common.cwd, &args.common).await;
 
-    // That advisory may persist the redirect ledger, so it ran under the
-    // lock; everything below is output and telemetry, so release the lock
-    // before the telemetry round-trip.
+    // Everything below is output and telemetry, so release the lock before
+    // the telemetry round-trip.
     drop(lock);
 
     if args.common.json {
@@ -847,6 +872,487 @@ pub async fn run(args: VendorArgs) -> i32 {
         .await;
     }
 
+    exit
+}
+
+/// A refused eject: the JSON error envelope (`status: error`) or an
+/// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
+fn emit_eject_refusal(common: &GlobalArgs, code: &'static str, message: &str) -> i32 {
+    if common.json {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = common.dry_run;
+        env.mark_error(EnvelopeError::new(code, message.to_string()));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("Error ({code}): {message}");
+    }
+    1
+}
+
+/// The hosted pins whose ecosystem `--ecosystems` selects.
+fn hosted_pins_in_scope(common: &GlobalArgs, pins: Vec<HostedPin>) -> Vec<HostedPin> {
+    pins.into_iter()
+        .filter(|pin| {
+            socket_patch_core::utils::purl::purl_parts(&pin.purl)
+                .is_some_and(|(eco, _, _)| ecosystem_in_scope(common, &eco))
+        })
+        .collect()
+}
+
+/// What a wet eject can touch, captured before it touches anything: every
+/// regular file directly in the project root, the hosted pins' files and
+/// the restore's files (nested locks included), the project's cargo and
+/// maven config files, the vendor ledger, and the set of vendored uuid
+/// directories. [`EjectSnapshot::restore`] puts all of it back and removes
+/// what the eject created.
+struct EjectSnapshot {
+    root: std::path::PathBuf,
+    files: Vec<(String, Option<Vec<u8>>)>,
+    root_files: std::collections::BTreeSet<String>,
+    vendor_dirs: std::collections::BTreeSet<std::path::PathBuf>,
+}
+
+impl EjectSnapshot {
+    const EXTRA: [&'static str; 5] = [
+        ".cargo/config",
+        ".cargo/config.toml",
+        ".mvn/maven.config",
+        ".mvn/checksums/checksums.sha256",
+        socket_patch_core::vendor::VENDOR_STATE_REL,
+    ];
+
+    async fn root_file_names(root: &Path) -> std::io::Result<std::collections::BTreeSet<String>> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut dir = tokio::fs::read_dir(root).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                out.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    fn vendor_dir_set(root: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let base = root.join(".socket/vendor");
+        let mut out = std::collections::BTreeSet::new();
+        for eco in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+            if eco.file_type().is_ok_and(|t| t.is_dir()) {
+                for unit in std::fs::read_dir(eco.path()).into_iter().flatten().flatten() {
+                    out.insert(unit.path());
+                }
+            }
+        }
+        out
+    }
+
+    async fn take(root: &Path, touched: &[String]) -> std::io::Result<Self> {
+        let root_files = Self::root_file_names(root).await?;
+        let mut rels: std::collections::BTreeSet<String> = root_files.clone();
+        rels.extend(touched.iter().cloned());
+        rels.extend(Self::EXTRA.iter().map(|s| s.to_string()));
+        let mut files = Vec::with_capacity(rels.len());
+        for rel in rels {
+            let bytes = match tokio::fs::read(root.join(&rel)).await {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            files.push((rel, bytes));
+        }
+        Ok(EjectSnapshot {
+            root: root.to_path_buf(),
+            files,
+            root_files,
+            vendor_dirs: Self::vendor_dir_set(root),
+        })
+    }
+
+    async fn restore(&self) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+        for (rel, bytes) in &self.files {
+            let path = self.root.join(rel);
+            let result = match bytes {
+                Some(bytes) => {
+                    socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
+                }
+                None => match tokio::fs::remove_file(&path).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            };
+            if let Err(e) = result {
+                errors.push(format!("{rel}: {e}"));
+            }
+        }
+        // Root files the eject created.
+        if let Ok(now) = Self::root_file_names(&self.root).await {
+            for name in now.difference(&self.root_files) {
+                if self.files.iter().any(|(rel, _)| rel == name) {
+                    continue;
+                }
+                if let Err(e) = tokio::fs::remove_file(self.root.join(name)).await {
+                    errors.push(format!("{name}: {e}"));
+                }
+            }
+        }
+        // Vendored uuid dirs the eject created.
+        for dir in Self::vendor_dir_set(&self.root).difference(&self.vendor_dirs) {
+            if let Err(e) = remove_tree_and_prune(dir, &self.root.join(SOCKET_DIR)).await {
+                errors.push(format!("{}: {e}", dir.display()));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// The project files for the manual remedy.
+    fn files_hint(&self) -> String {
+        self.files
+            .iter()
+            .filter(|(_, bytes)| bytes.is_some())
+            .map(|(rel, _)| rel.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Standalone `vendor` in a hosted project — no manifest, hosted pins in the
+/// lockfiles: EJECT. The patch set is the pins themselves (purl + the uuid
+/// in each hosted URL); each record is fetched from the API, vendored into
+/// `.socket/vendor/` exactly like `scan --mode vendored`, and the lock is
+/// rewired from hosted to vendored (the engine's takeover restores each
+/// pin's upstream registry entry first, so `vendor --revert` later returns
+/// the project to upstream, not to hosted).
+async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
+    let common = &args.common;
+    let (client, use_public_proxy) =
+        get_api_client_with_overrides(common.api_client_overrides()).await;
+    let (api_token, org_slug) = (client.api_token().cloned(), client.org_slug().cloned());
+    if !common.json && !common.silent {
+        println!(
+            "{} {} into .socket/vendor/...",
+            if common.dry_run { "Would eject" } else { "Ejecting" },
+            plural(pins.len(), "hosted package", "hosted packages")
+        );
+    }
+
+    // One view per distinct uuid, fetched concurrently and consumed in pin
+    // order; the views' blobs seed the in-memory staging.
+    let mut records: HashMap<String, PatchRecord> = HashMap::new();
+    let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut fetch_failures: Vec<(String, String)> = Vec::new();
+    let mut views = std::pin::pin!(ordered_concurrent(
+        pins.iter(),
+        socket_patch_core::utils::concurrent::api_concurrency_for(
+            client.uses_public_proxy(),
+            pins.len(),
+        ),
+        |pin| {
+            let client = &client;
+            async move { client.fetch_patch(&pin.uuid).await }
+        },
+    ));
+    for pin in &pins {
+        let Some(view) = views.next().await else {
+            break;
+        };
+        match view {
+            Ok(Some(patch)) => {
+                for info in patch.files.values() {
+                    let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
+                        continue;
+                    };
+                    if !socket_patch_core::patch::apply::is_valid_blob_hash(hash)
+                        || blobs.contains_key(hash)
+                    {
+                        continue;
+                    }
+                    if let Ok(bytes) = crate::commands::get::base64_decode(b64) {
+                        blobs.insert(hash.clone(), bytes);
+                    }
+                }
+                let (_, record) = crate::commands::get::record_from_patch_response(&patch);
+                records.insert(pin.purl.clone(), record);
+            }
+            Ok(None) => fetch_failures.push((
+                pin.purl.clone(),
+                format!("patch {} was not found on the API", pin.uuid),
+            )),
+            Err(e) => fetch_failures.push((
+                pin.purl.clone(),
+                format!("could not fetch patch {}: {e}", pin.uuid),
+            )),
+        }
+    }
+
+    // All or nothing: a record the API cannot serve refuses the whole eject
+    // before anything is touched, so every package stays hosted.
+    if !fetch_failures.is_empty() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = common.dry_run;
+        for (purl, detail) in &fetch_failures {
+            report_vendor_failure(common, purl, detail);
+            env.record(
+                PatchEvent::new(PatchAction::Failed, purl.clone())
+                    .with_error("patch_fetch_failed", detail.clone()),
+            );
+        }
+        env.mark_error(EnvelopeError::new(
+            "eject_refused",
+            "not every hosted patch record could be fetched; nothing was changed",
+        ));
+        if common.json {
+            println!("{}", env.to_pretty_json());
+        }
+        track_outcomes_for_vendor(true, &env, common.dry_run, api_token.as_deref(), org_slug.as_deref())
+            .await;
+        return 1;
+    }
+
+    // Plan the upstream restore before touching anything: every pin must
+    // re-resolve to its registry entry (a dry resolve), or the eject is
+    // refused whole with each pin's remedy.
+    let origins = crate::commands::rollback::patch_server_origins(common);
+    let plan = socket_patch_core::patch::redirect::upstream::restore_upstream(
+        &common.cwd,
+        &pins,
+        &socket_patch_core::patch::redirect::upstream::RestoreOptions {
+            dry_run: true,
+            offline: common.offline,
+            patch_server_origins: origins.clone(),
+            bun_lockb: true,
+        },
+    )
+    .await;
+    let refused: Vec<(String, String)> = plan
+        .refused()
+        .map(|(pin, why)| (pin.purl.clone(), why.to_string()))
+        .collect();
+    if !refused.is_empty() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = common.dry_run;
+        for (purl, why) in &refused {
+            report_vendor_failure(common, purl, why);
+            env.record(
+                PatchEvent::new(PatchAction::Failed, purl.clone())
+                    .with_error("redirect_revert_failed", why.clone()),
+            );
+        }
+        env.mark_error(EnvelopeError::new(
+            "eject_refused",
+            "not every hosted pin can be restored to its upstream registry entry; nothing was \
+             changed",
+        ));
+        if common.json {
+            println!("{}", env.to_pretty_json());
+        }
+        track_outcomes_for_vendor(true, &env, common.dry_run, api_token.as_deref(), org_slug.as_deref())
+            .await;
+        return 1;
+    }
+
+    // A dry run stops at the verified plan: restoring the live lock to
+    // preview the vendor step would be a write.
+    if common.dry_run {
+        let mut env = Envelope::new(Command::Vendor);
+        env.dry_run = true;
+        for pin in &pins {
+            env.record(PatchEvent::new(PatchAction::Applied, pin.purl.clone()).with_reason(
+                "eject_planned",
+                format!(
+                    "would restore the upstream registry entry ({}) and vendor the patch",
+                    pin.files.join(", ")
+                ),
+            ));
+            if !common.json && !common.silent {
+                println!(
+                    "Would eject {} (restore {}, then vendor into .socket/vendor/)",
+                    pin.purl,
+                    pin.files.join(", ")
+                );
+            }
+        }
+        if args.vex.vex.is_some() && !common.json && !common.silent {
+            println!("{}", crate::commands::vex::format_vex_dry_run_skip("vendored"));
+        }
+        if common.json {
+            println!("{}", env.to_pretty_json());
+        }
+        track_outcomes_for_vendor(false, &env, true, api_token.as_deref(), org_slug.as_deref()).await;
+        return 0;
+    }
+
+    // One transaction under one apply lock: snapshot what the eject can
+    // touch, restore every pin upstream (so the vendor engine resolves the
+    // pristine registry package even in a fresh checkout with nothing
+    // installed), vendor, and on ANY failure put the snapshot back — a
+    // failed eject leaves the project hosted, exactly as it was.
+    let socket_dir = common.socket_dir();
+    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
+    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let (code, message) = crate::commands::lock_cli::lock_failure(&e, timeout);
+            return emit_eject_refusal(common, code, &message);
+        }
+    };
+    let touched: Vec<String> = pins
+        .iter()
+        .flat_map(|p| p.files.iter().cloned())
+        .chain(plan.reverted_files.iter().cloned())
+        .collect();
+    let snapshot = match EjectSnapshot::take(&common.cwd, &touched).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            drop(guard);
+            return emit_eject_refusal(
+                common,
+                "eject_refused",
+                &format!("could not snapshot the project before ejecting: {e}"),
+            );
+        }
+    };
+    let mut env = Envelope::new(Command::Vendor);
+    let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
+        &common.cwd,
+        &pins,
+        &socket_patch_core::patch::redirect::upstream::RestoreOptions {
+            dry_run: false,
+            offline: common.offline,
+            patch_server_origins: origins,
+            bun_lockb: true,
+        },
+    )
+    .await;
+    let restore_failure = restore
+        .refused()
+        .map(|(_, why)| why.to_string())
+        .next()
+        .or_else(|| restore.flush_error.clone());
+    let mut exit: i32;
+    if let Some(why) = restore_failure {
+        env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
+        if !common.json {
+            eprintln!("Error: {}", crate::commands::rollback::capitalize_first(&why));
+        }
+        exit = 1;
+    } else {
+        for (code, detail) in &restore.warnings {
+            env.warnings.push(RunWarning {
+                code: code.to_string(),
+                detail: detail.clone(),
+            });
+        }
+        let manifest = PatchManifest {
+            patches: records,
+            setup: None,
+        };
+        match crate::commands::scan::vendor_flow::stage_and_vendor(
+            common,
+            &socket_dir,
+            &manifest,
+            blobs,
+            client.clone(),
+            use_public_proxy,
+            &mut env,
+            None,
+        )
+        .await
+        {
+            Ok(has_errors) => exit = i32::from(has_errors),
+            Err((code, message)) => {
+                env.mark_error(EnvelopeError::new(code, message.clone()));
+                if !common.json {
+                    eprintln!(
+                        "{}",
+                        crate::commands::scan::vendor_flow::format_vendor_step_error(code, &message)
+                    );
+                }
+                exit = 1;
+            }
+        }
+    }
+    if exit != 0 {
+        match snapshot.restore().await {
+            Ok(()) => env.warnings.push(RunWarning {
+                code: "eject_rolled_back".to_string(),
+                detail: "the eject did not complete, so every file it touched was restored: the \
+                         project is still hosted, exactly as before"
+                    .to_string(),
+            }),
+            Err(e) => {
+                let detail = format!(
+                    "the eject did not complete and restoring the pre-eject files failed ({e}); \
+                     restore them from version control (`git checkout -- {}`)",
+                    snapshot.files_hint()
+                );
+                if !common.json {
+                    eprintln!("Error: {detail}");
+                }
+                env.mark_error(EnvelopeError::new("eject_rollback_failed", detail));
+            }
+        }
+        if env.error.is_none() {
+            env.mark_partial_failure();
+        }
+    }
+    note_classic_migration_risk(&mut env, &common.cwd, common);
+    drop(guard);
+
+    // Embedded VEX: same contract as the manifest-driven arm — only on
+    // success, never on a dry run, and a requested-but-failed VEX flips the
+    // exit code. The ejected project has no manifest.
+    if exit == 0 {
+        if let Some(vex_path) = args.vex.vex.as_ref() {
+            if common.dry_run {
+                if !common.json && !common.silent {
+                    println!("{}", crate::commands::vex::format_vex_dry_run_skip("vendored"));
+                }
+            } else {
+                let params = args.vex.to_build_params();
+                let manifest_path = common.resolved_manifest_path();
+                match generate_vex_without_manifest(common, &params, &manifest_path).await {
+                    ManifestlessVex::Written(summary) => {
+                        env.vex = Some(VexSummary {
+                            path: vex_path.display().to_string(),
+                            statements: summary.statements,
+                            format: "openvex-0.2.0".to_string(),
+                            warnings: summary.warnings,
+                        });
+                    }
+                    ManifestlessVex::NothingToAttest(warnings) => {
+                        env.warnings.extend(warnings);
+                        if !common.json && !common.silent {
+                            println!("{}", crate::commands::vex::format_vex_nothing_to_attest());
+                        }
+                    }
+                    ManifestlessVex::Failed(e) => {
+                        env.warnings.extend(e.embedded_warnings());
+                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                        if !common.json {
+                            e.print_embedded(common);
+                        }
+                        exit = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    track_outcomes_for_vendor(
+        exit != 0,
+        &env,
+        common.dry_run,
+        api_token.as_deref(),
+        org_slug.as_deref(),
+    )
+    .await;
     exit
 }
 
@@ -1582,9 +2088,7 @@ async fn plan_service_downloads(
             if bun_refusal.is_some_and(|r| r.applies_to(candidate)) {
                 continue;
             }
-            if socket_patch_core::patch::redirect::redirect_revert_supported(candidate)
-                && takeover_blocked(candidate)
-            {
+            if takeover_blocked(candidate) {
                 continue;
             }
             // The npm backends re-wire a committed artifact the ledger
@@ -1918,10 +2422,9 @@ pub(crate) async fn vendor_records_reusing(
             // version) is deferred rather than fetched: the backend refuses
             // it — at its turn, in its own words — before anything reads
             // the source, so the refusal costs no registry request. A purl
-            // the hosted redirect ledger claims keeps the eager fetch: its
-            // takeover reverts the hosted lock edits first, which rewrites
-            // the text the gates read (and a malformed redirect ledger
-            // defers nothing).
+            // the lockfiles pin hosted keeps the eager fetch: its takeover
+            // restores the upstream lock entry first, which rewrites the
+            // text the gates read.
             let lock_candidates: Vec<(&str, &str)> = missing
                 .iter()
                 .zip(&rungs)
@@ -1939,15 +2442,14 @@ pub(crate) async fn vendor_records_reusing(
                 })
                 .collect();
             if !lock_candidates.is_empty() {
-                let claimed: Option<Vec<String>> =
-                    match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
-                    {
-                        Ok(Some(state)) => {
-                            Some(state.records.keys().map(|k| canonical_purl(k)).collect())
-                        }
-                        Ok(None) => Some(Vec::new()),
-                        Err(_) => None,
-                    };
+                let claimed: Option<Vec<String>> = Some(
+                    socket_patch_core::patch::redirect::upstream::HostedPin::all(
+                        &crate::commands::discover_wiring(common, &common.cwd).await,
+                    )
+                    .into_iter()
+                    .map(|pin| canonical_purl(&pin.purl))
+                    .collect(),
+                );
                 if let Some(claimed) = claimed {
                     let unclaimed: Vec<(&str, &str)> = lock_candidates
                         .into_iter()
@@ -2195,17 +2697,19 @@ pub(crate) async fn vendor_records_reusing(
     let mut matched: HashSet<String> = HashSet::new();
     let mut handled_bases: HashSet<String> = HashSet::new();
 
-    // The hosted redirect ledger, for cross-mode takeovers: vendoring a purl
-    // it still claims must revert the hosted edits FIRST (see the dispatch
-    // loop below). Loaded once; mutated + persisted per reverted purl. With
-    // a MALFORMED ledger a claimed purl is indistinguishable from an
-    // unclaimed one, so every takeover-capable purl fails closed; other
-    // purls proceed.
-    let (mut redirect_ledger, redirect_ledger_corrupt) =
-        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
-            Ok(state) => (state, None),
-            Err(corrupt) => (None, Some(corrupt)),
-        };
+    // The lockfiles' hosted pins, for cross-mode takeovers: vendoring a purl
+    // the lockfiles still pin hosted must restore its upstream registry
+    // entry FIRST (see the dispatch loop below). Discovered once, before any
+    // write of this run.
+    let hosted_pins: Vec<socket_patch_core::patch::redirect::upstream::HostedPin> =
+        socket_patch_core::patch::redirect::upstream::HostedPin::all(
+            &crate::commands::discover_wiring(common, &common.cwd).await,
+        );
+    let hosted_pin_of = |purl: &str| {
+        hosted_pins
+            .iter()
+            .find(|pin| canonical_purl(&pin.purl) == canonical_purl(purl))
+    };
 
     // Yarn berry takeover preflight (see
     // `socket_patch_core::vendor::yarn_berry_vendor_preflight`): the berry
@@ -2242,14 +2746,7 @@ pub(crate) async fn vendor_records_reusing(
     // is still decided at the loop's own call (see `VendorPrefetch`).
     let service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
         Some(cfg) => {
-            let takeover_blocked = |purl: &str| {
-                redirect_ledger_corrupt.is_some()
-                    || redirect_ledger.as_ref().is_some_and(|l| {
-                        l.records
-                            .keys()
-                            .any(|k| canonical_purl(k) == canonical_purl(purl))
-                    })
-            };
+            let takeover_blocked = |purl: &str| hosted_pin_of(purl).is_some();
             let planned = plan_service_downloads(
                 &common.cwd,
                 force,
@@ -2402,42 +2899,23 @@ pub(crate) async fn vendor_records_reusing(
                 continue;
             }
 
-            // Cross-mode takeover: vendoring over a LIVE hosted redirect
-            // must first revert the hosted edits from the redirect ledger.
-            // Cargo: `[patch.crates-io]` only patches crates-io-sourced
-            // deps, so vendoring on top of the hosted registry pin leaves the
-            // project unbuildable. npm family: without the pre-revert the
-            // vendor ledger records the grant-tokenized HOSTED lock fragment
-            // as its pre-vendor original. In every ecosystem the pre-revert
-            // hands the vendor detach the PRISTINE registry fragment to
-            // record. A purl whose hosted edits cannot be cleanly reverted is
-            // REFUSED; the cargo backend's `hosted_redirect_live` guard
-            // backstops states with no usable ledger.
-            if socket_patch_core::patch::redirect::redirect_revert_supported(candidate) {
-                if let Some(corrupt) = &redirect_ledger_corrupt {
-                    has_errors = true;
-                    env.record(
-                        PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
-                            "redirect_ledger_corrupt",
-                            format!(
-                                "cannot vendor over a possibly-live hosted redirect: \
-                                 {corrupt}"
-                            ),
-                        ),
-                    );
-                    report_vendor_failure(common, candidate, &corrupt.to_string());
-                    continue;
-                }
-                let claimed = redirect_ledger.as_ref().is_some_and(|l| {
-                    l.records
-                        .keys()
-                        .any(|k| canonical_purl(k) == canonical_purl(candidate))
-                });
+            // Cross-mode takeover: vendoring over a LIVE hosted pin must
+            // first restore the upstream registry entry (v5 keeps no hosted
+            // ledger: the entry is re-resolved from the registry). Cargo:
+            // `[patch.crates-io]` only patches crates-io-sourced deps, so
+            // vendoring on top of the hosted registry pin leaves the project
+            // unbuildable. npm family: without the restore the vendor ledger
+            // records the grant-tokenized HOSTED lock fragment as its
+            // pre-vendor original. In every ecosystem the restore hands the
+            // vendor detach the PRISTINE registry entry to record. A purl
+            // whose upstream entry cannot be restored is REFUSED; the cargo
+            // backend's `hosted_redirect_live` guard backstops the rest.
+            if let Some(pin) = hosted_pin_of(candidate) {
                 // The refusal the berry backend would raise after the
-                // revert, raised HERE instead — the same `failed` event,
+                // restore, raised HERE instead — the same `failed` event,
                 // code and detail, in the dry run and the wet run alike —
-                // so the hosted wiring and redirect ledger stay untouched.
-                if claimed && candidate.starts_with("pkg:npm/") {
+                // so the hosted wiring stays untouched.
+                if candidate.starts_with("pkg:npm/") {
                     let refusal = berry_takeover_refusal
                         .get_or_init(|| {
                             socket_patch_core::vendor::yarn_berry_vendor_preflight(&common.cwd)
@@ -2453,177 +2931,103 @@ pub(crate) async fn vendor_records_reusing(
                         continue;
                     }
                 }
-                if claimed && common.dry_run {
-                    // Probe the takeover exactly as the wet run would (a dry
-                    // revert on a throwaway clone), so the preview never
-                    // promises a takeover the wet run then refuses.
-                    let mut probe = redirect_ledger.clone().expect("claimed implies Some");
-                    match socket_patch_core::patch::redirect::revert_redirect_purl(
-                        &common.cwd,
-                        &mut probe,
-                        candidate,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(revert) => {
-                            record_warning(
-                                env,
-                                candidate,
-                                &VendorWarning::new(
-                                    "vendor_would_revert_redirect",
-                                    format!(
-                                        "{} is hosted-redirected; a non-dry-run vendor will \
-                                         revert the hosted redirect edits first, then vendor \
-                                         (mode takeover)",
-                                        normalize_purl(candidate)
-                                    ),
-                                ),
-                                common,
-                            );
-                            // The backend preview below reads the lock from
-                            // disk, where the hosted wiring is still live.
-                            // Bun's hosted rewrite REPLACES the entry's
-                            // `name@version` spec, so the backend would refuse
-                            // a `vendor_lock_entry_not_found` the wet run never
-                            // sees: the advisory already states the plan, so
-                            // the preview stops here.
-                            if revert
-                                .reverted_files
-                                .iter()
-                                .any(|f| f == "bun.lock" || f == "bun.lockb")
-                            {
-                                continue;
-                            }
-                        }
-                        Err(detail) => {
-                            has_errors = true;
-                            env.record(
-                                PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
-                                    "redirect_revert_failed",
-                                    format!(
-                                        "cannot vendor over the live hosted redirect: \
-                                         {detail}"
-                                    ),
-                                ),
-                            );
-                            report_vendor_failure(
-                                common,
-                                candidate,
-                                &format!("cannot revert the hosted redirect: {detail}"),
-                            );
-                            continue;
-                        }
-                    }
-                } else if claimed {
-                    let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
-                    let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
-                        &common
-                            .cwd
-                            .join(socket_patch_core::constants::npm_family::VLT_LOCK),
-                    )
-                    .await
-                    .ok();
-                    let targets = socket_patch_core::patch::redirect::vlt_heal::ledger_targets(
-                        ledger,
-                        std::slice::from_ref(candidate),
-                        vlt_lock.as_deref(),
+                let origins = crate::commands::rollback::patch_server_origins(common);
+                let vlt_lock = socket_patch_core::utils::fs::read_regular_to_string(
+                    &common
+                        .cwd
+                        .join(socket_patch_core::constants::npm_family::VLT_LOCK),
+                )
+                .await
+                .ok();
+                let targets = vlt_lock
+                    .as_deref()
+                    .map(|lock| {
+                        socket_patch_core::patch::redirect::vlt_heal::lock_targets(
+                            lock,
+                            &origins,
+                            std::slice::from_ref(candidate),
+                        )
+                    })
+                    .unwrap_or_default();
+                let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
+                    &common.cwd,
+                    std::slice::from_ref(pin),
+                    &socket_patch_core::patch::redirect::upstream::RestoreOptions {
+                        dry_run: common.dry_run,
+                        offline: common.offline,
+                        patch_server_origins: origins,
+                        bun_lockb: true,
+                    },
+                )
+                .await;
+                let refusal = restore
+                    .refused()
+                    .map(|(_, why)| why.to_string())
+                    .next()
+                    .or_else(|| restore.flush_error.clone());
+                if let Some(detail) = refusal {
+                    has_errors = true;
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
+                            "redirect_revert_failed",
+                            format!("cannot vendor over the live hosted pin: {detail}"),
+                        ),
                     );
-                    match socket_patch_core::patch::redirect::revert_redirect_purl(
-                        &common.cwd,
-                        ledger,
+                    report_vendor_failure(
+                        common,
                         candidate,
-                        false,
-                    )
-                    .await
+                        &format!("cannot restore the upstream entry: {detail}"),
+                    );
+                    continue;
+                }
+                for (code, detail) in &restore.warnings {
+                    record_warning(env, candidate, &VendorWarning::new(code, detail.clone()), common);
+                }
+                if common.dry_run {
+                    record_warning(
+                        env,
+                        candidate,
+                        &VendorWarning::new(
+                            "vendor_would_revert_redirect",
+                            format!(
+                                "{} is hosted; a non-dry-run vendor will restore its upstream \
+                                 registry entry first, then vendor (mode takeover)",
+                                normalize_purl(candidate)
+                            ),
+                        ),
+                        common,
+                    );
+                    // The backend preview below reads the lock from disk,
+                    // where the hosted wiring is still live. Bun's hosted
+                    // rewrite REPLACES the entry's `name@version` spec, so the
+                    // backend would refuse a `vendor_lock_entry_not_found`
+                    // the wet run never sees: the advisory already states the
+                    // plan, so the preview stops here.
+                    if restore
+                        .reverted_files
+                        .iter()
+                        .any(|f| f == "bun.lock" || f == "bun.lockb")
                     {
-                        Ok(revert) => {
-                            // Advisories from the same transaction (a
-                            // redirect-created `.npmrc` modified since —
-                            // kept, only the `allow-remote=all` line removed).
-                            for (code, detail) in &revert.warnings {
-                                if code == "redirect_npmrc_allow_remote_modified" {
-                                    record_warning(
-                                        env,
-                                        candidate,
-                                        &VendorWarning::new(
-                                            "redirect_npmrc_allow_remote_modified",
-                                            detail.clone(),
-                                        ),
-                                        common,
-                                    );
-                                }
-                            }
-                            if let Err(e) =
-                                socket_patch_core::patch::redirect::persist_redirect_state(
-                                    &common.cwd,
-                                    ledger,
-                                )
-                                .await
-                            {
-                                // The hosted edits are reverted but the ledger
-                                // still claims them; vendoring now would leave
-                                // a ledger asserting wiring that is gone. Fail
-                                // closed for this purl.
-                                has_errors = true;
-                                let detail = format!(
-                                    "reverted the hosted redirect but could not update \
-                                     .socket/vendor/redirect-state.json: {e}"
-                                );
-                                report_vendor_failure(common, candidate, &detail);
-                                env.record(
-                                    PatchEvent::new(PatchAction::Failed, candidate.clone())
-                                        .with_error("redirect_ledger_write_failed", detail),
-                                );
-                                continue;
-                            }
-                            let reverted_what = if candidate.starts_with("pkg:cargo/") {
-                                "the hosted edits (Cargo.toml registry pin, Cargo.lock \
-                                 source/checksum, registries block)"
-                            } else if candidate.starts_with("pkg:golang/") {
-                                "the hosted edits (go.mod replace, the socket module's go.sum \
-                                 lines, the pruned upstream go.sum lines)"
-                            } else {
-                                "the hosted lockfile edits back to their pre-redirect \
-                                 registry values"
-                            };
-                            if !targets.is_empty() {
-                                vlt_takeover_targets.insert(candidate.clone(), targets);
-                            }
-                            record_warning(
-                                env,
-                                candidate,
-                                &VendorWarning::new(
-                                    "vendor_takeover_reverted_redirect",
-                                    format!(
-                                        "{} was hosted-redirected; reverted {reverted_what} \
-                                         and dropped the redirect-ledger record before \
-                                         vendoring (mode takeover)",
-                                        normalize_purl(candidate)
-                                    ),
-                                ),
-                                common,
-                            );
-                        }
-                        Err(detail) => {
-                            has_errors = true;
-                            env.record(
-                                PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
-                                    "redirect_revert_failed",
-                                    format!(
-                                        "cannot vendor over the live hosted redirect: \
-                                             {detail}"
-                                    ),
-                                ),
-                            );
-                            report_vendor_failure(
-                                common,
-                                candidate,
-                                &format!("cannot revert the hosted redirect: {detail}"),
-                            );
-                            continue;
-                        }
+                        continue;
                     }
+                } else {
+                    if !targets.is_empty() {
+                        vlt_takeover_targets.insert(candidate.clone(), targets);
+                    }
+                    record_warning(
+                        env,
+                        candidate,
+                        &VendorWarning::new(
+                            "vendor_takeover_reverted_redirect",
+                            format!(
+                                "{} was hosted; restored its upstream registry entry ({}) \
+                                 before vendoring (mode takeover)",
+                                normalize_purl(candidate),
+                                restore.reverted_files.join(", ")
+                            ),
+                        ),
+                        common,
+                    );
                 }
             }
 
@@ -3274,6 +3678,56 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
                     PatchEvent::new(PatchAction::Failed, purl.clone())
                         .with_error("vendor_state_write_failed", e),
                 );
+            }
+        }
+    }
+
+    // `--revert` returns to UPSTREAM: a package vendored over hosted wiring
+    // before v5 recorded the hosted fragment as its pre-vendor original, so
+    // its revert just wired it back to the patch server. Restore those pins
+    // to their upstream registry entries too (a wet run only — a dry revert
+    // wrote nothing to inspect).
+    if !common.dry_run {
+        let reverted: HashSet<String> = env
+            .events
+            .iter()
+            .filter(|e| e.action == PatchAction::Removed)
+            .filter_map(|e| e.purl.as_deref().map(canonical_purl))
+            .collect();
+        let rehosted: Vec<HostedPin> =
+            HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
+                .into_iter()
+                .filter(|pin| reverted.contains(&canonical_purl(&pin.purl)))
+                .collect();
+        if !rehosted.is_empty() {
+            let leg = crate::commands::rollback::run_hosted_leg(common, &rehosted).await;
+            for purl in &leg.reverted {
+                record_warning(
+                    env,
+                    purl,
+                    &VendorWarning::new(
+                        "vendor_revert_restored_upstream",
+                        format!(
+                            "{purl} was vendored over a hosted pin before v5, so its revert \
+                             re-wired it to the hosted patch server; restored its upstream \
+                             registry entry"
+                        ),
+                    ),
+                    common,
+                );
+            }
+            for (purl, why) in &leg.failed {
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, purl.clone())
+                        .with_error("hosted_restore_failed", why.clone()),
+                );
+            }
+            for (code, detail) in &leg.warnings {
+                env.warnings.push(RunWarning {
+                    code: code.clone(),
+                    detail: detail.clone(),
+                });
             }
         }
     }

@@ -1508,8 +1508,8 @@ pub fn record_fetch_failed_warning(purl: &str) -> RewriteWarning {
         "record_fetch_failed",
         format!(
             "{purl} redirected, but its patch record could not be fetched; \
-             it will be missing from VEX until `socket-patch scan --mode \
-             hosted` is re-run"
+             this run's VEX attestation omits it (`socket-patch vex` \
+             fetches it again once the API answers)"
         ),
     )
 }

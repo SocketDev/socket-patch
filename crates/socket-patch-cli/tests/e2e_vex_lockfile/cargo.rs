@@ -1782,11 +1782,12 @@ fn embedded_scan_vex_attests_lockfile_wired_patches() {
     assert!(!out_path.exists(), "the stale document is removed");
 }
 
-/// Embedded `apply --vex` / `vendor --vex` on the manifest-less mixed
-/// project: neither command has anything of its own to do, but the
-/// requested document must still be produced (`status: noManifest` + a
-/// `vex` summary) — and offline, with no record anywhere, the requested VEX
-/// fails the command rather than exiting 0 without it.
+/// Embedded `apply --vex` on the manifest-less mixed project: the command
+/// has nothing of its own to do, but the requested document must still be
+/// produced (`status: noManifest` + a `vex` summary) — and offline, with no
+/// record anywhere, the requested VEX fails the command rather than exiting
+/// 0 without it. (`vendor` is not driven here: over the project's HOSTED
+/// pins it is the v5 eject flow, not a manifest-less no-op.)
 #[test]
 fn embedded_apply_and_vendor_vex_attest_lockfile_wired_patches_without_manifest() {
     let api = mixed_api();
@@ -1797,7 +1798,8 @@ fn embedded_apply_and_vendor_vex_attest_lockfile_wired_patches_without_manifest(
         .map(|f| fx.read(f))
         .collect();
     let out_path = fx.cwd.join("embedded.vex.json");
-    for command in ["apply", "vendor"] {
+    {
+        let command = "apply";
         let run = |extra: &[&str]| {
             let _ = std::fs::remove_file(&out_path);
             let mut args = vec![
@@ -1838,7 +1840,7 @@ fn embedded_apply_and_vendor_vex_attest_lockfile_wired_patches_without_manifest(
         );
         assert!(!out_path.exists(), "{command}");
     }
-    // Neither command touched the committed wiring.
+    // The command never touched the committed wiring.
     let after: Vec<String> = ["Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
         .iter()
         .map(|f| fx.read(f))

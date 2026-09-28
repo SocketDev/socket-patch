@@ -38,7 +38,7 @@ pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 /// Whole-package caps — wider than `patch/package.rs`'s patch-archive caps
 /// because these are full upstream packages, but still bounded so a
 /// poisoned lockfile cannot turn the fetch into a disk/memory bomb.
-const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
 // `pub(crate)`: `common::read_zip_members` is the in-memory twin of
 // [`extract_zip`] and must refuse exactly the same archives, so it reads the
 // one set of caps rather than carrying a copy that can drift.
@@ -1071,7 +1071,7 @@ async fn fetch_gem(
 /// hash, and Pipfile.lock, which records every release file's hash).
 pub const DEFAULT_PYPI_JSON_API: &str = "https://pypi.org/pypi";
 
-fn pypi_json_api_base() -> String {
+pub(crate) fn pypi_json_api_base() -> String {
     std::env::var("SOCKET_PYPI_JSON_API")
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
@@ -1211,7 +1211,7 @@ async fn fetch_pypi(
 /// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
 pub const DEFAULT_CRATES_REGISTRY: &str = "https://static.crates.io/crates";
 
-fn crates_registry_base() -> String {
+pub(crate) fn crates_registry_base() -> String {
     std::env::var("SOCKET_CRATES_REGISTRY")
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
@@ -1261,7 +1261,7 @@ pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";
 /// the module matches GONOPROXY (defaulting to GOPRIVATE). Falling back to a
 /// public proxy there would send a private module path off the machine.
 /// A non-empty `SOCKET_GOPROXY` is an explicit choice and always wins.
-fn goproxy_base(module: &str) -> Result<String, String> {
+pub(crate) fn goproxy_base(module: &str) -> Result<String, String> {
     if let Ok(v) = std::env::var("SOCKET_GOPROXY") {
         let v = v.trim_end_matches('/').to_string();
         if !v.is_empty() {
@@ -1304,7 +1304,7 @@ fn goproxy_base(module: &str) -> Result<String, String> {
 /// glob match a leading path-element prefix of `target`? A glob with
 /// syntax this matcher does not implement (`[...]`, `\`) counts as a
 /// match, so an unrecognized private pattern never leaks a module path.
-fn go_match_prefix_patterns(globs: &str, target: &str) -> bool {
+pub(crate) fn go_match_prefix_patterns(globs: &str, target: &str) -> bool {
     globs
         .split(',')
         .map(str::trim)
@@ -1339,7 +1339,7 @@ fn go_glob_match(pattern: &[u8], name: &[u8]) -> bool {
 ///
 /// Runs in the ecosystem-agnostic service-download path whenever the
 /// service reports a `dirhashH1`.
-fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
+pub(crate) fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     Ok(walk_module_zip(bytes, None)?.h1)
 }
 
@@ -1863,7 +1863,7 @@ pub async fn stage_local_dir_artifact(
 /// Capped download. http(s) only; the cap is enforced on the declared
 /// Content-Length AND the actual stream (a lying server cannot blow past
 /// it).
-async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+pub(crate) async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(format!("refusing non-http(s) artifact URL `{url}`"));
     }
@@ -2012,7 +2012,7 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
 /// legacy package unvendorable whenever the prebuilt-artifact service misses.
 /// The bare-hex twin of this trust
 /// decision already lives in the `LockIntegrity::Sha1Hex` arm above.
-fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
+pub(crate) fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
     let mut best: Option<(u8, &str, &str)> = None;
     for token in sri.split_whitespace() {
         let Some((algo, b64)) = token.split_once('-') else {

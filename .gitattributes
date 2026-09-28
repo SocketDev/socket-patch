@@ -6,6 +6,13 @@ crates/socket-patch-core/tests/fixtures/redirect/** -text
 
 crates/socket-patch-core/tests/fixtures/pdm-native/*.lock -text
 
+# Poetry and Pipenv locks are real `poetry lock` / `pipenv lock` output: the
+# upstream restore and VEX tests round-trip them byte for byte and derive
+# their CRLF variants from the LF bytes themselves.
+crates/socket-patch-core/tests/fixtures/poetry/** -text
+crates/socket-patch-core/tests/fixtures/pipenv/** -text
+crates/socket-patch-core/tests/fixtures/pipenv-shapes/** -text
+
 # The captured pnpm 1-12 locks are byte-real: the hosted/vendored rewriters
 # refuse CRLF by design (vendor_lockfile_crlf_unsupported), and the tests
 # derive their CRLF variants from the LF bytes themselves.

@@ -784,25 +784,23 @@ async fn cargo_wet_preflight(
     uuid: &str,
 ) -> Result<cargo_lock::LockEntryProbe, VendorOutcome> {
     // Cross-mode takeover guard (fail-closed): a LIVE hosted-redirect wiring
-    // for this crate must be reverted from the redirect ledger BEFORE
-    // vendoring — the CLI vendored flows do exactly that. Reaching this point
-    // with the residue still present means the redirect ledger is missing or
-    // corrupt (no recorded originals to revert with); proceeding would bake
+    // for this crate must be restored to its crates.io entry BEFORE
+    // vendoring — the CLI vendored flows do exactly that (the upstream
+    // restore). Reaching this point with the residue still present means
+    // that restore did not run or could not undo it; proceeding would bake
     // the hosted registry values into this entry's lock originals as if they
     // were pristine, leave Cargo.toml pinned to the hosted registry, and
     // report success on an unbuildable half-migrated project. Refuse with the
     // manual remediation instead. Runs after the dry-run branch: a preview
-    // must not report the wet run's ledger-driven revert as a failure.
+    // must not report the wet run's restore as a failure.
     if let Some(residue) = hosted_redirect_residue(project_root, name, version).await {
         return Err(refused(
             "hosted_redirect_live",
             format!(
-                "{residue}, but no redirect ledger record can revert it \
-                 (.socket/vendor/redirect-state.json is missing or does not \
-                 record this package); restore the ledger, or manually remove \
-                 the `registry = \"socket-patch-…\"` key from Cargo.toml, \
-                 restore the crates.io source/checksum in Cargo.lock, and drop \
-                 the `[registries.socket-patch-…]` block, then re-run"
+                "{residue}, and it was not restored to its crates.io entry; run \
+                 `socket-patch rollback` for this package first, or restore \
+                 Cargo.toml and Cargo.lock from version control (`git checkout \
+                 -- Cargo.toml Cargo.lock`), then re-run"
             ),
         ));
     }
@@ -4203,12 +4201,12 @@ mod tests {
         );
     }
 
-    /// FAIL CLOSED: vendoring over a LIVE hosted redirect with no ledger to
-    /// revert it must refuse — proceeding would record the hosted registry
+    /// FAIL CLOSED: vendoring over a LIVE hosted redirect the upstream
+    /// restore did not undo must refuse — proceeding would record the hosted registry
     /// values as the entry's "originals" and leave Cargo.toml pinned to the
     /// hosted registry (unbuildable in both modes) while reporting success.
     #[tokio::test]
-    async fn test_refuses_live_hosted_redirect_without_ledger() {
+    async fn test_refuses_live_hosted_redirect_left_unrestored() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let index = "sparse+http://127.0.0.1:5555/index/";
@@ -4245,7 +4243,12 @@ mod tests {
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
             "hosted_redirect_live",
         );
-        assert!(detail.contains("redirect-state.json"), "{detail}");
+        assert!(
+            detail.contains("socket-patch rollback")
+                && detail.contains("git checkout -- Cargo.toml Cargo.lock"),
+            "the refusal names the restore remedies: {detail}"
+        );
+        assert!(!detail.contains("redirect-state.json"), "{detail}");
         // Nothing was half-vendored.
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
 

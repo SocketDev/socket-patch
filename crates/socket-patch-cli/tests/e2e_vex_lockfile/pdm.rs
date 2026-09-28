@@ -19,8 +19,10 @@
 //!
 //! The cells (see `vex_pdm_hatch_common`) run for every (release, mode):
 //! a) wiring-only checkout attests online; b) `record_unavailable` offline /
-//! unreachable / 404 with zero requests offline; c) ledger without manifest
-//! attests offline; d) reverted lock is unwired even with `--no-verify`;
+//! unreachable / 404 with zero requests offline; c) the vendor ledger
+//! without manifest attests offline (v5 hosted keeps no ledger: offline it
+//! is `record_unavailable`, online it attests); d) reverted lock is unwired
+//! even with `--no-verify` (hosted: nothing is discovered);
 //! e) tampered installed tree / wheel member omitted; f) foreign host,
 //! root-escaping path and mismatched records never attest; g) hosted
 //! installed-tree states (not installed → pin, patched → hashed, pristine →

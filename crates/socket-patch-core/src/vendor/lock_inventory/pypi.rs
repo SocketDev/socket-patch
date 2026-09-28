@@ -586,8 +586,20 @@ async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>
 /// out.
 async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text("requirements.txt").await.ok()?;
+    let lines = crate::utils::requirements::logical_lines(&text);
+    // An exact pin's `--hash=sha256:` digests verify a PyPI download only
+    // while the file resolves from the public index: an index option
+    // (`-i` / `--index-url` / `--extra-index-url` / `-f`) may serve other
+    // bytes under the same name, so it keeps every pin unverifiable (the
+    // Pipfile.lock `public_index` rule).
+    let public_index = lines.iter().all(|line| {
+        let code = crate::utils::requirements::strip_comment(&line.text).trim_start();
+        !["-i", "--index-url", "--extra-index-url", "-f", "--find-links"]
+            .iter()
+            .any(|opt| code.starts_with(opt))
+    });
     let mut out = Vec::new();
-    for line in crate::utils::requirements::logical_lines(&text) {
+    for line in lines {
         let (code, comment) = crate::utils::requirements::split_comment(&line.text);
         let t = code.trim();
         if t.is_empty() || t.starts_with('-') {
@@ -595,8 +607,18 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
         }
         // `name==version` (extras, env markers, hash options stripped) —
         // the shared exact-pin rule discovery reads requirements with.
+        let mut integrity = LockIntegrity::None;
         let (name, version) = match crate::utils::requirements::exact_pin(t) {
-            Some((raw_name, version)) => (canonicalize_pypi_name(raw_name), version.to_string()),
+            Some((raw_name, version)) => {
+                let hashes: Vec<String> = crate::utils::requirements::hash_options(t)
+                    .into_iter()
+                    .filter_map(|h| sha256_hex(&h))
+                    .collect();
+                if public_index && !hashes.is_empty() {
+                    integrity = LockIntegrity::Sha256AnyOf(hashes);
+                }
+                (canonicalize_pypi_name(raw_name), version.to_string())
+            }
             None => {
                 let Some((raw_name, reference)) = crate::utils::requirements::direct_reference(t)
                     .and_then(|(n, r)| Some((n, socket_reference_coords(r)?)))
@@ -630,7 +652,7 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
             name,
             version,
             resolved: None,
-            integrity: LockIntegrity::None,
+            integrity,
         });
     }
     if out.is_empty() {

@@ -16,8 +16,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::vex_e2e_common::{
-    assert_absent, assert_attested, assert_not_attested, run_vex, seed_legacy_manifest,
-    statements_for, strip_ledgers, strip_manifest, Marker, PatchApi, VexOutcome, VexRun, VexVia,
+    assert_absent, assert_attested, assert_no_hosted_ledger, assert_not_attested, run_vex,
+    seed_legacy_manifest, statements_for, strip_ledgers, strip_manifest, Marker, PatchApi,
+    VexOutcome, VexRun, VexVia,
 };
 
 /// npm >= 12 needs `allow-remote=all` for a hosted redirect's lock (the
@@ -77,6 +78,8 @@ pub struct ManifestlessCase<'a> {
     /// the revert cell.
     pub registry_locks: Vec<(&'a str, Vec<u8>)>,
     /// Also drive embedded `apply --vex` / `vendor --vex` (manifest-less).
+    /// For a hosted flow `vendor` is skipped: over hosted pins it EJECTS
+    /// the project into `.socket/vendor/` (v5) instead of attesting it.
     pub embedded: &'a [VexVia],
 }
 
@@ -109,7 +112,10 @@ fn run(case: &ManifestlessCase<'_>, run: VexRun) -> VexOutcome {
     run_vex(&crate::vex_e2e_common::binary(), case.project, &run)
 }
 
-/// The manifest-less cells every npm hosted / vendored flow ends in:
+/// The manifest-less cells every npm hosted / vendored flow ends in. The
+/// flow's own state is checked first: a vendored flow wrote the vendor
+/// ledger; a hosted flow wrote NO ledger (v5 hosted state is the lockfile
+/// alone).
 ///
 /// 0. `legacy-manifest` (vendored only): the `.socket/manifest.json` a
 ///    pre-5.0 vendored run left beside its ledger (the ledger's embedded
@@ -117,31 +123,40 @@ fn run(case: &ManifestlessCase<'_>, run: VexRun) -> VexOutcome {
 /// 1. `manifest-deleted`: `.socket/manifest.json` removed (ledgers kept) →
 ///    standalone `vex` attests the purl with the right marker + vuln ids
 ///    (and every `embedded` command does too);
-/// 2. `ledgers-deleted`: both ledgers removed too → still attested, from
-///    lockfile discovery + the patch API (≥ 1 view request);
+/// 2. `ledgers-deleted`: the vendor ledger removed too → still attested,
+///    from lockfile discovery + the patch API (≥ 1 view request);
 /// 3. `offline`: no ledgers, `--offline` → `record_unavailable`, ZERO
 ///    requests;
 /// 4. `reverted`: ledgers restored, locks reverted to their registry bytes
-///    → NOT attested (default and `--no-verify`); with the ledgers gone as
-///    well nothing names the patch at all.
+///    → NOT attested (default and `--no-verify`): vendored → the stale
+///    ledger entry is `vendor_unwired`; hosted → nothing names the patch at
+///    all (the lock was the only hosted state). With the ledgers gone as
+///    well nothing names the patch either way.
 ///
 /// Leaves the project reverted (locks at registry bytes, no ledgers).
 pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
     let mut report = MatrixReport::default();
     let label = &case.label;
     let p = case.project;
-    let ledger_paths = [
-        socket_patch_core::vendor::VENDOR_STATE_REL,
-        socket_patch_core::patch::redirect::REDIRECT_STATE_REL,
-    ];
-    let ledgers: Vec<(&str, Vec<u8>)> = ledger_paths
+    let hosted = case.marker != Marker::Vendored;
+    let ledgers: Vec<(&str, Vec<u8>)> = [socket_patch_core::vendor::VENDOR_STATE_REL]
         .iter()
         .filter_map(|rel| std::fs::read(p.join(rel)).ok().map(|b| (*rel, b)))
         .collect();
-    assert!(
-        !ledgers.is_empty(),
-        "[{label}] the flow must have written a ledger"
-    );
+    if hosted {
+        assert_no_hosted_ledger(p, &format!("[{label}]"));
+    } else {
+        assert!(
+            !ledgers.is_empty(),
+            "[{label}] the vendored flow must have written its ledger"
+        );
+    }
+    let embedded: Vec<VexVia> = case
+        .embedded
+        .iter()
+        .copied()
+        .filter(|via| !(hosted && *via == VexVia::Vendor))
+        .collect();
 
     // 0. a LEGACY vendored checkout: vendored mode is manifest-free now,
     //    but a pre-5.0 run left the record in `.socket/manifest.json`
@@ -162,7 +177,7 @@ pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
     let out = run(case, VexRun::online(case.api));
     assert_eq!(out.code, Some(0), "[{label}] manifest-deleted:\n{out}");
     assert_attested(out.doc(), case.purl, case.uuid, case.marker, case.vulns);
-    for via in case.embedded {
+    for via in &embedded {
         let out = run(case, VexRun::online(case.api).via(*via));
         assert_eq!(out.code, Some(0), "[{label}] embedded {via:?}:\n{out}");
         assert_attested(out.doc(), case.purl, case.uuid, case.marker, case.vulns);
@@ -188,7 +203,7 @@ pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
         "[{label}] the record must come from the patch API: {:?}",
         case.api.requests()
     );
-    for via in case.embedded {
+    for via in &embedded {
         let out = run(case, VexRun::online(case.api).via(*via));
         assert_eq!(
             out.code,
@@ -221,10 +236,6 @@ pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
     for (lock, bytes) in &case.registry_locks {
         std::fs::write(p.join(lock), bytes).unwrap();
     }
-    let unwired = match case.marker {
-        Marker::Vendored => "vendor_unwired",
-        _ => "redirect_unwired",
-    };
     for no_verify in [false, true] {
         let mut r = VexRun::online(case.api);
         r.no_verify = no_verify;
@@ -235,7 +246,14 @@ pub fn manifestless_vex_matrix(case: &ManifestlessCase<'_>) -> MatrixReport {
             "[{label}] reverted (no_verify={no_verify}):\n{out}"
         );
         assert_absent(out.doc.as_ref(), case.purl);
-        assert_not_attested(&out.envelope, case.purl, unwired);
+        if hosted {
+            assert_eq!(
+                out.envelope["error"]["code"], "manifest_not_found",
+                "[{label}] reverted hosted lock: no hosted state is left:\n{out}"
+            );
+        } else {
+            assert_not_attested(&out.envelope, case.purl, "vendor_unwired");
+        }
     }
     strip_ledgers(p);
     let out = run(case, VexRun::online(case.api));

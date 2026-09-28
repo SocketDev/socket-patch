@@ -375,7 +375,10 @@ fn fresh_checkout_install(tmp: &Path, proj: &Path, yarnrc: &str) -> (PathBuf, Ou
     .unwrap();
     std::fs::copy(proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
     std::fs::write(fresh.join(".yarnrc.yml"), yarnrc).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    // v5 hosted mode may leave no `.socket/` at all (no ledger, no manifest).
+    if proj.join(".socket").is_dir() {
+        copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    }
     let fresh_global = tmp.join("fresh-yarn-global");
     let ci = corepack(
         &fresh,

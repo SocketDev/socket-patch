@@ -842,36 +842,13 @@ async fn mount_hosted(server: &MockServer, failing: &[usize], delay: fn(usize) -
     }
 }
 
-/// The ledger with its run timestamps blanked, for a byte comparison.
-fn ledger_without_timestamps(root: &Path) -> String {
-    let raw = std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap();
-    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    fn blank(v: &mut serde_json::Value) {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, val) in map.iter_mut() {
-                    let key = k.to_ascii_lowercase();
-                    if key.ends_with("at") && val.is_string() {
-                        *val = serde_json::Value::String("<ts>".into());
-                    } else {
-                        blank(val);
-                    }
-                }
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(blank),
-            _ => {}
-        }
-    }
-    blank(&mut v);
-    serde_json::to_string_pretty(&v).unwrap()
-}
-
 /// A wet hosted run where 2 of 6 record views fail, with reversed
 /// latencies: the `record_fetch_failed` warnings keep `confirmed` order,
-/// and stdout, the rewritten lockfile and the ledger all equal a
-/// zero-latency run's.
+/// stdout and the rewritten lockfile equal a zero-latency run's, and (v5)
+/// neither run writes a redirect ledger — a failed record fetch only drops
+/// the purl from this run's in-memory VEX records.
 #[tokio::test]
-async fn hosted_record_fetch_failures_keep_order_and_ledger_bytes() {
+async fn hosted_record_fetch_failures_keep_order_and_lock_bytes() {
     let failing = [1usize, 3];
     let slow: fn(usize) -> Duration = |i| Duration::from_millis(50 * (6 - i as u64));
     let fast: fn(usize) -> Duration = |_| Duration::ZERO;
@@ -890,10 +867,16 @@ async fn hosted_record_fetch_failures_keep_order_and_ledger_bytes() {
         );
         assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
         let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
-        outcomes.push((stdout, lock, ledger_without_timestamps(tmp.path())));
+        assert!(
+            !tmp.path()
+                .join(".socket/vendor/redirect-state.json")
+                .exists(),
+            "v5 hosted mode writes no redirect ledger"
+        );
+        outcomes.push((stdout, lock));
     }
 
-    let (stdout, lock, ledger) = &outcomes[0];
+    let (stdout, lock) = &outcomes[0];
     let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
     let warnings: Vec<&str> = v["redirect"]["warnings"]
         .as_array()
@@ -903,12 +886,19 @@ async fn hosted_record_fetch_failures_keep_order_and_ledger_bytes() {
         .map(|w| w["detail"].as_str().unwrap())
         .collect();
     assert_eq!(warnings.len(), 2, "{stdout}");
-    assert!(warnings[0].starts_with(&format!("{} redirected", purl(NAMES[1]))));
-    assert!(warnings[1].starts_with(&format!("{} redirected", purl(NAMES[3]))));
+    for (warning, idx) in warnings.iter().zip([1usize, 3]) {
+        assert_eq!(
+            *warning,
+            format!(
+                "{} redirected, but its patch record could not be fetched; this run's VEX \
+                 attestation omits it (`socket-patch vex` fetches it again once the API \
+                 answers)",
+                purl(NAMES[idx])
+            )
+        );
+    }
     for idx in 0..NAMES.len() {
         assert!(lock.contains(&hosted_url(idx)), "{lock}");
-        let has_record = ledger.contains(&format!("GHSA-conc-{idx:04}-aaaa"));
-        assert_eq!(has_record, !failing.contains(&idx), "{ledger}");
     }
 
     assert_eq!(outcomes[0], outcomes[1], "latency must not change the run");

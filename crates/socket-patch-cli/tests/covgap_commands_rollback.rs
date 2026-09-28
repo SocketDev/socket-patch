@@ -4,8 +4,8 @@
 //!    per-file details, preserve-state closing message, and the
 //!    error-class stderr notices (other suites run `--json`/`--silent`);
 //! 2. failure legs of the vendored and hosted rollback (unknown-backend
-//!    revert failure, ledger save/persist failure, replay refusal,
-//!    per-purl revert I/O failure, corrupt ledgers);
+//!    revert failure, ledger save failure, per-pin upstream-restore
+//!    refusals, lockfile write failure, pre-v5 hosted ledger retirement);
 //! 3. GC-failure warnings (unix permissions);
 //! 4. manifest-write failure (macOS immutable flag);
 //! 5. the interactive confirm DECLINE (PTY-driven, like
@@ -19,18 +19,16 @@
 //!
 //! Binary-driven throughout (the `rollback_duality_invariants.rs` shape):
 //! `SOCKET_*`-scrubbed child processes via `common::run`, hand-written
-//! camelCase manifests, git-sha256 oracle, `--offline` everywhere. Hosted
-//! ledgers are serialized through the real `RedirectState`/`FileEdit`
-//! types so fixtures can never drift from the on-disk schema (the
-//! `in_process_rollback_hosted.rs` convention).
+//! camelCase manifests, git-sha256 oracle, `--offline` everywhere except the
+//! hosted leg: v5 hosted state is the lockfile pins themselves, and their
+//! rollback restores the upstream registry entry from a mock npm registry
+//! (`SOCKET_NPM_REGISTRY`, see `NpmRegistry`).
 
 #[path = "common/pty_io.rs"]
 mod pty_io;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
-use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -149,11 +147,6 @@ struct PatchedFixture {
     purl: &'static str,
     before: &'static [u8],
     after: &'static [u8],
-    // Read only by the macOS-only test below.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    before_hash: String,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    after_hash: String,
 }
 
 fn patched_fixture() -> PatchedFixture {
@@ -182,8 +175,6 @@ fn patched_fixture() -> PatchedFixture {
         purl,
         before,
         after,
-        before_hash,
-        after_hash,
     }
 }
 
@@ -1353,73 +1344,134 @@ fn qualified_manifest_purl_removed_after_vendored_revert() {
 }
 
 // ═════════════════════════ 3. hosted-leg gaps ══════════════════════════════
+//
+// v5 hosted mode keeps no ledger: the hosted pins are discovered from the
+// lockfiles (on `--patch-server-url`'s origin for these mock-host URLs) and
+// rollback restores each pin's DEFAULT UPSTREAM registry entry, re-resolved
+// from the (mocked) npm registry. A pre-v5 ledger is never replayed; it is
+// retired once no hosted pin remains.
 
 const LP_PURL: &str = "pkg:npm/left-pad@1.2.3";
-const LP_UUID: &str = "55555555-5555-4555-8555-555555555555";
 const LP_HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
-const GEM_PURL: &str = "pkg:gem/rex@1.0.0";
-const GEM_UUID: &str = "77777777-7777-4777-8777-777777777777";
-const GEM_UPSTREAM_REMOTE: &str = "https://rubygems.org/";
-const GEM_PATCH_REMOTE: &str = "http://patch.test/gems/t0k3nt0k3n/";
+const IO_PURL: &str = "pkg:npm/is-odd@3.0.1";
+const IO_HOSTED_URL: &str = "http://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
+const PATCH_SERVER: &str = "http://patch.test";
+const UPSTREAM_INTEGRITY: &str = "sha512-UPSTREAMupstream==";
 
-/// A full camelCase patch record for hand-written ledgers.
-fn hosted_record(uuid: &str) -> PatchRecord {
-    let mut files = std::collections::HashMap::new();
-    files.insert(
-        "package/index.js".to_string(),
-        PatchFileInfo {
-            before_hash: "a".repeat(64),
-            after_hash: "b".repeat(64),
-        },
-    );
-    PatchRecord {
-        uuid: uuid.to_string(),
-        exported_at: "2024-01-01T00:00:00Z".to_string(),
-        files,
-        vulnerabilities: std::collections::HashMap::new(),
-        description: "x".to_string(),
-        license: "MIT".to_string(),
-        tier: "free".to_string(),
+/// A mock npm registry (the `SOCKET_NPM_REGISTRY` override the upstream
+/// restore reads) serving the version document of each `(name, version)`
+/// it was started with; everything else is a 404. The server runs on
+/// wiremock's own thread; the runtime is kept only to own it.
+struct NpmRegistry {
+    server: wiremock::MockServer,
+    _rt: tokio::runtime::Runtime,
+}
+
+impl NpmRegistry {
+    fn start(served: &[(&str, &str)]) -> Self {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let server = rt.block_on(async {
+            let server = MockServer::start().await;
+            for (name, version) in served {
+                Mock::given(method("GET"))
+                    .and(path(format!("/npm/{name}/{version}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "name": name,
+                        "version": version,
+                        "dist": {
+                            "tarball": format!(
+                                "https://registry.yarnpkg.com/{name}/-/{name}-{version}.tgz"
+                            ),
+                            "shasum": "aaaa",
+                            "integrity": UPSTREAM_INTEGRITY,
+                        }
+                    })))
+                    .mount(&server)
+                    .await;
+            }
+            server
+        });
+        Self { server, _rt: rt }
+    }
+
+    fn base(&self) -> String {
+        format!("{}/npm", self.server.uri())
+    }
+
+    fn request_count(&self) -> usize {
+        self._rt
+            .block_on(self.server.received_requests())
+            .map(|r| r.len())
+            .unwrap_or(0)
     }
 }
 
-/// Serialize a hand-written ledger through the real core types (real
-/// schema: version, mode "hosted", edits[FileEdit], records{purl:record}).
-fn write_hosted_ledger(root: &Path, records: Vec<(&str, PatchRecord)>, edits: Vec<FileEdit>) {
-    let mut state = RedirectState::new();
-    state.edits = edits;
-    for (purl, record) in records {
-        state.records.insert(purl.to_string(), record);
+/// `common::run` with the mock patch host recognized as hosted
+/// (`--patch-server-url`) and, when given, the npm registry pointed at the
+/// mock.
+fn run_hosted(cwd: &Path, args: &[&str], registry: Option<&NpmRegistry>) -> (i32, String, String) {
+    let mut full: Vec<&str> = args.to_vec();
+    full.extend(["--patch-server-url", PATCH_SERVER]);
+    match registry {
+        Some(r) => {
+            let base = r.base();
+            common::run_with_env(cwd, &full, &[("SOCKET_NPM_REGISTRY", base.as_str())])
+        }
+        None => run(cwd, &full),
     }
-    let vendor_dir = root.join(".socket/vendor");
-    std::fs::create_dir_all(&vendor_dir).expect("create .socket/vendor");
-    let mut bytes = serde_json::to_vec_pretty(&state).expect("serialize ledger");
-    bytes.push(b'\n');
-    std::fs::write(vendor_dir.join("redirect-state.json"), bytes).expect("write ledger");
 }
 
 fn ledger_path(root: &Path) -> PathBuf {
     root.join(".socket/vendor/redirect-state.json")
 }
 
-// yarn-classic fragments — `redirect_yarn_classic_entry` is a text kind the
-// per-purl npm revert claims by `<name>@<version>` key.
+/// Write a pre-v5 hosted ledger (v5 never writes one) with the given raw
+/// `edits`, exactly as an old release serialized it.
+fn write_legacy_ledger(root: &Path, edits: Value) {
+    let vendor_dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).expect("create .socket/vendor");
+    let ledger = json!({
+        "version": 1,
+        "mode": "hosted",
+        "edits": edits,
+        "records": {},
+    });
+    let mut bytes = serde_json::to_vec_pretty(&ledger).expect("serialize ledger");
+    bytes.push(b'\n');
+    std::fs::write(vendor_dir.join("redirect-state.json"), bytes).expect("write ledger");
+}
 
-fn yarn_block(resolved: &str, integrity: &str) -> String {
+// yarn-classic fragments: the upstream block is exactly what the restore
+// re-derives from the mock registry's version document.
+
+fn yarn_block_for(name: &str, version: &str, resolved: &str, integrity: &str) -> String {
     format!(
-        "left-pad@1.2.3:\n  version \"1.2.3\"\n  resolved \"{resolved}\"\n  integrity {integrity}"
+        "{name}@{version}:\n  version \"{version}\"\n  resolved \"{resolved}\"\n  integrity {integrity}"
+    )
+}
+
+fn yarn_upstream_block_for(name: &str, version: &str) -> String {
+    yarn_block_for(
+        name,
+        version,
+        &format!("https://registry.yarnpkg.com/{name}/-/{name}-{version}.tgz#aaaa"),
+        UPSTREAM_INTEGRITY,
     )
 }
 
 fn yarn_original_block() -> String {
-    yarn_block(
-        "https://registry.yarnpkg.com/left-pad/-/left-pad-1.2.3.tgz#aaaa",
-        "sha512-UPSTREAMupstream==",
-    )
+    yarn_upstream_block_for("left-pad", "1.2.3")
 }
 
 fn yarn_redirected_block() -> String {
-    yarn_block(LP_HOSTED_URL, "sha512-PATCHEDpatched==")
+    yarn_block_for(
+        "left-pad",
+        "1.2.3",
+        LP_HOSTED_URL,
+        "sha512-PATCHEDpatched==",
+    )
 }
 
 fn yarn_lock_content(block: &str) -> String {
@@ -1429,99 +1481,42 @@ fn yarn_lock_content(block: &str) -> String {
     )
 }
 
-fn yarn_classic_edit() -> FileEdit {
-    FileEdit {
-        path: "yarn.lock".to_string(),
-        kind: "redirect_yarn_classic_entry".to_string(),
-        action: "rewritten".to_string(),
-        key: Some("left-pad@1.2.3".to_string()),
-        original: Some(Value::String(yarn_original_block())),
-        new: Some(Value::String(yarn_redirected_block())),
-    }
-}
-
-// gem fragments — `redirect_gemfile_lock_source_url` has NO per-purl revert.
-
-fn gemfile_lock_content(remote: &str) -> String {
-    format!(
-        "GEM\n  remote: {remote}\n  specs:\n    rex (1.0.0)\n\n\
-         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rex\n\nBUNDLED WITH\n   2.5.9\n"
-    )
-}
-
-fn gem_source_edit() -> FileEdit {
-    FileEdit {
-        path: "Gemfile.lock".to_string(),
-        kind: "redirect_gemfile_lock_source_url".to_string(),
-        action: "rewritten".to_string(),
-        key: Some("rex".to_string()),
-        original: Some(Value::String(GEM_UPSTREAM_REMOTE.to_string())),
-        new: Some(Value::String(GEM_PATCH_REMOTE.to_string())),
-    }
-}
-
-/// Single-record npm fixture (yarn-classic wiring, redirected on disk).
+/// Single-pin npm fixture: a yarn.lock hosted-wired to the mock patch host.
 fn write_single_npm_fixture(root: &Path) {
     std::fs::write(
         root.join("yarn.lock"),
         yarn_lock_content(&yarn_redirected_block()),
     )
     .unwrap();
-    write_hosted_ledger(
-        root,
-        vec![(LP_PURL, hosted_record(LP_UUID))],
-        vec![yarn_classic_edit()],
-    );
 }
 
-/// Two-record fixture: npm (per-purl revertable) + gem (replay-only).
-fn write_two_record_fixture(root: &Path) {
-    std::fs::write(
-        root.join("yarn.lock"),
-        yarn_lock_content(&yarn_redirected_block()),
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("Gemfile.lock"),
-        gemfile_lock_content(GEM_PATCH_REMOTE),
-    )
-    .unwrap();
-    write_hosted_ledger(
-        root,
-        vec![
-            (LP_PURL, hosted_record(LP_UUID)),
-            (GEM_PURL, hosted_record(GEM_UUID)),
-        ],
-        vec![yarn_classic_edit(), gem_source_edit()],
-    );
-}
-
-/// Human wet run over a hosted-only (manifest-less) project: the wet
-/// "Unwound hosted redirect for {purl}" line and the reinstall note — with
-/// the wiring actually unwound, the emptied ledger deleted and no
+/// Human wet run over a hosted-only (manifest-less, ledger-less) project:
+/// the "Restored {purl} to its upstream registry entry" line and the
+/// reinstall note — with the lock entry actually restored and no
 /// `.socket/` residue. The unscoped "No patches found in manifest" line is
 /// reserved for a run with no work in ANY leg: a project whose patches are
-/// all hosted has work, so the line must NOT print alongside the unwind.
+/// all hosted has work, so the line must NOT print alongside the restore.
 #[test]
 fn hosted_human_wet_announces_and_unwinds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_single_npm_fixture(tmp.path());
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes"]);
+    let (code, stdout, stderr) = run_hosted(tmp.path(), &["rollback", "--yes"], Some(&registry));
     assert_eq!(
         code, 0,
         "the hosted-only rollback succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    // No manifest at all: "No patches found in manifest" would be a
-    // misleading line right above the hosted unwind.
     assert!(
         !stdout.contains("No patches found in manifest"),
         "the empty-manifest announce must not print when the hosted leg has work; \
          stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains(&format!("Unwound hosted redirect for {LP_PURL}")),
-        "the wet unwind line must print; stdout=\n{stdout}"
+        stdout.contains(&format!(
+            "Restored {LP_PURL} to its upstream registry entry"
+        )),
+        "the wet restore line must print; stdout=\n{stdout}"
     );
     assert!(
         stdout.contains("1 unwired package keeps its patched bytes"),
@@ -1530,238 +1525,312 @@ fn hosted_human_wet_announces_and_unwinds() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_original_block()),
-        "the wiring must be unwound on disk"
+        "the lock entry must be restored to the upstream registry entry"
     );
     assert!(
         !ledger_path(tmp.path()).exists(),
-        "the emptied ledger must be deleted"
+        "no ledger is ever written"
     );
     assert!(
         !tmp.path().join(".socket").exists(),
-        "a fully unwound hosted project keeps no .socket/ residue (vendor/ pruned \
-         with the ledger, apply.lock removed by the lock guard)"
+        "a fully restored hosted project keeps no .socket/ residue (apply.lock \
+         removed by the lock guard)"
     );
 }
 
-/// Human dry-run twin: "Would unwind hosted redirect for {purl}", nothing
-/// mutated.
+/// Human dry-run twin: "Would restore {purl} …", nothing mutated. A dry
+/// run resolves exactly like a wet run (the registry IS asked) and skips
+/// only the write.
 #[test]
 fn hosted_human_dry_run_previews() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_single_npm_fixture(tmp.path());
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--dry-run"]);
+    let (code, stdout, stderr) =
+        run_hosted(tmp.path(), &["rollback", "--dry-run"], Some(&registry));
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains(&format!("Would unwind hosted redirect for {LP_PURL}")),
-        "the dry-run unwind preview must print; stdout=\n{stdout}"
+        stdout.contains(&format!(
+            "Would restore {LP_PURL} to its upstream registry entry"
+        )),
+        "the dry-run restore preview must print; stdout=\n{stdout}"
+    );
+    assert!(
+        registry.request_count() >= 1,
+        "a dry run resolves the upstream entry like a wet run"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_redirected_block()),
         "dry run must not touch the wired lock"
     );
-    assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "dry run must not touch the ledger"
-    );
+    assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
-/// Human notice for a SCOPED hosted target with no per-purl revert (gem,
-/// with an out-of-scope npm record blocking the replay): the "Cannot
-/// unwind hosted redirect for …" stderr guidance, exit 1, nothing touched.
+/// `--offline` cannot re-resolve the upstream entry: the pin is REFUSED
+/// with the `git checkout` remedy on stderr (human), exit 1, nothing
+/// written — the registry is never asked.
 #[test]
-fn scoped_unsupported_ecosystem_prints_human_notice() {
+fn offline_refusal_prints_human_notice() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    write_two_record_fixture(tmp.path());
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    write_single_npm_fixture(tmp.path());
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes", GEM_PURL]);
+    let (code, stdout, stderr) = run_hosted(
+        tmp.path(),
+        &["rollback", "--offline", "--yes", LP_PURL],
+        Some(&registry),
+    );
     assert_eq!(
         code, 1,
-        "a scoped unsupported hosted purl fails closed; stdout=\n{stdout}\nstderr=\n{stderr}"
+        "an offline hosted restore is refused; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains(&format!("Cannot unwind hosted redirect for {GEM_PURL}"))
-            && stderr.contains("no per-purl revert exists"),
-        "the human guidance must print on stderr; stderr=\n{stderr}"
+        stderr.contains(&format!(
+            "Error: Cannot restore {LP_PURL} to its upstream registry entry"
+        )) && stderr.contains("this run is offline")
+            && stderr.contains("`git checkout -- yarn.lock`"),
+        "the human refusal must print on stderr with the remedy; stderr=\n{stderr}"
     );
+    assert_eq!(registry.request_count(), 0, "offline asks no registry");
     assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "the ledger must be untouched"
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
-        gemfile_lock_content(GEM_PATCH_REMOTE),
-        "the refused gem wiring must be untouched"
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&yarn_redirected_block()),
+        "the refused pin's wiring must be untouched"
     );
 }
 
-/// Per-purl hosted revert FAILURE: the wired lockfile is unreadable
-/// (yarn.lock is a directory), so the scoped npm revert errors — the purl
-/// + error land in `hosted.failed`, exit 1, everything else untouched.
+/// Two pins in one yarn.lock, one of which the registry does not answer
+/// for: each pin restores or refuses on its own. The refused purl + error
+/// land in `hosted.failed` (exit 1, `partial_failure`), the other pin is
+/// restored, and the refused block stays hosted byte-for-byte.
 #[test]
 fn per_purl_revert_failure_lands_in_hosted_failed() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // Two records so the scoped npm run is NOT replay-eligible: the
-    // failure under test is the per-purl revert alone.
-    std::fs::create_dir(tmp.path().join("yarn.lock")).unwrap(); // a DIRECTORY
+    let io_redirected = yarn_block_for("is-odd", "3.0.1", IO_HOSTED_URL, "sha512-PATCHEDio==");
     std::fs::write(
-        tmp.path().join("Gemfile.lock"),
-        gemfile_lock_content(GEM_PATCH_REMOTE),
+        tmp.path().join("yarn.lock"),
+        yarn_lock_content(&format!("{io_redirected}\n\n{}", yarn_redirected_block())),
     )
     .unwrap();
-    write_hosted_ledger(
-        tmp.path(),
-        vec![
-            (LP_PURL, hosted_record(LP_UUID)),
-            (GEM_PURL, hosted_record(GEM_UUID)),
-        ],
-        vec![yarn_classic_edit(), gem_source_edit()],
-    );
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    // left-pad is NOT served: its lookup 404s.
+    let registry = NpmRegistry::start(&[("is-odd", "3.0.1")]);
 
-    let (code, stdout, stderr) = run(
+    let (code, stdout, stderr) = run_hosted(
         tmp.path(),
-        &["rollback", "--json", "--offline", "--yes", LP_PURL],
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
     );
     assert_eq!(
         code, 1,
-        "a failed per-purl revert must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+        "a refused pin must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
     let failed = v["hosted"]["failed"].as_array().expect("failed array");
     assert_eq!(failed.len(), 1, "stdout=\n{stdout}");
     assert_eq!(failed[0]["purl"], LP_PURL, "stdout=\n{stdout}");
+    let error = failed[0]["error"].as_str().unwrap_or_default();
     assert!(
-        failed[0]["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("read yarn.lock")),
-        "the error must name the unreadable lockfile; stdout=\n{stdout}"
+        error.contains(&format!(
+            "cannot restore {LP_PURL} to its upstream registry entry"
+        )) && error.contains("404")
+            && error.contains("git checkout -- yarn.lock"),
+        "the error must name the purl, the registry failure and the remedy; \
+         stdout=\n{stdout}"
     );
     assert_eq!(
         v["hosted"]["reverted"],
-        json!([]),
-        "nothing may be reported reverted; stdout=\n{stdout}"
+        json!([IO_PURL]),
+        "the other pin restores on its own; stdout=\n{stdout}"
     );
     assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "a failed revert must leave the ledger byte-identical"
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap(),
-        gemfile_lock_content(GEM_PATCH_REMOTE),
-        "the out-of-scope gem wiring must be untouched"
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&format!(
+            "{}\n\n{}",
+            yarn_upstream_block_for("is-odd", "3.0.1"),
+            yarn_redirected_block()
+        )),
+        "only the resolvable pin is restored; the refused one stays hosted"
     );
 }
 
-/// The whole-ledger replay REFUSAL loop: a leftover edit with an unsafe
-/// path refuses its group — `group:<name>` failure entries in the JSON,
-/// the "Cannot unwind hosted redirect edits" stderr line in human mode,
-/// exit 1, ledger intact.
+/// Human twin of `per_purl_revert_failure_lands_in_hosted_failed`: the
+/// refused pin prints the "Error: Cannot restore {purl} …" stderr line
+/// (errors print even without `--json`), exit 1, the lock untouched.
 #[test]
-fn replay_refusal_reports_group_failures_in_both_modes() {
-    let evil_edit = || FileEdit {
-        path: "../evil.lock".to_string(),
-        kind: "redirect_yarn_classic_entry".to_string(),
-        action: "rewritten".to_string(),
-        key: Some("left-pad@1.2.3".to_string()),
-        original: Some(Value::String(yarn_original_block())),
-        new: Some(Value::String(yarn_redirected_block())),
+fn per_purl_revert_failure_prints_human_stderr_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_single_npm_fixture(tmp.path());
+    let registry = NpmRegistry::start(&[]);
+
+    let (code, stdout, stderr) =
+        run_hosted(tmp.path(), &["rollback", "--yes", LP_PURL], Some(&registry));
+    assert_eq!(
+        code, 1,
+        "a refused pin must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Error: Cannot restore {LP_PURL} to its upstream registry entry:"
+        )),
+        "the human failure line must print on stderr; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&yarn_redirected_block()),
+        "a refused pin leaves the lock byte-identical"
+    );
+}
+
+/// A pre-v5 ledger's edits are NEVER replayed: a ledger whose only content
+/// is an edit naming an unsafe path (the old replay refused such a group)
+/// is simply retired — no lockfile pins a hosted patch, so rollback removes
+/// the stale file and exits 0 (`legacyRedirectLedgerRemoved`), and the
+/// edit's target is never touched. Human mode says so on stdout.
+#[test]
+fn legacy_ledger_edits_are_never_replayed_in_both_modes() {
+    let edits = || {
+        json!([{
+            "path": "../evil.lock",
+            "kind": "redirect_yarn_classic_entry",
+            "action": "rewritten",
+            "key": "left-pad@1.2.3",
+            "original": yarn_original_block(),
+            "new": yarn_redirected_block(),
+        }])
     };
 
     // ── --json ──
     let tmp = tempfile::tempdir().expect("tempdir");
-    write_hosted_ledger(tmp.path(), vec![], vec![evil_edit()]);
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let evil = tmp.path().join("evil.lock");
+    std::fs::write(&evil, yarn_lock_content(&yarn_redirected_block())).unwrap();
+    write_legacy_ledger(&project, edits());
 
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--json", "--offline", "--yes"]);
+    let (code, stdout, stderr) = run_hosted(&project, &["rollback", "--json", "--yes"], None);
     assert_eq!(
-        code, 1,
-        "a replay refusal must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+        code, 0,
+        "a stale pre-v5 ledger is retired, not replayed; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
-    let failed = v["hosted"]["failed"].as_array().expect("failed array");
-    assert_eq!(failed.len(), 1, "stdout=\n{stdout}");
-    assert_eq!(
-        failed[0]["purl"], "group:yarn",
-        "the refusal is reported per group; stdout=\n{stdout}"
-    );
+    assert_eq!(v["status"], "success", "stdout=\n{stdout}");
+    assert_eq!(v["legacyRedirectLedgerRemoved"], true, "stdout=\n{stdout}");
     assert!(
-        failed[0]["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("unsafe path") && e.contains("../evil.lock")),
-        "the refusal must name the reason and the file; stdout=\n{stdout}"
+        !ledger_path(&project).exists(),
+        "the stale ledger is deleted"
     );
     assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "a refused replay must leave the ledger byte-identical"
+        std::fs::read_to_string(&evil).unwrap(),
+        yarn_lock_content(&yarn_redirected_block()),
+        "a legacy ledger's edit is never replayed"
     );
 
     // ── human ──
     let tmp = tempfile::tempdir().expect("tempdir");
-    write_hosted_ledger(tmp.path(), vec![], vec![evil_edit()]);
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes"]);
-    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    write_legacy_ledger(tmp.path(), edits());
+    let (code, stdout, stderr) = run_hosted(tmp.path(), &["rollback", "--yes"], None);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("Cannot unwind hosted redirect edits (yarn)"),
-        "the human refusal line must print on stderr; stderr=\n{stderr}"
+        stdout.contains(
+            "Removed the pre-v5 hosted ledger .socket/vendor/redirect-state.json: no \
+             lockfile pins a hosted patch."
+        ),
+        "the human retire line must print; stdout=\n{stdout}"
     );
+    assert!(!ledger_path(tmp.path()).exists());
 }
 
-/// A records-EMPTY ledger with leftover edits (the degraded
-/// record-fetch-failed shape): an unscoped wet run replays the edits —
-/// the confirm clause for leftover edits composes on the way — restoring
-/// the wired file and deleting the emptied ledger.
+/// A pre-v5 ledger beside a live hosted pin: the pin is restored from the
+/// registry (never from the ledger's recorded original), and the ledger is
+/// retired once no pin remains. Offline, the ledger's recorded original is
+/// NOT a fallback: the pin is refused, and the ledger stays while the pin
+/// is still wired.
 #[test]
-fn leftover_edits_only_ledger_replays_unscoped() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(
-        tmp.path().join("yarn.lock"),
-        yarn_lock_content(&yarn_redirected_block()),
-    )
-    .unwrap();
-    write_hosted_ledger(tmp.path(), vec![], vec![yarn_classic_edit()]);
+fn legacy_ledger_beside_a_live_pin_is_never_the_revert_source() {
+    let legacy_edits = || {
+        json!([{
+            "path": "yarn.lock",
+            "kind": "redirect_yarn_classic_entry",
+            "action": "rewritten",
+            "key": "left-pad@1.2.3",
+            // A recorded "original" the registry disagrees with: a replay
+            // would write it; the restore must not.
+            "original": yarn_block_for(
+                "left-pad", "1.2.3",
+                "https://registry.yarnpkg.com/left-pad/-/left-pad-1.2.3.tgz#bbbb",
+                "sha512-LEDGERledger==",
+            ),
+            "new": yarn_redirected_block(),
+        }])
+    };
 
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--json", "--offline", "--yes"]);
-    assert_eq!(
-        code, 0,
-        "the leftover-edits replay succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
+    // Offline: refused, nothing written, ledger kept.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_single_npm_fixture(tmp.path());
+    write_legacy_ledger(tmp.path(), legacy_edits());
+    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    let (code, stdout, stderr) = run_hosted(
+        tmp.path(),
+        &["rollback", "--json", "--offline", "--yes"],
+        None,
     );
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_envelope(&stdout, &stderr);
+    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    assert_eq!(
+        v["hosted"]["failed"][0]["purl"], LP_PURL,
+        "stdout=\n{stdout}"
+    );
+    assert_eq!(v["hosted"]["reverted"], json!([]), "stdout=\n{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&yarn_redirected_block()),
+        "the ledger's recorded original is never replayed"
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(tmp.path())).unwrap(),
+        ledger_before,
+        "the ledger stays while a pin is still wired"
+    );
+
+    // Online: restored from the registry, ledger retired.
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
+    let (code, stdout, stderr) = run_hosted(
+        tmp.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "success", "stdout=\n{stdout}");
+    assert_eq!(
+        v["hosted"]["reverted"],
+        json!([LP_PURL]),
+        "stdout=\n{stdout}"
+    );
     assert!(
         v["hosted"]["editedFiles"].as_u64().unwrap_or(0) >= 1,
-        "the replay rewrote the lock; stdout=\n{stdout}"
+        "the restore rewrote the lock; stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_original_block()),
-        "the leftover edit must be replayed"
+        "the entry comes back from the registry, not the ledger"
     );
     assert!(
         !ledger_path(tmp.path()).exists(),
-        "the emptied ledger must be deleted"
-    );
-    assert!(
-        !tmp.path().join(".socket").exists(),
-        "the replayed-out project keeps no .socket/ residue"
+        "with no hosted pin left the pre-v5 ledger is retired"
     );
 }
 
-/// A corrupt redirect ledger skips ONLY the hosted leg: exit 1 with the
-/// `redirect_state_unreadable` warning (JSON) / `Error
-/// (redirect_state_unreadable):` notice (human), and the garbage file is
-/// left in place for quarantine.
+/// A corrupt pre-v5 ledger is inert: a project whose only state is that
+/// garbage file retires it and exits 0 in both modes (it is never parsed,
+/// so it can never fail the run).
 #[test]
-fn corrupt_redirect_ledger_warns_and_fails_in_both_modes() {
+fn corrupt_legacy_ledger_is_retired_in_both_modes() {
     let corrupt = || {
         let tmp = tempfile::tempdir().expect("tempdir");
         let vendor_dir = tmp.path().join(".socket/vendor");
@@ -1774,103 +1843,77 @@ fn corrupt_redirect_ledger_warns_and_fails_in_both_modes() {
     let tmp = corrupt();
     let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--json", "--offline", "--yes"]);
     assert_eq!(
-        code, 1,
-        "a corrupt redirect ledger must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+        code, 0,
+        "a corrupt pre-v5 ledger never fails the run; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
-    assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
+    assert_eq!(v["status"], "success", "stdout=\n{stdout}");
+    assert_eq!(v["legacyRedirectLedgerRemoved"], true, "stdout=\n{stdout}");
+    assert!(!ledger_path(tmp.path()).exists());
+
+    // ── human dry run: previewed, kept ──
+    let tmp = corrupt();
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--dry-run"]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        warning_codes(&v).contains(&"redirect_state_unreadable".to_string()),
-        "the warning must be surfaced; stdout=\n{stdout}"
-    );
-    assert_eq!(
-        v["hosted"]["reverted"],
-        json!([]),
-        "the hosted leg must be skipped; stdout=\n{stdout}"
+        stdout.contains("Would remove the pre-v5 hosted ledger"),
+        "stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read(ledger_path(tmp.path())).unwrap(),
         b"garbage not json",
-        "the corrupt ledger must be left in place for quarantine"
-    );
-
-    // ── human ──
-    let tmp = corrupt();
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes"]);
-    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains("Error (redirect_state_unreadable):"),
-        "the error-class notice must print on stderr; stderr=\n{stderr}"
+        "a dry run deletes nothing"
     );
 }
 
 /// `--ecosystems` narrows the hosted leg: a pypi-scoped run leaves the npm
-/// record (and, being a scope, blocks the whole-ledger replay); an
-/// npm-scoped run unwinds it.
+/// pin; an npm-scoped run restores it.
 #[test]
 fn ecosystems_filter_narrows_hosted_scope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_single_npm_fixture(tmp.path());
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
-    let (code, stdout, stderr) = run(
+    let (code, stdout, stderr) = run_hosted(
         tmp.path(),
-        &[
-            "rollback",
-            "--json",
-            "--offline",
-            "--yes",
-            "--ecosystems",
-            "pypi",
-        ],
+        &["rollback", "--json", "--yes", "--ecosystems", "pypi"],
+        Some(&registry),
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
         v["hosted"]["reverted"],
         json!([]),
-        "a pypi-scoped run must not unwind the npm record; stdout=\n{stdout}"
-    );
-    assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "the record must survive the eco-narrowed run"
+        "a pypi-scoped run must not restore the npm pin; stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_redirected_block()),
-        "the wiring must survive too"
+        "the wiring must survive the eco-narrowed run"
     );
 
-    let (code, stdout, stderr) = run(
+    let (code, stdout, stderr) = run_hosted(
         tmp.path(),
-        &[
-            "rollback",
-            "--json",
-            "--offline",
-            "--yes",
-            "--ecosystems",
-            "npm",
-        ],
+        &["rollback", "--json", "--yes", "--ecosystems", "npm"],
+        Some(&registry),
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(
         v["hosted"]["reverted"],
         json!([LP_PURL]),
-        "the npm-scoped run must unwind it; stdout=\n{stdout}"
+        "the npm-scoped run must restore it; stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_original_block()),
-        "the wiring must be unwound"
+        "the entry must be restored"
     );
-    assert!(!ledger_path(tmp.path()).exists(), "ledger deleted");
     assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
-/// A path-shaped target selects a HOSTED record through its installed
-/// copy: `rollback node_modules/left-pad` unwinds the redirect.
+/// A path-shaped target selects a HOSTED pin through its installed copy:
+/// `rollback node_modules/left-pad` restores the upstream entry.
 #[test]
 fn path_glob_selects_hosted_record() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1884,16 +1927,12 @@ fn path_glob_selects_hosted_record() {
         "1.2.3",
         b"installed bytes\n",
     );
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
-    let (code, stdout, stderr) = run(
+    let (code, stdout, stderr) = run_hosted(
         tmp.path(),
-        &[
-            "rollback",
-            "--json",
-            "--offline",
-            "--yes",
-            "node_modules/left-pad",
-        ],
+        &["rollback", "--json", "--yes", "node_modules/left-pad"],
+        Some(&registry),
     );
     assert_eq!(
         code, 0,
@@ -1903,117 +1942,165 @@ fn path_glob_selects_hosted_record() {
     assert_eq!(
         v["hosted"]["reverted"],
         json!([LP_PURL]),
-        "the path target must select the hosted record; stdout=\n{stdout}"
+        "the path target must select the hosted pin; stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_original_block()),
-        "the wiring must be unwound"
+        "the entry must be restored"
     );
-    assert!(!ledger_path(tmp.path()).exists(), "ledger deleted");
     assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
-/// `persist_redirect_state` FAILURE after the hosted leg mutated the
-/// ledger in memory: the replay rewrote the wired file, but the emptied
-/// ledger cannot be removed (read-only `.socket/vendor`) — the failure
-/// lands in `hosted.failed` as the `ledger` entry and the run exits 1.
+/// The restored lockfile cannot be written (a read-only project root; the
+/// write is an atomic temp-file + rename beside it): the failure lands in
+/// `hosted.failed` under the `files` key and the run exits 1, the lock
+/// untouched. (Skipped where the sandbox ignores directory modes, e.g. as
+/// root.)
 #[cfg(unix)]
 #[test]
-fn hosted_persist_failure_lands_in_hosted_failed() {
+fn hosted_restore_write_failure_lands_in_hosted_failed() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(
-        tmp.path().join("yarn.lock"),
-        yarn_lock_content(&yarn_redirected_block()),
-    )
-    .unwrap();
-    write_hosted_ledger(tmp.path(), vec![], vec![yarn_classic_edit()]);
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    write_single_npm_fixture(&project);
+    // `.socket/` exists and stays writable so the apply lock is taken.
+    std::fs::create_dir(project.join(".socket")).unwrap();
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
-    let vendor_dir = tmp.path().join(".socket/vendor");
-    let guard = DirModeGuard::chmod(&vendor_dir, 0o555, 0o755);
-    if !readonly_dir_enforced(&vendor_dir) {
+    let guard = DirModeGuard::chmod(&project, 0o555, 0o755);
+    if !readonly_dir_enforced(&project) {
         return;
     }
-
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--json", "--offline", "--yes"]);
+    let (code, stdout, stderr) =
+        run_hosted(&project, &["rollback", "--json", "--yes"], Some(&registry));
     guard.restore();
 
     assert_eq!(
         code, 1,
-        "a ledger persist failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+        "a lockfile write failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout, &stderr);
     assert_eq!(v["status"], "partial_failure", "stdout=\n{stdout}");
     let failed = v["hosted"]["failed"].as_array().expect("failed array");
     assert!(
-        failed.iter().any(|f| f["purl"] == "ledger"
+        failed.iter().any(|f| f["purl"] == "files"
             && f["error"]
                 .as_str()
-                .is_some_and(|e| e.contains("failed to persist the hosted redirect ledger"))),
-        "the persist failure must be reported under the 'ledger' key; stdout=\n{stdout}"
+                .is_some_and(|e| e.contains("writing the restored lockfiles failed"))),
+        "the write failure must be reported under the 'files' key; stdout=\n{stdout}"
     );
-    // The replay itself ran before the persist: the wired file is restored.
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
-        yarn_lock_content(&yarn_original_block()),
-        "the replay's file writes land before the persist failure"
-    );
-    assert!(
-        ledger_path(tmp.path()).exists(),
-        "the un-removable ledger file must still be on disk"
+        std::fs::read_to_string(project.join("yarn.lock")).unwrap(),
+        yarn_lock_content(&yarn_redirected_block()),
+        "the lock was never written"
     );
 }
 
-/// An unscoped Bun rollback stages its package edits together through
-/// whole-ledger replay. Its human confirmation prints from that deferred
-/// path after the original lockfile is restored.
+/// Human twin of `hosted_restore_write_failure_lands_in_hosted_failed`:
+/// the "Error: Writing the restored lockfiles failed" stderr line, exit 1.
+#[cfg(unix)]
 #[test]
-fn bun_deferred_purl_unwinds_via_replay() {
-    let bun_original =
-        r#"    "left-pad": ["left-pad@1.2.3", "", {}, "sha512-UPSTREAMupstream=="],"#;
-    // The engine's real redirected shape: registry 4-tuple → URL 3-tuple
-    // `["name@<url>", {deps}, "sha512-…"]` (the registry slot is dropped).
-    let bun_redirected = format!(
-        r#"    "left-pad": ["left-pad@{LP_HOSTED_URL}", {{}}, "sha512-PATCHEDpatched=="],"#
-    );
-    let bun_lock = |block: &str| {
-        format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n{block}\n  }}\n}}\n")
-    };
-
+fn hosted_restore_write_failure_prints_human_error_line() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join("bun.lock"), bun_lock(&bun_redirected)).unwrap();
-    write_hosted_ledger(
-        tmp.path(),
-        vec![(LP_PURL, hosted_record(LP_UUID))],
-        vec![FileEdit {
-            path: "bun.lock".to_string(),
-            kind: "redirect_bun_lock_package".to_string(),
-            action: "rewritten".to_string(),
-            key: Some("left-pad".to_string()),
-            original: Some(Value::String(bun_original.to_string())),
-            new: Some(Value::String(bun_redirected.clone())),
-        }],
-    );
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    write_single_npm_fixture(&project);
+    std::fs::create_dir(project.join(".socket")).unwrap();
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
 
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes"]);
+    let guard = DirModeGuard::chmod(&project, 0o555, 0o755);
+    if !readonly_dir_enforced(&project) {
+        return;
+    }
+    let (code, stdout, stderr) = run_hosted(&project, &["rollback", "--yes"], Some(&registry));
+    guard.restore();
+
     assert_eq!(
-        code, 0,
-        "the bun-deferred unwind succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
+        code, 1,
+        "a lockfile write failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains(&format!("Unwound hosted redirect for {LP_PURL}")),
-        "the deferred purl's wet unwind line must print; stdout=\n{stdout}"
+        stderr.contains("Error: Writing the restored lockfiles failed"),
+        "the human write-failure line must print on stderr; stderr=\n{stderr}"
+    );
+}
+
+fn bun_original_line() -> String {
+    format!(r#"    "left-pad": ["left-pad@1.2.3", "", {{}}, "{UPSTREAM_INTEGRITY}"],"#)
+}
+
+/// The engine's real redirected shape: registry 4-tuple → URL 3-tuple
+/// `["name@<url>", {deps}, "sha512-…"]` (the registry slot is dropped).
+fn bun_redirected_line() -> String {
+    format!(r#"    "left-pad": ["left-pad@{LP_HOSTED_URL}", {{}}, "sha512-PATCHEDpatched=="],"#)
+}
+
+fn bun_lock(line: &str) -> String {
+    format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n{line}\n  }}\n}}\n")
+}
+
+/// A hosted bun.lock pin restores to the registry 4-tuple
+/// `["name@version", "", {deps}, "<registry integrity>"]`, with the human
+/// restore line.
+#[test]
+fn bun_lock_pin_restores_to_the_registry_tuple() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("bun.lock"),
+        bun_lock(&bun_redirected_line()),
+    )
+    .unwrap();
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
+
+    let (code, stdout, stderr) = run_hosted(tmp.path(), &["rollback", "--yes"], Some(&registry));
+    assert_eq!(
+        code, 0,
+        "the bun.lock restore succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Restored {LP_PURL} to its upstream registry entry"
+        )),
+        "the wet restore line must print; stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap(),
-        bun_lock(bun_original),
-        "the bun.lock fragment must be replayed back to the original"
-    );
-    assert!(
-        !ledger_path(tmp.path()).exists(),
-        "record and edit both unwound: the ledger must be deleted"
+        bun_lock(&bun_original_line()),
+        "the bun.lock entry must be the registry tuple again"
     );
     assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
+}
+
+/// Dry-run twin of `bun_lock_pin_restores_to_the_registry_tuple`: "Would
+/// restore …", bun.lock byte-identical afterwards.
+#[test]
+fn bun_lock_pin_dry_run_previews() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("bun.lock"),
+        bun_lock(&bun_redirected_line()),
+    )
+    .unwrap();
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
+
+    let (code, stdout, stderr) =
+        run_hosted(tmp.path(), &["rollback", "--dry-run"], Some(&registry));
+    assert_eq!(
+        code, 0,
+        "the bun.lock dry run succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Would restore {LP_PURL} to its upstream registry entry"
+        )),
+        "the dry-run preview line must print; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap(),
+        bun_lock(&bun_redirected_line()),
+        "dry run must not touch the wired bun.lock"
+    );
 }
 
 // ═══════════════ 4. GC-failure warnings (unix permissions) ═════════════════
@@ -2161,8 +2248,8 @@ fn manifest_write_failure_warns_and_exits_one() {
     // And the entry's blobs must survive for a retry (the failed-write
     // fallback restores the in-memory reference before the GC).
     assert!(
-        fx.socket.join("blobs").join(&fx.before_hash).exists()
-            && fx.socket.join("blobs").join(&fx.after_hash).exists(),
+        fx.socket.join("blobs").join(git_sha256(fx.before)).exists()
+            && fx.socket.join("blobs").join(git_sha256(fx.after)).exists(),
         "the failed-cleanup entry's blobs must be pinned"
     );
 }
@@ -2333,101 +2420,6 @@ fn vendored_dry_run_json_previews_without_human_print() {
     assert!(fx.tgz_path().is_file(), "dry run must keep the artifact");
 }
 
-/// Human twin of `per_purl_revert_failure_lands_in_hosted_failed`: the
-/// failed per-purl npm revert prints the "Failed to unwind hosted
-/// redirect for {purl}: {e}" stderr line (errors print even without
-/// `--json`), exit 1, ledger untouched.
-#[test]
-fn per_purl_revert_failure_prints_human_stderr_line() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    // yarn.lock is a DIRECTORY so the scoped npm revert fails on read;
-    // the second (gem) record keeps the scoped run replay-ineligible.
-    std::fs::create_dir(tmp.path().join("yarn.lock")).unwrap();
-    std::fs::write(
-        tmp.path().join("Gemfile.lock"),
-        gemfile_lock_content(GEM_PATCH_REMOTE),
-    )
-    .unwrap();
-    write_hosted_ledger(
-        tmp.path(),
-        vec![
-            (LP_PURL, hosted_record(LP_UUID)),
-            (GEM_PURL, hosted_record(GEM_UUID)),
-        ],
-        vec![yarn_classic_edit(), gem_source_edit()],
-    );
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
-
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes", LP_PURL]);
-    assert_eq!(
-        code, 1,
-        "a failed per-purl revert must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("Failed to unwind hosted redirect for {LP_PURL}:")),
-        "the human failure line must print on stderr; stderr=\n{stderr}"
-    );
-    assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "a failed revert must leave the ledger byte-identical"
-    );
-}
-
-/// Dry-run twin of `bun_deferred_purl_unwinds_via_replay`: the deferred
-/// preview routes through the replay's dropped-records probe and prints
-/// "Would unwind hosted redirect for {purl}" — with bun.lock and the
-/// ledger byte-identical afterwards.
-#[test]
-fn bun_deferred_purl_dry_run_previews_via_replay() {
-    let bun_original =
-        r#"    "left-pad": ["left-pad@1.2.3", "", {}, "sha512-UPSTREAMupstream=="],"#;
-    // The engine's real redirected shape: registry 4-tuple → URL 3-tuple
-    // `["name@<url>", {deps}, "sha512-…"]` (the registry slot is dropped).
-    let bun_redirected = format!(
-        r#"    "left-pad": ["left-pad@{LP_HOSTED_URL}", {{}}, "sha512-PATCHEDpatched=="],"#
-    );
-    let bun_lock = |block: &str| {
-        format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n{block}\n  }}\n}}\n")
-    };
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join("bun.lock"), bun_lock(&bun_redirected)).unwrap();
-    write_hosted_ledger(
-        tmp.path(),
-        vec![(LP_PURL, hosted_record(LP_UUID))],
-        vec![FileEdit {
-            path: "bun.lock".to_string(),
-            kind: "redirect_bun_lock_package".to_string(),
-            action: "rewritten".to_string(),
-            key: Some("left-pad".to_string()),
-            original: Some(Value::String(bun_original.to_string())),
-            new: Some(Value::String(bun_redirected.clone())),
-        }],
-    );
-    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
-
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--dry-run"]);
-    assert_eq!(
-        code, 0,
-        "the bun-deferred dry run succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
-    );
-    assert!(
-        stdout.contains(&format!("Would unwind hosted redirect for {LP_PURL}")),
-        "the deferred purl's dry-run preview line must print; stdout=\n{stdout}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap(),
-        bun_lock(&bun_redirected),
-        "dry run must not touch the wired bun.lock"
-    );
-    assert_eq!(
-        std::fs::read(ledger_path(tmp.path())).unwrap(),
-        ledger_before,
-        "dry run must not touch the ledger"
-    );
-}
-
 /// The manifest vanishing while another process holds the apply lock: the
 /// pre-lock existence probe saw the file, but the under-lock read finds
 /// it gone — rollback fails closed with the "Invalid manifest" error
@@ -2500,45 +2492,6 @@ fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
         }
     }
     panic!("the probe-then-delete interleaving never landed in 8 attempts");
-}
-
-/// Human twin of `hosted_persist_failure_lands_in_hosted_failed`: the
-/// wet-run ledger persist failure prints the "Error: Failed to persist
-/// the hosted redirect ledger" stderr line, exit 1 — after the replay
-/// already restored the wired file.
-#[cfg(unix)]
-#[test]
-fn hosted_persist_failure_prints_human_error_line() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(
-        tmp.path().join("yarn.lock"),
-        yarn_lock_content(&yarn_redirected_block()),
-    )
-    .unwrap();
-    write_hosted_ledger(tmp.path(), vec![], vec![yarn_classic_edit()]);
-
-    let vendor_dir = tmp.path().join(".socket/vendor");
-    let guard = DirModeGuard::chmod(&vendor_dir, 0o555, 0o755);
-    if !readonly_dir_enforced(&vendor_dir) {
-        return;
-    }
-
-    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes"]);
-    guard.restore();
-
-    assert_eq!(
-        code, 1,
-        "a ledger persist failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Error: Failed to persist the hosted redirect ledger"),
-        "the human persist-failure line must print on stderr; stderr=\n{stderr}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
-        yarn_lock_content(&yarn_original_block()),
-        "the replay's file writes land before the persist failure"
-    );
 }
 
 /// Human twin of `manifest_write_failure_warns_and_exits_one`: the failed
@@ -3350,7 +3303,6 @@ fn empty_manifest_announces_no_patches() {
 
 const VLT_UUID: &str = "88888888-8888-4888-8888-888888888888";
 const VLT_ID: &str = "~npm~left-pad@1.3.0";
-const VLT_REGISTRY_SHA: &str = "sha512-REGISTRY==";
 const VLT_PATCHED_SHA: &str = "sha512-PATCHED==";
 
 fn vlt_entry(sha: &str, url: &str) -> String {
@@ -3364,12 +3316,10 @@ fn vlt_lock_text(entry: &str) -> String {
 }
 
 /// A redirected vlt project whose store holds the patched copy `vlt
-/// install` extracted, with the hidden lock recording the hosted pin.
-fn write_vlt_hosted_fixture(root: &Path) -> (String, PathBuf) {
-    let registry = vlt_entry(
-        VLT_REGISTRY_SHA,
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-    );
+/// install` extracted, with the hidden lock recording the hosted pin (on
+/// Socket's own patch host, so discovery needs no `--patch-server-url`).
+/// Returns the store path.
+fn write_vlt_hosted_fixture(root: &Path) -> PathBuf {
     let hosted = vlt_entry(
         VLT_PATCHED_SHA,
         &format!("https://patch.socket.dev/patch/npm/t/{VLT_UUID}/left-pad-1.3.0.tgz"),
@@ -3386,42 +3336,29 @@ fn write_vlt_hosted_fixture(root: &Path) -> (String, PathBuf) {
         vlt_lock_text(&hosted),
     )
     .unwrap();
-    let mut record = hosted_record(VLT_UUID);
-    record.files.insert(
-        "package/index.js".to_string(),
-        PatchFileInfo {
-            before_hash: git_sha256(b"pristine"),
-            after_hash: git_sha256(b"patched"),
-        },
-    );
-    write_hosted_ledger(
-        root,
-        vec![("pkg:npm/left-pad@1.3.0", record)],
-        vec![FileEdit {
-            path: "vlt-lock.json".to_string(),
-            kind: "redirect_vlt_lock_node".to_string(),
-            action: "rewritten".to_string(),
-            key: Some("left-pad@1.3.0".to_string()),
-            original: Some(json!(registry)),
-            new: Some(json!(hosted)),
-        }],
-    );
-    (vlt_lock_text(&registry), store)
+    store
 }
 
-/// A dry-run rollback previews the vlt unwind but deletes nothing and
+/// A dry-run rollback previews the vlt restore but deletes nothing and
 /// says nothing about installed copies; the wet human run restores the
-/// registry pin, invalidates the patched store entry and prints the
-/// advisory as a warning line.
+/// registry pin (integrity from the registry's version document),
+/// invalidates the patched store entry and prints the advisory as a
+/// warning line.
 #[test]
 fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let (registry_lock, store) = write_vlt_hosted_fixture(root);
+    let store = write_vlt_hosted_fixture(root);
     let hosted_lock = std::fs::read_to_string(root.join("vlt-lock.json")).unwrap();
+    let registry = NpmRegistry::start(&[("left-pad", "1.3.0")]);
 
-    let (code, stdout, stderr) = run(root, &["rollback", "--dry-run", "--yes", "--offline"]);
+    let (code, stdout, stderr) =
+        run_hosted(root, &["rollback", "--dry-run", "--yes"], Some(&registry));
     assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("Would restore pkg:npm/left-pad@1.3.0 to its upstream registry entry"),
+        "{stdout}"
+    );
     assert!(
         !stderr.contains("redirect_vlt_reinstall_required"),
         "{stderr}"
@@ -3432,11 +3369,14 @@ fn vlt_hosted_rollback_dry_run_keeps_the_store_and_wet_human_run_heals() {
     );
     assert!(store.join("index.js").exists());
 
-    let (code, stdout, stderr) = run(root, &["rollback", "--yes", "--offline"]);
+    let (code, stdout, stderr) = run_hosted(root, &["rollback", "--yes"], Some(&registry));
     assert_eq!(code, 0, "{stdout}\n{stderr}");
-    assert_eq!(
-        std::fs::read_to_string(root.join("vlt-lock.json")).unwrap(),
-        registry_lock
+    let restored = std::fs::read_to_string(root.join("vlt-lock.json")).unwrap();
+    assert!(
+        restored.contains(&format!(
+            "\"{VLT_ID}\": [0,\"left-pad\",\"{UPSTREAM_INTEGRITY}\""
+        )) && !restored.contains("patch.socket.dev"),
+        "the node must carry the registry integrity again, no hosted URL:\n{restored}"
     );
     assert!(
         stderr.contains(

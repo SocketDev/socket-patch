@@ -42,6 +42,72 @@ pub(crate) fn metadata_files<'d>(lock: &'d DocumentMut, name: &str) -> Vec<&'d d
     table_likes(entry)
 }
 
+/// Whether a `[metadata.files]` entry is laid out one file per line, which is
+/// how Poetry 1.0/1.1 write every NON-empty entry (tomlkit `multiline(True)`);
+/// an empty one is `[]`.
+pub(crate) fn is_multiline_array(item: &Item) -> bool {
+    item.as_array().is_some_and(|array| {
+        let has_break = |raw: Option<&str>| raw.is_some_and(|s| s.contains('\n'));
+        has_break(array.trailing().as_str())
+            || array
+                .iter()
+                .any(|v| has_break(v.decor().prefix().and_then(|p| p.as_str())))
+    })
+}
+
+/// The patched `[metadata.files]` entry (lock 1.0/1.1) replacing
+/// `table[name]`, laid out as the entry it replaces: one file per line
+/// (Poetry's own rendering) when that entry listed files, inline when it was
+/// Poetry's empty `[]` (what Poetry 1.0/1.1 record against today's PyPI JSON
+/// API). The layout is the only record of which the lock had: the hosted
+/// restore (`patch::redirect::upstream::pypi_locks`) reads it back to put
+/// either the full release list or `[]` back. A `rewritten` package (one
+/// already carrying a source: a rotated hosted url) keeps the layout of the
+/// entry it has, which is the original's bit, so re-runs are idempotent.
+fn legacy_files_entry(table: &dyn TableLike, name: &str, files: Array, rewritten: bool) -> Item {
+    let canon = canonicalize_pypi_name(name);
+    let existing = table.get(name).or_else(|| {
+        table
+            .iter()
+            .find(|(key, _)| canonicalize_pypi_name(key) == canon)
+            .map(|(_, item)| item)
+    });
+    let populated = if rewritten {
+        existing.is_some_and(is_multiline_array)
+    } else {
+        existing
+            .and_then(Item::as_array)
+            .is_some_and(|existing| !existing.is_empty())
+    };
+    if !populated {
+        return value(files);
+    }
+    let entries: Vec<String> = files
+        .iter()
+        .filter_map(Value::as_inline_table)
+        .map(|entry| {
+            let field = |key: &str| {
+                entry
+                    .get(key)
+                    .map(|v| {
+                        let mut v = v.clone();
+                        v.decor_mut().clear();
+                        v.to_string()
+                    })
+                    .unwrap_or_default()
+            };
+            format!("    {{file = {}, hash = {}}},\n", field("file"), field("hash"))
+        })
+        .collect();
+    match format!("[\n{}]", entries.concat()).parse::<Value>() {
+        Ok(mut multiline) => {
+            multiline.decor_mut().clear();
+            Item::Value(multiline)
+        }
+        Err(_) => value(files),
+    }
+}
+
 /// The lock generation: `"0"`, `"1.0"`, `"1.1"`, or any `"2.<minor>"` (Poetry
 /// bumps the minor additively — 2.0 → 2.1 kept every shape we rewrite, and the
 /// vendored loader already accepts newer minors with an advisory; the hosted
@@ -290,6 +356,7 @@ pub fn rewrite_poetry_lock_in<'a>(
         // without it), even for archive sources.
         source.insert("reference", value(""));
     }
+    let rewritten = package.contains_key("source");
     package.insert("source", Item::Table(source));
     if matches!(format.as_str(), "1.0" | "1.1") && source_type == "url" {
         // Poetry >= 1.2 verifies url sources against the package's own
@@ -318,7 +385,8 @@ pub fn rewrite_poetry_lock_in<'a>(
             hashes.push(sha256.as_str());
             table.insert(&package_name, value(hashes));
         } else {
-            table.insert(&package_name, value(files));
+            let entry = legacy_files_entry(table, &package_name, files, rewritten);
+            table.insert(&package_name, entry);
         }
     }
     let mut rewritten = lock.to_string();
@@ -968,6 +1036,7 @@ mod parse_reuse_equivalence_tests {
             // without it), even for archive sources.
             source.insert("reference", value(""));
         }
+        let rewritten = package.contains_key("source");
         package.insert("source", Item::Table(source));
         if matches!(format.as_str(), "1.0" | "1.1") && source_type == "url" {
             // Poetry >= 1.2 verifies url sources against the package's own
@@ -996,7 +1065,8 @@ mod parse_reuse_equivalence_tests {
                 hashes.push(sha256.as_str());
                 table.insert(&package_name, value(hashes));
             } else {
-                table.insert(&package_name, value(files));
+                let entry = legacy_files_entry(table, &package_name, files, rewritten);
+                table.insert(&package_name, entry);
             }
         }
         let mut rewritten = lock.to_string();

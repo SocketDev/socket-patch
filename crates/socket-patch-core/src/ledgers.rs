@@ -1,7 +1,10 @@
 //! The project's patch stores read as one view: the agent manifest
 //! (`.socket/manifest.json`), the vendored ledger
-//! (`.socket/vendor/state.json`) and the hosted redirect ledger
-//! (`.socket/vendor/redirect-state.json`).
+//! (`.socket/vendor/state.json`) and the hosted records. v5 hosted mode
+//! keeps no ledger, so the hosted records are the lockfiles' hosted pins
+//! (shaped as uuid-only records) or a run's fetched records, plus a pre-v5
+//! redirect ledger (`.socket/vendor/redirect-state.json`) read, never
+//! written, for migration.
 //!
 //! One owner-precedence rule decides which store owns a purl every reader
 //! merges ([`Ledgers::owned`], [`Ledgers::listed`], [`Ledgers::matching`]):
@@ -16,15 +19,15 @@
 //!
 //! So: manifest > vendored > hosted, by ledger key. The losing copies stay
 //! reachable as alternates ([`Owned::alts`]) for readers that decide by
-//! lockfile evidence (`vex`). The hosted ledger only ever joins as the
-//! last store, so removing it is a matter of dropping [`Store::Hosted`].
+//! lockfile evidence (`vex`). The hosted records only ever join as the
+//! last store.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::redirect::{CorruptRedirectState, RedirectState};
-use crate::utils::purl::{normalize_purl, patch_matches, purl_name_version, strip_purl_qualifiers};
+use crate::utils::purl::{normalize_purl, patch_matches, strip_purl_qualifiers};
 use crate::vendor::{VendorEntry, VendorState};
 
 /// A patch store, in owner-precedence order (a lower store wins a key).
@@ -34,7 +37,8 @@ pub enum Store {
     Manifest,
     /// `.socket/vendor/state.json` (vendored mode).
     Vendored,
-    /// `.socket/vendor/redirect-state.json` (hosted mode, legacy).
+    /// The hosted records (lockfile pins, a run's fetched records, or a
+    /// pre-v5 redirect ledger read for migration).
     Hosted,
 }
 
@@ -45,13 +49,13 @@ pub struct LoadedLedgers {
     pub manifest: std::io::Result<Option<PatchManifest>>,
     /// Absent is `Ok(empty)`; `Err` is unreadable or malformed.
     pub vendor: std::io::Result<VendorState>,
-    /// Absent is `Ok(None)`.
+    /// The pre-v5 redirect ledger, read only (absent is `Ok(None)`).
     pub redirect: Result<Option<RedirectState>, CorruptRedirectState>,
 }
 
 impl LoadedLedgers {
-    /// Load the manifest at `manifest_path` and both ledgers of
-    /// `project_root`, concurrently.
+    /// Load the manifest at `manifest_path`, the vendored ledger and any
+    /// pre-v5 redirect ledger of `project_root`, concurrently.
     pub async fn load(project_root: &Path, manifest_path: &Path) -> Self {
         let (manifest, vendor, redirect) = tokio::join!(
             crate::manifest::operations::read_manifest(manifest_path),
@@ -95,7 +99,7 @@ pub struct Owned<'a> {
     /// The vendored entry in this group (the owner itself, or the one the
     /// manifest key claimed), with its ledger key.
     pub vendor: Option<(&'a str, &'a VendorEntry)>,
-    /// Whether the hosted ledger holds a record under this key.
+    /// Whether the hosted records hold one under this key.
     pub hosted: bool,
     /// The losing copies' records, in precedence order.
     pub alts: Vec<&'a PatchRecord>,
@@ -323,11 +327,9 @@ impl<'a> Ledgers<'a> {
         }
     }
 
-    /// The purls both the hosted and the vendored ledger claim, canonical
-    /// (qualifiers dropped, percent-decoded), sorted: each is stale in
-    /// exactly one ledger, which only the live lockfile can tell. With an
-    /// edits-only hosted ledger (every record fetch failed), the vendored
-    /// purls whose name (and version) a recorded edit key names.
+    /// The purls both the hosted records and the vendored ledger claim,
+    /// canonical (qualifiers dropped, percent-decoded), sorted: each is
+    /// stale in exactly one store, which only the live lockfile can tell.
     pub fn hosted_vendored_overlap(&self) -> Vec<String> {
         let (Some(redirect), Some(vendor)) = (self.redirect, self.vendor) else {
             return Vec::new();
@@ -345,42 +347,11 @@ impl<'a> Ledgers<'a> {
             vendor_purls.insert(canon(key));
             vendor_purls.insert(canon(&entry.base_purl));
         }
-        if !redirect.records.is_empty() {
-            let redirect_purls: std::collections::BTreeSet<String> =
-                redirect.records.keys().map(|p| canon(p)).collect();
-            return redirect_purls
-                .intersection(&vendor_purls)
-                .cloned()
-                .collect();
-        }
-        // The records map can be EMPTY while the ledger still asserts stale lock
-        // wiring (every per-uuid record fetch failed: `record_fetch_failed`), so
-        // fall back to matching the vendored purls against the recorded edit
-        // keys — npm `node_modules/<name>` (possibly nested), pnpm/yarn/cargo/uv
-        // `<name>@<version>` (vlt `<name>@<version>~<extra>`), bun
-        // `<prefix>/<name>`, gem/composer/pypi bare `<name>`. Name-level matching
-        // can over-claim across versions, but the CLI's `classify_overlap_takeover` still
-        // requires the live lock to prove one side before anything is reported.
-        if redirect.edits.is_empty() {
-            return Vec::new();
-        }
-        vendor_purls
-            .into_iter()
-            .filter(|purl| {
-                let Some((name, version)) = purl_name_version(strip_purl_qualifiers(purl)) else {
-                    return false;
-                };
-                redirect
-                    .edits
-                    .iter()
-                    .filter_map(|e| e.key.as_deref())
-                    .any(|key| {
-                        key == name
-                            || key == format!("{name}@{version}")
-                            || key.starts_with(&format!("{name}@{version}~"))
-                            || key.ends_with(&format!("/{name}"))
-                    })
-            })
+        let redirect_purls: std::collections::BTreeSet<String> =
+            redirect.records.keys().map(|p| canon(p)).collect();
+        redirect_purls
+            .intersection(&vendor_purls)
+            .cloned()
             .collect()
     }
 }
