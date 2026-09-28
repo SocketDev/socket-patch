@@ -34,7 +34,9 @@ use super::common::{already_patched_result, refused, service_offline_conflict};
 use super::npm_common::{
     declares_bundled_deps, done_failure, done_failure_unstage, guard_coordinates,
 };
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{
+    fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
+};
 use super::source::PackageSource;
 use super::state::VENDOR_MARKER_FILE;
 use super::vlt_lock_text::vendored_dir_rel;
@@ -611,7 +613,7 @@ pub(super) async fn stage_patch_dir(
         )
         .await
         {
-            ServiceDir::Used => {
+            ServiceDir::Used(()) => {
                 result = Some(already_patched_result(purl, &rel_abs, &record.files));
             }
             ServiceDir::HardFail(outcome) => return Err(outcome),
@@ -877,11 +879,7 @@ async fn tree_matches_after_hashes(stage: &Path, record: &PatchRecord) -> bool {
     true
 }
 
-enum ServiceDir {
-    Used,
-    HardFail(Box<VendorOutcome>),
-    FallBack,
-}
+type ServiceDir = ServiceAttempt<()>;
 
 /// The service fast path: the prebuilt tarball, integrity- and
 /// afterHash-verified, extracted into `stage` with its first path component
@@ -896,75 +894,44 @@ async fn try_service_dir(
     version: &str,
     warnings: &mut Vec<VendorWarning>,
 ) -> ServiceDir {
-    let hard_fail = |detail: String| ServiceDir::HardFail(Box::new(done_failure(purl, detail)));
-    let fallback_or_fail =
-        |reason: String, code: &'static str, warnings: &mut Vec<VendorWarning>| {
-            if cfg.source.requires_service() {
-                hard_fail(reason)
-            } else {
-                warnings.push(VendorWarning::new(
-                    code,
-                    format!("{reason}; building locally instead"),
-                ));
-                ServiceDir::FallBack
-            }
-        };
-    match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
-            let (bytes, dest) = (archive.bytes, stage.to_path_buf());
-            let extracted = tokio::task::spawn_blocking(move || {
-                super::registry_fetch::extract_tgz_strict(&bytes, &dest)
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
-            if let Err(e) = extracted {
-                return hard_fail(format!(
-                    "prebuilt tarball for {name}@{version} is unsafe: {e}"
-                ));
-            }
-            if !tree_matches_after_hashes(stage, record).await {
-                let _ = remove_tree(stage).await;
-                return fallback_or_fail(
-                    format!(
-                        "prebuilt tarball for {name}@{version} does not carry the patched files \
-                         at their recorded paths"
-                    ),
-                    "vendor_prebuilt_layout_mismatch",
-                    warnings,
-                );
-            }
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {name}@{version} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            ServiceDir::Used
-        }
-        ServiceArtifact::IntegrityMismatch(reason) => hard_fail(format!(
-            "prebuilt artifact failed integrity verification ({reason}); refusing to fall back \
-             to a local build on tampered bytes"
-        )),
-        ServiceArtifact::Pending => fallback_or_fail(
-            "prebuilt artifact is still building".to_string(),
-            "vendor_prebuilt_pending",
-            warnings,
-        ),
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard_fail(format!("prebuilt artifact unavailable: {reason}"))
-            } else {
-                ServiceDir::FallBack
-            }
-        }
-        ServiceArtifact::Failed(reason) => fallback_or_fail(
-            format!("patch service request failed ({reason})"),
-            "vendor_prebuilt_unavailable",
-            warnings,
-        ),
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Failure(purl));
+    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
+    let archive = match policy.settle(fetched, "artifact", "artifact", warnings) {
+        Ok(archive) => archive,
+        Err(attempt) => return attempt,
+    };
+    let (bytes, dest) = (archive.bytes, stage.to_path_buf());
+    let extracted = tokio::task::spawn_blocking(move || {
+        super::registry_fetch::extract_tgz_strict(&bytes, &dest)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    if let Err(e) = extracted {
+        return policy.hard(
+            "vendor_prebuilt_extract_failed",
+            format!("prebuilt tarball for {name}@{version} is unsafe: {e}"),
+        );
     }
+    if !tree_matches_after_hashes(stage, record).await {
+        let _ = remove_tree(stage).await;
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!(
+                "prebuilt tarball for {name}@{version} does not carry the patched files \
+                 at their recorded paths"
+            ),
+        );
+    }
+    warnings.push(VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!(
+            "vendored {name}@{version} from the patch service ({})",
+            archive.source_url
+        ),
+    ));
+    ServiceDir::Used(())
 }
 
 #[cfg(test)]
