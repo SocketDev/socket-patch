@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::constants::SOCKET_DIR;
+use socket_patch_core::formats::registry;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::utils::fs::{
@@ -56,36 +57,6 @@ struct Candidate {
     detached: bool,
     reason: &'static str,
 }
-
-/// Files the vendor backends rewire — the search space for
-/// `.socket/vendor/<eco>/<uuid>/<leaf>` references. The Python locks the
-/// root LISTS (`pylock*.toml`, `*.py.lock` + script) and the requirements
-/// `-r` include tree are appended at scan time.
-const WIRING_FILES: &[&str] = &[
-    "vlt-lock.json",
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "bun.lock",
-    "package.json",
-    "Cargo.toml",
-    "Cargo.lock",
-    // Pre-v5 vendored cargo wiring (migrated into Cargo.toml on re-run).
-    ".cargo/config.toml",
-    ".cargo/config",
-    "go.mod",
-    "composer.json",
-    "composer.lock",
-    "Gemfile",
-    "Gemfile.lock",
-    "uv.lock",
-    "pyproject.toml",
-    "poetry.lock",
-    "pdm.lock",
-    "Pipfile.lock",
-    "requirements.txt",
-];
 
 /// Scan the wiring-bearing files for vendored-artifact references,
 /// returning deduped `(ecosystem, uuid, artifact relpath)` triples. Pure
@@ -148,13 +119,14 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
 }
 
 /// Every wiring-bearing file name the vendor backends may rewrite, relative
-/// to `project_root`: [`WIRING_FILES`], vlt importer manifests, the Python
+/// to `project_root`: the registry's vendored wiring files
+/// ([`registry::VENDORED`]), vlt importer manifests, the Python
 /// locks the root lists (and their scripts) and the requirements `-r`
 /// include tree. Sorted and deduplicated; entries need not exist.
 async fn wiring_files(project_root: &Path) -> Vec<String> {
-    let mut files: Vec<String> = WIRING_FILES
-        .iter()
-        .map(|file| (*file).to_string())
+    let mut files: Vec<String> = registry::paths_with(registry::VENDORED)
+        .into_iter()
+        .map(str::to_string)
         .collect();
     files.extend(vendor::vlt_lock::vlt_importer_package_jsons(project_root).await);
     if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {

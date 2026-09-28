@@ -277,7 +277,7 @@ pub async fn vendor_yarn_classic<'a>(
 /// separates classic from berry, but rewriting a berry lock with classic
 /// grammar would corrupt it — never proceed past a `__metadata:` key.
 fn refuse_berry_lock(text: &str) -> Result<(), Box<VendorOutcome>> {
-    if text.lines().any(|l| l.starts_with("__metadata:")) {
+    if crate::formats::yarn::is_berry_lock(text) {
         return Err(Box::new(refused(
             "vendor_lockfile_version_unsupported",
             "yarn.lock is a yarn berry (v2+) lockfile (top-level `__metadata:` key); the \

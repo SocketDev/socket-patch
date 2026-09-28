@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::super::{find_composer_entry, json_object_end_from, json_string_field, ComposerEntry};
+use crate::formats::composer::hosted::{
+    find_composer_entry, json_object_end_from, json_string_field, ComposerEntry,
+};
 use super::{Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::composer_crawler::normalize_version;
 
