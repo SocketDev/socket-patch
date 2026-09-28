@@ -151,7 +151,7 @@ async fn vlt_pinned_matrix_agent_get_and_remove() {
         return;
     };
     let fx = Fixture::build(leg, Shape::with_bystander().warm()).await;
-    let out = socket_api(&fx.proj, &fx.svc, &["get", UUID], &[]);
+    let out = socket_api(&fx.proj, &fx.svc, &["get", UUID, "--mode", "agent"], &[]);
     assert_eq!(out.code, 0, "{out}");
     assert_eq!(state(&fx.proj, fx.t()), State::Patched);
     let purl = fx.t().purl();
