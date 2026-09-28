@@ -527,6 +527,18 @@ fn scan_json_empty_cwd_emits_updates_key() {
             "warnings": [],
             "dryRun": false
         },
+        // v5: the socket.yml patch policy block rides every successful
+        // scan (no file here: the built-in defaults).
+        "policy": {
+            "source": "none",
+            "path": null,
+            "sha256": null,
+            "enabled": true,
+            "minSeverity": { "value": null, "source": "default" },
+            "counts": { "filtered": 0, "retained": 0 },
+            "filtered": [],
+            "retained": []
+        },
     });
     assert_eq!(
         v,

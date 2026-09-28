@@ -1046,6 +1046,7 @@ pub(super) async fn run_redirect(
     api_client: &socket_patch_core::api::client::ApiClient,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
+    policy: &super::policy::ScanPolicy,
     // The classic scan object `run` builds for the `--json` path (`Some` in
     // JSON mode, `None` for human output). The redirect result is NESTED into
     // it so the hosted `--json` envelope stays schema-consistent with every
@@ -1060,11 +1061,11 @@ pub(super) async fn run_redirect(
     npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
-    let selected = match discover_selected(
+    let selected: Vec<socket_patch_core::api::types::PatchSearchResult> = match discover_selected(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
-        &args.common,
+        policy,
         false,
         false,
         telemetry,
@@ -1072,7 +1073,7 @@ pub(super) async fn run_redirect(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(offers) => offers.selected.into_values().collect(),
         // Hosted mode has no discovery envelope to fold the message into at
         // this point (it builds its `redirect` result further down).
         // `discover_selected` already printed the message to stderr; a

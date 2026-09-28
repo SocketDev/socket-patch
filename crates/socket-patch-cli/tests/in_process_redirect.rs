@@ -45,6 +45,7 @@ const GHSA: &str = "GHSA-rdir-aaaa-bbbb";
 
 fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {

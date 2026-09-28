@@ -71,6 +71,7 @@ async fn assert_discovered_purl(server: &MockServer, expected_purl: &str) {
 
 fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
