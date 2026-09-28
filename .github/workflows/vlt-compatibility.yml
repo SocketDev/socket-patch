@@ -115,11 +115,11 @@ on:
 permissions:
   contents: read
 
-# Supersede stale PR runs; main runs are the only rust-cache writers, so they
-# are never cancelled mid-save.
+# Supersede stale PR runs only: main runs are the only rust-cache writers, so
+# push, dispatch and schedule runs are never cancelled mid-save.
 concurrency:
   group: vlt-compat-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_PROFILE_DEV_DEBUG: '0'

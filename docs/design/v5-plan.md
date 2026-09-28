@@ -207,6 +207,13 @@ patch-UI review.
   `[error] <purl> (<code>)` / `[would-refuse]` lines keep their codes
   (grep-able under `--silent`).
 
+### WS9 — Staged patch rollout  *(branches `v5/rollout-policy` (A), `v5/rollout-limit` (B))*
+- Added 2026-09-28 at the owner's request. `socket.yml` `patches:` policy
+  (paths, ecosystems, packages, severity floor, enabled) read by `scan`
+  and the in-memory engine, plus `scan --max-new-patches` (severity-ordered
+  per-run cap on new patches). Full plan and the two work-item specs:
+  `docs/design/staged-rollout.md`. Merge order A then B.
+
 ## Remaining small follow-ups
 *(All done on `v5/remove-setup-and-ui`: the vacuous rows are dropped,
 GEM_PATCHES has both patches, `tool_command` and the deprecated aliases —
