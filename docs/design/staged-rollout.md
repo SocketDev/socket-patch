@@ -948,10 +948,11 @@ Scope:
   offers.
 - Make `discover_selected` (`scan/mod.rs:553`) the single disk selection
   point: route the human agent/vendored arm (`mod.rs:2386-2402`) through
-  it, and have it return `{admitted, deferred}` so hosted
+  it, and add the step-7 stage after it (classify its `Offers`, planning
+  pass, `plan_rollout`) yielding `{admitted, deferred}`, so hosted
   (`run_redirect_selected`, `hosted.rs:1196`), vendored and agent writers
   receive only the rows 9.0 step 8 allows (ALREADY with the recorded
-  uuid).
+  uuid). `discover_selected`'s return type is A's `Offers`.
 - Classification from the merged recorded view (5.1); the planning pass
   for eligibility (hosted: grants, purl/url, vlt preflight, symlink
   refusals, rewriter planning; vendored: preflight; agent: partition);
