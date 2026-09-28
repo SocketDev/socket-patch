@@ -167,11 +167,13 @@ pub(crate) async fn dispatch_vendor_one(
     }
     // Maven and NuGet have no registry-fetch rung — `fetch_and_stage` serves
     // no fetcher for either and `stage_local_artifact` is npm-only — so their
-    // source is always the crawler's own directory.
+    // source is the crawler's own directory. A ledger-driven maven re-run on
+    // a cold cache gets a deferred hint instead: the committed tree answers
+    // an in-sync re-run, and anything else refuses for the missing jar.
     macro_rules! vend_installed {
         ($backend:path) => {{
             debug_assert!(
-                matches!(pkg_path, PackageSource::Installed(_)),
+                eco == "maven" || matches!(pkg_path, PackageSource::Installed(_)),
                 "{eco} has no fetch rung; a pending source would need materialising"
             );
             $backend(
@@ -1077,6 +1079,32 @@ async fn sweep_stale_artifact(
     stale: StaleArtifact,
 ) {
     let StaleArtifact { candidate, prev } = stale;
+    // A JVM tree is not a uuid dir: the replaced entry's own tree files go,
+    // minus any path a live entry records (a Gradle update rewrites them).
+    if vendor::jvm::apply::is_jvm_entry(&prev) {
+        let removed = if common.dry_run {
+            Ok(false)
+        } else {
+            vendor::jvm::apply::sweep_replaced_tree(&common.cwd, &prev, state.entries.values())
+                .await
+        };
+        match removed {
+            Ok(true) => env.record(
+                PatchEvent::new(PatchAction::Removed, candidate).with_reason(
+                    "vendor_stale_artifact_removed",
+                    "previous patch uuid's vendored artifact removed",
+                ),
+            ),
+            Ok(false) => {}
+            Err(detail) => record_warning(
+                env,
+                &candidate,
+                &VendorWarning::new("vendor_stale_artifact_kept", detail),
+                common,
+            ),
+        }
+        return;
+    }
     let still_referenced = state
         .entries
         .values()

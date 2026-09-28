@@ -66,6 +66,7 @@ pub(crate) mod gemfile_lock;
 pub mod go_mod_edit;
 pub mod go_sum_edit;
 pub mod golang;
+pub mod jvm;
 pub(crate) mod ledger_snapshots;
 pub mod lock_inventory;
 pub(crate) mod maven_pom;

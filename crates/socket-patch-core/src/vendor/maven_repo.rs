@@ -301,10 +301,17 @@ pub(crate) async fn service_preflight(
     project_root: &Path,
     record: &PatchRecord,
 ) -> Option<crate::api::client::PlannedDownload> {
-    maven_prelude(purl, project_root, record)
-        .await
-        .ok()
-        .filter(|p| !p.in_sync)?;
+    if let Some(shape) = jvm_shape(project_root).await {
+        jvm_committed_patch(shape, purl, project_root, record)
+            .await
+            .is_none()
+            .then_some(())?;
+    } else {
+        maven_prelude(purl, project_root, record)
+            .await
+            .ok()
+            .filter(|p| !p.in_sync)?;
+    }
     // `service_archive_copy` checks the archive's members against the
     // afterHashes before writing it verbatim.
     Some(crate::api::client::PlannedDownload {
@@ -333,6 +340,20 @@ pub async fn vendor_maven(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    if let Some(shape) = jvm_shape(project_root).await {
+        return vendor_maven_jvm(
+            shape,
+            purl,
+            installed_dir,
+            project_root,
+            record,
+            sources,
+            dry_run,
+            force,
+            service,
+        )
+        .await;
+    }
     let MavenPrelude {
         group_id,
         artifact_id,
@@ -599,6 +620,12 @@ pub async fn revert_maven_opts(
         dry_run,
         keep_artifact,
     } = opts;
+    // Routed only when EVERY record is a JVM kind; the JVM revert validates
+    // the uuid, the coordinates and each recorded path before any disk
+    // access (state.json is tamper-able).
+    if super::jvm::apply::is_jvm_entry(entry) {
+        return super::jvm::apply::revert(project_root, entry, opts).await;
+    }
     // SECURITY: state.json is committed and tamper-able; the uuid keys the
     // directory we are about to delete. Anything but the canonical uuid grammar
     // is rejected fail-closed before any disk access.
@@ -679,6 +706,239 @@ pub async fn revert_maven_opts(
         outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
     }
     outcome
+}
+
+// ── prototype v5 JVM backend (reactors, Gradle) ─────────────────────────────────
+
+/// The JVM shape this project routes to the prototype backend: only with
+/// [`super::jvm::EXPERIMENTAL_ENV`] set, or once the ledger holds an entry
+/// that backend wrote (so a vendored project keeps working without the
+/// flag), and only for a reactor or a Gradle build.
+async fn jvm_shape(project_root: &Path) -> Option<super::jvm::Shape> {
+    if !super::jvm::experimental_enabled() {
+        let state = super::state::load_state(project_root).await.ok()?;
+        if !state.entries.values().any(super::jvm::apply::is_jvm_entry) {
+            return None;
+        }
+    }
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    let shape = super::jvm::detect(&|rel: &str| reader.read(rel));
+    (shape != super::jvm::Shape::Other).then_some(shape)
+}
+
+/// The committed tree bytes for `record` (jar, upstream pom, module) when
+/// the jar's patched members hash to the record's `afterHash`es: a re-run
+/// then needs no jar source at all (the in-sync hot path).
+async fn jvm_committed_patch(
+    shape: super::jvm::Shape,
+    purl: &str,
+    project_root: &Path,
+    record: &PatchRecord,
+) -> Option<super::jvm::CommittedTree> {
+    let (g, a, v) = parse_maven_purl(purl)?;
+    let coords = super::jvm::Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &record.uuid,
+    };
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    let read = |rel: &str| reader.read(rel);
+    let committed = match shape {
+        super::jvm::Shape::MavenReactor => {
+            super::jvm::maven_reactor::committed(&read, &coords).map(|(jar, pom)| (jar, pom, None))
+        }
+        super::jvm::Shape::Gradle => super::jvm::gradle::committed(&read, &coords),
+        super::jvm::Shape::Other => None,
+    }?;
+    (!record.files.is_empty() && zip_bytes_match_after_hashes(&committed.0, &record.files))
+        .then_some(committed)
+}
+
+/// Vendor into a multi-module reactor or a Gradle build through the
+/// prototype [`super::jvm`] backend. The jar and pom come from the committed
+/// tree when it already holds this patch, else from the same service /
+/// local-rebuild rungs as the legacy path; nothing is written for a
+/// refused plan.
+#[allow(clippy::too_many_arguments)]
+async fn vendor_maven_jvm(
+    shape: super::jvm::Shape,
+    purl: &str,
+    installed_dir: &Path,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
+        return refused("unsafe_coordinates", format!("not a maven purl: {purl}"));
+    };
+    let (group_id, artifact_id, version) = (
+        group_id.to_string(),
+        artifact_id.to_string(),
+        version.to_string(),
+    );
+    if vendor_uuid_dir_rel("maven", &record.uuid).is_none() {
+        return refused(
+            "unsafe_coordinates",
+            format!("non-canonical patch uuid {:?}", record.uuid),
+        );
+    }
+    if !super::jvm::safe_coordinates(&group_id, &artifact_id, &version) {
+        return refused(
+            "unsafe_coordinates",
+            format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
+        );
+    }
+    let display_path = project_root.join(".socket/vendor");
+    if record.files.is_empty() {
+        return done(
+            synthesized_result(purl, &display_path, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        );
+    }
+
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    let committed = jvm_committed_patch(shape, purl, project_root, record).await;
+    let (jar_bytes, pom_bytes, module_bytes, mut result) = match committed {
+        Some((jar, pom, module)) => (
+            jar,
+            pom,
+            module,
+            already_patched_result(purl, &display_path, &record.files),
+        ),
+        None => {
+            let (jar, result) =
+                match service_archive_copy(service, record, &artifact_id, ".jar", &mut warnings)
+                    .await
+                {
+                    ServiceCopy::Used(bytes) => (
+                        bytes,
+                        already_patched_result(purl, &display_path, &record.files),
+                    ),
+                    ServiceCopy::HardFail(outcome) => return *outcome,
+                    ServiceCopy::FallBack => {
+                        match local_rebuild_jar(
+                            purl,
+                            installed_dir,
+                            &display_path,
+                            &artifact_id,
+                            &version,
+                            record,
+                            sources,
+                            force,
+                            &mut warnings,
+                        )
+                        .await
+                        {
+                            Ok(pair) => pair,
+                            Err(outcome) => return jvm_refusal(*outcome),
+                        }
+                    }
+                };
+            if !result.success {
+                return done(result, None, warnings);
+            }
+            let pom = match acquire_upstream_pom(
+                installed_dir,
+                &group_id,
+                &artifact_id,
+                &version,
+                &group_id_to_path(&group_id),
+                service,
+                &mut warnings,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(detail) => {
+                    return refused(
+                        "vendor_jvm_upstream_unavailable",
+                        format!("reason: pom_unavailable: {detail}"),
+                    )
+                }
+            };
+            let module = read_regular_to_bytes(
+                &installed_dir.join(format!("{artifact_id}-{version}.module")),
+            )
+            .await
+            .ok();
+            (jar, pom, module, result)
+        }
+    };
+
+    let patch = super::jvm::JvmPatch {
+        group_id: &group_id,
+        artifact_id: &artifact_id,
+        version: &version,
+        uuid: &record.uuid,
+        jar: &jar_bytes,
+        upstream_pom: &pom_bytes,
+        upstream_module: module_bytes.as_deref(),
+    };
+    let reader = super::jvm::apply::ProjectReader::new(project_root);
+    let planned = super::jvm::plan(shape, &|rel: &str| reader.read(rel), &patch);
+    if let Some(rel) = reader.escaped() {
+        return refused(
+            "vendor_jvm_shape_unsupported",
+            super::jvm::apply::outside_root_detail(&rel),
+        );
+    }
+    let plan = match planned {
+        Ok(plan) => plan,
+        Err(refusal) => return refused(refusal.code, refusal.detail),
+    };
+    warnings.extend(
+        plan.warnings
+            .iter()
+            .map(|w| VendorWarning::new(w.code, w.detail.clone())),
+    );
+    let jar_path = project_root.join(&plan.jar_rel);
+    result.package_path = jar_path.display().to_string();
+    if plan.writes.is_empty() {
+        return done(
+            already_patched_result(purl, &jar_path, &record.files),
+            None,
+            warnings,
+        );
+    }
+    if dry_run {
+        return done(result, None, warnings);
+    }
+    let mut wiring = match super::jvm::apply::write_plan(project_root, &plan).await {
+        Ok(records) => records,
+        Err(e) => return done(failed_result(purl, &jar_path, e), None, warnings),
+    };
+    // Shared fragments another JVM entry wrote, and the pristine originals
+    // of a patch update, come from the ledger (§7.3).
+    if let Ok(state) = super::state::load_state(project_root).await {
+        super::jvm::apply::inherit_peer_records(&mut wiring, state.entries.values());
+    }
+    let entry = maven_entry(
+        build_maven_purl(&group_id, &artifact_id, &version),
+        record,
+        plan.jar_rel.clone(),
+        &jar_bytes,
+        wiring,
+    );
+    done(result, Some(entry), warnings)
+}
+
+/// A legacy jar refusal in the JVM backend's codes (§8.2).
+fn jvm_refusal(outcome: VendorOutcome) -> VendorOutcome {
+    match outcome {
+        VendorOutcome::Refused {
+            code: "vendor_maven_jar_not_found",
+            detail,
+        } => refused(
+            "vendor_jvm_upstream_unavailable",
+            format!("reason: no_base_jar: {detail}"),
+        ),
+        other => other,
+    }
 }
 
 // ── materialisation (service download / local rebuild) ──────────────────────────
@@ -4265,5 +4525,223 @@ mod tests {
         };
         assert_eq!(code, "vendor_prebuilt_required");
         assert!(!root.join(".socket").exists(), "nothing written");
+    }
+
+    // ── prototype JVM backend glue ──
+
+    const REACTOR_ROOT: &str = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+        <groupId>t</groupId>\n  <artifactId>root</artifactId>\n  <version>1</version>\n  \
+        <packaging>pom</packaging>\n  <modules>\n    <module>a</module>\n  </modules>\n</project>\n";
+
+    fn reactor_module() -> String {
+        "<project>\n  <parent>\n    <groupId>t</groupId>\n    <artifactId>root</artifactId>\n    \
+         <version>1</version>\n  </parent>\n  <artifactId>a</artifactId>\n  <dependencies>\n    \
+         <dependency><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId>\
+         <version>1.10.0</version></dependency>\n  </dependencies>\n</project>\n"
+            .to_string()
+    }
+
+    async fn reactor_fixture(
+        with_local_jar: bool,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PatchRecord) {
+        let fx = fixture(Some(REACTOR_ROOT), with_local_jar, true).await;
+        let a = fx.0.path().join("a");
+        tokio::fs::create_dir_all(&a).await.unwrap();
+        tokio::fs::write(a.join("pom.xml"), reactor_module())
+            .await
+            .unwrap();
+        fx
+    }
+
+    async fn run_jvm(
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        service: Option<&VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let sources = PatchSources::blobs_only(blobs);
+        vendor_maven_jvm(
+            super::super::jvm::Shape::MavenReactor,
+            PURL,
+            installed,
+            root,
+            record,
+            &sources,
+            false,
+            false,
+            service,
+        )
+        .await
+    }
+
+    /// A re-run over a committed tree that holds this patch needs no jar
+    /// source: no cached jar, and `--vendor-source=service --offline`.
+    #[tokio::test]
+    async fn jvm_rerun_is_in_sync_without_any_jar_source() {
+        let (dir, blobs, installed, record) = reactor_fixture(true).await;
+        let root = dir.path();
+        let (result, entry, _) =
+            unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert!(result.success, "{result:?}");
+        let entry = entry.expect("ledger entry");
+        assert!(super::super::jvm::apply::is_jvm_entry(&entry));
+        tokio::fs::remove_file(installed.join("commons-text-1.10.0.jar"))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(installed.join("commons-text-1.10.0.pom"))
+            .await
+            .unwrap();
+        let cfg = crate::vendor::test_support::service_cfg(
+            "http://127.0.0.1:9",
+            crate::vendor::VendorSource::Service,
+            true,
+        );
+        let (result, again, _) =
+            unwrap_done(run_jvm(root, &blobs, &installed, &record, Some(&cfg)).await);
+        assert!(result.success && again.is_none(), "{result:?}");
+        assert!(
+            jvm_committed_patch(super::super::jvm::Shape::MavenReactor, PURL, root, &record)
+                .await
+                .is_some(),
+            "the service prefetch plan skips an in-sync JVM entry"
+        );
+        // A tampered committed jar is not in sync: the jar source is needed.
+        let jar = root.join(&entry.artifact.path);
+        tokio::fs::write(&jar, make_jar(PRISTINE)).await.unwrap();
+        let (code, detail) = unwrap_refused(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert_eq!(code, "vendor_jvm_upstream_unavailable");
+        assert!(detail.starts_with("reason: no_base_jar: "), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn jvm_revert_honours_keep_artifact_and_restores_the_poms() {
+        let (dir, blobs, installed, record) = reactor_fixture(true).await;
+        let root = dir.path();
+        let (_, entry, _) = unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        let entry = entry.unwrap();
+        let out = revert_maven_opts(
+            &entry,
+            root,
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(
+            out.success && !out.kept_artifact && out.warnings.is_empty(),
+            "{out:?}"
+        );
+        assert!(
+            root.join(&entry.artifact.path).is_file(),
+            "--preserve-state keeps the jar"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pom.xml")).unwrap(),
+            REACTOR_ROOT
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a/pom.xml")).unwrap(),
+            reactor_module()
+        );
+        assert!(!root.join(".mvn").exists());
+    }
+
+    /// A forged JVM entry (tamper-able state.json) is refused before any
+    /// disk access, whatever the experimental switch says.
+    #[tokio::test]
+    async fn jvm_revert_refuses_forged_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        tokio::fs::create_dir_all(root.join("src")).await.unwrap();
+        tokio::fs::write(root.join("src/Main.java"), "class Main {}\n")
+            .await
+            .unwrap();
+        let tree = |file: &str| WiringRecord {
+            file: file.to_string(),
+            kind: super::super::jvm::TREE_KIND.to_string(),
+            action: WiringAction::Added,
+            key: None,
+            original: None,
+            new: Some(Value::String(hex::encode(Sha256::digest(
+                b"class Main {}\n",
+            )))),
+        };
+        let forged = |uuid: &str, file: &str| VendorEntry {
+            uuid: uuid.to_string(),
+            wiring: vec![tree(file)],
+            ..maven_entry(
+                PURL.to_string(),
+                &PatchRecord {
+                    uuid: UUID.to_string(),
+                    ..fixture_record()
+                },
+                String::new(),
+                b"",
+                Vec::new(),
+            )
+        };
+        for entry in [
+            forged("../../../NOT-A-UUID", "src/Main.java"),
+            forged(UUID, "src/Main.java"),
+        ] {
+            let out = revert_maven_opts(&entry, root, RevertOpts::new(false)).await;
+            assert!(!out.success, "{out:?}");
+        }
+        assert!(root.join("src/Main.java").is_file());
+    }
+
+    fn fixture_record() -> PatchRecord {
+        PatchRecord {
+            uuid: UUID.to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jvm_refuses_a_module_symlinked_outside_the_checkout() {
+        let (dir, blobs, installed, record) = fixture(Some(REACTOR_ROOT), true, true).await;
+        let root = dir.path();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(outside.path().join("pom.xml"), reactor_module())
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("a")).unwrap();
+        let (code, detail) = unwrap_refused(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert_eq!(code, "vendor_jvm_shape_unsupported");
+        assert!(
+            detail.starts_with("reason: build_file_outside_root: a "),
+            "{detail}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("pom.xml")).unwrap(),
+            reactor_module()
+        );
+    }
+
+    /// A project the prototype vendored keeps routing to it once the
+    /// switch is unset (its ledger names a JVM entry).
+    #[tokio::test]
+    async fn jvm_routing_follows_the_ledger() {
+        let (dir, blobs, installed, record) = reactor_fixture(true).await;
+        let root = dir.path();
+        if !super::super::jvm::experimental_enabled() {
+            assert!(jvm_shape(root).await.is_none());
+        }
+        let (_, entry, _) = unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        let mut state = super::super::state::VendorState::new();
+        state.entries.insert(PURL.to_string(), entry.unwrap());
+        super::super::state::save_state(root, &state).await.unwrap();
+        assert_eq!(
+            jvm_shape(root).await,
+            Some(super::super::jvm::Shape::MavenReactor)
+        );
     }
 }

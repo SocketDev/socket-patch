@@ -245,6 +245,15 @@ async fn extract_hosted(
             .map(String::as_str)
             .filter(|uuid| uuid.starts_with(hex8))
             .collect();
+        // A JVM-backend pin: its committed maven2 tree serves it.
+        let jvm_tree = candidates.is_empty()
+            && ctx
+                .exists(&format!(
+                    "{}/{}/{artifact}/{pinned}/{artifact}-{pinned}.jar",
+                    crate::vendor::jvm::maven_reactor::TREE_ROOT,
+                    group.replace('.', "/")
+                ))
+                .await;
         match candidates.as_slice() {
             [uuid] => {
                 ties.entry(*uuid).or_default().insert((
@@ -254,6 +263,7 @@ async fn extract_hosted(
                     pinned.clone(),
                 ));
             }
+            [] if jvm_tree => {}
             [] => out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 POM,
@@ -486,6 +496,13 @@ fn classify_repo(ctx: &DiscoverCtx<'_>, repo: &PomRepo, out: &mut Discovery) -> 
     let url_hosted = ctx.hosted_uuid(url);
     let url_vendor_text = names_vendor_dir(url);
     if !id_socket && url_hosted.is_none() && !url_vendor_text {
+        return RepoKind::NotOurs;
+    }
+    // The JVM backend's one shared fallback repository names no patch; its
+    // ledger entries prove their own liveness.
+    if id == crate::vendor::jvm::maven_reactor::REPO_ID
+        && url == crate::vendor::jvm::maven_reactor::REPO_URL
+    {
         return RepoKind::NotOurs;
     }
     let invalid = |out: &mut Discovery, why: &str| {

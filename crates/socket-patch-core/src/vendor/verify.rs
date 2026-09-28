@@ -50,6 +50,13 @@ pub(crate) fn checked_artifact_path(
     entry: &VendorEntry,
     record: &PatchRecord,
 ) -> Result<PathBuf, String> {
+    // The JVM trees are not `<eco>/<uuid>` dirs: the jar must be the
+    // entry's own tree jar for this uuid (checked against the layout and
+    // the marker).
+    if super::jvm::apply::is_jvm_entry(entry) {
+        return super::jvm::apply::checked_tree_jar(project_root, entry, &record.uuid)
+            .map(|rel| project_root.join(rel));
+    }
     let rel = &entry.artifact.path;
     let parts = parse_vendor_path(rel).ok_or_else(|| "vendor_path_unsafe".to_string())?;
     let norm = rel.replace('\\', "/");

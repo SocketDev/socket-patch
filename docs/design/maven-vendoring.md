@@ -1136,3 +1136,36 @@ There were five reviewers:
 | Q13 | What is the root cause of the missing enforcement on 3.9.2–3.9.3 (resolver 1.9.13 → 1.9.14)? Knowing it would let the 3.9.4 threshold rest on a documented change. |
 
 Q4 (does 3.9.0 crash? yes, V) and Q5 (the header was dropped) are closed.
+---
+
+## 17. Prototype status (this branch)
+
+The prototype lives in `crates/socket-patch-core/src/vendor/jvm/`. It runs only when `SOCKET_PATCH_EXPERIMENTAL_JVM_VENDOR=1` is set, and only for shapes the legacy backend refuses: a root `pom.xml` with `<modules>`, or a Gradle-only root. With the variable unset, every shape behaves exactly as before. After an entry exists, its re-runs and reverts follow the ledger even without the variable.
+
+| Area | Covered |
+|---|---|
+| Maven reactor (§4) | Discovery; parent chains, including a middle local parent reached by a directory `relativePath`; local roots; pins; literal and `${p}` rewrites, including profiles and `.mvn/maven.config` `-D` values; the conflicting-literal un-pin; the shared fallback repository; the 2-line `maven.config`; the SV tree with a port of `suffixMavenPom`; enforcer and classifier warnings |
+| Gradle (§5) | Static script with layer-1 hashing; index; apply lines for root, buildSrc and literal `includeBuild` settings in both DSLs; the in-block `pluginManagement` entry; hash replace or insert in an existing verification file; the Android/KMP, `exclusiveContent` and settings-classpath refusals |
+| State (§7) | Per-fragment records. Shared fragments are removed only when no other patch still references them, so revert order does not matter. Also covered: same-uuid re-runs; patch updates with the stale-tree sweep; `--preserve-state`; the cold-cache in-sync fast path; VEX liveness and repair of a deleted tree jar |
+| Safety | Every path resolves inside the checkout (a symlink that leaves it is refused); recorded paths are whitelisted per record kind; the D15 coordinate grammar is enforced |
+
+**Evidence:**
+- **Unit tests:** 113 in `vendor::jvm`.
+- **Subprocess tests:** 6 in `crates/socket-patch-cli/tests/vendor_jvm_cli.rs`: two patches reverted in either order, patch update, cold cache plus VEX plus repair, `--preserve-state`, forged ledgers, and escaping symlinks.
+- **Real-tool capstones:** 2 in `crates/socket-patch-cli/tests/e2e_vendor_jvm_build.rs`. The reactor test is a fresh checkout built offline from the root and from `cd module`, followed by a byte-exact revert. The Gradle test covers Kotlin DSL, FAIL_ON_PROJECT_REPOS and STRICT locking: lockfiles stay byte-unchanged, `--offline` works, a tamper fails, and revert is byte-exact.
+- **Versions:** the capstones pass on Maven 3.8.8, 3.9.2, 3.9.11 and 4.0.0-rc-7, and on Gradle 6.9.4, 7.6.4, 8.14.3 and 9.8.0. A wider reactor fixture built patched in all 42 cells: Maven 3.6.3, 3.8.8, 3.9.0, 3.9.2, 3.9.11 and 4.0.0-rc-7, each with 7 invocations.
+
+**Not yet implemented** (differences from this design):
+- Ledger entries still use ecosystem `maven`, not `jvm`.
+- Shared-fragment liveness comes from what the project files still reference, not from `RevertOpts.live_peers`.
+- There is no revert without a ledger.
+- GroupCommit does not capture the index, the script or `.gitattributes`.
+- Entries are not all planned before the vendor loop.
+- Maven:
+  - `not_build_root`;
+  - the `maven_f_outside_root` and `maven_mirror_of_all` warnings;
+  - wrapper detection;
+  - `--maven-config=none`;
+  - Maven 4 implicit subprojects.
+- Gradle: the settings `buildscript{}` in-block entry, parent-chain and BOM components in the verification file (only warned), and `gradle_below_6_8`.
+- `vendor --check`, the D7 byte-identity conformance test, and install-time checks against Central checksums.
