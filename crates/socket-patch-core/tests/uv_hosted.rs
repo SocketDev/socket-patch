@@ -13,7 +13,6 @@ fn patch(name: &str) -> DepOverride {
         token: "11111111-1111-4111-8111-111111111111".into(),
         patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
         artifact_url: format!("https://patch.socket.dev/pkg/{name}-1.0.0-py3-none-any.whl"),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some("a".repeat(64)),

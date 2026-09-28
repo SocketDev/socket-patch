@@ -2734,7 +2734,6 @@ async fn the_hosted_rewriters_own_output_reinventories() {
             sha256: Some("c".repeat(64)),
             ..Default::default()
         },
-        berry_zip_url: None,
         registry_override: None,
     };
     let rewritten = rewrite_registry_redirect(

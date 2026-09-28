@@ -221,7 +221,6 @@ fn binary_lock(release: &str, wiring: &Wiring) -> Vec<u8> {
         token: TOKEN.into(),
         patch_uuid: uuid,
         artifact_url,
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: Some(sri),

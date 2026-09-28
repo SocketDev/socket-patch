@@ -2523,7 +2523,6 @@ mod tests {
             token: "tok".to_string(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             artifact_url: artifact_url.to_string(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Default::default(),
         }

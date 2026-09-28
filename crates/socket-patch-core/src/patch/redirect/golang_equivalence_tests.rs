@@ -544,7 +544,6 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
         token: String::new(),
         patch_uuid: uuid(n),
         artifact_url: String::new(),
-        berry_zip_url: None,
         registry_override,
         integrity: Integrity {
             dirhash_h1: h1(rng),
@@ -642,7 +641,6 @@ fn single_walk_golang_rewrite_matches_oracle_on_fixtures() {
                 token: String::new(),
                 patch_uuid: uuid(n),
                 artifact_url: String::new(),
-                berry_zip_url: None,
                 registry_override: Some(RegistryOverride {
                     kind: "goproxy".into(),
                     index_url: "https://patch.socket.dev/patch-registry/golang".into(),
