@@ -712,6 +712,8 @@ worse, lets a warm cache silently serve unpatched bytes):
   0) — NOT `not_found`, which stays reserved for identifier-matches-nothing. `remove`'s default
   GC also extends (v5.0, additive) from blobs-only to blobs + diff archives + package archives
   (parity with rollback/repair/`scan --prune`; GC errors warn and continue, repair's posture).
+  Package archives (`.socket/packages/`) are legacy in v5.0: nothing writes or reads them, so
+  every GC sweep removes the whole directory.
 * **remove restores hosted pins (v5.0)**: an identifier matching hosted pins in the lockfiles
   (purl or patch uuid; v5 keeps no hosted ledger) restores each matched pin to its default
   upstream registry entry — the same restore as `rollback` (see "Hosted unwind coverage"), for every
@@ -1053,7 +1055,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
     {
       "path":        "package/index.js",
       "verified":    true,
-      "appliedVia":  "package" | "diff" | "blob"   // only on action=applied
+      "appliedVia":  "diff" | "blob"   // only on action=applied; v5.0 drops "package"
     }
   ],
   "bytes":      1234,                       // optional (downloaded/removed)

@@ -60,7 +60,6 @@ async fn apply_foo(root: &Path, primary: &Path) -> socket_patch_core::patch::app
     );
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };

@@ -4035,7 +4035,6 @@ mod dispatch_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };
@@ -4347,7 +4346,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };
@@ -4431,7 +4429,6 @@ mod variant_probe_tests {
         };
         let sources = PatchSources {
             blobs_path: tmp.path(),
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };
