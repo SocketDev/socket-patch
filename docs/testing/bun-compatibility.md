@@ -42,7 +42,7 @@ other npm lockfile flavors.
 | Version-0 lock (Bun 1.1.39–1.1.45 `--save-text-lockfile`) with `workspace:` packages — 2-tuple entries `"consumer": ["consumer@workspace:packages/consumer", { "dependencies": { … } }]` | Refused `redirect_bun_workspace_unsupported`, lock untouched, exit 0. Remedy: delete `bun.lock` and re-lock with Bun ≥ 1.2 (writes lockfileVersion 1, which hosted mode accepts; 2 on Bun ≥ 1.4). A plain in-place `bun install` bumps the version only when a workspace depends on another workspace (root → member — the matrix's `workspace` shape, the only shape it was measured on); otherwise Bun 1.2.0 keeps version 0 and 1.2.23+ fail to resolve (see [In-place re-versioning](#installer-boundaries-measured)). | Refused `vendor_bun_workspace_unsupported` (pre-version-2 policy, next row); its remedy tail for a version-0 lock says to re-lock with Bun ≥ 1.2 before trying `--mode hosted`, which refuses version 0 too. | Works. |
 | Version-1 lock (Bun 1.2–1.3 default) with `workspace:` packages — 1-tuple entries `["consumer@workspace:packages/consumer"]` | Rewritten (golden `lock-v1-workspace`; matrix 1.2.0–1.3.14 `workspace` / `workspace-nested`). | Refused `vendor_bun_workspace_unsupported` before any write. Policy, not a grammar limit: Bun 1.2.x–1.3.x resolve a workspace member's local-tarball path relative to the MEMBER (our root-relative tuple ENOENTs on `bun install`), 1.4.x relative to the lockfile, and a committed lockfileVersion-2 lock is the only proof that every consumer runs Bun ≥ 1.4 (1.3.x cannot parse v2). A deliberate over-approximation: a package declared only by the workspace ROOT vendors and installs on v1 too, but the lock cannot cheaply prove which workspace declares a hoisted entry. Remedy in the detail: delete `bun.lock`, re-run `bun install` with Bun ≥ 1.4 (an in-place `bun install` keeps the existing version), or — version 1 — use `--mode hosted`, which accepts version-1 workspace locks (a version-0 lock is told to re-lock with Bun ≥ 1.2 first). NOT refused: purls the vendor ledger wires at the selected uuid, purls whose every matching lock tuple already points into `.socket/vendor/npm/` (any uuid — a superseding patch re-pins in place; the lock-derived rule the engine uses), in-sync re-runs and `repair` rebuilds. `vendor` and the vendor step run the same preflight BEFORE a hosted → vendored takeover's revert, so a hosted-redirected purl on such a lock stays hosted-patched (`failed vendor_bun_workspace_unsupported`, lock and ledgers untouched; `vendor --dry-run` previews the same code). A `.socket/vendor/state.json` the preflight cannot read is `vendor_state_unreadable`, fail-closed. | Works. |
 | Version-2 lock (Bun 1.4+) with `workspace:` packages, nested versions included | Rewritten (golden `lock-v2-workspace-nested` — provenance: its nested same-version `consumer/left-pad` entry is a synthetic, grammar-valid extension of the 1.4.2 capture; bun hoists identical resolutions and never writes that entry itself, but bun 1.4.2 installs the fixture unchanged, and it is the only case pinning the rewrite of every matching tuple in one lock). | Vendored (matrix 1.4.0 / 1.4.2 `workspace`, `workspace-nested`, `already-vendored-workspace`). | Works. |
-| Binary `bun.lockb` (binary format revisions 1, 2 and 3) | Package resolution and integrity records are rewritten in place. The CLI does not spawn Bun or produce a text lock. | Native local-tarball wiring, committed artifact, repair and hosted ⇄ vendored takeover. | Registry package records are inventoried directly, including lockfile-only projects without `node_modules`. |
+| Binary `bun.lockb` (binary format revisions 1, 2 and 3) | Package resolution and integrity records are rewritten in place. The CLI does not spawn Bun or produce a text lock. `rollback` / `remove` cannot restore a hosted `bun.lockb` entry to its upstream registry entry (v5.0 keeps no ledger to replay, and the binary lock is not re-derived), so they refuse it with the `git checkout -- bun.lockb` remedy. | Native local-tarball wiring, committed artifact, repair and vendored → hosted takeover. Hosted → vendored refuses a hosted `bun.lockb` pin (`redirect_revert_failed`: its upstream entry cannot be restored), leaving it hosted. | Registry package records are inventoried directly, including lockfile-only projects without `node_modules`. |
 | Truncated, corrupt or unrecognized binary `bun.lockb` | Refused with `redirect_bun_lockb_invalid`, preserving the lock. | Refused with `vendor_bun_lockb_invalid` before downloads or artifact creation. | The inventory reports the malformed lock. |
 | `bun.lock` with a `lockfileVersion` ≥ 3, no integer version, or a `packages` section outside bun's single-line grammar | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory skips the lock. |
 
@@ -65,19 +65,21 @@ code-tagged refusal on stderr; `--dry-run` previews it as the additive
 `would_refuse` action. Agent-mode `get --save-only` is not preflighted.
 
 **Mode conversion.** Hosted → vendored (`scan` / `get --mode vendored`,
-`vendor` over a hosted-redirected `bun.lock`) reverts the hosted line to its
-pristine registry tuple, drops the redirect-ledger record and vendors
-(`vendor_takeover_reverted_redirect`; `vendor --dry-run` PROBES the revert and
-reports `vendor_would_revert_redirect`) — but only after the Bun vendored
+`vendor` over a hosted `bun.lock`) restores the hosted line to its upstream
+registry tuple — re-resolved from the npm registry, since v5.0 keeps no hosted
+ledger — and vendors (`vendor_takeover_reverted_redirect`; `vendor --dry-run`
+resolves the same restore and reports `vendor_would_revert_redirect`) — but only after the Bun vendored
 preflight accepted the lock: on a lock the vendored backend refuses (a
 pre-version-2 `workspace:` lock) `vendor`, the vendor step and the dry run
-report `failed vendor_bun_workspace_unsupported` BEFORE the revert, leaving the
-hosted wiring, the redirect ledger and `bun.lock` byte-untouched (the purl
+report `failed vendor_bun_workspace_unsupported` BEFORE the restore, leaving the
+hosted wiring and `bun.lock` byte-untouched (the purl
 stays hosted-patched). Vendored → hosted reverts the vendored
 wiring, ledger entry and committed artifact first
 (`redirect_takeover_reverted_vendored`). `rollback <purl>` / `remove <purl>`
-unwind one of several hosted bun records; an unscoped `rollback` unwinds
-everything through the whole-ledger replay. Pinned hermetically by
+restore one of several hosted bun packages to its upstream registry tuple; an
+unscoped `rollback` restores every hosted pin the same way (no ledger replay).
+A hosted `bun.lockb` pin cannot be restored and is refused (`git checkout --
+bun.lockb`). Pinned hermetically by
 `tests/in_process_vendor_bun_takeover.rs`, against real Bun by
 `tests/mode_migration_bun.rs` (CI: Bun 1.4.2 on three OSes, 1.3.14 on Linux)
 and by the matrix's `hosted-then-vendored` / `vendored-then-hosted` shapes.
@@ -93,10 +95,11 @@ normalized to the equivalent representation accepted by old and new readers;
 the original encoding is retained for rollback. Unknown versions and invalid
 offsets fail closed.
 
-Hosted redirects and vendoring use per-package binary snapshots in their ledgers.
-This allows a scoped rollback or mode switch to restore one package while keeping
-other packages wired. Whole-ledger reverse replay restores the original binary
-bytes when no external re-save occurred. Scoped rollback restores package
+Vendoring uses per-package binary snapshots in its ledger. This allows a scoped
+rollback or mode switch to restore one package while keeping other packages wired.
+Hosted mode (v5.0) keeps no ledger, and a hosted `bun.lockb` entry cannot be
+re-derived from the registry, so its rollback, `remove` and hosted → vendored
+takeover refuse it (restore `bun.lockb` from version control). Scoped rollback restores package
 resolutions and may retain equivalent binary normalization; if Bun itself has
 subsequently upgraded the binary schema, rollback preserves that schema and
 restores the original package resolutions.
@@ -275,8 +278,7 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   `["name@<url|path>", {meta}]`, spec and meta intact; 1.3.10, 1.3.14 and
   1.4.2 keep the digest. The CLI recognises that spelling as its own wiring:
   the repeat hosted run heals it (`redirected: 1`, no
-  `redirect_bun_entry_not_found`, a second ledger edit whose `original` is
-  the 2-tuple), the vendored re-run stays `already_vendored` and re-pins the
+  `redirect_bun_entry_not_found`), the vendored re-run stays `already_vendored` and re-pins the
   digest on disk, `repair` rebuilds through it, and `rollback` / scoped
   `rollback` / `remove` / `vendor --revert` / both takeovers accept the
   digest-less spelling of a recorded line and restore the registry original
@@ -374,9 +376,10 @@ asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
 
 **Every supported case verifies:**
 
-- the ledger record (redirect ledger for hosted, vendor ledger for vendored — no
-  mode writes `.socket/manifest.json`, and every cell asserts its absence) names
-  the expected published patch uuid;
+- the patch uuid (the hosted URL in the lock for hosted — v5.0 writes no hosted
+  ledger — and the vendor ledger record for vendored; no mode writes
+  `.socket/manifest.json`, and every cell asserts its absence) is the expected
+  published patch uuid;
 - a fresh `bun install --frozen-lockfile` and a fresh ordinary `bun install`
   (empty caches, no `node_modules`) install the record's exact `afterHash`
   bytes and leave the lockfile byte-identical;
