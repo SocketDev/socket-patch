@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use regex::Regex;
 
 use super::{Ctx, FormatResult, HostedPin, View};
+use crate::formats::cargo::CargoLock;
 
 /// How Cargo.lock names crates.io (cargo keeps this spelling even when it
 /// fetches over the sparse protocol).
@@ -30,18 +31,12 @@ fn registry_name(uuid: &str) -> String {
 
 struct LockHit {
     uuid: String,
+    /// The package's position in [`CargoLock::packages`].
+    index: usize,
     name: String,
     version: String,
     /// The hosted source string (`sparse+https://…/index/`).
     source: String,
-}
-
-fn quoted_field(block: &str, field: &str) -> Option<String> {
-    block.lines().find_map(|l| {
-        let rest = l.strip_prefix(field)?.trim_start().strip_prefix('=')?;
-        let v = rest.trim();
-        v.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
-    })
 }
 
 pub(crate) async fn restore(
@@ -66,29 +61,34 @@ pub(crate) async fn restore(
     if let Some(raw) = lock_raw {
         let crlf = raw.contains("\r\n");
         let mut lock = raw.replace("\r\n", "\n");
+        // The one parse of the lock: every package with its value spans.
+        let model = match CargoLock::parse(&lock) {
+            Ok(model) => model,
+            Err(_) => {
+                for pin in pins {
+                    result.refuse(&pin.uuid, "Cargo.lock does not parse as TOML");
+                }
+                return result;
+            }
+        };
         let mut hits: Vec<LockHit> = Vec::new();
-        let mut from = 0;
-        while let Some((start, end)) = super::super::next_lock_block(&lock, from) {
-            from = end.max(start + 1);
-            let block = &lock[start..end];
-            let Some(source) = quoted_field(block, "source") else {
+        for (i, pkg) in model.packages().iter().enumerate() {
+            let Some(source) = &pkg.source else {
                 continue;
             };
-            let Some(uuid) = ctx.hosted_uuid(&source) else {
+            let Some(uuid) = ctx.hosted_uuid(source) else {
                 continue;
             };
             if !by_uuid.contains_key(uuid.as_str()) {
                 continue;
             }
-            match (quoted_field(block, "name"), quoted_field(block, "version")) {
-                (Some(name), Some(version)) => hits.push(LockHit {
-                    uuid,
-                    name,
-                    version,
-                    source,
-                }),
-                _ => result.refuse(&uuid, "its Cargo.lock entry names no crate and version"),
-            }
+            hits.push(LockHit {
+                uuid,
+                index: i,
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                source: source.clone(),
+            });
         }
         let lookups = hits.iter().map(|h| async move {
             (
@@ -99,6 +99,7 @@ pub(crate) async fn restore(
         let cksums: BTreeMap<String, Result<String, String>> =
             futures_util::future::join_all(lookups).await.into_iter().collect();
         let mut changed = false;
+        let mut restored: Vec<(&LockHit, String)> = Vec::new();
         for hit in &hits {
             let cksum = match cksums.get(&hit.uuid) {
                 Some(Ok(c)) => c.clone(),
@@ -111,32 +112,26 @@ pub(crate) async fn restore(
             if result.refused.contains_key(&hit.uuid) {
                 continue;
             }
-            // The entry's own source + checksum lines.
-            let mut from = 0;
-            while let Some((start, end)) = super::super::next_lock_block(&lock, from) {
-                from = end.max(start + 1);
-                let block = lock[start..end].to_string();
-                if quoted_field(&block, "source").as_deref() != Some(hit.source.as_str())
-                    || quoted_field(&block, "name").as_deref() != Some(hit.name.as_str())
-                    || quoted_field(&block, "version").as_deref() != Some(hit.version.as_str())
-                {
-                    continue;
-                }
-                let rebuilt: Vec<String> = block
-                    .split('\n')
-                    .map(|l| {
-                        if l.starts_with("source = ") {
-                            format!("source = \"{CRATES_IO_SOURCE}\"")
-                        } else if l.starts_with("checksum = ") {
-                            format!("checksum = \"{cksum}\"")
-                        } else {
-                            l.to_string()
-                        }
-                    })
-                    .collect();
-                lock.replace_range(start..end, &rebuilt.join("\n"));
-                from = start + 1;
+            restored.push((hit, cksum));
+        }
+        // The entries' own source + checksum values, spliced at the parse's
+        // spans (every hit is a distinct block: its source names its uuid).
+        let spans = model.spans().expect("a lock parsed from text carries spans");
+        let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        for (hit, cksum) in &restored {
+            let at = &spans.packages[hit.index];
+            if let Some(source) = &at.source {
+                splices.push((source.clone(), format!("\"{CRATES_IO_SOURCE}\"")));
             }
+            if let Some(checksum) = &at.checksum {
+                splices.push((checksum.clone(), format!("\"{cksum}\"")));
+            }
+        }
+        splices.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+        for (range, with) in splices {
+            lock.replace_range(range, &with);
+        }
+        for (hit, cksum) in &restored {
             // Dependents' full-id references and the v1 `[metadata]` key.
             lock = lock.replace(&format!("({})", hit.source), &format!("({CRATES_IO_SOURCE})"));
             let metadata_key = format!(
