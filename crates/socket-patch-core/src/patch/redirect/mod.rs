@@ -5123,7 +5123,9 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
     // socket-only and every other package would fail. Seed the implicit default
     // nuget.org source so the catch-all has a real target (unless the config
     // already has one). Only relevant when we are about to CREATE the mapping.
-    let creating_mapping = !out.contains("<packageSourceMapping>");
+    // Comment-aware, and any whitespace or attributes in the open tag
+    // (`<packageSourceMapping >` is valid XML NuGet reads).
+    let creating_mapping = nuget_source::mapping_open_end(&nuget_source::visible(&out)).is_none();
     // "Already has one" is decided by the parsed <packageSources> keys ALONE:
     // a whole-file "nuget.org" probe is satisfied by text that defines no
     // source (a defaultPushSource URL, a <disabledPackageSources> entry, a
@@ -5145,9 +5147,9 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
         // own): append ONLY this source's mapping — every other source is
         // already covered. It goes after the section's last `<clear/>`,
         // which would otherwise discard it.
-        let open = "<packageSourceMapping>";
-        let open_end = out.find(open)? + open.len();
-        let at = nuget_source::child_insert_at(&out, open_end, "</packageSourceMapping");
+        let visible = nuget_source::visible(&out);
+        let open_end = nuget_source::mapping_open_end(&visible)?;
+        let at = nuget_source::child_insert_at(&visible, open_end, "</packageSourceMapping");
         out = format!("{}\n{socket_mapping}{}", &out[..at], &out[at..]);
     } else {
         // Creating the mapping from scratch. Once ANY <packageSourceMapping>
@@ -5176,8 +5178,7 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
         // XML); a literal replacen would silently drop the mapping.
         let close_re = Regex::new(r"</configuration\s*>")
             .expect("static configuration close-tag regex is valid");
-        let m = close_re.find(&out)?;
-        let at = m.start();
+        let at = close_re.find(&nuget_source::visible(&out))?.start();
         out = format!("{}{map_block}\n{}", &out[..at], &out[at..]);
     }
     Some(out)
@@ -5205,7 +5206,10 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
     // vendor/nuget_feed twin already tolerates the spelling.
     let open_tag = Regex::new(r"<packageSources(?:\s[^>]*)?>")
         .expect("static packageSources open-tag regex is valid");
-    if let Some(m) = self_closing.find(config) {
+    // Anchors come from the comment-blanked view (same offsets): a
+    // commented-out section must not capture the source.
+    let visible = nuget_source::visible(config);
+    if let Some(m) = self_closing.find(&visible) {
         let mut out = String::with_capacity(config.len() + source_line.len() + 40);
         out.push_str(&config[..m.start()]);
         out.push_str(&format!(
@@ -5214,7 +5218,7 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
         out.push_str(&config[m.end()..]);
         Some(out)
     } else if let Some(m) = open_tag
-        .find(config)
+        .find(&visible)
         // An attribute-carrying self-closing form (`<packageSources … />`,
         // schema-invalid but cheap to guard) has no children span: fall
         // through to the from-scratch branch rather than insert outside it.
@@ -5222,7 +5226,7 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
     {
         // After the section's last `<clear/>`, which would otherwise
         // discard the source.
-        let end = nuget_source::child_insert_at(config, m.end(), "</packageSources");
+        let end = nuget_source::child_insert_at(&visible, m.end(), "</packageSources");
         Some(format!(
             "{}\n{source_line}{}",
             &config[..end],
@@ -5235,7 +5239,7 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
         // source undefined while the mapping still lands.
         let open_re = Regex::new(r"<configuration(\s[^>]*)?>")
             .expect("static configuration open-tag regex is valid");
-        let end = open_re.find(config)?.end();
+        let end = open_re.find(&visible)?.end();
         Some(format!(
             "{}\n  <packageSources>\n{source_line}\n  </packageSources>{}",
             &config[..end],
@@ -5269,8 +5273,10 @@ static NUGET_ADD_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn nuget_package_source_keys(config: &str) -> Vec<String> {
+    // A commented-out `<add>` (or section) is no source NuGet reads.
+    let visible = nuget_source::visible(config);
     let scope = NUGET_PACKAGE_SOURCES_REGION_RE
-        .captures(config)
+        .captures(&visible)
         .map(|c| {
             c.get(1)
                 .expect("region_re always captures group 1")

@@ -6,6 +6,11 @@
 //! undefined (NU1100) or the patched id falls back to `*` on nuget.org while
 //! the lock pins the patched contentHash (NU1403). Entries land after the
 //! section's last `<clear/>`, or right after its open tag when it has none.
+//!
+//! NuGet never reads a comment, so every anchor is found in the
+//! comment-blanked view ([`visible`], same offsets as the text): a
+//! commented-out section must not capture an edit, and a commented-out
+//! `<add>` is not a source.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -19,6 +24,28 @@ use crate::vendor::nuget_config::CONFIG_NAMES;
 static NUGET_CLEAR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"<clear\s*(?:/>|>\s*</clear\s*>)").expect("static clear regex is valid")
 });
+
+/// `<packageSourceMapping>` open tag, any whitespace or attributes.
+static NUGET_MAPPING_OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<packageSourceMapping(?:\s[^>]*)?>")
+        .expect("static packageSourceMapping open-tag regex is valid")
+});
+
+/// `text` with every comment blanked to spaces, offsets preserved (the
+/// vendored backend's reader).
+pub(super) fn visible(text: &str) -> String {
+    crate::vendor::nuget_feed::blank_comments(text)
+}
+
+/// The end of the first `<packageSourceMapping …>` open tag in `visible`
+/// (a self-closing form has no children span and does not count), or
+/// `None` when the config has no mapping section.
+pub(super) fn mapping_open_end(visible: &str) -> Option<usize> {
+    NUGET_MAPPING_OPEN_RE
+        .find_iter(visible)
+        .find(|m| !m.as_str().ends_with("/>"))
+        .map(|m| m.end())
+}
 
 /// The offset to insert a section child at: just past the last `<clear/>`
 /// between `open_end` (the end of the section's open tag) and the section's
@@ -118,18 +145,27 @@ mod tests {
     }
 
     /// Re-running over a golden's own output is a no-op: the Socket source
-    /// after the `<clear/>` reads as wired, the lock is already pinned.
+    /// (after any `<clear/>`, outside comments, in whichever config spelling)
+    /// reads as wired and the lock is already pinned.
     #[test]
-    fn rerun_over_clear_goldens_changes_nothing() {
+    fn rerun_over_goldens_changes_nothing() {
         for case in [
             "clear-sources",
             "clear-mapping",
             "clear-both",
             "clear-sources-only-cleared",
+            "http-loopback",
+            "spelling-mixed-case",
+            "spelling-title-case",
+            "commented-mapping",
+            "spaced-open-tag",
+            "commented-sources",
         ] {
             let mut files = BTreeMap::new();
-            for rel in ["nuget.config", "packages.lock.json"] {
-                files.insert(rel.to_string(), fixture(case, &format!("expected/{rel}")));
+            let expected = format!("{FIXTURES}/{case}/expected");
+            for entry in std::fs::read_dir(&expected).expect("golden expected dir") {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                files.insert(name.clone(), fixture(case, &format!("expected/{name}")));
             }
             let r = rewrite_registry_redirect(&files, &overrides(case));
             assert!(r.files.is_empty(), "{case}: {:?}", r.files.keys());
@@ -160,6 +196,18 @@ mod tests {
             .rfind("<add key=\"socket-patch-")
             .expect("socket source");
         assert!(socket > clear, "{out}");
+    }
+
+    #[test]
+    fn mapping_open_tag_ignores_comments_and_self_closing_forms() {
+        let at = |text: &str| mapping_open_end(&visible(text));
+        assert_eq!(at("<configuration>\n</configuration>"), None);
+        assert_eq!(at("<!-- <packageSourceMapping> -->"), None);
+        assert_eq!(at("<packageSourceMapping />"), None);
+        let spaced = "<!-- <packageSourceMapping> --><packageSourceMapping >";
+        assert_eq!(at(spaced), Some(spaced.len()));
+        let attrs = "<packageSourceMapping\n  a=\"b\">";
+        assert_eq!(at(attrs), Some(attrs.len()));
     }
 
     #[test]

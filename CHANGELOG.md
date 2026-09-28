@@ -914,6 +914,14 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Hosted NuGet redirects ignore commented-out config and accept a
+  spaced `<packageSourceMapping >`.** A commented-out
+  `<packageSourceMapping>` used to capture the Socket mapping inside the
+  comment (so NuGet never saw it), a commented-out `<add>` was fanned a
+  `*` mapping, and `<packageSourceMapping >` got a duplicate section. The
+  hosted rewriter now reads the config the way NuGet does, skipping
+  comments and tolerating whitespace or attributes in the open tag.
+
 - **NuGet redirects and vendoring edit the config NuGet actually reads.**
   Hosted mode only looked for `nuget.config`, and vendored mode missed
   `NuGet.config`, so on a case-sensitive filesystem a project configured

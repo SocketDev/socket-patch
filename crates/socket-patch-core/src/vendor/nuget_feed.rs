@@ -1292,7 +1292,7 @@ fn build_config_edit(
 /// one must be invisible to the wiring logic — the nuget twin of maven's
 /// `find_wireable_anchor` comment masking. An unterminated comment blanks
 /// through EOF (fail-closed).
-fn blank_comments(text: &str) -> String {
+pub(crate) fn blank_comments(text: &str) -> String {
     let mut out = text.as_bytes().to_vec();
     let mut from = 0;
     while let Some(rel) = text[from..].find("<!--") {
