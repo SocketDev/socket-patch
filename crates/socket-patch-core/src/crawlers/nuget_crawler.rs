@@ -6,9 +6,6 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
 
-#[cfg(test)]
-mod oracle;
-
 /// NuGet/.NET ecosystem crawler for discovering packages in global cache,
 /// legacy `packages/` folders, and `obj/` restore layouts.
 pub struct NuGetCrawler;
@@ -1289,14 +1286,13 @@ mod tests {
         );
     }
 
-    // ── Equivalence with the per-call async scan (oracle) ─────────────
+    // ── Seeded package roots, pinned by golden ───────────────────────
 
-    mod equivalence {
-        use super::super::oracle::LegacyNuGetCrawler;
+    mod sweep {
         use super::*;
         use crate::crawlers::test_tree::{
-            crawl_goldens_apply, map_rows, mkdir, rel_map_rows, rel_rows, rows, symlink,
-            tree_listing, write, PermGuard,
+            crawl_goldens_apply, mkdir, rel_map_rows, rel_rows, symlink, tree_listing, write,
+            PermGuard,
         };
         use crate::golden::Golden;
         use crate::test_rng::Rng;
@@ -1398,13 +1394,13 @@ mod tests {
         /// The case-insensitive legacy fallback — the only reader of the
         /// package root's memoized listing — over several PURLs in one
         /// call: the listing is built on the first PURL that needs it and
-        /// reused by the rest, matching the per-PURL oracle either way.
+        /// reused by the rest, answering as a per-PURL lookup would.
         ///
         /// The fallback can only MATCH on a case-sensitive filesystem:
         /// where `Foo.1.0` and `foo.1.0` are one directory, the exact-case
         /// probe above it already resolves every case variant, so nothing
-        /// reaches the fallback with a name to find (the randomized oracle
-        /// test has the same blind spot locally — it distinguishes the two
+        /// reaches the fallback with a name to find (the randomized sweep
+        /// has the same blind spot locally — it distinguishes the two
         /// layouts by case alone). The on-disk spelling below is therefore
         /// asserted only where the filesystem can tell them apart, and CI
         /// is where that happens.
@@ -1434,8 +1430,6 @@ mod tests {
                 .find_by_purls(&root, &purls)
                 .await
                 .unwrap();
-            let old = LegacyNuGetCrawler::find_by_purls(&root, &purls).await;
-            assert_eq!(map_rows(&new), map_rows(&old));
             assert_eq!(new.len(), 2, "{new:?}");
             let mut g = Golden::new(
                 "crawl_nuget_legacy_fallback",
@@ -1490,7 +1484,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn randomized_package_dirs_match_the_async_oracle() {
+        async fn randomized_package_dirs_match_golden() {
             let (mut crawled, mut found) = (0, 0);
             let mut g = Golden::new(
                 "crawl_nuget_packages",
@@ -1510,20 +1504,11 @@ mod tests {
                     global_prefix: Some(root.clone()),
                 };
                 let new = NuGetCrawler::new().crawl_all(&options).await;
-                let old = LegacyNuGetCrawler::crawl_all(&options).await;
-                assert_eq!(rows(&new), rows(&old), "seed {seed}: crawl_all");
-
-                let purls = probe_purls(&mut rng, &old);
+                let purls = probe_purls(&mut rng, &new);
                 let new_found = NuGetCrawler::new()
                     .find_by_purls(&root, &purls)
                     .await
                     .unwrap();
-                let old_found = LegacyNuGetCrawler::find_by_purls(&root, &purls).await;
-                assert_eq!(
-                    map_rows(&new_found),
-                    map_rows(&old_found),
-                    "seed {seed}: find_by_purls"
-                );
                 g.case(
                     seed,
                     &(input, &purls),
@@ -1532,8 +1517,8 @@ mod tests {
                         rel_map_rows(tmp.path(), &new_found),
                     ),
                 );
-                crawled += old.len();
-                found += old_found.len();
+                crawled += new.len();
+                found += new_found.len();
             }
             assert!(
                 crawled > 100 && found > 100,

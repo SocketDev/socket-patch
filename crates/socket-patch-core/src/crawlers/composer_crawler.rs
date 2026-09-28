@@ -7,9 +7,6 @@ use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, is_file, normalize_lexically, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
-#[cfg(test)]
-mod oracle;
-
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
 /// vendor directories.
 pub struct ComposerCrawler;
@@ -1729,13 +1726,12 @@ mod tests {
         );
     }
 
-    // ── Equivalence with the per-package async stats (oracle) ─────────
+    // ── Seeded vendor trees, pinned by golden ────────────────────────
 
-    mod equivalence {
-        use super::super::oracle::LegacyComposerCrawler;
+    mod sweep {
         use super::*;
         use crate::crawlers::test_tree::{
-            crawl_goldens_apply, map_rows, mkdir, rel_map_rows, rel_rows, rows, symlink,
+            crawl_goldens_apply, mkdir, rel_map_rows, rel_rows, symlink,
             tree_listing, write,
         };
         use crate::golden::Golden;
@@ -1797,7 +1793,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn randomized_vendor_trees_match_the_async_oracle() {
+        async fn randomized_vendor_trees_match_golden() {
             let (mut crawled, mut found) = (0, 0);
             let mut g = Golden::new(
                 "crawl_composer_vendor",
@@ -1815,10 +1811,8 @@ mod tests {
                     global_prefix: None,
                 };
                 let new = ComposerCrawler::new().crawl_all(&options).await;
-                let old = LegacyComposerCrawler::crawl_all(&options).await;
-                assert_eq!(rows(&new), rows(&old), "seed {seed}: crawl_all");
 
-                let mut purls: Vec<String> = old.iter().map(|p| p.purl.clone()).collect();
+                let mut purls: Vec<String> = new.iter().map(|p| p.purl.clone()).collect();
                 for (name, version) in &packages {
                     purls.push(format!("pkg:composer/{name}@{version}"));
                     purls.push(format!(
@@ -1832,12 +1826,6 @@ mod tests {
                     .find_by_purls(&vendor, &purls)
                     .await
                     .unwrap();
-                let old_found = LegacyComposerCrawler::find_by_purls(&vendor, &purls).await;
-                assert_eq!(
-                    map_rows(&new_found),
-                    map_rows(&old_found),
-                    "seed {seed}: find_by_purls"
-                );
                 g.case(
                     seed,
                     &input,
@@ -1846,8 +1834,8 @@ mod tests {
                         rel_map_rows(tmp.path(), &new_found),
                     ),
                 );
-                crawled += old.len();
-                found += old_found.len();
+                crawled += new.len();
+                found += new_found.len();
             }
             assert!(
                 crawled > 50 && found > 50,

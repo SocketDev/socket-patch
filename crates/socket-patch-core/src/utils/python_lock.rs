@@ -5,10 +5,6 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Tab
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::{sha256_hex, sha256_prefixed};
 
-#[cfg(test)]
-#[path = "python_lock_oracle.rs"]
-pub(crate) mod oracle;
-
 #[derive(Clone, Copy, Debug)]
 pub enum ArtifactSource<'a> {
     Url(&'a str),

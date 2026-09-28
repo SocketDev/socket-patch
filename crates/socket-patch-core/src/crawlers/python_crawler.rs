@@ -8,9 +8,6 @@ use crate::utils::fs::{
 };
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
-#[cfg(test)]
-mod oracle;
-
 // ---------------------------------------------------------------------------
 // Python command discovery
 // ---------------------------------------------------------------------------
@@ -2732,14 +2729,13 @@ mod tests {
         assert!(!result.contains_key("pkg:pypi/flask@3.0.0"));
     }
 
-    // ── Equivalence with the per-call async scan (oracle) ─────────────
+    // ── Seeded site-packages, pinned by golden ───────────────────────
 
-    mod equivalence {
-        use super::super::oracle::{self, LegacyPythonCrawler};
+    mod sweep {
         use super::*;
         use crate::crawlers::test_tree::{
-            crawl_goldens_apply, fifo, map_rows, mkdir, rel_map_rows, rel_rows, rows, symlink,
-            tree_listing, write, write_bytes, PermGuard,
+            crawl_goldens_apply, fifo, mkdir, rel_map_rows, rel_rows, rows, symlink, tree_listing,
+            write, write_bytes, PermGuard,
         };
         use crate::golden::Golden;
         use crate::test_rng::Rng;
@@ -2786,7 +2782,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn randomized_site_packages_match_the_async_oracle() {
+        async fn randomized_site_packages_match_golden() {
             let (mut crawled, mut found) = (0, 0);
             let mut g = Golden::new(
                 "crawl_python_site_packages",
@@ -2802,21 +2798,14 @@ mod tests {
                 perms.apply();
 
                 let listing = list_dist_info_packages(&root).await;
-                assert_eq!(
-                    listing,
-                    oracle::list_dist_info_packages(&root).await,
-                    "seed {seed}: listing"
-                );
                 let options = CrawlerOptions {
                     cwd: tmp.path().to_path_buf(),
                     global: false,
                     global_prefix: Some(root.clone()),
                 };
                 let new = PythonCrawler::new().crawl_all(&options).await;
-                let old = LegacyPythonCrawler::crawl_all(&options).await;
-                assert_eq!(rows(&new), rows(&old), "seed {seed}: crawl_all");
 
-                let mut purls: Vec<String> = old.iter().map(|p| p.purl.clone()).collect();
+                let mut purls: Vec<String> = new.iter().map(|p| p.purl.clone()).collect();
                 purls.push("pkg:pypi/Flask-Cors@1.0".to_string());
                 purls.push("pkg:pypi/requests@1.0%2Blocal".to_string());
                 purls.push("pkg:pypi/DUP@1.0".to_string());
@@ -2826,13 +2815,14 @@ mod tests {
                     .find_by_purls(&root, &purls)
                     .await
                     .unwrap();
-                let found_old = LegacyPythonCrawler::find_by_purls(&root, &purls).await;
-                assert_eq!(map_rows(&found_new), map_rows(&found_old));
-                // Each PURL on its own, from one listing.
+                // Each PURL on its own, from one listing, answers as a
+                // one-PURL lookup would.
                 let each = PythonCrawler::new().find_each_by_purl(&root, &purls).await;
                 for (purl, got) in purls.iter().zip(&each) {
-                    let single =
-                        LegacyPythonCrawler::find_by_purls(&root, std::slice::from_ref(purl)).await;
+                    let single = PythonCrawler::new()
+                        .find_by_purls(&root, std::slice::from_ref(purl))
+                        .await
+                        .unwrap();
                     assert_eq!(
                         got.as_ref().map(|p| rows(std::slice::from_ref(p))),
                         single.get(purl).map(|p| rows(std::slice::from_ref(p))),
@@ -2856,7 +2846,7 @@ mod tests {
                         each_rows,
                     ),
                 );
-                crawled += old.len();
+                crawled += new.len();
                 found += found_new.len();
             }
             assert!(

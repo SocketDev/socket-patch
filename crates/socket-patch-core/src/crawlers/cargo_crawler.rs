@@ -6,9 +6,6 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, run_blocking};
 
-#[cfg(test)]
-mod oracle;
-
 // ---------------------------------------------------------------------------
 // Cargo.toml minimal parser
 // ---------------------------------------------------------------------------
@@ -1126,13 +1123,12 @@ version = "fake"
         assert_eq!(packages[0].purl, "pkg:cargo/serde@1.0.200");
     }
 
-    // ── Equivalence with the per-call async scan (oracle) ─────────────
+    // ── Seeded source trees, pinned by golden ────────────────────────
 
-    mod equivalence {
-        use super::super::oracle::LegacyCargoCrawler;
+    mod sweep {
         use super::*;
         use crate::crawlers::test_tree::{
-            crawl_goldens_apply, mkdir, rel_rows, rows, symlink, tree_listing, write, PermGuard,
+            crawl_goldens_apply, mkdir, rel_rows, symlink, tree_listing, write, PermGuard,
         };
         use crate::golden::Golden;
         use crate::test_rng::Rng;
@@ -1188,7 +1184,7 @@ version = "fake"
         }
 
         #[tokio::test]
-        async fn randomized_sources_match_the_async_oracle() {
+        async fn randomized_sources_match_golden() {
             let mut total = 0;
             let mut g = Golden::new(
                 "crawl_cargo_sources",
@@ -1208,10 +1204,8 @@ version = "fake"
                     global_prefix: Some(root.clone()),
                 };
                 let new = CargoCrawler::new().crawl_all(&options).await;
-                let old = LegacyCargoCrawler::crawl_all(&options).await;
-                assert_eq!(rows(&new), rows(&old), "seed {seed}");
                 g.case(seed, &input, &rel_rows(tmp.path(), &new));
-                total += old.len();
+                total += new.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
             if crawl_goldens_apply(true) {
@@ -1221,7 +1215,7 @@ version = "fake"
 
         /// Local mode: a Cargo project with a `vendor/` tree.
         #[tokio::test]
-        async fn vendor_tree_matches_the_async_oracle() {
+        async fn vendor_tree_matches_golden() {
             let tmp = tempfile::tempdir().unwrap();
             let mut perms = PermGuard::default();
             let mut rng = Rng::new(7);
@@ -1240,9 +1234,7 @@ version = "fake"
                 global_prefix: None,
             };
             let new = CargoCrawler::new().crawl_all(&options).await;
-            let old = LegacyCargoCrawler::crawl_all(&options).await;
-            assert!(!old.is_empty());
-            assert_eq!(rows(&new), rows(&old));
+            assert!(!new.is_empty());
             let mut g = Golden::new(
                 "crawl_cargo_vendor",
                 "A seeded Cargo project vendor/ tree, crawled locally.",

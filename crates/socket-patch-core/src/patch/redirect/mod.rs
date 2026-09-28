@@ -44,9 +44,7 @@ pub mod npmrc;
 mod pdm;
 mod pipenv;
 pub mod presence;
-// The pnpm entry grammar and hosted planner live with the format's model.
-#[cfg(test)]
-use crate::formats::pnpm::grammar as pnpm;
+// The pnpm hosted planner lives with the format's model.
 use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
@@ -63,8 +61,6 @@ mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
-#[cfg(test)]
-mod rewrite_oracle_support;
 mod staged;
 mod state;
 mod hosted_url;

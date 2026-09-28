@@ -13,7 +13,7 @@ use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 use crate::vendor::vlt_lock_text::decode_vlt_dep_id;
 
 #[cfg(test)]
-mod oracle;
+mod sweep_tests;
 
 /// Directories to skip when searching for workspace node_modules.
 const SKIP_DIRS: &[&str] = &[

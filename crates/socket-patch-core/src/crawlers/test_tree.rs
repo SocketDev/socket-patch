@@ -124,26 +124,6 @@ pub(crate) fn rows(pkgs: &[CrawledPackage]) -> Vec<Row> {
         .collect()
 }
 
-/// A `find_by_purls` map as sorted comparable rows.
-pub(crate) fn map_rows(
-    map: &std::collections::HashMap<String, CrawledPackage>,
-) -> std::collections::BTreeMap<String, Row> {
-    map.iter()
-        .map(|(k, p)| {
-            (
-                k.clone(),
-                (
-                    p.name.clone(),
-                    p.version.clone(),
-                    p.namespace.clone(),
-                    p.purl.clone(),
-                    p.path.clone(),
-                ),
-            )
-        })
-        .collect()
-}
-
 /// A crawled package as a row with its path relative to `base` (the sweep's
 /// tempdir), so the row is the same on every run.
 pub(crate) type RelRow = (String, String, Option<String>, String, String);

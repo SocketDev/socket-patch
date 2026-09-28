@@ -7,9 +7,6 @@ use super::walk_pool::{par_map, run_walk};
 use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
 
-#[cfg(test)]
-mod oracle;
-
 /// How many `.pom` paths the parallel parse takes at a time. Every phase
 /// stays in walk order whatever the chunk, so this only bounds peak
 /// memory: a real `~/.m2` holds 10-50k artifacts (corporate caches many
@@ -2165,10 +2162,9 @@ mod tests {
         assert_eq!(paths[0], dir.path().to_path_buf());
     }
 
-    // ── Equivalence with the serial scan (oracle) ────────────────────
+    // ── Seeded repositories, pinned by golden ────────────────────────
 
-    mod equivalence {
-        use super::super::oracle::LegacyMavenCrawler;
+    mod sweep {
         use super::*;
         use crate::crawlers::test_tree::{
             crawl_goldens_apply, mkdir, rel, rel_rows, rows, symlink, tree_listing, write,
@@ -2246,11 +2242,11 @@ mod tests {
 
         /// Chunking the parallel parse changes nothing: the walk, the
         /// parse and the dedup each stay in walk order, so every chunk
-        /// size — one POM at a time included — produces the serial
-        /// oracle's rows, with the first-seen version dir still winning
-        /// across a chunk boundary.
+        /// size — one POM at a time included — produces the same rows,
+        /// with the first-seen version dir still winning across a chunk
+        /// boundary.
         #[tokio::test]
-        async fn every_parse_chunk_size_matches_the_serial_oracle() {
+        async fn every_parse_chunk_size_matches_golden() {
             let mut g = Golden::new(
                 "crawl_maven_parse_chunks",
                 "One seeded ~/.m2 repository, scanned at one parse chunk size.",
@@ -2269,18 +2265,18 @@ mod tests {
                     global: false,
                     global_prefix: Some(root.clone()),
                 };
-                let old = LegacyMavenCrawler::crawl_all(&options).await;
+                let crawled = MavenCrawler::new().crawl_all(&options).await;
                 for chunk in [0usize, 1, 2, 3, 7, 4096] {
                     let mut seen = HashSet::new();
                     let found = MavenCrawler.scan_maven_repo_chunked(&root, &mut seen, chunk);
-                    assert_eq!(rows(&found), rows(&old), "seed {seed}, chunk {chunk}");
+                    assert_eq!(rows(&found), rows(&crawled), "seed {seed}, chunk {chunk}");
                     g.case(
                         format!("{seed}/{chunk}"),
                         &input,
                         &rel_rows(tmp.path(), &found),
                     );
                 }
-                total += old.len();
+                total += crawled.len();
             }
             assert!(total > 50, "vacuous fixtures: {total}");
             if crawl_goldens_apply(true) {
@@ -2290,12 +2286,12 @@ mod tests {
 
         /// The no-walk-pool fallback (the OS refused even one walk thread,
         /// so `run_walk` runs the walk on the calling blocking-pool thread)
-        /// scans exactly as the serial oracle does. A bare rayon iterator
+        /// scans exactly as the pooled walk does. A bare rayon iterator
         /// here would instead build rayon's GLOBAL pool from that thread —
         /// which needs the threads the OS just refused, and panics when it
         /// cannot get them — where the serial scan simply finished.
         #[tokio::test]
-        async fn no_pool_repos_match_the_serial_oracle() {
+        async fn no_pool_repos_match_golden() {
             let mut g = Golden::new(
                 "crawl_maven_no_pool",
                 "One seeded ~/.m2 repository, crawled with no walk pool.",
@@ -2316,10 +2312,8 @@ mod tests {
                     global_prefix: Some(root.clone()),
                 };
                 let new = MavenCrawler::new().crawl_all(&options).await;
-                let old = LegacyMavenCrawler::crawl_all(&options).await;
-                assert_eq!(rows(&new), rows(&old), "no pool, seed {seed}");
                 g.case(seed, &input, &rel_rows(tmp.path(), &new));
-                total += old.len();
+                total += new.len();
             }
             assert!(total > 50, "vacuous fixtures: {total}");
             if crawl_goldens_apply(true) {
@@ -2334,7 +2328,7 @@ mod tests {
         /// included (`extra.pom`, unreadable and non-UTF-8 files, parent-only
         /// and comment-only POMs).
         #[tokio::test]
-        async fn consistent_repos_match_the_content_first_scan() {
+        async fn consistent_repos_match_golden() {
             let mut g = Golden::new(
                 "crawl_maven_consistent",
                 "One seeded ~/.m2 repository whose POMs agree with their dirs, crawled.",
@@ -2360,10 +2354,8 @@ mod tests {
                     global_prefix: Some(root.clone()),
                 };
                 let new = MavenCrawler::new().crawl_all(&options).await;
-                let old = super::super::oracle::crawl_all_content_first(&options).await;
-                assert_eq!(rows(&new), rows(&old), "seed {seed}");
                 g.case(seed, &input, &rel_rows(tmp.path(), &new));
-                total += old.len();
+                total += new.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
             if crawl_goldens_apply(true) {
@@ -2378,7 +2370,7 @@ mod tests {
         /// scan exactly as the content-first scan had it — the parse and
         /// path-rescue arms included.
         #[tokio::test]
-        async fn misrooted_repos_match_the_content_first_scan() {
+        async fn misrooted_repos_match_golden() {
             let mut g = Golden::new(
                 "crawl_maven_misrooted",
                 "One seeded ~/.m2 repository, crawled from a misplaced root.",
@@ -2412,14 +2404,12 @@ mod tests {
                         global_prefix: Some(misroot.clone()),
                     };
                     let new = MavenCrawler::new().crawl_all(&options).await;
-                    let old = super::super::oracle::crawl_all_content_first(&options).await;
-                    assert_eq!(rows(&new), rows(&old), "seed {seed}, {}", misroot.display());
                     g.case(
                         format!("{seed}/{}", rel(tmp.path(), &misroot)),
                         &input,
                         &rel_rows(tmp.path(), &new),
                     );
-                    total += old.len();
+                    total += new.len();
                 }
             }
             assert!(total > 400, "vacuous fixtures: {total}");
@@ -2429,7 +2419,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn randomized_repos_match_the_serial_oracle() {
+        async fn randomized_repos_match_golden() {
             let mut g = Golden::new("crawl_maven_repos", "One seeded ~/.m2 repository, crawled.");
             let mut total = 0;
             for seed in 0..64u64 {
@@ -2446,10 +2436,8 @@ mod tests {
                     global_prefix: Some(root.clone()),
                 };
                 let new = MavenCrawler::new().crawl_all(&options).await;
-                let old = LegacyMavenCrawler::crawl_all(&options).await;
-                assert_eq!(rows(&new), rows(&old), "seed {seed}");
                 g.case(seed, &input, &rel_rows(tmp.path(), &new));
-                total += old.len();
+                total += new.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
             if crawl_goldens_apply(true) {
