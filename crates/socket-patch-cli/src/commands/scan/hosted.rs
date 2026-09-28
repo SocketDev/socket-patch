@@ -1041,6 +1041,7 @@ fn gem_sha_key(purl: &str) -> (String, String) {
 /// then rewrite ONLY those dependencies' lockfile/registry-config entries to
 /// point at the hosted vendored patches (the byte-identical counterpart of the
 /// GitHub-app registry mode). No artifact bytes land in the repo.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_redirect(
     args: &ScanArgs,
     api_client: &socket_patch_core::api::client::ApiClient,
@@ -1058,13 +1059,19 @@ pub(super) async fn run_redirect(
     // handed to the VEX step so it does not walk the tree for the npm
     // roots again.
     npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    // The merged recorded view (manifest > hosted pins > vendor ledger) the
+    // rollout classifies against, whether a batch failed, and the stage
+    // that holds this directory's budget.
+    recorded: Option<&socket_patch_core::manifest::schema::PatchManifest>,
+    batch_failed: bool,
+    stage: &mut super::rollout::Stage,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
-    let selected = match discover_selected(
+    let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
-        &args.common,
+        false,
         false,
         false,
         telemetry,
@@ -1072,7 +1079,7 @@ pub(super) async fn run_redirect(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(d) => d,
         // Hosted mode has no discovery envelope to fold the message into at
         // this point (it builds its `redirect` result further down).
         // `discover_selected` already printed the message to stderr; a
@@ -1089,13 +1096,22 @@ pub(super) async fn run_redirect(
             return code;
         }
     };
+    let rows = super::classified_rows(
+        stage,
+        &discovered,
+        recorded,
+        batch_failed,
+        all_packages_with_patches,
+        scan_result.as_mut(),
+    );
 
     // The redirect body consumes the selection only as (purl, uuid) pairs —
     // the seam `get --mode hosted` injects its advisory-pinned selection
-    // through (see `run_redirect_selected`).
-    let pairs: Vec<(String, String)> = selected
+    // through (see `run_redirect_selected`). ALREADY rows carry the
+    // recorded uuid, so a re-scan re-confirms the pin instead of swapping it.
+    let pairs: Vec<(String, String)> = rows
         .iter()
-        .map(|s| (s.purl.clone(), s.uuid.clone()))
+        .map(|r| (r.writer.purl.clone(), r.writer.uuid.clone()))
         .collect();
     run_redirect_selected(
         &args.common,
@@ -1105,8 +1121,256 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
+        Some(super::rollout::Gate { stage, rows }),
     )
     .await
+}
+
+/// One granted reference in [`run_redirect_selected`]: the purl it was
+/// granted for plus the rewriter override built from it. The purl is what
+/// the takeover, the skip records and the confirmation probe key on;
+/// everything the probe needs AFTER the rewrite to decide whether the dep
+/// was actually redirected (artifact URL, registry index URL, fail-closed
+/// maven's suffixed version) already rides the override. The single vector
+/// is filtered in place by every withhold/refusal step, and the rewriters'
+/// `overrides` slice is materialized from it once, after the last filter.
+struct Candidate {
+    purl: String,
+    /// The selection's own purl spelling (the rollout rows key on it; the
+    /// server's reference may spell `purl` differently).
+    sel_purl: String,
+    dep: DepOverride,
+}
+
+/// What every rewrite pass of [`run_redirect_selected`] shares besides the
+/// files and the overrides.
+struct RewriteInputs<'a> {
+    python_metadata: &'a std::collections::BTreeMap<String, String>,
+    pipenv_major: Option<u32>,
+    bun_lockb_present: bool,
+    withheld_from_vlt: &'a std::collections::BTreeSet<String>,
+    /// The binary `bun.lockb` bytes (or why they are unusable), when the
+    /// lock is rewritten directly.
+    binary_content: Option<&'a Result<Vec<u8>, socket_patch_core::patch::redirect::RewriteWarning>>,
+}
+
+/// One pure rewrite pass over the candidate files: the text rewriters on
+/// the blocking pool, then the binary Bun lock. `files` comes back for the
+/// confirmation probe.
+async fn rewrite_candidates(
+    files: std::collections::BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    inputs: &RewriteInputs<'_>,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    socket_patch_core::patch::redirect::RewriteResult,
+) {
+    // A malformed primary lock must not cause edits to stale npm siblings.
+    let rewrite_overrides: Vec<DepOverride> = overrides
+        .iter()
+        .filter(|o| !(inputs.binary_content.is_some_and(Result::is_err) && o.ecosystem == "npm"))
+        .cloned()
+        .collect();
+    // Pure CPU over every lock text (the independent rewriter groups run
+    // concurrently inside), so it runs on the blocking pool rather than on a
+    // runtime worker.
+    let python_metadata = inputs.python_metadata.clone();
+    let pipenv_major = inputs.pipenv_major;
+    let bun_lockb_present = inputs.bun_lockb_present;
+    let withheld_from_vlt = inputs.withheld_from_vlt.clone();
+    let (files, mut rewrite) = tokio::task::spawn_blocking(move || {
+        let rewrite = socket_patch_core::patch::redirect::rewrite_registry_redirect_withholding_vlt(
+            &files,
+            &rewrite_overrides,
+            &python_metadata,
+            pipenv_major,
+            bun_lockb_present,
+            &withheld_from_vlt,
+        );
+        (files, rewrite)
+    })
+    .await
+    .unwrap_or_else(|e| match e.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(e) => panic!("hosted rewrite task failed: {e}"),
+    });
+    if let Some(content) = inputs.binary_content {
+        rewrite
+            .warnings
+            .retain(|w| w.code != "redirect_npm_no_lockfile");
+        match content {
+            Ok(bytes) => {
+                socket_patch_core::patch::redirect::rewrite_bun_binary(bytes, overrides, &mut rewrite)
+            }
+            Err(warning) => rewrite.warnings.push(warning.clone()),
+        }
+    }
+    (files, rewrite)
+}
+
+/// The confirmation probe of [`run_redirect_selected`], one answer per
+/// candidate: whether its redirect lands in the project's final texts.
+fn confirmed_mask(
+    candidates: &[Candidate],
+    files: &std::collections::BTreeMap<String, String>,
+    rewrite: &socket_patch_core::patch::redirect::RewriteResult,
+    binary_bun: bool,
+    withheld_from_vlt: &std::collections::BTreeSet<String>,
+) -> Vec<bool> {
+    // A dep counts as REDIRECTED only if its hosted-artifact URL (or its
+    // per-dependency registry index URL) actually landed in the project's
+    // files — either written by this run or already present from an earlier
+    // one. A granted reference whose rewriter found nothing to edit (e.g. no
+    // lockfile) must NOT be recorded or attested: nothing pins the patch.
+    // A `pdm.lock` that is NOT the PyPI install driver (a `uv.lock` or
+    // `poetry.lock` sits beside it) is never rewritten, yet can still carry a
+    // Socket artifact URL from an earlier run. That stale text pins nothing,
+    // so it must not feed the substring probe below. When pdm DOES drive,
+    // pypi confirmation keys off `confirmed_pdm_uuids`, so dropping the file
+    // is always safe.
+    let pdm_inactive =
+        files.contains_key("pdm.lock") && !socket_patch_core::patch::redirect::pdm_drives(files);
+    // Likewise a `vlt-lock.json` the vlt rewrite was withheld from (its
+    // artifact failed the preflight beside another npm-family lock) may
+    // still hold an earlier run's pin: only the sibling lock this run
+    // rewrote can confirm that dep.
+    let final_texts: Vec<(&str, &String)> = files
+        .iter()
+        .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
+        .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
+        .chain(
+            rewrite
+                .files
+                .iter()
+                .filter(|(name, _)| !files.contains_key(*name))
+                .map(|(name, content)| (name.as_str(), content)),
+        )
+        .collect();
+    // Every non-substring rule decides a candidate outright; the rest are
+    // confirmed by substring presence of their needles in the final texts.
+    // All needle groups are answered in ONE multi-needle pass per text
+    // (`groups_present`), which is the per-candidate `any()` exactly —
+    // presence does not depend on search order, and `confirmed` keeps
+    // candidate order. `candidate_present_oracle` is the reference form.
+    let steps: Vec<ProbeStep> = candidates
+        .iter()
+        .map(|c| {
+            let purl = c.purl.as_str();
+            let uuid = c.dep.patch_uuid.as_str();
+            // vlt decides before the binary-bun rule, so `bun.lockb` beside
+            // a vlt-driven `vlt-lock.json` never confirms an npm purl.
+            if rewrite.refused_vlt_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
+            if rewrite.vlt_drives && purl.starts_with("pkg:npm/") {
+                return ProbeStep::Decided(rewrite.confirmed_vlt_uuids.contains(uuid));
+            }
+            if binary_bun && purl.starts_with("pkg:npm/") {
+                return ProbeStep::Decided(rewrite.confirmed_bun_binary_uuids.contains(uuid));
+            }
+            if rewrite.refused_pipenv_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
+            // pdm is transactional like cargo: a refused uuid is never
+            // confirmed, and when `pdm.lock` is the PyPI install driver
+            // (no `uv.lock` / `poetry.lock`) a pypi dep is confirmed ONLY
+            // by the pdm rewriter's own report — the URL landing in a
+            // sibling `requirements.txt` the project does not install from
+            // pins nothing. When uv/poetry drive, their own lock proof
+            // below still confirms them. This check precedes the hatch
+            // gate: a PDM project may declare `hatchling` as its build
+            // backend, which registers every pypi uuid as hatch-owned while
+            // the lock's presence keeps hatch from confirming any of them.
+            if rewrite.refused_pdm_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
+            if purl.starts_with("pkg:pypi/")
+                && socket_patch_core::patch::redirect::pdm_drives(files)
+            {
+                return ProbeStep::Decided(rewrite.confirmed_pdm_uuids.contains(uuid));
+            }
+            if rewrite.python_lock_uuids.contains(uuid) {
+                return ProbeStep::Decided(
+                    rewrite.confirmed_python_lock_uuids.contains(uuid)
+                        && !rewrite.refused_python_lock_uuids.contains(uuid),
+                );
+            }
+            if rewrite.hatch_uuids.contains(uuid) {
+                return ProbeStep::Decided(rewrite.confirmed_hatch_uuids.contains(uuid));
+            }
+            // A Pipfile.lock rewrite confirms its own uuids (the sibling
+            // requirements.txt rewriter may have had nothing to do).
+            if purl.starts_with("pkg:pypi/") {
+                return ProbeStep::Decided(
+                    rewrite.confirmed_pipenv_uuids.contains(uuid)
+                        || rewrite.confirmed_requirements_uuids.contains(uuid),
+                );
+            }
+            if rewrite.refused_pnpm_uuids.contains(uuid) {
+                return ProbeStep::Decided(false);
+            }
+            // Cargo is transactional: the rewriter reports exactly which
+            // patch uuids FULLY landed (manifest pin + lock + registry
+            // block). Substring presence must never confirm a cargo dep —
+            // the `[registries.…]` config block contains the index URL while
+            // pinning nothing, so a config-block-only rewrite would be
+            // attested with zero enforcement in any build.
+            if purl.starts_with("pkg:cargo/") {
+                return ProbeStep::Decided(rewrite.confirmed_cargo_uuids.contains(uuid));
+            }
+            // Golang likewise: the goproxy `indexUrl` is the bare
+            // patch-server origin (present in any other hosted lock), and
+            // the socket module's go.sum lines outlive a removed replace.
+            if purl.starts_with("pkg:golang/") {
+                return ProbeStep::Decided(rewrite.confirmed_golang_uuids.contains(uuid));
+            }
+            let needles = candidate_presence_needles(&c.dep);
+            if withheld_from_vlt.contains(uuid) {
+                ProbeStep::NeedlesOutsideVlt(needles)
+            } else {
+                ProbeStep::Needles(needles)
+            }
+        })
+        .collect();
+    let groups = |outside_vlt: bool| -> Vec<&[String]> {
+        steps
+            .iter()
+            .filter_map(|step| match step {
+                ProbeStep::Needles(needles) if !outside_vlt => Some(needles.as_slice()),
+                ProbeStep::NeedlesOutsideVlt(needles) if outside_vlt => Some(needles.as_slice()),
+                _ => None,
+            })
+            .collect()
+    };
+    let all_texts: Vec<&String> = final_texts.iter().map(|(_, text)| *text).collect();
+    let mut present =
+        socket_patch_core::patch::redirect::presence::groups_present(&all_texts, &groups(false))
+            .into_iter();
+    let outside_vlt_groups = groups(true);
+    let mut present_outside_vlt = if outside_vlt_groups.is_empty() {
+        Vec::new()
+    } else {
+        let texts: Vec<&String> = final_texts
+            .iter()
+            .filter(|(name, _)| *name != socket_patch_core::constants::npm_family::VLT_LOCK)
+            .map(|(_, text)| *text)
+            .collect();
+        socket_patch_core::patch::redirect::presence::groups_present(&texts, &outside_vlt_groups)
+    }
+    .into_iter();
+    candidates
+        .iter()
+        .zip(&steps)
+        .map(|(_, step)| match step {
+            ProbeStep::Decided(keep) => *keep,
+            ProbeStep::Needles(_) => present
+                .next()
+                .expect("one presence answer per needle group"),
+            ProbeStep::NeedlesOutsideVlt(_) => present_outside_vlt
+                .next()
+                .expect("one presence answer per needle group"),
+        })
+        .collect()
 }
 
 /// How the confirmation probe in [`run_redirect_selected`] settles one
@@ -1193,6 +1457,7 @@ fn candidate_present_oracle(
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
 /// would get a minimal envelope that drops its own keys). `prune_requested`
 /// only feeds the `redirect_prune_ignored` warning — `get` passes `false`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_redirect_selected(
     common: &crate::args::GlobalArgs,
     vex: &crate::commands::vex::VexEmbedArgs,
@@ -1201,25 +1466,13 @@ pub(crate) async fn run_redirect_selected(
     selected: &[(String, String)],
     mut scan_result: Option<serde_json::Value>,
     npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    // `scan`'s rollout gate: NEW rows past the budget are deferred after
+    // every write-free eligibility check below (§5.2). `get` passes `None`.
+    mut rollout: Option<super::rollout::Gate<'_>>,
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
-    use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect_withholding_vlt,
-    };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
-    /// One granted reference: the purl it was granted for plus the rewriter
-    /// override built from it. The purl is what the takeover, the skip
-    /// records and the confirmation probe key on; everything the probe
-    /// needs AFTER the rewrite to decide whether the dep was actually
-    /// redirected (artifact URL, registry index URL, fail-closed maven's
-    /// suffixed version) already rides the override. The single vector is
-    /// filtered in place by every withhold/refusal step, and the rewriters'
-    /// `overrides` slice is materialized from it once, after the last filter.
-    struct Candidate {
-        purl: String,
-        dep: DepOverride,
-    }
     let mut candidates: Vec<Candidate> = Vec::new();
     // The network phases below (reference grants, wheel metadata, patch
     // records) would otherwise be silent gaps on a terminal. Inert under
@@ -1236,6 +1489,20 @@ pub(crate) async fn run_redirect_selected(
         status.finish();
         let references = match fetched {
             Ok(r) => r,
+            // A capped run whose every row is NEW: the failure affects only
+            // rows the incomplete lookup defers anyway (§5.2), so it becomes
+            // a warning instead of failing the run.
+            Err(e)
+                if rollout.as_ref().is_some_and(|gate| {
+                    gate.stage.capped() && selected.iter().all(|(p, u)| gate.is_new(p, u))
+                }) =>
+            {
+                if let Some(gate) = rollout.as_mut() {
+                    gate.stage.incomplete = true;
+                    gate.stage.reference_failed = Some(e.to_string());
+                }
+                std::collections::HashMap::new()
+            }
             Err(e) => {
                 let message = format!("failed to resolve patch references: {e}");
                 eprintln!(
@@ -1248,7 +1515,13 @@ pub(crate) async fn run_redirect_selected(
                 return 1;
             }
         };
+        let references_failed = rollout
+            .as_ref()
+            .is_some_and(|gate| gate.stage.reference_failed.is_some());
         for (sel_purl, sel_uuid) in selected {
+            if references_failed {
+                continue;
+            }
             let Some(reference) = references.get(sel_uuid) else {
                 skipped.push(serde_json::json!({ "purl": sel_purl, "uuid": sel_uuid, "reason": "not_found" }));
                 continue;
@@ -1330,6 +1603,7 @@ pub(crate) async fn run_redirect_selected(
                 .unwrap_or_default();
             candidates.push(Candidate {
                 purl: purl.to_string(),
+                sel_purl: sel_purl.clone(),
                 dep: DepOverride {
                     ecosystem,
                     name,
@@ -1405,7 +1679,15 @@ pub(crate) async fn run_redirect_selected(
     // preview must not create `.socket/`, flip to `lock_held` under a
     // concurrent wet run, or fail on a read-only checkout). Held to the end
     // of the function.
-    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
+    // A capped run whose only candidates are NEW rows it cannot admit
+    // (budget 0, or incomplete data) writes nothing: take no lock either.
+    let may_write = rollout.as_ref().is_none_or(|gate| {
+        gate.stage.may_admit_new()
+            || candidates
+                .iter()
+                .any(|c| !gate.is_new(&c.sel_purl, &c.dep.patch_uuid))
+    });
+    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
         match acquire_hosted_lock(common, &mut scan_result) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
@@ -2059,9 +2341,10 @@ pub(crate) async fn run_redirect_selected(
     }
     status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
-    // The rewriters' override slice — materialized ONCE, after the last
-    // candidate filter, so it can never disagree with `candidates`.
-    let overrides: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
+    // The rewriters' override slice — materialized after the last candidate
+    // filter (and again after the rollout gate), so it can never disagree
+    // with `candidates`.
+    let mut overrides: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
     // The Pipfile.lock reference shape depends on the installing Pipenv
     // (`path` for 7–11, `file` from 2018 on), so the installed release is
     // probed (`pipenv --version`, up to 10 s) — but only when a pypi patch
@@ -2100,47 +2383,48 @@ pub(crate) async fn run_redirect_selected(
     } else {
         None
     };
-    // A malformed primary lock must not cause edits to stale npm siblings.
-    let rewrite_overrides: Vec<_> = overrides
-        .iter()
-        .filter(|o| !(binary_content.as_ref().is_some_and(Result::is_err) && o.ecosystem == "npm"))
-        .cloned()
-        .collect();
-    // Pure CPU over every lock text (the independent rewriter groups run
-    // concurrently inside), so it runs on the blocking pool rather than on a
-    // runtime worker; `files` comes back for the confirmation probe below.
     let bun_lockb_present = common.cwd.join("bun.lockb").exists();
-    let withheld_from_vlt = vlt_preflight.withheld_from_vlt.clone();
+    let inputs = RewriteInputs {
+        python_metadata: &python_metadata,
+        pipenv_major,
+        bun_lockb_present,
+        withheld_from_vlt: &vlt_preflight.withheld_from_vlt,
+        binary_content: binary_content.as_ref(),
+    };
     // `mut`: the pnpm trustLockfile auto-config below may fold a
     // pnpm-workspace.yaml write (plus its ledger edit) into the rewrite set so
     // it rides the same atomic-write / ledger-first machinery as the locks.
-    let (files, mut rewrite) = tokio::task::spawn_blocking(move || {
-        let rewrite = rewrite_registry_redirect_withholding_vlt(
-            &files,
-            &rewrite_overrides,
-            &python_metadata,
-            pipenv_major,
-            bun_lockb_present,
-            &withheld_from_vlt,
-        );
-        (files, rewrite)
-    })
-    .await
-    .unwrap_or_else(|e| match e.try_into_panic() {
-        Ok(payload) => std::panic::resume_unwind(payload),
-        Err(e) => panic!("hosted rewrite task failed: {e}"),
-    });
-    if let Some(content) = binary_content {
-        rewrite
-            .warnings
-            .retain(|w| w.code != "redirect_npm_no_lockfile");
-        match content {
-            Ok(bytes) => socket_patch_core::patch::redirect::rewrite_bun_binary(
-                &bytes,
-                &overrides,
-                &mut rewrite,
-            ),
-            Err(warning) => rewrite.warnings.push(warning),
+    let (mut files, mut rewrite) = rewrite_candidates(files, &overrides, &inputs).await;
+
+    // The rollout gate (§5.2): every write-free check has run — grants,
+    // purl/url, vlt preflight, takeover refusals, wheel metadata, and the
+    // rewrite above, whose confirmation probe proves a NEW row would be
+    // pinned. Only then is the budget spent; deferred rows leave the
+    // rewrite set, which is planned again without them.
+    if let Some(gate) = rollout.as_mut() {
+        let eligible: std::collections::HashSet<(String, String)> = candidates
+            .iter()
+            .zip(confirmed_mask(
+                &candidates,
+                &files,
+                &rewrite,
+                binary_bun,
+                &vlt_preflight.withheld_from_vlt,
+            ))
+            .filter(|(_, confirmed)| *confirmed)
+            .map(|(c, _)| (c.sel_purl.clone(), c.dep.patch_uuid.clone()))
+            .collect();
+        let unknown = gate.stage.reference_failed.is_some();
+        gate.stage.plan(&gate.rows, |row| {
+            unknown || eligible.contains(&(row.writer.purl.clone(), row.writer.uuid.clone()))
+        });
+        let deferred = gate.stage.deferred_keys();
+        skipped.extend(gate.stage.deferred_skips());
+        let before = candidates.len();
+        candidates.retain(|c| !deferred.contains(&(c.sel_purl.clone(), c.dep.patch_uuid.clone())));
+        if candidates.len() != before {
+            overrides = candidates.iter().map(|c| c.dep.clone()).collect();
+            (files, rewrite) = rewrite_candidates(files, &overrides, &inputs).await;
         }
     }
 
@@ -2544,159 +2828,16 @@ pub(crate) async fn run_redirect_selected(
         .cloned()
         .collect();
 
-    // A dep counts as REDIRECTED only if its hosted-artifact URL (or its
-    // per-dependency registry index URL) actually landed in the project's
-    // files — either written by this run or already present from an earlier
-    // one. A granted reference whose rewriter found nothing to edit (e.g. no
-    // lockfile) must NOT be recorded or attested: nothing pins the patch.
-    // A `pdm.lock` that is NOT the PyPI install driver (a `uv.lock` or
-    // `poetry.lock` sits beside it) is never rewritten, yet can still carry a
-    // Socket artifact URL from an earlier run. That stale text pins nothing,
-    // so it must not feed the substring probe below. When pdm DOES drive,
-    // pypi confirmation keys off `confirmed_pdm_uuids`, so dropping the file
-    // is always safe.
-    let pdm_inactive =
-        files.contains_key("pdm.lock") && !socket_patch_core::patch::redirect::pdm_drives(&files);
-    // Likewise a `vlt-lock.json` the vlt rewrite was withheld from (its
-    // artifact failed the preflight beside another npm-family lock) may
-    // still hold an earlier run's pin: only the sibling lock this run
-    // rewrote can confirm that dep.
-    let final_texts: Vec<(&str, &String)> = files
-        .iter()
-        .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
-        .chain(
-            rewrite
-                .files
-                .iter()
-                .filter(|(name, _)| !files.contains_key(*name))
-                .map(|(name, content)| (name.as_str(), content)),
-        )
-        .collect();
-    // Every non-substring rule decides a candidate outright; the rest are
-    // confirmed by substring presence of their needles in the final texts.
-    // All needle groups are answered in ONE multi-needle pass per text
-    // (`groups_present`), which is the per-candidate `any()` exactly —
-    // presence does not depend on search order, and `confirmed` keeps
-    // candidate order. `candidate_present_oracle` is the reference form.
-    let steps: Vec<ProbeStep> = candidates
-        .iter()
-        .map(|c| {
-            let purl = c.purl.as_str();
-            let uuid = c.dep.patch_uuid.as_str();
-            // vlt decides before the binary-bun rule, so `bun.lockb` beside
-            // a vlt-driven `vlt-lock.json` never confirms an npm purl.
-            if rewrite.refused_vlt_uuids.contains(uuid) {
-                return ProbeStep::Decided(false);
-            }
-            if rewrite.vlt_drives && purl.starts_with("pkg:npm/") {
-                return ProbeStep::Decided(rewrite.confirmed_vlt_uuids.contains(uuid));
-            }
-            if binary_bun && purl.starts_with("pkg:npm/") {
-                return ProbeStep::Decided(rewrite.confirmed_bun_binary_uuids.contains(uuid));
-            }
-            if rewrite.refused_pipenv_uuids.contains(uuid) {
-                return ProbeStep::Decided(false);
-            }
-            // pdm is transactional like cargo: a refused uuid is never
-            // confirmed, and when `pdm.lock` is the PyPI install driver
-            // (no `uv.lock` / `poetry.lock`) a pypi dep is confirmed ONLY
-            // by the pdm rewriter's own report — the URL landing in a
-            // sibling `requirements.txt` the project does not install from
-            // pins nothing. When uv/poetry drive, their own lock proof
-            // below still confirms them. This check precedes the hatch
-            // gate: a PDM project may declare `hatchling` as its build
-            // backend, which registers every pypi uuid as hatch-owned while
-            // the lock's presence keeps hatch from confirming any of them.
-            if rewrite.refused_pdm_uuids.contains(uuid) {
-                return ProbeStep::Decided(false);
-            }
-            if purl.starts_with("pkg:pypi/")
-                && socket_patch_core::patch::redirect::pdm_drives(&files)
-            {
-                return ProbeStep::Decided(rewrite.confirmed_pdm_uuids.contains(uuid));
-            }
-            if rewrite.python_lock_uuids.contains(uuid) {
-                return ProbeStep::Decided(
-                    rewrite.confirmed_python_lock_uuids.contains(uuid)
-                        && !rewrite.refused_python_lock_uuids.contains(uuid),
-                );
-            }
-            if rewrite.hatch_uuids.contains(uuid) {
-                return ProbeStep::Decided(rewrite.confirmed_hatch_uuids.contains(uuid));
-            }
-            // A Pipfile.lock rewrite confirms its own uuids (the sibling
-            // requirements.txt rewriter may have had nothing to do).
-            if purl.starts_with("pkg:pypi/") {
-                return ProbeStep::Decided(
-                    rewrite.confirmed_pipenv_uuids.contains(uuid)
-                        || rewrite.confirmed_requirements_uuids.contains(uuid),
-                );
-            }
-            if rewrite.refused_pnpm_uuids.contains(uuid) {
-                return ProbeStep::Decided(false);
-            }
-            // Cargo is transactional: the rewriter reports exactly which
-            // patch uuids FULLY landed (manifest pin + lock + registry
-            // block). Substring presence must never confirm a cargo dep —
-            // the `[registries.…]` config block contains the index URL while
-            // pinning nothing, so a config-block-only rewrite would be
-            // attested with zero enforcement in any build.
-            if purl.starts_with("pkg:cargo/") {
-                return ProbeStep::Decided(rewrite.confirmed_cargo_uuids.contains(uuid));
-            }
-            // Golang likewise: the goproxy `indexUrl` is the bare
-            // patch-server origin (present in any other hosted lock), and
-            // the socket module's go.sum lines outlive a removed replace.
-            if purl.starts_with("pkg:golang/") {
-                return ProbeStep::Decided(rewrite.confirmed_golang_uuids.contains(uuid));
-            }
-            let needles = candidate_presence_needles(&c.dep);
-            if vlt_preflight.withheld_from_vlt.contains(uuid) {
-                ProbeStep::NeedlesOutsideVlt(needles)
-            } else {
-                ProbeStep::Needles(needles)
-            }
-        })
-        .collect();
-    let groups = |outside_vlt: bool| -> Vec<&[String]> {
-        steps
-            .iter()
-            .filter_map(|step| match step {
-                ProbeStep::Needles(needles) if !outside_vlt => Some(needles.as_slice()),
-                ProbeStep::NeedlesOutsideVlt(needles) if outside_vlt => Some(needles.as_slice()),
-                _ => None,
-            })
-            .collect()
-    };
-    let all_texts: Vec<&String> = final_texts.iter().map(|(_, text)| *text).collect();
-    let mut present =
-        socket_patch_core::patch::redirect::presence::groups_present(&all_texts, &groups(false))
-            .into_iter();
-    let outside_vlt_groups = groups(true);
-    let mut present_outside_vlt = if outside_vlt_groups.is_empty() {
-        Vec::new()
-    } else {
-        let texts: Vec<&String> = final_texts
-            .iter()
-            .filter(|(name, _)| *name != socket_patch_core::constants::npm_family::VLT_LOCK)
-            .map(|(_, text)| *text)
-            .collect();
-        socket_patch_core::patch::redirect::presence::groups_present(&texts, &outside_vlt_groups)
-    }
-    .into_iter();
     let confirmed: Vec<(String, String)> = candidates
         .iter()
-        .zip(&steps)
-        .filter(|(_, step)| match step {
-            ProbeStep::Decided(keep) => *keep,
-            ProbeStep::Needles(_) => present
-                .next()
-                .expect("one presence answer per needle group"),
-            ProbeStep::NeedlesOutsideVlt(_) => present_outside_vlt
-                .next()
-                .expect("one presence answer per needle group"),
-        })
+        .zip(confirmed_mask(
+            &candidates,
+            &files,
+            &rewrite,
+            binary_bun,
+            &vlt_preflight.withheld_from_vlt,
+        ))
+        .filter(|(_, confirmed)| *confirmed)
         .map(|(c, _)| (c.purl.clone(), c.dep.patch_uuid.clone()))
         .collect();
     // Dry-run mode-takeover previews were withheld from the rewriters (their
@@ -3020,6 +3161,9 @@ pub(crate) async fn run_redirect_selected(
             common.dry_run,
         );
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
+        if let Some(gate) = &rollout {
+            super::finish_rollout_json(gate.stage, &mut result);
+        }
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
                 "path": vex.vex.as_ref().expect("vex_statements is Some only when --vex was given").display().to_string(),
@@ -3082,8 +3226,10 @@ pub(crate) async fn run_redirect_selected(
                 .collect();
             // Human output prints the bare strings — `Value`'s `Display`
             // would JSON-quote them.
+            // Deferred rows are summed up by the rollout lines instead.
             let skipped_pairs: Vec<(String, String)> = skipped
                 .iter()
+                .filter(|s| s["reason"] != super::rollout::ROLLOUT_DEFERRED)
                 .map(|s| {
                     (
                         s["purl"].as_str().unwrap_or_default().to_string(),
@@ -3146,12 +3292,26 @@ pub(crate) async fn run_redirect_selected(
                     crate::commands::vex::format_vex_dry_run_skip("redirected")
                 );
             }
-            if !common.dry_run {
-                for line in
-                    format_next_steps(&human_files, !takeover_migrated.is_empty())
-                {
-                    println!("{line}");
+            let (rollout_line, deferred_steps) = match &rollout {
+                Some(gate) => {
+                    for (code, detail) in gate.stage.warnings() {
+                        eprintln!("{}", format_warning(code, &detail, width));
+                    }
+                    gate.stage.human(common.dry_run)
                 }
+                None => (None, Vec::new()),
+            };
+            if let Some(line) = rollout_line {
+                println!("{line}");
+            }
+            let mut next_steps = if common.dry_run {
+                Vec::new()
+            } else {
+                format_next_steps(&human_files, !takeover_migrated.is_empty())
+            };
+            next_steps.extend(deferred_steps);
+            for line in next_steps {
+                println!("{line}");
             }
         }
         // Errors print even under --silent ("errors only", never
@@ -3487,6 +3647,7 @@ fn format_next_steps(files: &[String], vendored_removed: bool) -> Vec<String> {
 /// future embeds the whole hosted engine, and callers outside scan (`get
 /// --mode hosted`) must not materialize it in their own poll frame (Windows
 /// 1 MiB main-thread stack; same rationale as scan's `boxed_*` family).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn boxed_run_redirect_selected<'a>(
     common: &'a crate::args::GlobalArgs,
     vex: &'a crate::commands::vex::VexEmbedArgs,
@@ -3495,6 +3656,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
     selected: &'a [(String, String)],
     scan_result: Option<serde_json::Value>,
     npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    rollout: Option<super::rollout::Gate<'a>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_redirect_selected(
         common,
@@ -3504,6 +3666,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         selected,
         scan_result,
         npm_prior,
+        rollout,
     ))
 }
 

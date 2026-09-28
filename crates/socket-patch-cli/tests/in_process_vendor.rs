@@ -3267,6 +3267,7 @@ snapshots:
             mode: Some(ScanMode::Hosted),
             all_releases: false,
             vex: Default::default(),
+            rollout: Default::default(),
         }
     }
 

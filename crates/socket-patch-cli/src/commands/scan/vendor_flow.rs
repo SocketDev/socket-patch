@@ -20,7 +20,7 @@
 use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::PatchRecord;
+use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
@@ -42,9 +42,10 @@ use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 use crate::ui::{plural, print_json};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
+use super::rollout::Stage;
 use super::{
-    discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json,
-    push_run_warning, ScanArgs,
+    classified_rows, discover_selected, download_params, embed_vex_into_json,
+    emit_discovery_error_json, finish_rollout_json, push_run_warning, writers_of, ScanArgs,
 };
 
 /// Run-level warning: a `.socket/manifest.json` record for a purl the
@@ -123,6 +124,29 @@ pub(crate) async fn preview_vendor_json(
         .collect();
     patches.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
     serde_json::json!({ "dryRun": true, "patches": patches })
+}
+
+/// The purls of `selected` the wet run's Bun or vlt preflight would refuse
+/// before any download (the `would_refuse` rows of
+/// [`preview_vendor_json`]): the vendored planning pass, so a refused NEW
+/// patch holds no rollout slot.
+pub(super) async fn preflight_refused_purls(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+) -> HashSet<String> {
+    let state = load_state(cwd).await;
+    let refusal =
+        bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    let vlt_refusals =
+        vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    selected
+        .iter()
+        .filter(|p| {
+            refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
+                || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
+        })
+        .map(|p| p.purl.clone())
+        .collect()
 }
 
 /// Human rendering of the vendored dry-run preview's `would_refuse` records
@@ -453,6 +477,9 @@ async fn run_vendor_json_path(
     use_public_proxy: bool,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
+    recorded: Option<&PatchManifest>,
+    batch_failed: bool,
+    stage: &mut Stage,
     result: &mut serde_json::Value,
     manifest_path: &Path,
     socket_dir: &Path,
@@ -470,11 +497,11 @@ async fn run_vendor_json_path(
     // Same discovery as `--apply`. Vendored purls are NOT filtered here —
     // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
     // land on the backend's `already_vendored` skip).
-    let selected = match discover_selected(
+    let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
-        &args.common,
+        false,
         false,
         false,
         telemetry,
@@ -482,12 +509,31 @@ async fn run_vendor_json_path(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(d) => d,
         Err((code, message)) => {
             emit_discovery_error_json(result, &message);
             return code;
         }
     };
+    let rows = classified_rows(
+        stage,
+        &discovered,
+        recorded,
+        batch_failed,
+        all_packages_with_patches,
+        Some(&mut *result),
+    );
+    // The planning pass: a patch the preflight refuses holds no slot (it
+    // still reaches the engine, which reports the refusal).
+    let writers = writers_of(&rows);
+    let refused = preflight_refused_purls(&args.common.cwd, &writers).await;
+    stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
+    let deferred = stage.deferred_keys();
+    let selected: Vec<PatchSearchResult> = writers
+        .into_iter()
+        .filter(|p| !deferred.contains(&(p.purl.clone(), p.uuid.clone())))
+        .collect();
+    finish_rollout_json(stage, result);
 
     if args.common.dry_run {
         // No downloads, no backends: classify against the ledger
@@ -781,6 +827,9 @@ pub(super) fn boxed_vendor_json_path<'a>(
     use_public_proxy: bool,
     all_packages_with_patches: &'a [BatchPackagePatches],
     can_access_paid_patches: bool,
+    recorded: Option<&'a PatchManifest>,
+    batch_failed: bool,
+    stage: &'a mut Stage,
     result: &'a mut serde_json::Value,
     manifest_path: &'a Path,
     socket_dir: &'a Path,
@@ -798,6 +847,9 @@ pub(super) fn boxed_vendor_json_path<'a>(
         use_public_proxy,
         all_packages_with_patches,
         can_access_paid_patches,
+        recorded,
+        batch_failed,
+        stage,
         result,
         manifest_path,
         socket_dir,

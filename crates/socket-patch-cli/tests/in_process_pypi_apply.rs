@@ -274,6 +274,7 @@ async fn pypi_install_scan_sync_patches_real_file() {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     // Avoid borrow problem with into_iter
     let _ = &mut args;
@@ -351,6 +352,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     let scan_code = scan_run(scan_args).await;
     assert_eq!(scan_code, 0, "scan --sync should succeed (exit 0)");
@@ -461,6 +463,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     // Require success: otherwise an early crash (before the apply path
     // is ever reached) would leave the file untouched and let this test
@@ -591,6 +594,7 @@ async fn pypi_crawler_finds_real_installed_six() {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 

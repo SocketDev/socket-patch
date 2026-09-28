@@ -225,6 +225,7 @@ async fn gem_install_scan_sync_patches_real_file() {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     let code = scan_run(args).await;
     assert_eq!(
@@ -338,6 +339,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 

@@ -643,14 +643,15 @@ mod tests {
     #[test]
     fn resolve_max_new_precedence_table() {
         use MaxNewSource::*;
-        let cases: [(
+        type Case = (
             Option<Option<u32>>,
             Option<Option<u32>>,
             Option<u32>,
             Option<u32>,
             Option<u32>,
             MaxNewSource,
-        ); 10] = [
+        );
+        let cases: [Case; 10] = [
             (None, None, None, None, None, Default),
             (None, None, Some(5), None, Some(5), File),
             (None, Some(Some(2)), Some(5), None, Some(2), Env),

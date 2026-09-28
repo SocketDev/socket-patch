@@ -66,6 +66,7 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 

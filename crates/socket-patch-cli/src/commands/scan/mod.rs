@@ -33,12 +33,14 @@ use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
-use super::get::{download_and_apply_patches_with, select_patches, DownloadParams, DownloadRun};
+use super::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
 
 mod discovery;
 mod gc;
 pub(crate) mod hosted;
 pub(crate) mod render;
+pub(crate) mod rollout;
+pub mod rollout_args;
 pub(crate) mod vendor_flow;
 
 use self::discovery::{
@@ -372,6 +374,9 @@ pub struct ScanArgs {
     /// VEX makes the command exit non-zero.
     #[command(flatten)]
     pub vex: VexEmbedArgs,
+
+    #[command(flatten)]
+    pub rollout: rollout_args::RolloutArgs,
 }
 
 /// Whether a `--package` spec names the package at `purl`: a purl spec
@@ -535,31 +540,30 @@ async fn embed_vex_human(
     }
 }
 
-/// The per-package discovery + selection step shared by the apply, vendor,
-/// and redirect flows: search each patched package's full patch list, then
-/// resolve the top-ranked accessible patch per PURL. Per-package search
-/// errors are skipped, but when EVERY query errors the empty set would be
-/// indistinguishable from a genuine "no patches" result, so that surfaces
-/// as `Err(1)` with the failure on stderr. Selects with [`selection_args`]:
-/// scan never prompts, so every run auto-selects the top-ranked patch (see
-/// `api::ranking`) rather than erroring with `selection_required`. `Err`
-/// carries the exit code AND the message, since JSON callers must fold it
-/// into their single envelope (CLI_CONTRACT.md). `show_progress` / `warn`
-/// are the human-only knobs of [`fetch_patch_details`] (JSON callers pass
-/// `false, false`). `json_warnings` is the JSON callers' envelope: a
-/// partial failure adds one [`PATCH_DETAILS_FAILED`] warning per failed
-/// package to it.
+/// The per-package discovery + selection step every mode shares: search
+/// each patched package's full patch list, then take the top-ranked
+/// accessible patch per purl (see `api::ranking`; scan never prompts).
+/// Per-package search errors are skipped (their purls come back in
+/// [`Discovered::failed`]), but when EVERY query errors the empty set would
+/// be indistinguishable from a genuine "no patches" result, so that
+/// surfaces as `Err(1)` with the failure on stderr (`detail_error_line`
+/// picks the agent/vendored human arm's wording). `Err` carries the exit
+/// code AND the message, since JSON callers must fold it into their single
+/// envelope (CLI_CONTRACT.md). `show_progress` / `warn` are the human-only
+/// knobs of [`fetch_patch_details`] (JSON callers pass `false, false`).
+/// `json_warnings` is the JSON callers' envelope: a partial failure adds
+/// one [`PATCH_DETAILS_FAILED`] warning per failed package to it.
 #[allow(clippy::too_many_arguments)]
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
     can_access_paid_patches: bool,
-    common: &GlobalArgs,
     show_progress: bool,
     warn: bool,
+    detail_error_line: bool,
     telemetry: &mut PendingTelemetry,
     json_warnings: Option<&mut serde_json::Value>,
-) -> Result<Vec<PatchSearchResult>, (i32, String)> {
+) -> Result<Discovered, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
     // The scan event's send overlapped the detail fetches; every caller's
@@ -569,11 +573,14 @@ async fn discover_selected(
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
         let err = failures
-            .into_iter()
             .last()
-            .map_or_else(|| "all patch-detail queries failed".to_string(), |(_, e)| e);
+            .map_or_else(|| "all patch-detail queries failed".to_string(), |(_, e)| e.clone());
         let message = format!("all {error_count} patch-detail queries failed: {err}");
-        eprintln!("Error: {message}");
+        if detail_error_line {
+            eprintln!("{}", render::fetch_details_failed(&failures));
+        } else {
+            eprintln!("Error: {message}");
+        }
         return Err((1, message));
     }
     // Some queries failed, some succeeded: a `--json` run has no stderr
@@ -588,35 +595,128 @@ async fn discover_selected(
             );
         }
     }
-    if all_search_results.is_empty() {
-        return Ok(Vec::new());
-    }
-    if common.json {
-        // Pre-filter to accessible patches so `select_patches` takes the
-        // top-ranked one per PURL.
-        let accessible: Vec<PatchSearchResult> = all_search_results
-            .into_iter()
-            .filter(|p| can_access_paid_patches || p.tier == "free")
-            .collect();
-        return select_patches(&accessible, true, &selection_args(common))
-            .map_err(|code| (code, "patch selection failed".to_string()));
-    }
-    select_patches(
-        &all_search_results,
-        can_access_paid_patches,
-        &selection_args(common),
-    )
-    .map_err(|code| (code, "patch selection failed".to_string()))
+    Ok(Discovered {
+        offers: rollout::Offers::from_results(&all_search_results, can_access_paid_patches),
+        fetched: all_search_results.len(),
+        failed: failures,
+    })
 }
 
-/// `common` for `select_patches`: scan never prompts, so it always takes
-/// the top-ranked patch, and with `json` off it never gets
-/// `selection_required` (scan has no "re-run with the chosen UUID" path).
-fn selection_args(common: &GlobalArgs) -> GlobalArgs {
-    GlobalArgs {
-        json: false,
-        yes: true,
-        ..common.clone()
+/// [`discover_selected`]'s result: the offers, how many records came back
+/// (before the tier filter), and each failed detail query as `(purl,
+/// error)` (a failure for a package with no recorded patch makes a capped
+/// run's data incomplete).
+struct Discovered {
+    offers: rollout::Offers,
+    fetched: usize,
+    failed: Vec<(String, String)>,
+}
+
+/// The `updates[]` JSON array.
+fn updates_json(updates: &[discovery::UpdateInfo]) -> Vec<serde_json::Value> {
+    updates
+        .iter()
+        .map(|u| {
+            serde_json::json!({
+                "purl": u.purl,
+                "oldUuid": u.old_uuid,
+                "newUuid": u.new_uuid,
+            })
+        })
+        .collect()
+}
+
+/// Classify the discovered offers against the recorded view (§5.1), note
+/// whether a capped run's data is incomplete, and (JSON) replace the
+/// batch-derived `updates[]` with the by-package UPGRADE rows.
+fn classified_rows(
+    stage: &mut rollout::Stage,
+    discovered: &Discovered,
+    recorded: Option<&PatchManifest>,
+    batch_failed: bool,
+    packages: &[BatchPackagePatches],
+    result: Option<&mut serde_json::Value>,
+) -> Vec<rollout::Row> {
+    let failed: Vec<String> = discovered.failed.iter().map(|(purl, _)| purl.clone()).collect();
+    stage.incomplete = rollout::lookup_incomplete(recorded, &failed, batch_failed);
+    let rows = rollout::classify(&discovered.offers, recorded, &stage.project);
+    if let Some(result) = result {
+        let updates = offer_updates(&rows, discovered, recorded, packages);
+        result["updates"] = serde_json::Value::Array(updates_json(&updates));
+    }
+    rows
+}
+
+/// `updates[]` from the by-package records (see [`rollout::merge_updates`]).
+fn offer_updates(
+    rows: &[rollout::Row],
+    discovered: &Discovered,
+    recorded: Option<&PatchManifest>,
+    packages: &[BatchPackagePatches],
+) -> Vec<discovery::UpdateInfo> {
+    let purls: Vec<String> = packages.iter().map(|p| p.purl.clone()).collect();
+    rollout::merge_updates(
+        rows,
+        &discovered.offers,
+        &purls,
+        detect_updates(recorded, packages),
+    )
+}
+
+/// The offers the writers would receive, one per row.
+fn writers_of(rows: &[rollout::Row]) -> Vec<PatchSearchResult> {
+    rows.iter().map(|r| r.writer.clone()).collect()
+}
+
+/// Plan the rows whose writer survived the mode's own partition (`kept`;
+/// the rest cannot land and hold no slot), then return `kept` without the
+/// deferred rows.
+fn plan_kept_rows(
+    stage: &mut rollout::Stage,
+    rows: Vec<rollout::Row>,
+    kept: Vec<PatchSearchResult>,
+) -> Vec<PatchSearchResult> {
+    let kept_keys: HashSet<(&str, &str)> = kept
+        .iter()
+        .map(|p| (p.purl.as_str(), p.uuid.as_str()))
+        .collect();
+    let kept_rows: Vec<rollout::Row> = rows
+        .into_iter()
+        .filter(|r| kept_keys.contains(&(r.writer.purl.as_str(), r.writer.uuid.as_str())))
+        .collect();
+    stage.plan(&kept_rows, |_| true);
+    let deferred = stage.deferred_keys();
+    kept.into_iter()
+        .filter(|p| !deferred.contains(&(p.purl.clone(), p.uuid.clone())))
+        .collect()
+}
+
+/// Fold the stage's `rollout` block and warnings into a JSON result.
+pub(super) fn finish_rollout_json(stage: &rollout::Stage, result: &mut serde_json::Value) {
+    result["rollout"] = stage.json();
+    for (code, detail) in stage.warnings() {
+        push_scan_json_warning(result, code, &detail);
+    }
+}
+
+/// The human `Rollout:` line and the Next-steps lines about deferred
+/// patches, for the agent and vendored summaries.
+fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool) {
+    if silent {
+        return;
+    }
+    for (code, detail) in stage.warnings() {
+        eprintln!("Warning ({code}): {detail}");
+    }
+    let (line, next) = stage.human(dry_run);
+    if let Some(line) = line {
+        println!("\n{line}");
+    }
+    if !next.is_empty() {
+        println!("Next steps:");
+        for step in next {
+            println!("  {step}");
+        }
     }
 }
 
@@ -1306,6 +1406,17 @@ async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i
         );
         return 2;
     }
+    // One budget per invocation (§5.2): the directories spend it in sorted
+    // order, and a package admitted in one is admitted free in the next.
+    let configured = match args.rollout.resolve_from_env(None) {
+        Ok(max) => max,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            return 2;
+        }
+    };
+    let root = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
+    let carry = rollout_args::RolloutCarry::new(configured, root);
     let mut code = 0;
     for dir in &dirs {
         if dirs.len() > 1 && !args.common.silent {
@@ -1315,6 +1426,7 @@ async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i
         let mut child = args.clone();
         child.paths.clear();
         child.common.cwd = dir.clone();
+        child.rollout.carry = Some(carry.clone());
         code = code.max(Box::pin(run_scan(child, telemetry)).await);
     }
     code
@@ -1349,6 +1461,25 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             return 2;
         }
     };
+
+    // The per-run cap on NEW patches (`--max-new-patches` > env > the
+    // file's `maxNewPatches`, which work item A wires in). A malformed env
+    // value is a usage error.
+    let configured_cap = match args.rollout.carry.as_ref() {
+        Some(carry) => carry.lock().configured,
+        None => match args.rollout.resolve_from_env(None) {
+            Ok(max) => max,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                return 2;
+            }
+        },
+    };
+    let mut stage = rollout::Stage::new(
+        configured_cap,
+        args.rollout.carry.clone(),
+        &args.common.cwd,
+    );
 
     // Strict airgap (CLI_CONTRACT.md `--offline`): scan's patch discovery
     // is remote data, so refuse before the crawl and before the API client
@@ -1597,6 +1728,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 "packages": [],
                 "updates": [],
                 "paths": path_scope.raw(),
+                "rollout": stage.json(),
             });
             // Layout refusals: additive top-level `warnings` (omitted when
             // empty) so a consumer can tell an unscannable project from an
@@ -1909,7 +2041,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         vendor_state.as_ref().ok(),
         &hosted_pins,
     );
-    let updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
+    let mut updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
 
     // The hosted-wiring probes below take `all_purls` (POST-filter: only
     // packages this run covered), unlike the PRE-filter `scanned_purls`
@@ -1927,11 +2059,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             "canAccessPaidPatches": can_access_paid_patches,
             "packages": all_packages_with_patches,
             "paths": path_scope.raw(),
-            "updates": updates.iter().map(|u| serde_json::json!({
-                "purl": u.purl,
-                "oldUuid": u.old_uuid,
-                "newUuid": u.new_uuid,
-            })).collect::<Vec<_>>(),
+            "updates": updates_json(&updates),
+            "rollout": stage.json(),
         });
         // Layout refusals ride the non-empty envelope too (additive,
         // omitted when empty).
@@ -1971,6 +2100,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 Some(result),
                 telemetry,
                 npm_crawl.as_ref(),
+                update_manifest.as_deref(),
+                batch_error_count > 0,
+                &mut stage,
             )
             .await;
         }
@@ -1996,11 +2128,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 
         // --- Apply path (if requested) -----------------------------------
         if apply {
-            let selected = match discover_selected(
+            let discovered = match discover_selected(
                 &api_client,
                 &all_packages_with_patches,
                 can_access_paid_patches,
-                &args.common,
+                false,
                 false,
                 false,
                 telemetry,
@@ -2008,21 +2140,31 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             )
             .await
             {
-                Ok(s) => s,
+                Ok(d) => d,
                 Err((code, message)) => {
                     emit_discovery_error_json(&mut result, &message);
                     return code;
                 }
             };
+            let rows = classified_rows(
+                &mut stage,
+                &discovered,
+                update_manifest.as_deref(),
+                batch_error_count > 0,
+                &all_packages_with_patches,
+                Some(&mut result),
+            );
 
             // Vendor-owned and lockfile-only purls leave the selection as
-            // skip records BEFORE download (see `partition_agent_selection`).
+            // skip records BEFORE download (see `partition_agent_selection`);
+            // they cannot land, so they hold no rollout slot either.
             let AgentSelection {
-                kept: selected,
+                kept,
                 skip_records: vendored_records,
                 vendored_purls: vendored_skip_purls,
                 ..
-            } = partition_agent_selection(selected, &vendored_purls, &lockfile_only);
+            } = partition_agent_selection(writers_of(&rows), &vendored_purls, &lockfile_only);
+            let selected = plan_kept_rows(&mut stage, rows, kept);
 
             if dry {
                 // Synthesize the per-patch outcome without touching disk.
@@ -2120,6 +2262,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 use_public_proxy,
                 &all_packages_with_patches,
                 can_access_paid_patches,
+                update_manifest.as_deref(),
+                batch_error_count > 0,
+                &mut stage,
                 &mut result,
                 &manifest_path,
                 &socket_dir,
@@ -2152,6 +2297,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             .await;
         }
 
+        finish_rollout_json(&stage, &mut result);
         let final_code = embed_vex_into_json(
             &args.common,
             &args.vex,
@@ -2198,6 +2344,72 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
         return finish_human(0).await;
     }
+
+    // Count downloadable patches: a free-tier org whose every offer is
+    // paid-tier has nothing any mode could select, so every human arm stops
+    // below the table with the same paid-subscription line.
+    let downloadable_count = if can_access_paid_patches {
+        all_packages_with_patches.len()
+    } else {
+        all_packages_with_patches
+            .iter()
+            .filter(|pkg| pkg.patches.iter().any(|p| p.tier == "free"))
+            .count()
+    };
+
+    // The by-package records every arm selects from, fetched before the
+    // table so its `[UPDATE]` markers are the same UPGRADE rows the
+    // selection acts on (§5.1). Discovery said these packages HAVE
+    // patches, so an empty merged set is a fetch failure.
+    // A failed discovery still prints the table first; its exit code is
+    // returned below it.
+    let mut discovery_failure: Option<i32> = None;
+    let rows: Vec<rollout::Row> = if downloadable_count == 0 {
+        Vec::new()
+    } else {
+        match discover_selected(
+            &api_client,
+            &all_packages_with_patches,
+            can_access_paid_patches,
+            human,
+            !silent,
+            !hosted,
+            telemetry,
+            None,
+        )
+        .await
+        {
+            // The agent / vendored / report-only arms need records to show:
+            // an empty merged set is a fetch failure there.
+            Ok(discovered) if !hosted && discovered.fetched == 0 => {
+                eprintln!("{}", render::fetch_details_failed(&discovered.failed));
+                discovery_failure = Some(1);
+                Vec::new()
+            }
+            Ok(discovered) => {
+                let rows = classified_rows(
+                    &mut stage,
+                    &discovered,
+                    update_manifest.as_deref(),
+                    batch_error_count > 0,
+                    &all_packages_with_patches,
+                    None,
+                );
+                updates = offer_updates(
+                    &rows,
+                    &discovered,
+                    update_manifest.as_deref(),
+                    &all_packages_with_patches,
+                );
+                rows
+            }
+            // `discover_selected` already printed the failure to stderr.
+            Err((code, _)) => {
+                discovery_failure = Some(code);
+                Vec::new()
+            }
+        }
+    };
 
     // Presentational only, so `--silent` skips it wholesale.
     if !silent {
@@ -2322,23 +2534,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         }
     }
 
-    // Count downloadable patches: a free-tier org whose every offer is
-    // paid-tier has nothing any mode could select, so every human arm stops
-    // here with the same paid-subscription line.
-    let downloadable_count = if can_access_paid_patches {
-        all_packages_with_patches.len()
-    } else {
-        all_packages_with_patches
-            .iter()
-            .filter(|pkg| pkg.patches.iter().any(|p| p.tier == "free"))
-            .count()
-    };
-
     if downloadable_count == 0 {
         if !silent {
             println!("\nNo downloadable patches (paid subscription required).");
         }
         return finish_human(0).await;
+    }
+    if let Some(code) = discovery_failure {
+        return code;
     }
 
     // Hosted mode is a self-contained flow: it reuses the discovery, table
@@ -2346,27 +2549,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // engine (the same entry as `get --mode hosted`) — it must NOT fall
     // through to the apply/vendor branches.
     if hosted {
-        let selected = match discover_selected(
-            &api_client,
-            &all_packages_with_patches,
-            can_access_paid_patches,
-            &args.common,
-            human,
-            !silent,
-            telemetry,
-            None,
-        )
-        .await
-        {
-            Ok(s) => s,
-            // `discover_selected` already printed the failure to stderr.
-            Err((code, _)) => {
-                return code;
-            }
-        };
-        let pairs: Vec<(String, String)> = selected
+        let pairs: Vec<(String, String)> = rows
             .iter()
-            .map(|s| (s.purl.clone(), s.uuid.clone()))
+            .map(|r| (r.writer.purl.clone(), r.writer.uuid.clone()))
             .collect();
         return boxed_run_redirect_selected(
             &args.common,
@@ -2376,33 +2561,18 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &pairs,
             None,
             npm_crawl.as_ref(),
+            Some(rollout::Gate {
+                stage: &mut stage,
+                rows,
+            }),
         )
         .await;
-    }
-
-    // Fetch the full per-package patch lists — the same loop the JSON arms
-    // run through `discover_selected`, here with progress + per-package
-    // warnings. Discovery said these packages HAVE patches, so an empty
-    // merged set is a fetch failure.
-    let (all_search_results, detail_failures) =
-        fetch_patch_details(&api_client, &all_packages_with_patches, human, !silent).await;
-    if all_search_results.is_empty() {
-        eprintln!("{}", render::fetch_details_failed(&detail_failures));
-        return 1;
     }
 
     // A scan left without a mode (`--prune` or global; see
     // `resolve_mode_flags`) only reports, plus the `--prune` GC.
     let report_only = args.mode.is_none();
-
-    // Scan always takes the top-ranked patch (see `selection_args`).
-    let mut select_common = selection_args(&args.common);
-    select_common.silent |= report_only;
-    let selected: Vec<PatchSearchResult> =
-        match select_patches(&all_search_results, can_access_paid_patches, &select_common) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
+    let selected: Vec<PatchSearchResult> = writers_of(&rows);
 
     // The skip / already-recorded lines below open their own paragraph
     // under the table's Summary: one blank line before the first of them.
@@ -2425,6 +2595,23 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             }
         }
         split.kept
+    };
+
+    // The rollout plan (§5.2): deferred NEW rows leave the selection here.
+    // Vendored eligibility is the wet run's Bun / vlt preflight; the agent
+    // partition above already removed what cannot land in place.
+    let selected = if report_only {
+        selected
+    } else if vendor {
+        let refused = vendor_flow::preflight_refused_purls(&args.common.cwd, &selected).await;
+        stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
+        let deferred = stage.deferred_keys();
+        selected
+            .into_iter()
+            .filter(|p| !deferred.contains(&(p.purl.clone(), p.uuid.clone())))
+            .collect()
+    } else {
+        plan_kept_rows(&mut stage, rows, selected)
     };
 
     // Drop selections the manifest already records at the same uuid.
@@ -2453,12 +2640,15 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     if selected.is_empty() {
         if !silent {
             open_paragraph(&mut skip_paragraph);
-            if already_recorded.is_empty() {
+            if !stage.deferred_keys().is_empty() {
+                println!("No new patches admitted this run.");
+            } else if already_recorded.is_empty() {
                 println!("No patches selected.");
             } else {
                 println!("{}", render::ALL_ALREADY_RECORDED);
             }
         }
+        print_rollout_human(&stage, args.common.dry_run, silent);
         return finish_human(0).await;
     }
 
@@ -2537,6 +2727,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 print_dry_run_refusals(preview);
             }
         }
+        print_rollout_human(&stage, true, silent);
         return finish_human(0).await;
     }
 
@@ -2635,6 +2826,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             );
         }
     }
+
+    print_rollout_human(&stage, false, silent);
 
     // Post-apply GC: only with `--prune` or `--sync`; otherwise an agent
     // apply leaves every other manifest entry alone (`socket-patch repair`
@@ -3038,20 +3231,6 @@ mod tests {
             vec!["pkg:npm/minimist@1.2.2".to_string()],
             "positive control: a record names the package"
         );
-    }
-
-    #[test]
-    fn selection_args_never_prompts() {
-        for common in [
-            GlobalArgs::default(),
-            GlobalArgs {
-                json: true,
-                ..GlobalArgs::default()
-            },
-        ] {
-            let picked = selection_args(&common);
-            assert!(!picked.json && picked.yes, "scan always takes the top patch");
-        }
     }
 
     #[test]

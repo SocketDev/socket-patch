@@ -45,6 +45,7 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_JSON",
     "SOCKET_LOCK_TIMEOUT",
     "SOCKET_MANIFEST_PATH",
+    "SOCKET_MAX_NEW_PATCHES",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
@@ -518,6 +519,11 @@ fn scan_json_empty_cwd_emits_updates_key() {
         // v4 duality rework: the positional PATH globs are echoed on every
         // scan envelope, always present (empty when no scoping was given).
         "paths": [],
+        "rollout": {
+            "maxNewPatches": { "value": null, "source": "default" },
+            "counts": { "new": 0, "deferred": 0, "upgrade": 0, "already": 0 },
+            "deferred": [],
+        },
         // v5: a bare scan runs hosted mode, so its result nests here.
         "redirect": {
             "mode": "hosted",

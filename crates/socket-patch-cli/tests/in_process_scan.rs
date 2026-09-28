@@ -44,6 +44,7 @@ fn default_args(cwd: &Path) -> ScanArgs {
         mode: None,
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
