@@ -279,6 +279,42 @@ pub fn staged_leaf_for_purl(purl: &str) -> String {
     }
 }
 
+/// Why [`fetch_and_stage`] refuses `entry` as unverifiable before any
+/// request, decided from the entry (and go's proxy settings) alone. Covers
+/// the npm, cargo, golang and composer fetchers completely; the gem and
+/// pypi fetchers raise further refusals only their downloads can decide.
+pub fn refusal_before_download(entry: &LockfileEntry) -> Option<String> {
+    if entry.integrity == LockIntegrity::None {
+        return Some(format!(
+            "the lockfile records no integrity hash for {}@{}; refusing to fetch \
+             unverifiable content",
+            entry.name, entry.version
+        ));
+    }
+    match entry.ecosystem {
+        "npm" => match &entry.integrity {
+            LockIntegrity::BerryChecksum(expected) if !expected.starts_with("10c0/") => {
+                Some(format!(
+                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
+                     the cache-zip recipe is not reproducible for it"
+                ))
+            }
+            _ => None,
+        },
+        "golang" => match (&entry.integrity, &entry.resolved) {
+            (LockIntegrity::GoH1(_), Some(_)) => None,
+            (LockIntegrity::GoH1(_), None) => goproxy_base(&entry.name).err(),
+            _ => Some("go module entries verify via the go.sum h1 dirhash only".to_string()),
+        },
+        "composer" if entry.resolved.is_none() => Some(format!(
+            "composer.lock records no dist URL for {}@{}",
+            entry.name, entry.version
+        )),
+        "cargo" | "composer" | "gem" | "pypi" => None,
+        other => Some(format!("no registry fetcher for ecosystem `{other}`")),
+    }
+}
+
 /// Fetch + verify + extract one lockfile entry. Ecosystems without a
 /// fetcher yet return [`FetchError::Unverifiable`] (callers keep their
 /// not-installed outcome).
@@ -286,12 +322,8 @@ pub async fn fetch_and_stage(
     entry: &LockfileEntry,
     client: &reqwest::Client,
 ) -> Result<FetchedPackage, FetchError> {
-    if entry.integrity == LockIntegrity::None {
-        return Err(FetchError::Unverifiable(format!(
-            "the lockfile records no integrity hash for {}@{}; refusing to fetch \
-             unverifiable content",
-            entry.name, entry.version
-        )));
+    if let Some(reason) = refusal_before_download(entry) {
+        return Err(FetchError::Unverifiable(reason));
     }
     match entry.ecosystem {
         "npm" => fetch_npm(entry, client).await,
@@ -3786,6 +3818,71 @@ mod tests {
             "case escaping must apply to the name AND the version"
         );
         assert!(fetched.dir().await.unwrap().join("go.mod").is_file());
+    }
+
+    /// The pre-download refusals the vendor loop's service deferral mirrors
+    /// are exactly the ones `fetch_and_stage` raises before any request.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refusal_before_download_matches_the_fetchers_first_refusals() {
+        let entry = |ecosystem: &'static str, resolved: Option<&str>, integrity: LockIntegrity| {
+            LockfileEntry {
+                ecosystem,
+                name: "example.com/mod".into(),
+                version: "1.0.0".into(),
+                purl: format!("pkg:{ecosystem}/example.com/mod@1.0.0"),
+                resolved: resolved.map(str::to_string),
+                integrity,
+                source_kind: SourceKind::Unspecified,
+            }
+        };
+        let saved = std::env::var("GOPROXY").ok();
+        std::env::set_var("GOPROXY", "off");
+        let refused = [
+            entry("npm", None, LockIntegrity::None),
+            entry(
+                "npm",
+                Some("http://127.0.0.1:1/x.tgz"),
+                LockIntegrity::BerryChecksum("8/abc".into()),
+            ),
+            entry("golang", None, LockIntegrity::GoH1("h1:AAAA".into())),
+            entry("golang", None, LockIntegrity::Sri("sha512-AAAA".into())),
+            entry("composer", None, LockIntegrity::Sha1Hex("aa".into())),
+            entry("nuget", Some("http://127.0.0.1:1/x"), LockIntegrity::Sri("x".into())),
+        ];
+        for e in &refused {
+            let reason = refusal_before_download(e).expect("refused");
+            match fetch_and_stage(e, &build_registry_client()).await {
+                Err(FetchError::Unverifiable(d)) => assert_eq!(d, reason),
+                other => panic!("{e:?}: {:?}", other.err()),
+            }
+        }
+        match saved {
+            Some(v) => std::env::set_var("GOPROXY", v),
+            None => std::env::remove_var("GOPROXY"),
+        }
+        let fetchable = [
+            entry("npm", Some("http://127.0.0.1:1/x.tgz"), LockIntegrity::Sri("x".into())),
+            entry(
+                "npm",
+                Some("http://127.0.0.1:1/x.tgz"),
+                LockIntegrity::BerryChecksum("10c0/abc".into()),
+            ),
+            entry("cargo", None, LockIntegrity::Sha256Hex("aa".into())),
+            entry(
+                "golang",
+                Some("http://127.0.0.1:1/x.zip"),
+                LockIntegrity::GoH1("h1:AAAA".into()),
+            ),
+            entry(
+                "composer",
+                Some("http://127.0.0.1:1/x.zip"),
+                LockIntegrity::Sha1Hex("aa".into()),
+            ),
+        ];
+        for e in &fetchable {
+            assert_eq!(refusal_before_download(e), None, "{e:?}");
+        }
     }
 
     /// go never sends a module path to a proxy when GOPROXY starts with
