@@ -237,3 +237,24 @@ async fn default_repair_downloads_the_created_files_blob_for_offline_apply() {
     assert_eq!(code, 0, "apply: stdout={stdout}\nstderr={stderr}");
     assert_fully_patched(&pkg);
 }
+
+#[test]
+fn offline_repair_names_the_created_files_missing_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_project(tmp.path());
+    seed_cached_diff_archive(tmp.path());
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &["repair", "--offline"], None);
+
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("All diff archives are present locally."),
+        "stdout={stdout}"
+    );
+    let short: String = git_sha256(CREATED).chars().take(12).collect();
+    assert!(
+        stderr.contains("Warning: 1 blob is missing (offline mode - not downloading):")
+            && stderr.contains(&short),
+        "the created file's blob is still missing; stderr={stderr}"
+    );
+}
