@@ -100,6 +100,68 @@ pub struct HostedScanOptions {
     pub request_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<HostedScanLimits>,
+    /// The run-wide cap on NEW patches (`scan --max-new-patches`); absent
+    /// or `"none"` is unlimited, 0 admits upgrades only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_new_patches: Option<MaxNewPatchesOption>,
+    /// A server ceiling applied on top of `maxNewPatches`, `"none"`
+    /// included: it can tighten the cap, never loosen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_new_patches_cap: Option<u32>,
+    /// Base purls already proposed in an open rollout PR: ranked first, so
+    /// a newly published patch never displaces one under review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight_patches: Option<Vec<String>>,
+}
+
+/// `maxNewPatches`: a count, or `"none"` (`None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxNewPatchesOption(pub Option<u32>);
+
+impl Serialize for MaxNewPatchesOption {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(n) => s.serialize_u32(n),
+            None => s.serialize_str("none"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxNewPatchesOption {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = MaxNewPatchesOption;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a patch count (0 to 4294967295) or \"none\"")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .map(|n| MaxNewPatchesOption(Some(n)))
+                    .map_err(|_| E::custom("maxNewPatches exceeds 4294967295"))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                u64::try_from(v)
+                    .map_err(|_| E::custom("maxNewPatches must not be negative"))
+                    .and_then(|v| self.visit_u64(v))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                if v.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&v) {
+                    Ok(MaxNewPatchesOption(Some(v as u32)))
+                } else {
+                    Err(E::custom("maxNewPatches must be a whole number of patches"))
+                }
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v == "none" {
+                    Ok(MaxNewPatchesOption(None))
+                } else {
+                    Err(E::custom(format!("maxNewPatches must be a number or \"none\", not `{v}`")))
+                }
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
 }
 
 pub const DEFAULT_BATCH_SIZE: u32 = 100;
@@ -228,8 +290,24 @@ pub struct ProjectResult {
     pub summary: ProjectSummary,
     pub redirected: Vec<RedirectedPatch>,
     pub skipped: Vec<SkippedPatch>,
+    /// NEW patches over the run-wide `maxNewPatches` budget, in rank order
+    /// (also in `skipped[]` as `rollout_deferred`).
+    #[serde(default)]
+    pub deferred: Vec<DeferredPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ProjectError>,
+}
+
+/// One deferred NEW patch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredPatch {
+    pub purl: String,
+    pub uuid: String,
+    /// `critical` … `unknown`.
+    pub severity: String,
+    /// 1-based rank among the run's eligible NEW base purls.
+    pub rank: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +354,8 @@ pub struct HostedScanOutput {
     pub changed_binary_files: Vec<ChangedBinaryFile>,
     pub deleted_files: Vec<String>,
     pub warnings: Vec<EngineWarning>,
+    /// The session-level `rollout` block, the CLI `--json` shape.
+    pub rollout: serde_json::Value,
     pub stats: EngineStats,
     pub engine_version: String,
 }

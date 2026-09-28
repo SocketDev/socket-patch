@@ -409,7 +409,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 /// bridges the spellings); a legacy entry without an embedded record
 /// contributes its uuid alone. Borrows the manifest untouched when nothing
 /// else contributes.
-pub(super) fn merge_ledger_records_for_updates<'a>(
+pub(crate) fn merge_ledger_records_for_updates<'a>(
     manifest: Option<&'a PatchManifest>,
     vendor: Option<&VendorState>,
     hosted_pins: &[(String, String)],

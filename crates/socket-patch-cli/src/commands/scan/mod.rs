@@ -45,14 +45,14 @@ pub(crate) mod vendor_flow;
 
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
-    merge_ledger_records_for_updates, preverify_vendor_baselines, severity_order,
+    preverify_vendor_baselines, severity_order,
     vendored_ledger_supplement, LockfileSupplement,
 };
 // Shared with `get --mode hosted|vendored` (commands::get): the advisory-
 // pinned entry into the hosted engine, the vendor step + its dry-run
 // preview, and the PnP layout-refusal warning mapping. `pub(crate)`
 // re-exports because the submodules themselves stay private to scan.
-pub(crate) use self::discovery::unsupported_layout_warnings;
+pub(crate) use self::discovery::{merge_ledger_records_for_updates, unsupported_layout_warnings};
 use self::gc::gc_json;
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;

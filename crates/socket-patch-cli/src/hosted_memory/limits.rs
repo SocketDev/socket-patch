@@ -27,6 +27,10 @@ pub(crate) struct ResolvedOptions {
     pub(crate) provider_concurrency: usize,
     pub(crate) request_timeout: std::time::Duration,
     pub(crate) limits: ResolvedLimits,
+    /// The run-wide cap on NEW patches (the option reports as `flag`).
+    pub(crate) max_new: socket_patch_core::rollout::MaxNew,
+    /// `inFlightPatches` as canonical base purls.
+    pub(crate) in_flight: std::collections::BTreeSet<String>,
 }
 
 pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOptions, EngineError> {
@@ -103,6 +107,18 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
         provider_concurrency: provider_concurrency.min(MAX_PROVIDER_CONCURRENCY) as usize,
         request_timeout: std::time::Duration::from_millis(timeout_ms),
         limits: options.limits.clone().unwrap_or_default().resolve(),
+        max_new: socket_patch_core::rollout::resolve_max_new(
+            options.max_new_patches.map(|v| v.0),
+            None,
+            None,
+            options.max_new_patches_cap,
+        ),
+        in_flight: options
+            .in_flight_patches
+            .iter()
+            .flatten()
+            .map(|p| socket_patch_core::rollout::canonical_base_purl(p))
+            .collect(),
     })
 }
 

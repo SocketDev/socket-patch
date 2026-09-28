@@ -312,6 +312,64 @@ pub struct DiskRun {
 /// node / pipenv / gem subprocesses), `HOME` and the language caches at
 /// empty directories, no socket-cli config, no telemetry.
 pub fn run_disk(server: &MockServer, files: &BTreeMap<String, Vec<u8>>, dry_run: bool) -> DiskRun {
+    run_disk_with(server, files, dry_run, &[])
+}
+
+/// A human (non-`--json`) disk scan with `args`: exit code, stdout, and the
+/// files it changed.
+pub fn run_disk_args(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    args: &[&str],
+) -> (i32, String, BTreeMap<String, Vec<u8>>) {
+    let (project, _home, mut cmd) = disk_command(server, files);
+    cmd.args(args);
+    let output = cmd.output().expect("spawn socket-patch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let after = read_tree(project.path());
+    let changed = after
+        .into_iter()
+        .filter(|(rel, bytes)| files.get(rel) != Some(bytes))
+        .collect();
+    (output.status.code().unwrap_or(-1), stdout, changed)
+}
+
+/// [`run_disk`] with extra `scan --json` arguments.
+pub fn run_disk_with(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    dry_run: bool,
+    extra: &[&str],
+) -> DiskRun {
+    let (project, _home, mut cmd) = disk_command(server, files);
+    cmd.arg("--json");
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    cmd.args(extra);
+    let output = cmd.output().expect("spawn socket-patch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let envelope: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("disk --json output is not JSON ({e}):\n{stdout}\n{stderr}"));
+    let after = read_tree(project.path());
+    let changed = after
+        .into_iter()
+        .filter(|(rel, bytes)| files.get(rel) != Some(bytes))
+        .collect();
+    DiskRun {
+        envelope,
+        changed,
+        stderr,
+    }
+}
+
+/// The scrubbed `scan --mode hosted` command over a copy of `files` (the
+/// returned tempdirs, the project and `HOME`, must outlive the run).
+fn disk_command(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> (tempfile::TempDir, tempfile::TempDir, std::process::Command) {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     for (rel, bytes) in files {
@@ -353,7 +411,6 @@ pub fn run_disk(server: &MockServer, files: &BTreeMap<String, Vec<u8>>, dry_run:
         "scan",
         "--mode",
         "hosted",
-        "--json",
         "--yes",
         "--cwd",
         project.path().to_str().unwrap(),
@@ -364,24 +421,7 @@ pub fn run_disk(server: &MockServer, files: &BTreeMap<String, Vec<u8>>, dry_run:
         "--api-url",
         &server.uri(),
     ]);
-    if dry_run {
-        cmd.arg("--dry-run");
-    }
-    let output = cmd.output().expect("spawn socket-patch");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let envelope: Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("disk --json output is not JSON ({e}):\n{stdout}\n{stderr}"));
-    let after = read_tree(project.path());
-    let changed = after
-        .into_iter()
-        .filter(|(rel, bytes)| files.get(rel) != Some(bytes))
-        .collect();
-    DiskRun {
-        envelope,
-        changed,
-        stderr,
-    }
+    (project, home, cmd)
 }
 
 /// The engine's changed files (text and binary) as bytes.

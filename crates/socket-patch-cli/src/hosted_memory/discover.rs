@@ -15,7 +15,7 @@ use std::time::Duration;
 use socket_patch_core::api::client::{ApiError, ApiFuture, PatchApi};
 use socket_patch_core::api::ranking::cmp_search_results;
 use socket_patch_core::api::types::{
-    BatchPackagePatches, PackageVendorResult, PatchResponse, PatchSearchResult, SearchResponse,
+    BatchPackagePatches, PackageVendorResult, PatchResponse, SearchResponse,
 };
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 
@@ -280,29 +280,6 @@ pub(crate) async fn fetch_details(
         .collect()
 }
 
-/// The disk `--json` selection over one root's merged detail results:
-/// accessible patches only, then the top-ranked patch per purl, sorted by
-/// purl, as `(purl, uuid)`.
-pub(crate) fn select_top_ranked(
-    results: &[PatchSearchResult],
-    can_access_paid: bool,
-) -> Vec<(String, String)> {
-    let mut by_purl: BTreeMap<&str, Vec<&PatchSearchResult>> = BTreeMap::new();
-    for patch in results
-        .iter()
-        .filter(|p| can_access_paid || p.tier == "free")
-    {
-        by_purl.entry(patch.purl.as_str()).or_default().push(patch);
-    }
-    by_purl
-        .into_iter()
-        .filter_map(|(purl, mut group)| {
-            group.sort_by(|a, b| cmp_search_results(a, b));
-            group.first().map(|p| (purl.to_string(), p.uuid.clone()))
-        })
-        .collect()
-}
-
 /// Reference grants for every distinct uuid (`MAX_REFERENCE_BATCH` per
 /// request): the merged results, plus the uuids whose request failed.
 pub(crate) async fn fetch_references(
@@ -389,6 +366,7 @@ pub(crate) async fn fetch_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket_patch_core::api::types::PatchSearchResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -440,13 +418,21 @@ mod tests {
             result("pkg:npm/a@1", "a-paid", "paid", "critical"),
             result("pkg:npm/a@1", "a-free", "free", "low"),
         ];
+        // The engine selects through the disk flow's own seam.
+        let pairs = |paid: bool| -> Vec<(String, String)> {
+            crate::commands::scan::rollout::offers_from_results(&results, paid)
+                .selected
+                .into_iter()
+                .map(|(purl, p)| (purl, p.uuid))
+                .collect()
+        };
         assert_eq!(
-            select_top_ranked(&results, false),
+            pairs(false),
             vec![
                 ("pkg:npm/a@1".to_string(), "a-free".to_string()),
                 ("pkg:npm/b@1".to_string(), "b-crit".to_string())
             ]
         );
-        assert_eq!(select_top_ranked(&results, true)[0].1, "a-paid");
+        assert_eq!(pairs(true)[0].1, "a-paid");
     }
 }

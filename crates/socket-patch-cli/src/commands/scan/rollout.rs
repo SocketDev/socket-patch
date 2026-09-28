@@ -191,17 +191,44 @@ pub(crate) fn lookup_incomplete(
             .any(|purl| recorded.is_none_or(|m| recorded_uuids(m, purl).is_empty()))
 }
 
+/// Every canonical-shaped uuid (`8-4-4-4-12` hex) `text` mentions,
+/// lowercased, in one linear pass.
+pub(crate) fn mentioned_uuids(text: &str, out: &mut HashSet<String>) {
+    let bytes = text.as_bytes();
+    if bytes.len() < 36 {
+        return;
+    }
+    let mut i = 0;
+    while i + 36 <= bytes.len() {
+        let window = &bytes[i..i + 36];
+        let shaped = window.iter().enumerate().all(|(k, b)| match k {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+        if shaped {
+            out.insert(String::from_utf8_lossy(window).to_ascii_lowercase());
+            i += 36;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Mark NEW rows whose selected uuid the project's lockfile texts already
 /// mention as ALREADY. A hosted pin on a patch server discovery does not
 /// recognize (an origin missing from `--patch-server-url`) would otherwise
 /// read as NEW on every run and hold its slot forever; patch uuids are
 /// unique, so a mention is a pin.
 pub(crate) fn mark_pinned(rows: &mut [Row], texts: &[&str]) {
+    if !rows.iter().any(|r| r.candidate.recorded.is_new()) {
+        return;
+    }
+    let mut mentioned = HashSet::new();
+    for text in texts {
+        mentioned_uuids(text, &mut mentioned);
+    }
     for row in rows.iter_mut().filter(|r| r.candidate.recorded.is_new()) {
-        if texts
-            .iter()
-            .any(|t| t.contains(row.candidate.uuid.as_str()))
-        {
+        if mentioned.contains(&row.candidate.uuid.to_ascii_lowercase()) {
             row.candidate.recorded = Recorded::Same;
         }
     }
@@ -729,6 +756,42 @@ mod tests {
                 old_uuid: "c".into()
             }
         );
+    }
+
+    #[test]
+    fn mentioned_uuids_finds_every_canonical_shape_once() {
+        let mut out = HashSet::new();
+        mentioned_uuids(
+            "https://h/p/22222222-2222-4222-8222-222222222222/AAAAAAAA-1111-4111-8111-00000000000A/x.tgz \
+             not-a-uuid 1234 socket-patch-bbbbbbbb-1111-4111-8111-00000000000b",
+            &mut out,
+        );
+        let mut got: Vec<&str> = out.iter().map(String::as_str).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "22222222-2222-4222-8222-222222222222",
+                "aaaaaaaa-1111-4111-8111-00000000000a",
+                "bbbbbbbb-1111-4111-8111-00000000000b",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lock_naming_the_selected_uuid_marks_the_row_already() {
+        let results = vec![
+            offer("pkg:npm/a@1", "aaaaaaaa-1111-4111-8111-00000000000a", "", &["high"]),
+            offer("pkg:npm/b@1", "bbbbbbbb-1111-4111-8111-00000000000b", "", &["high"]),
+        ];
+        let offers = offers_from_results(&results, true);
+        let mut rows = classify(&offers, None, "");
+        mark_pinned(
+            &mut rows,
+            &["resolved: https://x/AAAAAAAA-1111-4111-8111-00000000000A/a.tgz"],
+        );
+        assert_eq!(rows[0].candidate.recorded, Recorded::Same);
+        assert_eq!(rows[1].candidate.recorded, Recorded::None);
     }
 
     #[test]
