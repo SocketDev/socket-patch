@@ -74,7 +74,10 @@ asserted and each named test or row exists.
   releases, the Node floors 22.22.0 / 22.13.0 / 22.7.0 / 22.0.0 with the
   collation golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
   cache root); `native` (the backtest against production, artifacts
-  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape);
+  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape; on macOS
+  it first pins the TLS-verified patch hosts in `/etc/hosts` through
+  `.github/actions/pin-socket-hosts`, because the hosted macOS resolver
+  intermittently loses `patch.socket.dev` for minutes while the service is up);
   `lock-diff` (the same cell's `vlt-lock.json` must be byte-identical on Linux,
   macOS and Windows); `matrix-coverage` (every era × suite × OS).
 - **Nightly:** `canary` runs every capstone on `vlt@latest` on 3 OS (only the
