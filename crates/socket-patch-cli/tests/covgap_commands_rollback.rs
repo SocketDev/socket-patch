@@ -149,6 +149,10 @@ struct PatchedFixture {
     purl: &'static str,
     before: &'static [u8],
     after: &'static [u8],
+    #[cfg(target_os = "macos")]
+    before_hash: String,
+    #[cfg(target_os = "macos")]
+    after_hash: String,
 }
 
 fn patched_fixture() -> PatchedFixture {
@@ -177,6 +181,10 @@ fn patched_fixture() -> PatchedFixture {
         purl,
         before,
         after,
+        #[cfg(target_os = "macos")]
+        before_hash,
+        #[cfg(target_os = "macos")]
+        after_hash,
     }
 }
 
