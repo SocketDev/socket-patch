@@ -21,26 +21,8 @@ use std::process::Command;
 use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
-
-/// Ecosystems opted in via `setup.manual` in test fixtures so the
-/// property-7 setup-state filter (`commands/setup::configured_ecosystems`)
-/// keeps these patches — these tests exercise VEX document GENERATION, not
-/// setup state. Only npm/pypi/gem/composer are setup-capable; cargo, golang,
-/// maven and nuget have no setup hook and get in only through `manual`
-/// (maven/nuget are appended by [`all_manual`]).
-const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
-
-/// [`ALL_MANUAL`] plus the apply-only ecosystems (maven/nuget), so the
-/// all-ecosystem agent matrix below can declare every non-Deno ecosystem
-/// (8 of the 9).
-fn all_manual() -> Vec<String> {
-    let mut names: Vec<String> = ALL_MANUAL.iter().map(|s| (*s).to_string()).collect();
-    names.push("maven".to_string());
-    names.push("nuget".to_string());
-    names
-}
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
@@ -77,14 +59,9 @@ fn cli() -> Command {
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut m = manifest.clone();
-    m.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: all_manual(),
-    });
     std::fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
+        serde_json::to_string_pretty(manifest).unwrap(),
     )
     .unwrap();
 }
@@ -275,13 +252,12 @@ fn two_patches_sharing_ghsa_merge_subcomponents() {
 // `e2e_vex_redirect::no_verify_attests_redirected_patches_across_ecosystems`.
 // One manifest patch per non-Deno ecosystem (qualified PURLs for the
 // release-variant ones: pypi `?artifact_id=`, gem `?platform=`, maven
-// `?classifier=&ext=`), `setup.manual` declaring every ecosystem (via
-// `all_manual`) so property 7 keeps them all, and `--no-verify` attests
-// straight from the manifest with no installed tree.
+// `?classifier=&ext=`), and `--no-verify` attests straight from the
+// manifest with no installed tree.
 //
-// Unlike the redirect matrix — whose patches bypass BOTH property 7 and
-// `Ecosystem::from_purl` via the `redirected` set — an agent patch routes
-// through `Ecosystem::from_purl` + the `manual` allowlist. Each statement must
+// Unlike the redirect matrix — whose patches bypass `Ecosystem::from_purl`
+// via the `redirected` set — an agent patch routes through
+// `Ecosystem::from_purl`. Each statement must
 // carry a PLAIN impact statement (NO `(vendored)`/`(redirected)` marker — that
 // is what distinguishes agent provenance) and preserve the (possibly
 // qualified) PURL verbatim as the subcomponent id.
@@ -349,8 +325,6 @@ fn no_verify_attests_agent_patches_across_ecosystems() {
             ),
         );
     }
-    // write_manifest stamps setup.manual = all_manual(), which declares
-    // every non-Deno ecosystem (8 of the 9).
     write_manifest(cwd, &manifest);
 
     let out = cli()

@@ -517,7 +517,7 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
     assert_eq!(code, 0, "a refused takeover still exits 0: {doc:#}");
     let detail = warning_detail(&doc, "redirect_vendored_revert_failed");
     assert!(
-        detail.contains("NOT redirected") && detail.contains("vendor --revert"),
+        detail.contains("NOT switched to hosted") && detail.contains("vendor --revert"),
         "the refusal must name the fail-closed outcome and the manual path: {detail}"
     );
     assert!(
@@ -555,18 +555,18 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
     assert_eq!(code, 0, "human refusal run exits 0; stderr=\n{stderr}");
     assert!(
-        stdout.contains("Redirected 0 packages; rewrote 0 files."),
+        stdout.contains("Switched 0 packages to hosted patches; rewrote 0 files."),
         "anchor: the human redirect branch ran; stdout=\n{stdout}"
     );
     assert!(
         stderr.contains(&format!(
-            "No patches could be redirected:\n  {PURL}: its vendored state could not be \
+            "No patches could be switched to hosted:\n  {PURL}: its vendored state could not be \
              reverted (see the warning)"
         )),
         "the human skipped line must name purl + reason; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning (redirect_vendored_revert_failed): ")
+        stderr.contains("Warning: ")
             && stderr.contains("could not be reverted"),
         "the takeover pre-warning must reach human stderr; stderr=\n{stderr}"
     );
@@ -958,7 +958,7 @@ async fn successful_wet_hosted_run_leaves_nothing_under_socket() {
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "the run must have redirected (and therefore locked); stdout=\n{stdout}"
     );
     assert!(
@@ -1083,15 +1083,15 @@ async fn hosted_human_paid_only_discovery_stops_with_the_paid_hint() {
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("No downloadable patches (paid subscription required)."),
+        stdout.contains("No downloadable patches: every patch found requires a paid Socket plan."),
         "stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 additional patch is available with a paid subscription"),
+        stdout.contains("1 additional patch is available with a paid Socket plan"),
         "the table's paid nudge still prints; stdout=\n{stdout}"
     );
     assert!(
-        !stdout.contains("Redirected"),
+        !stdout.contains("Switched"),
         "the engine is never entered; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -1932,8 +1932,7 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
     assert_eq!(code, 0, "human overlap run exits 0; stderr=\n{stderr}");
     assert!(
         stderr.contains(
-            "Warning (redirect_supersedes_vendored): Hosted redirect superseded the vendored \
-             ledger for:"
+            "Warning: Hosted wiring superseded the vendored ledger for:"
         ) && stderr.contains(XPURL),
         "the supersedes warning must reach human stderr; stderr=\n{stderr}"
     );
@@ -1973,16 +1972,16 @@ async fn human_dry_run_prints_would_rewrite_pnpm_guidance_and_vex_skip() {
     );
     assert!(
         stdout.contains(
-            "Would redirect 1 package and rewrite 2 files (--dry-run: nothing was changed)."
+            "Would switch 1 package to hosted patches and rewrite 2 files (--dry-run: nothing was changed)."
         ),
         "the dry-run summary must use the preview verb; stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("Skipping VEX generation (--dry-run: nothing was redirected)."),
+        stderr.contains("Skipping VEX generation (--dry-run: nothing was rewritten)."),
         "the requested-but-skipped VEX must be announced; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning (redirect_pnpm_trust_lockfile): ")
+        stderr.contains("Warning: ")
             && stderr.contains("trustLockfile"),
         "the pnpm trust guidance must reach human stderr; stderr=\n{stderr}"
     );
@@ -2027,7 +2026,7 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
         "scan --vex exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "anchor: the wet-run summary verb; stdout=\n{stdout}"
     );
     assert!(
@@ -2122,12 +2121,12 @@ async fn human_rush_run_prints_the_repo_state_stale_warning_line() {
         "rush run exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "anchor: the rush lock must be rewritten; stdout=\n{stdout}"
     );
     assert!(
         stderr.contains(
-            "Warning (redirect_rush_repo_state_stale): pnpm-lock.yaml was edited outside \
+            "Warning: pnpm-lock.yaml was edited outside \
              `rush update`"
         ),
         "the rush repo-state warning must reach human stderr; stderr=\n{stderr}"
@@ -2241,7 +2240,7 @@ async fn human_reference_failure_prints_an_error_line_and_exits_1() {
             && line.ends_with("(nothing was changed; re-run to retry)"),
         "{line}"
     );
-    assert!(!stdout.contains("Redirected"), "stdout=\n{stdout}");
+    assert!(!stdout.contains("Switched"), "stdout=\n{stdout}");
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_before
@@ -2276,7 +2275,7 @@ async fn human_malformed_pre_v5_ledger_does_not_abort_the_run() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("Would redirect 1 package"),
+        stdout.contains("Would switch 1 package to hosted patches"),
         "stdout=\n{stdout}"
     );
     assert!(
@@ -2338,10 +2337,12 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "Redirected 1 package; rewrote 2 files.\n\
-         Commit .npmrc and package-lock.json to keep the redirect.\n\
-         Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages pick \
-         up the patched artifacts, then run `socket-patch vex` to verify them.\n",
+        "Switched 1 package to hosted patches; rewrote 2 files.\n\
+         Next steps:\n  \
+         1. Commit .npmrc and package-lock.json to keep the hosted patches.\n  \
+         2. Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages pick \
+         up the patched artifacts, then run `socket-patch vex` to verify the installed \
+         patches.\n",
         "stderr=\n{stderr}"
     );
 
@@ -2349,14 +2350,14 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already redirected; nothing to rewrite.\n",
+        "1 package is already on hosted patches; nothing to rewrite.\n",
         "stderr=\n{stderr}"
     );
     let (code, stdout, _) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0);
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already redirected; nothing to rewrite.\n"
+        "1 package is already on hosted patches; nothing to rewrite.\n"
     );
 }
 
@@ -2383,13 +2384,13 @@ async fn human_unconfirmed_purl_is_listed_with_a_headline() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "a no-op redirect still exits 0; stderr=\n{stderr}");
     assert!(
-        stdout.contains("Would redirect 0 packages and rewrite 0 files"),
+        stdout.contains("Would switch 0 packages to hosted patches and rewrite 0 files"),
         "stdout=\n{stdout}"
     );
     assert!(
         stderr.contains(&format!(
-            "No patches could be redirected:\n  {PURL}: no lockfile entry pinning it could \
-             be redirected"
+            "No patches could be switched to hosted:\n  {PURL}: no lockfile entry pinning it \
+             could be rewritten"
         )),
         "stderr=\n{stderr}"
     );
@@ -2411,22 +2412,22 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_pnpm_project(root);
-    const REMINDER: &str = "Warning (redirect_pnpm_trust_lockfile): pnpm-lock.yaml is already \
-        redirected and pnpm-workspace.yaml already sets `trustLockfile: true`; keep both \
+    const REMINDER: &str = "Warning: pnpm-lock.yaml already uses \
+        hosted patches and pnpm-workspace.yaml already sets `trustLockfile: true`; keep both \
         committed, and never rebuild the lockfile (`pnpm clean --lockfile`), which discards \
-        the redirect\n";
+        the hosted patches\n";
 
     let (code, stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        engine_stdout(&stdout).starts_with("Redirected 1 package; rewrote 2 files.\n"),
+        engine_stdout(&stdout).starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
         "{stdout}"
     );
     // Everything from the pnpm warning on (the lines above it are the
     // token-format notice and discovery progress).
     let pnpm_part = |stderr: &str| -> String {
         stderr
-            .find("Warning (redirect_pnpm_trust_lockfile): ")
+            .find("Warning: pnpm-lock.yaml")
             .map(|i| stderr[i..].to_string())
             .unwrap_or_default()
     };
@@ -2440,7 +2441,7 @@ async fn human_pnpm_rerun_prints_only_the_reminder_and_heal_restores_guidance() 
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "1 package is already redirected; nothing to rewrite.\n"
+        "1 package is already on hosted patches; nothing to rewrite.\n"
     );
     assert_eq!(
         pnpm_part(&stderr),

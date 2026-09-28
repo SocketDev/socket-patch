@@ -141,8 +141,8 @@ impl Sources {
 
 /// The resolved attestation inputs.
 pub(crate) struct Plan {
-    /// purl → record for every candidate that passed the gates (with the
-    /// manifest file's `setup` block, which property 7 reads).
+    /// purl → record for every candidate that passed the gates (carrying
+    /// the manifest file's legacy `setup` block through unchanged).
     pub view: PatchManifest,
     /// Vendored-basis entries, keyed by view purl — the verification
     /// routing for `applied_patches_with_vendor`.
@@ -364,7 +364,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
                         &cand.key,
                         &[
                             (&entry.uuid, WiringMode::Vendored, "vendor ledger"),
-                            (&hosted.uuid, WiringMode::Hosted, "redirect ledger"),
+                            (&hosted.uuid, WiringMode::Hosted, "hosted ledger"),
                         ],
                     ));
                     gated.push(failed(&cand.key, VENDOR_UNWIRED));
@@ -400,7 +400,7 @@ pub(crate) async fn plan(common: &GlobalArgs, sources: Sources, assume_live: &[S
                 notes.extend(dead_claim_notes(
                     &discovery,
                     &cand.key,
-                    &[(&cand.uuid, WiringMode::Hosted, "redirect ledger")],
+                    &[(&cand.uuid, WiringMode::Hosted, "hosted ledger")],
                 ));
                 gated.push(failed(&cand.key, REDIRECT_UNWIRED));
                 continue;
@@ -1497,7 +1497,7 @@ mod tests {
         );
         assert!(
             dead.notes.iter().any(|n| n.detail.contains("Cargo.lock")
-                && n.detail.contains("redirect ledger")
+                && n.detail.contains("hosted ledger")
                 && n.detail.contains(U2)),
             "{:?}",
             dead.notes

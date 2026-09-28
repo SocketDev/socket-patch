@@ -9,9 +9,9 @@
 //!
 //!   1. redirected PURL attested against the installed tree, `(redirected)`
 //!      marker (the post-install verified path)
-//!   2. property-7 exemption: a redirected patch bypasses the configured/manual
-//!      ecosystem filter (the lockfile rewrite is the persistence), while a
-//!      plain unconfigured control is dropped
+//!   2. a redirected patch and a plain agent-mode control both attest with
+//!      no manifest `setup` section; only the redirected one is marked
+//!      `(redirected)`
 //!   3. tampered installed file → omitted with skip reason `hash_mismatch`
 //!      (fail-closed)
 //!   4. `--no-verify` attests from the ledger records with NO installed tree
@@ -230,15 +230,15 @@ fn redirected_purl_attested_against_installed_tree() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 2. property-7 exemption — a redirected patch bypasses the filter
+// 2. redirected + agent-mode patches attest together
 // ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn redirected_purl_bypasses_property7_filter() {
+fn redirected_and_agent_patches_attest_without_setup_config() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
 
-    // Redirected npm patch: verifies + bypasses property 7.
+    // Redirected npm patch: verifies from the redirect state.
     let patched = b"redirected patched index\n";
     let after = compute_git_sha256_from_bytes(patched);
     let purl = scaffold_npm(cwd, "left-pad", "1.3.0", patched);
@@ -249,9 +249,8 @@ fn redirected_purl_bypasses_property7_filter() {
     );
     write_hosted_package_lock(cwd, &[("left-pad", "1.3.0", UUID)], true);
 
-    // Control: a plain manifest npm patch that VERIFIES against node_modules
-    // but is neither redirected nor set up / manual — property 7 must drop it,
-    // proving the filter ran while the redirected patch sailed through.
+    // Control: a plain manifest (agent-mode) npm patch that VERIFIES against
+    // node_modules, with no install hook — it attests too, unmarked.
     let ctrl_patched = b"control patched index\n";
     let ctrl_after = compute_git_sha256_from_bytes(ctrl_patched);
     let ctrl_pkg = cwd.join("node_modules/control-pkg");
@@ -273,7 +272,6 @@ fn redirected_purl_bypasses_property7_filter() {
             &["CVE-2024-3"],
         ),
     );
-    // NO setup section: nothing configured, nothing manual.
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -288,23 +286,29 @@ fn redirected_purl_bypasses_property7_filter() {
         .expect("invoke vex");
     assert!(
         out.status.success(),
-        "the redirected patch must be attested without setup/manual. stderr:\n{}",
+        "both patches must attest. stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     let doc: Value = serde_json::from_str(&stdout).unwrap();
     let stmts = doc["statements"].as_array().unwrap();
-    assert_eq!(
-        stmts.len(),
-        1,
-        "only the redirected patch bypasses property 7; the unconfigured npm \
-         control must be dropped. doc:\n{stdout}"
-    );
-    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-rdir-keep");
+    assert_eq!(stmts.len(), 2, "both patches attest. doc:\n{stdout}");
+    let impact = |vuln: &str| -> String {
+        let hit: Vec<&Value> = stmts
+            .iter()
+            .filter(|s| s["vulnerability"]["name"] == vuln)
+            .collect();
+        assert_eq!(hit.len(), 1, "one statement for {vuln}:\n{stdout}");
+        hit[0]["impact_statement"].as_str().unwrap().to_string()
+    };
     assert!(
-        !stdout.contains("GHSA-npm-control"),
-        "the non-redirected, non-configured control must be filtered:\n{stdout}"
+        impact("GHSA-rdir-keep").contains("(redirected)"),
+        "the redirected patch carries its marker:\n{stdout}"
+    );
+    assert!(
+        !impact("GHSA-npm-control").contains("(redirected)"),
+        "the agent-mode control is not redirected:\n{stdout}"
     );
 }
 

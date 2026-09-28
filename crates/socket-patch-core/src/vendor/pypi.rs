@@ -224,8 +224,8 @@ pub async fn finish_hosted_wheel_metadata(
 }
 
 const SETUP_ALTERNATIVE: &str =
-    "use the `socket-patch setup` .pth install hook instead, which patches installed \
-     site-packages without lockfile edits";
+    "use agent mode instead (`scan --mode agent`, then `socket-patch apply` after each \
+     install), which patches installed site-packages without lockfile edits";
 
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
@@ -2144,7 +2144,7 @@ mod tests {
         let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_uv_no_lockfile");
         assert!(err.1.contains("uv lock"));
-        assert!(err.1.contains("socket-patch setup"));
+        assert!(err.1.contains("scan --mode agent"));
 
         let tmp = tempfile::tempdir().unwrap();
         touch(
@@ -2206,7 +2206,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_no_requirements");
-        assert!(err.1.contains("socket-patch setup"));
+        assert!(err.1.contains("scan --mode agent"));
     }
 
     /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —

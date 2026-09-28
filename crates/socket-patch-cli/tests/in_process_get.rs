@@ -572,7 +572,7 @@ async fn get_one_off_with_save_only_errors() {
     args.save_only = true;
 
     let code = run(args).await;
-    assert_eq!(code, 1, "conflicting flags must exit 1");
+    assert_eq!(code, 2, "conflicting flags are a usage error (exit 2)");
     // The conflict is rejected up front, before any fetch — nothing saved.
     assert_no_manifest(tmp.path());
     assert_no_api_requests(&server).await;
@@ -600,7 +600,7 @@ async fn get_one_off_is_an_honest_not_implemented_error() {
     args.save_only = false;
 
     let code = run(args).await;
-    assert_eq!(code, 1, "--one-off must fail as not-yet-implemented");
+    assert_eq!(code, 2, "--one-off must fail as not-yet-implemented (usage, exit 2)");
     assert_no_manifest(tmp.path());
     assert_no_api_requests(&server).await;
 }

@@ -327,8 +327,8 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
     );
     assert_eq!(code, 0, "human re-scan must succeed:\n{stderr}");
     assert!(
-        stderr.contains("redirect_gem_stale_install"),
-        "human mode must carry the greppable code tag on stderr:\n{stderr}"
+        stderr.contains("Warning: ") && stderr.contains("was switched to its hosted patch, but a stale"),
+        "human mode must print the stale-install warning on stderr:\n{stderr}"
     );
     assert!(
         stderr.contains(&gem_dir.display().to_string()),
@@ -458,7 +458,7 @@ async fn gem_hosted_rescan_with_failing_record_fetch_reports_it_and_keeps_the_wi
     assert_eq!(
         failed["detail"],
         format!(
-            "{PURL} redirected, but its patch record could not be fetched; this run's VEX \
+            "{PURL} was switched to hosted, but its patch record could not be fetched; this run's VEX \
              attestation omits it (`socket-patch vex` fetches it again once the API answers)"
         ),
         "{env}"

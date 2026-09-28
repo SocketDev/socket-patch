@@ -15,7 +15,7 @@ use serial_test::serial;
 use socket_patch_cli::commands::scan::{run, ScanArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -446,12 +446,7 @@ async fn redirect_vex_verifies_manifest_patches_normally() {
             "GHSA-ctrl-bad",
         ),
     );
-    // npm declared `manual` so property-7 admits the controls — what drops
-    // GHSA-ctrl-bad must be VERIFICATION, not the ecosystem filter.
-    manifest.setup = Some(SetupConfig {
-        exclude: Vec::new(),
-        manual: vec!["npm".to_string()],
-    });
+    // What drops GHSA-ctrl-bad must be VERIFICATION.
     let socket_dir = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket_dir).unwrap();
     std::fs::write(
@@ -2112,12 +2107,12 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
         "a no-op redirect still exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Redirected 0 packages; rewrote 0 files."),
+        stdout.contains("Switched 0 packages to hosted patches; rewrote 0 files."),
         "anchor: the run must have taken the human-mode redirect branch; \
          stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("Warning (redirect_npm_no_lockfile): No package-lock.json"),
+        stderr.contains("Warning: No package-lock.json"),
         "human mode must print the rewriter's no-lockfile warning (JSON mode \
          already carries it); stderr=\n{stderr}"
     );
@@ -2197,13 +2192,13 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("Redirected 1 package; rewrote"),
+        stdout.contains("Switched 1 package to hosted patches; rewrote"),
         "anchor: the dep must have been redirected so the record fetch runs; \
          stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "Warning (record_fetch_failed): {PURL} redirected, but its patch record could not \
+            "Warning: {PURL} was switched to hosted, but its patch record could not \
              be fetched"
         )),
         "the record-fetch warning must print the bare detail string, not a \

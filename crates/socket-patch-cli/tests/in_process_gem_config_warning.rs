@@ -197,11 +197,11 @@ fn apply_stderr_warning_gates_on_silent() {
     let (code, _stdout, stderr) = run(tmp.path(), &["apply", "--offline", "--ecosystems", "gem"]);
     assert_eq!(code, 0, "loud apply exits 0.\nstderr:\n{stderr}");
     assert!(
-        stderr.contains(CODE),
+        stderr.contains("Warning: bundler app config BUNDLE_PATH"),
         "non-silent stderr must carry the {CODE} warning; got:\n{stderr}"
     );
     assert_eq!(
-        stderr.matches(CODE).count(),
+        stderr.matches("Warning: bundler app config BUNDLE_PATH").count(),
         1,
         "exactly ONE warning line (not one per discovery call); got:\n{stderr}"
     );

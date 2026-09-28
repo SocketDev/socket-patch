@@ -890,9 +890,9 @@ async fn hosted_record_fetch_failures_keep_order_and_lock_bytes() {
         assert_eq!(
             *warning,
             format!(
-                "{} redirected, but its patch record could not be fetched; this run's VEX \
-                 attestation omits it (`socket-patch vex` fetches it again once the API \
-                 answers)",
+                "{} was switched to hosted, but its patch record could not be fetched; this \
+                 run's VEX attestation omits it (`socket-patch vex` fetches it again once the \
+                 API answers)",
                 purl(NAMES[idx])
             )
         );

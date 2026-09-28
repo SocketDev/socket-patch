@@ -31,7 +31,6 @@
 
 use std::path::{Path, PathBuf};
 
-use std::fs::FileType;
 use tokio::fs::DirEntry;
 
 /// List the immediate children of `path`.
@@ -370,7 +369,8 @@ pub async fn remove_link(path: &Path) -> std::io::Result<()> {
 /// be treated as scannable-but-non-recurseable). The returned
 /// `FileType` is the symlink-aware kind from `entry.file_type()`,
 /// not the resolved-target kind from `metadata()`.
-pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
+#[cfg(test)]
+pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<std::fs::FileType> {
     entry.file_type().await.ok()
 }
 

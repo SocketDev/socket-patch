@@ -47,24 +47,6 @@ pub(crate) fn confirm_waits(common: &GlobalArgs) -> bool {
     !(common.yes || common.json) && io::stdin().is_terminal()
 }
 
-/// A default-**no** confirmation that still proceeds when nobody can be
-/// asked (stdin not a terminal): `setup`'s mutation gate. `--yes`/`--json`
-/// proceed without asking.
-pub(crate) fn confirm_or_proceed(prompt: &str, common: &GlobalArgs) -> bool {
-    if common.yes || common.json {
-        return true;
-    }
-    ask(
-        prompt,
-        Ask {
-            default_yes: false,
-            non_interactive_answer: true,
-            interactive: io::stdin().is_terminal(),
-            silent: common.silent,
-        },
-    )
-}
-
 /// How a yes/no question is answered (see [`confirm_with`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ask {
