@@ -54,6 +54,7 @@ on:
       - 'scripts/install-vlt.sh'
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
+      - 'scripts/ci-vlt-proof-suites.py'
   push:
     branches: [main]
     paths:
@@ -91,6 +92,7 @@ on:
       - 'scripts/install-vlt.sh'
       - 'scripts/vlt-historical-integrity.json'
       - 'scripts/gen-vlt-collation-golden.mjs'
+      - 'scripts/ci-vlt-proof-suites.py'
   schedule:
     # Nightly: vlt releases and the production service drift with no PR open.
     - cron: '17 4 * * *'
@@ -313,6 +315,8 @@ jobs:
           SOCKET_PATCH_VLT_E2E_STORE_LINKER: ${{ matrix.linker }}
           SOCKET_PATCH_VLT_E2E_CACHE_ROOT: ${{ matrix.cache_root }}
           VLT_SUITES: ${{ matrix.suites || 'e2e_redirect_vlt_build e2e_vendor_vlt_build mode_migration_vlt e2e_safety_vlt e2e_vlt' }}
+          MATRIX_OS: ${{ matrix.os }}
+          NODE_PIN: ${{ matrix.node }}
         run: |
           set -uo pipefail
           exe=''
@@ -328,6 +332,14 @@ jobs:
             mkdir -p "$SOCKET_PATCH_VLT_E2E_CACHE_ROOT"
           fi
           py=$(command -v python3 || command -v python)
+          # Cells ci.yml's e2e rows run identically (every PR, main push and
+          # nightly) are left to them; a dispatch runs every cell.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            # shellcheck disable=SC2086 # VLT_SUITES is a word list
+            VLT_SUITES=$("$py" scripts/ci-vlt-proof-suites.py --os "$MATRIX_OS" --vlt "$SOCKET_PATCH_VLT_E2E_VERSION" \
+              --node "$NODE_PIN" --linker "${SOCKET_PATCH_VLT_E2E_STORE_LINKER:-}" \
+              --cache-root "${SOCKET_PATCH_VLT_E2E_CACHE_ROOT:-}" $VLT_SUITES | tr -d '\r') || exit 1
+          fi
           status=0
           for suite in $VLT_SUITES; do
             echo "::group::$suite"

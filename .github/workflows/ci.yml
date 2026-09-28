@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly on main: the `full` tier (e2e-full, cargo-vex-matrix-full,
+    # yarn-berry-full) and e2e-docker, which pull_request runs skip.
+    - cron: '41 5 * * *'
   workflow_dispatch:
     inputs:
       hosted_e2e:
@@ -261,7 +265,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
-        run: cargo build --workspace --all-features
+        run: cargo build --workspace
 
       - name: Install Go (for vexctl)
         # The `vex` subcommand emits OpenVEX documents; tests/e2e_vex.rs
@@ -310,13 +314,12 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run tests
-        # `--all-features` would also RUN the docker-e2e / setup-e2e suites,
-        # which soft-skip as "ok" in this job (no images are built here, and
-        # macOS/Windows have no Docker at all) — dozens of fake greens per OS
-        # that would hide a broken skip-guard behind a passing checkmark.
-        # Build them with --all-features (compile rot is real coverage), but
-        # run only the default-feature suites; the dedicated e2e-docker and
-        # setup-matrix jobs run the gated suites for real.
+        # Default features only: `--all-features` would also RUN the
+        # docker-e2e / setup-e2e suites, which soft-skip as "ok" here (no
+        # images, and macOS/Windows have no Docker) — fake greens hiding a
+        # broken skip-guard. Their compile rot is caught on every OS by
+        # e2e-build, which compiles every CLI test target with
+        # --all-features; one feature set here means one compile.
         #
         # `--no-fail-fast`: without it cargo stops at the first failing test
         # BINARY, so one bad file hides every later binary's result on that
@@ -329,18 +332,13 @@ jobs:
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
         run: |
-          set -euo pipefail
-          cargo test --workspace --all-features --no-run
           cargo test --workspace --no-fail-fast
 
   test-release:
     runs-on: ubuntu-latest
-    # Every tests/ target is its own optimized link, and the two cargo
-    # invocations below build the graph twice (--all-features, then the
-    # default features): ~25m on main with ~240 test binaries, so 30m left
-    # no headroom as suites grow. The manifest-less VEX suites share two
-    # multi-module binaries (tests/e2e_vex_lockfile/, tests/e2e_vex_build/)
-    # to keep the count down; the extra 10m covers the rest.
+    # Every tests/ target is its own optimized link (~240 test binaries).
+    # The manifest-less VEX suites share two multi-module binaries
+    # (tests/e2e_vex_lockfile/, tests/e2e_vex_build/) to keep the count down.
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -366,13 +364,9 @@ jobs:
         # `ci-release` = [profile.release] minus the full-LTO link (see the
         # profile's comment in Cargo.toml). Same opt-level/debug-assertion
         # semantics this job exists to validate; ~23m of LTO relinking gone.
-        # Build/run split for the same reason as the `test` job: the gated
-        # docker-e2e / setup-e2e suites only soft-skip here — compile them,
-        # don't count their skips as passes.
-        run: |
-          set -euo pipefail
-          cargo test --workspace --all-features --profile ci-release --no-run
-          cargo test --workspace --profile ci-release
+        # Default features for the same reason as the `test` job; the
+        # feature-gated suites' compile rot is e2e-build's.
+        run: cargo test --workspace --profile ci-release
 
   coverage:
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
@@ -454,6 +448,45 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Dockerfile.base compiles the full-LTO release binary inside Docker, with
+  # no cache. Build it once per run and hand the image to every docker leg.
+  docker-base:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # `driver: docker`: see coverage-docker's matching step.
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker
+
+      - name: Build base image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.base
+          tags: socket-patch-test-base:latest
+          load: true
+
+      - name: Save base image
+        run: |
+          mkdir -p docker-base
+          docker save --output docker-base/socket-patch-test-base.tar socket-patch-test-base:latest
+
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: docker-base-image
+          path: docker-base/socket-patch-test-base.tar
+          if-no-files-found: error
+          retention-days: 3
+
   coverage-docker:
     # Per-ecosystem coverage for the Docker-driven e2e suite. Mirrors
     # the e2e-docker matrix but builds an instrumented socket-patch
@@ -463,7 +496,9 @@ jobs:
     #
     # Hooks: docker_e2e_<eco>.rs reads SOCKET_PATCH_COV_BIN +
     # SOCKET_PATCH_COV_PROFRAW_DIR. Both unset is the no-op default
-    # (used by the e2e-docker matrix below).
+    # (used by the e2e-docker matrix below). Every per-push docker_e2e
+    # suite runs here; e2e-docker is the nightly run of the same suites
+    # against the base image's full-LTO release binary.
     #
     # Pin to ubuntu-22.04 (glibc 2.35) instead of ubuntu-latest
     # (currently 24.04, glibc 2.39). The instrumented binary built
@@ -471,6 +506,7 @@ jobs:
     # (glibc 2.36); a binary linked against a newer glibc than the
     # container ships fails to load. ubuntu-22.04's older glibc is
     # the highest base that's forward-compatible with debian:12.
+    needs: docker-base
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -516,13 +552,15 @@ jobs:
       # (a PR-poisoned cargo cache could compromise the instrumented
       # binary we mount into the container).
 
-      - name: Build base image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+      - name: Download base image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          context: .
-          file: tests/docker/Dockerfile.base
-          tags: socket-patch-test-base:latest
-          load: true
+          pattern: docker-base-image*
+          merge-multiple: true
+          path: docker-base
+
+      - name: Load base image
+        run: docker load --input docker-base/socket-patch-test-base.tar
 
       - name: Build ${{ matrix.ecosystem }} image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -674,8 +712,57 @@ jobs:
       - name: Run pypi dispatch tests
         run: python pypi/socket-patch/test_dispatch.py
 
+  # Compiles the CLI and every CLI test target once per OS (--all-features,
+  # so this is also the feature-gated suites' compile-rot check) and uploads
+  # the binaries the e2e, e2e-full and cargo-vex legs run. The legs run the
+  # test binaries directly from the same checkout path, so `CARGO_BIN_EXE_*`
+  # and `CARGO_MANIFEST_DIR` resolve as they did under `cargo test`.
+  e2e-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: e2e-build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Compile the CLI and every CLI test target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p socket-patch-cli --all-features --tests --no-run --message-format=json > target-build.json
+
+      - name: Bundle the binaries the legs run
+        shell: bash
+        env:
+          BUNDLE_OS: ${{ matrix.os }}
+        run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
+
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: e2e-bin-${{ matrix.os }}
+          path: target/e2e-bin/
+          if-no-files-found: error
+          retention-days: 3
+
   e2e:
-    needs: test
+    needs: [test, e2e-build]
     strategy:
       fail-fast: false
       matrix:
@@ -684,18 +771,9 @@ jobs:
             suite: e2e_cargo
           - os: ubuntu-latest
             suite: e2e_golang
-          - os: ubuntu-latest
-            suite: e2e_maven
-          - os: ubuntu-latest
-            suite: e2e_composer
-            # composer is a shipped ecosystem, so e2e_composer's tests are
-            # NOT `#[ignore]`-gated the way the live-registry maven/nuget
-            # suites are — the matrix default `--ignored` filter
-            # selected zero tests here and the leg passed vacuously.
-            # `--include-ignored` runs them, plus any capstone added later.
-            test_filter: --include-ignored
-          - os: ubuntu-latest
-            suite: e2e_nuget
+          # (No e2e_maven / e2e_nuget / e2e_composer rows: their tests are
+          # hermetic and not `#[ignore]`d, so the `test` job runs them on
+          # every OS.)
           # Host build-proof capstones: fresh-checkout install + revert
           # against the REAL composer/bundler toolchains, each ending in the
           # manifest-less VEX matrix. `#[ignore]`-gated (the unpinned `test`
@@ -723,13 +801,13 @@ jobs:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
           # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
           # strict frozen check (rubygems#9750). bundler <= 2.2 needs
-          # Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`).
+          # Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`). 2.7.2
+          # (no boundary of its own) is in e2e-full.
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '1.17.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.1.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.2.33'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.5.23'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.7.2'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.15'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.21'}
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
@@ -737,7 +815,6 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
-          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
           - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
           # not #[ignore]-gated -> --include-ignored is mandatory
@@ -767,14 +844,9 @@ jobs:
           # Safety-hardening e2e suites. The fast non-ignored ones
           # (e2e_safety_lock, e2e_safety_yarn_pnp) run via the
           # standard `test` job above on all three platforms, so no
-          # matrix entry is needed for them. The two below need real
-          # toolchains and are #[ignore]-gated.
-          - os: ubuntu-latest
-            suite: e2e_safety_cargo_build
-          - os: macos-latest
-            suite: e2e_safety_cargo_build
-          - os: windows-latest
-            suite: e2e_safety_cargo_build
+          # matrix entry is needed for them. e2e_safety_pnpm below needs a
+          # real pnpm and is #[ignore]-gated; e2e_safety_cargo_build runs in
+          # every cargo-vex-matrix leg (ubuntu, macOS and Windows).
           - os: ubuntu-latest
             suite: e2e_safety_pnpm
           - os: macos-latest
@@ -964,39 +1036,18 @@ jobs:
           - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
           - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
           # Real-uv hosted/vendored capstones ending in manifest-less VEX:
-          # one leg per uv 0.N line + the 0.5.x boundary (0.5.4 still
+          # the oldest and newest line + the 0.5.x boundary (0.5.4 still
           # re-resolves a transitive override / rejects a repointed
-          # constraint under --locked; 0.5.5 keeps both).
+          # constraint under --locked; 0.5.5 keeps both). The other 0.N
+          # lines and 0.5.3/0.5.6 are in e2e-full.
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.1.45'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.2.37'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.3.5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.4.30'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.5'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.6'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.6.17'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.7.22'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.8.24'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.9.30'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.10.12'}
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.11.33'}
           - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
           - {os: macos-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.1.45', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.2.37', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.3.5', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.4.30', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.3', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.4', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.5', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.6', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.6.17', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.7.22', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.8.24', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.9.30', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.10.12', test_filter: --include-ignored}
-          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.11.33', test_filter: --include-ignored}
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           - {os: macos-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           # The Poetry / PDM / Hatch / Pipenv / pip / deno manifest-less VEX
@@ -1006,11 +1057,11 @@ jobs:
           # `--ignored`.
           # Real-Poetry hosted + vendored capstones (#[ignore]-gated,
           # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
-          # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.x (lock 2.1).
+          # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.x (lock 2.1; 2.0.1 is in
+          # e2e-full).
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.0.10'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.1.15'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.8.5'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
           - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
           # Real PDM / Hatch capstones (wiremock Socket API that also serves
@@ -1034,11 +1085,9 @@ jobs:
           - {os: macos-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
           # Real Pipenv / pip capstones (mock patch server; the tools are
           # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
-          # space-separated releases the suite loops over.
+          # space-separated releases the suite loops over. The middle
+          # Pipenv releases are in e2e-full.
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2023.12.1'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2024.4.1'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2025.1.3'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0'}
           - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19 2026.8.0'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
@@ -1057,11 +1106,9 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '4.0.0-rc-6'}
           - {os: macos-latest, suite: e2e_vendor_maven_build, maven: '3.9.16'}
           # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
-          # major (the suite pins the major through a sandbox global.json).
+          # major (the suite pins the major through a sandbox global.json):
+          # the oldest and newest here, 7-9 on ubuntu in e2e-full.
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '6'}
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '7'}
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '9'}
           - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '10'}
           - {os: macos-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
           # Real deno negative capstone (no hosted/vendored wiring exists for
@@ -1073,32 +1120,31 @@ jobs:
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
     # hatch), hence more than the 25 minutes the older legs needed.
     timeout-minutes: 40
-    steps:
+    # e2e-full runs these same steps over its rows.
+    steps: &e2e-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
-        # reads rust-toolchain.toml in the repo root, then installs the
-        # pinned channel + listed components if missing. No third-party
-        # action dependency needed for toolchain setup.
-        run: rustup show
-
-      - name: Cache cargo
-        # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
-        # step in this file.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Download the e2e binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          # Matrix suites otherwise collide on one key: only one of the ~9
-          # same-OS legs wins the cache reserve and the rest fail to save.
-          # Several suites run one leg per pinned toolchain release (bun, uv,
-          # poetry, pdm, hatch, pipenv, pip, bundler, composer, maven, dotnet,
-          # deno, vlt), so the release is part of the key too, plus the vlt
-          # store linker of the two ubuntu e2e_safety_vlt legs.
-          key: ${{ matrix.suite }}-${{ matrix.vlt || matrix.bun || matrix.uv || matrix.poetry || matrix.pdm || matrix.hatch || matrix.pipenv || matrix.pip || matrix.bundler || matrix.composer || matrix.maven || matrix.dotnet || matrix.deno || 'default' }}${{ matrix.vlt_store_linker && format('-{0}', matrix.vlt_store_linker) || '' }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          pattern: e2e-bin-${{ matrix.os }}*
+          merge-multiple: true
+          path: target/e2e-bin
+
+      - name: Stage the CLI where the test binaries expect it
+        # `CARGO_BIN_EXE_socket-patch` was baked in at compile time as
+        # <checkout>/target/debug/socket-patch; CARGO_TARGET_TMPDIR likewise.
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          chmod +x target/e2e-bin/* || true
+          mkdir -p target/debug target/tmp
+          cp "target/e2e-bin/socket-patch$exe" "target/debug/socket-patch$exe"
 
       - name: Setup Node.js
         if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan' || matrix.suite == 'e2e_safety_pnpm'
@@ -1354,7 +1400,18 @@ jobs:
           SOCKET_PATCH_DOTNET_E2E_VERSION: ${{ matrix.dotnet }}
           SOCKET_PATCH_DENO_E2E_REQUIRED: ${{ matrix.deno != '' && '1' || '' }}
           SOCKET_PATCH_DENO_E2E_VERSION: ${{ matrix.deno }}
-        run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- ${{ matrix.test_filter || '--ignored' }}
+          E2E_SUITE: ${{ matrix.suite }}
+          E2E_TEST_FILTER: ${{ matrix.test_filter || '--ignored' }}
+        shell: bash
+        # Runs from the package root with CARGO_MANIFEST_DIR set, as
+        # `cargo test` would.
+        run: |
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          cd crates/socket-patch-cli
+          export CARGO_MANIFEST_DIR="$PWD"
+          # shellcheck disable=SC2086 # the filter is several libtest arguments
+          "../../target/e2e-bin/$E2E_SUITE$exe" $E2E_TEST_FILTER
 
       - name: Run vlt e2e tests
         if: matrix.vlt != ''
@@ -1369,11 +1426,65 @@ jobs:
         run: |
           set -uo pipefail
           status=0
-          # shellcheck disable=SC2086 # the filter is several libtest arguments
-          cargo test -p socket-patch-cli --all-features --test "$VLT_SUITE" -- $VLT_TEST_FILTER 2>&1 | tee vlt-leg.log || status=1
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          (
+            cd crates/socket-patch-cli
+            export CARGO_MANIFEST_DIR="$PWD"
+            # shellcheck disable=SC2086 # the filter is several libtest arguments
+            "../../target/e2e-bin/$VLT_SUITE$exe" $VLT_TEST_FILTER
+          ) 2>&1 | tee vlt-leg.log || status=1
           py=$(command -v python3 || command -v python)
-          "$py" scripts/check-vlt-legs.py --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json vlt-leg.log || status=1
+          # No cargo `Running` line when the binary runs directly: name it.
+          "$py" scripts/check-vlt-legs.py --binary "$VLT_SUITE" --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json vlt-leg.log || status=1
           exit "$status"
+
+  # The PM-version legs with no boundary of their own: the middle uv lines,
+  # Pipenv releases and .NET SDK majors, Poetry 2.0 and bundler 2.7. Skipped
+  # on pull_request (the `e2e` rows keep every named boundary, the oldest
+  # and newest release of each tool and every vlt era there); main pushes,
+  # the nightly schedule and dispatch run them with the `e2e` steps.
+  e2e-full:
+    if: github.event_name != 'pull_request'
+    needs: [test, e2e-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.7.2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.2.37'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.3.5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.4.30'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.6'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.6.17'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.7.22'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.8.24'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.9.30'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.10.12'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.11.33'}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.2.37', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.3.5', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.4.30', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.3', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.6', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.6.17', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.7.22', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.8.24', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.9.30', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.10.12', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.11.33', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2023.12.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2024.4.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2025.1.3'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '7'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '9'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps: *e2e-steps
 
   # ----------------------------------------------------------------------
   # Docker-driven real-package e2e suite.
@@ -1385,11 +1496,16 @@ jobs:
   # managers and run socket-patch against a wiremock-served fixture —
   # no real Socket API contact. Hermetic, reproducible.
   #
-  # Triggered on every PR. The `e2e` job above runs the
-  # `#[ignore]`-gated real-toolchain capstones; the live-API smoke suites
-  # are run by hand (see the note in its matrix).
+  # Nightly and on dispatch only: coverage-docker runs every one of these
+  # suites on each push (with an instrumented binary mounted in); this job
+  # is the one run of them against the base image's full-LTO release
+  # binary. The `e2e` job above runs the `#[ignore]`-gated real-toolchain
+  # capstones; the live-API smoke suites are run by hand (see the note in
+  # its matrix).
   # ----------------------------------------------------------------------
   e2e-docker:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: docker-base
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
@@ -1419,13 +1535,15 @@ jobs:
       # No `actions/cache` here intentionally. This job builds Docker
       # images and would be flagged by zizmor's cache-poisoning audit.
 
-      - name: Build base image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+      - name: Download base image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          context: .
-          file: tests/docker/Dockerfile.base
-          tags: socket-patch-test-base:latest
-          load: true
+          pattern: docker-base-image*
+          merge-multiple: true
+          path: docker-base
+
+      - name: Load base image
+        run: docker load --input docker-base/socket-patch-test-base.tar
 
       - name: Build ${{ matrix.ecosystem }} image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -1500,15 +1618,17 @@ jobs:
       fail-fast: false
       matrix:
         # 4.0.2 bare-hex checksum writer (4.0.0-4.0.2), 4.1.0 first
-        # `10c0/` writer, then a spread up to current.
-        os: [ubuntu-latest]
-        yarn: ['4.0.2', '4.1.0', '4.6.0', '4.12.0', '4.18.0']
+        # `10c0/` writer, current, and 4.12.0 on macOS / Windows. The rest
+        # of the spread (4.6.0, 4.12.0 on ubuntu) is yarn-berry-full.
         include:
+          - {os: ubuntu-latest, yarn: '4.0.2'}
+          - {os: ubuntu-latest, yarn: '4.1.0'}
+          - {os: ubuntu-latest, yarn: '4.18.0'}
           - {os: macos-latest, yarn: '4.12.0'}
           - {os: windows-latest, yarn: '4.12.0'}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    steps:
+    steps: &yarn-berry-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1530,28 +1650,54 @@ jobs:
           YARN_BERRY_RELEASE: ${{ matrix.yarn }}
         run: scripts/yarn-berry-vex-matrix.sh "$YARN_BERRY_RELEASE"
 
+  # Skipped on pull_request, like e2e-full.
+  yarn-berry-full:
+    name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, yarn: '4.6.0'}
+          - {os: ubuntu-latest, yarn: '4.12.0'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps: *yarn-berry-steps
+
+  # Every toolchain and every lock re-encoding at least once on PRs (the
+  # toolchain's own lock is re-encoded as v1-v4 before socket-patch touches
+  # it, the committed-lockfile case; '' keeps the toolchain's own format),
+  # plus macOS and Windows. cargo-vex-matrix-full runs the rest of the
+  # toolchain x lock cross off pull_request. Each leg also runs
+  # e2e_safety_cargo_build (its headline test honours the knobs).
   cargo-vex-matrix:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
-    needs: test
+    needs: [test, e2e-build]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        # The toolchain's own lock is re-encoded as v1-v4 before
-        # socket-patch touches it (the committed-lockfile case); '' keeps the
-        # toolchain's own format.
-        os: [ubuntu-latest]
-        toolchain: ['1.82.0', '1.93.1', 'stable']
-        lock: ['', '1', '2', '3', '4']
         include:
+          - {os: ubuntu-latest, toolchain: '1.82.0', lock: ''}
+          - {os: ubuntu-latest, toolchain: '1.93.1', lock: '1'}
+          - {os: ubuntu-latest, toolchain: stable, lock: '2'}
+          - {os: ubuntu-latest, toolchain: '1.82.0', lock: '3'}
+          - {os: ubuntu-latest, toolchain: '1.93.1', lock: '4'}
           - {os: macos-latest, toolchain: stable, lock: '1'}
           - {os: windows-latest, toolchain: stable, lock: '1'}
-    steps:
+    steps: &cargo-vex-steps
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Download the e2e binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: e2e-bin-${{ matrix.os }}*
+          merge-multiple: true
+          path: target/e2e-bin
       - name: Install Rust
         run: rustup show
       - name: Install the cargo under test
@@ -1562,12 +1708,9 @@ jobs:
         env:
           CARGO_TEST_TOOLCHAIN: ${{ matrix.toolchain }}
         run: rustup toolchain install "$CARGO_TEST_TOOLCHAIN" --profile minimal
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: cargo-vex-${{ matrix.toolchain }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Real-cargo hosted/vendored + manifest-less VEX
+        # The e2e-build binaries, run from the package root as `cargo test`
+        # would (see the e2e job's staging step).
         shell: bash
         env:
           SOCKET_PATCH_CARGO_E2E_REQUIRED: '1'
@@ -1575,8 +1718,43 @@ jobs:
           SOCKET_PATCH_CARGO_E2E_LOCK_VERSION: ${{ matrix.lock }}
         run: |
           set -euo pipefail
-          cargo test -p socket-patch-cli --test e2e_redirect_cargo_build --test e2e_redirect_cargo_shapes --test e2e_vendor_cargo_build --test mode_migration_cargo
-          cargo test -p socket-patch-cli --test e2e_safety_cargo_build -- --ignored
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          chmod +x target/e2e-bin/* || true
+          mkdir -p target/debug target/tmp
+          cp "target/e2e-bin/socket-patch$exe" "target/debug/socket-patch$exe"
+          cd crates/socket-patch-cli
+          export CARGO_MANIFEST_DIR="$PWD"
+          status=0
+          for suite in e2e_redirect_cargo_build e2e_redirect_cargo_shapes e2e_vendor_cargo_build mode_migration_cargo; do
+            echo "::group::$suite"
+            "../../target/e2e-bin/$suite$exe" || status=1
+            echo "::endgroup::"
+          done
+          "../../target/e2e-bin/e2e_safety_cargo_build$exe" --ignored || status=1
+          exit "$status"
+
+  cargo-vex-matrix-full:
+    name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
+    needs: [test, e2e-build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, toolchain: '1.82.0', lock: '1'}
+          - {os: ubuntu-latest, toolchain: '1.82.0', lock: '2'}
+          - {os: ubuntu-latest, toolchain: '1.82.0', lock: '4'}
+          - {os: ubuntu-latest, toolchain: '1.93.1', lock: ''}
+          - {os: ubuntu-latest, toolchain: '1.93.1', lock: '2'}
+          - {os: ubuntu-latest, toolchain: '1.93.1', lock: '3'}
+          - {os: ubuntu-latest, toolchain: stable, lock: ''}
+          - {os: ubuntu-latest, toolchain: stable, lock: '1'}
+          - {os: ubuntu-latest, toolchain: stable, lock: '3'}
+          - {os: ubuntu-latest, toolchain: stable, lock: '4'}
+    steps: *cargo-vex-steps
 
   # Manifest `[patch]` + the tagged detached lock (the v5 vendored cargo
   # wiring) on cargo 1.41 and 1.56 — below / at the 1.56 floor of

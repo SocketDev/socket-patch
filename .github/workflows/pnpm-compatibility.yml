@@ -1,7 +1,25 @@
 name: pnpm hosted compatibility
 
 on:
+  # PRs: any crate source, but only the test files these capstones
+  # compile (a later `!` pattern excludes, a later plain one re-includes).
+  # Main pushes stay unfiltered.
   pull_request:
+    paths:
+      - '.github/actions/upload-artifact/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/pnpm-compatibility.yml'
+      - 'crates/**'
+      - '!crates/**/*.md'
+      - '!crates/socket-patch-node/**'
+      - '!crates/socket-patch-core/tests/**'
+      - '!crates/socket-patch-cli/tests/**'
+      - 'crates/socket-patch-cli/tests/vex_e2e_common/**'
+      - 'crates/socket-patch-cli/tests/e2e_redirect_pnpm_build.rs'
+      - 'crates/socket-patch-cli/tests/e2e_vendor_pnpm_build.rs'
+      - 'crates/socket-patch-cli/tests/common/cache_env.rs'
   push:
     branches: [main]
   workflow_dispatch:
