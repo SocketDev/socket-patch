@@ -443,6 +443,7 @@ purl)` row is:
 | ALREADY | recorded uuid == selected uuid, or the selection does not supersede the recorded uuid | no | the **recorded** uuid (re-confirmed idempotently) |
 | UPGRADE | the selection supersedes the recorded uuid, or the recorded uuid is no longer offered at all (unfiltered) | no | the selected uuid |
 | NEW | nothing recorded for this base purl in this project root | **yes** | the selected uuid, if admitted |
+| ALREADY (kept) | recorded, offers exist in `Offers.unfiltered` but none survive the floor | no | the recorded uuid (counted in `counts.already`) |
 
 - NEW is per project root. Widening `includePaths` makes piloted packages
   NEW in the added roots, so they go through the cap again.
@@ -494,7 +495,9 @@ purl)` row is:
   - in-memory engine: one budget across all roots (collect, plan, apply);
   - disk: one budget per invocation. `run_project_dirs` visits
     directories in sorted order and passes the **remaining** budget to
-    each; each directory spends it in rank order. `scan --json` accepts one
+    each, together with the set of base purls already admitted (a base
+    purl admitted in an earlier directory is admitted free in later ones);
+    each directory spends the budget in rank order. `scan --json` accepts one
     directory, so a CI job per directory gets N per directory. Documented.
 - **Order** (ascending; total; no time-dependent keys):
   1. in-flight first (in-memory option `inFlightPatches` only, matched by
@@ -747,9 +750,10 @@ A closed or rejected rolling PR re-proposes the same patches next run;
 
 Both items branch from `release/v5-prerelease` (suggested branches
 `v5/rollout-policy` for A, `v5/rollout-limit` for B). **Merge order: A,
-then B.** B rebases onto A and owns the final integration (9.3). Neither
-item needs the other's types to compile: the only exchanged values are
-plain integers and the pipeline order below.
+then B.** B rebases onto A and owns the final integration (9.3). The
+seams are small and listed in 9.0: the step 5 → step 7 `Offers` struct
+(A), the repo-relative path helpers (A), the file's `maxNewPatches` value
+(A → B), and the pipeline order.
 
 ### 9.0 Shared contract (frozen by this plan)
 
@@ -759,7 +763,9 @@ Scan pipeline, in order (disk and memory):
 2. crawl; capture the prune universe (unchanged)
 3. root filter, ecosystem/package filter, retained set (A)
 4. batch API, by-package details (unchanged fetches)
-5. candidate severity filter on by-package records (A)
+5. candidate severity filter on by-package records (A); `discover_selected`
+   returns `Offers` (below) so B sees both the unfiltered and the
+   floor-filtered candidates
 6. per-package ranking (unchanged `ranking`)
 7. classify, planning pass for eligibility, budget, deferral (B)
 8. writers (receive only admitted NEW rows, ALREADY rows with the recorded
@@ -782,7 +788,9 @@ pub enum PolicyError {
 impl PolicyError { pub fn code(&self) -> &'static str; } // socket_yml_invalid | socket_yml_ambiguous
 pub enum RootFile { Absent, Present(Vec<u8>), PresentWithoutContent }
 pub trait PolicyFs { fn read_root_file(&self, name: &str, cap: usize) -> std::io::Result<RootFile>; }
-pub struct PolicyOverrides { pub bypass: bool, pub min_severity: Option<Option<u8>> } // Some(None) = "none"
+pub enum OverrideSource { Flag, Env }
+pub struct PolicyOverrides { pub bypass: bool, pub min_severity: Option<(Option<u8>, OverrideSource)> } // (None, _) = "none"
+pub struct PolicyWarning { pub code: &'static str, pub detail: String }
 pub struct Root<'a> { pub rel_dir: &'a str, pub markers: &'a [String], pub explicit: bool }
 impl SelectionPolicy {
     pub fn unrestricted() -> Self;                          // built-in default ignores only
@@ -792,9 +800,17 @@ impl SelectionPolicy {
     pub fn admits_root(&self, root: &Root) -> Result<(), FilterReason>;
     pub fn admits_purl(&self, purl: &str) -> Result<(), FilterReason>;        // ecosystem + packages
     pub fn admits_severity(&self, severity_order: u8) -> Result<(), FilterReason>;
-    pub fn max_new_patches(&self) -> Option<u32>;           // the FILE value only; B resolves precedence
+    pub fn max_new_patches(&self) -> Option<u32>;  // the file's value; None when source() is None or Bypassed, or the key is absent
 }
 pub fn package_spec_matches(spec: &str, purl: &str) -> bool; // moved from cli scan/mod.rs:383
+pub fn find_repo_root(cwd: &Path) -> PathBuf;                // 4.5
+pub fn repo_relative(repo_root: &Path, dir: &Path) -> String; // "" for the repo root, `/` separators
+
+// crates/socket-patch-core/src/policy/mod.rs — OWNER A (the step 5 → 7 seam)
+pub struct Offers {
+    pub unfiltered: BTreeMap<String, Vec<PatchSearchResult>>, // purl → every offer (after tier)
+    pub selected: BTreeMap<String, PatchSearchResult>,        // purl → winner among floor-admitted offers
+}
 
 // crates/socket-patch-core/src/rollout.rs — OWNER B
 pub enum Recorded { None, Same, Kept { uuid: String }, Superseded { old_uuid: String } }
@@ -812,9 +828,13 @@ pub fn rollout_cmp(a: &Candidate, b: &Candidate) -> std::cmp::Ordering;
 pub struct RolloutCounts { pub new: u32, pub deferred: u32, pub upgrade: u32, pub already: u32 }
 pub struct RolloutPlan {
     pub admitted: Vec<Candidate>, pub deferred: Vec<(Candidate, u32)>,
-    pub counts: RolloutCounts, pub remaining: Option<u32>,   // carried to the next directory
+    pub counts: RolloutCounts,
+    pub remaining: Option<u32>,                       // carried to the next directory
+    pub admitted_base_purls: BTreeSet<String>,        // carried too
 }
-pub fn plan_rollout(candidates: Vec<Candidate>, max_new: &MaxNew, incomplete: bool) -> RolloutPlan; // pure
+// Rows whose base_purl is in `already_admitted` are admitted without spending budget.
+pub fn plan_rollout(candidates: Vec<Candidate>, max_new: &MaxNew, incomplete: bool,
+                    already_admitted: &BTreeSet<String>) -> RolloutPlan; // pure
 
 // crates/socket-patch-core/src/api/ranking.rs — OWNER B (addition)
 pub fn search_result_supersedes(candidate: &PatchSearchResult, recorded: &PatchSearchResult) -> bool;
@@ -923,7 +943,9 @@ Scope:
 - `crates/socket-patch-core/src/rollout.rs`; `pub mod rollout;` in
   `crates/socket-patch-core/src/lib.rs`; `search_result_supersedes` in
   `ranking.rs`, and `detect_updates` / `updates[]` switched to by-package
-  supersession.
+  supersession; move the `detect_updates` call (today `scan/mod.rs:1912`,
+  on batch data) after `discover_selected` so it receives the by-package
+  offers.
 - Make `discover_selected` (`scan/mod.rs:553`) the single disk selection
   point: route the human agent/vendored arm (`mod.rs:2386-2402`) through
   it, and have it return `{admitted, deferred}` so hosted
@@ -963,8 +985,10 @@ Tests:
   patch hold no slot; a failed detail lookup with a cap admits nothing
   NEW; two PATH directories share one budget in sorted order; JSON
   `rollout` and `redirect.skipped[]`; exit 0.
-- Parity: `hosted_memory_parity.rs` cap fixture: disk and memory admit and
-  defer the same rows; a memory rerun with pins (and with a committed
+- Parity: `hosted_memory_parity.rs` single-root cap fixture: disk and
+  memory admit and defer the same rows. Two-root fixture: assert memory's
+  run-wide order and disk's per-directory order separately (they differ by
+  design, 5.2). A memory rerun with pins (and with a committed
   manifest / vendor state) lands the next N.
 - Parser contract rows for the flag and env var.
 
@@ -982,7 +1006,11 @@ change), README (recipe R5, `--max-new-patches`), CHANGELOG
 - Resolve the `ScanArgs` struct-literal and `run_project_dirs` conflicts.
 - Combined e2e: a socket.yml with `includePaths`, `minSeverity: high` and
   `maxNewPatches: 2` over a two-root fixture, disk and memory, three runs to
-  convergence; `--no-socket-yml` drops the file's cap but keeps a flag cap.
+  convergence, asserting each engine's own budget scope (5.2);
+  `--no-socket-yml` drops the file's cap but keeps a flag cap.
+- Switch `Candidate.project` to A's `repo_relative` and consume A's
+  `Offers` (before A lands, B uses canonical `--cwd` as the repo root and
+  treats the selected offers as the unfiltered list).
 - If B is ready before A merges, B ships with the file layer passed as
   `None` and wires it in a follow-up commit on its branch once A lands.
 
