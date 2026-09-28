@@ -87,10 +87,12 @@
 //! ends) and by the [`crate::vendor::prestage`] pool, not by size.
 //!
 //! The package-reference half is batched: the plan's first call sends
-//! one request naming every planned uuid (see
+//! one request naming the planned uuids from its own position on (see
 //! [`VendorPrefetch::reference`]) in place of its own, and later calls
-//! take their granted reference from it. That request grants the whole
-//! plan up front, which the plan's exactness makes safe. The bounds
+//! take their granted reference from it. That request grants the rest of
+//! the plan up front, which the plan's exactness makes safe: a position
+//! the loop passes over is granted only if the loop passes it after the
+//! batch was sent. The bounds
 //! above then limit the archive downloads. A package the batch reports
 //! still building, or leaves out, makes its own request at its turn, as
 //! before.
@@ -376,8 +378,8 @@ impl VendorPrefetch {
     /// `None` to make the live request (not planned, other parameters, or
     /// the batch did not answer it).
     ///
-    /// The first planned call sends ONE request naming the whole plan, its
-    /// own uuid first, in place of its single-uuid request and with the
+    /// The first planned call sends ONE request naming the plan from its
+    /// own position on, its own uuid first, in place of its single-uuid request and with the
     /// same retry ladder: the endpoint takes up to [`MAX_REFERENCE_BATCH`]
     /// uuids, and one request per package paid a round trip and a quota
     /// unit each. Its failure is that call's own failure, so an outage
@@ -392,18 +394,18 @@ impl VendorPrefetch {
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Option<Result<PackageVendorResult, (ApiError, bool)>> {
-        if free_only != self.free_only
-            || vendor_url != self.vendor_url.as_deref()
-            || !self.planned.iter().any(|planned| planned == uuid)
-        {
+        if free_only != self.free_only || vendor_url != self.vendor_url.as_deref() {
             return None;
         }
+        let at = self.planned.iter().position(|planned| planned == uuid)?;
         let mut own = None;
         let cache = self
             .references
             .get_or_init(|| async {
+                // Positions before this call's were passed over: the loop
+                // never asks for them, so they are never granted.
                 let mut order = vec![uuid.to_string()];
-                for planned in &self.planned {
+                for planned in &self.planned[at..] {
                     if !order.contains(planned) {
                         order.push(planned.clone());
                     }
@@ -1609,5 +1611,36 @@ mod tests {
             })
             .collect();
         assert_eq!(sizes, [MAX_REFERENCE_BATCH, 1]);
+    }
+
+    /// The batch names the plan from the first call's position on: a
+    /// position the loop passed over before it is never granted.
+    #[tokio::test]
+    async fn the_reference_batch_starts_at_the_first_call() {
+        let scripts: Vec<Script> = (0..4).map(|_| Script::Granted(0)).collect();
+        let server = serve_batches(&scripts).await;
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_packages((0..4).map(uuid).collect(), false, None, None, 1);
+        assert!(
+            summary(&c.fetch_vendor_package(&uuid(2), false, None, None).await)
+                .starts_with("ready")
+        );
+        let bodies: Vec<Vec<String>> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["uuids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|u| u.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(bodies, [vec![uuid(2), uuid(3)]]);
     }
 }

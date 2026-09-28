@@ -589,7 +589,7 @@ async fn repair_inner(
         _ => DownloadPass::default(),
     };
     let missing_count = primary.missing;
-    downloaded_count += primary.downloaded + created.downloaded;
+    downloaded_count += primary.downloaded;
     download_failed_count += primary.failed;
 
     // Step 1.5: vendored artifacts — health-check the ledger (and any
@@ -670,12 +670,23 @@ async fn repair_inner(
         // so a piped stdout never ends in a stray blank line when the
         // line itself goes to stderr.
         let other_failure = matches!(env.status, Status::PartialFailure | Status::Error);
-        let (failed, failed_noun) = if download_failed_count > 0 {
-            (download_failed_count, noun)
+        let failed = download_failed_count + created.failed;
+        let line = if download_failed_count > 0 && created.failed > 0 {
+            format!(
+                "Repair finished with errors: {} and {} were not downloaded.",
+                noun.count(download_failed_count),
+                BLOB.count(created.failed)
+            )
+        } else if download_failed_count > 0 {
+            format_final_line(
+                download_failed_count,
+                other_failure,
+                noun,
+                args.common.dry_run,
+            )
         } else {
-            (created.failed, BLOB)
+            format_final_line(created.failed, other_failure, BLOB, args.common.dry_run)
         };
-        let line = format_final_line(failed, other_failure, failed_noun, args.common.dry_run);
         if failed > 0 || other_failure {
             if stdout_started {
                 eprintln!();
@@ -755,7 +766,7 @@ async fn repair_inner(
     Ok((
         env,
         RepairCounts {
-            downloaded: downloaded_count,
+            downloaded: downloaded_count + created.downloaded,
             cleaned: blobs_cleaned,
             bytes_freed,
         },

@@ -1109,8 +1109,10 @@ into the new version's section — see docs/releasing.md.
     a server-side archive build and count against quota, are exactly the
     one-at-a-time loop's (71 on a fresh depscan run, where an earlier
     draft of the look-ahead issued 74). What changes is only their timing:
-    up to four are in flight at once. `SOCKET_API_CONCURRENCY=1` turns the
-    look-ahead off entirely.
+    they are requested in one batch at the first planned package (see
+    "Fewer downloads in vendored runs"), and up to four archives are in
+    flight at once. `SOCKET_API_CONCURRENCY=1` turns the look-ahead off
+    entirely.
   - A token revoked *mid-run* now costs the authenticated batch endpoint
     the requests already in flight — up to the in-flight cap instead of
     one — before the run downgrades to the public proxy. Their answers are
@@ -1120,6 +1122,21 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **`apply` no longer half-applies a patch that creates a file from a
+  diff-only cache.** A diff archive has no delta for a file the patch
+  creates, but the source check counted a cached diff archive as covering
+  the whole patch: `apply --offline` passed it, patched the modified files,
+  then failed on the created file's missing blob; online `apply` never
+  fetched that blob. Coverage is now per file (a diff covers only files
+  with a `beforeHash`), so `apply --offline` reports the patch as having no
+  local source up front and changes nothing, online `apply` fetches just
+  the created files' blobs, and a default (diff-mode) `repair` downloads
+  them too. Such a repair's `--json` envelope carries a second
+  `downloaded` (dry-run `verified`) artifact event with `mode: "file"` for
+  those blobs.
+- **Hosted `scan` resolves more than 500 patches.** The package-reference
+  request is sent in chunks of 500 uuids, the endpoint's limit; a larger
+  scan used to fail with a 400.
 - **`rollback` fetches a before-blob that only a store peer variant
   needs.** The before-blob gate now probes every pnpm and vlt store variant
   copy the rollback restores, so an online rollback no longer fails
@@ -1762,6 +1779,15 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **Fewer downloads in vendored runs.** A vendored run now asks the patch
+  service for all of its planned packages' download references in one
+  request (in chunks of 500) from the first package it reaches, in place
+  of one request per package; an outage costs the same retries as before,
+  and a package the service reports still building is asked again at its
+  turn. A pypi patch the service serves as an sdist (every patch without a
+  file qualifier) is refused from its reference, before its bytes are
+  downloaded: `auto` still warns `vendor_prebuilt_unavailable` and builds
+  the wheel locally, `service` still refuses.
 - **The npm crawl skips tagged cache directories.** The walk that finds
   workspace `node_modules` trees no longer descends into a directory that
   carries a [Cache Directory Tagging](https://bford.info/cachedir/)
@@ -1859,22 +1885,25 @@ into the new version's section — see docs/releasing.md.
   covers the purl (its entry records the record's patch uuid and the
   committed artifact is on disk — a file artifact such as a wheel or
   tarball only while it still hashes to the ledger's `sha256`; `--force`
-  keeps the eager fetch), and for every lockfile-only cargo crate the
-  registry could fetch and verify (a crates.io `Cargo.lock` entry with a
-  checksum, or the pre-vendor resolution the ledger recovers) while the
-  patch service is enabled (the cargo backend reads the pristine source
-  only once `cargo_service_copy` falls back to the local build). A git,
-  path or custom-registry crate is never deferred: it keeps the eager
-  ladder's `vendor_fetch_unverifiable` + `package_not_installed` refusal
-  and is not vendored from the service's crates.io build, and a committed
+  keeps the eager fetch), and for every lockfile-only npm, cargo, golang
+  or composer package the registry would fetch and verify (a lock entry
+  with an integrity, or the pre-vendor resolution the ledger recovers,
+  that none of its fetcher's pre-download refusals applies to) while the
+  patch service is enabled (those backends read the pristine source only
+  once the service falls back to the local build; pypi and gem keep the
+  eager fetch, which their installed-variant probe reads). A git, path,
+  local-tarball or custom-registry package is never deferred: it keeps the
+  eager ladder's `vendor_fetch_unverifiable` + `package_not_installed`
+  refusal and is not vendored from the service's registry build, and a committed
   file artifact that no longer matches its pin keeps the eager ladder's
   outcome too. Visible effects: an idempotent re-run
   makes no registry requests and no longer reports `vendor_fetched_missing`
   for fetches it never needed; with no network (or under `--offline`) the
   re-run of an already-vendored pypi, cargo, go or lockfile-only gem
   project now SUCCEEDS (`already_vendored`, exit 0) instead of failing
-  `vendor_fetch_failed` / `package_not_installed`; a cargo crate the service
-  serves is never downloaded from the registry. When a deferred fetch does
+  `vendor_fetch_failed` / `package_not_installed`; an npm, cargo, golang or
+  composer package the service serves is never downloaded from the
+  registry. When a deferred fetch does
   happen (a drifted committed copy being rebuilt locally, a service miss),
   its `vendor_fetched_missing` warning is recorded just ahead of that
   package's own event instead of in the up-front fetch pass, and a failed,

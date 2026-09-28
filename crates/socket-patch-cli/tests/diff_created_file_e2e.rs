@@ -258,3 +258,25 @@ fn offline_repair_names_the_created_files_missing_blob() {
         "the created file's blob is still missing; stderr={stderr}"
     );
 }
+
+#[tokio::test]
+async fn repair_json_reports_the_created_blob_download_once_as_file_mode() {
+    let mock = MockServer::start().await;
+    mount_blob(&mock, CREATED).await;
+    let tmp = tempfile::tempdir().unwrap();
+    seed_project(tmp.path());
+    seed_cached_diff_archive(tmp.path());
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &["repair", "--json"], Some(&mock.uri()));
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let downloads: Vec<&serde_json::Value> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "downloaded")
+        .collect();
+    assert_eq!(downloads.len(), 1, "{v:#}");
+    assert_eq!(downloads[0]["details"]["mode"], "file", "{v:#}");
+    assert_eq!(downloads[0]["details"]["count"], 1, "{v:#}");
+}

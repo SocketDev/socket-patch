@@ -138,11 +138,16 @@ fn classic_registry_view(text: &str) -> Vec<LockfileEntry> {
         let Some(version) = classic_field(&block.lines, "version") else {
             continue;
         };
-        // `resolved "url#sha1hex"` — the fragment is the legacy verifier.
+        // `resolved "url#sha1hex"` — the fragment is the legacy verifier of
+        // a registry tarball. A git resolution's fragment is a commit id,
+        // which verifies nothing a registry fetch could download.
         let (resolved, sha1_hex) = match classic_field(&block.lines, "resolved") {
             Some(raw) => {
                 let (url, sha1) = split_resolved_sha1(raw);
-                (http_url(url), sha1)
+                match http_url(url) {
+                    Some(url) => (Some(url), sha1),
+                    None => (None, None),
+                }
             }
             None => (None, None),
         };
