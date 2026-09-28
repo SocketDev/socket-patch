@@ -541,8 +541,8 @@ pub struct GetArgs {
     /// [default: hosted; agent with `--save-only` or `--global`]
     // agent = record in .socket/manifest.json + blobs and apply in place;
     // hosted = rewrite lockfiles so the patched deps resolve to Socket's
-    // hosted patch server (no manifest, no blobs; state lives in the
-    // redirect ledger); vendored = commit patched artifacts under
+    // hosted patch server (no manifest, no blobs, no ledger: the lockfile
+    // is the record); vendored = commit patched artifacts under
     // .socket/vendor/ and rewire the lockfile (no manifest, no blobs; the
     // vendor ledger carries the records). Hosted/vendored runs produce the
     // same on-disk result as `scan --mode hosted|vendored` selecting the
@@ -3683,7 +3683,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
 
 /// `get … --mode hosted`: hand the selected (purl, uuid) pairs to scan's
 /// hosted engine ([`super::scan::boxed_run_redirect_selected`]) — lockfile
-/// rewrite + redirect ledger, no manifest, no blobs — so the on-disk result
+/// rewrite only, no manifest, no blobs, no ledger — so the on-disk result
 /// matches `scan --mode hosted` selecting the same patches. The engine owns
 /// all output (and honors `--dry-run` internally); in JSON mode it nests its
 /// `redirect` block into the get base envelope passed as `scan_result`.

@@ -20,13 +20,10 @@ pub(crate) mod vlt_preflight;
 
 use std::path::Path;
 
-/// The documented name of the mode whose ledger is
-/// `.socket/vendor/redirect-state.json`. Shared by scan's `redirectState`
-/// envelope block and list's hosted event labels so the two surfaces can
-/// never drift, and deliberately a CONSTANT rather than an echo of the
-/// ledger's own `mode` string: that string is opaque to the loader
-/// (pre-rename ledgers carry `"redirect"`), and a consumer dispatching on
-/// these keys must not have to know that history.
+/// The documented name of hosted mode (lockfile pins to Socket-hosted
+/// patched packages; no ledger). Shared by scan's `redirectState` envelope
+/// block and list's hosted event labels so the two surfaces can never
+/// drift.
 pub(crate) const HOSTED_MODE_LABEL: &str = "hosted";
 
 /// The documented name of the mode whose ledger is

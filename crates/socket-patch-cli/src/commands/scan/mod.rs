@@ -1076,21 +1076,21 @@ pub(super) const API_BATCH_FAILED: &str = "api_batch_failed";
 /// prefix. (Every query failing is the discovery error envelope instead.)
 pub(super) const PATCH_DETAILS_FAILED: &str = "patch_details_failed";
 
-/// The scanned purls whose HOSTED redirect wiring is still live: the
-/// redirect ledger records the purl AND lockfile discovery proves the
-/// current lockfile still routes it to that hosted patch — core
+/// The scanned purls whose HOSTED redirect wiring is still live: a hosted
+/// pin names the purl (`redirect_state`, the lockfiles' hosted state — see
+/// [`crate::commands::hosted_state_from_lockfiles`]) AND lockfile discovery
+/// proves the current lockfile still routes it to that hosted patch — core
 /// `Discovery::redirect_record_live`, the same liveness rule `vex` gates
-/// redirect-ledger attestations on.
+/// hosted attestations on.
 ///
 /// Deliberately NOT routed through [`classify_overlap_takeover`]: that
 /// classifier keys on purls present in BOTH ledgers, so hosted-only wiring
 /// can never trigger it (pinned by
 /// `hosted_only_wiring_fires_agent_probe_not_the_overlap_classifier`).
 ///
-/// Silent cases (each pinned by a test): ledger absent/malformed or
-/// `records` empty (even while `edits` remain); purl not scanned this run;
-/// the live lock does not prove hosted wiring — never guess from ledger
-/// presence alone.
+/// Silent cases (each pinned by a test): no hosted pin (a pre-v5 ledger is
+/// not hosted state); purl not scanned this run; the live lock does not
+/// prove hosted wiring.
 pub(super) async fn hosted_wiring_retained_purls(
     common: &GlobalArgs,
     redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
