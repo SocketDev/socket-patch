@@ -16,7 +16,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `apply` | — | Agent mode: apply patches from the local manifest |
 | `rollback` | — | **Full-state rollback (v5.0, MAJOR)**: restore original files AND unwind vendored lockfile wiring / restore hosted pins to their upstream registry entries, remove the rolled-back entries from the manifest, and GC their blobs/archives; takes optional variadic positional `targets` (PURL \| UUID \| path glob). See [Rollback command contract](#rollback-command-contract-v50) |
 | `remove` | — | Agent mode: remove a patch from manifest (rolls back first); requires positional `identifier` |
-| `repair` | `gc` | Agent mode: download missing blobs, rebuild missing/corrupt vendored artifacts, and clean up unused ones (refuses with `lock_held` when a live process holds the lock; see "Lock lifecycle" below) |
+| `repair` | `gc` | Agent mode: download missing blobs, re-vendor missing/corrupt vendored artifacts (never re-synthesizing a lost ledger), and clean up unused ones (refuses with `lock_held` when a live process holds the lock; see "Lock lifecycle" below) |
 
 Rows are in `--help` order (v5.0): the hosted/vendored workflow (`scan` → `vex` → `vendor`, with `list` to inspect), then the agent-mode (in-place patching) commands.
 
@@ -524,38 +524,41 @@ into memory via the patch-view endpoint. A vendored project's `.socket/` holds o
 by an agent-mode manifest, or as the `{"patches": {}}` husk left after a legacy record migrated
 into the ledger).
 
-**Vendored artifact repair (v3.5)**: `repair` health-checks every ledger entry — per-file
+**Vendored artifact repair (v5.0)**: `repair` health-checks every ledger entry — per-file
 afterHashes inside the artifact plus, for file-shaped artifacts (`.tgz`/`.whl`), the whole file
 against the ledger's recorded sha256 (the rewired lock integrity references those exact bytes) —
-and REBUILDS missing/corrupt artifacts through the normal vendor backends. The wired hot paths
-rebuild the artifact only: lockfiles stay byte-identical and the ledger entry is not re-recorded
-(the first run's entry holds the only pre-vendor originals). Pristine sources follow the same
-ladder as vendor: the installed copy first (works under `--offline`), then a lockfile-verified
-registry fetch, then the pre-vendor registry fragment recovered from the ledger's wiring
-`original`s (`recover_lock_entry`) — always integrity-verified fail-closed, and the rebuilt
-artifact is re-verified against the recorded fingerprint before the run counts it (`rebuilt`
-event; a mismatch removes the artifact and fails with `vendor_artifact_rebuild_failed`).
-Lockfile references to `.socket/vendor/<eco>/<uuid>/...` with NO ledger coverage (the ledger was
-deleted wholesale) are RECONSTRUCTED: the uuid comes from the path (the recovery rule above), the
-record from the manifest — or the patch API, yielding an entry with the record embedded (the same
-`detached: true` + `record` shape every `scan`/`get --mode vendored` entry has)
-— and a fresh ledger entry is persisted with the rebuilt artifact's fingerprint. When nothing is
-installed and the ledger is gone, npm-family reconstruction has one more rung: the REWIRED
-lockfile still records the integrity of the packed vendored tarball, so the pristine copy is
-fetched (unverified, conventional registry URL, `SOCKET_NPM_REGISTRY` honored) and the
-deterministically REBUILT artifact must reproduce that wired integrity — a tampered pristine
-source changes the rebuilt bytes and fails closed (`vendor_artifact_rebuild_failed`, nothing
-kept). Reconstructed entries carry no pre-vendor wiring originals, so a later `--revert` degrades
-to the documented `vendor_lock_entry_drifted` guidance (re-resolve with the package manager). Because of this
-phase, `repair` no longer errors with `manifest_not_found` when the project has a vendor ledger
-or vendor-path lockfile references — it runs the vendored phase alone. A **hosted-only** project
-(no manifest, no vendor ledger, no vendored references — only hosted pins in its lockfiles, v5.0,
-or a pre-v5 `.socket/vendor/redirect-state.json`) is a no-op: `repair` exits 0 with a
-`redirect_only_project` skip pointing at `scan --mode hosted` (hosted pins have no local artifacts
-to repair), rather than the `manifest_not_found` error a
-bare directory still gets. Step 1's source download
-likewise skips vendored-in-sync manifest entries (their content lives in the committed artifact),
-so repairing a vendored project never re-litters `.socket/blobs`. `--dry-run` previews
+and RE-VENDORS missing/corrupt artifacts through the same vendored backend `vendor`, `scan --mode
+vendored` and `get --mode vendored` use. The artifact therefore comes from the same place a fresh
+vendor gets it: under the default `--vendor-source auto` the patch service's prebuilt artifact is
+downloaded again, with a local build from a lockfile-verified pristine source as the fallback
+(and the only source under `--offline` / `--vendor-source build`). The wired hot paths rebuild
+the artifact only: lockfiles stay byte-identical and the ledger entry keeps its recorded
+pre-vendor originals. The re-vendored artifact is verified against the ledger fingerprint before
+the run counts it (`rebuilt` event; a mismatch removes the artifact and fails with
+`vendor_artifact_rebuild_failed`). The check is always against the ORIGINAL ledger entry: a source
+that produces other bytes (a service archive re-packed since vendoring) is never committed — its
+wiring and ledger entry are put back and repair falls back to the deterministic local build. A
+corrupt artifact's afterHash-verified members are harvested as patch content (so `--offline`
+repairs it from the installed copy) before it is moved aside for the rebuild, and put back when
+nothing replaced it.
+
+**The ledger is not rebuilt from lockfiles (v5.0).** A lockfile reference to
+`.socket/vendor/<eco>/<uuid>/...` with NO ledger entry (state.json deleted or never committed)
+fails with `vendor_ledger_missing` (an artifact-level `failed` event carrying `uuid` and
+`details.{ecosystem,path}`; exit 1) — the pre-vendor originals a revert needs cannot be recovered
+from the rewired lockfile. Recovery: restore `.socket/vendor/state.json` from version control and
+re-run `repair`, or restore the lockfile (`git checkout -- <lockfile>`) and re-vendor. Earlier
+releases re-synthesized such entries (`details.ledgerRestored`); ledgers they wrote keep working.
+
+Because of this phase, `repair` does not error with `manifest_not_found` when the project has a
+vendor ledger or vendor-path lockfile references — it runs the vendored phase alone. A
+**hosted-only** project (no manifest, no vendor ledger, no vendored references — only hosted pins
+in its lockfiles, v5.0, or a pre-v5 `.socket/vendor/redirect-state.json`) is a no-op: `repair`
+exits 0 with a `redirect_only_project` skip pointing at `scan --mode hosted` (hosted pins have no
+local artifacts to repair), rather than the `manifest_not_found` error a bare directory still
+gets. Step 1's source download skips
+vendored manifest entries and lockfile-referenced uuids (their content lives in the committed
+artifact), so repairing a vendored project never re-litters `.socket/blobs`. `--dry-run` previews
 (`details.wouldRebuild`); `--offline` rebuilds only from fully local sources and fails per-entry
 otherwise; `vendor`/`scan --vendor` re-runs get the same rebuild for wired-but-broken artifacts
 (`vendor_artifact_rebuilt` warning) and recover registry resolutions for missing committed
@@ -778,7 +781,7 @@ worse, lets a warm cache silently serve unpatched bytes):
 
 A bare `rollback` (or a scoped one, for its scope) restores the SYSTEM to unpatched and cleans up the local state, in phases under one `apply.lock` acquisition:
 
-1. **State discovery.** A missing manifest is no longer fatal when the vendor ledger or the lockfiles' hosted pins hold work (`rollback` runs manifest-less on hosted-only / vendored projects — every `scan`/`get --mode vendored` and v5 `scan --mode hosted` project is manifest-less). The **truly-empty** project — no manifest, no vendor ledger, no hosted pin — keeps the legacy "Manifest not found" exit 1 (JSON: the legacy `{status: "error", error: "Manifest not found", path}` shape), with one v5.0 exception: when a pre-v5 `.socket/vendor/redirect-state.json` is the only thing left, nothing pins it any more, so a wet run deletes it and exits 0 (human `Removed the pre-v5 hosted ledger .socket/vendor/redirect-state.json: no lockfile pins a hosted patch.`, `Would remove …` on `--dry-run`, which deletes nothing; JSON `{status: "success", rolledBack: 0, alreadyOriginal: 0, failed: 0, dryRun, warnings, legacyRedirectLedgerRemoved}` — a minimal envelope without the keys below; a failed delete is the `legacy_redirect_ledger_kept` warning, still exit 0). A project whose lockfiles still reference `.socket/vendor/` artifacts but whose vendor ledger is missing errors naming `socket-patch repair` (reconstruct the ledger, then roll back). **Corrupt-ledger containment**: an unreadable vendor ledger fails ONLY the legs that need it — the vendored leg, manifest cleanup, and GC are skipped fail-closed (`vendor_state_unreadable` warning) while the agent and hosted legs still run; it drives `partial_failure` exit 1, and an emergency restore is never blocked by it. When the ONLY state on disk is an unreadable vendor ledger, the run fails closed naming the store. A pre-v5 redirect ledger is never read by rollback (v4's `redirect_state_unreadable` is no longer emitted).
+1. **State discovery.** A missing manifest is no longer fatal when the vendor ledger or the lockfiles' hosted pins hold work (`rollback` runs manifest-less on hosted-only / vendored projects — every `scan`/`get --mode vendored` and v5 `scan --mode hosted` project is manifest-less). The **truly-empty** project — no manifest, no vendor ledger, no hosted pin — keeps the legacy "Manifest not found" exit 1 (JSON: the legacy `{status: "error", error: "Manifest not found", path}` shape), with one v5.0 exception: when a pre-v5 `.socket/vendor/redirect-state.json` is the only thing left, nothing pins it any more, so a wet run deletes it and exits 0 (human `Removed the pre-v5 hosted ledger .socket/vendor/redirect-state.json: no lockfile pins a hosted patch.`, `Would remove …` on `--dry-run`, which deletes nothing; JSON `{status: "success", rolledBack: 0, alreadyOriginal: 0, failed: 0, dryRun, warnings, legacyRedirectLedgerRemoved}` — a minimal envelope without the keys below; a failed delete is the `legacy_redirect_ledger_kept` warning, still exit 0). A project whose lockfiles still reference `.socket/vendor/` artifacts but whose vendor ledger is missing errors asking for `.socket/vendor/state.json` to be restored from version control first (v5.0: `repair` no longer reconstructs the ledger). **Corrupt-ledger containment**: an unreadable vendor ledger fails ONLY the legs that need it — the vendored leg, manifest cleanup, and GC are skipped fail-closed (`vendor_state_unreadable` warning) while the agent and hosted legs still run; it drives `partial_failure` exit 1, and an emergency restore is never blocked by it. When the ONLY state on disk is an unreadable vendor ledger, the run fails closed naming the store. A pre-v5 redirect ledger is never read by rollback (v4's `redirect_state_unreadable` is no longer emitted).
 2. **Agent leg** — the existing in-place restore machinery, unchanged (v5.0 presentation: the human `No patches found in manifest` line prints only for an unscoped run with no work in ANY leg — a run whose work is all vendored/hosted stays quiet about the manifest): multi-copy restore, release-variant narrowing, the before-blob gate (+ on-demand download; a gate abort still exits 1 with per-package `missing_blob` failure results **and** skips manifest cleanup + GC entirely — nothing was restored, and the retry's revert data must survive), local-go redirect drop, and the `not_installed` exit-0 asymmetry verbatim. Vendor-owned purls are still excluded here (see the vendored-mode section) — they are handled by the next leg instead of being punted to other commands.
 3. **Vendored leg** — each in-scope ledger entry (embedded-record entries included) is reverted through the vendor backends: lockfile wiring restored, artifact dir deleted (and its emptied `.socket/vendor/<eco>/` husk pruned, v5.0), ledger entry dropped + persisted per purl (crash-consistent, like `vendor --revert`). A **drift-keep** (the backend refused a drifted lock) keeps the entry, the artifact, AND the manifest record (`vendoredKept`, exit 1 — the system is still patched); a failure is recorded and other entries proceed.
 4. **Hosted leg** — each in-scope hosted pin is restored to its default upstream registry entry; see "Hosted unwind coverage" below. After a hosted leg with no failure, a wet run deletes a pre-v5 `redirect-state.json` once no lockfile pins a hosted patch any more (a failed delete is the `legacy_redirect_ledger_kept` warning).
@@ -975,7 +978,7 @@ Env-only knobs (no CLI flag) read by the vendor auto-fetch / artifact-rebuild pa
 
 | Env var | Default | Notes |
 |---|---|---|
-| `SOCKET_NPM_REGISTRY` | `https://registry.npmjs.org` | Base for conventional npm tarball URLs (vendor auto-fetch + the npm-family lockfile-integrity reconstruction rung in `repair`) and, v5.0, the version documents (`<base>/<name>/<version>`, a scoped name's `/` as `%2f`; `dist.tarball` / `integrity` / `shasum`) the npm-family and vlt upstream restore reads. |
+| `SOCKET_NPM_REGISTRY` | `https://registry.npmjs.org` | Base for conventional npm tarball URLs (vendor auto-fetch, including `repair`'s local-build fallback) and, v5.0, the version documents (`<base>/<name>/<version>`, a scoped name's `/` as `%2f`; `dist.tarball` / `integrity` / `shasum`) the npm-family and vlt upstream restore reads. |
 | `SOCKET_CRATES_REGISTRY` | `https://static.crates.io/crates` | crates.io static `.crate` download host. |
 | `SOCKET_GOPROXY` | `https://proxy.golang.org` | Go module proxy. Wins over the standard `GOPROXY` env var, whose first element is used otherwise. When that element is `off` or `direct`, or the module matches `GONOPROXY` (default `GOPRIVATE`), go would not ask a proxy, so the pristine fetch is refused (`vendor_fetch_unverifiable` + the calm `package_not_installed` skip) instead of falling back to `proxy.golang.org`. |
 | `SOCKET_MAVEN_REGISTRY` | `https://repo1.maven.org/maven2` | maven2 base for the fallback upstream-pom download. |
@@ -1078,7 +1081,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `failed`     | every command                         | A specific patch attempt failed. `errorCode` + `error` set. |
 | `removed`    | `gc`/`repair`, `remove`, `rollback`   | Data was removed from `.socket/` (or files rolled back). `bytes` optional. |
 | `verified`   | `apply --dry-run`, `scan --dry-run`   | The patch *would* apply cleanly. `files` lists previewed changes. |
-| `rebuilt`    | `repair`                              | A missing/corrupt vendored artifact was rebuilt in place (or its lost ledger entry restored — `details.ledgerRestored`). `summary.rebuilt` counts these (the field is omitted while zero). |
+| `rebuilt`    | `repair`                              | A missing/corrupt vendored artifact was re-vendored in place (v5.0: never a lost ledger entry — see `vendor_ledger_missing`). `summary.rebuilt` counts these (the field is omitted while zero). |
 
 ### Stable `errorCode` tags
 
@@ -1117,7 +1120,8 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
 | `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |
 | `revert_failed`           | `failed`         | vendor --revert: a recorded entry could not be reverted. |
-| `vendor_wiring_unknown_revert_blocked` | `skipped` (beside the `failed`/`revert_failed` event) | vendor --revert: the ledger entry was reconstructed by `repair` without wiring records and the live lockfile still resolves through the artifact — the revert refuses (fail-closed) instead of deleting a tarball the lock points at. Recovery: `socket-patch repair`, then restore the pre-vendor lock (or re-lock without the override) and re-run the revert. repair: an npm ledger entry whose `flavor` this release does not know (written by a newer socket-patch) is skipped, never health-checked or rebuilt, and the artifact, wiring and ledger stay as found (a lone `skipped` event; the run's exit is unaffected). Recovery: upgrade socket-patch. |
+| `vendor_ledger_missing` | `failed` (artifact-level: `uuid` + `details.{ecosystem,path}`, no purl) | repair (v5.0): a lockfile references `.socket/vendor/<eco>/<uuid>/` but the vendor ledger has no entry for it; repair no longer rebuilds ledger entries from lockfiles. Recovery: restore `.socket/vendor/state.json` from version control and re-run `repair`, or `git checkout -- <lockfile>` and re-vendor. |
+| `vendor_wiring_unknown_revert_blocked` | `skipped` (beside the `failed`/`revert_failed` event) | vendor --revert: the ledger entry was reconstructed by a pre-v5 `repair` without wiring records and the live lockfile still resolves through the artifact — the revert refuses (fail-closed) instead of deleting a tarball the lock points at. Recovery: `socket-patch repair`, then restore the pre-vendor lock (or re-lock without the override) and re-run the revert. repair: an npm ledger entry whose `flavor` this release does not know (written by a newer socket-patch) is skipped, never health-checked or rebuilt, and the artifact, wiring and ledger stay as found (a lone `skipped` event; the run's exit is unaffected). Recovery: upgrade socket-patch. |
 | `stale_install`           | `skipped`        | vex (in-run `scan --mode hosted --vex`): a hosted stale-install probe found positively unpatched installed bytes, so the purl is omitted even under `--vex-no-verify` (see the gem / Python stale-install guards). |
 | `record_unavailable`      | `skipped`        | vex (manifest-less): a lockfile-wired patch has no local record (manifest, this run's hosted records or a pre-v5 redirect ledger, vendor ledger) and none could be fetched — `--offline`, transport error, 404, or a refused (paid) patch. Omitted, never attested from the `socket-patch.vendor.json` marker. |
 | `record_mismatch`         | `skipped`        | vex (manifest-less): the record found for a wired patch names another package or another patch uuid than the wiring. |
@@ -1166,7 +1170,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_flavor_changed` | `failed` | vendor (npm): the purl's vendor ledger entry was written for another lockfile `flavor` than the one the router now detects (for example `npm` → `vlt` after switching package managers). Remedy: `socket-patch vendor --revert` it first, then re-vendor. Refused before any write. |
 | `vendor_artifact_gitignored` | `failed` | vendor (vlt): inside a git work tree, `git check-ignore --no-index` reports the new artifact's uuid directory as ignored by a rule its own `.gitignore` cannot override (such as a root `.socket/` rule; the detail names the rule). Remedy: drop that rule for `.socket/vendor/`. Refused before any write. |
 | `vendor_artifact_gitignore_unchecked` | warning | vendor (vlt): git is installed but could not answer the ignore check for the written vendored directory (it failed to start, ran past 30 s, or `rev-parse` / `check-ignore` exited with an error); the package is vendored and the detail names what failed. Remedy: make sure no ignore rule covers `.socket/` before committing. Git absent, or a project outside any work tree, raises nothing. |
-| `vendor_ledger_entry_missing` | `failed` | vendor (vlt): the only installed copy is vlt's link to a committed vendored directory, but the vendor ledger has no entry for the package; run `socket-patch repair` to restore it. Replaces the `package_not_installed` skip. |
+| `vendor_ledger_entry_missing` | `failed` | vendor (vlt): the only installed copy is vlt's link to a committed vendored directory, but the vendor ledger has no entry for the package; restore `.socket/vendor/state.json` from version control (v5.0: `repair` no longer re-synthesizes it). Replaces the `package_not_installed` skip. |
 | `vendor_artifact_missing` | `skipped` (warning) / `failed` | vendor: the committed artifact is gone — the registry resolution is recovered from the ledger and the artifact rebuilt (warning); repair `--offline` with no local source surfaces it as the per-entry failure instead. |
 | `vendor_artifact_corrupt` | `failed` | repair `--offline`: the committed artifact fails verification (member afterHashes or the ledger's whole-file sha256) and no local source can rebuild it. Online repairs rebuild instead. |
 | `vendor_artifact_reused` | `skipped` (verbose note) | vendor / scan `--vendor` (pypi): the wiring was dropped by a relock but the committed wheel the ledger vouches for verified, so it was re-wired as-is — no service download, no rebuild; the lock pins the first run's sha again. |

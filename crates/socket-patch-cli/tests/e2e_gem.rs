@@ -484,7 +484,7 @@ fn test_gem_full_lifecycle() {
     let gem_dir = find_gem_dir(cwd);
 
     // -- GET: download + apply patch ------------------------------------------
-    assert_run_ok(cwd, &["get", GEM_UUID], "get");
+    assert_run_ok(cwd, &["get", GEM_UUID, "--mode", "agent"], "get");
 
     let manifest_path = cwd.join(".socket/manifest.json");
     assert!(
@@ -583,7 +583,7 @@ fn test_gem_dry_run() {
     let gem_dir = find_gem_dir(cwd);
 
     // Download without applying.
-    assert_run_ok(cwd, &["get", GEM_UUID, "--no-apply"], "get --no-apply");
+    assert_run_ok(cwd, &["get", GEM_UUID, "--mode", "agent", "--no-apply"], "get --no-apply");
 
     // Read manifest to get file list and expected hashes.
     let manifest_path = cwd.join(".socket/manifest.json");

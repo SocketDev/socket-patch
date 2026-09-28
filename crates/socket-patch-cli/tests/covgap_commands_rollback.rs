@@ -655,12 +655,12 @@ fn path_scope_warns_about_out_of_scope_restored_copies() {
 }
 
 /// Ledger-less but still WIRED: a lockfile that consumes `.socket/vendor/`
-/// artifacts with NO ledger and NO manifest is a supported recovery state —
-/// rollback must refuse with the `socket-patch repair` guidance (exit 1),
+/// artifacts with NO ledger and NO manifest — rollback must refuse with the
+/// restore-`state.json` guidance (exit 1),
 /// never fall through to the bare "Manifest not found" error, and must not
 /// touch the wired lock.
 #[test]
-fn ledgerless_wired_lock_errors_with_repair_guidance() {
+fn ledgerless_wired_lock_errors_with_state_json_guidance() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // A v3 package-lock whose resolution points into `.socket/vendor/` —
     // exactly what a deleted/uncommitted state.json leaves behind.
@@ -691,9 +691,9 @@ fn ledgerless_wired_lock_errors_with_repair_guidance() {
     assert!(
         v["error"].as_str().is_some_and(|e| {
             e.contains("lockfiles still reference .socket/vendor/ artifacts")
-                && e.contains("socket-patch repair")
+                && e.contains("restore .socket/vendor/state.json")
         }),
-        "the error must carry the repair guidance, not 'Manifest not found'; stdout=\n{stdout}"
+        "the error must carry the state.json guidance, not 'Manifest not found'; stdout=\n{stdout}"
     );
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),

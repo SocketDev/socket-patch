@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use super::get::short_uuid;
 use super::rollback::{
-    pin_before_hash_blobs, revert_vendor_entry, rollback_patches_inner, run_hosted_leg,
-    sweep_failure, sweep_unused_artifacts, HostedLegOutcome, InnerSelection, VendorRevertStep,
+    pin_before_hash_blobs, rollback_patches_inner, run_hosted_leg, sweep_failure,
+    sweep_unused_artifacts, HostedLegOutcome, InnerSelection,
 };
+use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
@@ -1153,9 +1154,19 @@ async fn revert_vendored_matches(
         keep_artifact: args.preserve_state,
     };
     let mut leg = RemoveVendorLeg::default();
-    for key in keys {
-        let result = revert_vendor_entry(&args.common.cwd, key, state, opts).await;
-        for w in &result.warnings {
+    // Stops at the first hard failure: remove aborts there, leaving the
+    // remaining matches (and the manifest) untouched.
+    let reverted = VendoredBackend::new(&args.common, None)
+        .revert(keys, state, opts, true)
+        .await;
+    for RevertedEntry {
+        key,
+        warnings,
+        step,
+        ..
+    } in reverted
+    {
+        for w in &warnings {
             if loud {
                 eprintln!("Warning: {}", w.detail);
             }
@@ -1164,7 +1175,7 @@ async fn revert_vendored_matches(
                     .with_reason(w.code, w.detail.clone()),
             );
         }
-        match result.step {
+        match step {
             VendorRevertStep::Missing => {}
             VendorRevertStep::Failed(why) => {
                 track_patch_remove_failed(

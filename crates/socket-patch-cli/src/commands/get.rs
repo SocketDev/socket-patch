@@ -3890,36 +3890,28 @@ async fn run_get_vendored(
         ))
         .await
     };
-    let mut has_errors = dl_code != 0;
     fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
 
     // The vendor step (scan's, verbatim): apply lock, in-memory staging
     // seeded with the blobs fetched above, the engine over exactly the
     // records fetched above (moved in — nothing here needs them afterwards)
-    // and over this run's client. A per-patch download failure does not
-    // skip it (scan parity).
-    match super::scan::boxed_scan_vendor_step(
-        &args.common,
+    // and over this run's client, then the run's telemetry. A per-patch
+    // download failure does not skip it (scan parity).
+    match super::scan::boxed_vendor_step(super::scan::VendorStep {
+        common: &args.common,
         records,
-        blobs,
-        api_client.clone(),
+        seed: blobs,
+        client: api_client.clone(),
         use_public_proxy,
-    )
+        report_empty: true,
+        prior: None,
+        download_errors: dl_code != 0,
+        telemetry_token,
+        telemetry_org,
+    })
     .await
     {
-        Ok((vendor_errors, venv)) => {
-            has_errors |= vendor_errors;
-            // Telemetry follows the RUN outcome, not the vendor step alone:
-            // a download-phase refusal/failure exits 1 and must not report
-            // a successful vendoring of zero patches (scan's arms agree).
-            crate::commands::vendor::track_outcomes_for_vendor(
-                has_errors,
-                &venv,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
+        Ok((has_errors, venv)) => {
             if args.common.json {
                 result["status"] = serde_json::json!(if has_errors {
                     "partial_failure"
@@ -3933,13 +3925,6 @@ async fn run_get_vendored(
             i32::from(has_errors)
         }
         Err((code, message, venv)) => {
-            socket_patch_core::telemetry::track_patch_vendor_failed(
-                &message,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
             if args.common.json {
                 // A vendor envelope built before the failure (events
                 // included) must reach the JSON consumer even though the

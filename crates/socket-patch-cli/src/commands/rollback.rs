@@ -17,7 +17,7 @@ use socket_patch_core::patch::rollback::{
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
-use socket_patch_core::vendor::{save_state, RevertOpts, VendorState, VendorWarning};
+use socket_patch_core::vendor::{RevertOpts, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,7 +25,7 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vendor::dispatch_revert_one_opts;
+use crate::commands::vendored_backend::{RevertedEntry, VendorRevertStep, VendoredBackend};
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
@@ -827,76 +827,6 @@ pub(crate) struct HostedLegOutcome {
     pub(crate) edited_files: std::collections::BTreeSet<String>,
 }
 
-/// What one vendored ledger entry's revert did. Silent by design — the
-/// caller owns the print and envelope vocabulary. Shared by `rollback`'s
-/// vendored leg and both of `remove`'s vendored paths, so the drift-keep
-/// and `--preserve-state` rules are identical by construction.
-pub(crate) enum VendorRevertStep {
-    /// `key` has no ledger entry (a divergent ledger, or an earlier leg
-    /// already reverted it): a silent no-op.
-    Missing,
-    /// The backend refused; nothing changed for this entry.
-    Failed(String),
-    /// Drift-keep: the lock changed under us and the backend left both the
-    /// wiring and the artifact alone. Per `RevertOutcome`'s contract the
-    /// ledger entry — and any manifest record — must survive.
-    Kept,
-    /// Dry run: the revert (or, with `keep_artifact`, the unwire) would
-    /// succeed. Nothing changed.
-    WouldRevert,
-    /// `keep_artifact`: wiring restored; artifact and ledger entry kept
-    /// byte-identical. Its wiring records now describe already-reverted
-    /// fragments, which later reverts replay as silent no-ops (the
-    /// liveness contract), and a re-vendor re-wires from the live lock.
-    Preserved,
-    /// Reverted on disk, dropped from the ledger, ledger saved (per entry,
-    /// so the run is crash-consistent like `vendor --revert`).
-    Reverted,
-    /// Reverted on disk and dropped from the in-memory ledger, but the
-    /// ledger write failed.
-    LedgerWriteFailed(String),
-}
-
-pub(crate) struct VendorRevertResult {
-    pub(crate) warnings: Vec<VendorWarning>,
-    pub(crate) step: VendorRevertStep,
-}
-
-/// Revert the vendored ledger entry `key` (see [`VendorRevertStep`]).
-pub(crate) async fn revert_vendor_entry(
-    cwd: &Path,
-    key: &str,
-    state: &mut VendorState,
-    opts: RevertOpts,
-) -> VendorRevertResult {
-    let Some(entry) = state.entries.get(key).cloned() else {
-        return VendorRevertResult {
-            warnings: Vec::new(),
-            step: VendorRevertStep::Missing,
-        };
-    };
-    let outcome = dispatch_revert_one_opts(&entry, cwd, opts).await;
-    let step = if !outcome.success {
-        VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
-    } else if outcome.kept_artifact {
-        VendorRevertStep::Kept
-    } else if opts.dry_run {
-        VendorRevertStep::WouldRevert
-    } else if opts.keep_artifact {
-        VendorRevertStep::Preserved
-    } else {
-        state.entries.remove(key);
-        match save_state(cwd, state).await {
-            Ok(()) => VendorRevertStep::Reverted,
-            Err(e) => VendorRevertStep::LedgerWriteFailed(e.to_string()),
-        }
-    };
-    VendorRevertResult {
-        warnings: outcome.warnings,
-        step,
-    }
-}
-
 /// One GC pass over `.socket/blobs`, `diffs` and `packages` against
 /// `reference` (the post-removal manifest with the revert blobs a later
 /// rollback needs pinned in). Each directory reports separately: callers
@@ -952,50 +882,58 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    for key in keys {
-        let result = revert_vendor_entry(&common.cwd, key, state, opts).await;
-        for w in &result.warnings {
+    let reverted = VendoredBackend::new(common, None)
+        .revert(keys, state, opts, false)
+        .await;
+    for RevertedEntry {
+        key,
+        warnings,
+        step,
+        ..
+    } in reverted
+    {
+        for w in &warnings {
             if loud {
                 eprintln!("Warning: {}", w.detail);
             }
             out.warnings.push((w.code.to_string(), w.detail.clone()));
         }
-        match result.step {
+        match step {
             VendorRevertStep::Missing => {}
             VendorRevertStep::Failed(why) => {
                 // Errors print even under --silent.
                 if !common.json {
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
-                out.failed.push((key.clone(), why));
+                out.failed.push((key, why));
             }
             VendorRevertStep::Kept => out.kept.push((
-                key.clone(),
+                key,
                 "lockfile wiring drifted; vendored state left untouched".to_string(),
             )),
             VendorRevertStep::WouldRevert if preserve => {
                 if loud {
                     println!("Would unwire vendoring for {key} (artifact preserved)");
                 }
-                out.preserved.push(key.clone());
+                out.preserved.push(key);
             }
             VendorRevertStep::WouldRevert => {
                 if loud {
                     println!("Would revert vendoring for {key}");
                 }
-                out.reverted.push(key.clone());
+                out.reverted.push(key);
             }
             VendorRevertStep::Preserved => {
                 if loud {
                     println!("Unwired vendoring for {key} (artifact preserved)");
                 }
-                out.preserved.push(key.clone());
+                out.preserved.push(key);
             }
             VendorRevertStep::Reverted => {
                 if loud {
                     println!("Reverted vendoring for {key}");
                 }
-                out.reverted.push(key.clone());
+                out.reverted.push(key);
             }
             VendorRevertStep::LedgerWriteFailed(e) => {
                 let why = format!("vendor ledger write failed: {e}");
@@ -1003,7 +941,7 @@ async fn run_vendored_leg(
                 if !common.json {
                     eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
-                out.failed.push((key.clone(), why));
+                out.failed.push((key, why));
             }
         }
     }
@@ -1260,14 +1198,16 @@ pub async fn run(args: RollbackArgs) -> i32 {
             return 0;
         }
         // Ledger-less but still wired? (a deleted/uncommitted state.json
-        // with lockfiles still consuming `.socket/vendor/` artifacts is a
-        // supported recovery state — `repair` reconstructs the ledger.)
-        let wired = crate::commands::repair_vendor::scan_vendor_references(&cwd).await;
+        // with lockfiles still consuming `.socket/vendor/` artifacts: the
+        // ledger holds the pre-vendor originals, so it must come back from
+        // version control first.)
+        let wired = crate::commands::vendored_backend::repair::scan_vendor_references(&cwd).await;
         if !wired.is_empty() {
             emit_rollback_error(
                 args.common.json,
                 "lockfiles still reference .socket/vendor/ artifacts but the vendor ledger \
-                 is missing — run `socket-patch repair` to reconstruct it, then roll back",
+                 is missing — restore .socket/vendor/state.json from version control, then \
+                 roll back (or restore the lockfiles with `git checkout -- <lockfile>`)",
             );
             return 1;
         }
