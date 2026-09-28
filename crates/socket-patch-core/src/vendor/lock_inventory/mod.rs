@@ -372,8 +372,8 @@ pub(crate) fn http_url(raw: &str) -> Option<String> {
 /// `// ── file selection ──` (stat / list only, never a content read), and
 /// `// ── registry view ──` (unrestricted) — so lockfile discovery can
 /// import the models without bypassing its recognizing ctx reads. The same
-/// rule covers the other readers discovery imports: `vendor::maven_pom`,
-/// `vendor::nuget_config`'s reader half, and the `// ── pure reader ──`
+/// rule covers the other readers discovery imports: `formats::maven`,
+/// `formats::nuget`, and the `// ── pure reader ──`
 /// regions of the writer-owned `go_mod_edit`, `go_sum_edit`,
 /// `cargo_config` and `cargo_manifest`.
 #[cfg(test)]
@@ -469,7 +469,7 @@ mod architecture_tests {
             check(name, &text);
         }
         // Vendor-side readers lockfile discovery imports.
-        for rel in ["vendor/nuget_config.rs", "vendor/maven_pom.rs"] {
+        for rel in ["formats/nuget/mod.rs", "formats/maven/mod.rs"] {
             let text = std::fs::read_to_string(src.join(rel)).expect("read reader module");
             check(rel, &text);
         }
@@ -481,8 +481,8 @@ mod architecture_tests {
             "vendor/go_sum_edit.rs",
             "vendor/cargo_config.rs",
             "vendor/cargo_manifest.rs",
-            "vendor/nuget_config.rs",
-            "vendor/maven_pom.rs",
+            "formats/nuget/mod.rs",
+            "formats/maven/mod.rs",
         ] {
             let text = std::fs::read_to_string(src.join(rel)).expect("read reader module");
             assert!(

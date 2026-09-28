@@ -67,7 +67,6 @@ pub mod go_sum_edit;
 pub mod golang;
 pub(crate) mod ledger_snapshots;
 pub mod lock_inventory;
-pub(crate) mod maven_pom;
 pub mod maven_repo;
 pub(crate) mod npm_common;
 pub(crate) mod npm_dir;

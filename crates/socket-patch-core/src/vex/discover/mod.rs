@@ -34,9 +34,9 @@
 //! `berry_entries`, `BunLockb::parse_packages`, `vlt::vlt_lock_model`) and,
 //! for the other formats, the readers the writers own (`cargo_lock` /
 //! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `formats::gem`,
-//! `composer_lock_packages`, the
+//! `formats::composer`, the
 //! `utils::python_lock` / `poetry_lock` / `requirements` / `hatch` readers,
-//! `maven_pom`, `nuget_config` / `nuget_feed`). The inventory's registry
+//! `formats::maven`, `nuget_config` / `nuget_feed`). The inventory's registry
 //! views drop the Socket-owned entries (they feed registry discovery and
 //! fetches); the extractors here classify and validate exactly those. File
 //! selection and I/O stay with each consumer: discovery reads every present

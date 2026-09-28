@@ -29,6 +29,8 @@
 pub mod cargo;
 pub mod composer;
 pub mod gem;
+pub(crate) mod maven;
+pub(crate) mod nuget;
 pub mod pnpm;
 pub(crate) mod bun;
 pub mod registry;
