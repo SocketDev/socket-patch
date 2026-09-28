@@ -43,7 +43,7 @@ on:
       - 'crates/socket-patch-cli/src/commands/scan/**'
       - 'crates/socket-patch-cli/src/commands/rollback.rs'
       - 'crates/socket-patch-cli/src/commands/vendor.rs'
-      - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/vendored_backend/**'
       - 'crates/socket-patch-cli/src/commands/remove.rs'
   # Main runs are the only rust-cache writers (save-if below), so a
   # path-filtered push trigger is what seeds the cache the PR builds restore
@@ -75,7 +75,7 @@ on:
       - 'crates/socket-patch-cli/src/commands/scan/**'
       - 'crates/socket-patch-cli/src/commands/rollback.rs'
       - 'crates/socket-patch-cli/src/commands/vendor.rs'
-      - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/vendored_backend/**'
       - 'crates/socket-patch-cli/src/commands/remove.rs'
   workflow_dispatch:
     inputs:

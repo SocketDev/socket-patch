@@ -1,20 +1,16 @@
 //! Coverage-gap tests for `repair`'s vendored-artifact phase
-//! (`commands/repair_vendor.rs`): the record-resolution edges of pass 1
-//! (corrupt ledger, dropped/moved-on manifest records, API-recovered
-//! records), the tampered-state health arms (StaleUuid / Unverifiable),
-//! dry-run previews of ledger/wiring reconstruction, the pristine ladder's
-//! ledger-recovered registry rung (Fetched and Failed), the rebuild loop's
-//! Refused/rebuild-failed arms, soft-restore fallbacks, `--ecosystems`
-//! scoping, and the human (non-`--json`) output lines.
-//!
+//! (`commands/vendored_backend/repair.rs`): record resolution (corrupt
+//! ledger, dropped/moved-on manifest records, API-recovered records), the
+//! tampered-state health arms (StaleUuid / Unverifiable), the re-vendor's
+//! failure arms and detail selection, `--ecosystems` scoping, and the
+//! human (non-`--json`) output lines.//!
 //! Fixtures and helpers mirror `repair_vendor_e2e.rs` (this suite owns its
 //! own copies).
 //!
 //! A vendored run (`scan --vendor`) is manifest-free: every ledger entry is
 //! `detached` with its record embedded and `.socket/manifest.json` is never
 //! written. The manifest-backed repair arms (dropped / moved-on manifest
-//! records, the `(None, None)` uuid recovery, pass 2's manifest-by-uuid
-//! reconstruction) belong to LEGACY manifest-mode projects, which the tests
+//! records, the `(None, None)` uuid recovery) belong to LEGACY manifest-mode projects, which the tests
 //! build by hand-migrating the fixture with [`to_legacy_manifest_mode`].
 
 use std::path::{Path, PathBuf};
@@ -399,7 +395,7 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
 }
 
 /// The human-output twin of [`run_cli`]: identical flags minus `--json`
-/// (every `!quiet` println/eprintln in repair_vendor.rs is dead under
+/// (every `!quiet` println/eprintln in vendored_backend/repair.rs is dead under
 /// `--json`, so these lines are only reachable here).
 fn run_cli_human(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) {
     run_cli_with(root, mock_uri, argv, false, &[])
@@ -434,11 +430,6 @@ fn parse_env(stdout: &str) -> serde_json::Value {
 
 fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
     v["events"].as_array().cloned().unwrap_or_default()
-}
-
-/// Run-level `warnings[]` (`{code, detail}`); empty when omitted.
-fn warnings_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    v["warnings"].as_array().cloned().unwrap_or_default()
 }
 
 fn read_state(root: &Path) -> serde_json::Value {
@@ -877,320 +868,6 @@ async fn repair_fails_closed_on_unsafe_ledger_artifact_path() {
     );
 }
 
-// ───────────── pass 2: reference with no ledger, no manifest, offline ─────────────
-
-/// Lockfile reference with the ledger gone (a vendored run never writes a
-/// manifest, so no local record survives), `--offline`:
-/// the failure is attributed to a SYNTHETIC purl carrying the recovered
-/// uuid (`pkg:npm/unknown@<uuid>`) and advises restoring state.json or
-/// re-running online. Nothing on disk is touched.
-#[tokio::test]
-async fn repair_no_ledger_no_manifest_offline_fails_with_synthetic_purl() {
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    let tgz = vendor_project(tmp.path(), &mock.uri());
-    let tgz_bytes = std::fs::read(&tgz).unwrap();
-    let lock_bytes = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
-
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    assert!(
-        !tmp.path().join(".socket/manifest.json").exists(),
-        "vendored runs write no manifest"
-    );
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == format!("pkg:npm/unknown@{UUID}")
-            && e["errorCode"] == "vendor_artifact_missing"
-            && e["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("restore .socket/vendor/state.json or re-run online")),
-        "envelope={v}"
-    );
-    assert_eq!(
-        std::fs::read(&tgz).unwrap(),
-        tgz_bytes,
-        "the surviving artifact is untouched"
-    );
-    assert_eq!(
-        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
-        lock_bytes,
-        "the lock is untouched"
-    );
-}
-
-// ─────────────────────── dry-run previews ───────────────────────
-
-/// Dry-run preview of an ANCHORED ledger reconstruction (artifact intact,
-/// wired lock integrity vouches): `wouldRestoreLedgerEntry` with NO
-/// `wouldRebuild`, and state.json is not recreated.
-#[tokio::test]
-async fn repair_dry_run_previews_anchored_ledger_restore() {
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    vendor_project(tmp.path(), &mock.uri());
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--dry-run"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    let preview = events_of(&v)
-        .into_iter()
-        .find(|e| e["action"] == "verified" && e["purl"] == PURL)
-        .unwrap_or_else(|| panic!("expected a verified preview: {v}"));
-    assert_eq!(
-        preview["details"]["wouldRestoreLedgerEntry"], true,
-        "envelope={v}"
-    );
-    assert!(
-        preview["details"].get("wouldRebuild").is_none(),
-        "an anchored surviving artifact previews restore-only: {preview}"
-    );
-    assert!(
-        !tmp.path().join(".socket/vendor/state.json").exists(),
-        "dry run writes no ledger"
-    );
-}
-
-/// Dry-run preview of an UNANCHORED reconstruction (gem dir — no lockfile
-/// integrity can vouch): `wouldRestoreLedgerEntry` AND `wouldRebuild`
-/// (the fingerprint would come from a rebuild, never the live tree), and
-/// neither the ledger nor the copy dir is touched.
-#[tokio::test]
-async fn repair_dry_run_previews_unanchored_reconstruction_rebuild() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--dry-run"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    let preview = events_of(&v)
-        .into_iter()
-        .find(|e| e["action"] == "verified" && e["purl"] == GEM_PURL)
-        .unwrap_or_else(|| panic!("expected a verified preview: {v}"));
-    assert_eq!(
-        preview["details"]["wouldRestoreLedgerEntry"], true,
-        "envelope={v}"
-    );
-    assert_eq!(
-        preview["details"]["wouldRebuild"], true,
-        "an unanchored survivor previews a trust-restoring rebuild: {preview}"
-    );
-    assert!(
-        !tmp.path().join(".socket/vendor/state.json").exists(),
-        "dry run writes no ledger"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
-        AFTER,
-        "dry run touches no artifact bytes"
-    );
-}
-
-// ─────────────────── pass-1 gem wiring backfill edges ───────────────────
-
-/// Dry-run preview of the pass-1 empty-wiring gem backfill:
-/// `wouldRestoreWiring` — and the persisted wiring stays empty.
-#[tokio::test]
-async fn repair_dry_run_previews_gem_wiring_backfill() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    let mut state = read_state(tmp.path());
-    state["entries"][GEM_PURL]["wiring"] = serde_json::json!([]);
-    write_state(tmp.path(), &state);
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--dry-run"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "verified"
-            && e["purl"] == GEM_PURL
-            && e["details"]["wouldRestoreWiring"] == true),
-        "envelope={v}"
-    );
-    let state = read_state(tmp.path());
-    assert_eq!(
-        state["entries"][GEM_PURL]["wiring"]
-            .as_array()
-            .map(Vec::len),
-        Some(0),
-        "dry run must not persist the backfilled wiring: {state}"
-    );
-}
-
-/// The pass-1 backfill's degradation-notes loop: on a CHECKSUMS lock the
-/// reconstruction succeeds with the unrecoverable-sha256 note, which must
-/// ride the envelope as a skipped advisory NEXT TO the wiringRestored
-/// rebuilt event.
-#[tokio::test]
-async fn repair_backfill_surfaces_unrecoverable_checksum_note() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), true);
-    vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    let mut state = read_state(tmp.path());
-    state["entries"][GEM_PURL]["wiring"] = serde_json::json!([]);
-    write_state(tmp.path(), &state);
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "rebuilt"
-            && e["purl"] == GEM_PURL
-            && e["details"]["wiringRestored"] == true
-            && e["details"]["artifactRebuilt"] == false),
-        "envelope={v}"
-    );
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
-            && e["purl"] == GEM_PURL
-            && e["errorCode"] == "vendor_checksum_unrecoverable"),
-        "the degradation note rides the envelope: {v}"
-    );
-    let state = read_state(tmp.path());
-    assert!(
-        !state["entries"][GEM_PURL]["wiring"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .is_empty(),
-        "the backfilled wiring is persisted: {state}"
-    );
-}
-
-/// Pass-1 backfill reconstruction FAILURE (Gemfile deleted while the
-/// artifact stays healthy): the gap rides the run-level `warnings[]` as
-/// `vendor_wiring_unknown` naming the purl — never a skipped event — the
-/// run stays exit 0, and the wiring stays empty.
-#[tokio::test]
-async fn repair_backfill_failure_warns_wiring_unknown() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    let mut state = read_state(tmp.path());
-    state["entries"][GEM_PURL]["wiring"] = serde_json::json!([]);
-    write_state(tmp.path(), &state);
-    std::fs::remove_file(tmp.path().join("Gemfile")).unwrap();
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        warnings_of(&v)
-            .iter()
-            .any(|w| w["code"] == "vendor_wiring_unknown"
-                && w["detail"].as_str().unwrap_or("").contains(GEM_PURL)
-                && w["detail"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("cannot be reconstructed")),
-        "the backfill failure rides run-level warnings[]: {v}"
-    );
-    assert!(
-        !events_of(&v)
-            .iter()
-            .any(|e| e["errorCode"] == "vendor_wiring_unknown"),
-        "no skipped event for the run-level advisory: {v}"
-    );
-    let state = read_state(tmp.path());
-    assert_eq!(
-        state["entries"][GEM_PURL]["wiring"]
-            .as_array()
-            .map(Vec::len),
-        Some(0),
-        "an unreconstructable wiring stays empty: {state}"
-    );
-}
-
-/// The pass-2 twin: a NO-LEDGER gem reconstruction whose Gemfile is gone
-/// maps the reconstruction error to WiringReconstruction::Unknown — the
-/// run-level warning says the entry "was reconstructed without pre-vendor
-/// wiring originals", the re-synthesized entry persists with empty wiring,
-/// and when the soft rebuild's dispatch then REFUSES (`gemfile_missing`)
-/// the healthy set-aside artifact bytes are restored, not destroyed.
-#[tokio::test]
-async fn repair_reconstruction_without_gemfile_warns_wiring_unknown() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_file(tmp.path().join("Gemfile")).unwrap();
-
-    mount_blob(&mock).await;
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--download-mode", "file"],
-    );
-    let v = parse_env(&stdout);
-    assert!(
-        warnings_of(&v)
-            .iter()
-            .any(|w| w["code"] == "vendor_wiring_unknown"
-                && w["detail"].as_str().unwrap_or("").contains(GEM_PURL)
-                && w["detail"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("was reconstructed without pre-vendor wiring originals")),
-        "the pass-2 reconstruction gap rides run-level warnings[]: {v}"
-    );
-    // The soft rebuild's gem dispatch REFUSES without a Gemfile
-    // (`gemfile_missing`), staying loud — and the refused dispatch replaced
-    // nothing, so the healthy set-aside artifact is restored below.
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == GEM_PURL
-            && e["errorCode"] == "gemfile_missing"),
-        "envelope={v}"
-    );
-    let state = read_state(tmp.path());
-    assert_eq!(
-        state["entries"][GEM_PURL]["wiring"]
-            .as_array()
-            .map(Vec::len),
-        Some(0),
-        "no guessed wiring on the re-synthesized entry: {state}"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
-        AFTER,
-        "the healthy artifact bytes survive the reconstruction"
-    );
-}
-
 // ────────────── pristine ladder: ledger-recovered registry rung ──────────────
 
 /// The PristineFetch::Fetched rung under repair: artifact AND node_modules
@@ -1272,56 +949,6 @@ async fn repair_fails_when_ledger_recovered_fetch_fails() {
         "envelope={v}"
     );
     assert!(!tgz.exists(), "a failed fetch must not invent an artifact");
-}
-
-/// The UNVERIFIED-registry reconstruction rung when the conventional fetch
-/// fails: `fetch_npm_unverified`'s error maps to `vendor_fetch_failed`, the
-/// candidate goes unrebuildable, and the rewired lock stays byte-identical.
-#[tokio::test]
-async fn repair_reconstruction_unverified_fetch_failure() {
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock).await;
-    Mock::given(method("GET"))
-        .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&mock)
-        .await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    let tgz = vendor_project(tmp.path(), &mock.uri());
-    let lock_bytes = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
-
-    // Fresh-clone hole: vendor tree gone AND nothing installed — only the
-    // rewired lock (whose recorded integrity is the trust anchor) is left.
-    std::fs::remove_dir_all(tmp.path().join(".socket/vendor")).unwrap();
-    std::fs::remove_dir_all(tmp.path().join("node_modules")).unwrap();
-
-    mount_blob(&mock).await;
-    let (code, stdout, stderr) = run_cli_with(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--download-mode", "file"],
-        true,
-        &[("SOCKET_NPM_REGISTRY", &mock.uri())],
-    );
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == PURL
-            && e["errorCode"] == "vendor_fetch_failed"),
-        "envelope={v}"
-    );
-    assert!(!tgz.exists(), "nothing rebuilt from the failed fetch");
-    assert_eq!(
-        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
-        lock_bytes,
-        "the trust-anchor lock is untouched"
-    );
 }
 
 // ─────────────────── rebuild-loop failure arms ───────────────────
@@ -1415,146 +1042,6 @@ async fn human_repair_rebuild_failure_does_not_claim_complete() {
         stderr.lines().last(),
         Some("Repair finished with errors."),
         "stderr={stderr}"
-    );
-}
-
-// ─────────────────── soft-restore fallbacks ───────────────────
-
-/// Staging itself is Unavailable (offline, one candidate's patch content
-/// has no local source): the SOFT candidate is restored fingerprint-less
-/// and counted rebuilt, while the non-soft sibling fails — one run, both
-/// arms. The gem's content IS harvestable from its healthy artifact, but
-/// staging is all-or-nothing across the candidate set, exactly the shape
-/// this fallback exists for. Legacy manifest-mode fixture: offline, the
-/// manifest is the only record source once the ledger is gone.
-#[tokio::test]
-async fn repair_soft_restore_when_staging_unavailable() {
-    const AFTER_GEM: &[u8] = b"gem after\n";
-    let mock = MockServer::start().await;
-    mount_batch(&mock, true, true).await;
-    mount_npm_routes(&mock).await;
-    mount_gem_routes(&mock, AFTER_GEM).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    write_gem_fixture(tmp.path(), false);
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["scan", "--vendor", "--yes"]);
-    assert_eq!(code, 0, "combined vendor setup failed: {stdout} {stderr}");
-    let tgz = tmp
-        .path()
-        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
-    assert!(tgz.is_file(), "setup must vendor the npm tarball");
-    let copy = tmp.path().join(gem_copy_rel());
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).expect("vendored gem lib"),
-        AFTER_GEM,
-        "setup must vendor the patched gem copy"
-    );
-
-    // Legacy manifest-mode project with its ledger gone; npm artifact
-    // broken (non-soft), gem artifact healthy (soft). Offline: the npm
-    // after-blob has no local source, so the in-memory staging is
-    // Unavailable for the whole candidate set.
-    to_legacy_manifest_mode(tmp.path());
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_file(&tgz).unwrap();
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    // The soft gem candidate: fingerprint-less restore, counted rebuilt.
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "rebuilt"
-            && e["purl"] == GEM_PURL
-            && e["details"]["ledgerRestored"] == true
-            && e["details"]["artifactRebuilt"] == false),
-        "envelope={v}"
-    );
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
-            && e["purl"] == GEM_PURL
-            && e["errorCode"] == "vendor_inventory_unverified"
-            && e["reason"]
-                .as_str()
-                .unwrap_or("")
-                .contains("no local source to rebuild from")),
-        "the fingerprint gap is surfaced: {v}"
-    );
-    // The non-soft npm candidate stays a loud failure.
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == PURL
-            && e["error"].as_str().unwrap_or("").contains("--offline")),
-        "envelope={v}"
-    );
-    let state = read_state(tmp.path());
-    assert!(
-        state["entries"][GEM_PURL]["artifact"]["fileInventory"].is_null(),
-        "no fingerprint was invented for the soft restore: {state}"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
-        AFTER_GEM,
-        "the soft-restored artifact bytes are untouched"
-    );
-}
-
-/// `--offline` + soft candidate + package NOT installed: staging succeeds
-/// (the healthy artifact's own blobs are harvested), but the pristine
-/// ladder cannot fetch — the entry is soft-restored fingerprint-less with
-/// the offline cause named. Legacy manifest-mode fixture (the manifest is
-/// the offline record source once the ledger is gone).
-#[tokio::test]
-async fn repair_offline_soft_restore_without_installed_copy() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    to_legacy_manifest_mode(tmp.path());
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_dir_all(tmp.path().join("vendor/bundle")).unwrap();
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "rebuilt"
-            && e["purl"] == GEM_PURL
-            && e["details"]["ledgerRestored"] == true
-            && e["details"]["artifactRebuilt"] == false),
-        "envelope={v}"
-    );
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
-            && e["purl"] == GEM_PURL
-            && e["errorCode"] == "vendor_inventory_unverified"
-            && e["reason"]
-                .as_str()
-                .unwrap_or("")
-                .contains("--offline prevents fetching")),
-        "the offline cause is named: {v}"
-    );
-    let state = read_state(tmp.path());
-    assert!(
-        state["entries"][GEM_PURL]["artifact"]["fileInventory"].is_null(),
-        "the live tree must not be fingerprinted in: {state}"
-    );
-    assert!(
-        !state["entries"][GEM_PURL]["wiring"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .is_empty(),
-        "the reconstructed wiring is persisted: {state}"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
-        AFTER,
-        "the artifact bytes are untouched"
     );
 }
 
@@ -1688,11 +1175,9 @@ async fn repair_restores_crashed_set_aside_leftover_before_classifying() {
 
 // ─────────────── precise unrepairable detail selection ───────────────
 
-/// A non-soft pass-1 gem candidate with a precise Unverifiable cause
-/// (artifact gone, installed copy gone, no CHECKSUMS sha recorded): the
-/// recover-error detail is surfaced VERBATIM in
-/// `vendor_artifact_unrepairable` — not the blanket "no verifiable pristine
-/// source" text, which falsely implies the ledger recorded nothing.
+/// A gem candidate with no pristine source (artifact gone, installed copy
+/// gone, no CHECKSUMS sha recorded to verify a registry fetch against):
+/// `vendor_artifact_unrepairable` naming the missing source.
 #[tokio::test]
 async fn repair_gem_unverifiable_reason_is_surfaced() {
     let mock = MockServer::start().await;
@@ -1717,24 +1202,21 @@ async fn repair_gem_unverifiable_reason_is_surfaced() {
     );
     let detail = failed["error"].as_str().unwrap_or("");
     assert!(
-        detail.contains("the ledger cannot recover")
-            && detail.contains("no pre-vendor Gemfile.lock checksum recorded"),
-        "the precise recover-error must be surfaced verbatim: {failed}"
+        detail.contains("no installed package found on disk"),
+        "the missing source is named: {failed}"
     );
-    assert!(
-        !detail.contains("no verifiable pristine source"),
-        "the blanket text must not mask the precise cause: {failed}"
-    );
+    assert!(!copy.exists(), "no artifact is invented without a source");
 }
 
 // ─────────────── backend warning forwarding during rebuilds ───────────────
 
-/// Non-`vendor_artifact_rebuilt` backend warnings surface during a repair
-/// rebuild: a drifted installed copy is force-applied and its
-/// `vendor_content_mismatch_overwritten` advisory rides the envelope next
-/// to the rebuilt event.
+/// A drifted installed copy of a release-variant ecosystem (gem): repair
+/// re-vendors through the same engine as `vendor`, whose installed-variant
+/// probe does not accept a copy matching neither the before nor the after
+/// hash — so the rebuild fails loudly (no artifact invented), exactly like
+/// a `vendor` re-run over the same tree.
 #[tokio::test]
-async fn repair_forwards_backend_content_mismatch_warning() {
+async fn repair_refuses_a_drifted_variant_install() {
     let mock = MockServer::start().await;
     mount_gem_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1752,25 +1234,15 @@ async fn repair_forwards_backend_content_mismatch_warning() {
     .unwrap();
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
+        events_of(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == GEM_PURL
-            && e["errorCode"] == "vendor_content_mismatch_overwritten"),
-        "the backend advisory is forwarded: {v}"
-    );
-    assert!(
-        events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "rebuilt" && e["purl"] == GEM_PURL),
+            && e["errorCode"] == "vendor_artifact_unrepairable"),
         "envelope={v}"
     );
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
-        AFTER,
-        "the rebuild force-applied the patched content"
-    );
+    assert!(!copy.exists(), "no artifact is invented from a drifted copy");
 }
 
 // ─────────────────────── --ecosystems scoping ───────────────────────
@@ -1861,29 +1333,6 @@ async fn repair_human_output_lines() {
     );
 }
 
-/// The human-mode `vendor_wiring_unknown` warning line (the run-level
-/// advisory's stderr twin).
-#[tokio::test]
-async fn repair_human_warns_wiring_unknown() {
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    let mut state = read_state(tmp.path());
-    state["entries"][GEM_PURL]["wiring"] = serde_json::json!([]);
-    write_state(tmp.path(), &state);
-    std::fs::remove_file(tmp.path().join("Gemfile")).unwrap();
-
-    let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    assert!(
-        stderr.contains("Warning (vendor_wiring_unknown):"),
-        "the run-level advisory is printed to stderr: {stderr}"
-    );
-}
-
 // ────────────── unrepairable-detail selection: remaining arms ──────────────
 
 /// A broken PLATFORM-LOCKED artifact with no pristine source anywhere (not
@@ -1939,9 +1388,8 @@ async fn repair_platform_locked_detail_when_no_pristine_source() {
 }
 
 /// A tampered `base_purl` (version lost) inside a ledger entry whose lock
-/// still records the wired trust anchor: the unverified-registry rung must
-/// fail CLOSED on the unparsable coordinates (never fetch garbage), falling
-/// through to the precise ledger-recovery error instead.
+/// still records the wired trust anchor, with nothing installed: repair
+/// fails CLOSED (never fetches garbage) and invents no artifact.
 #[tokio::test]
 async fn repair_tampered_base_purl_surfaces_precise_unverifiable_detail() {
     let mock = MockServer::start().await;
@@ -1976,106 +1424,12 @@ async fn repair_tampered_base_purl_surfaces_precise_unverifiable_detail() {
         failed["error"]
             .as_str()
             .unwrap_or("")
-            .contains("the ledger cannot recover one"),
-        "the precise recovery error must surface: {failed}"
+            .contains("no installed package found on disk"),
+        "the missing source is named: {failed}"
     );
     assert!(
         !tgz.exists(),
         "unparsable coordinates must never drive a registry fetch"
-    );
-}
-
-// ────────────── soft reconstruction + pristine fetch FAILURE ──────────────
-
-/// A SOFT reconstruction (healthy-by-members, no lock integrity anchors the
-/// vendored tarball) whose pristine registry fetch then FAILS (500): the
-/// entry stays restored fingerprint-less with the fetch failure named —
-/// never a hard failure, never a live-tree fingerprint. The lock shape: the
-/// registry resolution survived for left-pad while a second spec references
-/// the vendored tarball WITHOUT integrity (a hand-migrated lock), so the
-/// reference is found but nothing anchors the artifact bytes.
-#[tokio::test]
-async fn repair_soft_restore_when_pristine_fetch_fails() {
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock).await;
-    Mock::given(method("GET"))
-        .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&mock)
-        .await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    let tgz = vendor_project(tmp.path(), &mock.uri());
-    let tgz_bytes = std::fs::read(&tgz).unwrap();
-
-    // Ledger gone, package not installed; the hand-shaped lock keeps the
-    // fetchable registry resolution AND an unanchored vendored reference.
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_dir_all(tmp.path().join("node_modules")).unwrap();
-    let lock = serde_json::json!({
-        "name": "covgap-repair-vendor",
-        "version": "0.0.0",
-        "lockfileVersion": 3,
-        "requires": true,
-        "packages": {
-            "": {
-                "name": "covgap-repair-vendor",
-                "version": "0.0.0",
-                "dependencies": { "left-pad": "^1.3.0" }
-            },
-            "node_modules/left-pad": {
-                "version": "1.3.0",
-                "resolved": format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri()),
-                "integrity": sri_of(&pristine_tgz())
-            },
-            "node_modules/left-pad-vendored": {
-                "version": "1.3.0",
-                "resolved": format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
-            }
-        }
-    });
-    std::fs::write(
-        tmp.path().join("package-lock.json"),
-        serde_json::to_vec_pretty(&lock).unwrap(),
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "rebuilt"
-            && e["purl"] == PURL
-            && e["details"]["ledgerRestored"] == true
-            && e["details"]["artifactRebuilt"] == false),
-        "the soft candidate is restored, not failed: {v}"
-    );
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
-            && e["purl"] == PURL
-            && e["errorCode"] == "vendor_inventory_unverified"
-            && e["reason"]
-                .as_str()
-                .unwrap_or("")
-                .contains("the pristine fetch failed")),
-        "the fetch failure is named in the fingerprint-gap advisory: {v}"
-    );
-    let state = read_state(tmp.path());
-    assert!(
-        state["entries"][PURL]["artifact"]["sha256"]
-            .as_str()
-            .unwrap_or("")
-            .is_empty(),
-        "the live tarball must never be fingerprinted in: {state}"
-    );
-    assert_eq!(
-        std::fs::read(&tgz).unwrap(),
-        tgz_bytes,
-        "the healthy artifact bytes are untouched"
     );
 }
 
@@ -2134,8 +1488,8 @@ async fn repair_recovers_multiple_records_by_uuid_sharing_one_client() {
 /// A (tampered/hand-migrated) ledger entry keyed by a purl whose ecosystem
 /// has NO vendor backend (`pkg:jsr/…`), its artifact corrupt and its
 /// package "installed" (JSR cache staged via `DENO_DIR`): the dispatch
-/// returns no backend, repair fails with `vendor_artifact_unrepairable`
-/// naming the missing backend — and the set-aside corrupt bytes are put
+/// has no backend, repair fails with `vendor_artifact_unrepairable`
+/// naming the unsupported ecosystem — and the set-aside corrupt bytes are put
 /// BACK (the failed dispatch replaced nothing; forensic evidence survives).
 #[tokio::test]
 async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
@@ -2216,7 +1570,7 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
             && e["error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("no vendor backend for this ecosystem")),
+                .contains("vendoring is not supported for this ecosystem")),
         "envelope={v}"
     );
     assert_eq!(
@@ -2251,7 +1605,7 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
             && e["error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("no vendor backend for this ecosystem")),
+                .contains("vendoring is not supported for this ecosystem")),
         "envelope={v}"
     );
     assert!(
@@ -2261,66 +1615,6 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
                 .join(format!(".socket/vendor/npm/{JSR_UUID}.pre-rebuild"))
                 .exists(),
         "a missing artifact stays missing: nothing is invented or set aside"
-    );
-}
-
-// ────────── must-verify rebuild at a renamed lock reference ──────────
-
-/// The lock's vendored reference was hand-RENAMED (leaf drift) and the
-/// ledger is gone: the reconstruction records the renamed path, the rebuild
-/// dispatch rebuilds/wires the CANONICAL leaf, and the trust-anchor verify
-/// then cannot read the artifact at the reconstructed path — fail closed:
-/// uuid dir removed ("nothing was kept") and the snapshotted trust-anchor
-/// lock restored byte-for-byte (the backend's re-wire must not survive).
-#[tokio::test]
-async fn repair_reconstruction_renamed_leaf_fails_closed_and_restores_lock() {
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    vendor_project(tmp.path(), &mock.uri());
-
-    // Rename the leaf inside the rewired lock, then lose the whole vendor
-    // tree (ledger + artifact) — the fresh-clone hole plus leaf drift.
-    let lock_path = tmp.path().join("package-lock.json");
-    let renamed = std::fs::read_to_string(&lock_path)
-        .unwrap()
-        .replace("left-pad-1.3.0.tgz", "custom-left-pad.tgz");
-    std::fs::write(&lock_path, &renamed).unwrap();
-    std::fs::remove_dir_all(tmp.path().join(".socket/vendor")).unwrap();
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    let failed = events_of(&v)
-        .into_iter()
-        .find(|e| {
-            e["action"] == "failed"
-                && e["purl"] == PURL
-                && e["errorCode"] == "vendor_artifact_rebuild_failed"
-        })
-        .unwrap_or_else(|| panic!("expected a rebuild failure: {v}"));
-    assert!(
-        failed["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("cannot read the rebuilt artifact"),
-        "the unreadable reconstructed path is the named cause: {failed}"
-    );
-    assert!(
-        !tmp.path()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists(),
-        "nothing is kept from the rejected rebuild"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&lock_path).unwrap(),
-        renamed,
-        "the trust-anchor lock is restored byte-for-byte from the snapshot"
     );
 }
 
@@ -2413,264 +1707,6 @@ fn writable_vendor_dir(root: &Path) {
 
 // ────────────── ledger-write failures stay loud, everywhere ──────────────
 
-/// Pass-1 gem wiring BACKFILL whose ledger write fails: the
-/// `vendor_state_write_failed` failure is the outcome — no `wiringRestored`
-/// rebuilt event may claim the backfill happened.
-#[cfg(unix)]
-#[tokio::test]
-async fn repair_backfill_persist_failure_stays_loud() {
-    if is_root() {
-        eprintln!("skipped: read-only-dir contraption is inert as root");
-        return;
-    }
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    let mut state = read_state(tmp.path());
-    state["entries"][GEM_PURL]["wiring"] = serde_json::json!([]);
-    write_state(tmp.path(), &state);
-    readonly_vendor_dir(tmp.path());
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    writable_vendor_dir(tmp.path());
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == GEM_PURL
-            && e["errorCode"] == "vendor_state_write_failed"),
-        "envelope={v}"
-    );
-    assert!(
-        !events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "rebuilt" && e["details"]["wiringRestored"] == true),
-        "an unpersisted backfill must not claim wiringRestored: {v}"
-    );
-    let state = read_state(tmp.path());
-    assert_eq!(
-        state["entries"][GEM_PURL]["wiring"]
-            .as_array()
-            .map(Vec::len),
-        Some(0),
-        "the committed ledger still has the empty wiring: {state}"
-    );
-}
-
-/// Pass-2 ANCHORED ledger restore whose state write fails: the failure is
-/// surfaced per purl, no `ledgerRestored` event is emitted, and the intact
-/// artifact is untouched.
-#[cfg(unix)]
-#[tokio::test]
-async fn repair_anchored_restore_persist_failure_stays_loud() {
-    if is_root() {
-        eprintln!("skipped: read-only-dir contraption is inert as root");
-        return;
-    }
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    let tgz = vendor_project(tmp.path(), &mock.uri());
-    let tgz_bytes = std::fs::read(&tgz).unwrap();
-
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    readonly_vendor_dir(tmp.path());
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    writable_vendor_dir(tmp.path());
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == PURL
-            && e["errorCode"] == "vendor_state_write_failed"),
-        "envelope={v}"
-    );
-    assert!(
-        !events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
-        "an unpersisted anchored restore must not claim ledgerRestored: {v}"
-    );
-    assert!(
-        !tmp.path().join(".socket/vendor/state.json").exists(),
-        "no ledger could be written"
-    );
-    assert_eq!(
-        std::fs::read(&tgz).unwrap(),
-        tgz_bytes,
-        "the anchored artifact is untouched"
-    );
-}
-
-/// The SOFT-reconstruction early persist fails: the candidate goes
-/// unrebuildable up front, so the later ladder must not double-report it —
-/// staging proceeds (harvest from the healthy artifact) but the pristine
-/// loop and rebuild loop both skip the purl: exactly one failed event, no
-/// soft-restore advisory, no rebuilt event.
-#[cfg(unix)]
-#[tokio::test]
-async fn repair_soft_persist_failure_skips_downstream_ladder() {
-    if is_root() {
-        eprintln!("skipped: read-only-dir contraption is inert as root");
-        return;
-    }
-    let mock = MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_gem_fixture(tmp.path(), false);
-    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
-
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    readonly_vendor_dir(tmp.path());
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    writable_vendor_dir(tmp.path());
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    let failed: Vec<serde_json::Value> = events_of(&v)
-        .into_iter()
-        .filter(|e| e["action"] == "failed" && e["purl"] == GEM_PURL)
-        .collect();
-    assert_eq!(
-        failed.len(),
-        1,
-        "exactly one failure for the unpersistable soft candidate: {v}"
-    );
-    assert_eq!(failed[0]["errorCode"], "vendor_state_write_failed", "{v}");
-    assert!(
-        !events_of(&v).iter().any(|e| e["purl"] == GEM_PURL
-            && (e["action"] == "rebuilt" || e["errorCode"] == "vendor_inventory_unverified")),
-        "no restore is claimed and no fingerprint advisory rides a dead restore: {v}"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
-        AFTER,
-        "the healthy artifact bytes are untouched"
-    );
-}
-
-/// The Unavailable-staging fallback must ALSO skip a purl the early soft
-/// persist already failed: one combined run — the gem soft candidate's
-/// state write fails, the npm blob has no offline source — yields the state
-/// failure for the gem (no soft-restore advisory) and the offline failure
-/// for the npm candidate. Legacy manifest-mode fixture (the manifest is the
-/// offline record source once the ledger is gone).
-#[cfg(unix)]
-#[tokio::test]
-async fn repair_unavailable_staging_skips_unpersistable_soft_candidate() {
-    if is_root() {
-        eprintln!("skipped: read-only-dir contraption is inert as root");
-        return;
-    }
-    const AFTER_GEM: &[u8] = b"gem after\n";
-    let mock = MockServer::start().await;
-    mount_batch(&mock, true, true).await;
-    mount_npm_routes(&mock).await;
-    mount_gem_routes(&mock, AFTER_GEM).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    write_gem_fixture(tmp.path(), false);
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["scan", "--vendor", "--yes"]);
-    assert_eq!(code, 0, "combined vendor setup failed: {stdout} {stderr}");
-    let tgz = tmp
-        .path()
-        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
-
-    to_legacy_manifest_mode(tmp.path());
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_file(&tgz).unwrap();
-    readonly_vendor_dir(tmp.path());
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
-    writable_vendor_dir(tmp.path());
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == GEM_PURL
-            && e["errorCode"] == "vendor_state_write_failed"),
-        "envelope={v}"
-    );
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == PURL
-            && e["error"].as_str().unwrap_or("").contains("--offline")),
-        "the non-soft candidate still fails on the missing source: {v}"
-    );
-    assert!(
-        !events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "rebuilt" || e["errorCode"] == "vendor_inventory_unverified"),
-        "no restore is claimed for the unpersistable candidate: {v}"
-    );
-}
-
-/// A SUCCESSFUL rebuild of a RECONSTRUCTED entry whose ledger write then
-/// fails: the artifact is legitimately rebuilt on disk (and trust-anchor
-/// verified), but the run reports the state failure and never claims
-/// `rebuilt` (the post-verify is skipped — an unpersisted entry must not be
-/// attested). A plain pass-1 rebuild never persists (nothing about the
-/// entry changed), so the persist-after-rebuild step is only reachable via
-/// a reconstruction (or a backend-returned entry).
-#[cfg(unix)]
-#[tokio::test]
-async fn repair_rebuild_persist_failure_stays_loud() {
-    if is_root() {
-        eprintln!("skipped: read-only-dir contraption is inert as root");
-        return;
-    }
-    let mock = MockServer::start().await;
-    mount_patch_api(&mock).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(
-        tmp.path(),
-        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-        "sha512-orig==",
-    );
-    let tgz = vendor_project(tmp.path(), &mock.uri());
-
-    // Ledger gone + artifact gone, installed copy kept: pass 2 reconstructs
-    // the entry, the rebuild dispatch succeeds from the installed copy, and
-    // ONLY the ledger write fails (the eco subdir stays writable).
-    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_file(&tgz).unwrap();
-    readonly_vendor_dir(tmp.path());
-
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    writable_vendor_dir(tmp.path());
-    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["purl"] == PURL
-            && e["errorCode"] == "vendor_state_write_failed"),
-        "envelope={v}"
-    );
-    assert!(
-        !events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
-        "an unpersisted rebuild must not be claimed: {v}"
-    );
-    assert!(
-        tgz.is_file(),
-        "the rebuild itself succeeded before the ledger write failed"
-    );
-}
-
 /// The INVENTORY-REFRESH persist failing: the refreshed entry cannot be
 /// recorded, so the run surfaces `vendor_state_write_failed` next to the
 /// `vendor_inventory_refreshed` advisory and never claims `rebuilt`.
@@ -2730,29 +1766,3 @@ async fn repair_inventory_refresh_persist_failure_stays_loud() {
 mod vlt_hosted_common;
 #[path = "vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
-
-/// A lost ledger over a vlt dir artifact, offline and with nothing
-/// installed: no lock integrity anchors a dir, so the entry is restored
-/// fingerprint-less with `vendor_inventory_unverified` (never the live
-/// tree fingerprinted), stamped `flavor: "vlt"`, the artifact kept.
-#[test]
-fn repair_offline_restores_a_vlt_entry_without_a_fingerprint() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    vlt_vendored::vendored_project(root, true);
-    std::fs::remove_file(root.join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
-    let cwd = root.to_str().unwrap().to_string();
-    let (code, env, stderr) =
-        vlt_hosted_common::run_json(root, &["repair", "--offline", "--cwd", &cwd], &[]);
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
-    assert!(
-        env.to_string().contains("vendor_inventory_unverified"),
-        "{env:#}"
-    );
-    let entry = vlt_vendored::state(root)["entries"][vlt_hosted_common::PURL].clone();
-    assert_eq!(entry["flavor"], "vlt", "{entry:#}");
-    assert_eq!(entry["artifact"]["path"], vlt_vendored::rel(), "{entry:#}");
-    assert!(entry["artifact"]["fileInventory"].is_null(), "{entry:#}");
-    assert!(root.join(vlt_vendored::rel()).join("index.js").is_file());
-}
