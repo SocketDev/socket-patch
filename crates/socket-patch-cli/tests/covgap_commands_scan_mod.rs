@@ -1062,29 +1062,7 @@ async fn scan_human_apply_over_live_hosted_wiring_warns_retained() {
     )
     .unwrap();
 
-    // The redirect ledger recording that hosted redirect.
-    use socket_patch_core::manifest::schema::PatchRecord;
-    use socket_patch_core::patch::redirect::RedirectState;
-    let mut state = RedirectState::new();
-    state.records.insert(
-        purl.to_string(),
-        PatchRecord {
-            uuid: UUID.to_string(),
-            exported_at: "2024-01-01T00:00:00Z".to_string(),
-            files: std::collections::HashMap::new(),
-            vulnerabilities: std::collections::HashMap::new(),
-            description: String::new(),
-            license: "MIT".to_string(),
-            tier: "free".to_string(),
-        },
-    );
-    let vendor_dir = tmp.path().join(".socket/vendor");
-    std::fs::create_dir_all(&vendor_dir).unwrap();
-    std::fs::write(
-        vendor_dir.join("redirect-state.json"),
-        serde_json::to_string_pretty(&state).unwrap(),
-    )
-    .unwrap();
+    // v5: the lock pin above is the whole hosted state (no ledger).
 
     let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
@@ -1447,31 +1425,38 @@ fn reference_posts(reqs: &[wiremock::Request]) -> usize {
         .count()
 }
 
-/// Seed a redirect ledger recording `uuid` for `purl` (hosted mode's only
-/// patch store), so update detection has an "old" side to compare. Written
-/// through the real ledger type so the hosted engine's strict loader
-/// accepts it.
-fn seed_redirect_ledger(root: &Path, purl: &str, uuid: &str) {
-    use socket_patch_core::manifest::schema::PatchRecord;
-    use socket_patch_core::patch::redirect::RedirectState;
-    let mut state = RedirectState::new();
-    state.records.insert(
-        purl.to_string(),
-        PatchRecord {
-            uuid: uuid.to_string(),
-            exported_at: "2024-01-01T00:00:00Z".to_string(),
-            files: std::collections::HashMap::new(),
-            vulnerabilities: std::collections::HashMap::new(),
-            description: "seed".to_string(),
-            license: "MIT".to_string(),
-            tier: "free".to_string(),
-        },
-    );
-    let vendor_dir = root.join(".socket/vendor");
-    std::fs::create_dir_all(&vendor_dir).unwrap();
+/// Seed a hosted pin for the npm `purl` in `package-lock.json` — the
+/// lockfile resolving it to the Socket patch server under `uuid`. v5 hosted
+/// mode keeps its state only in lockfile pins, so this is update
+/// detection's "old" side.
+fn seed_hosted_pin(root: &Path, purl: &str, uuid: &str) {
+    let (name, version) = purl
+        .strip_prefix("pkg:npm/")
+        .and_then(|rest| rest.rsplit_once('@'))
+        .expect("an npm purl");
+    let lock = serde_json::json!({
+        "name": "covgap-scan-root",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "covgap-scan-root",
+                "version": "0.0.0",
+                "dependencies": { name: version }
+            },
+            format!("node_modules/{name}"): {
+                "version": version,
+                "resolved": format!(
+                    "https://patch.socket.dev/patch/npm/{name}/{version}/tok/{uuid}/{name}-{version}.tgz"
+                ),
+                "integrity": "sha512-orig==",
+            }
+        }
+    });
     std::fs::write(
-        vendor_dir.join("redirect-state.json"),
-        serde_json::to_string_pretty(&state).unwrap(),
+        root.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock).unwrap(),
     )
     .unwrap();
 }
@@ -1516,9 +1501,9 @@ async fn scan_hosted_human_prints_table_updates_and_redirects() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
-    // The ledger records an OLDER patch: the shared update detection must
+    // The lock pins an OLDER hosted patch: the shared update detection must
     // flag the newer offer in hosted mode too.
-    seed_redirect_ledger(tmp.path(), purl, OLD_UUID);
+    seed_hosted_pin(tmp.path(), purl, OLD_UUID);
 
     // v5: a bare scan is hosted.
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
@@ -2446,18 +2431,17 @@ async fn scan_prune_keeps_a_wired_vlt_uuid_and_sweeps_an_unwired_one() {
     );
 }
 
-/// The degraded-ledger overlap through the CLI: a redirect ledger holding
-/// only a vlt node edit (no records) keyed at a peer variant of the
-/// vendored package's DepID is superseded by the vendored wiring (warned
-/// and reconciled), at the `~` boundary only.
+/// A pre-v5 redirect ledger holding only a vlt node edit keyed at a peer
+/// variant of the vendored package's DepID is IGNORED by a vendored scan:
+/// v5 has no `vendor_supersedes_redirect` reconciliation (once the lock
+/// routes a package to `.socket/vendor/`, no hosted state is left), so no
+/// warning fires at either side of the `~` boundary and the legacy file is
+/// left byte-identical.
 #[tokio::test]
-async fn scan_vendored_warns_on_a_degraded_vlt_edit_at_the_tilde_boundary() {
+async fn scan_vendored_ignores_a_degraded_pre_v5_vlt_ledger_edit() {
     use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
     use vlt_hosted_common as hosted;
-    for (key, overlaps) in [
-        ("left-pad@1.3.0~peer.2", true),
-        ("left-pad@1.3.00~peer.2", false),
-    ] {
+    for key in ["left-pad@1.3.0~peer.2", "left-pad@1.3.00~peer.2"] {
         let server = MockServer::start().await;
         hosted::mock_all(&server).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -2472,14 +2456,11 @@ async fn scan_vendored_warns_on_a_degraded_vlt_edit_at_the_tilde_boundary() {
             original: None,
             new: None,
         }];
-        std::fs::write(
-            hosted::ledger_path(root),
-            serde_json::to_string_pretty(&ledger).unwrap(),
-        )
-        .unwrap();
+        let bytes = serde_json::to_string_pretty(&ledger).unwrap();
+        std::fs::write(hosted::ledger_path(root), &bytes).unwrap();
         let cwd = root.to_str().unwrap().to_string();
         let uri = server.uri();
-        let (_, env, stderr) = hosted::run_json(
+        let (code, env, stderr) = hosted::run_json(
             root,
             &[
                 "scan",
@@ -2497,22 +2478,16 @@ async fn scan_vendored_warns_on_a_degraded_vlt_edit_at_the_tilde_boundary() {
             ],
             &[],
         );
+        assert_eq!(code, 0, "{key}: {env:#}\n{stderr}");
         let text = env.to_string();
-        let warned = text.contains("vendor_supersedes_redirect");
-        assert_eq!(warned, overlaps, "{key}: {env:#}\n{stderr}");
-        let edits = std::fs::read(hosted::ledger_path(root))
-            .ok()
-            .map(|b| {
-                serde_json::from_slice::<RedirectState>(&b)
-                    .unwrap()
-                    .edits
-                    .len()
-            })
-            .unwrap_or(0);
+        assert!(
+            !text.contains("vendor_supersedes_redirect"),
+            "{key}: the v5 vendored scan never reconciles a hosted ledger: {env:#}"
+        );
         assert_eq!(
-            edits,
-            usize::from(!overlaps),
-            "{key}: the reconciliation drops exactly the claimed edit: {env:#}"
+            std::fs::read_to_string(hosted::ledger_path(root)).unwrap(),
+            bytes,
+            "{key}: the pre-v5 ledger is left byte-identical: {env:#}"
         );
     }
 }

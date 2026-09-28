@@ -20,6 +20,14 @@ vlt project, and the caveats users meet, are in
 | E | 1.0.8 … 1.1.1 | `1` | as C, `peer.<16 hex>` | the registry URL |
 | F | 1.2.0 | `1` | as E; the global store (`store-linker`) | the registry URL |
 
+On every release that writes slot [3], it is omitted when the project
+configures `registry` and the node's tarball URL starts with it (vlt's
+`lockfile/save.ts`; the lock then records `options.registry`): with
+`config.registry` and `registries.npm` both set to the default registry,
+1.0.0-rc.33, 1.0.4, 1.0.10 and 1.2.0 all write a byte-identical 3-tuple lock
+(fixture `capture-1.2.0-config-registry`). The upstream restore follows the
+same rule.
+
 Hosted mode writes the patched sha512 into slot [2] and the hosted URL into
 slot [3] of every default-registry node (appending slot [3] to a 3-tuple);
 vendored mode turns the node into a `file` node for the D19 directory

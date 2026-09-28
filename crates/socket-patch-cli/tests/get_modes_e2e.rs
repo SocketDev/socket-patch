@@ -553,10 +553,12 @@ async fn get_hosted_silent_prints_nothing_to_stdout() {
         lock.contains(HOSTED_URL1),
         "silent run must still redirect; lock:\n{lock}"
     );
-    assert!(tmp
-        .path()
-        .join(".socket/vendor/redirect-state.json")
-        .is_file());
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "v5 hosted mode writes no redirect ledger"
+    );
 
     // Loud control: without --silent the human path prints the redirect
     // summary — otherwise the empty-stdout assertion above proves nothing.
@@ -781,12 +783,13 @@ async fn get_vendored_then_hosted_takes_over_cleanly() {
             "the vendored ledger must no longer claim the purl; got:\n{state}"
         );
     }
-    // Hosted ledger present with the record.
-    let ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(ledger["records"][PURL1]["uuid"], UUID1);
+    // v5: the lock pin is the whole hosted state — no redirect ledger.
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "v5 hosted mode writes no redirect ledger"
+    );
     // The takeover is announced, not silent.
     assert!(
         stdout.contains("redirect_takeover_reverted_vendored"),

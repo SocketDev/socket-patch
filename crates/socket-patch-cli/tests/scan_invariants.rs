@@ -1483,9 +1483,11 @@ async fn scan_agent_over_vendored_purl_surfaces_run_level_warning() {
     );
 }
 
-/// Write a hosted redirect ledger + a yarn.lock the ledger claims to have
-/// edited, whose resolved URL still pins the patch server (the live-wiring
-/// proof `redirect_record_live` reads).
+/// Write a yarn.lock whose resolved URL pins the Socket patch server — a
+/// hosted pin, which is the whole v5 hosted state — plus, when
+/// `with_record`, a pre-v5 redirect ledger recording the purl (edits and a
+/// record). v5 scan never reads that ledger, so it must not change any
+/// verdict: the lock pin alone decides.
 fn seed_live_hosted_wiring(root: &Path, purl: &str, uuid: &str, with_record: bool) {
     let hosted_url =
         format!("https://patch.socket.dev/patch/npm/minimist/1.2.2/tok/{uuid}/minimist-1.2.2.tgz");
@@ -1499,6 +1501,9 @@ fn seed_live_hosted_wiring(root: &Path, purl: &str, uuid: &str, with_record: boo
         ),
     )
     .unwrap();
+    if !with_record {
+        return;
+    }
     let vendor_dir = root.join(".socket/vendor");
     std::fs::create_dir_all(&vendor_dir).unwrap();
     let mut state = serde_json::json!({
@@ -1581,9 +1586,13 @@ async fn scan_agent_over_live_hosted_wiring_surfaces_run_level_warning() {
         "must name the migration path: {detail}"
     );
     assert!(
-        detail.contains("Do not delete"),
-        "must warn against hand-deleting the ledger (it holds the only \
-         revert originals): {detail}"
+        detail.contains("socket-patch rollback"),
+        "must name the upstream-restore path (v5 keeps no ledger to \
+         protect): {detail}"
+    );
+    assert!(
+        !detail.contains("ledger"),
+        "v5 hosted state is the lockfile pin, not a ledger: {detail}"
     );
     assert!(
         stderr.contains("Warning: agent-mode scan left the hosted wiring live"),
@@ -1591,13 +1600,11 @@ async fn scan_agent_over_live_hosted_wiring_surfaces_run_level_warning() {
     );
 }
 
-/// Coordination guard (lane B: hosted→vendored pre-revert): once another
-/// flow retires the redirect ledger RECORDS for a purl, the agent-flow
-/// warning must stay silent — it keys on records still live at scan time,
-/// never on leftover `edits` (which are append-only revert data and
-/// legitimately outlive the records).
+/// v5: the agent-flow warning keys on the lockfile's hosted pin alone — a
+/// project with NO redirect ledger at all (what v5 `scan --mode hosted`
+/// leaves behind) whose lock still pins the patch server must warn.
 #[tokio::test]
-async fn scan_agent_hosted_warning_silent_once_ledger_records_are_gone() {
+async fn scan_agent_hosted_warning_keys_on_the_lock_pin_without_a_ledger() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
@@ -1606,14 +1613,14 @@ async fn scan_agent_hosted_warning_silent_once_ledger_records_are_gone() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
-    // Ledger with edits but NO records (the post-pre-revert shape) — and
-    // the lock text still carrying the uuid must not resurrect the warning.
+    // The lock pin only: no `.socket/` at all.
     seed_live_hosted_wiring(
         tmp.path(),
         purl,
         AGENT_WARN_UUID,
         /*with_record=*/ false,
     );
+    assert!(!tmp.path().join(".socket").exists());
 
     let (code, stdout, stderr) = run_scan(
         tmp.path(),
@@ -1622,14 +1629,17 @@ async fn scan_agent_hosted_warning_silent_once_ledger_records_are_gone() {
     );
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let w = find_warning(&v, "hosted_wiring_retained").unwrap_or_else(|| {
+        panic!("a live lock pin ⇒ hosted_wiring_retained, ledger or not; envelope={v}")
+    });
     assert!(
-        find_warning(&v, "hosted_wiring_retained").is_none(),
-        "no ledger records ⇒ no hosted_wiring_retained warning; envelope={v}"
+        w["detail"].as_str().unwrap_or_default().contains(purl),
+        "envelope={v}"
     );
 }
 
-/// Registry-clean lock (hosted wiring NOT live) with a leftover record:
-/// the live lock is the truth source — no warning.
+/// Registry-clean lock (hosted wiring NOT live) with a leftover pre-v5
+/// ledger record: the live lock is the truth source — no warning.
 #[tokio::test]
 async fn scan_agent_hosted_warning_silent_when_lock_is_registry_clean() {
     let mock = MockServer::start().await;
@@ -1717,9 +1727,9 @@ async fn report_only_scan_json_surfaces_hosted_redirect_state() {
          redirectState block; envelope={v}"
     );
     assert_eq!(state["mode"], "hosted", "envelope={v}");
-    assert_eq!(
-        state["ledger"], ".socket/vendor/redirect-state.json",
-        "the block must name the ledger it reports; envelope={v}"
+    assert!(
+        state.get("ledger").is_none() && state.get("ledgerKey").is_none(),
+        "v5: the block is built from lockfile pins and names no ledger; envelope={v}"
     );
     let records = state["records"].as_array().expect("records array");
     assert_eq!(records.len(), 1, "envelope={v}");
@@ -1746,16 +1756,18 @@ async fn report_only_scan_json_surfaces_hosted_redirect_state() {
     );
 }
 
-/// The block keys on ledger RECORDS: an edits-only ledger (the post-takeover
-/// / degraded shape) and a ledger-less project both omit it entirely.
+/// The block keys on the lockfiles' hosted PINS: a ledger-less project
+/// whose lock pins the patch server carries it (v5 hosted mode writes no
+/// ledger), and a project with neither a pin nor a ledger omits it.
 #[tokio::test]
-async fn report_only_scan_json_omits_redirect_state_without_ledger_records() {
+async fn report_only_scan_json_redirect_state_keys_on_lock_pins() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
     mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
 
-    // Edits-only ledger (records retired), live-looking lock text.
+    // Pin only, no ledger. `--prune` with no mode: the read-only discovery
+    // envelope (a bare scan is hosted, whose envelope omits the block).
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
@@ -1765,33 +1777,37 @@ async fn report_only_scan_json_omits_redirect_state_without_ledger_records() {
         AGENT_WARN_UUID,
         /*with_record=*/ false,
     );
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--prune"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert!(
-        v.get("redirectState").is_none(),
-        "an edits-only ledger asserts no records ⇒ no redirectState block; \
-         envelope={v}"
+    let state = &v["redirectState"];
+    assert_eq!(state["mode"], "hosted", "envelope={v}");
+    assert_eq!(
+        state["records"],
+        serde_json::json!([{ "purl": purl, "uuid": AGENT_WARN_UUID }]),
+        "the lock pin is the record; envelope={v}"
     );
+    assert_eq!(state["wiringLive"], serde_json::json!([purl]), "envelope={v}");
 
-    // No ledger at all: the key must stay absent (additive contract).
+    // No pin, no ledger: the key must stay absent (additive contract).
     let clean = tempfile::tempdir().expect("tempdir");
     write_root_package_json(clean.path());
     write_npm_package(clean.path(), "minimist", "1.2.2");
-    let (code, stdout, stderr) = run_scan(clean.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_scan(clean.path(), &mock.uri(), &["--prune"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert!(
         v.get("redirectState").is_none(),
-        "no ledger ⇒ no redirectState block; envelope={v}"
+        "no hosted pin ⇒ no redirectState block; envelope={v}"
     );
 }
 
-/// Records with a registry-clean lock: the block still lists the records
-/// (the ledger is real state) but `wiringLive` is empty — the records/proof
-/// split mirrors the agent warning's live-lock gate.
+/// A pre-v5 ledger record whose lock entry is back on the registry is NOT
+/// hosted state: v5 reads hosted state from the lockfiles only, so the
+/// block is omitted (never guessed from ledger presence), and the agent
+/// warning stays silent.
 #[tokio::test]
-async fn report_only_scan_json_redirect_state_splits_records_from_live_proof() {
+async fn report_only_scan_json_ignores_a_stale_pre_v5_ledger_record() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
@@ -1816,25 +1832,25 @@ async fn report_only_scan_json_redirect_state_splits_records_from_live_proof() {
          integrity sha512-orig==\n",
     )
     .unwrap();
+    let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
 
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run"]);
-    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let state = &v["redirectState"];
-    assert!(
-        state.is_object(),
-        "records exist ⇒ block exists; envelope={v}"
-    );
+    for extra in [&["--prune"][..], &["--mode", "agent", "--dry-run"][..]] {
+        let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), extra);
+        assert_eq!(code, 0, "{extra:?}: stdout={stdout}; stderr={stderr}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+        assert!(
+            v.get("redirectState").is_none(),
+            "{extra:?}: a stale pre-v5 ledger record is not hosted state; envelope={v}"
+        );
+        assert!(
+            find_warning(&v, "hosted_wiring_retained").is_none(),
+            "{extra:?}: envelope={v}"
+        );
+    }
     assert_eq!(
-        state["records"].as_array().map(Vec::len),
-        Some(1),
-        "envelope={v}"
-    );
-    assert_eq!(
-        state["wiringLive"].as_array().map(Vec::len),
-        Some(0),
-        "registry-clean lock ⇒ empty wiringLive (never guess from ledger \
-         presence alone); envelope={v}"
+        std::fs::read(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+        ledger_before,
+        "scan leaves a pre-v5 ledger byte-identical"
     );
 }
 
@@ -2008,12 +2024,11 @@ async fn vendored_mode_envelopes_omit_redirect_state() {
     );
 }
 
-/// The malformed-ledger degradation warning is advisory, so `--silent`
-/// ("errors only") must mute it — on the report-only path like everywhere
-/// else. The envelope itself is unchanged either way (no redirectState from
-/// a ledger that cannot be read).
+/// A malformed pre-v5 redirect ledger is IGNORED by scan (v5 never reads
+/// it): no warning on stderr with or without `--silent`, no redirectState,
+/// and the file is left byte-identical in place (never quarantined).
 #[tokio::test]
-async fn silent_gates_scan_malformed_ledger_warning() {
+async fn scan_ignores_a_malformed_pre_v5_ledger() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
@@ -2026,31 +2041,34 @@ async fn silent_gates_scan_malformed_ledger_warning() {
     std::fs::create_dir_all(&vendor_dir).unwrap();
     std::fs::write(vendor_dir.join("redirect-state.json"), "{ torn ledger").unwrap();
 
-    // Control: without --silent the corruption is surfaced on stderr.
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run"]);
-    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        stderr.contains("malformed"),
-        "a malformed ledger must be surfaced when not silent: {stderr}"
-    );
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert!(
-        v.get("redirectState").is_none(),
-        "an unreadable ledger asserts nothing; envelope={v}"
-    );
-
-    // --silent mutes the advisory warning; the run is otherwise identical.
-    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--dry-run", "--silent"]);
-    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    assert!(
-        !stderr.contains("malformed"),
-        "--silent must mute the malformed-ledger warning: {stderr}"
-    );
+    for extra in [
+        &["--mode", "agent", "--dry-run"][..],
+        &["--mode", "agent", "--dry-run", "--silent"][..],
+        &["--prune"][..],
+    ] {
+        let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), extra);
+        assert_eq!(code, 0, "{extra:?}: stdout={stdout}; stderr={stderr}");
+        assert!(
+            !stderr.contains("malformed") && !stderr.contains("redirect ledger"),
+            "{extra:?}: a pre-v5 ledger is never read, so never reported: {stderr}"
+        );
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+        assert!(
+            v.get("redirectState").is_none(),
+            "{extra:?}: envelope={v}"
+        );
+        assert_eq!(
+            std::fs::read(vendor_dir.join("redirect-state.json")).unwrap(),
+            b"{ torn ledger",
+            "{extra:?}: left in place, byte-identical"
+        );
+        assert!(!vendor_dir.join("redirect-state.json.corrupt").exists());
+    }
 }
 
 /// `wiringLive` (like the agent warning) only ever names packages this run
 /// actually counted: an `--ecosystems` filter that excludes the hosted
-/// ecosystem leaves the records listed — the ledger is still real state —
+/// ecosystem leaves the records listed — the lock pin is still real state —
 /// with an EMPTY wiringLive ("purl not crawled/queried this run" is a
 /// documented silent cause, distinct from "wiring unwound"). This also pins
 /// the zero-discovery envelope carrying the block at all.
@@ -2078,7 +2096,7 @@ async fn ecosystems_filter_keeps_records_but_not_wiring_live() {
     let state = &v["redirectState"];
     assert!(
         state.is_object(),
-        "records exist ⇒ the block rides even the filtered/zero-discovery \
+        "a pin exists ⇒ the block rides even the filtered/zero-discovery \
          envelope; envelope={v}"
     );
     assert_eq!(

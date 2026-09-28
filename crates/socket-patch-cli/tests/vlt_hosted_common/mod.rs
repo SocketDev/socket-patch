@@ -537,3 +537,46 @@ pub fn vex_attests(path: &Path) -> bool {
             .any(|c| c["@id"] == PURL)
     })
 }
+
+/// v5 hosted mode writes no ledger: assert `.socket/vendor/redirect-state.json`
+/// does not exist under `root`.
+pub fn assert_no_ledger(root: &Path) {
+    let ledger = ledger_path(root);
+    assert!(
+        !ledger.exists(),
+        "v5 hosted mode must not write the redirect ledger, found {}",
+        ledger.display()
+    );
+}
+
+/// A pre-v5 ledger record (the `PatchRecord` shape) built from a
+/// `/patches/view` body: `publishedAt` becomes `exportedAt`, `purl` is
+/// dropped.
+pub fn legacy_record_from_view(view: &Value) -> Value {
+    let mut record = view.clone();
+    let obj = record.as_object_mut().expect("a view body is an object");
+    obj.remove("purl");
+    let exported = obj
+        .remove("publishedAt")
+        .unwrap_or_else(|| json!("2024-01-01T00:00:00Z"));
+    obj.insert("exportedAt".to_string(), exported);
+    obj.entry("description").or_insert_with(|| json!("x"));
+    obj.entry("license").or_insert_with(|| json!("MIT"));
+    obj.entry("tier").or_insert_with(|| json!("free"));
+    record
+}
+
+/// Write a pre-v5 hosted ledger (`.socket/vendor/redirect-state.json`)
+/// holding `records` (`(purl, PatchRecord JSON)`) and no edits — what an
+/// older socket-patch left behind; v5 reads it only as an extra local
+/// record source (vex) and never for planning (scan).
+pub fn write_legacy_ledger(root: &Path, records: &[(&str, Value)]) {
+    let map: serde_json::Map<String, Value> = records
+        .iter()
+        .map(|(purl, record)| (purl.to_string(), record.clone()))
+        .collect();
+    let ledger = json!({ "version": 1, "mode": "hosted", "records": map });
+    let path = ledger_path(root);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+}

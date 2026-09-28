@@ -18,6 +18,11 @@
 //! - `--dry-run` => no generation, no document, no network;
 //! - `apply --check` => no generation, the output path untouched, no
 //!   network (read-only, like the with-manifest `--check`).
+//!
+//! `vendor` on a checkout whose lockfiles carry HOSTED pins is not a
+//! no-manifest no-op any more: it EJECTS the pins into `.socket/vendor/`
+//! (v5 WS2), so the hosted-wiring cells below drive `apply` only, and
+//! [`vendor_on_a_hosted_checkout_takes_the_eject_path`] pins the switch.
 
 use crate::vex_e2e_common;
 
@@ -28,6 +33,9 @@ const GHSA: &str = "GHSA-mfls-embd-0001";
 const CVE: &str = "CVE-2026-5151";
 
 const EMBEDDED: [VexVia; 2] = [VexVia::Apply, VexVia::Vendor];
+/// The embedded commands that treat a HOSTED-wired checkout as manifest-less
+/// (`vendor` ejects it instead).
+const EMBEDDED_OVER_HOSTED: [VexVia; 1] = [VexVia::Apply];
 
 fn api() -> PatchApi {
     PatchApi::start(vec![(
@@ -56,7 +64,7 @@ fn write_stale_doc(project: &std::path::Path) {
 
 #[test]
 fn manifest_less_embedded_vex_attests_hosted_wiring() {
-    for via in EMBEDDED {
+    for via in EMBEDDED_OVER_HOSTED {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         let purl = write_hosted_npm_lock(p, "left-pad", "1.3.0", UUID);
@@ -156,7 +164,7 @@ fn nothing_discovered_still_reports_discovery_diagnostics() {
 
 #[test]
 fn vex_failure_without_manifest_fails_the_command() {
-    for via in EMBEDDED {
+    for via in EMBEDDED_OVER_HOSTED {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         write_hosted_npm_lock(p, "left-pad", "1.3.0", UUID);
@@ -235,7 +243,11 @@ fn dry_run_skips_manifest_less_vex() {
     for via in EMBEDDED {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
-        write_hosted_npm_lock(p, "left-pad", "1.3.0", UUID);
+        // `vendor` over hosted pins is the eject flow; its no-manifest
+        // dry-run skip is pinned on a checkout without them.
+        if via == VexVia::Apply {
+            write_hosted_npm_lock(p, "left-pad", "1.3.0", UUID);
+        }
         let api = api();
         let run = VexRun {
             dry_run: true,
@@ -267,4 +279,50 @@ fn dry_run_skips_manifest_less_vex() {
         assert!(out.doc.is_none(), "{out}");
         api.assert_no_requests();
     }
+}
+
+/// v5 WS2: `vendor` with no manifest and HOSTED pins in the lockfiles is the
+/// eject flow, not the calm no-manifest no-op — it fetches each pin's patch
+/// record from the API. With the API not serving the patch the purl fails
+/// `patch_fetch_failed`, the command exits 1, no document is written, and
+/// the hosted lock is left as it was.
+#[test]
+fn vendor_on_a_hosted_checkout_takes_the_eject_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let purl = write_hosted_npm_lock(p, "left-pad", "1.3.0", UUID);
+    let lock_before = std::fs::read(p.join("package-lock.json")).unwrap();
+    let api = PatchApi::empty();
+    let out = run_vex(&binary(), p, &VexRun::online(&api).via(VexVia::Vendor));
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_ne!(out.envelope["status"], "noManifest", "{out}");
+    let failed = out.envelope["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["action"] == "failed" && e["purl"] == purl.as_str())
+        .unwrap_or_else(|| panic!("the hosted pin must be an eject candidate: {out}"));
+    assert_eq!(failed["errorCode"], "patch_fetch_failed", "{out}");
+    assert!(api.view_requests(UUID) >= 1, "{:?}", api.requests());
+    assert!(out.envelope.get("vex").is_none(), "{out}");
+    assert!(out.doc.is_none(), "{out}");
+    assert_eq!(
+        std::fs::read(p.join("package-lock.json")).unwrap(),
+        lock_before,
+        "a failed eject leaves the hosted lock alone"
+    );
+    assert_no_hosted_ledger(p, "vendor eject");
+
+    // Human mode names the eject.
+    let human = VexRun {
+        human: true,
+        ..VexRun::online(&api).via(VexVia::Vendor)
+    };
+    let out = run_vex(&binary(), p, &human);
+    assert_eq!(out.code, Some(1), "{out}");
+    assert!(
+        out.stdout
+            .contains("Ejecting 1 hosted package into .socket/vendor/..."),
+        "{out}"
+    );
 }

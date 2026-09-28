@@ -82,8 +82,8 @@ async fn mock_hosted_api(server: &MockServer) {
         })))
         .mount(server)
         .await;
-    // `view/{uuid}` — the record the wet run persists into the redirect
-    // ledger after a confirmed redirect.
+    // `view/{uuid}` — the record the wet run fetches (in memory: stale-install
+    // probes, in-run VEX) after a confirmed redirect.
     let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
     let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
     Mock::given(method("GET"))
@@ -547,9 +547,8 @@ async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
     );
     assert!(
         wet_out.contains(
-            "  1. Commit .socket/vendor/ (the hosted ledger, plus the removed vendored ledger \
-             entries and artifacts), package.json, pnpm-lock.yaml, and pnpm-workspace.yaml \
-             to keep the hosted patches."
+            "  1. Commit .socket/vendor/ (the removed vendored ledger entries and artifacts), \
+             package.json, pnpm-lock.yaml, and pnpm-workspace.yaml to keep the hosted patches."
         ),
         "stdout=\n{wet_out}"
     );

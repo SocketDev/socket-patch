@@ -64,18 +64,15 @@ pub async fn run(args: RepairArgs) -> i32 {
     let mut vendor_references: Option<Vec<(String, String, String)>> = None;
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        // Hosted (redirect) mode leaves no local artifacts to repair: the
-        // lockfiles point at patch.socket.dev URLs, not `.socket/vendor/...`,
-        // and there is no manifest or vendor ledger. A project whose only
-        // trace is `redirect-state.json` is therefore a no-op for repair —
-        // exit success with an informational skip rather than the
-        // `manifest_not_found` error a bare directory would get. Only cheap
-        // existence probes (and the read-only lockfile scan) run before the
-        // lock, so a project with nothing to repair never grows `.socket/`.
-        let redirect_state = args
-            .common
-            .cwd
-            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+        // Hosted mode leaves no local artifacts to repair: the lockfiles
+        // point at patch.socket.dev URLs, not `.socket/vendor/...`, and
+        // there is no manifest or vendor ledger. A project whose only trace
+        // is its hosted lockfile pins (or a pre-v5 `redirect-state.json`)
+        // is therefore a no-op for repair — exit success with an
+        // informational skip rather than the `manifest_not_found` error a
+        // bare directory would get. Only cheap existence probes (and the
+        // read-only lockfile scans) run before the lock, so a project with
+        // nothing to repair never grows `.socket/`.
         let state_file = args
             .common
             .cwd
@@ -88,7 +85,15 @@ pub async fn run(args: RepairArgs) -> i32 {
             vendor_references = Some(refs);
         }
         if !has_vendor_traces {
-            if tokio::fs::metadata(&redirect_state).await.is_ok() {
+            let legacy_ledger = args
+                .common
+                .cwd
+                .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+            let hosted = tokio::fs::metadata(&legacy_ledger).await.is_ok()
+                || !crate::commands::hosted_inventory(&args.common, &args.common.cwd)
+                    .await
+                    .is_empty();
+            if hosted {
                 let msg = HOSTED_ONLY_REASON;
                 if args.common.json {
                     let mut env = Envelope::new(Command::Repair);

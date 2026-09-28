@@ -6,9 +6,10 @@
 //! exercised in JSON mode.
 //!
 //! Binary-driven (spawns `CARGO_BIN_EXE_socket-patch` through
-//! `common::run_with_env`, which scrubs the ambient `SOCKET_*` env), fully
-//! offline: every fixture is hand-written camelCase JSON, and every wet run
-//! passes `--offline`. Fixture shapes are copied from
+//! `common::run_with_env`, which scrubs the ambient `SOCKET_*` env): every
+//! fixture is hand-written camelCase JSON, and every wet run passes
+//! `--offline` — except the hosted leg's, whose upstream restore re-resolves
+//! the registry entry from a mock npm registry (`SOCKET_NPM_REGISTRY`). Fixture shapes are copied from
 //! remove_invariants.rs / remove_duality_invariants.rs /
 //! interactive_prompts_e2e.rs.
 
@@ -158,7 +159,8 @@ fn write_vendor_ledger_entry(
 const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }]"#;
 
 // ---------------------------------------------------------------------------
-// Hosted-redirect fixtures (copied from remove_duality_invariants.rs).
+// Hosted-redirect fixtures (copied from remove_duality_invariants.rs). The
+// lockfile pin IS the hosted state; the ledger text is a pre-v5 leftover.
 // ---------------------------------------------------------------------------
 
 const NPM_PURL: &str = "pkg:npm/left-pad@1.3.0";
@@ -190,7 +192,7 @@ fn redirected_lock_text() -> String {
     )
 }
 
-/// Redirect ledger (real `RedirectState` schema) with ONE npm record and
+/// A PRE-V5 redirect ledger (v5 never writes one) with ONE npm record and
 /// its recorded `redirect_npm_lock_entry` edit matching
 /// [`redirected_lock_text`].
 fn npm_redirect_ledger_text() -> String {
@@ -231,9 +233,10 @@ fn write_redirect_ledger_text(root: &Path, text: &str) -> PathBuf {
     path
 }
 
-/// The exact bytes the npm redirect revert writes when it restores
-/// [`redirected_lock_text`] to the pre-redirect entry (same whole-file
-/// derivation the remove_duality_invariants.rs twins use).
+/// The exact bytes the upstream restore writes when it puts
+/// [`redirected_lock_text`] back on the registry entry the mock registry
+/// serves (`ORIG_RESOLVED` / `ORIG_INTEGRITY`; same whole-file derivation
+/// the remove_duality_invariants.rs twins use).
 fn expected_reverted_lock_text() -> String {
     let mut expected: serde_json::Value =
         serde_json::from_str(&redirected_lock_text()).expect("parse fixture lock");
@@ -623,27 +626,75 @@ fn remove_detached_vendor_state_write_failure_fails_with_code() {
 
 // ---------------------------------------------------------------------------
 // 5. Hosted leg: dry-run previews (main flow + hosted-only)
+//
+// v5 hosted state is the lockfile pin itself (no ledger): removing a hosted
+// patch restores the pin's DEFAULT UPSTREAM registry entry, re-resolved
+// from the mock npm registry below (`SOCKET_NPM_REGISTRY`).
 // ---------------------------------------------------------------------------
 
-/// A dry-run remove touching hosted records had NEVER run. The preview
-/// must leave BOTH the lockfile and the redirect ledger byte-identical
-/// while reporting the would-be unwind as a Verified/hosted_reverted
-/// event.
+/// A mock npm registry serving left-pad@1.3.0's version document with the
+/// fixture's upstream tarball + integrity (or nothing: every lookup 404s).
+/// wiremock serves from its own thread; the runtime only owns the server.
+struct NpmRegistry {
+    server: wiremock::MockServer,
+    _rt: tokio::runtime::Runtime,
+}
+
+impl NpmRegistry {
+    fn start(serve_left_pad: bool) -> Self {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let server = rt.block_on(async {
+            let server = MockServer::start().await;
+            if serve_left_pad {
+                Mock::given(method("GET"))
+                    .and(path("/npm/left-pad/1.3.0"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "name": "left-pad",
+                        "version": "1.3.0",
+                        "dist": { "tarball": ORIG_RESOLVED, "integrity": ORIG_INTEGRITY }
+                    })))
+                    .mount(&server)
+                    .await;
+            }
+            server
+        });
+        Self { server, _rt: rt }
+    }
+
+    fn base(&self) -> String {
+        format!("{}/npm", self.server.uri())
+    }
+}
+
+/// `run_remove` with the npm registry pointed at `registry`.
+fn run_remove_online(cwd: &Path, args: &[&str], registry: &NpmRegistry) -> (i32, String, String) {
+    let base = registry.base();
+    run_remove(cwd, args, &[("SOCKET_NPM_REGISTRY", base.as_str())])
+}
+
+fn legacy_ledger_path(root: &Path) -> PathBuf {
+    root.join(".socket/vendor/redirect-state.json")
+}
+
+/// A dry-run remove touching a hosted pin must leave the lockfile
+/// byte-identical (and write no ledger) while reporting the would-be
+/// restore as a Verified/hosted_reverted event.
 #[test]
-fn remove_hosted_dry_run_leaves_lock_and_ledger_untouched() {
+fn remove_hosted_dry_run_leaves_lock_untouched() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-    let ledger_before = read_bytes(&ledger_path);
     let lock_before = read_bytes(&lock_path);
     let socket = write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
     let manifest_before = read_bytes(&socket.join("manifest.json"));
+    let registry = NpmRegistry::start(true);
 
-    let (code, stdout, stderr) = run_remove(
+    let (code, stdout, stderr) = run_remove_online(
         tmp.path(),
-        &[NPM_PURL, "--json", "--yes", "--offline", "--dry-run"],
-        &[],
+        &[NPM_PURL, "--json", "--yes", "--dry-run"],
+        &registry,
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout);
@@ -657,7 +708,7 @@ fn remove_hosted_dry_run_leaves_lock_and_ledger_untouched() {
         events.iter().any(|e| e["action"] == "verified"
             && e["purl"] == NPM_PURL
             && e["errorCode"] == "hosted_reverted"),
-        "the hosted unwind preview must be a verified/hosted_reverted event: {events:?}"
+        "the hosted restore preview must be a verified/hosted_reverted event: {events:?}"
     );
     assert!(
         events.iter().all(|e| e["action"] != "removed"),
@@ -666,10 +717,9 @@ fn remove_hosted_dry_run_leaves_lock_and_ledger_untouched() {
 
     // Nothing on disk moved.
     assert_eq!(read_bytes(&lock_path), lock_before, "lock byte-identical");
-    assert_eq!(
-        read_bytes(&ledger_path),
-        ledger_before,
-        "ledger byte-identical"
+    assert!(
+        !legacy_ledger_path(tmp.path()).exists(),
+        "no hosted ledger is ever written"
     );
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
@@ -685,21 +735,17 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-    let ledger_before = read_bytes(&ledger_path);
     let lock_before = read_bytes(&lock_path);
+    let registry = NpmRegistry::start(true);
 
-    let (code, stdout, stderr) = run_remove(
-        tmp.path(),
-        &[NPM_PURL, "--json", "--offline", "--dry-run"],
-        &[],
-    );
+    let (code, stdout, stderr) =
+        run_remove_online(tmp.path(), &[NPM_PURL, "--json", "--dry-run"], &registry);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout);
     assert_eq!(v["dryRun"], true);
     assert_eq!(
         v["summary"]["verified"], 1,
-        "the preview must count the would-be unwind; envelope={v}"
+        "the preview must count the would-be restore; envelope={v}"
     );
     assert_eq!(v["summary"]["removed"], 0);
     let events = v["events"].as_array().expect("events array");
@@ -710,14 +756,9 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
         "expected a verified/hosted_reverted preview event: {events:?}"
     );
     assert_eq!(read_bytes(&lock_path), lock_before, "lock byte-identical");
-    assert_eq!(
-        read_bytes(&ledger_path),
-        ledger_before,
-        "ledger byte-identical"
-    );
     assert!(
-        !tmp.path().join(".socket/manifest.json").exists(),
-        "no manifest may be materialized as a side effect"
+        !tmp.path().join(".socket").exists(),
+        "no manifest (or any .socket/ state) may be materialized as a side effect"
     );
 }
 
@@ -725,7 +766,7 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
 // 6. Hosted leg: --preserve-state note + preserve-state human summary
 // ---------------------------------------------------------------------------
 
-/// `--preserve-state` still unwinds hosted redirects (hosted has no
+/// `--preserve-state` still restores hosted pins (hosted has no
 /// preservable local state) and the human run must say so on stderr —
 /// while the manifest entry survives and the final preserve summary
 /// prints.
@@ -734,18 +775,18 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
     let socket = write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
     let manifest_before = read_bytes(&socket.join("manifest.json"));
+    let registry = NpmRegistry::start(true);
 
-    let (code, stdout, stderr) = run_remove(
+    let (code, stdout, stderr) = run_remove_online(
         tmp.path(),
-        &[NPM_PURL, "--yes", "--offline", "--preserve-state"],
-        &[],
+        &[NPM_PURL, "--yes", "--preserve-state"],
+        &registry,
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("hosted patches have no preservable local state"),
+        stderr.contains("hosted wiring has no preservable local state"),
         "the preserve-state hosted note must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -753,15 +794,11 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
         "the preserve-state summary must print; got:\n{stdout}"
     );
 
-    // The unwind really happened: lock restored, emptied ledger deleted.
+    // The restore really happened: the lock holds the upstream entry.
     assert_eq!(
         std::fs::read_to_string(&lock_path).unwrap(),
         expected_reverted_lock_text(),
-        "the lock must hold exactly the pre-redirect entry"
-    );
-    assert!(
-        !ledger_path.exists(),
-        "the emptied redirect ledger must be deleted"
+        "the lock must hold exactly the upstream registry entry"
     );
     // The state half was preserved: manifest byte-identical.
     assert_eq!(
@@ -772,15 +809,14 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Corrupt hosted-redirect ledger: warn-and-continue
+// 7. Corrupt pre-v5 hosted ledger: ignored
 // ---------------------------------------------------------------------------
 
-/// A corrupt redirect ledger must not block a manifest removal: the main
-/// flow warns on stderr ("hosted redirects were not examined") and the
-/// removal still succeeds. The corrupt ledger is left alone (it may hold
-/// revert data a human can repair).
+/// A corrupt pre-v5 redirect ledger is inert: hosted state comes from the
+/// lockfiles, so a manifest removal neither reads nor warns about it, the
+/// removal succeeds, and the file is left alone.
 #[test]
-fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
+fn remove_corrupt_legacy_hosted_ledger_is_ignored_human() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
     let socket =
@@ -791,11 +827,11 @@ fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
     assert_eq!(
         code, 0,
-        "a corrupt hosted ledger must not block the removal; stdout=\n{stdout}\nstderr=\n{stderr}"
+        "a corrupt pre-v5 ledger must not block the removal; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("hosted patches were not examined"),
-        "the warning must reach stderr; got:\n{stderr}"
+        !stderr.contains("redirect") && !stderr.contains("ledger"),
+        "the pre-v5 ledger is never read, so nothing warns about it; got:\n{stderr}"
     );
     assert!(
         stdout.contains("Removed 1 patch from manifest:"),
@@ -811,15 +847,14 @@ fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
     assert_eq!(
         read_bytes(&ledger_path),
         ledger_before,
-        "the corrupt ledger must be left alone (it may hold repairable revert data)"
+        "the corrupt ledger must be left alone"
     );
 }
 
-/// JSON twin: the removal still succeeds and the corrupt ledger is left
-/// alone. (Known gap, deliberately NOT pinned here: JSON mode currently
-/// carries no machine-visible signal for the skipped hosted leg.)
+/// JSON twin: the removal still succeeds with no warning, and the corrupt
+/// ledger is left alone.
 #[test]
-fn remove_corrupt_hosted_ledger_json_still_removes() {
+fn remove_corrupt_legacy_hosted_ledger_is_ignored_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
     write_manifest_files_empty(tmp.path(), purl, "77777777-7777-4777-8777-777777777777");
@@ -833,6 +868,10 @@ fn remove_corrupt_hosted_ledger_json_still_removes() {
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["removed"], 1, "envelope={v}");
     assert_eq!(event_purls(&v, "removed"), vec![purl]);
+    assert!(
+        v["warnings"].as_array().is_none_or(Vec::is_empty),
+        "the pre-v5 ledger is never read: no warning; envelope={v}"
+    );
     assert_eq!(
         read_bytes(&ledger_path),
         ledger_before,
@@ -845,15 +884,13 @@ fn remove_corrupt_hosted_ledger_json_still_removes() {
 // ---------------------------------------------------------------------------
 
 /// With no manifest entry to delete, removing a hosted patch can only mean
-/// unwinding its redirect — `--skip-rollback` is refused with
+/// restoring its upstream entry — `--skip-rollback` is refused with
 /// `hosted_state_retained` and nothing moves.
 #[test]
 fn remove_hosted_only_skip_rollback_refused() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-    let ledger_before = read_bytes(&ledger_path);
     let lock_before = read_bytes(&lock_path);
 
     let (code, stdout, stderr) = run_remove(
@@ -870,21 +907,27 @@ fn remove_hosted_only_skip_rollback_refused() {
         msg.contains(NPM_PURL) && msg.contains("--skip-rollback"),
         "the refusal must name the purl and the flag; got: {msg}"
     );
-    assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger untouched");
     assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
+    assert!(!tmp.path().join(".socket").exists(), "nothing written");
 }
 
 /// Hosted-only human mode: the pre-confirm listing ("The following hosted
-/// redirect(s) will be unwound and removed:") must print to stderr, and
-/// the wet run must complete the unwind.
+/// redirect(s) will be unwound and removed:") must print to stderr, the
+/// wet run must restore the upstream entry, and a pre-v5 ledger left
+/// beside the pin is retired once no hosted pin remains (it is never the
+/// revert source: its recorded original disagrees with the registry).
 #[test]
 fn remove_hosted_only_human_lists_redirects_and_unwinds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
+    let ledger_path = write_redirect_ledger_text(
+        tmp.path(),
+        &npm_redirect_ledger_text().replace(ORIG_INTEGRITY, "sha512-LEDGERledger=="),
+    );
+    let registry = NpmRegistry::start(true);
 
-    let (code, stdout, stderr) = run_remove(tmp.path(), &[NPM_PURL, "--yes", "--offline"], &[]);
+    let (code, stdout, stderr) = run_remove_online(tmp.path(), &[NPM_PURL, "--yes"], &registry);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
         stderr.contains("The following hosted patch will be unwound and removed:"),
@@ -894,71 +937,76 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
         stderr.contains(&format!("  - {NPM_PURL}")),
         "the listing must name the purl; got:\n{stderr}"
     );
-    // The unwind really ran: lock restored byte-exactly, ledger deleted.
+    assert!(
+        stdout.contains(&format!(
+            "Restored {NPM_PURL} to its upstream registry entry"
+        )),
+        "the restore line must print; got:\n{stdout}"
+    );
+    // The restore really ran: lock holds the registry's entry byte-exactly.
     assert_eq!(
         std::fs::read_to_string(&lock_path).unwrap(),
         expected_reverted_lock_text(),
-        "the lock must hold exactly the pre-redirect entry"
+        "the lock must hold exactly the upstream registry entry"
     );
     assert!(
         !ledger_path.exists(),
-        "the emptied redirect ledger must be deleted"
+        "the pre-v5 ledger is retired once no hosted pin remains"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 9. Hosted per-purl revert failure fails closed (main flow + hosted-only
+// 9. Hosted upstream-restore refusal fails closed (main flow + hosted-only
 //    twin)
 // ---------------------------------------------------------------------------
 
-/// A package-lock.json that is no longer valid JSON makes the recorded
-/// `redirect_npm_lock_entry` revert fail — the remove must abort with
-/// `hosted_revert_failed` BEFORE the manifest mutation, leaving every
-/// store byte-identical.
+/// The registry cannot re-resolve the upstream entry (404): the pin is
+/// refused, and the remove must abort with `hosted_revert_failed` BEFORE
+/// the manifest mutation, leaving every store byte-identical.
 #[test]
 fn remove_hosted_revert_failure_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
-    std::fs::write(&lock_path, "{corrupt lock").unwrap();
+    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
     let lock_before = read_bytes(&lock_path);
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-    let ledger_before = read_bytes(&ledger_path);
     let socket = write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
     let manifest_before = read_bytes(&socket.join("manifest.json"));
+    let registry = NpmRegistry::start(false);
 
     let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[NPM_PURL, "--json", "--yes", "--offline"], &[]);
+        run_remove_online(tmp.path(), &[NPM_PURL, "--json", "--yes"], &registry);
     assert_eq!(
         code, 1,
-        "a failed hosted revert must abort the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
+        "a refused hosted restore must abort the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("could not unwind the hosted patch for pkg:npm/left-pad@1.3.0")
+        msg.contains("cannot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
+            && msg.contains("404")
+            && msg.contains("git checkout -- package-lock.json")
             && msg.contains("The manifest was not modified."),
-        "the error must name the purl and promise the manifest is intact; got: {msg}"
+        "the error must name the purl, the cause, the remedy and promise the manifest is \
+         intact; got: {msg}"
     );
     assert_eq!(v["summary"]["removed"], 0);
 
-    // Fail-closed: manifest, ledger, and (corrupt) lock all byte-identical.
+    // Fail-closed: manifest and lock byte-identical.
     assert_eq!(read_bytes(&socket.join("manifest.json")), manifest_before);
-    assert_eq!(read_bytes(&ledger_path), ledger_before);
     assert_eq!(read_bytes(&lock_path), lock_before);
 }
 
-/// Hosted-only twin: the same corrupt-lock failure surfaces through
-/// `remove_hosted_only`'s failed-revert branch.
+/// Hosted-only twin: an `--offline` run cannot re-resolve the upstream
+/// entry, so the pin is refused through `remove_hosted_only`'s
+/// failed-restore branch.
 #[test]
 fn remove_hosted_only_revert_failure_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
-    std::fs::write(&lock_path, "{corrupt lock").unwrap();
+    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
     let lock_before = read_bytes(&lock_path);
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-    let ledger_before = read_bytes(&ledger_path);
 
     let (code, stdout, stderr) =
         run_remove(tmp.path(), &[NPM_PURL, "--json", "--yes", "--offline"], &[]);
@@ -968,45 +1016,42 @@ fn remove_hosted_only_revert_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("could not unwind the hosted patch for pkg:npm/left-pad@1.3.0"),
-        "the error must name the purl; got: {msg}"
+        msg.contains("cannot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
+            && msg.contains("this run is offline"),
+        "the error must name the purl and the offline cause; got: {msg}"
     );
-    assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger untouched");
-    assert_eq!(
-        read_bytes(&lock_path),
-        lock_before,
-        "corrupt lock untouched"
-    );
+    assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
 }
 
 // ---------------------------------------------------------------------------
-// 10. Hosted ledger persist failure after successful lockfile reverts
-//     (main flow + hosted-only). Unix-only.
+// 10. Restored-lockfile write failure (main flow + hosted-only). Unix-only;
+//     skipped where directory modes are not enforced (root).
 // ---------------------------------------------------------------------------
 
-/// The per-purl reverts flush lockfile writes as they go; when the ledger
-/// persist then fails, the remove must abort with `hosted_revert_failed`
-/// naming the persist — the manifest untouched, the (stale) ledger still
-/// on disk, and the lock already restored (the documented desync posture).
+/// Every pin resolved, but the restored lockfile cannot be written (a
+/// read-only project root; the write is a temp-file + rename beside it):
+/// the remove aborts with `hosted_revert_failed` naming the write — the
+/// manifest untouched and the lock byte-identical.
 #[cfg(unix)]
 #[test]
-fn remove_hosted_ledger_persist_failure_fails_closed() {
+fn remove_hosted_lockfile_write_failure_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let lock_path = tmp.path().join("package-lock.json");
+    let root = tmp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let lock_path = root.join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-    let ledger_before = read_bytes(&ledger_path);
-    let socket = write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
+    let lock_before = read_bytes(&lock_path);
+    let socket = write_manifest_files_empty(&root, NPM_PURL, NPM_UUID);
     let manifest_before = read_bytes(&socket.join("manifest.json"));
-    let vendor = tmp.path().join(".socket/vendor");
+    let registry = NpmRegistry::start(true);
 
-    chmod(&vendor, 0o555);
-    let _mode = ModeGuard(vendor.clone());
-    if !readonly_dir_enforced(&vendor) {
+    chmod(&root, 0o555);
+    let _mode = ModeGuard(root.clone());
+    if !readonly_dir_enforced(&root) {
         return;
     }
     let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[NPM_PURL, "--json", "--yes", "--offline"], &[]);
+        run_remove_online(&root, &[NPM_PURL, "--json", "--yes"], &registry);
 
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout);
@@ -1014,8 +1059,8 @@ fn remove_hosted_ledger_persist_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("failed to persist the hosted ledger"),
-        "the error must name the persist failure; got: {msg}"
+        msg.contains("writing the restored lockfiles failed"),
+        "the error must name the write failure; got: {msg}"
     );
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
@@ -1023,37 +1068,33 @@ fn remove_hosted_ledger_persist_failure_fails_closed() {
         "the manifest mutation must not have happened"
     );
     assert_eq!(
-        read_bytes(&ledger_path),
-        ledger_before,
-        "the unwritable ledger keeps its old bytes"
-    );
-    // The lockfile edits flushed BEFORE the persist (the documented
-    // desync-avoidance ordering): the lock is already restored.
-    assert_eq!(
-        std::fs::read_to_string(&lock_path).unwrap(),
-        expected_reverted_lock_text(),
-        "the per-purl revert flushed the lock before the persist failed"
+        read_bytes(&lock_path),
+        lock_before,
+        "the lock was never written"
     );
 }
 
-/// Hosted-only twin of the persist failure.
+/// Hosted-only twin of the write failure.
 #[cfg(unix)]
 #[test]
-fn remove_hosted_only_ledger_persist_failure_fails_closed() {
+fn remove_hosted_only_lockfile_write_failure_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let lock_path = tmp.path().join("package-lock.json");
+    let root = tmp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let lock_path = root.join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-    let ledger_before = read_bytes(&ledger_path);
-    let vendor = tmp.path().join(".socket/vendor");
+    let lock_before = read_bytes(&lock_path);
+    // `.socket/` exists and stays writable so the apply lock is taken.
+    std::fs::create_dir(root.join(".socket")).unwrap();
+    let registry = NpmRegistry::start(true);
 
-    chmod(&vendor, 0o555);
-    let _mode = ModeGuard(vendor.clone());
-    if !readonly_dir_enforced(&vendor) {
+    chmod(&root, 0o555);
+    let _mode = ModeGuard(root.clone());
+    if !readonly_dir_enforced(&root) {
         return;
     }
     let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[NPM_PURL, "--json", "--yes", "--offline"], &[]);
+        run_remove_online(&root, &[NPM_PURL, "--json", "--yes"], &registry);
 
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout);
@@ -1061,18 +1102,13 @@ fn remove_hosted_only_ledger_persist_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("failed to persist the hosted ledger"),
-        "the error must name the persist failure; got: {msg}"
+        msg.contains("writing the restored lockfiles failed"),
+        "the error must name the write failure; got: {msg}"
     );
     assert_eq!(
-        read_bytes(&ledger_path),
-        ledger_before,
-        "ledger keeps its old bytes"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&lock_path).unwrap(),
-        expected_reverted_lock_text(),
-        "the per-purl revert flushed the lock before the persist failed"
+        read_bytes(&lock_path),
+        lock_before,
+        "the lock was never written"
     );
 }
 
@@ -1799,14 +1835,13 @@ mod pty {
     }
 
     /// Declining the hosted-only confirm prompt must cancel cleanly (exit
-    /// 0, "Cancelled; no changes made.") with the lock and ledger byte-identical.
+    /// 0, "Cancelled; no changes made.") with the lock byte-identical and no
+    /// `.socket/` state written.
     #[test]
     fn remove_hosted_only_interactive_n_cancels() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let lock_path = tmp.path().join("package-lock.json");
         std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-        let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
-        let ledger_before = read_bytes(&ledger_path);
         let lock_before = read_bytes(&lock_path);
 
         let (code, output) = run_in_pty(
@@ -1833,8 +1868,11 @@ mod pty {
             "'n' must report cancellation; got: {output}"
         );
         // Declined: nothing moved.
-        assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger untouched");
         assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "a declined remove leaves no .socket/ state"
+        );
     }
 }
 

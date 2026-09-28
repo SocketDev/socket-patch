@@ -1819,12 +1819,34 @@ pub fn get_hosted(proj: &Path, svc: &PatchService, uuid: &str, extra: &[&str]) -
     out.json()
 }
 
-/// `rollback --yes --json` (whole ledger) in `proj`.
+/// `rollback --yes --json` in `proj`: every hosted pin the lockfiles wire
+/// (v5 keeps no hosted ledger) plus the vendor ledger / manifest.
 pub fn rollback(proj: &Path, extra: &[&str]) -> SocketOut {
     let cwd = proj.to_str().unwrap().to_string();
     let mut args = vec!["rollback", "--json", "--yes", "--cwd", &cwd];
     args.extend_from_slice(extra);
     socket(proj, &args, &[])
+}
+
+/// [`rollback`] of HOSTED pins against the harness: `--patch-server-url
+/// <patch_server>` (when the pins sit on the mock patch service rather than
+/// `patch.socket.dev`; discovery recognizes no other host) and
+/// `SOCKET_NPM_REGISTRY=<registry>`, the npm registry the v5 upstream
+/// restore re-resolves each pin's integrity from (the harness registry, so
+/// synthetic packages restore too and the run stays hermetic).
+pub fn rollback_upstream(
+    proj: &Path,
+    registry: &str,
+    patch_server: Option<&str>,
+    extra: &[&str],
+) -> SocketOut {
+    let cwd = proj.to_str().unwrap().to_string();
+    let mut args = vec!["rollback", "--json", "--yes", "--cwd", &cwd];
+    if let Some(origin) = patch_server {
+        args.extend(["--patch-server-url", origin]);
+    }
+    args.extend_from_slice(extra);
+    socket(proj, &args, &[("SOCKET_NPM_REGISTRY", registry)])
 }
 
 pub fn redirect_warnings(doc: &Value) -> Vec<(String, String)> {

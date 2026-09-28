@@ -18,7 +18,8 @@
 //!
 //! Each state then runs the manifest-less VEX tail
 //! ([`golang_e2e_matrix::manifestless_vex`]): fresh checkout, real install
-//! on a fresh cache, attested with and without ledgers, `record_unavailable`
+//! on a fresh cache, attested with and without ledgers (hosted mode writes
+//! none since v5), `record_unavailable`
 //! offline, omitted when tampered or reverted. Hermetic + offline (file
 //! GOPROXY, per-"machine" caches, wiremock API). Needs Go 1.18+ (`go.work`);
 //! the release is whatever `go` is on `PATH` (see `golang_e2e_matrix`).
@@ -604,8 +605,8 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
         "only the ROOT module's files: {env}"
     );
     assert!(
-        root.join(".socket/vendor/redirect-state.json").is_file(),
-        "hosted persistence is the redirect ledger"
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "v5 hosted persistence is the go.mod/go.sum rewrite alone — no ledger"
     );
     run_members(
         root,

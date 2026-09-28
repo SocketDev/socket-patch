@@ -161,7 +161,9 @@ impl Wiring {
         }
     }
 
-    /// The omission code once the ledger outlives a reverted lock.
+    /// The omission code once the (vendor) ledger outlives a reverted lock.
+    /// Hosted never reaches it: v5 writes no redirect ledger, so a reverted
+    /// hosted lock names the patch nowhere.
     fn unwired(self) -> &'static str {
         match self {
             Wiring::Hosted => "redirect_unwired",
@@ -345,6 +347,10 @@ impl<'a> ManifestlessVex<'a> {
             socket_patch_core::patch::redirect::REDIRECT_STATE_REL,
         ]
         .map(|rel| (rel, std::fs::read(project.join(rel)).ok()));
+        assert!(
+            ledgers[1].1.is_none(),
+            "{leg}: v5 hosted mode writes no redirect ledger"
+        );
         strip_ledgers(project);
         let before = self.api.view_requests(self.uuid);
         let out = run_vex(&binary(), project, &self.online());

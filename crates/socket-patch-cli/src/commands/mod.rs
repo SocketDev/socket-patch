@@ -19,13 +19,10 @@ pub(crate) mod vlt_preflight;
 
 use std::path::Path;
 
-/// The documented name of the mode whose ledger is
-/// `.socket/vendor/redirect-state.json`. Shared by scan's `redirectState`
-/// envelope block and list's hosted event labels so the two surfaces can
-/// never drift, and deliberately a CONSTANT rather than an echo of the
-/// ledger's own `mode` string: that string is opaque to the loader
-/// (pre-rename ledgers carry `"redirect"`), and a consumer dispatching on
-/// these keys must not have to know that history.
+/// The documented name of hosted mode (lockfile pins to Socket-hosted
+/// patched packages; no ledger). Shared by scan's `redirectState` envelope
+/// block and list's hosted event labels so the two surfaces can never
+/// drift.
 pub(crate) const HOSTED_MODE_LABEL: &str = "hosted";
 
 /// The documented name of the mode whose ledger is
@@ -61,35 +58,63 @@ pub(crate) async fn discover_wiring(
     socket_patch_core::vex::discover_patched_refs_with(root, &opts).await
 }
 
-/// Read-only lenient load of the hosted redirect ledger: missing → `None`
-/// (a fresh start); malformed → `None` with the corruption surfaced on
-/// stderr unless `silent`. This is the "read-only consumers may degrade a
-/// malformed ledger to nothing-to-consult, but must surface it" posture
-/// from `load_redirect_state`'s contract — the warning is advisory
-/// (muted by `--silent`, "errors only"), because every path that would
-/// WRITE or ATTEST from the ledger hard-errors on the same corruption
-/// instead. Used by scan's empty-discovery `redirectState` consult; the
-/// main-path consult inlines the same posture so it can flush telemetry
-/// before the warning.
-pub(crate) async fn load_redirect_state_lenient(
-    cwd: &Path,
-    silent: bool,
-) -> Option<socket_patch_core::patch::redirect::RedirectState> {
-    match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
-        Ok(state) => state,
-        Err(corrupt) => {
-            if !silent {
-                eprintln!("Warning: {corrupt}");
-            }
-            None
-        }
+/// The project's hosted wiring as raw inventory (core
+/// [`HostedInventory`]): the attributable pins management commands act on,
+/// and the contested wiring they must refuse around. VEX eligibility is a
+/// separate judgment over the same discovery.
+///
+/// [`HostedInventory`]: socket_patch_core::patch::redirect::upstream::HostedInventory
+pub(crate) async fn hosted_inventory(
+    common: &crate::args::GlobalArgs,
+    root: &Path,
+) -> socket_patch_core::patch::redirect::upstream::HostedInventory {
+    socket_patch_core::patch::redirect::upstream::HostedInventory::of(
+        &discover_wiring(common, root).await,
+    )
+}
+
+/// The project's hosted state, v5-style: v5 hosted mode keeps no ledger,
+/// so the hosted pins [`discover_wiring`] finds in the lockfiles are the
+/// whole record. Shaped as a [`RedirectState`] for the readers that classify
+/// hosted against vendored state (one uuid-only record per pinned purl, no
+/// edits) — it is never persisted.
+///
+/// [`RedirectState`]: socket_patch_core::patch::redirect::RedirectState
+pub(crate) async fn hosted_state_from_lockfiles(
+    common: &crate::args::GlobalArgs,
+    root: &Path,
+) -> socket_patch_core::patch::redirect::RedirectState {
+    hosted_state_from_pins(&socket_patch_core::patch::redirect::upstream::HostedPin::all(
+        &discover_wiring(common, root).await,
+    ))
+}
+
+/// [`hosted_state_from_lockfiles`] over already-discovered pins. A purl
+/// pinned to several uuids (different lockfiles) keeps the first.
+pub(crate) fn hosted_state_from_pins(
+    pins: &[socket_patch_core::patch::redirect::upstream::HostedPin],
+) -> socket_patch_core::patch::redirect::RedirectState {
+    let mut state = socket_patch_core::patch::redirect::RedirectState::new();
+    for pin in pins {
+        state
+            .records
+            .entry(pin.purl.clone())
+            .or_insert_with(|| socket_patch_core::manifest::schema::PatchRecord {
+                uuid: pin.uuid.clone(),
+                exported_at: String::new(),
+                files: Default::default(),
+                vulnerabilities: Default::default(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            });
     }
+    state
 }
 
 /// Read-only lenient load of the vendor ledger (`.socket/vendor/state.json`):
 /// missing → an empty ledger; malformed/unreadable → `None` with the
-/// problem surfaced on stderr unless `silent`. The vendor twin of
-/// [`load_redirect_state_lenient`], with the same posture: a read-only
+/// problem surfaced on stderr unless `silent`. A read-only
 /// consumer (`list`) degrades a broken ledger to nothing-to-consult but
 /// must say so, while every path that writes or attests from it fails
 /// closed instead.

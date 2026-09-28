@@ -39,8 +39,9 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   committed shrinkwrap). npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
-  line; ledger-recorded as `redirect_npmrc_allow_remote` and removed again by
-  `rollback` / `remove` / the vendored takeover) and always warns
+  line; once `rollback` / `remove` / the vendored takeover has restored the last
+  hosted lock entry, a file holding only that line is deleted, otherwise the line
+  stays with an `npm_allow_remote_left` warning) and always warns
   `redirect_npm_allow_remote` with the tradeoff (any url-resolved dependency is
   then admitted; sha512 pins stay enforced). Commit `.npmrc` with the lock. An
   explicit user `allow-remote=none` / `root` is respected (never rewritten or
@@ -107,9 +108,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   malformed binary locks fail closed before patching. Hosted → vendored and
   vendored → hosted conversions both work
   in place (mode takeover) — on a lock the vendored backend refuses (a pre-version-2
-  `workspace:` lock) `vendor` reports the refusal before the hosted revert and leaves the
-  purl hosted-patched — and `rollback <purl>` / `remove <purl>` unwind one of several
-  hosted bun redirects.
+  `workspace:` lock) `vendor` reports the refusal before the upstream restore and leaves the
+  purl hosted-patched — and `rollback <purl>` / `remove <purl>` restore one of several
+  hosted bun packages to its upstream registry entry. A hosted `bun.lockb` entry is not
+  rolled back (v5.0 keeps no hosted ledger, and a rebuilt binary record is not byte-exact
+  for every lock): rollback and remove refuse it with the `git checkout -- bun.lockb`
+  remedy, while the hosted → vendored takeover rebuilds its npm registry record natively
+  and vendors over it.
   Bun verifies the sha512 of URL and local-tarball tuples only from 1.3.10 (registry
   tuples from 1.2.0), so on 1.1.39–1.3.9 a hosted or vendored rewrite removes digest
   enforcement for the patched package. Every boundary here is measured against real
@@ -295,9 +300,9 @@ claimed only for `en`-equivalent locales (`LANG` unset, `C`, `POSIX` or `en_US`)
 test job sets `LANG=C` and `LC_ALL=C`. Vendored ownership and revert match by entry text,
 so they do not depend on the order.
 
-**Compatibility of ledgers.** vlt ledgers (`redirect_vlt_lock_node` hosted edits and
-`flavor: "vlt"` vendored entries) require the socket-patch release that adds vlt support:
-an older release does not understand them.
+**Compatibility of ledgers.** vlt vendor ledgers (`flavor: "vlt"` entries) require the
+socket-patch release that adds vlt support: an older release does not understand them.
+Hosted vlt pins need no ledger (v5.0): `rollback` restores them from the npm registry.
 
 ## Maven & NuGet caveats
 

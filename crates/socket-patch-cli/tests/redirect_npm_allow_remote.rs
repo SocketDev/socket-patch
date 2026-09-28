@@ -11,14 +11,21 @@
 //! The hosted run therefore AUTO-CONFIGURES it (the npm twin of the pnpm
 //! `trustLockfile` auto-config): it ensures `allow-remote=all` in the project
 //! `.npmrc` (created, or one line appended with every other byte kept),
-//! records the edit in the redirect ledger (`redirect_npmrc_allow_remote`)
-//! so `rollback` removes exactly what it added, respects an explicit other
-//! user value, honors `--no-npm-allow-remote-config` /
+//! respects an explicit other user value, honors `--no-npm-allow-remote-config` /
 //! `SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG` and `--dry-run`, and ALWAYS warns
 //! (`redirect_npm_allow_remote`) with the whole-tree tradeoff — while a
 //! project whose npm-family redirect is not in an npm lock stays quiet.
 //!
-//! Hermetic: wiremock API, the built binary, no npm needed.
+//! v5 hosted mode keeps no ledger, so nothing records WHICH `.npmrc` bytes
+//! the run wrote. When `rollback` / `remove` restore the last npm-lock pin
+//! to its upstream registry entry, the `.npmrc` is deleted only when it is
+//! still byte-identical to the file a hosted run creates; any other file
+//! (the user's, or one hosted mode appended to) is kept as-is, and a line
+//! `allow-remote=all` left in it is reported (`npm_allow_remote_left`) for
+//! the user to remove if nothing else needs it.
+//!
+//! Hermetic: wiremock API + wiremock npm registry (`SOCKET_NPM_REGISTRY`,
+//! for the upstream restore), the built binary, no npm needed.
 
 use std::path::Path;
 
@@ -37,6 +44,7 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const CODE: &str = "redirect_npm_allow_remote";
+const LEFT: &str = "npm_allow_remote_left";
 
 fn hosted_url() -> String {
     format!(
@@ -89,6 +97,18 @@ async fn mock_api(server: &MockServer) {
                 }],
                 "registryOverride": null
             }}
+        })))
+        .mount(server)
+        .await;
+    // The npm registry's version document (the upstream restore's source).
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": NAME, "version": VERSION,
+            "dist": {
+                "tarball": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                "integrity": UPSTREAM_SHA512,
+            }
         })))
         .mount(server)
         .await;
@@ -225,44 +245,52 @@ fn allow_remote_warning(doc: &Value) -> Option<&str> {
         .and_then(|w| w["detail"].as_str())
 }
 
-/// The recorded `.npmrc` ledger edits (`(action, key, new)`).
-fn npmrc_edits(root: &Path) -> Vec<(String, String, String)> {
-    let Ok(text) = std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")) else {
-        return Vec::new();
-    };
-    let ledger: Value = serde_json::from_str(&text).unwrap();
-    ledger["edits"]
+/// v5 hosted mode records the `.npmrc` edit nowhere: no ledger is written.
+fn assert_no_ledger(root: &Path) {
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "hosted mode keeps no ledger"
+    );
+}
+
+/// The run-level warning `code` of a rollback/remove envelope, if any.
+fn run_warning<'a>(doc: &'a Value, code: &str) -> Option<&'a str> {
+    doc["warnings"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|e| e["kind"] == "redirect_npmrc_allow_remote")
-        .map(|e| {
-            assert_eq!(e["path"], ".npmrc", "{e}");
-            (
-                e["action"].as_str().unwrap().to_string(),
-                e["key"].as_str().unwrap().to_string(),
-                e["new"].as_str().unwrap().to_string(),
-            )
-        })
-        .collect()
+        .find(|w| w["code"] == code)
+        .and_then(|w| w["detail"].as_str())
 }
 
-fn rollback(cwd: &Path, extra: &[&str]) -> (i32, Value) {
+/// The args + env every hosted rollback/remove needs here: the mock patch
+/// host recognized as hosted, and the npm registry pointed at the mock.
+fn hosted_unwind_env(server: &MockServer) -> (String, [&'static str; 2]) {
+    (
+        format!("{}/npm-registry", server.uri()),
+        ["--patch-server-url", "http://patch.test"],
+    )
+}
+
+fn rollback(cwd: &Path, server: &MockServer, extra: &[&str]) -> (i32, Value) {
     let cwd_s = cwd.to_str().unwrap().to_string();
+    let (registry, flags) = hosted_unwind_env(server);
     let mut args = vec!["rollback", "--json", "--cwd", &cwd_s];
+    args.extend_from_slice(&flags);
     args.extend_from_slice(extra);
-    let (code, stdout, stderr) = run_isolated(cwd, &args, &[]);
+    let (code, stdout, stderr) =
+        run_isolated(cwd, &args, &[("SOCKET_NPM_REGISTRY", registry.as_str())]);
     let doc = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
     (code, doc)
 }
 
 /// A package-lock.json redirect CREATES `.npmrc` with exactly
-/// `allow-remote=all`, records a `created` ledger edit, and warns (JSON +
-/// human) with the npm 12 failure, the whole-tree tradeoff and the opt-out;
-/// the idempotent re-run records nothing new and still warns (the
-/// already-set variant); `rollback` deletes the file it created and
-/// restores the lock.
+/// `allow-remote=all` (no ledger records it), and warns (JSON + human) with
+/// the npm 12 failure, the whole-tree tradeoff and the opt-out; the
+/// idempotent re-run changes nothing and still warns (the already-set
+/// variant); `rollback` restores the lock to its upstream entry and deletes
+/// the still-pristine `.npmrc` the run created.
 #[tokio::test]
 async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
     let server = MockServer::start().await;
@@ -290,10 +318,7 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
         "allow-remote=all\n"
     );
-    assert_eq!(
-        npmrc_edits(tmp.path()),
-        vec![("created".into(), "allow-remote".into(), "all".into())]
-    );
+    assert_no_ledger(tmp.path());
     // The `.npmrc` write rides the hosted run's lock window: the lock is
     // released (unlinked) when the run ends.
     assert!(
@@ -309,7 +334,12 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
         detail.contains("already sets `allow-remote=all`"),
         "{detail}"
     );
-    assert_eq!(npmrc_edits(tmp.path()).len(), 1, "no duplicate ledger edit");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
+        "allow-remote=all\n",
+        "no duplicate line"
+    );
+    assert_no_ledger(tmp.path());
 
     // Human output: one line by default, the full text under --verbose;
     // --silent mutes it.
@@ -331,7 +361,7 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
     assert!(!stderr.contains(CODE), "--silent is errors only: {stderr}");
 
     // Rollback: the created .npmrc is deleted with the lock redirect.
-    let (code, doc) = rollback(tmp.path(), &[]);
+    let (code, doc) = rollback(tmp.path(), &server, &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert!(!tmp.path().join(".npmrc").exists(), "{doc:#}");
     // (The npm writer normalizes the trailing newline; compare the JSON.)
@@ -340,10 +370,7 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
         json(&std::fs::read(tmp.path().join("package-lock.json")).unwrap()),
         json(&pristine)
     );
-    assert!(!tmp
-        .path()
-        .join(".socket/vendor/redirect-state.json")
-        .exists());
+    assert!(run_warning(&doc, LEFT).is_none(), "{doc:#}");
     assert!(
         !tmp.path().join(".socket").exists(),
         "a fully unwound hosted project keeps no .socket/ residue: {doc:#}"
@@ -351,9 +378,11 @@ async fn package_lock_redirect_writes_npmrc_warns_and_rollback_removes_it() {
 }
 
 /// An existing `.npmrc` (BOM + CRLF, no allow-remote) gets exactly one
-/// appended line in its own line ending; a user edit made AFTER the scan
-/// survives rollback, which removes only the appended line. The shrinkwrap
-/// flavor is configured the same way.
+/// appended line in its own line ending. With no ledger recording the
+/// append, rollback never edits a file the user owns: the `.npmrc` (and a
+/// user edit made AFTER the scan) survives byte-for-byte, and the leftover
+/// `allow-remote=all` line is reported (`npm_allow_remote_left`). The
+/// shrinkwrap flavor is configured the same way.
 #[tokio::test]
 async fn existing_npmrc_gets_one_line_and_rollback_keeps_user_edits() {
     let server = MockServer::start().await;
@@ -374,22 +403,24 @@ async fn existing_npmrc_gets_one_line_and_rollback_keeps_user_edits() {
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
         format!("{user}allow-remote=all\r\n")
     );
-    assert_eq!(
-        npmrc_edits(tmp.path()),
-        vec![("added".into(), "allow-remote".into(), "all".into())]
-    );
+    assert_no_ledger(tmp.path());
 
     // The user keeps editing the file after the scan.
     let mut live = std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap();
     live.push_str("fund=false\r\n");
     std::fs::write(tmp.path().join(".npmrc"), &live).unwrap();
 
-    let (code, doc) = rollback(tmp.path(), &[]);
+    let (code, doc) = rollback(tmp.path(), &server, &[]);
     assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(doc["hosted"]["reverted"], json!([PURL]), "{doc:#}");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
-        format!("{user}fund=false\r\n"),
-        "only the appended line is removed"
+        live,
+        "a user-owned .npmrc is never edited by the restore"
+    );
+    assert!(
+        run_warning(&doc, LEFT).is_some_and(|d| d.contains("allow-remote=all")),
+        "the leftover line is reported: {doc:#}"
     );
     // The reversal prunes the emptied `.socket/` — never the user's
     // `.npmrc`, which lives outside it and keeps their settings.
@@ -399,8 +430,8 @@ async fn existing_npmrc_gets_one_line_and_rollback_keeps_user_edits() {
     );
 }
 
-/// An explicit other value (`none` / `root`) is RESPECTED — never rewritten,
-/// no ledger edit — and named with the manual remedy; an `allow_remote`
+/// An explicit other value (`none` / `root`) is RESPECTED — never rewritten
+/// — and named with the manual remedy; an `allow_remote`
 /// spelling npm does not honor in `.npmrc` is left alone and the real key
 /// appended; an existing `allow-remote=all` is kept (already-set warning).
 #[tokio::test]
@@ -426,7 +457,7 @@ async fn explicit_values_are_respected_and_unhonored_spellings_are_not_trusted()
             npmrc,
             "an explicit user setting is never rewritten"
         );
-        assert!(npmrc_edits(tmp.path()).is_empty());
+        assert_no_ledger(tmp.path());
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -448,9 +479,9 @@ async fn explicit_values_are_respected_and_unhonored_spellings_are_not_trusted()
     assert!(
         allow_remote_warning(&doc).is_some_and(|d| d.contains("already sets `allow-remote=all`"))
     );
-    assert!(npmrc_edits(tmp.path()).is_empty());
+    assert_no_ledger(tmp.path());
     // A user-owned setting survives rollback untouched.
-    let (code, doc) = rollback(tmp.path(), &[]);
+    let (code, doc) = rollback(tmp.path(), &server, &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
@@ -506,7 +537,7 @@ async fn opt_out_dry_run_and_unredirected_projects() {
             !tmp.path().join(".npmrc").exists(),
             "opt-out writes nothing"
         );
-        assert!(npmrc_edits(tmp.path()).is_empty());
+        assert_no_ledger(tmp.path());
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -563,7 +594,7 @@ async fn symlinked_npmrc_is_left_alone() {
         std::fs::read_to_string(tmp.path().join("shared.npmrc")).unwrap(),
         "fund=false\n"
     );
-    assert!(npmrc_edits(tmp.path()).is_empty());
+    assert_no_ledger(tmp.path());
 }
 
 /// Review findings, end to end:
@@ -573,8 +604,9 @@ async fn symlinked_npmrc_is_left_alone() {
 ///   below it is respected (writing above it would not have taken effect);
 /// - a CR-only file without the key is never spliced (manual remedy);
 /// - a section-scoped `allow-remote=all` (inert to npm) gets our top-level
-///   line, and rollback removes exactly ours instead of refusing the two
-///   copies as ambiguous.
+///   line; rollback restores the lock without editing the user's file (the
+///   section copy never makes the restore ambiguous or refused) and reports
+///   the leftover line.
 #[tokio::test]
 async fn npm_ini_line_and_section_rules_are_honored() {
     let server = MockServer::start().await;
@@ -599,7 +631,7 @@ async fn npm_ini_line_and_section_rules_are_honored() {
             npmrc,
             "an explicit value is never flipped"
         );
-        assert!(npmrc_edits(tmp.path()).is_empty());
+        assert_no_ledger(tmp.path());
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -617,7 +649,7 @@ async fn npm_ini_line_and_section_rules_are_honored() {
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
         cr_only
     );
-    assert!(npmrc_edits(tmp.path()).is_empty());
+    assert_no_ledger(tmp.path());
 
     let tmp = tempfile::tempdir().unwrap();
     write_npm_project(tmp.path(), "package-lock.json");
@@ -629,22 +661,24 @@ async fn npm_ini_line_and_section_rules_are_honored() {
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
         format!("allow-remote=all\n{sectioned}")
     );
-    let (code, doc) = rollback(tmp.path(), &[]);
+    let (code, doc) = rollback(tmp.path(), &server, &[]);
     assert_eq!(
         code, 0,
-        "the section copy must not make the unwind ambiguous: {doc:#}"
+        "the section copy must not make the restore ambiguous: {doc:#}"
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
-        sectioned
+        format!("allow-remote=all\n{sectioned}"),
+        "a user-owned .npmrc is never edited by the restore"
     );
+    assert!(run_warning(&doc, LEFT).is_some(), "{doc:#}");
 }
 
 /// Review finding: only the project `.npmrc` was consulted. An explicit
 /// `allow-remote` in the env (which beats the project file) or in the
 /// user / global npm config (a machine / org policy a committed project
-/// line would silently override) is now respected — nothing written, no
-/// ledger edit — and the warning names the source and the remedy.
+/// line would silently override) is now respected — nothing written — and
+/// the warning names the source and the remedy.
 #[tokio::test]
 async fn outer_npm_config_layers_are_respected() {
     let server = MockServer::start().await;
@@ -680,7 +714,7 @@ async fn outer_npm_config_layers_are_respected() {
         !tmp.path().join(".npmrc").exists(),
         "no project override written"
     );
-    assert!(npmrc_edits(tmp.path()).is_empty());
+    assert_no_ledger(tmp.path());
 
     // global config under <prefix>/etc/npmrc, the prefix relocated the
     // way npm allows from the env (`npm_config_prefix` — it outranks the
@@ -756,10 +790,11 @@ async fn outer_npm_config_layers_are_respected() {
     );
 }
 
-/// Review finding: `remove` dropped the hosted leg's warnings, so a
-/// redirect-created `.npmrc` the user had since added to was rewritten
-/// with no `redirect_npmrc_allow_remote_modified` (CLI_CONTRACT promises
-/// it in rollback/remove `warnings[]`). Human stderr and JSON both carry it.
+/// Review finding: `remove` dropped the hosted leg's warnings. A
+/// redirect-created `.npmrc` the user has since added to is no longer the
+/// scaffold, so the restore keeps it byte-for-byte and warns that the
+/// `allow-remote=all` line is left (`npm_allow_remote_left`, in
+/// rollback/remove `warnings[]`). Human stderr and JSON both carry it.
 #[tokio::test]
 async fn remove_surfaces_the_npmrc_modified_warning() {
     let server = MockServer::start().await;
@@ -772,11 +807,17 @@ async fn remove_surfaces_the_npmrc_modified_warning() {
         std::fs::write(tmp.path().join(".npmrc"), "allow-remote=all\nfund=false\n").unwrap();
 
         let cwd_s = tmp.path().to_str().unwrap().to_string();
+        let (registry, flags) = hosted_unwind_env(&server);
         let mut args = vec!["remove", PURL, "--yes", "--cwd", &cwd_s];
+        args.extend_from_slice(&flags);
         if json {
             args.push("--json");
         }
-        let (code, stdout, stderr) = run_isolated(tmp.path(), &args, &[]);
+        let (code, stdout, stderr) = run_isolated(
+            tmp.path(),
+            &args,
+            &[("SOCKET_NPM_REGISTRY", registry.as_str())],
+        );
         assert_eq!(code, 0, "{stdout}\n{stderr}");
         if json {
             let doc: Value = serde_json::from_str(&stdout)
@@ -786,7 +827,7 @@ async fn remove_surfaces_the_npmrc_modified_warning() {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .any(|w| w["code"] == "redirect_npmrc_allow_remote_modified"),
+                    .any(|w| w["code"] == LEFT),
                 "{doc:#}"
             );
             assert!(
@@ -794,14 +835,18 @@ async fn remove_surfaces_the_npmrc_modified_warning() {
                 "--json keeps stderr quiet: {stderr}"
             );
         } else {
-            assert!(
-                stderr.contains("Warning: "),
-                "{stderr}"
-            );
+            assert!(stderr.contains("Warning: "), "{stderr}");
         }
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(".npmrc")).unwrap(),
-            "fund=false\n"
+            "allow-remote=all\nfund=false\n",
+            "a modified .npmrc is kept byte-for-byte"
+        );
+        assert!(
+            !std::fs::read_to_string(tmp.path().join("package-lock.json"))
+                .unwrap()
+                .contains("patch.test"),
+            "the lock is back on the registry"
         );
     }
 }

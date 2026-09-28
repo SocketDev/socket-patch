@@ -215,7 +215,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    # Windows runs the same suite ~1.6x slower than macOS: on the base
+    # branch it already took 34m40s of a flat 35m budget.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 50 || 35 }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
