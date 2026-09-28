@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use socket_patch_core::formats::registry;
-use socket_patch_core::utils::python_lock::is_python_lock_name;
+use crate::formats::registry;
+use crate::utils::python_lock::is_python_lock_name;
 
 use super::types::IgnoredPath;
 

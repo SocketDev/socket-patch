@@ -1310,20 +1310,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
         vendor_scope.extend(vendor_entries.iter().map(|(k, _)| k.clone()));
         hosted_scope.extend(redirect_records.iter().map(|(p, _)| p.clone()));
     }
+    let ledgers = socket_patch_core::ledgers::Ledgers {
+        manifest: Some(&manifest),
+        vendor: vendor_state_result.as_ref().ok(),
+        redirect: None,
+    };
     for id in &identifiers {
-        let mut matched = false;
-        for (purl, patch) in &manifest.patches {
-            if patch_matches(purl, &patch.uuid, id) {
-                manifest_scope.insert(purl.clone());
-                matched = true;
-            }
-        }
-        for (key, entry) in &vendor_entries {
-            if entry.matches_identifier(key, id) {
-                vendor_scope.insert(key.clone());
-                matched = true;
-            }
-        }
+        let found = ledgers.matching(id);
+        let mut matched = !found.is_empty();
+        manifest_scope.extend(found.manifest);
+        vendor_scope.extend(found.vendor.into_iter().map(|(k, _)| k));
+        // Hosted pins live in the lockfiles, not in a store.
         for (purl, uuid) in &redirect_records {
             if patch_matches(purl, uuid, id) {
                 hosted_scope.insert(purl.clone());
