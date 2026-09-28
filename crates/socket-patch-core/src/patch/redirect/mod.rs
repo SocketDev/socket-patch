@@ -5157,7 +5157,10 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
     // socket-only and every other package would fail. Seed the implicit default
     // nuget.org source so the catch-all has a real target (unless the config
     // already has one). Only relevant when we are about to CREATE the mapping.
-    let creating_mapping = !out.contains("<packageSourceMapping>");
+    // The open tag may carry whitespace or attributes (`<packageSourceMapping >`
+    // is valid XML); a literal probe reads it as absent and authors a
+    // DUPLICATE section.
+    let creating_mapping = nuget_mapping_open_end(&out).is_none();
     // "Already has one" is decided by the parsed <packageSources> keys ALONE:
     // a whole-file "nuget.org" probe is satisfied by text that defines no
     // source (a defaultPushSource URL, a <disabledPackageSources> entry, a
@@ -5180,8 +5183,8 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> O
         // already covered.
         // After any `<clear />` in the section: NuGet drops every mapping
         // read before one, leaving the patched id routed nowhere.
-        let open_end = out.find("<packageSourceMapping>")? + "<packageSourceMapping>".len();
-        let at = nuget_after_last_clear(&out, open_end, "</packageSourceMapping>");
+        let open_end = nuget_mapping_open_end(&out)?;
+        let at = nuget_after_last_clear(&out, open_end, "packageSourceMapping");
         out = format!("{}\n{socket_mapping}{}", &out[..at], &out[at..]);
     } else {
         // Creating the mapping from scratch. Once ANY <packageSourceMapping>
@@ -5256,7 +5259,7 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
     {
         // After any `<clear />`: NuGet drops every source read before one,
         // so the mapping would point at an undefined source (NU1100).
-        let end = nuget_after_last_clear(config, m.end(), "</packageSources>");
+        let end = nuget_after_last_clear(config, m.end(), "packageSources");
         Some(format!(
             "{}\n{source_line}{}",
             &config[..end],
@@ -5278,16 +5281,42 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
     }
 }
 
-/// The offset just past the last `<clear />` between `from` and the next
-/// `close` tag, else `from`.
-fn nuget_after_last_clear(config: &str, from: usize, close: &str) -> usize {
+/// The offset just past the `<packageSourceMapping>` open tag (any whitespace
+/// or attributes), or `None` when the config has no open/close section — a
+/// self-closing `<packageSourceMapping />` holds no children to append to.
+fn nuget_mapping_open_end(config: &str) -> Option<usize> {
+    static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"<packageSourceMapping(?:\s[^>]*)?>")
+            .expect("static packageSourceMapping open-tag regex is valid")
+    });
+    OPEN_RE
+        .find(config)
+        .filter(|m| !m.as_str().ends_with("/>"))
+        .map(|m| m.end())
+}
+
+/// The offset just past the last `<clear />` between `from` and the `section`
+/// element's close tag (any whitespace before `>`), else `from`. Comments are
+/// skipped: a commented-out `<clear />` clears nothing, and anchoring on it
+/// would splice the new entry INSIDE the comment.
+fn nuget_after_last_clear(config: &str, from: usize, section: &str) -> usize {
     static CLEAR_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"<clear\s*/>").expect("static clear-tag regex is valid"));
-    let Some(len) = config[from..].find(close) else {
+    static COMMENT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("static comment regex is valid"));
+    // Blank comment bytes in place so offsets still index `config`.
+    let mut masked = config[from..].as_bytes().to_vec();
+    for m in COMMENT_RE.find_iter(&config[from..]) {
+        masked[m.range()].fill(b' ');
+    }
+    let masked = String::from_utf8(masked).expect("only whole comments are blanked");
+    let close_re =
+        Regex::new(&format!(r"</{section}\s*>")).expect("section close-tag regex is valid");
+    let Some(close) = close_re.find(&masked) else {
         return from;
     };
     CLEAR_RE
-        .find_iter(&config[from..from + len])
+        .find_iter(&masked[..close.start()])
         .last()
         .map_or(from, |m| from + m.end())
 }
@@ -8345,6 +8374,58 @@ mod tests {
         assert!(
             out.contains("  <disabledPackageSources>\n    <clear />\n  </disabledPackageSources>"),
             "a <clear /> in another section is not an anchor: {out}"
+        );
+    }
+
+    /// Close tags with whitespace before `>` are valid XML: a literal probe
+    /// misses the section, falls back to the open tag and lands the Socket
+    /// entries ahead of the `<clear />` that drops them.
+    #[test]
+    fn nuget_after_clear_tolerates_spaced_tags() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources >\n    <clear />\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources >\n  <packageSourceMapping >\n    <clear />\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>\n  </packageSourceMapping >\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains("  <packageSources >\n    <clear />\n    <add key=\"socket-patch-uuid\""),
+            "socket source after <clear />: {out}"
+        );
+        assert!(
+            out.contains(
+                "  <packageSourceMapping >\n    <clear />\n    <packageSource key=\"socket-patch-uuid\">"
+            ),
+            "socket mapping after the mapping's <clear />: {out}"
+        );
+        assert_eq!(
+            out.matches("<packageSourceMapping").count(),
+            1,
+            "no duplicate mapping section: {out}"
+        );
+    }
+
+    /// A commented-out `<clear />` clears nothing; anchoring on it would
+    /// splice the Socket source inside the comment.
+    #[test]
+    fn nuget_commented_clear_is_not_an_anchor() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n    <!-- <clear /> -->\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains("    <clear />\n    <add key=\"socket-patch-uuid\""),
+            "socket source after the real <clear />: {out}"
+        );
+        assert!(
+            out.contains("    <!-- <clear /> -->\n"),
+            "comment left intact: {out}"
         );
     }
 
