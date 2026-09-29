@@ -866,166 +866,9 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod parse_reuse_tests {
-    //! Shared by the pdm parse-reuse oracles: the previous
-    //! [`rewrite_pdm_lock_with_edits`], kept verbatim, and the native
-    //! fixtures grown to several packages.
+    //! Shared by the pdm parse-reuse sweeps: the native fixtures grown to
+    //! several packages, and the dep steps rewritten over them.
     use super::*;
-
-    pub(crate) fn rewrite_pdm_lock_with_edits_oracle<'a>(
-        text: &'a str,
-        name: &'a str,
-        version: &str,
-        source: (&str, &str),
-        filename: &str,
-        sha256: &str,
-    ) -> Result<PdmLockRewrite<'a>, String> {
-        let (kind, location) = source;
-        if !matches!(kind, "url" | "path")
-            || sha256.len() != 64
-            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err("invalid PDM artifact source or SHA-256".into());
-        }
-        if !wheel_matches(filename, name, version) {
-            return Err("PDM patch wheel does not match package".into());
-        }
-        let mut lock: DocumentMut = text.parse().map_err(|e| format!("invalid PDM lock: {e}"))?;
-        lock_version(&lock)?;
-        validate_strategy(&lock)?;
-        let packages = lock
-            .get("package")
-            .and_then(Item::as_array_of_tables)
-            .ok_or("missing PDM packages")?;
-        let indices: Vec<_> = packages
-            .iter()
-            .enumerate()
-            .filter(|(_, package)| {
-                package
-                    .get("name")
-                    .and_then(Item::as_str)
-                    .is_some_and(|candidate| {
-                        canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
-                    })
-            })
-            .map(|(index, _)| index)
-            .collect();
-        if indices.is_empty() {
-            return Err("missing PDM package".into());
-        }
-        // A marker/multi-target lock (PDM >= 2.17 `pdm lock --append`) can carry the
-        // same package at several versions, one per resolution fork. A single
-        // surgical rewrite would patch one fork and leave the others pinned to the
-        // registry, so refuse the whole lock ahead of the per-unit version check —
-        // the target version IS present, so the plain "version differs" below would
-        // misdirect the user to re-lock.
-        let locked_versions: std::collections::BTreeSet<&str> = indices
-            .iter()
-            .filter_map(|&index| packages.get(index)?.get("version").and_then(Item::as_str))
-            .collect();
-        if locked_versions.len() > 1 {
-            return Err(
-                "PDM lock resolves this package at multiple versions (a marker or \
-                        multi-target fork); patching one fork would leave the others unpatched"
-                    .into(),
-            );
-        }
-        let mut variants = std::collections::BTreeSet::new();
-        let mut edits = Vec::new();
-        for index in indices {
-            let package = packages.get(index).ok_or("missing PDM package")?;
-            if package.get("version").and_then(Item::as_str) != Some(version) {
-                return Err("PDM locked version differs from installed version".into());
-            }
-            let mut extras = Vec::new();
-            if let Some(value) = package.get("extras") {
-                for extra in value.as_array().ok_or("invalid PDM extras")? {
-                    extras.push(extra.as_str().ok_or("invalid PDM extra")?.to_string());
-                }
-            }
-            extras.sort();
-            if !variants.insert(extras) {
-                return Err("forked PDM package".into());
-            }
-            for field in [
-                "url", "path", "git", "hg", "svn", "bzr", "editable", "source",
-            ] {
-                if let Some(existing) = package.get(field) {
-                    let same_target = field == kind && existing.as_str() == Some(location);
-                    // A prior socket-hosted `url` (rotated grant token or a
-                    // superseded patch uuid — same origin and wheel leaf) is taken
-                    // over in place; foreign urls and every other source refuse.
-                    let prior_hosted = field == kind
-                        && kind == "url"
-                        && existing
-                            .as_str()
-                            .is_some_and(|existing| is_prior_hosted_url(existing, location));
-                    if !same_target && !prior_hosted {
-                        return Err(format!("refusing existing PDM {field} source"));
-                    }
-                }
-            }
-            let original_files = files_for(&lock, package).ok_or("missing PDM file hashes")?;
-            if original_files.is_empty()
-                || original_files.iter().any(|file| {
-                    !file
-                        .as_inline_table()
-                        .and_then(|file| file.get("hash"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|hash| {
-                            hash.strip_prefix("sha256:").is_some_and(|hex| {
-                                hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            })
-                        })
-                })
-            {
-                return Err("invalid PDM file hashes".into());
-            }
-            let files_key = legacy_files_key(package).ok_or("missing PDM files key")?;
-            edits.push((index, package.contains_key("files"), files_key));
-        }
-        for (index, inline_files, files_key) in edits {
-            let mut file = InlineTable::new();
-            file.insert("file", Value::from(filename));
-            file.insert(
-                "hash",
-                Value::from(format!("sha256:{}", sha256.to_ascii_lowercase())),
-            );
-            let mut files = Array::new();
-            files.push(file);
-            let package = lock
-                .get_mut("package")
-                .and_then(Item::as_array_of_tables_mut)
-                .and_then(|packages| packages.get_mut(index))
-                .ok_or("missing PDM package")?;
-            package.insert(kind, value(location));
-            if inline_files {
-                package.insert("files", value(files));
-            } else {
-                let table = lock
-                    .get_mut("metadata")
-                    .and_then(|metadata| metadata.get_mut("files"))
-                    .and_then(Item::as_table_like_mut)
-                    .ok_or("missing PDM metadata.files")?;
-                table.insert(&files_key, value(files));
-            }
-        }
-        let rendered = preserve_line_endings(text, lock.to_string());
-        let before = pdm_lock_fragments(text, name)?;
-        let after = pdm_lock_fragments(&rendered, name)?;
-        let edits = pair_pdm_lock_fragments(text, &before, &rendered, after)?;
-        let mut result = text.to_string();
-        for (old, new) in &edits {
-            result = result.replacen(old, new, 1);
-        }
-        let known_edits = (result == rendered).then_some(edits);
-        Ok(PdmLockRewrite {
-            text: result,
-            original: text,
-            name,
-            before,
-            known_edits,
-        })
-    }
 
     /// Every native pdm lock generation in `tests/fixtures/pdm-native`.
     pub(crate) fn fixtures() -> Vec<(String, String)> {
@@ -1156,49 +999,41 @@ pub(crate) mod parse_reuse_tests {
     }
 
     #[test]
-    fn reused_parse_matches_the_fresh_parse_rewrite() {
+    fn reused_parse_matches_golden() {
+        let mut golden = crate::golden::Golden::new(
+            "pdm_lock_reused_parse",
+            "One rewrite step over a grown pdm.lock: the text and edits, or the refusal.",
+        );
         let mut landed = 0;
-        for (fixture, lock) in fixtures() {
+        for (_, lock) in fixtures() {
             for extra in [0, 3] {
                 for crlf in [false, true] {
                     let mut lock = grown(&lock.replace("\r\n", "\n"), extra);
                     if crlf {
                         lock = lock.replace('\n', "\r\n");
                     }
-                    let (mut want_text, mut got_text) = (lock.clone(), lock);
+                    let mut got_text = lock;
                     let mut parse = PdmLockParse::default();
-                    for (i, (name, version, (kind, location), sha)) in
-                        steps(extra).iter().enumerate()
-                    {
-                        let what = format!("{fixture} extra={extra} crlf={crlf} step {i}");
+                    for (name, version, (kind, location), sha) in steps(extra).iter() {
                         let filename = location.rsplit('/').next().unwrap();
                         let source = (kind.as_str(), location.as_str());
-                        let want = rewrite_pdm_lock_with_edits_oracle(
-                            &want_text, name, version, source, filename, sha,
-                        );
                         let got = rewrite_pdm_lock_in(
                             &mut parse, &got_text, name, version, source, filename, sha,
                         );
-                        match (want, got) {
-                            (Err(w), Err(g)) => assert_eq!(g, w, "{what}"),
-                            (Ok(w), Ok(g)) => {
-                                assert_eq!(g.text, w.text, "{what}: text");
-                                assert_eq!(g.edits(), w.edits(), "{what}: edits");
-                                landed += 1;
-                                want_text = w.text;
-                                got_text = g.text;
-                            }
-                            (w, g) => panic!(
-                                "{what}: verdicts differ: {:?} vs {:?}",
-                                w.map(|r| r.text),
-                                g.map(|r| r.text)
-                            ),
+                        golden.next(
+                            &(&got_text, name, version, kind, location, sha),
+                            &format!("{:?}", got.as_ref().map(|r| (&r.text, r.edits()))),
+                        );
+                        if let Ok(g) = got {
+                            landed += 1;
+                            got_text = g.text;
                         }
                     }
                 }
             }
         }
         assert!(landed > 100, "only {landed} rewrites landed");
+        golden.finish();
     }
 
     /// A parse is reused only for byte-identical text.

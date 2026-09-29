@@ -1,0 +1,6 @@
+# A uv.lock + pyproject.toml whose middle dep is refused, LF and CRLF.
+# <case> <input digest> <output digest>
+0 a2feb95faecac550 efb0c5ad3e7e4d37
+1 675efda53823ee32 05f38ded897afaa1
+2 a3fd07e7336c6ac2 5f70dfa0b238ff6a
+3 81de580200f61334 c48407e0913b0c9c

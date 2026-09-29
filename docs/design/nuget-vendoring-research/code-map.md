@@ -192,7 +192,7 @@ Run everything from `/home/user/socket-patch`.
 | `docker_e2e_nuget.rs` (apply chain, `:570`, `:607`) | Docker image `socket-patch-test-nuget:latest` | `#![cfg(feature="docker-e2e")]`; soft-skips if the image is missing (`:482`); `cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_nuget` |
 | `docker_e2e_vendor_nuget.rs` (`:472`: 3-stage vendor → cold offline `--locked-mode` restore → RED/TAMPER(NU1403) → idempotence and revert) | Docker (SDK 8.0) | `--features docker-e2e --test docker_e2e_vendor_nuget` |
 | `setup_matrix_nuget.rs` | host guard runs; `dotnet()` is `#[ignore]` (baseline gap) | `--features setup-e2e --test setup_matrix_nuget` |
-| Other hermetic CLI tests (`in_process_get_hosted_ecosystems.rs:532`, `in_process_scan.rs:1374`, `in_process_rollback_all_ecosystems.rs:552`, `e2e_safety_advisories.rs:412-671`, `ecosystem_dispatch_e2e.rs:310,986`, `vendor_ecosystem_fixtures/mod.rs:748`, `e2e_vex_vendor.rs`, `e2e_vendored_production.rs`) | nothing (production suites are canaries) | normal `cargo test -p socket-patch-cli --test <name>` |
+| Other hermetic CLI tests (`in_process_get_hosted_ecosystems.rs:532`, `in_process_scan.rs:1374`, `in_process_rollback_all_ecosystems.rs:552`, `apply/e2e_safety_advisories.rs`, `ecosystem_dispatch_e2e.rs:310,986`, `vendor_ecosystem_fixtures/mod.rs:748`, `e2e_vex_vendor.rs`, `e2e_vendored_production.rs`) | nothing (production suites are canaries) | normal `cargo test -p socket-patch-cli --test <name>` |
 
 **Docker images:** build `tests/docker/Dockerfile.base` tagged `socket-patch-test-base:latest`, then `tests/docker/Dockerfile.nuget` (FROM `mcr.microsoft.com/dotnet/sdk:8.0`, copies the binary from base) tagged `socket-patch-test-nuget:latest`.
 
