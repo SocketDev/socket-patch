@@ -103,7 +103,6 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
         ghsa: false,
         package: false,
         save_only: true,
-        one_off: false,
         all_releases: false,
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Agent),
     }

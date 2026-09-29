@@ -2332,7 +2332,7 @@ mod tests {
     fn applied_event_emits_one_file_entry_per_patched_file() {
         let mut applied_via = HashMap::new();
         applied_via.insert("package/a.js".to_string(), CoreAppliedVia::Diff);
-        applied_via.insert("package/b.js".to_string(), CoreAppliedVia::Package);
+        applied_via.insert("package/b.js".to_string(), CoreAppliedVia::Diff);
         applied_via.insert("package/c.js".to_string(), CoreAppliedVia::Blob);
         let result = ApplyResult {
             package_key: "pkg:npm/foo@1.0.0".to_string(),
@@ -2359,7 +2359,7 @@ mod tests {
             .map(|f| (f["path"].as_str().unwrap().to_string(), f))
             .collect();
         assert_eq!(by_path["package/a.js"]["appliedVia"], "diff");
-        assert_eq!(by_path["package/b.js"]["appliedVia"], "package");
+        assert_eq!(by_path["package/b.js"]["appliedVia"], "diff");
         assert_eq!(by_path["package/c.js"]["appliedVia"], "blob");
     }
 

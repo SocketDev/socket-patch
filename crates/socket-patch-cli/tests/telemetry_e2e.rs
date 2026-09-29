@@ -137,7 +137,6 @@ fn build_cmd_with_token(
     // (`is_telemetry_disabled()` flips on `VITEST=true`).
     cmd.env_remove("VITEST");
     cmd.env_remove("SOCKET_TELEMETRY_DISABLED");
-    cmd.env_remove("SOCKET_PATCH_TELEMETRY_DISABLED");
     cmd.env_remove("SOCKET_OFFLINE");
     // An ambient VIRTUAL_ENV hijacks the python crawler (its site-packages
     // get crawled as project packages), breaking the exact

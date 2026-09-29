@@ -184,7 +184,7 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
             "min_severity",
             "max_new_patches",
         ],
-        "get" => &["id", "cve", "ghsa", "package", "save_only", "one_off", "all_releases"],
+        "get" => &["id", "cve", "ghsa", "package", "save_only", "all_releases"],
         "vex" => &["doc_id", "compact"],
         "apply" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],
         "vendor" => &["vex_product", "vex_no_verify", "vex_doc_id", "vex_compact"],

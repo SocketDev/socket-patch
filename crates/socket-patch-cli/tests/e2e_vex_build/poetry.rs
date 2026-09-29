@@ -4,7 +4,7 @@
 //! 1. a real project on `six==1.16.0`, locked by the real `poetry lock`
 //!    (PyPI is used for fixture setup only);
 //! 2. OUR CLI produces the committed state against a wiremock patch service:
-//!    hosted = `scan --redirect --vex` on the lock-only checkout (the lock is
+//!    hosted = `scan --mode hosted --vex` on the lock-only checkout (the lock is
 //!    repointed at a patched wheel the mock serves — v5 writes NO redirect
 //!    ledger — the same-run VEX attests from the lock's sha256 pin); vendored
 //!    = `scan --vendor --vendor-source build --vex` over the pristine
@@ -765,14 +765,14 @@ fn poetry_hosted_fresh_install_then_manifestless_vex() {
         &service,
         &[
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--vex",
             embedded.to_str().unwrap(),
             "--vex-product",
             PRODUCT,
         ],
     );
-    assert_eq!(code, Some(0), "scan --redirect: {env}");
+    assert_eq!(code, Some(0), "scan --mode hosted: {env}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env}");
     let lock = std::fs::read_to_string(project.join("poetry.lock")).unwrap();
     let sha = hex::encode(Sha256::digest(&wheel));

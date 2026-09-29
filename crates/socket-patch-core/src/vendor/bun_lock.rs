@@ -81,18 +81,6 @@ pub async fn cleanup_binary_workspace_artifacts(
     super::bun_workspace::cleanup(project_root, entry, dry_run).await
 }
 
-/// Snapshot member copies before a repair whose rebuilt bytes need checking
-/// against the original lockfile integrity. `None` records a missing file.
-pub type BinaryWorkspaceArtifactSnapshot = Vec<(std::path::PathBuf, Option<Vec<u8>>)>;
-
-/// Read the validated workspace artifacts, recording missing copies as well.
-pub fn snapshot_binary_workspace_artifacts(
-    project_root: &Path,
-    entry: &VendorEntry,
-) -> Result<BinaryWorkspaceArtifactSnapshot, String> {
-    super::bun_workspace::snapshot(project_root, entry)
-}
-
 /// The `WiringRecord.kind` this backend owns: key = the `packages` map key,
 /// original/new = the verbatim entry LINE.
 const KIND_LOCK_PACKAGE: &str = "bun_lock_package";

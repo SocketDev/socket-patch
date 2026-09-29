@@ -190,7 +190,7 @@ pub fn build_candidates(
             .unwrap_or_default();
         // The yarn-berry cache zip carries the `yarnBerry10c0` checksum the
         // berry rewriter pins (berry verifies the zip, not the tarball).
-        // Merge it in and carry the zip URL (None when not stored yet).
+        // Merge it in; the zip URL itself is never read.
         let berry_zip = reference
             .artifacts
             .iter()
@@ -242,7 +242,6 @@ pub fn build_candidates(
                 token,
                 patch_uuid: sel_uuid.clone(),
                 artifact_url: url,
-                berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
                 registry_override: reference.registry_override.clone(),
                 integrity,
             },

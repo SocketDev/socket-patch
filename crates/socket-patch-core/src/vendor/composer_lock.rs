@@ -54,7 +54,9 @@ use crate::formats::composer::{composer_lock_packages, ComposerLockPackage};
 use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
-use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{
+    claim_prestaged, fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
+};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -306,7 +308,9 @@ pub async fn vendor_composer<'a>(
             )
             .await
             {
-                ComposerServiceCopy::Used => already_patched_result(purl, &copy_dir, &record.files),
+                ComposerServiceCopy::Used(()) => {
+                    already_patched_result(purl, &copy_dir, &record.files)
+                }
                 ComposerServiceCopy::HardFail(outcome) => return *outcome,
                 ComposerServiceCopy::FallBack => {
                     match copy_and_patch(
@@ -390,7 +394,7 @@ pub async fn vendor_composer<'a>(
         match composer_service_copy(service, record, &pkg, &copy_dir, &uuid_dir, &mut warnings)
             .await
         {
-            ComposerServiceCopy::Used => already_patched_result(purl, &copy_dir, &record.files),
+            ComposerServiceCopy::Used(()) => already_patched_result(purl, &copy_dir, &record.files),
             ComposerServiceCopy::HardFail(outcome) => return *outcome,
             ComposerServiceCopy::FallBack => {
                 match copy_and_patch(
@@ -746,15 +750,9 @@ async fn copy_and_patch(
     Ok(result)
 }
 
-/// Outcome of attempting to materialise the composer copy from the patch service.
-enum ComposerServiceCopy {
-    /// The prebuilt dist zip was extracted into `copy_dir`.
-    Used,
-    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
-    HardFail(Box<VendorOutcome>),
-    /// Fall back to copying + patching the installed package.
-    FallBack,
-}
+/// Outcome of attempting to materialise the composer copy from the patch
+/// service (`Used`: the prebuilt dist zip was extracted into `copy_dir`).
+type ComposerServiceCopy = ServiceAttempt<()>;
 
 /// Download the prebuilt dist zip, integrity-verify it, and extract it into
 /// `copy_dir` (dropping the zip's variable top-level dir). Maps each service
@@ -774,120 +772,78 @@ async fn composer_service_copy(
     if !cfg.service_enabled() {
         return ComposerServiceCopy::FallBack;
     }
-    fn hard(code: &'static str, detail: String) -> ComposerServiceCopy {
-        ComposerServiceCopy::HardFail(Box::new(refused(code, detail)))
-    }
-    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
-        if cfg.source.requires_service() {
-            hard("vendor_prebuilt_required", reason)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            ComposerServiceCopy::FallBack
-        }
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
+    let subject = format!("dist zip for {pkg}");
+    let mut archive = match policy.settle(fetched, "dist zip", &subject, warnings) {
+        Ok(archive) => archive,
+        Err(attempt) => return attempt,
     };
-    match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(mut archive) => {
-            // Extract into a STAGE sibling and swap it into the copy dir only
-            // once fully verified — a failure then leaves any pre-existing
-            // (possibly live-wired) copy and its marker untouched and no husk
-            // behind.
-            let stage = stage_dir_for(copy_dir);
-            // A tree the download plan already extracted from these bytes
-            // (see `prestage`) is moved into the stage instead; otherwise —
-            // or should the move fail — extract here.
-            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
-                let _ = remove_tree(&stage).await;
-                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                    cleanup_failed_stage(&stage, uuid_dir, false).await;
-                    return hard(
-                        "vendor_prebuilt_write_failed",
-                        format!("cannot create {}: {e}", stage.display()),
-                    );
-                }
-                // composer dist zips carry a single variable top-level dir.
-                let zip_bytes = std::mem::take(&mut archive.bytes);
-                if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, extract_dist_zip).await
-                {
-                    cleanup_failed_stage(&stage, uuid_dir, false).await;
-                    return hard(
-                        "vendor_prebuilt_extract_failed",
-                        format!("cannot extract the prebuilt dist zip: {e}"),
-                    );
-                }
-            }
-            // Verify the EXTRACTED TREE, not just the archive bytes. The
-            // archive-bytes SRI (checked in fetch_verified_archive) proves
-            // the download is intact, but says nothing about whether the
-            // internal layout lands the patched files at the paths the
-            // record names: a zip with an unexpected wrapper dir (the
-            // single-level `strip_first` leaves an extra `pkg-<sha>/`
-            // segment) or a root-level `src/…` (over-stripped) extracts
-            // "successfully" with every file at the WRONG path, and the
-            // caller would ship a copy missing its patched files. Fail
-            // closed here and let the `auto` source fall back to the local
-            // build.
-            if !copy_matches_after_hashes(&stage, &record.files).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return miss(
-                    warnings,
-                    "vendor_prebuilt_layout_mismatch",
-                    format!(
-                        "prebuilt dist zip for {pkg} extracted to an \
-                         unexpected layout (patched files absent at their \
-                         recorded paths)"
-                    ),
-                );
-            }
-            if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
-                cleanup_failed_stage(&stage, uuid_dir, false).await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot move the extracted dist into place: {e}"),
-                );
-            }
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {pkg} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            ComposerServiceCopy::Used
+    // Extract into a STAGE sibling and swap it into the copy dir only
+    // once fully verified — a failure then leaves any pre-existing
+    // (possibly live-wired) copy and its marker untouched and no husk
+    // behind.
+    let stage = stage_dir_for(copy_dir);
+    // A tree the download plan already extracted from these bytes
+    // (see `prestage`) is moved into the stage instead; otherwise —
+    // or should the move fail — extract here.
+    if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+        let _ = remove_tree(&stage).await;
+        if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+            cleanup_failed_stage(&stage, uuid_dir, false).await;
+            return policy.hard(
+                "vendor_prebuilt_write_failed",
+                format!("cannot create {}: {e}", stage.display()),
+            );
         }
-        // Bytes that fail integrity verification are an active tamper signal:
-        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
-        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
-        ServiceArtifact::IntegrityMismatch(reason) => hard(
-            "vendor_prebuilt_integrity_mismatch",
-            format!(
-                "prebuilt dist zip for {pkg} failed integrity verification ({reason}); \
-                 refusing to fall back to a local build on tampered bytes"
-            ),
-        ),
-        ServiceArtifact::Pending => miss(
-            warnings,
-            "vendor_prebuilt_pending",
-            "prebuilt dist zip is still building".to_string(),
-        ),
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt dist zip unavailable: {reason}"),
-                )
-            } else {
-                ComposerServiceCopy::FallBack
-            }
+        // composer dist zips carry a single variable top-level dir.
+        let zip_bytes = std::mem::take(&mut archive.bytes);
+        if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, extract_dist_zip).await {
+            cleanup_failed_stage(&stage, uuid_dir, false).await;
+            return policy.hard(
+                "vendor_prebuilt_extract_failed",
+                format!("cannot extract the prebuilt dist zip: {e}"),
+            );
         }
-        ServiceArtifact::Failed(reason) => miss(
-            warnings,
-            "vendor_prebuilt_unavailable",
-            format!("patch service request failed ({reason})"),
-        ),
     }
+    // Verify the EXTRACTED TREE, not just the archive bytes. The
+    // archive-bytes SRI (checked in fetch_verified_archive) proves
+    // the download is intact, but says nothing about whether the
+    // internal layout lands the patched files at the paths the
+    // record names: a zip with an unexpected wrapper dir (the
+    // single-level `strip_first` leaves an extra `pkg-<sha>/`
+    // segment) or a root-level `src/…` (over-stripped) extracts
+    // "successfully" with every file at the WRONG path, and the
+    // caller would ship a copy missing its patched files. Fail
+    // closed here and let the `auto` source fall back to the local
+    // build.
+    if !copy_matches_after_hashes(&stage, &record.files).await {
+        cleanup_failed_stage(&stage, uuid_dir, false).await;
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!(
+                "prebuilt dist zip for {pkg} extracted to an \
+                 unexpected layout (patched files absent at their \
+                 recorded paths)"
+            ),
+        );
+    }
+    if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+        cleanup_failed_stage(&stage, uuid_dir, false).await;
+        return policy.hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot move the extracted dist into place: {e}"),
+        );
+    }
+    warnings.push(VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!(
+            "vendored {pkg} from the patch service ({})",
+            archive.source_url
+        ),
+    ));
+    ComposerServiceCopy::Used(())
 }
 
 /// Locate the package's entry: `packages[]` first, then `packages-dev[]`.

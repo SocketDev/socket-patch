@@ -39,7 +39,7 @@
 //! 1. build the project with uv from PyPI (`uv lock` + `uv sync`, `uv lock
 //!    --script`, `uv export --format pylock.toml`, `uv pip compile -o
 //!    pylock.toml` or `pip lock`) and install the PRISTINE package;
-//! 2. produce the committed state with our CLI — hosted: `scan --redirect
+//! 2. produce the committed state with our CLI — hosted: `scan --mode hosted
 //!    --vex` against a wiremock patch API that also serves the patched
 //!    wheel; vendored: `vendor --offline --vex` over a staged manifest +
 //!    blob — asserting the in-run document;
@@ -53,7 +53,7 @@
 //!    deleted (a hosted flow writes none in v5 — asserted) it still attests
 //!    from lockfile discovery + the API record; (c) `--offline` without
 //!    ledgers is `record_unavailable` with ZERO requests; (d) the embedded
-//!    `apply --vex` (+ `vendor --vex` / `scan --redirect --vex`) attest too
+//!    `apply --vex` (+ `vendor --vex` / `scan --mode hosted --vex`) attest too
 //!    (hosted: online, there is no local record); (e) the wiring reverted to
 //!    the registry files with the ledgers and artifacts left behind,
 //!    reinstalled pristine by uv, is NOT attested — verified or
@@ -557,7 +557,7 @@ fn wheel_from_installed(site: &Path, version: &str, module: &[u8]) -> (String, V
 
 // ── the scan-side mock (hosted) ────────────────────────────────────────
 
-/// The authenticated routes `scan --redirect` uses for one pypi patch, plus
+/// The authenticated routes `scan --mode hosted` uses for one pypi patch, plus
 /// the patched wheel itself at its hosted url.
 pub struct ScanApi {
     server: wiremock::MockServer,
@@ -1209,7 +1209,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                 &proj,
                 &[
                     "scan",
-                    "--redirect",
+                    "--mode=hosted",
                     "--json",
                     "--yes",
                     "--cwd",
@@ -1226,34 +1226,34 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                     PRODUCT,
                 ],
             );
-            let env = envelope(&out, &report.what("scan --redirect"));
+            let env = envelope(&out, &report.what("scan --mode hosted"));
             assert!(
                 env["redirect"]["redirected"].as_u64().unwrap_or(0) >= 1,
                 "{}: nothing redirected: {env:#}",
-                report.what("scan --redirect")
+                report.what("scan --mode hosted")
             );
             // The in-run `--vex` judges the INSTALLED tree, which is still
             // the pristine wheel until uv reinstalls from the rewritten lock
             // ("installed evidence wins"): the redirect lands, the stale
             // install is reported, and nothing is attested (exit 1, no
             // document). The manifest-less matrix below re-runs `scan
-            // --redirect --vex` over the reinstalled fresh checkout.
+            // --mode hosted --vex` over the reinstalled fresh checkout.
             assert_eq!(
                 out.status.code(),
                 Some(1),
                 "{}: {env:#}",
-                report.what("scan --redirect")
+                report.what("scan --mode hosted")
             );
             assert_eq!(
                 env["error"]["code"],
                 "no_applicable_patches",
                 "{}: {env:#}",
-                report.what("scan --redirect")
+                report.what("scan --mode hosted")
             );
             assert!(
                 env.to_string().contains("redirect_pypi_stale_install"),
                 "{}: the stale pristine install is not reported: {env:#}",
-                report.what("scan --redirect")
+                report.what("scan --mode hosted")
             );
             assert!(
                 !embedded_doc.exists(),
@@ -1525,7 +1525,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
     match mode {
         Mode::Vendored => embedded.push(("vendor --vex", VexRun::offline().via(VexVia::Vendor))),
         Mode::Hosted => embedded.push((
-            "scan --redirect --vex",
+            "scan --mode hosted --vex",
             VexRun {
                 api_url: patch_server.clone(),
                 api_token: Some("fake-token".into()),
@@ -1533,7 +1533,7 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                 ..VexRun::default()
             }
             .via(VexVia::Scan)
-            .arg("--redirect")
+            .arg("--mode=hosted")
             .arg("--yes"),
         )),
     }

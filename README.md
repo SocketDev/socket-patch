@@ -685,7 +685,7 @@ socket-patch scan [PATHS]... [options]
 |------|---------|-------------|
 | `--mode <hosted\|vendored\|agent>` | — | Selects one of the three [patch modes](#three-patch-modes) (default: `hosted`). Combining `--mode` with a legacy boolean flag of a *different* mode is an error (exit 2); the same mode spelled both ways is accepted. |
 | `--package <name\|purl>` | `SOCKET_SCAN_PACKAGES` | Only scan these packages: a name (`lodash`, `@scope/pkg`, `requests`; case-insensitive) or a purl with or without its version (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`). Repeat the flag or separate with commas. |
-| `--prune` | — | Agent-mode garbage collection after the scan: remove manifest entries for packages no longer present in the crawl (installed trees + lockfiles — a wiped `node_modules` alone doesn't prune lockfile-listed entries) and delete orphan blob/diff/package-archive files. [Vendored](#vendor) packages are exempt from the crawl-based prune, but a vendored entry whose dependency has left the lockfile is reverted. Ignored, with a `redirect_prune_ignored` warning, in hosted mode; without a mode the scan is report-only. |
+| `--prune` | — | Agent-mode garbage collection after the scan: remove manifest entries for packages no longer present in the crawl (installed trees + lockfiles — a wiped `node_modules` alone doesn't prune lockfile-listed entries) and delete orphan blob/diff-archive files (plus any legacy package archives). [Vendored](#vendor) packages are exempt from the crawl-based prune, but a vendored entry whose dependency has left the lockfile is reverted. Ignored, with a `redirect_prune_ignored` warning, in hosted mode; without a mode the scan is report-only. |
 | `--sync` | — | Shorthand for `--mode agent --prune`: the one-flag agent-mode auto-update run. |
 | `--max-new-patches <N\|none>` | `SOCKET_MAX_NEW_PATCHES` | Add at most N patches to packages that have none yet, most severe first; the rest are deferred to the next scan and listed in the output. Upgrades of already-patched packages are not capped. `0` adds no new patches, `none` means no cap (it also lifts a `socket.yml` `patches.maxNewPatches`). See [Add a few new patches per run](#add-a-few-new-patches-per-run). |
 | `--batch-size <n>` | `SOCKET_BATCH_SIZE` | Packages per API request (default: `500` on the authenticated API, `100` on the public proxy). A request whose body would exceed 256 KiB is split into smaller ones. |
@@ -696,8 +696,7 @@ socket-patch scan [PATHS]... [options]
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_*` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
 > Deprecated, hidden spellings (still accepted): `--apply` (== `--mode agent`) and
-> `--vendor` (== `--mode vendored`). `--detached` is a hidden no-op kept for compatibility (vendored mode is
-> always manifest-free); it is still an error without vendored mode.
+> `--vendor` (== `--mode vendored`).
 
 **Examples:**
 ```bash
@@ -1014,7 +1013,6 @@ socket-patch get <identifier> [options]
 | `--ghsa` | — | Force identifier to be treated as a GHSA ID. |
 | `-p, --package` | — | Force identifier to be treated as a package name. |
 | `--save-only` | `SOCKET_SAVE_ONLY` | Download the patch without applying it (alias: `--no-apply`). |
-| `--one-off` | `SOCKET_ONE_OFF` | Reserved (hidden from `--help`): apply the patch immediately without saving to the `.socket` folder. **Not yet implemented** — the command currently errors up front. |
 | `--all-releases` | `SOCKET_ALL_RELEASES` | Download patches for every release/distribution variant of a matched package (PyPI wheel/sdist, RubyGems platform, Maven classifier), not just the installed one. |
 | `--mode <hosted\|vendored\|agent>` | — | How to consume the patch; the same modes as `scan --mode` (default: `agent`). |
 
@@ -1133,7 +1131,6 @@ socket-patch rollback [targets]... [options]
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--preserve-state` | `SOCKET_PRESERVE_STATE` | Unpatch the system but keep the local patch state — manifest entries, vendored artifacts + ledger entries — for a later re-apply, and skip GC. Hosted patches have no preservable state (the lockfile is their only record) and are restored to upstream either way. |
-| `--one-off` | `SOCKET_ONE_OFF` | Reserved: rollback by fetching original (`beforeHash`) files from the API, no manifest required. **Not yet implemented** — the command currently errors up front. |
 
 **Examples:**
 ```bash

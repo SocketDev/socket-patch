@@ -9,9 +9,7 @@
 //!
 //! Precedence for every flag: CLI arg > env var > default.
 //!
-//! All env-var names use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*`
-//! names are still read at runtime (via `socket_patch_core::env_compat`) with
-//! a one-shot deprecation warning; they will be removed in the next major.
+//! All env-var names use the `SOCKET_*` prefix.
 
 use std::path::{Path, PathBuf};
 
@@ -614,7 +612,6 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_FORCE",
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
-    "SOCKET_ONE_OFF",
     "SOCKET_ALL_RELEASES",
     "SOCKET_SKIP_ROLLBACK",
     "SOCKET_PRESERVE_STATE",
@@ -641,7 +638,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
 /// per-token validator) outright — a single stray blank var crashed every
 /// subcommand — and an empty `SOCKET_DOWNLOAD_MODE` / `SOCKET_MANIFEST_PATH`
 /// (or `SOCKET_VEX_OUTPUT`, which would silently target `""`) leaked `""`
-/// past the documented defaults. Called from `main` after legacy-name
+/// past the documented defaults. Called from `main` after peer-alias
 /// promotion and before clap runs. Only exactly-empty values are scrubbed;
 /// whitespace is significant in paths, so it is left for the parsers to
 /// judge.
@@ -763,11 +760,10 @@ mod tests {
 
     /// Clear the extra env the core telemetry gate reads beyond the
     /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` — the
-    /// kill-switch socket-cli's vitest suite relies on — and the legacy
-    /// `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests below
-    /// can't pass or fail vacuously. Restores afterwards.
+    /// kill-switch socket-cli's vitest suite relies on), so the airgap tests
+    /// below can't pass or fail vacuously. Restores afterwards.
     fn with_clean_telemetry_env(f: impl FnOnce()) {
-        with_env_cleared(&["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"], f);
+        with_env_cleared(&["VITEST"], f);
     }
 
     /// `--offline` promises "never contact the network", but the telemetry
@@ -1571,12 +1567,10 @@ mod tests {
             ("SOCKET_FORCE", &["socket-patch", "vendor"]),
             ("SOCKET_FORCE", &["socket-patch", "self-update"]),
             ("SOCKET_SAVE_ONLY", &["socket-patch", "get", "x"]),
-            ("SOCKET_ONE_OFF", &["socket-patch", "get", "x"]),
-            ("SOCKET_ONE_OFF", &["socket-patch", "rollback"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "scan"]),
             ("SOCKET_SKIP_ROLLBACK", &["socket-patch", "remove", "x"]),
-            // Shared by rollback and remove, like SOCKET_ONE_OFF above.
+            // Shared by rollback and remove.
             ("SOCKET_PRESERVE_STATE", &["socket-patch", "rollback"]),
             ("SOCKET_PRESERVE_STATE", &["socket-patch", "remove", "x"]),
             ("SOCKET_DOWNLOAD_ONLY", &["socket-patch", "repair"]),

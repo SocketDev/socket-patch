@@ -421,7 +421,6 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
         artifact_url: url,
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha1: (!rng.chance(8)).then(|| {
@@ -522,7 +521,6 @@ fn in_place_composer_rewrite_matches_oracle_on_fixture() {
             token: String::new(),
             patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
             artifact_url: format!("https://patch.socket.dev/composer/{n}.zip"),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha1: Some("0123456789abcdef0123456789abcdef01234567".into()),

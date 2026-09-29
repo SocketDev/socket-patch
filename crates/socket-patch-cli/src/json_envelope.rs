@@ -350,7 +350,6 @@ pub enum PatchAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AppliedVia {
-    Package,
     Diff,
     Blob,
 }
@@ -359,7 +358,6 @@ impl AppliedVia {
     pub fn from_core(via: socket_patch_core::patch::apply::AppliedVia) -> Self {
         use socket_patch_core::patch::apply::AppliedVia as Core;
         match via {
-            Core::Package => AppliedVia::Package,
             Core::Diff => AppliedVia::Diff,
             Core::Blob => AppliedVia::Blob,
         }

@@ -1,6 +1,6 @@
 //! Real-install redirect→VEX capstone e2e for npm — the full-chain proof.
 //!
-//! `scan --redirect` never lands patched bytes in the repo: it rewrites the
+//! `scan --mode hosted` never lands patched bytes in the repo: it rewrites the
 //! lockfile so the patched dependency RESOLVES from Socket's hosted vendored
 //! patch (here: a wiremock standing in for patch.socket.dev). v5 keeps no
 //! redirect ledger: the lockfile pin IS the hosted state. This test proves
@@ -11,7 +11,7 @@
 //!   2. Build a PATCHED tarball from the actually-installed bytes (marker
 //!      comment prepended to `index.js`) and serve it from wiremock, alongside
 //!      the discovery / reference / view API mocks.
-//!   3. `scan --redirect --json --vex …` (the real binary): the lockfile now
+//!   3. `scan --mode hosted --json --vex …` (the real binary): the lockfile now
 //!      pins the wiremock tarball URL + the patched tarball's sha512, NO
 //!      `.socket/vendor/redirect-state.json` is written, and the in-run VEX
 //!      is the unverified `(redirected)` attestation (`verified: false`).
@@ -158,7 +158,7 @@ struct RedirectFixture {
 /// selection must produce the identical on-disk redirect.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum RedirectCli {
-    /// `scan --redirect --json --yes --vex …` (embedded VEX asserted).
+    /// `scan --mode hosted --json --yes --vex …` (embedded VEX asserted).
     ScanRedirectVex,
     /// `get <UUID> --mode hosted --json --yes` — get has no `--vex`.
     GetUuidHosted,
@@ -365,7 +365,7 @@ async fn redirect_scanned_project(
             .await;
     }
 
-    // The redirect invocation itself: `scan --redirect --vex` (the original
+    // The redirect invocation itself: `scan --mode hosted --vex` (the original
     // capstone, in-run unverified attestation included) or one of the
     // `get … --mode hosted` twins (get has no --vex).
     let uri = server.uri();
@@ -373,7 +373,7 @@ async fn redirect_scanned_project(
     let argv: Vec<&str> = match cli {
         RedirectCli::ScanRedirectVex => vec![
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--json",
             "--yes",
             "--cwd",

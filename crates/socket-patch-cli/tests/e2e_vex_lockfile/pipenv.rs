@@ -21,8 +21,8 @@
 //! record-mismatched references never attest; hosted not-installed attests
 //! from the pin, a pristine install is `not_applied`, pinless needs an
 //! install; a vendored wheel over a pristine venv warns; and the embedded
-//! forms (`scan --redirect --vex` / `scan --vendor --vex` re-runs,
-//! `scan --vendor --detached --vex`, `apply --vex`, `vendor --vex`).
+//! forms (`scan --mode hosted --vex` / `scan --vendor --vex` re-runs,
+//! `apply --vex`, `vendor --vex`).
 //!
 //! Pipenv-specific cells below: a relock that re-serializes AROUND our
 //! reference (Pipenv 2023+ restores `version` / `index` / registry

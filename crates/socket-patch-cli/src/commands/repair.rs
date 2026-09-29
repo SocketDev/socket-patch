@@ -345,7 +345,6 @@ fn format_final_line(
 /// The `.socket/` source directories a download pass writes into.
 struct SourcePaths<'a> {
     blobs: &'a Path,
-    packages: &'a Path,
     diffs: &'a Path,
 }
 
@@ -406,7 +405,6 @@ async fn download_pass(
     let client = client.as_ref().expect("client built just above");
     let sources = PatchSources {
         blobs_path: paths.blobs,
-        packages_path: Some(paths.packages),
         diffs_path: Some(paths.diffs),
         mem_blobs: None,
     };
@@ -473,7 +471,6 @@ async fn repair_inner(
     let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
     let diffs_path = socket_dir.join("diffs");
-    let packages_path = socket_dir.join("packages");
 
     let download_mode =
         DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
@@ -553,7 +550,6 @@ async fn repair_inner(
     let noun = download_mode.noun();
     let paths = SourcePaths {
         blobs: &blobs_path,
-        packages: &packages_path,
         diffs: &diffs_path,
     };
     // Whether stdout already carries a line, so the blank separators
@@ -994,18 +990,22 @@ mod tests {
         );
     }
 
-    /// Cleanup must sweep orphaned diff *and* package archives in addition to
-    /// blobs, and the reclaimed counts/bytes from all three directories must
-    /// aggregate into a single `RepairCounts`. Guards against a regression
-    /// where a cleanup pass uses the wrong directory or drops its tallies.
+    /// Cleanup must sweep orphaned diff archives and every legacy
+    /// `.socket/packages/` archive (nothing reads them, so even one named
+    /// after a manifest UUID goes) in addition to blobs, and the reclaimed
+    /// counts/bytes from all three directories must aggregate into a single
+    /// `RepairCounts`. Guards against a regression where a cleanup pass uses
+    /// the wrong directory or drops its tallies.
     #[tokio::test]
     async fn cleanup_sweeps_diff_and_package_archives() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = make_socket(tmp.path());
 
-        // Referenced archives (named after the manifest UUID) must survive.
+        // A referenced diff archive (named after the manifest UUID) must
+        // survive; a legacy package archive under the same name must not.
         write_archive(&socket, "diffs", REFERENCED_UUID, b"kept-diff");
-        write_archive(&socket, "packages", REFERENCED_UUID, b"kept-package");
+        let legacy_pkg = b"legacy package"; // 14 bytes
+        write_archive(&socket, "packages", REFERENCED_UUID, legacy_pkg);
 
         // Orphan archives (unknown UUIDs) must be swept.
         let orphan_diff = b"orphan diff archive bytes"; // 25 bytes
@@ -1029,16 +1029,17 @@ mod tests {
                 .await
                 .expect("repair_inner");
 
-        // Two orphans removed (one diff, one package); the referenced ones stay.
-        assert_eq!(counts.cleaned, 2, "both orphan archives should be swept");
+        // Both orphans and the legacy package archive go; the referenced
+        // diff archive stays.
+        assert_eq!(counts.cleaned, 3, "orphans and legacy archives should be swept");
         assert_eq!(
             counts.bytes_freed,
-            (orphan_diff.len() + orphan_pkg.len()) as u64,
+            (orphan_diff.len() + orphan_pkg.len() + legacy_pkg.len()) as u64,
             "bytes_freed must aggregate diff + package reclaim"
         );
         // Cleanup is reported as a SINGLE batched `removed` artifact event whose
         // `details.count` carries the tally — so the event-count summary is 1
-        // (`Summary::bump` increments once per event), and the 2-artifact count
+        // (`Summary::bump` increments once per event), and the 3-artifact count
         // is asserted via `counts.cleaned` above and the event details here.
         assert_eq!(env.summary.removed, 1, "one batched removal event");
         let removed = env
@@ -1052,15 +1053,15 @@ mod tests {
                 .as_ref()
                 .and_then(|d| d.get("count"))
                 .and_then(serde_json::Value::as_u64),
-            Some(2),
-            "the batched removal event must report 2 swept artifacts"
+            Some(3),
+            "the batched removal event must report 3 swept artifacts"
         );
 
         assert!(socket
             .join("diffs")
             .join(format!("{REFERENCED_UUID}.tar.gz"))
             .exists());
-        assert!(socket
+        assert!(!socket
             .join("packages")
             .join(format!("{REFERENCED_UUID}.tar.gz"))
             .exists());

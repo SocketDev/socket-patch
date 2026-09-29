@@ -1,4 +1,4 @@
-//! The hosted-mode (`--mode hosted` / `--redirect`) flow: rewrite ONLY the
+//! The hosted-mode (`--mode hosted`) flow: rewrite ONLY the
 //! patched dependencies' lockfile / registry-config entries to point at
 //! Socket's hosted vendored patches. Self-contained — reuses `run`'s
 //! discovery, then returns without touching the apply/vendor branches.
@@ -2673,7 +2673,6 @@ mod tests {
             token: "tok".to_string(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
             artifact_url: artifact_url.to_string(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Default::default(),
         }

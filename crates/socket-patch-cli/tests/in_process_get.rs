@@ -39,7 +39,6 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
         ghsa: false,
         package: false,
         save_only: true,
-        one_off: false,
         all_releases: false,
         mode: None,
     }
@@ -533,76 +532,6 @@ async fn get_with_explicit_package_flag_resolves_installed_and_saves() {
             .any(|p| p == &format!("/v0/orgs/{ORG}/patches/view/{UUID}")),
         "must fetch the selected patch's view, saw: {paths:?}"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Conflict flags (--one-off + --save-only)
-// ---------------------------------------------------------------------------
-
-/// Assert the mounted mock saw zero requests — the up-front-rejection
-/// oracle for the flag-validation tests below. A dead (unreachable) API
-/// cannot prove "rejected before any fetch": a run that ignored the flag,
-/// fetched, and failed on the dead socket produces the same exit 1 and
-/// the same absent manifest. Against a LIVE mock the regressed flow
-/// instead fetches successfully and saves, so all three oracles trip.
-async fn assert_no_api_requests(server: &MockServer) {
-    let requests = server.received_requests().await.unwrap();
-    assert!(
-        requests.is_empty(),
-        "flag must be rejected before any API call, saw: {:?}",
-        requests
-            .iter()
-            .map(|r| r.url.path().to_string())
-            .collect::<Vec<_>>()
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn get_one_off_with_save_only_errors() {
-    // Live mock (not a dead socket) so the zero-request oracle below can
-    // distinguish up-front rejection from fetch-and-fail.
-    let (server, url) = start_wiremock().await;
-    make_view_mock(&server, UUID, PURL, "free").await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let mut args = default_args(UUID, tmp.path());
-    args.common.api_url = Some(url);
-    args.one_off = true;
-    args.save_only = true;
-
-    let code = run(args).await;
-    assert_eq!(code, 2, "conflicting flags are a usage error (exit 2)");
-    // The conflict is rejected up front, before any fetch — nothing saved.
-    assert_no_manifest(tmp.path());
-    assert_no_api_requests(&server).await;
-}
-
-#[tokio::test]
-#[serial]
-async fn get_one_off_is_an_honest_not_implemented_error() {
-    // `--one-off` was a silent no-op for three majors: the flag parsed but
-    // was never read past the `--save-only` conflict check, so the patch
-    // was saved to the manifest anyway — lying about persistence. It now
-    // fails honestly, BEFORE any network or disk activity. The previous
-    // version of this test used an unreachable API, which proved nothing:
-    // the regressed flow's fetch failed on the dead socket with the same
-    // exit 1 and no manifest, so the exact historical regression passed.
-    // With a live view mock the regressed flow fetches and saves, so it
-    // now trips all three oracles (exit 0, manifest written, request seen).
-    let (server, url) = start_wiremock().await;
-    make_view_mock(&server, UUID, PURL, "free").await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let mut args = default_args(UUID, tmp.path());
-    args.common.api_url = Some(url);
-    args.one_off = true;
-    args.save_only = false;
-
-    let code = run(args).await;
-    assert_eq!(code, 2, "--one-off must fail as not-yet-implemented (usage, exit 2)");
-    assert_no_manifest(tmp.path());
-    assert_no_api_requests(&server).await;
 }
 
 // ---------------------------------------------------------------------------
