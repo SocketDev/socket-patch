@@ -1,181 +1,26 @@
-//! Equivalence oracle for the hosted uv.lock / pylock / PEP 723 rewriter,
-//! which now parses each lock once and plans, applies and completes every
-//! dep against that one document. The previous implementation (three parses
-//! and two renders per dep) is kept here verbatim, over the verbatim text
-//! rewriters in `utils::python_lock::oracle`, and the production rewriter
-//! must produce the identical output bytes, FileEdit list, warnings and
-//! confirmed / refused sets on randomized locks — including CRLF and
-//! mixed-ending locks, refusals in the middle of the dep list, duplicate
-//! overrides and metadata completion.
+//! Seeded uv.lock / pylock / PEP 723 sweep for the hosted rewriter, which
+//! parses each lock once and plans, applies and completes every dep against
+//! that one document: CRLF and mixed-ending locks, refusals in the middle of
+//! the dep list, duplicate overrides and metadata completion. Output bytes,
+//! FileEdits, warnings and confirmed / refused sets are pinned per case by
+//! `tests/equivalence/python_lock_*.golden`, blessed while the previous
+//! rewriter (three parses and two renders per dep) still ran beside it as
+//! an oracle.
 
 use super::*;
-use crate::utils::python_lock::oracle;
+use crate::golden::{record, Golden, Sweep};
+use crate::test_rng::Rng;
 
-/// `rewrite_uv_lock` before the single-parse session, verbatim except for
-/// the two text rewriters, which are their verbatim oracles.
-fn rewrite_uv_lock_oracle(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    python_metadata: &BTreeMap<String, String>,
-    result: &mut RewriteResult,
-) {
-    use crate::utils::python_lock::{is_python_lock_name, ArtifactSource};
-    use oracle::{complete_python_lock_metadata, rewrite_python_lock};
-
-    let locks: Vec<(&String, &String)> = files
-        .iter()
-        .filter(|(path, _)| is_python_lock_name(path))
-        .collect();
-    if locks.is_empty() {
-        return;
-    }
-    let mut usable: Vec<(&DepOverride, &str)> = Vec::new();
-    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
-        result.python_lock_uuids.insert(dep.patch_uuid.clone());
-        match dep.integrity.sha256.as_deref() {
-            Some(sha256) => usable.push((dep, sha256)),
-            None => result.warnings.push(RewriteWarning {
-                code: "redirect_uv_missing_sha256".into(),
-                detail: format!("{} has no sha256 integrity", dep.name),
-            }),
-        }
-    }
-    for (path, original) in locks {
-        let mut content = original.clone();
-        for &(dep, sha256) in &usable {
-            let rewritten = match rewrite_python_lock(
-                &content,
-                &dep.name,
-                &dep.version,
-                ArtifactSource::Url(&dep.artifact_url),
-                sha256,
-            ) {
-                Ok(Some(rewritten)) => rewritten,
-                Ok(None) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_uv_entry_not_found".into(),
-                        detail: format!("no {path} archive entry for {}@{}", dep.name, dep.version),
-                    });
-                    continue;
-                }
-                Err(detail) => {
-                    result
-                        .refused_python_lock_uuids
-                        .insert(dep.patch_uuid.clone());
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_uv_lock_unsupported".into(),
-                        detail: format!("{path}: {detail}"),
-                    });
-                    continue;
-                }
-            };
-            let (metadata_edit, project) =
-                match plan_python_metadata(path, &content, files, dep, result) {
-                    Ok(plan) => plan,
-                    Err(warning) => {
-                        result
-                            .refused_python_lock_uuids
-                            .insert(dep.patch_uuid.clone());
-                        result.warnings.push(warning);
-                        continue;
-                    }
-                };
-            let rewritten = match complete_python_lock_metadata(
-                &rewritten,
-                project.as_deref(),
-                &dep.name,
-                &dep.version,
-                ArtifactSource::Url(&dep.artifact_url),
-                python_metadata.get(&dep.artifact_url).map(String::as_str),
-            ) {
-                Ok(rewritten) => rewritten,
-                Err(detail) => {
-                    result
-                        .refused_python_lock_uuids
-                        .insert(dep.patch_uuid.clone());
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_uv_metadata_unsupported".into(),
-                        detail: format!("{path}: {detail}"),
-                    });
-                    continue;
-                }
-            };
-            result
-                .confirmed_python_lock_uuids
-                .insert(dep.patch_uuid.clone());
-            if let Some(edit) = metadata_edit {
-                record_python_metadata_edit(edit, dep, result);
-            }
-            if rewritten != content {
-                record_python_lock_edits(path, dep, &content, &rewritten, result);
-                content = rewritten;
-            }
-        }
-        if content != *original {
-            result.files.insert(path.clone(), content);
-        }
-    }
-}
-
-fn assert_same(want: &RewriteResult, got: &RewriteResult, what: &str) {
-    assert_eq!(got.files, want.files, "{what}: rewritten bytes");
-    assert_eq!(got.edits.len(), want.edits.len(), "{what}: edit count");
-    for (i, (g, w)) in got.edits.iter().zip(&want.edits).enumerate() {
-        assert_eq!(g, w, "{what}: edit #{i}");
-    }
-    let warnings = |r: &RewriteResult| {
-        r.warnings
-            .iter()
-            .map(|w| (w.code.clone(), w.detail.clone()))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(warnings(got), warnings(want), "{what}: warnings in order");
-    assert_eq!(got.python_lock_uuids, want.python_lock_uuids, "{what}");
-    assert_eq!(
-        got.confirmed_python_lock_uuids, want.confirmed_python_lock_uuids,
-        "{what}: confirmed"
-    );
-    assert_eq!(
-        got.refused_python_lock_uuids, want.refused_python_lock_uuids,
-        "{what}: refused"
-    );
-}
-
-fn run_both(
+/// The production rewriter, recorded into the running sweep.
+fn run(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     metadata: &BTreeMap<String, String>,
-    what: &str,
 ) -> RewriteResult {
-    let mut want = RewriteResult::default();
-    rewrite_uv_lock_oracle(files, overrides, metadata, &mut want);
     let mut got = RewriteResult::default();
     rewrite_uv_lock(files, overrides, metadata, &mut got);
-    assert_same(&want, &got, what);
+    record(&(files, overrides, metadata), &got);
     got
-}
-
-/// Deterministic xorshift64* — no `rand` dev-dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
-    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
-        items[self.below(items.len())]
-    }
 }
 
 const HEX: &str = "ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6";
@@ -518,7 +363,7 @@ type Case = (
 );
 
 fn case(seed: u64) -> Case {
-    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut rng = Rng::new(seed);
     let pool = 4 + rng.below(10);
     let mut files = BTreeMap::new();
     let mut any = false;
@@ -582,19 +427,26 @@ fn case(seed: u64) -> Case {
 }
 
 #[test]
-fn single_parse_uv_rewrite_matches_oracle() {
+fn single_parse_uv_rewrite_matches_golden() {
+    let sweep = Sweep::with(
+        Golden::new(
+            "python_lock_rewrite",
+            "One seeded uv / pylock / PEP 723 lock set + overrides + wheel metadata.",
+        )
+        .chunked(5),
+    );
     let mut rewritten = 0;
     let mut edits = 0;
     let mut codes = std::collections::BTreeSet::new();
     for seed in 1..=1500u64 {
         let (files, overrides, metadata) = case(seed);
-        let got = run_both(&files, &overrides, &metadata, &format!("seed {seed}"));
+        let got = run(&files, &overrides, &metadata);
         rewritten += got.files.len();
         edits += got.edits.len();
         codes.extend(got.warnings.iter().map(|w| w.code.clone()));
     }
     // The generator must actually reach the rewrite paths and every refusal,
-    // or the oracle compares nothing.
+    // or the golden pins nothing.
     assert!(rewritten > 300, "only {rewritten} rewritten files");
     assert!(edits > 1000, "only {edits} edits");
     for code in [
@@ -608,12 +460,17 @@ fn single_parse_uv_rewrite_matches_oracle() {
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }
+    sweep.finish();
 }
 
 /// A refusal between two rewritten deps must leave the lock exactly as the
 /// first dep left it — the session decides every refusal before mutating.
 #[test]
 fn refusal_in_the_middle_leaves_the_prior_rewrite_intact() {
+    let sweep = Sweep::start(
+        "python_lock_refusal",
+        "A uv.lock + pyproject.toml whose middle dep is refused, LF and CRLF.",
+    );
     let lock = "version = 1\nrevision = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [{ name = \"a\" }, { name = \"b\" }, { name = \"c\" }]\n\n[package.metadata]\nrequires-dist = [{ name = \"a\" }, { name = \"b\" }, { name = \"c\" }]\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/a-1.0.0-py3-none-any.whl\", hash = \"sha256:00\" }]\n\n[[package]]\nname = \"b\"\nversion = \"1.0.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/b-1.0.0-py3-none-any.whl\", hash = \"sha256:00\" }]\n\n[[package]]\nname = \"c\"\nversion = \"1.0.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/c-1.0.0-py3-none-any.whl\", hash = \"sha256:00\" }]\n";
     let project = "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"a\", \"b\", \"c\"]\n\n[tool.uv]\noverride-dependencies = [\"b==1.0.0\"]\n";
     let mk = |name: &str, n: usize| DepOverride {
@@ -641,7 +498,7 @@ fn refusal_in_the_middle_leaves_the_prior_rewrite_intact() {
         // b's wheel metadata is unparseable: b is refused after a is applied.
         let mut metadata = BTreeMap::new();
         metadata.insert(overrides[1].artifact_url.clone(), "[broken".to_string());
-        let got = run_both(&files, &overrides, &metadata, "b refused");
+        let got = run(&files, &overrides, &metadata);
         assert!(got
             .refused_python_lock_uuids
             .contains(&overrides[1].patch_uuid));
@@ -663,71 +520,10 @@ fn refusal_in_the_middle_leaves_the_prior_rewrite_intact() {
             1,
         );
         files.insert("uv.lock".to_string(), with_manifest);
-        let got = run_both(&files, &overrides, &BTreeMap::new(), "bad overrides");
+        let got = run(&files, &overrides, &BTreeMap::new());
         assert!(got
             .refused_python_lock_uuids
             .contains(&overrides[1].patch_uuid));
     }
-}
-
-/// Runs the oracle over the benchmark fixtures (real ~1.9 MB uv,
-/// pylock and PEP 723 locks, too large to commit) when
-/// `SOCKET_PATCH_PY_LOCK_FIXTURES` names their directory; a no-op otherwise.
-#[test]
-fn single_parse_uv_rewrite_matches_oracle_on_fixture_locks() {
-    let Some(root) = std::env::var_os("SOCKET_PATCH_PY_LOCK_FIXTURES") else {
-        return;
-    };
-    let root = std::path::PathBuf::from(root);
-    for (dir, lock, metadata_file) in [
-        ("uv-big", "uv.lock", Some("pyproject.toml")),
-        ("pylock-big", "pylock.toml", None),
-        ("script-big", "tool.py.lock", Some("tool.py")),
-    ] {
-        let read = |name: &str| std::fs::read_to_string(root.join(dir).join(name)).unwrap();
-        let text = read(lock);
-        let names: Vec<(String, String)> = {
-            let doc: toml_edit::DocumentMut = text.parse().unwrap();
-            let collection = if lock == "pylock.toml" {
-                "packages"
-            } else {
-                "package"
-            };
-            doc[collection]
-                .as_array_of_tables()
-                .unwrap()
-                .iter()
-                .filter_map(|t| {
-                    Some((
-                        t.get("name")?.as_str()?.to_string(),
-                        t.get("version")?.as_str()?.to_string(),
-                    ))
-                })
-                .collect()
-        };
-        for crlf in [false, true] {
-            let conv = |s: String| if crlf { s.replace('\n', "\r\n") } else { s };
-            let mut files = BTreeMap::new();
-            files.insert(lock.to_string(), conv(text.clone()));
-            if let Some(m) = metadata_file {
-                files.insert(m.to_string(), conv(read(m)));
-            }
-            let mut rng = Rng(0x5eed + crlf as u64);
-            let mut overrides = Vec::new();
-            let mut metadata = BTreeMap::new();
-            for (n, (name, version)) in names.iter().step_by(29).enumerate() {
-                let mut d = dep(0, version, n, &mut rng);
-                d.ecosystem = "pypi".into();
-                d.name = name.clone();
-                d.artifact_url =
-                    format!("https://patch.socket.dev/patch/{n}/{name}-{version}-py3-none-any.whl");
-                if n % 3 == 0 {
-                    metadata.insert(d.artifact_url.clone(), wheel_metadata(&mut rng, 5));
-                }
-                overrides.push(d);
-            }
-            let got = run_both(&files, &overrides, &metadata, &format!("{dir} crlf={crlf}"));
-            assert!(!got.edits.is_empty(), "{dir}: nothing rewritten");
-        }
-    }
+    sweep.finish();
 }
