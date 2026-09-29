@@ -1686,6 +1686,45 @@ pub(crate) async fn pristine_fetch_is_verifiable(
     }
 }
 
+/// Whether [`fetch_pristine_package`] would reach the download for this
+/// purl: the same entry choice (see [`pristine_fetch_is_verifiable`]), and
+/// none of the refusals its fetcher raises before the first request (a
+/// foreign yarn berry cacheKey, a go module go would not fetch through a
+/// proxy, a composer entry with no dist URL). Deferring a fetch that would
+/// refuse `vendor_fetch_unverifiable` behind the patch service would
+/// instead vendor the patch over a package it does not describe.
+async fn pristine_fetch_reaches_download(
+    project_root: &Path,
+    inventory: &[lock_inventory::LockfileEntry],
+    purl: &str,
+    ledger_entry: Option<&VendorEntry>,
+) -> bool {
+    let entry = match lock_inventory::lookup(inventory, purl)
+        .filter(|e| e.integrity != lock_inventory::LockIntegrity::None)
+    {
+        Some(e) => e.clone(),
+        None => match ledger_entry {
+            Some(le) => match lock_inventory::recover_lock_entry(project_root, le).await {
+                Ok(e) => e,
+                Err(_) => return false,
+            },
+            None => return false,
+        },
+    };
+    registry_fetch::refusal_before_download(&entry).is_none()
+}
+
+/// The ecosystems whose backend asks the patch service before it reads the
+/// pristine tree, and reads it only on a local-build fallback. pypi and gem
+/// read it earlier, in the loop's installed-variant probe; nuget and maven
+/// have no registry fetch.
+fn backend_reads_pristine_only_on_fallback(purl: &str) -> bool {
+    matches!(
+        Ecosystem::from_purl(purl),
+        Some(Ecosystem::Npm | Ecosystem::Cargo | Ecosystem::Golang | Ecosystem::Composer)
+    )
+}
+
 /// The purls among `purls` with an installed copy, found exactly as the
 /// vendor loop finds them: the qualified-aware resolver
 /// ([`find_packages_for_rollback_reusing`]), then the npm `package.json`
@@ -2365,11 +2404,12 @@ pub(crate) async fn vendor_records_reusing(
             //    backend's in-sync hot path answers it from the committed
             //    bytes alone, so a re-run needs no network. `--force` may
             //    rebuild anyway, so it keeps the eager fetch.
-            //  * a cargo crate the patch service can serve: the backend reads
-            //    the pristine tree only if it falls back to the local build.
-            //    Only a crate the registry ladder COULD fetch (see
-            //    `pristine_fetch_is_verifiable`) — a git, path or
-            //    custom-registry crate keeps the eager rung, whose
+            //  * a package the patch service can serve, in an ecosystem whose
+            //    backend reads the pristine tree only if it falls back to the
+            //    local build (`backend_reads_pristine_only_on_fallback`).
+            //    Only one the registry ladder would really download (see
+            //    `pristine_fetch_reaches_download`) — a git, path or
+            //    custom-registry crate, say, keeps the eager rung, whose
             //    `vendor_fetch_unverifiable` refusal keeps a crates.io patch
             //    off it.
             //
@@ -2389,10 +2429,10 @@ pub(crate) async fn vendor_records_reusing(
                         }
                         None => false,
                     };
-                let cargo_via_service = service_enabled
+                let via_service = service_enabled
                     && matches!(rung, MissingRung::Fetch)
-                    && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
-                    && pristine_fetch_is_verifiable(
+                    && backend_reads_pristine_only_on_fallback(purl)
+                    && pristine_fetch_reaches_download(
                         &common.cwd,
                         inventory
                             .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
@@ -2401,7 +2441,7 @@ pub(crate) async fn vendor_records_reusing(
                         lookup_entry(&state.entries, purl),
                     )
                     .await;
-                if covered || cargo_via_service {
+                if covered || via_service {
                     *rung = MissingRung::Deferred;
                 }
             }
