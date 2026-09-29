@@ -1042,7 +1042,6 @@ mod tests {
             token: TOKEN.into(),
             patch_uuid: uuid.into(),
             artifact_url: url,
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(PNPM_SRI.into()),

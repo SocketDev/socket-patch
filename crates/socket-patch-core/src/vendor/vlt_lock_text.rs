@@ -779,10 +779,6 @@ impl EdgeEntry<'_> {
         self.value.rsplit_once(' ').map_or("", |(_, to)| to)
     }
 
-    pub(crate) fn entry_text(&self) -> String {
-        entry_text(self.key, self.raw_value)
-    }
-
     pub(crate) fn sort_key(&self) -> EdgeSortKey<'_> {
         EdgeSortKey {
             from: self.from(),
@@ -1999,7 +1995,7 @@ mod tests {
         assert_eq!(edge.entry.spec(), "^3.0.0 || ^4.0.0");
         assert_eq!(edge.entry.target(), "~npm~js-tokens@4.0.0");
         assert_eq!(
-            edge.entry.entry_text(),
+            entry_text(edge.entry.key, edge.entry.raw_value),
             "\"~npm~loose-envify@1.4.0 js-tokens\": \"prod ^3.0.0 || ^4.0.0 ~npm~js-tokens@4.0.0\""
         );
         let missing = parse_edge_line("    \"~npm~tap@15.2.3~peer.6f88d0ccf17dbbdc ts-node\": \"peerOptional >=8.5.2 MISSING\"")

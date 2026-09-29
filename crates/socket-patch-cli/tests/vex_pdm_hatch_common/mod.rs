@@ -16,7 +16,7 @@
 //! mod vex_pdm_hatch_common;
 //! ```
 //!
-//! Every project is wired by the REAL CLI, not by hand: `scan --redirect`
+//! Every project is wired by the REAL CLI, not by hand: `scan --mode hosted`
 //! (hosted) or `scan --vendor --vendor-source build` (vendored) runs against
 //! a wiremock stand-in for the Socket API, with the package's pristine
 //! install in a fabricated `.venv` for the vendored build. The wired tree is
@@ -416,7 +416,7 @@ pub fn path_with_fake_hatch(scratch: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap()
 }
 
-/// `scan --json` (hosted: `--redirect`; vendored: `--vendor --vendor-source
+/// `scan --json` (hosted: `--mode hosted`; vendored: `--vendor --vendor-source
 /// build`) in `cwd` against `api`.
 pub fn run_scan(
     cwd: &Path,
@@ -441,7 +441,7 @@ pub fn run_scan(
     .map(|s| s.to_string())
     .collect();
     match mode {
-        Mode::Hosted => args.push("--redirect".into()),
+        Mode::Hosted => args.push("--mode=hosted".into()),
         Mode::Vendored => args.extend(["--vendor", "--vendor-source", "build"].map(String::from)),
     }
     args.extend(extra.iter().map(|s| s.to_string()));
@@ -1165,16 +1165,16 @@ pub fn g_vendored_attests_over_a_pristine_venv_with_a_warning(flavors: &[Flavor]
     }
 }
 
-/// `scan --vendor --detached --vex` never writes a manifest; its own VEX
+/// `scan --vendor --vex` never writes a manifest; its own VEX
 /// and a later standalone `vex` both attest (ledger present, then gone).
 pub fn embedded_detached_vendor_scan_attests_without_a_manifest(flavors: &[Flavor]) {
     for flavor in flavors.iter().filter(|f| f.vendored) {
         let (_tmp, cwd) = fresh();
-        wire_into(&cwd, flavor, Mode::Vendored, &["--detached"]);
-        let what = format!("{} detached", flavor.label);
+        wire_into(&cwd, flavor, Mode::Vendored, &[]);
+        let what = format!("{} vendored", flavor.label);
         assert!(
             !cwd.join(".socket/manifest.json").exists(),
-            "{what}: detached writes no manifest"
+            "{what}: vendored mode writes no manifest"
         );
         let run = VexRun {
             offline: true,
@@ -1191,7 +1191,7 @@ pub fn embedded_detached_vendor_scan_attests_without_a_manifest(flavors: &[Flavo
     }
 }
 
-/// A CI re-run of `scan --redirect --vex` / `scan --vendor --vex` on a
+/// A CI re-run of `scan --mode hosted --vex` / `scan --vendor --vex` on a
 /// checkout whose `.socket/` was never committed (the wiring is already
 /// there): the embedded document still attests. `expect_refusal` names the
 /// flavors whose vendored backend documents a refusal for a ledgerless

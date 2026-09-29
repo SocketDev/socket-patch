@@ -579,7 +579,6 @@ mod tests {
             token: String::new(),
             patch_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
             artifact_url: url.to_string(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: socket_patch_core::patch::redirect::Integrity {
                 sha512: Some("sha512-new".into()),

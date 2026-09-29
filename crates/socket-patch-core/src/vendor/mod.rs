@@ -97,7 +97,6 @@ pub(crate) mod test_support;
 mod toml_surgery;
 pub(crate) mod verify;
 pub mod vlt_lock;
-#[allow(dead_code)]
 pub(crate) mod vlt_lock_text;
 pub(crate) mod yarn_berry_lock;
 pub(crate) mod yarn_classic_lock;

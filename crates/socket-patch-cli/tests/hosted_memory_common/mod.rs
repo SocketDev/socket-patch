@@ -74,18 +74,11 @@ pub fn patches_from_overrides(overrides: &Path, rewrite_host: Option<&str>) -> V
                 }
             };
             let url = fix(&o["artifactUrl"]);
-            let mut artifacts = vec![serde_json::json!({
+            let artifacts = vec![serde_json::json!({
                 "kind": "tarball",
                 "url": url,
                 "integrity": o["integrity"].clone(),
             })];
-            if let Some(zip) = o["berryZipUrl"].as_str() {
-                artifacts.push(serde_json::json!({
-                    "kind": "yarn-berry-zip",
-                    "url": fix(&Value::String(zip.to_string())),
-                    "integrity": {"yarnBerry10c0": o["integrity"]["yarnBerry10c0"].clone()},
-                }));
-            }
             let mut registry_override = o.get("registryOverride").cloned().unwrap_or(Value::Null);
             if let Some(index) = registry_override.get("indexUrl").cloned() {
                 registry_override["indexUrl"] = fix(&index);

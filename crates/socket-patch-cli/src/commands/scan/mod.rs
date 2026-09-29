@@ -144,8 +144,8 @@ fn batch_chunks(purls: &[String], batch_size: usize, max_body_bytes: usize) -> V
 }
 
 /// The three patch-application modes `scan` can drive, selectable via
-/// `--mode` (the documented spelling). Each variant is equivalent to one
-/// legacy boolean flag, which remains supported as an alias.
+/// `--mode`. Vendored and agent also keep a hidden deprecated boolean
+/// spelling (`--vendor`, `--apply`/`--sync`).
 //
 // The `///` docs on the variants are user-facing `--help` text (shared
 // with `get --mode`); keep implementation notes in `//` comments.
@@ -154,15 +154,10 @@ pub enum ScanMode {
     /// Rewrite lockfiles so only patched dependencies resolve to Socket's
     /// hosted patch server: no artifact bytes land in the repo, but
     /// installs must reach the patch server
-    // Equivalent to the hidden `--redirect` boolean. The hidden value
-    // aliases mirror legacy spellings (`apply` is deliberately NOT an alias
-    // of agent).
-    #[value(alias = "host", alias = "redirect")]
     Hosted,
     /// Commit patched artifacts to `.socket/vendor/`: hermetic,
     /// offline-safe installs at the cost of repo size
     // Equivalent to `--vendor`.
-    #[value(alias = "vendor")]
     Vendored,
     /// Record patches in `.socket/manifest.json` plus blobs and re-apply
     /// them in place (e.g. from CI): smallest repo footprint, but every
@@ -183,8 +178,8 @@ impl ScanMode {
     }
 }
 
-/// Fold the legacy boolean spellings (`--redirect` / `--vendor` /
-/// `--apply` / `--sync`) into `args.mode`, so `ScanMode` is the single
+/// Fold the boolean spellings (`--vendor` / `--apply` / `--sync`) into
+/// `args.mode`, so `ScanMode` is the single
 /// source of truth everything downstream reads (the booleans are input
 /// spellings only, never consulted after this returns), and enforce the
 /// cross-flag rules clap cannot express:
@@ -201,8 +196,6 @@ impl ScanMode {
 ///   Hosted mode runs no GC, so `--mode hosted --prune` stays accepted but
 ///   emits an explicit `redirect_prune_ignored` warning in `run` rather
 ///   than silently dropping the flag.
-/// * `--detached` requires vendored mode in either spelling (clap's
-///   `requires = "vendor"` cannot see `--mode vendored`).
 ///
 /// Public (not `pub(crate)`) so the CLI-contract tests can exercise the
 /// fold without driving a full `run()`.
@@ -210,9 +203,6 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
     if let Some(mode) = args.mode {
         // First boolean that selects a mode OTHER than the requested one.
         let mut conflicting: Option<&'static str> = None;
-        if args.redirect && mode != ScanMode::Hosted {
-            conflicting = Some("--redirect");
-        }
         if args.vendor && mode != ScanMode::Vendored {
             conflicting = Some("--vendor");
         }
@@ -225,20 +215,13 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         if let Some(flag) = conflicting {
             // "cannot be used with" phrasing matches clap's conflict errors —
             // the scan_vendor_e2e contract test accepts exactly that shape.
-            // The hidden --redirect is only explained when it was typed.
-            let meaning = if flag == "--redirect" {
-                "--redirect means --mode hosted"
-            } else {
-                "--vendor means --mode vendored; --apply and --sync mean --mode agent"
-            };
             return Err(format!(
                 "--mode {} cannot be used with {flag}: the flags select different \
-                 modes ({meaning})",
+                 modes (--vendor means --mode vendored; --apply and --sync mean \
+                 --mode agent)",
                 mode.cli_name(),
             ));
         }
-    } else if args.redirect {
-        args.mode = Some(ScanMode::Hosted);
     } else if args.vendor {
         args.mode = Some(ScanMode::Vendored);
     } else if args.apply || args.sync {
@@ -262,14 +245,6 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
                 "--global-prefix"
             },
         ));
-    }
-    if args.detached && args.mode != Some(ScanMode::Vendored) {
-        // "required" phrasing matches clap's requires errors — the
-        // scan_vendor_e2e contract test accepts exactly that shape.
-        return Err(
-            "--detached requires vendored mode: --mode vendored or --vendor is required"
-                .to_string(),
-        );
     }
     Ok(())
 }
@@ -319,27 +294,13 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync"])]
     pub vendor: bool,
 
-    /// Accepted for compatibility; has no effect
-    // Hidden: vendored mode is always manifest-free (the vendor ledger
-    // embeds each patch record and `.socket/manifest.json` is never
-    // written), so the flag is a no-op. It still requires vendored mode in
-    // either spelling (`--mode vendored` / `--vendor`), enforced in
-    // `resolve_mode_flags` rather than clap `requires` so `--mode vendored`
-    // satisfies it too.
-    #[arg(long, default_value_t = false, hide = true)]
-    pub detached: bool,
-
-    // Hidden legacy spelling of `--mode hosted`.
-    #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync", "vendor"])]
-    pub redirect: bool,
-
     /// How discovered patches are consumed [default: hosted]. A `--prune`
     /// or `--global` scan with no mode only reports
-    // The hidden `--vendor` and `--apply` are older spellings of
-    // `--mode vendored` and `--mode agent`. Each mode is equivalent to one
-    // boolean flag (hosted == the hidden `--redirect`, vendored == `--vendor`, agent == `--apply`/`--sync`).
-    // Combining `--mode` with a boolean from a DIFFERENT mode is rejected in
-    // `resolve_mode_flags`; the same mode spelled both ways is accepted.
+    // The hidden `--vendor` and `--apply` are deprecated spellings of
+    // `--mode vendored` and `--mode agent` (`--sync` also selects agent);
+    // hosted has no boolean spelling. Combining `--mode` with a boolean
+    // from a DIFFERENT mode is rejected in `resolve_mode_flags`; the same
+    // mode spelled both ways is accepted.
     #[arg(long = "mode", value_enum)]
     pub mode: Option<ScanMode>,
 

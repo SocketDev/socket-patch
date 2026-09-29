@@ -9,8 +9,7 @@
 //! embeds each record in its ledger entry (`detached: true`), and
 //! `.socket/manifest.json` is never written — a project vendored by an
 //! older, manifest-mode CLI is migrated on its next vendored run (see
-//! [`migrate_legacy_manifest_records`]). `--detached` is accepted as a
-//! no-op for compatibility.
+//! [`migrate_legacy_manifest_records`]).
 //!
 //! One API client per run: `scan`/`get` build it once (proxy fallback
 //! included) and thread it through the download phase and into the vendor

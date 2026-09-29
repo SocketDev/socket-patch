@@ -31,7 +31,9 @@ use super::common::{
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
 use super::reuse;
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{
+    fetch_verified_archive, ServiceArtifact, ServiceAttempt, ServicePolicy, ServiceTerminal,
+};
 use super::source::PackageSource;
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -452,17 +454,9 @@ async fn reuse_committed_pack(
 
 // ───────────────────────── service-download path ─────────────────────────
 
-/// Outcome of attempting the service-download fast path in [`stage_patch_pack`].
-enum ServicePackDecision {
-    /// Use the service artifact — the staged pack + a synthesized success.
-    /// Boxed: the pair is large relative to the other (small) variants.
-    Used(Box<(Option<NpmStagedPack>, ApplyResult)>),
-    /// Abort vendoring this package (a `service`-mode miss, or a downloaded
-    /// artifact we could not turn into a staged pack).
-    HardFail(Box<VendorOutcome>),
-    /// Fall back to the local stage→patch→pack build.
-    FallBack,
-}
+/// Outcome of attempting the service-download fast path in [`stage_patch_pack`]
+/// (`Used`: the staged pack + a synthesized success, boxed — the pair is large).
+type ServicePackDecision = ServiceAttempt<Box<(Option<NpmStagedPack>, ApplyResult)>>;
 
 /// Download + verify the prebuilt tarball and turn it into an [`NpmStagedPack`],
 /// mapping each service outcome onto the `auto` / `service` fallback policy.
@@ -474,99 +468,60 @@ async fn try_service_pack(
     cfg: &VendorServiceConfig,
     warnings: &mut Vec<VendorWarning>,
 ) -> ServicePackDecision {
-    let hard_fail =
-        |detail: String| ServicePackDecision::HardFail(Box::new(done_failure(purl, detail)));
-    match fetch_verified_archive(cfg, &record.uuid).await {
-        // The SRI proves only that the transfer is intact: require the
-        // tarball to carry every patched file at its afterHash before
-        // reporting the package patched and wiring the lock to it.
-        ServiceArtifact::Ready(archive)
-            if !tgz_bytes_match_after_hashes(&archive.bytes, record) =>
-        {
-            let reason = format!(
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Failure(purl));
+    let archive = match fetch_verified_archive(cfg, &record.uuid).await {
+        // This backend's `service` refusal words a request failure differently.
+        ServiceArtifact::Failed(reason) if cfg.source.requires_service() => {
+            return policy.hard(
+                "vendor_prebuilt_required",
+                format!("patch service request failed: {reason}"),
+            );
+        }
+        fetched => match policy.settle(fetched, "artifact", "artifact", warnings) {
+            Ok(archive) => archive,
+            Err(attempt) => return attempt,
+        },
+    };
+    // The SRI proves only that the transfer is intact: require the tarball to
+    // carry every patched file at its afterHash before reporting the package
+    // patched and wiring the lock to it.
+    if !tgz_bytes_match_after_hashes(&archive.bytes, record) {
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!(
                 "prebuilt tarball for {}@{} does not carry the patched files at their \
                  recorded paths",
                 coords.name, coords.version
-            );
-            if cfg.source.requires_service() {
-                hard_fail(reason)
-            } else {
-                warnings.push(VendorWarning::new(
-                    "vendor_prebuilt_layout_mismatch",
-                    format!("{reason}; building locally instead"),
-                ));
-                ServicePackDecision::FallBack
-            }
+            ),
+        );
+    }
+    match staged_pack_from_service_bytes(
+        purl,
+        project_root,
+        coords,
+        record,
+        &archive.bytes,
+        &archive.integrity_sri,
+    )
+    .await
+    {
+        Ok(staged) => {
+            warnings.push(VendorWarning::new(
+                "vendor_prebuilt_downloaded",
+                format!(
+                    "vendored {}@{} from the patch service ({})",
+                    coords.name, coords.version, archive.source_url
+                ),
+            ));
+            // No local apply to verify — every patched file reads as
+            // `AlreadyPatched` (the tarball's members were checked against
+            // their afterHashes above).
+            let result =
+                already_patched_result(purl, &project_root.join(&staged.rel_tgz), &record.files);
+            ServicePackDecision::Used(Box::new((Some(staged), result)))
         }
-        ServiceArtifact::Ready(archive) => {
-            match staged_pack_from_service_bytes(
-                purl,
-                project_root,
-                coords,
-                record,
-                &archive.bytes,
-                &archive.integrity_sri,
-            )
-            .await
-            {
-                Ok(staged) => {
-                    warnings.push(VendorWarning::new(
-                        "vendor_prebuilt_downloaded",
-                        format!(
-                            "vendored {}@{} from the patch service ({})",
-                            coords.name, coords.version, archive.source_url
-                        ),
-                    ));
-                    // No local apply to verify — every patched file reads as
-                    // `AlreadyPatched` (the tarball's members were checked
-                    // against their afterHashes above).
-                    let result = already_patched_result(
-                        purl,
-                        &project_root.join(&staged.rel_tgz),
-                        &record.files,
-                    );
-                    ServicePackDecision::Used(Box::new((Some(staged), result)))
-                }
-                Err(outcome) => ServicePackDecision::HardFail(outcome),
-            }
-        }
-        // Bytes that fail integrity verification are an active tamper signal:
-        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
-        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
-        ServiceArtifact::IntegrityMismatch(reason) => hard_fail(format!(
-            "prebuilt artifact failed integrity verification ({reason}); \
-             refusing to fall back to a local build on tampered bytes"
-        )),
-        ServiceArtifact::Pending => {
-            if cfg.source.requires_service() {
-                hard_fail("prebuilt artifact is still building".to_string())
-            } else {
-                warnings.push(VendorWarning::new(
-                    "vendor_prebuilt_pending",
-                    "prebuilt artifact is still building; building locally instead".to_string(),
-                ));
-                ServicePackDecision::FallBack
-            }
-        }
-        // The common, quiet miss: not built / free-only / not found.
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard_fail(format!("prebuilt artifact unavailable: {reason}"))
-            } else {
-                ServicePackDecision::FallBack
-            }
-        }
-        ServiceArtifact::Failed(reason) => {
-            if cfg.source.requires_service() {
-                hard_fail(format!("patch service request failed: {reason}"))
-            } else {
-                warnings.push(VendorWarning::new(
-                    "vendor_prebuilt_unavailable",
-                    format!("patch service request failed ({reason}); building locally instead"),
-                ));
-                ServicePackDecision::FallBack
-            }
-        }
+        Err(outcome) => ServicePackDecision::HardFail(outcome),
     }
 }
 

@@ -152,16 +152,115 @@ pub(crate) async fn claim_prestaged(
     }
 }
 
-/// Outcome of attempting to materialise a single-file artifact from the patch
-/// service (the Tier-A backends — maven `.jar`, nuget `.nupkg` — where the
-/// verified archive bytes ARE the vendored artifact, written verbatim).
-pub(crate) enum ServiceCopy {
-    /// The prebuilt patched bytes (write them verbatim).
-    Used(Vec<u8>),
+/// Outcome of a backend's service fast path, mapped onto the `auto` /
+/// `service` fallback policy by [`ServicePolicy`].
+pub(crate) enum ServiceAttempt<T> {
+    /// The verified service artifact was used; `T` is what the backend made
+    /// of it.
+    Used(T),
     /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
     HardFail(Box<VendorOutcome>),
     /// Fall back to the local rebuild.
     FallBack,
+}
+
+/// The single-file outcome for the Tier-A backends (maven `.jar`, nuget
+/// `.nupkg`): the prebuilt patched bytes, written verbatim.
+pub(crate) type ServiceCopy = ServiceAttempt<Vec<u8>>;
+
+/// How a backend reports a terminal service failure.
+#[derive(Clone, Copy)]
+pub(crate) enum ServiceTerminal<'a> {
+    /// A [`VendorOutcome::Refused`] carrying the refusal code.
+    Refused,
+    /// The npm backends' failed `Done` for `purl` (the code is not reported).
+    Failure(&'a str),
+}
+
+/// The `auto` / `service` fallback policy every service-backed backend
+/// shares: `service` refuses every miss, `auto` warns (or, for a plain
+/// `Unavailable`, stays quiet) and builds locally. Tampered bytes are always
+/// terminal.
+pub(crate) struct ServicePolicy<'a> {
+    requires_service: bool,
+    terminal: ServiceTerminal<'a>,
+}
+
+impl<'a> ServicePolicy<'a> {
+    pub(crate) fn new(cfg: &VendorServiceConfig, terminal: ServiceTerminal<'a>) -> Self {
+        Self {
+            requires_service: cfg.source.requires_service(),
+            terminal,
+        }
+    }
+
+    pub(crate) fn hard<T>(&self, code: &'static str, detail: String) -> ServiceAttempt<T> {
+        ServiceAttempt::HardFail(Box::new(match self.terminal {
+            ServiceTerminal::Refused => refused(code, detail),
+            ServiceTerminal::Failure(purl) => super::npm_common::done_failure(purl, detail),
+        }))
+    }
+
+    /// `service` refuses with `reason`; `auto` warns under `code` and falls
+    /// back.
+    pub(crate) fn miss<T>(
+        &self,
+        warnings: &mut Vec<VendorWarning>,
+        code: &'static str,
+        reason: String,
+    ) -> ServiceAttempt<T> {
+        if self.requires_service {
+            self.hard("vendor_prebuilt_required", reason)
+        } else {
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
+            ServiceAttempt::FallBack
+        }
+    }
+
+    /// The verified archive of a `Ready` outcome, or every other outcome
+    /// mapped onto the policy. `noun` names the artifact kind in messages
+    /// ("crate"); `subject` names this artifact ("crate for serde").
+    pub(crate) fn settle<T>(
+        &self,
+        artifact: ServiceArtifact,
+        noun: &str,
+        subject: &str,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<VerifiedArchive, ServiceAttempt<T>> {
+        match artifact {
+            ServiceArtifact::Ready(archive) => Ok(archive),
+            // Bytes that fail integrity verification are an active tamper
+            // signal: ALWAYS a hard error, in `auto` exactly as in `service`
+            // — never a quiet local-build fallback ([`ServiceArtifact`]'s
+            // documented contract).
+            ServiceArtifact::IntegrityMismatch(reason) => Err(self.hard(
+                "vendor_prebuilt_integrity_mismatch",
+                format!(
+                    "prebuilt {subject} failed integrity verification ({reason}); \
+                     refusing to fall back to a local build on tampered bytes"
+                ),
+            )),
+            ServiceArtifact::Pending => Err(self.miss(
+                warnings,
+                "vendor_prebuilt_pending",
+                format!("prebuilt {noun} is still building"),
+            )),
+            // The common, quiet miss: not built / free-only / not found.
+            ServiceArtifact::Unavailable(reason) if self.requires_service => Err(self.hard(
+                "vendor_prebuilt_required",
+                format!("prebuilt {noun} unavailable: {reason}"),
+            )),
+            ServiceArtifact::Unavailable(_) => Err(ServiceAttempt::FallBack),
+            ServiceArtifact::Failed(reason) => Err(self.miss(
+                warnings,
+                "vendor_prebuilt_unavailable",
+                format!("patch service request failed ({reason})"),
+            )),
+        }
+    }
 }
 
 /// Download + integrity-verify the prebuilt patched archive for the Tier-A
@@ -186,83 +285,39 @@ pub(crate) async fn service_archive_copy(
     if !cfg.service_enabled() {
         return ServiceCopy::FallBack;
     }
-    fn hard(code: &'static str, detail: String) -> ServiceCopy {
-        ServiceCopy::HardFail(Box::new(refused(code, detail)))
-    }
-    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
-        if cfg.source.requires_service() {
-            hard("vendor_prebuilt_required", reason)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            ServiceCopy::FallBack
-        }
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
+    let archive = match policy.settle(fetched, noun, noun, warnings) {
+        Ok(archive) => archive,
+        Err(attempt) => return attempt,
     };
-    match fetch_verified_archive(cfg, &record.uuid).await {
-        // The SRI proves the download is intact, not that it carries the
-        // patch: the bytes are written verbatim and reported AlreadyPatched,
-        // so every patched member must hash to its afterHash first (the
-        // Tier-B backends' extracted-tree check). Fail closed → `auto`
-        // falls back to the local rebuild.
-        ServiceArtifact::Ready(archive)
-            if !archive
-                .prestaged
-                .zip_verdict(&record.files)
-                .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files)) =>
-        {
-            miss(
-                warnings,
-                "vendor_prebuilt_layout_mismatch",
-                format!(
-                    "prebuilt {noun} for {name} does not carry the patched files at their \
-                     recorded paths"
-                ),
-            )
-        }
-        ServiceArtifact::Ready(archive) => {
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {name} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            ServiceCopy::Used(archive.bytes)
-        }
-        // Bytes that fail integrity verification are an active tamper signal:
-        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
-        // quiet local-build fallback ([`ServiceArtifact`]'s documented
-        // contract).
-        ServiceArtifact::IntegrityMismatch(reason) => hard(
-            "vendor_prebuilt_integrity_mismatch",
+    // The SRI proves the download is intact, not that it carries the
+    // patch: the bytes are written verbatim and reported AlreadyPatched,
+    // so every patched member must hash to its afterHash first (the
+    // Tier-B backends' extracted-tree check). Fail closed → `auto`
+    // falls back to the local rebuild.
+    if !archive
+        .prestaged
+        .zip_verdict(&record.files)
+        .unwrap_or_else(|| zip_bytes_match_after_hashes(&archive.bytes, &record.files))
+    {
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
             format!(
-                "prebuilt {noun} failed integrity verification ({reason}); \
-                 refusing to fall back to a local build on tampered bytes"
+                "prebuilt {noun} for {name} does not carry the patched files at their \
+                 recorded paths"
             ),
-        ),
-        ServiceArtifact::Pending => miss(
-            warnings,
-            "vendor_prebuilt_pending",
-            format!("prebuilt {noun} is still building"),
-        ),
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt {noun} unavailable: {reason}"),
-                )
-            } else {
-                ServiceCopy::FallBack
-            }
-        }
-        ServiceArtifact::Failed(reason) => miss(
-            warnings,
-            "vendor_prebuilt_unavailable",
-            format!("patch service request failed ({reason})"),
-        ),
+        );
     }
+    warnings.push(VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!(
+            "vendored {name} from the patch service ({})",
+            archive.source_url
+        ),
+    ));
+    ServiceCopy::Used(archive.bytes)
 }
 
 /// Outcome of fetching + verifying a named secondary artifact.

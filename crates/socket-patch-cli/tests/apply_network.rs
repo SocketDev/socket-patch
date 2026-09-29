@@ -901,22 +901,20 @@ fn write_package_archive(packages: &Path, uuid: &str, entries: &[(&str, &[u8])])
         .unwrap();
 }
 
-/// A cached `.socket/packages/<uuid>.tar.gz` is a complete source for the
-/// patch: the same tree applies fine under `--offline`. Going online must
-/// not make it FAIL: when the (default) diff fetch and the blob fallback
-/// both fail (no archives served, blob GC'd, entitlement change, dead
-/// network), the stage step must only bail if some patch is actually left
-/// without a source.
+/// A leftover `.socket/packages/<uuid>.tar.gz` (v5.0 no longer reads package
+/// archives) is not a patch source: when the diff fetch and the blob
+/// fallback both fail, apply must report the patch as unavailable instead of
+/// silently patching from the stale archive.
 #[tokio::test]
-async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
+async fn apply_online_ignores_legacy_package_archive_when_downloads_fail() {
     let before = b"pkgcache before\n";
     let after = b"pkgcache after\n";
     let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
     let uuid = "44444444-4444-4444-8444-444444444444";
 
-    // Nothing is served: diff, package and blob endpoints all 404 (wiremock
-    // default for unmounted routes), i.e. every download attempt fails.
+    // Nothing is served: diff and blob endpoints 404 (wiremock default for
+    // unmounted routes), i.e. every download attempt fails.
     let mock = MockServer::start().await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -930,8 +928,6 @@ async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
         &before_hash,
         &after_hash,
     );
-    // The only local source: a package archive holding the patched bytes
-    // (what `repair --download-mode package` leaves behind). No blobs.
     write_package_archive(
         &socket.join("packages"),
         uuid,
@@ -939,25 +935,13 @@ async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
     );
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
-    assert_eq!(
+    assert_ne!(
         code, 0,
-        "a cached package archive is a usable source; failed downloads for \
-         artifacts we don't need must not abort the run; \
-         stdout={stdout}\nstderr={stderr}"
+        "a legacy package archive must not cover the patch; stdout={stdout}\nstderr={stderr}"
     );
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(
-        v["summary"]["applied"], 1,
-        "the patch must apply from the cached package archive; stdout={stdout}"
-    );
-    assert_eq!(v["summary"]["failed"], 0, "stdout={stdout}");
-
-    // The patched bytes came from the archive.
     let content = std::fs::read(tmp.path().join("node_modules/pkgcache/index.js")).unwrap();
-    assert_eq!(content, after, "file must carry the patched content");
+    assert_eq!(content, before, "the file must not be patched from the legacy archive");
 
-    // Keep the test honest: the downloads really were attempted and really
-    // did fail (otherwise this would pass for the wrong reason).
     let requests = mock.received_requests().await.unwrap_or_default();
     let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
     assert!(
@@ -968,16 +952,6 @@ async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
             .map(|r| r.url.path().to_string())
             .collect::<Vec<_>>()
     );
-
-    // Apply stays read-only against the persistent cache.
-    let blobs_dir = socket.join("blobs");
-    if blobs_dir.exists() {
-        let entries: Vec<_> = std::fs::read_dir(&blobs_dir).unwrap().collect();
-        assert!(
-            entries.is_empty(),
-            "apply must not write to .socket/blobs/; found {entries:?}"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

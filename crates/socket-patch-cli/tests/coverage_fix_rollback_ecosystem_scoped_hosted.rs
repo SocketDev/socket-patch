@@ -83,7 +83,6 @@ async fn rollback_in_process(cwd: &Path, ecosystems: Option<Vec<String>>) -> i32
             patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state: false,
     };
     let code = rollback_run(args).await;

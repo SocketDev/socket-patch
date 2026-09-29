@@ -67,7 +67,6 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             patch_server_url: Some("http://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        one_off: false,
         preserve_state: false,
     })
     .await;
@@ -75,8 +74,7 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
     code
 }
 
-/// `--mode hosted` (the documented spelling; the hidden `--redirect` boolean
-/// folds into it).
+/// `--mode hosted`.
 fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
         socket_yml: Default::default(),
@@ -96,8 +94,6 @@ fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: Some(ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),

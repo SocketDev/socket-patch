@@ -12,7 +12,7 @@
 //!
 //! 1. `python -m pip install -r requirements.txt` with the real pip major
 //!    from PyPI (the pristine install);
-//! 2. `socket-patch scan --redirect --vex` (hosted, on the lock-only
+//! 2. `socket-patch scan --mode hosted --vex` (hosted, on the lock-only
 //!    checkout) / `scan --vendor --vendor-source build --vex` (vendored,
 //!    from the pristine install) against a wiremock Socket API that also
 //!    serves the patched wheel — the same-run document attests;
@@ -24,7 +24,7 @@
 //! 4. the manifest-less VEX matrix (`vex_pipenv_pip_real`): manifest
 //!    deleted, ledgers deleted, `--offline` (zero requests), requirements
 //!    reverted to the registry pin (also `--no-verify`), `apply --vex`;
-//!    plus the embedded `scan --redirect --vex` / `scan --vendor --vex`
+//!    plus the embedded `scan --mode hosted --vex` / `scan --vendor --vex`
 //!    re-run on the manifest-less checkout.
 //!
 //! `#[ignore]`d (network: PyPI) — run with `--ignored`; CI sets

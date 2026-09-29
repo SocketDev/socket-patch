@@ -20,10 +20,9 @@ const BLOB_BYTES: &[u8] = b"patched\n";
 
 /// Run `get` via `common::run_with_env`, which scrubs the ambient
 /// `SOCKET_*` environment before spawning. The binary binds a wide env
-/// surface (`SOCKET_ONE_OFF`, `SOCKET_MANIFEST_PATH`, `SOCKET_CWD`,
-/// `SOCKET_OFFLINE`, ...); an ambient value silently changes what these
-/// tests exercise — `SOCKET_ONE_OFF=true` alone fails every invocation
-/// here ("--one-off and --save-only cannot be used together"), and
+/// surface (`SOCKET_MANIFEST_PATH`, `SOCKET_CWD`, `SOCKET_OFFLINE`, ...);
+/// an ambient value silently changes what these tests exercise —
+/// `SOCKET_OFFLINE=1` alone fails every invocation here, and
 /// `SOCKET_MANIFEST_PATH` aims the manifest write OUTSIDE the tempdir.
 fn run_get(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec![
@@ -474,7 +473,7 @@ async fn get_uuid_paid_patch_via_public_proxy_emits_paid_required_envelope() {
             "--api-url",
             &uri,
         ],
-        &[("SOCKET_PATCH_PROXY_URL", uri.as_str())],
+        &[("SOCKET_PROXY_URL", uri.as_str())],
     );
 
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
@@ -510,9 +509,8 @@ async fn get_paid_patch_via_public_proxy_returns_paid_required() {
     // returns a `paid_required` status. To simulate this we DON'T pass
     // --api-token / --org so the binary falls back to the public proxy
     // (the scrubbed env guarantees no ambient SOCKET_API_TOKEN /
-    // SOCKET_PROXY_URL interferes). We also have to point
-    // SOCKET_PATCH_PROXY_URL (the legacy alias, injected post-scrub) at
-    // the mock.
+    // SOCKET_PROXY_URL interferes). We then point SOCKET_PROXY_URL
+    // (injected post-scrub) at the mock.
     let mock = MockServer::start().await;
     let purl = "pkg:npm/paidpkg@1.0.0";
     let encoded = "pkg%3Anpm%2Fpaidpkg%401.0.0";
@@ -548,7 +546,7 @@ async fn get_paid_patch_via_public_proxy_returns_paid_required() {
             "--api-url",
             &uri,
         ],
-        &[("SOCKET_PATCH_PROXY_URL", uri.as_str())],
+        &[("SOCKET_PROXY_URL", uri.as_str())],
     );
 
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
