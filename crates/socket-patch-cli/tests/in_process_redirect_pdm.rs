@@ -151,6 +151,7 @@ fn assert_no_ledger(root: &Path) {
 
 fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: global(cwd, api_url),

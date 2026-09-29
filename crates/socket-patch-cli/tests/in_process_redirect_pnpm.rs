@@ -77,6 +77,7 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
 /// `--mode hosted`.
 fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {

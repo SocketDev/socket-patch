@@ -14,7 +14,7 @@ use super::types::IgnoredPath;
 
 /// Marker files of the ecosystems the in-memory engine cannot inventory
 /// (disk discovers them only through installed-tree crawlers).
-pub(crate) const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
+pub const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
     (
         "maven",
         &[
@@ -29,23 +29,31 @@ pub(crate) const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
 ];
 
 /// Directory names whose subtrees never hold a project root: installed
-/// trees, VCS and tool state, vendored dependencies, and test fixtures.
-pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 10] = [
-    "node_modules",
-    ".git",
-    ".socket",
-    ".yarn",
-    "vendor",
-    "test",
-    "tests",
-    "fixtures",
-    "__fixtures__",
-    "testdata",
-];
+/// trees, VCS and tool state, and vendored dependencies. Structural, so no
+/// policy can negate them. (Test and fixture trees are the socket.yml
+/// policy's overridable built-in ignores.)
+pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 5] = ["node_modules", ".git", ".socket", ".yarn", "vendor"];
+
+/// The marker basenames of `root` among `paths` (the files the policy's
+/// path filters test for that root).
+pub(crate) fn root_markers<'a>(root: &str, paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let (dir, base) = split_path(path);
+            let marker = marker_ecosystem(base).is_some()
+                || UNSUPPORTED_MARKERS.iter().any(|(_, names)| names.contains(&base));
+            (dir == root && marker).then(|| base.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
 
 /// The ecosystem a root marker basename belongs to: a [`registry::ROOT`]
 /// row (manifests alone never make a root) or a PEP 751 / PEP 723 lock.
-pub(crate) fn marker_ecosystem(base: &str) -> Option<&'static str> {
+pub fn marker_ecosystem(base: &str) -> Option<&'static str> {
     if let Some(row) = registry::root_marker(base) {
         return Some(row.ecosystem);
     }
@@ -82,6 +90,8 @@ fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
 }
 
 /// The detected roots (sorted) and the marker paths that did not make one.
+/// The socket.yml path policy (built-in default ignores included) is the
+/// caller's to apply.
 pub(crate) fn detect_roots<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     ecosystems: Option<&[String]>,
@@ -133,21 +143,15 @@ pub(crate) fn detect_roots<'a>(
                 || *dir == internal("common/temp")
                 || dir.starts_with(&format!("{}/", internal("common/temp")))
         });
-        let reason = if rush_internal {
-            Some("rush_internal")
-        } else {
-            None
-        };
-        match reason {
-            Some(reason) => {
-                for path in marker_paths.get(dir).into_iter().flatten() {
-                    ignored.push(IgnoredPath {
-                        path: path.clone(),
-                        reason: reason.to_string(),
-                    });
-                }
+        if rush_internal {
+            for path in marker_paths.get(dir).into_iter().flatten() {
+                ignored.push(IgnoredPath {
+                    path: path.clone(),
+                    reason: "rush_internal".to_string(),
+                });
             }
-            None => roots.push(dir.clone()),
+        } else {
+            roots.push(dir.clone());
         }
     }
     roots.sort();
@@ -190,9 +194,18 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(found, vec!["docs"]);
-        assert_eq!(ignored.len(), 4);
+        // Test and fixture trees are left to the socket.yml path policy.
+        assert_eq!(found, vec!["docs", "test/fixtures"]);
+        assert_eq!(ignored.len(), 3);
         assert!(ignored.iter().all(|i| i.reason == "excluded_dir"));
+    }
+
+    #[test]
+    fn root_markers_name_every_marker_of_the_root_only() {
+        assert_eq!(
+            root_markers("a", ["a/yarn.lock", "a/package.json", "a/b/yarn.lock", "a/pom.xml"]),
+            vec!["pom.xml".to_string(), "yarn.lock".to_string()]
+        );
     }
 
     #[test]

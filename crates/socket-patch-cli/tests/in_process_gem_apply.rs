@@ -199,6 +199,7 @@ async fn gem_install_scan_sync_patches_real_file() {
     .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
@@ -310,6 +311,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         .await;
 
     let args = ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {

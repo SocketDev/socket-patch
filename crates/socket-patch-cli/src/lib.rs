@@ -180,6 +180,8 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
             "vex_no_verify",
             "vex_doc_id",
             "vex_compact",
+            "no_socket_yml",
+            "min_severity",
         ],
         "get" => &["id", "cve", "ghsa", "package", "save_only", "all_releases"],
         "vex" => &["doc_id", "compact"],

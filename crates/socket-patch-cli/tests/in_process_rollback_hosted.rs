@@ -70,6 +70,7 @@ const GEM_PATCH_REMOTE: &str = "http://patch.test/gems/t0k3nt0k3n/";
 
 fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        socket_yml: Default::default(),
         paths: Vec::new(),
         packages: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {

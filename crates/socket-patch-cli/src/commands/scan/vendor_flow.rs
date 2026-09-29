@@ -452,6 +452,7 @@ async fn run_vendor_json_path(
     use_public_proxy: bool,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
+    policy: &super::policy::ScanPolicy,
     result: &mut serde_json::Value,
     manifest_path: &Path,
     socket_dir: &Path,
@@ -469,11 +470,11 @@ async fn run_vendor_json_path(
     // Same discovery as `--apply`. Vendored purls are NOT filtered here —
     // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
     // land on the backend's `already_vendored` skip).
-    let selected = match discover_selected(
+    let selected: Vec<socket_patch_core::api::types::PatchSearchResult> = match discover_selected(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
-        &args.common,
+        policy,
         false,
         false,
         telemetry,
@@ -481,7 +482,7 @@ async fn run_vendor_json_path(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(offers) => offers.selected.into_values().collect(),
         Err((code, message)) => {
             emit_discovery_error_json(result, &message);
             return code;
@@ -780,6 +781,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     use_public_proxy: bool,
     all_packages_with_patches: &'a [BatchPackagePatches],
     can_access_paid_patches: bool,
+    policy: &'a super::policy::ScanPolicy,
     result: &'a mut serde_json::Value,
     manifest_path: &'a Path,
     socket_dir: &'a Path,
@@ -797,6 +799,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
         use_public_proxy,
         all_packages_with_patches,
         can_access_paid_patches,
+        policy,
         result,
         manifest_path,
         socket_dir,

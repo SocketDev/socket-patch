@@ -3246,6 +3246,7 @@ snapshots:
     /// `in_process_redirect_pnpm.rs` shape).
     fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
         ScanArgs {
+            socket_yml: Default::default(),
             paths: Vec::new(),
             packages: Vec::new(),
             common: GlobalArgs {

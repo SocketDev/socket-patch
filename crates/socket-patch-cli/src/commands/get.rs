@@ -2935,7 +2935,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // included, so the listing can still show an installed package's paid
     // fix as `[PAID] (no access)`; selection, the skip records and the
     // JSON envelope only ever see the accessible share.
-    let (accessible, listed, narrow_skips, narrow_warnings) = if narrowing_exempt {
+    let (accessible, listed, narrow_skips, mut narrow_warnings) = if narrowing_exempt {
         let listed: Vec<PatchSearchResult> = search_response.patches.clone();
         (accessible, listed, Vec::new(), Vec::new())
     } else {
@@ -2956,6 +2956,8 @@ pub async fn run(args: GetArgs) -> i32 {
             .collect();
         (kept_accessible, narrowing.kept, skips, narrowing.warnings)
     };
+    // `get` bypasses the repo's socket.yml policy, but says so.
+    narrow_warnings.extend(super::scan::policy::policy_bypass_warnings(&args.common, &accessible));
     // Layout refusals print even when informational output is quieted only
     // by --json (stderr; the envelope carries them too) — but --silent
     // mutes them like scan does.

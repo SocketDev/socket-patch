@@ -652,7 +652,56 @@ into the new version's section — see docs/releasing.md.
   batch is reported as failed (warning, or the all-failed error when it was
   the only batch) — instead of that one package being skipped silently.
 
+- **scan honors the repo's socket.yml.** `projectIgnorePaths` (the
+  scanner's key) now also keeps `scan` from patching the matching projects,
+  in every mode and in the in-memory engine, whether or not the file has a
+  `patches` block (malformed values there only warn
+  `socket_yml_ignored_value`). See "socket.yml patch policy" in
+  CLI_CONTRACT.md.
+- **Test and fixture trees are skipped by default when scan discovers
+  projects.** `test/ tests/ fixtures/ __fixtures__/ testdata/` (any case)
+  are built-in `ignorePaths` for discovered roots: hosted/vendored
+  PATH-glob matches (`scan 'services/*'`) and the in-memory engine's
+  detected roots (which used to skip them through a hard-coded, case-
+  sensitive segment list). A directory you name (`--cwd`, a literal PATH,
+  `projectRoots`) is not affected; `ignorePaths: ["!/e2e/tests/"]`
+  re-includes one, in memory too.
+- **An invalid socket.yml fails scan.** An unparseable file, a misspelled
+  top-level `patches` key (`Patches`, `patchs`), a top-level merge or
+  aliased key, an invalid `patches` block (unknown key, wrong type, bad glob, `patches`
+  without `version: 2`), or `socket.yml` and `socket.yaml` that disagree
+  now fail `scan` before any request or write: exit 1, `errorCode:
+  socket_yml_invalid` / `socket_yml_ambiguous`, the key path and the fix
+  in the message. `--no-socket-yml` ignores the file for one run.
+- **scan rejects a PATH outside the repository root** (exit 2): one socket.yml
+  policy per invocation.
+
 ### Added
+
+- **socket.yml patch policy (staged rollout).** A `patches` block in the
+  repo-root socket.yml narrows what `scan` patches: `enabled` (false =
+  report only), `includePaths` / `ignorePaths` (gitignore patterns matched
+  against each project's lockfiles, npm `ignore` semantics),
+  `ecosystems`, `packages` / `ignorePackages` (`--package` specs),
+  `minSeverity` (critical|high|medium|moderate|low, judged by the worst
+  advisory a patch fixes) and `maxNewPatches` (validated; the per-run cap
+  lands with `--max-new-patches`). List flags (`--ecosystems`,
+  `--package`, PATHs) only narrow further; `--min-severity` beats the
+  file's floor and `--no-socket-yml` ignores the file. A package
+  that already carries a patch is never removed, upgraded or replaced by
+  the policy: it is held and reported under `policy.retained[]`. New flags
+  `--min-severity` / `SOCKET_MIN_SEVERITY` and `--no-socket-yml` /
+  `SOCKET_NO_SOCKET_YML`; every successful `scan --json` result gains a
+  top-level `policy` block (`source`, `sha256`, `minSeverity`, `filtered[]`,
+  `retained[]`) and the human output a `Policy (socket.yml): …` line that
+  names every skipped project and every critical/high patch the severity
+  floor held back. In memory, selection is two-phase:
+  `selectHostedScanPaths` takes the root policy files' text
+  (`policyFiles`) and `noSocketYml`, applies the full path policy and
+  returns `policyPaths`, `policySha256` and `policyError`; the session
+  takes `noSocketYml` / `minSeverity` / `policyPaths` / `policySha256` and
+  its result carries `policy` or `policyError`.
+  `get` ignores the policy and warns `policy_bypassed`.
 
 - **`scan --package <name|purl>`** (repeatable or comma-separated, env
   `SOCKET_SCAN_PACKAGES`) scopes a scan to the named packages: a name

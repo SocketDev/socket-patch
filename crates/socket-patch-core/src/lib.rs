@@ -7,6 +7,7 @@ pub mod hosted;
 pub mod ledgers;
 pub mod manifest;
 pub mod patch;
+pub mod policy;
 pub mod telemetry;
 pub mod update;
 pub mod utils;

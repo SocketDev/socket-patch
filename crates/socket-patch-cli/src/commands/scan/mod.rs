@@ -32,11 +32,16 @@ use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
-use super::get::{download_and_apply_patches_with, select_patches, DownloadParams, DownloadRun};
+use super::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
+
+pub use self::socket_yml_args::{SocketYmlArgs, MIN_SEVERITY_ENV};
+use self::policy::{load_invocation_policy, InvocationPolicy, PolicyLoadError, ScanPolicy};
 
 mod discovery;
 mod gc;
 pub(crate) mod hosted;
+pub(crate) mod policy;
+mod socket_yml_args;
 pub(crate) mod render;
 pub(crate) mod vendor_flow;
 
@@ -332,45 +337,12 @@ pub struct ScanArgs {
     /// VEX makes the command exit non-zero.
     #[command(flatten)]
     pub vex: VexEmbedArgs,
+
+    #[command(flatten)]
+    pub socket_yml: SocketYmlArgs,
 }
 
-/// Whether a `--package` spec names the package at `purl`: a purl spec
-/// matches the same purl, or any version of it when it carries none; a
-/// bare spec matches the package's full name (`@scope/pkg`, `group/name`)
-/// or its last segment. Qualifiers are ignored and names compare
-/// case-insensitively (PyPI, NuGet and Composer names are case-insensitive;
-/// npm forbids uppercase).
-pub(crate) fn package_spec_matches(spec: &str, purl: &str) -> bool {
-    let decoded = normalize_purl(strip_purl_qualifiers(purl)).to_lowercase();
-    let spec = spec.trim().to_lowercase();
-    if spec.is_empty() {
-        return false;
-    }
-    let Some(rest) = decoded.strip_prefix("pkg:") else {
-        return false;
-    };
-    let Some((_eco, name_version)) = rest.split_once('/') else {
-        return false;
-    };
-    let name = match name_version.rfind('@').filter(|&i| i > 0) {
-        Some(at) => &name_version[..at],
-        None => name_version,
-    };
-    if let Some(spec_rest) = spec.strip_prefix("pkg:") {
-        let spec_purl = normalize_purl(strip_purl_qualifiers(&format!("pkg:{spec_rest}"))).to_lowercase();
-        let spec_rest = &spec_purl[4..];
-        let has_version = spec_rest
-            .split_once('/')
-            .is_some_and(|(_, nv)| nv.rfind('@').is_some_and(|i| i > 0));
-        return if has_version {
-            decoded == spec_purl
-        } else {
-            decoded.strip_prefix(&spec_purl).is_some_and(|tail| tail.starts_with('@'))
-        };
-    }
-    let spec = spec.replace(':', "/");
-    name == spec || name.rsplit('/').next() == Some(spec.as_str())
-}
+pub(crate) use socket_patch_core::policy::package_spec_matches;
 
 /// Embedded-VEX side-effect for `scan`'s JSON terminal returns. When
 /// `--vex` was requested and `base_code` is 0, generate the OpenVEX
@@ -500,9 +472,9 @@ async fn embed_vex_human(
 /// resolve the top-ranked accessible patch per PURL. Per-package search
 /// errors are skipped, but when EVERY query errors the empty set would be
 /// indistinguishable from a genuine "no patches" result, so that surfaces
-/// as `Err(1)` with the failure on stderr. Selects with [`selection_args`]:
-/// scan never prompts, so every run auto-selects the top-ranked patch (see
-/// `api::ranking`) rather than erroring with `selection_required`. `Err`
+/// as `Err(1)` with the failure on stderr. Selects with
+/// [`select_accessible`]: scan never prompts, so every run auto-selects the
+/// top-ranked patch the policy admits (see `api::ranking`). `Err`
 /// carries the exit code AND the message, since JSON callers must fold it
 /// into their single envelope (CLI_CONTRACT.md). `show_progress` / `warn`
 /// are the human-only knobs of [`fetch_patch_details`] (JSON callers pass
@@ -514,12 +486,12 @@ async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
     can_access_paid_patches: bool,
-    common: &GlobalArgs,
+    policy: &ScanPolicy,
     show_progress: bool,
     warn: bool,
     telemetry: &mut PendingTelemetry,
     json_warnings: Option<&mut serde_json::Value>,
-) -> Result<Vec<PatchSearchResult>, (i32, String)> {
+) -> Result<socket_patch_core::policy::Offers, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
     // The scan event's send overlapped the detail fetches; every caller's
@@ -539,6 +511,7 @@ async fn discover_selected(
     // Some queries failed, some succeeded: a `--json` run has no stderr
     // warning (`warn` is human-only), so each failed package becomes a
     // run-level `warnings[]` entry — never a silent drop from the envelope.
+    let offers = select_accessible(all_search_results, can_access_paid_patches, policy);
     if let Some(result) = json_warnings {
         for (purl, e) in &failures {
             push_scan_json_warning(
@@ -547,26 +520,24 @@ async fn discover_selected(
                 &format!("could not fetch details for {purl}: {e}"),
             );
         }
+        policy.fold_into_json(result);
     }
-    if all_search_results.is_empty() {
-        return Ok(Vec::new());
-    }
-    if common.json {
-        // Pre-filter to accessible patches so `select_patches` takes the
-        // top-ranked one per PURL.
-        let accessible: Vec<PatchSearchResult> = all_search_results
-            .into_iter()
-            .filter(|p| can_access_paid_patches || p.tier == "free")
-            .collect();
-        return select_patches(&accessible, true, &selection_args(common))
-            .map_err(|code| (code, "patch selection failed".to_string()));
-    }
-    select_patches(
-        &all_search_results,
-        can_access_paid_patches,
-        &selection_args(common),
-    )
-    .map_err(|code| (code, "patch selection failed".to_string()))
+    Ok(offers)
+}
+
+/// The tier filter, then the policy's per-package selection (see
+/// [`ScanPolicy::select`]): scan never prompts, so every package gets its
+/// top-ranked admitted patch (see `api::ranking`).
+fn select_accessible(
+    all_search_results: Vec<PatchSearchResult>,
+    can_access_paid_patches: bool,
+    policy: &ScanPolicy,
+) -> socket_patch_core::policy::Offers {
+    let accessible: Vec<PatchSearchResult> = all_search_results
+        .into_iter()
+        .filter(|p| can_access_paid_patches || p.tier == "free")
+        .collect();
+    policy.select(accessible)
 }
 
 /// `common` for `select_patches`: scan never prompts, so it always takes
@@ -1202,41 +1173,54 @@ pub async fn run(args: ScanArgs) -> i32 {
     // delivered, as with an inline send). The flush here is the
     // backstop that keeps every event ahead of the process exit.
     let mut telemetry = PendingTelemetry::new();
-    let code = Box::pin(run_scan(args, &mut telemetry)).await;
+    let code = Box::pin(run_scan(args, &mut telemetry, None, true)).await;
     telemetry.flush().await;
     code
 }
 
 /// The project directories a hosted or vendored scan's PATHs name: each
 /// PATH is a directory, or a glob matching directories, relative to
-/// `--cwd`. Sorted and deduplicated.
-fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
+/// `--cwd`. Sorted and deduplicated; the flag says whether the user named
+/// the directory literally (explicit roots skip the built-in default path
+/// ignores; glob matches are discovered roots).
+fn project_dirs(cwd: &Path, paths: &[String]) -> Result<Vec<(PathBuf, bool)>, String> {
+    let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
     for raw in paths {
         let joined = cwd.join(raw);
         if raw.contains(['*', '?', '[']) {
             let pattern = joined.to_string_lossy().into_owned();
             let matches = glob::glob(&pattern).map_err(|e| format!("invalid path pattern `{raw}`: {e}"))?;
             let before = dirs.len();
-            dirs.extend(matches.filter_map(Result::ok).filter(|p| p.is_dir()));
+            dirs.extend(
+                matches
+                    .filter_map(Result::ok)
+                    .filter(|p| p.is_dir())
+                    .map(|p| (p, false)),
+            );
             if dirs.len() == before {
                 return Err(format!("`{raw}` matches no directory"));
             }
         } else if joined.is_dir() {
-            dirs.push(joined);
+            dirs.push((joined, true));
         } else {
             return Err(format!("`{raw}` is not a directory"));
         }
     }
-    dirs.sort();
-    dirs.dedup();
+    // A directory both named and matched counts as named.
+    dirs.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    dirs.dedup_by(|later, earlier| later.0 == earlier.0);
     Ok(dirs)
 }
 
 /// Run a hosted or vendored scan once per project directory its PATHs
 /// name, as if each were `--cwd`. The exit code is the worst of the runs.
-/// `--json` takes one directory, so stdout stays one document.
-async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
+/// `--json` takes one directory, so stdout stays one document. Every
+/// directory must be inside the repository root the policy was read from.
+async fn run_project_dirs(
+    args: ScanArgs,
+    telemetry: &mut PendingTelemetry,
+    invocation: &InvocationPolicy,
+) -> i32 {
     let dirs = match project_dirs(&args.common.cwd, &args.paths) {
         Ok(dirs) => dirs,
         Err(message) => {
@@ -1244,6 +1228,21 @@ async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i
             return 2;
         }
     };
+    if !args.common.is_global() {
+        for (dir, _) in &dirs {
+            let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            if !resolved.starts_with(&invocation.repo_root) {
+                eprintln!(
+                    "Error: `{}` is outside {} (the repository root socket.yml is read \
+                     from; without a trusted .git it is --cwd): run one scan per repository, \
+                     or pass --cwd at a common parent",
+                    dir.display(),
+                    invocation.repo_root.display()
+                );
+                return 2;
+            }
+        }
+    }
     if args.common.json && dirs.len() > 1 {
         eprintln!(
             "Error: --json takes one project directory ({} given); run one scan per directory",
@@ -1252,7 +1251,7 @@ async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i
         return 2;
     }
     let mut code = 0;
-    for dir in &dirs {
+    for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
             let shown = dir.strip_prefix(&args.common.cwd).unwrap_or(dir);
             println!("\n== {} ==", shown.display());
@@ -1260,12 +1259,29 @@ async fn run_project_dirs(args: ScanArgs, telemetry: &mut PendingTelemetry) -> i
         let mut child = args.clone();
         child.paths.clear();
         child.common.cwd = dir.clone();
-        code = code.max(Box::pin(run_scan(child, telemetry)).await);
+        code = code.max(Box::pin(run_scan(child, telemetry, Some(invocation), *explicit)).await);
     }
     code
 }
 
-async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
+/// Print a policy file that cannot be honored (fail closed, exit 1).
+fn report_policy_error(err: &socket_patch_core::policy::PolicyError, args: &ScanArgs) -> i32 {
+    if args.common.json {
+        print_json(&policy::policy_error_json(err, &args.paths));
+    } else {
+        eprintln!("Error ({}): {err}", err.code());
+    }
+    1
+}
+
+/// `invocation` is the policy a PATH-list parent already loaded (`None`
+/// loads it here); `explicit` says whether the user named this root.
+async fn run_scan(
+    mut args: ScanArgs,
+    telemetry: &mut PendingTelemetry,
+    invocation: Option<&InvocationPolicy>,
+    explicit: bool,
+) -> i32 {
     apply_env_toggles(&args.common);
 
     // Fold the legacy mode booleans into `args.mode` (see
@@ -1277,13 +1293,38 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         return 2;
     }
 
+    // The repo's socket.yml policy, read once per invocation before any
+    // write (an invalid file fails the run closed).
+    let loaded;
+    let invocation = match invocation {
+        Some(invocation) => invocation,
+        None => match load_invocation_policy(&args) {
+            Ok(i) => {
+                loaded = i;
+                &loaded
+            }
+            Err(PolicyLoadError::Usage(message)) => {
+                eprintln!("Error: {message}");
+                return 2;
+            }
+            Err(PolicyLoadError::Policy(err)) => return report_policy_error(&err, &args),
+        },
+    };
+
     // Hosted and vendored modes rewire a project's lockfiles, so their
     // PATHs name project directories: one scan per directory.
     if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
         && !args.paths.is_empty()
     {
-        return Box::pin(run_project_dirs(args, telemetry)).await;
+        return Box::pin(run_project_dirs(args, telemetry, invocation)).await;
     }
+
+    let mut policy = Box::new(ScanPolicy::for_root(
+        invocation,
+        &args.common.cwd,
+        explicit,
+        args.common.is_global(),
+    ));
 
     // Positional PATH globs (see `ScanArgs::paths`). An unparseable glob
     // is a usage error, same exit-2 shape as the mode conflicts.
@@ -1315,7 +1356,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let apply = args.mode == Some(ScanMode::Agent);
     let vendor = args.mode == Some(ScanMode::Vendored);
     let hosted = args.mode == Some(ScanMode::Hosted);
-    let prune = args.prune || args.sync;
+    // `patches.enabled: false` writes nothing, the GC included.
+    let prune = (args.prune || args.sync) && policy.writes_allowed();
 
     // Hosted mode runs no GC: say so once up front on the human path. The
     // `--json` path carries it in `redirect.warnings[]`.
@@ -1436,6 +1478,33 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         .map(VendorState::purl_keys)
         .unwrap_or_default();
 
+    // Read existing manifest once for update detection.
+    let existing_manifest = ctx.ledgers().await.manifest;
+    // Hosted mode records its patches ONLY in the lockfiles (v5 keeps no
+    // hosted ledger) and vendored mode ONLY in its ledger, so the hosted
+    // pins and the vendor ledger's purl→uuid records are folded into update
+    // detection (otherwise their `updates[]` would stay empty). The same
+    // merged view is the policy's recorded state (the retained set).
+    let hosted_pin_list: Vec<socket_patch_core::patch::redirect::upstream::HostedPin> =
+        if args.common.is_global() {
+            Vec::new()
+        } else {
+            socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
+        };
+    let hosted_state = (!args.common.is_global())
+        .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
+    let redirect_state = hosted_state.as_ref();
+    let hosted_pins: Vec<(String, String)> = hosted_pin_list
+        .iter()
+        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
+        .collect();
+    let update_manifest = merge_ledger_records_for_updates(
+        existing_manifest,
+        vendor_state.as_ref().ok(),
+        &hosted_pins,
+    );
+    policy.set_recorded(update_manifest.as_deref());
+
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = all_crawled
         .into_iter()
@@ -1498,6 +1567,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             .collect()
     };
 
+    // The socket.yml root/ecosystem/package filters, after the flags
+    // (which only narrow further) and after the prune-universe capture.
+    let filtered_crawled: Vec<_> = filtered_crawled
+        .into_iter()
+        .filter(|pkg| policy.admit_crawled(&pkg.purl))
+        .collect();
+
     let all_purls: Vec<String> = filtered_crawled.iter().map(|p| p.purl.clone()).collect();
     let package_count = all_purls.len();
 
@@ -1507,6 +1583,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             for (_, detail) in &layout_refusals {
                 eprintln!("Warning: {detail}");
             }
+            policy.print_warnings(args.common.silent);
             // Hosted mode already printed its own prune-ignored warning.
             if prune && !hosted {
                 eprintln!("{}", render::PRUNE_SKIPPED_EMPTY);
@@ -1553,6 +1630,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             if !layout_refusals.is_empty() {
                 result["warnings"] = layout_refusal_json(&layout_refusals);
             }
+            policy.fold_into_json(&mut result);
             // Hosted mode: a no-op `redirect` block keeps the envelope
             // schema-consistent with the ≥1-package path.
             if hosted {
@@ -1587,14 +1665,18 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             print_json(&result);
             return code;
         } else if !args.common.silent {
-            println!(
-                "{}",
-                render::no_packages_message(
-                    args.common.is_global(),
-                    args.common.ecosystems.as_deref(),
-                    &args.paths,
-                )
-            );
+            // A project the policy skipped as a whole is not an empty one.
+            if !policy.root_excluded() {
+                println!(
+                    "{}",
+                    render::no_packages_message(
+                        args.common.is_global(),
+                        args.common.ecosystems.as_deref(),
+                        &args.paths,
+                    )
+                );
+            }
+            policy.print_human(args.common.silent, args.common.verbose);
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
@@ -1632,6 +1714,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         for (_, detail) in &layout_refusals {
             eprintln!("Warning: {detail}");
         }
+        policy.print_warnings(args.common.silent);
     }
 
     // Query API in batches
@@ -1833,31 +1916,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         telemetry_org.as_deref(),
     );
 
-    // Read existing manifest once for update detection.
-    let existing_manifest = ctx.ledgers().await.manifest;
-    // Hosted mode records its patches ONLY in the lockfiles (v5 keeps no
-    // hosted ledger) and vendored mode ONLY in its ledger, so the hosted
-    // pins and the vendor ledger's purl→uuid records are folded into update
-    // detection (otherwise their `updates[]` would stay empty).
-    let hosted_pin_list: Vec<socket_patch_core::patch::redirect::upstream::HostedPin> =
-        if args.common.is_global() {
-            Vec::new()
-        } else {
-            socket_patch_core::patch::redirect::upstream::HostedPin::all(ctx.discovery().await)
-        };
-    let hosted_state = (!args.common.is_global())
-        .then(|| crate::commands::hosted_state_from_pins(&hosted_pin_list));
-    let redirect_state = hosted_state.as_ref();
-    let hosted_pins: Vec<(String, String)> = hosted_pin_list
-        .iter()
-        .map(|pin| (pin.purl.clone(), pin.uuid.clone()))
-        .collect();
-    let update_manifest = merge_ledger_records_for_updates(
-        existing_manifest,
-        vendor_state.as_ref().ok(),
-        &hosted_pins,
-    );
     let updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
+    policy.set_update_purls(updates.iter().map(|u| u.purl.as_str()));
 
     // The hosted-wiring probes below take `all_purls` (POST-filter: only
     // packages this run covered), unlike the PRE-filter `scanned_purls`
@@ -1892,6 +1952,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
             push_scan_json_warning(&mut result, API_BATCH_FAILED, detail);
         }
+        policy.fold_into_json(&mut result);
         // Flag lockfile-only packages (additive; absent means installed).
         // `normalize_purl` bridges the API's percent-encoded spelling to the
         // supplement's literal form.
@@ -1916,6 +1977,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 &api_client,
                 &all_packages_with_patches,
                 can_access_paid_patches,
+                &policy,
                 Some(result),
                 telemetry,
                 npm_crawl.as_ref(),
@@ -1942,13 +2004,15 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         let dry = args.common.dry_run;
         let mut apply_code = 0i32;
 
-        // --- Apply path (if requested) -----------------------------------
-        if apply {
-            let selected = match discover_selected(
+        // A report-only run selects nothing, but a severity floor or
+        // `enabled: false` still hides candidates; report them like the
+        // human arm does (the detail fetch runs only then).
+        if !apply && !vendor && policy.reports_selection() && !all_packages_with_patches.is_empty() {
+            if let Err((code, message)) = discover_selected(
                 &api_client,
                 &all_packages_with_patches,
                 can_access_paid_patches,
-                &args.common,
+                &policy,
                 false,
                 false,
                 telemetry,
@@ -1956,7 +2020,26 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             )
             .await
             {
-                Ok(s) => s,
+                emit_discovery_error_json(&mut result, &message);
+                return code;
+            }
+        }
+
+        // --- Apply path (if requested) -----------------------------------
+        if apply {
+            let selected: Vec<PatchSearchResult> = match discover_selected(
+                &api_client,
+                &all_packages_with_patches,
+                can_access_paid_patches,
+                &policy,
+                false,
+                false,
+                telemetry,
+                Some(&mut result),
+            )
+            .await
+            {
+                Ok(offers) => offers.selected.into_values().collect(),
                 Err((code, message)) => {
                     emit_discovery_error_json(&mut result, &message);
                     return code;
@@ -2068,6 +2151,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 use_public_proxy,
                 &all_packages_with_patches,
                 can_access_paid_patches,
+                &policy,
                 &mut result,
                 &manifest_path,
                 &socket_dir,
@@ -2124,7 +2208,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // the embedded VEX. An early "nothing to apply" exit still runs the GC.
     let (args_ref, manifest_ref, socket_ref) = (&args, &manifest_path, &socket_dir);
     let (scanned_ref, vendored_ref) = (&scanned_purls, &vendored_purls);
+    let policy_ref: &ScanPolicy = &policy;
     let finish_human = move |code: i32| async move {
+        policy_ref.print_human(silent, verbose);
         if prune && !vendor && !hosted && code == 0 {
             gc::run_human_gc(
                 &args_ref.common,
@@ -2292,11 +2378,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // engine (the same entry as `get --mode hosted`) — it must NOT fall
     // through to the apply/vendor branches.
     if hosted {
-        let selected = match discover_selected(
+        let selected: Vec<PatchSearchResult> = match discover_selected(
             &api_client,
             &all_packages_with_patches,
             can_access_paid_patches,
-            &args.common,
+            &policy,
             human,
             !silent,
             telemetry,
@@ -2304,12 +2390,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
         )
         .await
         {
-            Ok(s) => s,
+            Ok(offers) => offers.selected.into_values().collect(),
             // `discover_selected` already printed the failure to stderr.
             Err((code, _)) => {
                 return code;
             }
         };
+        policy.print_human(silent, verbose);
         let pairs: Vec<(String, String)> = selected
             .iter()
             .map(|s| (s.purl.clone(), s.uuid.clone()))
@@ -2341,14 +2428,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // `resolve_mode_flags`) only reports, plus the `--prune` GC.
     let report_only = args.mode.is_none();
 
-    // Scan always takes the top-ranked patch (see `selection_args`).
-    let mut select_common = selection_args(&args.common);
-    select_common.silent |= report_only;
+    // Scan always takes the top-ranked patch the policy admits.
     let selected: Vec<PatchSearchResult> =
-        match select_patches(&all_search_results, can_access_paid_patches, &select_common) {
-            Ok(s) => s,
-            Err(code) => return code,
-        };
+        select_accessible(all_search_results, can_access_paid_patches, &policy)
+            .selected
+            .into_values()
+            .collect();
+    policy.print_human(silent, verbose);
 
     // The skip / already-recorded lines below open their own paragraph
     // under the table's Summary: one blank line before the first of them.
@@ -2610,14 +2696,27 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join(d)).unwrap();
         }
         std::fs::write(tmp.path().join("apps/README"), "").unwrap();
-        let rel = |dirs: Vec<PathBuf>| -> Vec<String> {
+        let rel = |dirs: Vec<(PathBuf, bool)>| -> Vec<(String, bool)> {
             dirs.iter()
-                .map(|d| d.strip_prefix(tmp.path()).unwrap().to_string_lossy().replace('\\', "/"))
+                .map(|(d, explicit)| {
+                    (
+                        d.strip_prefix(tmp.path()).unwrap().to_string_lossy().replace('\\', "/"),
+                        *explicit,
+                    )
+                })
                 .collect()
         };
         let got = project_dirs(tmp.path(), &["apps/*".into(), "libs/core".into(), "apps/web".into()])
             .unwrap();
-        assert_eq!(rel(got), ["apps/api", "apps/web", "libs/core"]);
+        // Named literally = explicit (also when a glob matches it too).
+        assert_eq!(
+            rel(got),
+            [
+                ("apps/api".to_string(), false),
+                ("apps/web".to_string(), true),
+                ("libs/core".to_string(), true)
+            ]
+        );
         assert!(project_dirs(tmp.path(), &["apps/README".into()])
             .unwrap_err()
             .contains("is not a directory"));
@@ -2984,20 +3083,6 @@ mod tests {
             vec!["pkg:npm/minimist@1.2.2".to_string()],
             "positive control: a record names the package"
         );
-    }
-
-    #[test]
-    fn selection_args_never_prompts() {
-        for common in [
-            GlobalArgs::default(),
-            GlobalArgs {
-                json: true,
-                ..GlobalArgs::default()
-            },
-        ] {
-            let picked = selection_args(&common);
-            assert!(!picked.json && picked.yes, "scan always takes the top patch");
-        }
     }
 
     #[test]

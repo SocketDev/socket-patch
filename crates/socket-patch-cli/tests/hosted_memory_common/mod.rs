@@ -305,13 +305,28 @@ pub struct DiskRun {
 /// node / pipenv / gem subprocesses), `HOME` and the language caches at
 /// empty directories, no socket-cli config, no telemetry.
 pub fn run_disk(server: &MockServer, files: &BTreeMap<String, Vec<u8>>, dry_run: bool) -> DiskRun {
-    let project = tempfile::tempdir().unwrap();
+    run_disk_in(server, files, "", dry_run)
+}
+
+/// [`run_disk`] with `--cwd` at the repo-relative `cwd_rel` of a checkout
+/// (a `.git` directory marks the repo root, so a root `socket.yml`
+/// applies); `changed` stays relative to the repo root.
+pub fn run_disk_in(
+    server: &MockServer,
+    files: &BTreeMap<String, Vec<u8>>,
+    cwd_rel: &str,
+    dry_run: bool,
+) -> DiskRun {
+    let checkout = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     for (rel, bytes) in files {
-        let path = project.path().join(rel);
+        let path = checkout.path().join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
     }
+    // The checkout is its own repo: no socket.yml above the temp dir applies.
+    std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
+    let cwd = checkout.path().join(cwd_rel);
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.env_clear();
     for keep in [
@@ -349,7 +364,7 @@ pub fn run_disk(server: &MockServer, files: &BTreeMap<String, Vec<u8>>, dry_run:
         "--json",
         "--yes",
         "--cwd",
-        project.path().to_str().unwrap(),
+        cwd.to_str().unwrap(),
         "--org",
         ORG,
         "--api-token",
@@ -365,7 +380,7 @@ pub fn run_disk(server: &MockServer, files: &BTreeMap<String, Vec<u8>>, dry_run:
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let envelope: Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("disk --json output is not JSON ({e}):\n{stdout}\n{stderr}"));
-    let after = read_tree(project.path());
+    let after = read_tree(checkout.path());
     let changed = after
         .into_iter()
         .filter(|(rel, bytes)| files.get(rel) != Some(bytes))
