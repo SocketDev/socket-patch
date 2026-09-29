@@ -54,6 +54,9 @@ export interface HostedScanSessionOptions {
   providerConcurrency?: number     // default 8
   requestTimeoutMs?: number        // per provider call, default 60000
   limits?: HostedScanLimits
+  maxNewPatches?: number | 'none'  // run-wide cap on NEW patches, most severe first; 0 = upgrades only; absent/'none' = unlimited
+  maxNewPatchesCap?: number        // server ceiling: tightens maxNewPatches (including 'none'), never loosens it
+  inFlightPatches?: string[]       // base purls already in the open rollout PR: ranked first
   noSocketYml?: boolean            // ignore the repo's socket.yml (built-in test/fixture ignores still apply); default false
   minSeverity?: 'critical' | 'high' | 'medium' | 'moderate' | 'low' | 'none'   // beats socket.yml patches.minSeverity
   policyPaths?: string[]           // selectHostedScanPaths' policyPaths; each must be streamed with content or the session returns policyError
@@ -73,8 +76,15 @@ export interface ProjectResult {
   redirect: Record<string, unknown>                   // same shape as CLI `--json` `redirect` block
   summary: { scannedPackages: number; packagesWithPatches: number; totalPatches: number; freePatches: number; paidPatches: number; canAccessPaidPatches: boolean }
   redirected: { purl: string; uuid: string }[]
-  skipped: { purl: string; uuid: string; reason: string; detail?: string }[]   // reasons include the policy_* codes
+  skipped: { purl: string; uuid: string; reason: string; detail?: string }[]   // reasons include the policy_* codes; deferred rows appear as `rollout_deferred`
+  deferred: DeferredPatch[]                           // NEW patches over the maxNewPatches budget, rank order
   error?: { code: string; message: string }           // project-level failure (e.g. corrupt_ledger, patch_lookup_failed)
+}
+export interface DeferredPatch { purl: string; uuid: string; severity: 'critical' | 'high' | 'medium' | 'low' | 'unknown'; rank: number }
+export interface RolloutBlock {                       // same shape as CLI `scan --json` `rollout`
+  maxNewPatches: { value: number | null; source: 'flag' | 'env' | 'file' | 'default' | 'cap' }
+  counts: { new: number; deferred: number; upgrade: number; already: number }
+  deferred: { purl: string; uuids: string[]; severity: string; advisoryCount: number; projects: string[]; rank: number }[]
 }
 export interface HostedScanResult {
   projects: ProjectResult[]
@@ -82,6 +92,7 @@ export interface HostedScanResult {
   changedBinaryFiles: { path: string; content: Buffer }[]
   deletedFiles: string[]
   warnings: EngineWarning[]
+  rollout?: RolloutBlock                              // session-level: one budget across every project; absent only with policyError
   stats: { projects: number; filesInput: number; bytesInput: number; packagesScanned: number; packagesWithPatches: number; patchesSelected: number; patchesRedirected: number; filesChanged: number; providerCalls: Record<string, number>; phaseMs: Record<string, number> }
   engineVersion: string
   policy?: PolicyBlock                                         // absent only with policyError

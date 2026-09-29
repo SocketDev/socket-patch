@@ -8,6 +8,7 @@ pub mod ledgers;
 pub mod manifest;
 pub mod patch;
 pub mod policy;
+pub mod rollout;
 pub mod telemetry;
 pub mod update;
 pub mod utils;

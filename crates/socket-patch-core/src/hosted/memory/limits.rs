@@ -27,9 +27,28 @@ pub(crate) struct ResolvedOptions {
     pub(crate) provider_concurrency: usize,
     pub(crate) request_timeout: std::time::Duration,
     pub(crate) limits: ResolvedLimits,
+    /// `maxNewPatches` (`Some(None)` is `"none"`); see [`Self::max_new`].
+    max_new_patches: Option<Option<u32>>,
+    max_new_patches_cap: Option<u32>,
+    /// `inFlightPatches` as canonical base purls.
+    pub(crate) in_flight: std::collections::BTreeSet<String>,
     pub(crate) policy_overrides: crate::policy::PolicyOverrides,
     pub(crate) policy_paths: Vec<String>,
     pub(crate) policy_sha256: Option<String>,
+}
+
+impl ResolvedOptions {
+    /// The run-wide cap on NEW patches: the `maxNewPatches` option (reported
+    /// as `flag`), then the socket.yml `patches.maxNewPatches`, then
+    /// unlimited; `maxNewPatchesCap` only tightens it.
+    pub(crate) fn max_new(&self, file: Option<u32>) -> crate::rollout::MaxNew {
+        crate::rollout::resolve_max_new(
+            self.max_new_patches,
+            None,
+            file,
+            self.max_new_patches_cap,
+        )
+    }
 }
 
 pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOptions, EngineError> {
@@ -128,6 +147,14 @@ pub(crate) fn resolve_options(options: &HostedScanOptions) -> Result<ResolvedOpt
         provider_concurrency: provider_concurrency.min(MAX_PROVIDER_CONCURRENCY) as usize,
         request_timeout: std::time::Duration::from_millis(timeout_ms),
         limits: options.limits.clone().unwrap_or_default().resolve(),
+        max_new_patches: options.max_new_patches.map(|v| v.0),
+        max_new_patches_cap: options.max_new_patches_cap,
+        in_flight: options
+            .in_flight_patches
+            .iter()
+            .flatten()
+            .map(|p| crate::rollout::canonical_base_purl(p))
+            .collect(),
         policy_overrides,
         policy_paths,
         policy_sha256: options.policy_sha256.clone(),

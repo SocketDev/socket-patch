@@ -234,6 +234,24 @@ test('dry run previews the lockfile without patch fetches', async () => {
   assert.equal(calls.fetchPatch, 0)
 })
 
+test('maxNewPatches defers new patches and reports the rollout block', async () => {
+  const { provider } = fakeProvider()
+  const selection = addon.selectHostedScanPaths(tree)
+  const session = new addon.HostedScanSession({ orgSlug: 'test-org', maxNewPatches: 0 }, provider)
+  streamSelection(session, selection)
+  const result = await session.finish()
+  const [project] = result.projects
+  assert.deepEqual(project.redirected, [])
+  assert.deepEqual(
+    project.deferred.map((d) => [d.purl, d.rank]),
+    [['pkg:npm/left-pad@1.3.0', 1]],
+  )
+  assert.ok(project.skipped.some((s) => s.reason === 'rollout_deferred'))
+  assert.deepEqual(result.rollout.maxNewPatches, { value: 0, source: 'flag' })
+  assert.deepEqual(result.rollout.counts, { new: 0, deferred: 1, upgrade: 0, already: 0 })
+  assert.deepEqual(result.changedFiles, [])
+})
+
 test('provider failures become project errors, never rejections', async () => {
   for (const searchPatchesBatch of [
     async () => ({ ok: false, error: { kind: 'unauthorized', message: 'token revoked' } }),

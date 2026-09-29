@@ -78,6 +78,10 @@ fn emit_json_error_with_code(
     let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "error" }));
     result["status"] = serde_json::json!("error");
     result["error"] = serde_json::json!(message);
+    // The rollout block describes a successful run only.
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("rollout");
+    }
     if let Some(code) = code {
         result["errorCode"] = serde_json::json!(code);
     }
@@ -539,13 +543,20 @@ pub(super) async fn run_redirect(
     // handed to the VEX step so it does not walk the tree for the npm
     // roots again.
     npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    // The merged recorded view (manifest > hosted pins > vendor ledger) the
+    // rollout classifies against, whether a batch failed, and the stage
+    // that holds this directory's budget.
+    recorded: &super::rollout::RecordedState<'_>,
+    batch_failed: bool,
+    stage: &mut super::rollout::Stage,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
-    let selected: Vec<socket_patch_core::api::types::PatchSearchResult> = match discover_selected(
+    let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
         policy,
+        false,
         false,
         false,
         telemetry,
@@ -553,7 +564,7 @@ pub(super) async fn run_redirect(
     )
     .await
     {
-        Ok(offers) => offers.selected.into_values().collect(),
+        Ok(d) => d,
         // Hosted mode has no discovery envelope to fold the message into at
         // this point (it builds its `redirect` result further down).
         // `discover_selected` already printed the message to stderr; a
@@ -570,13 +581,22 @@ pub(super) async fn run_redirect(
             return code;
         }
     };
+    let rows = super::classified_rows(
+        stage,
+        &discovered,
+        recorded,
+        batch_failed,
+        all_packages_with_patches,
+        scan_result.as_mut(),
+    );
 
     // The redirect body consumes the selection only as (purl, uuid) pairs —
     // the seam `get --mode hosted` injects its advisory-pinned selection
-    // through (see `run_redirect_selected`).
-    let pairs: Vec<(String, String)> = selected
+    // through (see `run_redirect_selected`). ALREADY rows carry the
+    // recorded uuid, so a re-scan re-confirms the pin instead of swapping it.
+    let pairs: Vec<(String, String)> = rows
         .iter()
-        .map(|s| (s.purl.clone(), s.uuid.clone()))
+        .map(|r| (r.writer.purl.clone(), r.writer.uuid.clone()))
         .collect();
     run_redirect_selected(
         &args.common,
@@ -586,6 +606,7 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
+        Some(super::rollout::Gate::new(stage, rows)),
     )
     .await
 }
@@ -614,6 +635,7 @@ pub(super) async fn run_redirect(
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
 /// would get a minimal envelope that drops its own keys). `prune_requested`
 /// only feeds the `redirect_prune_ignored` warning — `get` passes `false`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_redirect_selected(
     common: &crate::args::GlobalArgs,
     vex: &crate::commands::vex::VexEmbedArgs,
@@ -622,6 +644,9 @@ pub(crate) async fn run_redirect_selected(
     selected: &[(String, String)],
     mut scan_result: Option<serde_json::Value>,
     npm_prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    // `scan`'s rollout gate: NEW rows past the budget are deferred after
+    // every write-free eligibility check below (§5.2). `get` passes `None`.
+    mut rollout: Option<super::rollout::Gate<'_>>,
 ) -> i32 {
     use socket_patch_core::hosted::engine::{
         self, Candidate, CandidateFiles, RewriteOptions, SkippedPatch,
@@ -647,6 +672,24 @@ pub(crate) async fn run_redirect_selected(
         status.finish();
         let references = match fetched {
             Ok(r) => r,
+            // A capped run whose every row is NEW: the failure affects only
+            // rows the incomplete lookup defers anyway (§5.2), so it becomes
+            // a warning instead of failing the run.
+            Err(e)
+                if rollout.as_ref().is_some_and(|gate| {
+                    let new = gate.new_keys();
+                    gate.stage.capped()
+                        && selected
+                            .iter()
+                            .all(|(p, u)| new.contains(&(p.clone(), u.clone())))
+                }) =>
+            {
+                if let Some(gate) = rollout.as_mut() {
+                    gate.stage.incomplete = true;
+                    gate.stage.reference_failed = Some(e.to_string());
+                }
+                std::collections::HashMap::new()
+            }
             Err(e) => {
                 let message = format!("failed to resolve patch references: {e}");
                 eprintln!(
@@ -659,8 +702,27 @@ pub(crate) async fn run_redirect_selected(
                 return 1;
             }
         };
-        candidates = engine::build_candidates(selected, &references, &mut skipped);
+        // Deferred rows need no reference: a failed lookup that only hit
+        // them builds nothing (and records no `not_found` for them).
+        if rollout
+            .as_ref()
+            .is_none_or(|gate| gate.stage.reference_failed.is_none())
+        {
+            candidates = engine::build_candidates(selected, &references, &mut skipped);
+        }
     }
+    // The rollout rows key on the selection's purl spelling; the server's
+    // reference may spell a candidate's `purl` differently. Uuids are unique
+    // across the selection.
+    let sel_purl_of: std::collections::HashMap<&str, &str> = selected
+        .iter()
+        .map(|(purl, uuid)| (uuid.as_str(), purl.as_str()))
+        .collect();
+    let sel_purl = |c: &Candidate| -> String {
+        sel_purl_of
+            .get(c.dep.patch_uuid.as_str())
+            .map_or_else(|| c.purl.clone(), |p| (*p).to_string())
+    };
 
     // Check binary lock symlinks before a mode takeover changes any wiring
     // (the takeover reverts rewrite locks in place, never create or remove
@@ -699,7 +761,15 @@ pub(crate) async fn run_redirect_selected(
     // preview must not create `.socket/`, flip to `lock_held` under a
     // concurrent wet run, or fail on a read-only checkout). Held to the end
     // of the function.
-    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
+    // A capped run whose only candidates are NEW rows it cannot admit
+    // (budget 0, or incomplete data) writes nothing: take no lock either.
+    let may_write = rollout.as_ref().is_none_or(|gate| {
+        let new = gate.new_keys();
+        candidates.iter().any(|c| {
+            !new.contains(&(sel_purl(c), c.dep.patch_uuid.clone())) || gate.may_admit(&sel_purl(c))
+        })
+    });
+    let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {
         match acquire_hosted_lock(common, &mut scan_result) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
@@ -864,28 +934,83 @@ pub(crate) async fn run_redirect_selected(
             socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
         })
     };
-    let done = engine::rewrite(
+    let rewrite_options = || RewriteOptions {
+        dry_run: common.dry_run,
+        targets_pipenv_lock,
+        pipenv_major,
+        pipenv_unknown_detail: format!(
+            "Pipenv was not found on PATH, so the Pipfile.lock references use the modern `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11 needs `path` references instead: put that pipenv on PATH or set {}=<major> and re-run `scan --mode hosted`.",
+            socket_patch_core::utils::pipenv::MAJOR_OVERRIDE_ENV
+        ),
+        trust_lockfile_config: !common.no_trust_lockfile_config,
+        npm_allow_remote_config: !common.no_npm_allow_remote_config,
+        npm_outer: &npm_outer,
+        blocking: true,
+    };
+    // The rollout gate plans again without its deferred rows: keep what
+    // the second pass needs.
+    let second_pass = rollout
+        .is_some()
+        .then(|| (read.clone(), python_metadata.clone()));
+    let mut done = engine::rewrite(
         &view,
         read,
         &candidates,
         python_metadata,
         &vlt_preflight.withheld_from_vlt,
         &dry_run_takeover_urls,
-        RewriteOptions {
-            dry_run: common.dry_run,
-            targets_pipenv_lock,
-            pipenv_major,
-            pipenv_unknown_detail: format!(
-                "Pipenv was not found on PATH, so the Pipfile.lock references use the modern `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11 needs `path` references instead: put that pipenv on PATH or set {}=<major> and re-run `scan --mode hosted`.",
-                socket_patch_core::utils::pipenv::MAJOR_OVERRIDE_ENV
-            ),
-            trust_lockfile_config: !common.no_trust_lockfile_config,
-            npm_allow_remote_config: !common.no_npm_allow_remote_config,
-            npm_outer: &npm_outer,
-            blocking: true,
-        },
+        rewrite_options(),
     )
     .await;
+
+    // The rollout gate (§5.2): every write-free check has run — grants,
+    // purl/url, vlt preflight, takeover refusals, wheel metadata, and the
+    // rewrite above, whose confirmation probe proves a NEW row would be
+    // pinned. Only then is the budget spent; deferred rows leave the
+    // rewrite set, which is rewritten again without them.
+    if let (Some(gate), Some((read, python_metadata))) = (rollout.as_mut(), second_pass) {
+        let eligible: std::collections::HashSet<(String, String)> = done
+            .confirmed
+            .iter()
+            .map(|(purl, uuid)| {
+                let purl = sel_purl_of.get(uuid.as_str()).map_or(purl.as_str(), |p| p);
+                (purl.to_string(), uuid.clone())
+            })
+            .collect();
+        let texts: Vec<&str> = done.files.values().map(String::as_str).collect();
+        super::rollout::mark_pinned(&mut gate.rows, &texts);
+        let unknown = gate.stage.reference_failed.is_some();
+        gate.stage.plan(&gate.rows, |row| {
+            unknown || eligible.contains(&(row.writer.purl.clone(), row.writer.uuid.clone()))
+        });
+        let deferred = gate.stage.deferred_keys();
+        skipped.extend(gate.stage.deferred_skips());
+        let before = candidates.len();
+        candidates.retain(|c| !deferred.contains(&(sel_purl(c), c.dep.patch_uuid.clone())));
+        if candidates.len() != before {
+            done = engine::rewrite(
+                &view,
+                read,
+                &candidates,
+                python_metadata,
+                &vlt_preflight.withheld_from_vlt,
+                &dry_run_takeover_urls,
+                rewrite_options(),
+            )
+            .await;
+        }
+        // A row that turned out to be pinned already (`mark_pinned`: a pin
+        // discovery did not recognize) still gets written: take the lock
+        // skipped above. Only NEW rows ran without it, so no takeover did.
+        if lock.is_none() && !common.dry_run && !candidates.is_empty() {
+            match acquire_hosted_lock(common, &mut scan_result) {
+                Ok(guard) => lock = Some(guard),
+                Err(code) => return code,
+            }
+        }
+    }
+    // Held to the end of the function.
+    let _lock = lock;
     // Dry-run mode-takeover previews were withheld from the rewriters (their
     // lock fragments still carry the vendored wiring the wet run reverts
     // first), so the presence probe cannot see them: the wet run reverts
@@ -1188,6 +1313,9 @@ pub(crate) async fn run_redirect_selected(
             common.dry_run,
         );
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
+        if let Some(gate) = &rollout {
+            super::finish_rollout_json(gate.stage, &mut result);
+        }
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
                 "path": vex.vex.as_ref().expect("vex_statements is Some only when --vex was given").display().to_string(),
@@ -1228,8 +1356,9 @@ pub(crate) async fn run_redirect_selected(
             human_files.extend(takeover_files.iter().cloned());
             human_files.sort();
             human_files.dedup();
-            // The one stdout line: scripts read it, so it stays on stdout;
-            // everything below is on stderr and names its package itself.
+            // The summary line: scripts read it, so it stays on stdout, as do
+            // the rollout line and the next steps; the warnings below are on
+            // stderr and name their package themselves.
             println!(
                 "{}",
                 format_redirect_summary(confirmed.len(), human_files.len(), common.dry_run)
@@ -1250,8 +1379,10 @@ pub(crate) async fn run_redirect_selected(
                 .collect();
             // Human output prints the bare strings — `Value`'s `Display`
             // would JSON-quote them.
+            // Deferred rows are summed up by the rollout lines instead.
             let skipped_pairs: Vec<(String, String)> = skipped
                 .iter()
+                .filter(|s| s.reason != super::rollout::ROLLOUT_DEFERRED)
                 .map(|s| (s.purl.clone(), s.reason.clone()))
                 .collect();
             // Granted, but nothing in the project pins it (no lock entry,
@@ -1311,12 +1442,26 @@ pub(crate) async fn run_redirect_selected(
                     crate::commands::vex::format_vex_dry_run_skip("rewritten")
                 );
             }
-            if !common.dry_run {
-                for line in
-                    format_next_steps(&human_files, !takeover_migrated.is_empty())
-                {
-                    println!("{line}");
+            let (rollout_line, deferred_steps) = match &rollout {
+                Some(gate) => {
+                    for (code, detail) in gate.stage.warnings() {
+                        eprintln!("{}", format_warning(code, &detail, width));
+                    }
+                    super::rollout::human(gate.stage, common.dry_run)
                 }
+                None => (None, Vec::new()),
+            };
+            if let Some(line) = rollout_line {
+                println!("{line}");
+            }
+            let mut next_steps = if common.dry_run {
+                Vec::new()
+            } else {
+                format_next_steps(&human_files, !takeover_migrated.is_empty())
+            };
+            next_steps.extend(deferred_steps);
+            for line in next_steps {
+                println!("{line}");
             }
         }
         // Errors print even under --silent ("errors only", never
@@ -2060,6 +2205,7 @@ fn format_next_steps(files: &[String], vendored_removed: bool) -> Vec<String> {
 /// future embeds the whole hosted engine, and callers outside scan (`get
 /// --mode hosted`) must not materialize it in their own poll frame (Windows
 /// 1 MiB main-thread stack; same rationale as scan's `boxed_*` family).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn boxed_run_redirect_selected<'a>(
     common: &'a crate::args::GlobalArgs,
     vex: &'a crate::commands::vex::VexEmbedArgs,
@@ -2068,6 +2214,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
     selected: &'a [(String, String)],
     scan_result: Option<serde_json::Value>,
     npm_prior: Option<&'a crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    rollout: Option<super::rollout::Gate<'a>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_redirect_selected(
         common,
@@ -2077,6 +2224,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         selected,
         scan_result,
         npm_prior,
+        rollout,
     ))
 }
 

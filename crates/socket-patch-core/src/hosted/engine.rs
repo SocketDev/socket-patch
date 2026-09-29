@@ -287,7 +287,7 @@ pub fn withhold_everywhere(
 }
 
 /// The project's candidate files as the rewriters read them.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CandidateFiles {
     /// Readable candidate texts, keyed by project-relative path.
     pub files: BTreeMap<String, String>,

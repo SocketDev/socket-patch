@@ -166,6 +166,7 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
             vex: vex.map(Path::to_path_buf),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 

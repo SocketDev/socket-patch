@@ -257,7 +257,13 @@ the same way everywhere, from the patches your account can download:
 
 "Newest" is when the patch was published, not the package version. When a better patch
 appears for a package you already patched, the JSON `updates[]` array lists it and the
-next `scan` in the same mode takes it.
+next `scan` in the same mode takes it. A patch that only wins on the tier or UUID
+tiebreak never replaces one you already have, so re-running `scan` never swaps patches.
+
+This order picks the patch *for* a package. When a capped scan
+([`--max-new-patches`](#add-a-few-new-patches-per-run)) has to choose *which packages*
+get their first patch, it takes the most severe first, then the ones fixing the most
+advisories.
 
 ### State in `.socket/`
 
@@ -416,6 +422,37 @@ hosted and vendored mode each PATH is a project directory, scanned as if it were
 To make the choice stick for everyone who runs `scan` in the repo (CI and the Socket
 autopatch bot included), put it in `socket.yml` instead — see
 [Roll out gradually](#roll-out-gradually-with-socketyml).
+### Add a few new patches per run
+
+```bash
+socket-patch scan --max-new-patches 5          # at most 5 packages get their first patch
+socket-patch scan --max-new-patches 0          # only upgrade patches you already have
+socket-patch scan --max-new-patches none       # no cap this run
+```
+
+A capped scan patches the most critical packages first: by the severity of the patch,
+then by how many advisories it fixes. Upgrades of packages that are already patched are
+never capped. Commit the result and run `scan` again to add the next batch; repeated
+runs on an unchanged repo add the same packages in the same order and stop once
+everything is patched. `--dry-run` shows exactly what the run would add and defer, and
+`--json` reports it under `rollout` (`jq '.rollout.counts.deferred'`). In hosted and
+vendored mode, several project directories in one run (`scan apps/*`) share the cap,
+visited in sorted order; `--json` takes one directory, so a CI job per directory gets
+its own N.
+
+To drip patches in through a PR bot, set the cap once in the repo's `socket.yml`
+(part of its [`patches:` policy](#roll-out-gradually-with-socketyml); the flag and
+`SOCKET_MAX_NEW_PATCHES` override it, and `--no-socket-yml` ignores it):
+
+```yaml
+# Weekly drip with the depscan autopatch PR
+version: 2
+patches:
+  maxNewPatches: 5        # the PR keeps the same 5 until merged, then the next 5
+```
+
+A cap only advances when the scan's changes are committed (or merged by a PR bot). In a
+CI job that scans without committing, set no cap.
 
 ### Patch one specific CVE or advisory
 
@@ -650,6 +687,7 @@ socket-patch scan [PATHS]... [options]
 | `--package <name\|purl>` | `SOCKET_SCAN_PACKAGES` | Only scan these packages: a name (`lodash`, `@scope/pkg`, `requests`; case-insensitive) or a purl with or without its version (`pkg:npm/lodash`, `pkg:pypi/requests@2.31.0`). Repeat the flag or separate with commas. |
 | `--prune` | — | Agent-mode garbage collection after the scan: remove manifest entries for packages no longer present in the crawl (installed trees + lockfiles — a wiped `node_modules` alone doesn't prune lockfile-listed entries) and delete orphan blob/diff-archive files (plus any legacy package archives). [Vendored](#vendor) packages are exempt from the crawl-based prune, but a vendored entry whose dependency has left the lockfile is reverted. Ignored, with a `redirect_prune_ignored` warning, in hosted mode; without a mode the scan is report-only. |
 | `--sync` | — | Shorthand for `--mode agent --prune`: the one-flag agent-mode auto-update run. |
+| `--max-new-patches <N\|none>` | `SOCKET_MAX_NEW_PATCHES` | Add at most N patches to packages that have none yet, most severe first; the rest are deferred to the next scan and listed in the output. Upgrades of already-patched packages are not capped. `0` adds no new patches, `none` means no cap (it also lifts a `socket.yml` `patches.maxNewPatches`). See [Add a few new patches per run](#add-a-few-new-patches-per-run). |
 | `--batch-size <n>` | `SOCKET_BATCH_SIZE` | Packages per API request (default: `500` on the authenticated API, `100` on the public proxy). A request whose body would exceed 256 KiB is split into smaller ones. |
 | `--min-severity <level>` | `SOCKET_MIN_SEVERITY` | Only patch packages whose patch fixes an advisory of at least `critical`, `high`, `medium` (or `moderate`) or `low`; `none` lifts the floor. Overrides `patches.minSeverity` in socket.yml. Patches of unknown severity are skipped whenever a floor is set. |
 | `--no-socket-yml` | `SOCKET_NO_SOCKET_YML` | Ignore the repo's socket.yml patch policy for this run (the built-in test/fixture directory ignores still apply). |
@@ -677,6 +715,9 @@ socket-patch scan --package lodash
 
 # Two projects of a monorepo
 socket-patch scan apps/web apps/api
+
+# Roll out gradually: at most 5 new patches, most critical first
+socket-patch scan --max-new-patches 5
 
 # Vendored mode: build + commit every patched dependency
 socket-patch scan --json --mode vendored

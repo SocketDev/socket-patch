@@ -58,6 +58,11 @@ pub use limits::SessionBuilder;
 pub use select::{candidate_files, safe_repo_path, select_paths};
 pub use types::*;
 
+use crate::rollout::stage::{
+    classify, lookup_incomplete, mentioned_uuids, offers_from_results, Offers, RecordedIndex, Row,
+    Stage,
+    ROLLOUT_DEFERRED,
+};
 use discover::Provider;
 use stages::{Planned, RewriteRefused, Rewritten, StageOptions};
 use crate::policy::{
@@ -115,8 +120,15 @@ struct RootState {
     purls: Vec<String>,
     summary: ProjectSummary,
     packages: Vec<crate::api::types::BatchPackagePatches>,
+    /// Every accessible offer per purl, and the winner per purl.
+    offers: Offers,
+    /// Purls whose detail query failed.
+    failed_details: Vec<String>,
+    /// The classified rows (§5.1) the run-wide rollout plan spends on.
+    rows: Vec<Row>,
     selected: Vec<(String, String)>,
     skipped: Vec<SkippedPatch>,
+    deferred: Vec<DeferredPatch>,
     /// Candidates the socket.yml policy withheld (`policy_*` reasons).
     policy_skipped: Vec<SkippedPatch>,
     error: Option<ProjectError>,
@@ -365,6 +377,56 @@ fn unrooted_unsupported_warnings<'a>(
     }
 }
 
+/// One root's recorded view (§5.1) in memory: its `.socket/manifest.json`,
+/// the hosted pins its lockfiles name, and its vendor ledger — the disk
+/// merge's precedence. A pin is a mention of an offered uuid for the purl
+/// in one of the root's own files (a nested root's files are its own); a
+/// pin to a patch the API no longer offers reads as NEW, which costs one
+/// slot once instead of stalling.
+fn memory_recorded(
+    project: &MemoryProject,
+    root: &str,
+    roots: &[String],
+    offers: &Offers,
+) -> RecordedIndex {
+    let manifest = project
+        .text(select::MANIFEST_REL)
+        .and_then(|text| serde_json::from_str(text).ok());
+    let vendor = stages::vendored_entries(project);
+    let nested: Vec<String> = roots
+        .iter()
+        .filter(|other| other.as_str() != root)
+        .filter_map(|other| roots::strip_root(root, other).map(|rel| format!("{rel}/")))
+        .filter(|rel| rel != "/")
+        .collect();
+    let mut mentioned = std::collections::HashSet::new();
+    for (path, entry) in project.entries() {
+        if path.starts_with(".socket/") || nested.iter().any(|n| path.starts_with(n.as_str())) {
+            continue;
+        }
+        if let MemoryEntry::Text(text) = entry {
+            mentioned_uuids(text, &mut mentioned);
+        }
+    }
+    let pins: Vec<(String, String)> = offers
+        .selected
+        .iter()
+        .filter_map(|(purl, selected)| {
+            let offered = offers.unfiltered.get(purl)?;
+            std::iter::once(selected)
+                .chain(offered.iter())
+                .find(|p| mentioned.contains(&p.uuid.to_ascii_lowercase()))
+                .map(|p| (purl.clone(), p.uuid.clone()))
+        })
+        .collect();
+    let merged = crate::ledgers::merge_ledger_records_for_updates(
+        manifest.as_ref(),
+        vendor.as_ref(),
+        &pins,
+    );
+    RecordedIndex::new(merged.as_deref(), &pins)
+}
+
 async fn engine(
     input: HostedScanInput,
     api: Arc<dyn PatchApi>,
@@ -487,8 +549,12 @@ async fn engine(
             purls: Vec::new(),
             summary: ProjectSummary::default(),
             packages: Vec::new(),
+            offers: Offers::default(),
+            failed_details: Vec::new(),
+            rows: Vec::new(),
             selected: Vec::new(),
             skipped: Vec::new(),
+            deferred: Vec::new(),
             policy_skipped: Vec::new(),
             error: None,
         })
@@ -555,6 +621,8 @@ async fn engine(
         .collect();
     let batch = discover::batch_search(&provider, &root_purls, options.batch_size).await;
     let can_access_paid = batch.can_access_paid_patches;
+    // A package a failed batch hid could have been NEW (§5.2).
+    let mut batch_failed = false;
     for state in states.iter_mut().filter(|s| s.error.is_none()) {
         state.summary.can_access_paid_patches = can_access_paid;
         let Some(outcome) = batch.roots.get(&state.root) else {
@@ -569,6 +637,7 @@ async fn engine(
             continue;
         }
         if outcome.failed_purls > 0 {
+            batch_failed = true;
             warnings.push(EngineWarning::new(
                 "batch_failed",
                 format!(
@@ -609,8 +678,14 @@ async fn engine(
         for pkg in &state.packages {
             match details.get(&pkg.purl) {
                 Some(Ok(response)) => results.extend(response.patches.iter().cloned()),
-                Some(Err(error)) => failures.push(error.clone()),
-                None => failures.push("patch details were not fetched".to_string()),
+                Some(Err(error)) => {
+                    failures.push(error.clone());
+                    state.failed_details.push(pkg.purl.clone());
+                }
+                None => {
+                    failures.push("patch details were not fetched".to_string());
+                    state.failed_details.push(pkg.purl.clone());
+                }
             }
         }
         if !failures.is_empty() && failures.len() == state.packages.len() {
@@ -632,7 +707,7 @@ async fn engine(
                 Some(&state.root),
             ));
         }
-        state.selected = select_with_policy(
+        state.offers = select_with_policy(
             &policy,
             results,
             can_access_paid,
@@ -642,6 +717,39 @@ async fn engine(
         );
     }
     phases.mark("details");
+
+    // Classify every root's selection against its recorded view (§5.1):
+    // the tree's manifest and vendor ledger, and the hosted pins its
+    // lockfiles name. ALREADY rows carry the recorded uuid, so a re-scan
+    // re-confirms a pin instead of swapping it.
+    let mut stage = Stage::new(options.max_new(policy.max_new_patches()), None, std::path::Path::new(""));
+    // A root whose every lookup failed hides packages that could have been
+    // NEW: a capped run then admits none anywhere (§5.2).
+    stage.incomplete |= states
+        .iter()
+        .any(|s| s.error.as_ref().is_some_and(|e| e.code == "patch_lookup_failed"));
+    let roots_by_path: Vec<String> = states.iter().map(|s| s.root.clone()).collect();
+    for state in states.iter_mut().filter(|s| s.error.is_none()) {
+        let Some(project) = state.project.as_ref() else {
+            continue;
+        };
+        let recorded = memory_recorded(project, &state.root, &roots_by_path, &state.offers);
+        stage.incomplete |= lookup_incomplete(
+            &recorded,
+            &state.failed_details,
+            batch_failed,
+        );
+        let mut rows = classify(&state.offers, &recorded, &state.root);
+        for row in &mut rows {
+            row.candidate.in_flight = options.in_flight.contains(&row.candidate.base_purl);
+        }
+        state.selected = rows
+            .iter()
+            .map(|r| (r.writer.purl.clone(), r.writer.uuid.clone()))
+            .collect();
+        state.rows = rows;
+    }
+    phases.mark("classify");
 
     let uuids: BTreeSet<String> = states
         .iter()
@@ -653,12 +761,24 @@ async fn engine(
     } else {
         discover::fetch_references(&provider, &uuids).await
     };
+    // Roots whose rows' eligibility is unknown: a reference failure that
+    // hit only NEW rows of a capped run defers them instead of failing the
+    // root (§5.2).
+    let mut unknown_roots: BTreeSet<String> = BTreeSet::new();
     for state in states.iter_mut().filter(|s| s.error.is_none()) {
         if let Some(error) = state
             .selected
             .iter()
             .find_map(|(_, uuid)| failed_refs.get(uuid))
         {
+            if stage.capped() && state.rows.iter().all(|r| r.candidate.recorded.is_new()) {
+                stage.incomplete = true;
+                stage.reference_failed = Some(error.clone());
+                unknown_roots.insert(state.root.clone());
+                state.selected.clear();
+                continue;
+            }
+            stage.incomplete = true;
             state.fail(
                 "reference_lookup_failed",
                 format!("failed to resolve patch references: {error}"),
@@ -693,16 +813,20 @@ async fn engine(
     };
     phases.mark("plan");
 
-    let stage = StageOptions {
+    let stage_options = StageOptions {
         dry_run: options.dry_run,
         pipenv_major: options.pipenv_major,
         trust_lockfile_config: options.trust_lockfile_config,
         npm_allow_remote_config: options.npm_allow_remote_config,
     };
     let mut rewritten: Vec<(usize, Rewritten)> = Vec::new();
+    let mut first_plans: BTreeMap<usize, Planned> = BTreeMap::new();
     for (index, plan) in planned {
         checkpoint(&cancel).await?;
-        match stages::rewrite(plan, &wheel_metadata, stage).await {
+        if stage.capped() {
+            first_plans.insert(index, plan.clone());
+        }
+        match stages::rewrite(plan, &wheel_metadata, stage_options).await {
             Ok(done) => rewritten.push((index, done)),
             Err(RewriteRefused { refusal, skipped }) => {
                 states[index].skipped = skipped;
@@ -711,6 +835,103 @@ async fn engine(
         }
     }
     phases.mark("rewrite");
+
+    // The run-wide rollout plan (§5.2): one budget across every root, spent
+    // after each root's write-free checks (grants, takeover refusals, vlt,
+    // wheel metadata, the rewrite's confirmation probe). A root with
+    // deferred rows is rewritten again without them.
+    let confirmed: BTreeSet<(String, String)> = rewritten
+        .iter()
+        .flat_map(|(index, done)| {
+            let root = states[*index].root.clone();
+            done.done
+                .confirmed
+                .iter()
+                .map(move |(_, uuid)| (root.clone(), uuid.clone()))
+        })
+        .collect();
+    let all_rows: Vec<Row> = states
+        .iter()
+        .filter(|s| s.error.is_none())
+        .flat_map(|s| s.rows.iter().cloned())
+        .collect();
+    stage.plan(&all_rows, |row| {
+        unknown_roots.contains(&row.candidate.project)
+            || confirmed.contains(&(row.candidate.project.clone(), row.writer.uuid.clone()))
+    });
+    let deferred_rows: Vec<(crate::rollout::Candidate, u32)> =
+        stage.plan.as_ref().map(|p| p.deferred.clone()).unwrap_or_default();
+    if !deferred_rows.is_empty() {
+        let root_index: BTreeMap<String, usize> = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.root.clone(), i))
+            .collect();
+        for (row, rank) in &deferred_rows {
+            let Some(&i) = root_index.get(&row.project) else {
+                continue;
+            };
+            states[i].deferred.push(DeferredPatch {
+                purl: row.purl.clone(),
+                uuid: row.uuid.clone(),
+                severity: crate::rollout::severity_label(row.severity_order).into(),
+                rank: *rank,
+            });
+        }
+        let deferred_skip = |d: &DeferredPatch| SkippedPatch {
+            purl: d.purl.clone(),
+            uuid: d.uuid.clone(),
+            reason: ROLLOUT_DEFERRED.to_string(),
+            detail: Some(format!(
+                "rank {} in the rollout queue; a later scan adds it",
+                d.rank
+            )),
+        };
+        let mut again: Vec<(usize, Rewritten)> = Vec::with_capacity(rewritten.len());
+        for (index, done) in rewritten {
+            let root_deferred: BTreeSet<String> = states[index]
+                .deferred
+                .iter()
+                .map(|d| d.uuid.clone())
+                .collect();
+            if root_deferred.is_empty() {
+                again.push((index, done));
+                continue;
+            }
+            checkpoint(&cancel).await?;
+            // The first pass's skips stay (wheel metadata the rewrite could
+            // not fetch): its candidates are already gone, so the second
+            // pass cannot report them again.
+            let Some(mut plan) = first_plans.remove(&index) else {
+                again.push((index, done));
+                continue;
+            };
+            plan.candidates
+                .retain(|c| !root_deferred.contains(&c.dep.patch_uuid));
+            plan.skipped
+                .extend(states[index].deferred.iter().map(deferred_skip));
+            match stages::rewrite(plan, &wheel_metadata, stage_options).await {
+                Ok(done) => again.push((index, done)),
+                Err(RewriteRefused { refusal, skipped }) => {
+                    states[index].skipped = skipped;
+                    states[index].error = Some(ProjectError::from(refusal));
+                }
+            }
+        }
+        rewritten = again;
+        // Roots that never reached the rewrite (unknown eligibility) list
+        // their deferred rows as skipped too.
+        for state in states.iter_mut() {
+            if unknown_roots.contains(&state.root) && state.error.is_none() {
+                let extra: Vec<SkippedPatch> = state.deferred.iter().map(deferred_skip).collect();
+                state.skipped.extend(extra);
+            }
+        }
+    }
+    for (code, detail) in stage.warnings() {
+        warnings.push(EngineWarning::new(code, detail, None));
+    }
+    phases.mark("rollout");
 
     let record_uuids: BTreeSet<String> = if options.dry_run {
         BTreeSet::new()
@@ -768,6 +989,7 @@ async fn engine(
             summary: state.summary.clone(),
             redirected: Vec::new(),
             skipped,
+            deferred: state.deferred.clone(),
             error: state.error.clone(),
         });
     }
@@ -802,6 +1024,7 @@ async fn engine(
         changed_binary_files,
         deleted_files: Vec::new(),
         warnings,
+        rollout: stage.json(),
         stats,
         engine_version: engine_version(),
         policy: Some(policy_block(&policy, &policy_filtered, &[])),
@@ -842,6 +1065,7 @@ fn policy_error_output(
         changed_binary_files: Vec::new(),
         deleted_files: Vec::new(),
         warnings,
+        rollout: serde_json::Value::Null,
         stats: EngineStats {
             files_input,
             bytes_input,
@@ -867,7 +1091,7 @@ fn select_with_policy(
     root: &str,
     filtered: &mut Vec<FilteredEntry>,
     skipped: &mut Vec<SkippedPatch>,
-) -> Vec<(String, String)> {
+) -> Offers {
     let accessible: Vec<PatchSearchResult> = results
         .into_iter()
         .filter(|p| can_access_paid || p.tier == "free")
@@ -883,8 +1107,8 @@ fn select_with_policy(
                 .collect(),
         )
     };
-    let selected = discover::select_top_ranked(&admitted, true);
-    let chosen: BTreeSet<&str> = selected.iter().map(|(purl, _)| purl.as_str()).collect();
+    let offers = offers_from_results(&admitted, true);
+    let chosen: BTreeSet<&str> = offers.selected.keys().map(String::as_str).collect();
     let mut by_purl: BTreeMap<String, Vec<(PatchSearchResult, FilterReason)>> = BTreeMap::new();
     for (patch, reason) in dropped {
         if !chosen.contains(patch.purl.as_str()) {
@@ -908,7 +1132,7 @@ fn select_with_policy(
             reason,
         });
     }
-    selected
+    offers
 }
 
 /// Records → the project's result and changed files.
@@ -1000,6 +1224,7 @@ fn finish_root(
             summary: state.summary.clone(),
             redirected: Vec::new(),
             skipped,
+            deferred: state.deferred.clone(),
             error: Some(ProjectError {
                 code: "conflicting_write".into(),
                 message,
@@ -1045,6 +1270,7 @@ fn finish_root(
             .map(|(purl, uuid)| RedirectedPatch { purl, uuid })
             .collect(),
         skipped,
+        deferred: state.deferred.clone(),
         error: None,
     }
 }
@@ -1062,8 +1288,12 @@ mod tests {
             purls: Vec::new(),
             summary: ProjectSummary::default(),
             packages: Vec::new(),
+            offers: Offers::default(),
+            failed_details: Vec::new(),
+            rows: Vec::new(),
             selected: Vec::new(),
             skipped: Vec::new(),
+            deferred: Vec::new(),
             policy_skipped: Vec::new(),
             error: None,
         }

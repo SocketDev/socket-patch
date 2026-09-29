@@ -65,6 +65,7 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
         mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 

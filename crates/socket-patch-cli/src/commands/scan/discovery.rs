@@ -13,7 +13,6 @@ use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurre
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::args::GlobalArgs;
@@ -365,58 +364,8 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     (mismatched, views)
 }
 
-/// Fold the hosted pins and the vendor ledger's patch records into the
-/// manifest view update detection consults. Hosted mode records purl→uuid
-/// ONLY in the lockfiles (`hosted_pins`, uuid only; v5 keeps no hosted
-/// ledger) and vendored mode ONLY in `.socket/vendor/state.json`, so without
-/// this fold a pure hosted or vendored project's `updates[]` would always
-/// be empty. Precedence on a collision: manifest > hosted pins > vendor
-/// ledger (the live lock over a possibly superseded vendored entry); the
-/// vendor entries fold under the shared owner rule
-/// ([`socket_patch_core::ledgers::Ledgers::owned`]), so one the manifest
-/// claims (its key or base purl) stays behind the manifest's record.
-/// Vendor entries are keyed by their ledger key (`detect_updates` bridges
-/// the spellings); a legacy entry without an embedded record contributes
-/// its uuid alone. Borrows the manifest untouched when nothing else
-/// contributes.
-pub(super) fn merge_ledger_records_for_updates<'a>(
-    manifest: Option<&'a PatchManifest>,
-    vendor: Option<&VendorState>,
-    hosted_pins: &[(String, String)],
-) -> Option<Cow<'a, PatchManifest>> {
-    use socket_patch_core::ledgers::{uuid_only_record, Ledgers, Store};
-    let vendor = vendor.filter(|s| !s.entries.is_empty());
-    if vendor.is_none() && hosted_pins.is_empty() {
-        return manifest.map(Cow::Borrowed);
-    }
-    let mut merged = manifest.cloned().unwrap_or_default();
-    for (purl, uuid) in hosted_pins {
-        merged
-            .patches
-            .entry(purl.clone())
-            .or_insert_with(|| uuid_only_record(uuid));
-    }
-    let ledgers = Ledgers {
-        manifest,
-        vendor,
-        redirect: None,
-    };
-    for owned in ledgers.owned() {
-        if owned.store == Store::Manifest {
-            continue;
-        }
-        merged
-            .patches
-            .entry(owned.key.to_string())
-            .or_insert_with(|| {
-                owned
-                    .record
-                    .cloned()
-                    .unwrap_or_else(|| uuid_only_record(owned.uuid))
-            });
-    }
-    Some(Cow::Owned(merged))
-}
+pub(super) use socket_patch_core::ledgers::merge_ledger_records_for_updates;
+
 
 /// Cross-reference an existing manifest against discovery results to find
 /// PURLs whose newest available patch UUID differs from the locally-recorded
@@ -566,6 +515,7 @@ pub(super) fn severity_order(s: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use socket_patch_core::api::types::BatchPatchInfo;
 
     use crate::commands::scan::tests::manifest_with;

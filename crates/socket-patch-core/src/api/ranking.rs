@@ -25,6 +25,11 @@
 //!
 //! `tier` is an access filter, not a ranking signal: callers drop the paid
 //! patches a free user cannot download before ranking.
+//!
+//! This order picks one patch per package. Which *packages* a capped scan
+//! patches first is a different order, [`crate::rollout::rollout_cmp`]:
+//! it reads the same severity ladder and advisory count, but never the
+//! publish date, so a missing date cannot reshuffle the rollout queue.
 
 use std::cmp::{Ordering, Reverse};
 
@@ -159,7 +164,18 @@ pub fn cmp_search_results(a: &PatchSearchResult, b: &PatchSearchResult) -> Order
 /// never count, and neither does a missing date (the batch endpoint omits
 /// `publishedAt`), so an equal sibling is never reported as an update.
 pub fn batch_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) -> bool {
-    let (c, a) = (rank_batch_info(candidate), rank_batch_info(applied));
+    key_supersedes(&rank_batch_info(candidate), &rank_batch_info(applied))
+}
+
+/// [`batch_supersedes`] over the by-package shape: the rule scan uses to
+/// classify a recorded patch (ALREADY vs UPGRADE) and to report
+/// `updates[]`, on the same records that pick the patch, so selection,
+/// classification and reporting cannot disagree.
+pub fn search_result_supersedes(candidate: &PatchSearchResult, recorded: &PatchSearchResult) -> bool {
+    key_supersedes(&rank_search_result(candidate), &rank_search_result(recorded))
+}
+
+fn key_supersedes(c: &RankKey<'_>, a: &RankKey<'_>) -> bool {
     if c.not_merged != a.not_merged {
         return !c.not_merged;
     }
@@ -805,6 +821,45 @@ mod tests {
             cmp_search_results(&a, &b),
             "changing the package must not change the relative rank"
         );
+    }
+
+    // ── search_result_supersedes ─────────────────────────────────────
+
+    #[test]
+    fn search_supersedes_on_merged_state_first() {
+        let merged = search_multi("z", "free", "2020-01-01T00:00:00Z", &["low", "low"]);
+        let single = search("a", "free", "2026-01-01T00:00:00Z", "critical");
+        assert!(search_result_supersedes(&merged, &single));
+        assert!(!search_result_supersedes(&single, &merged));
+    }
+
+    #[test]
+    fn search_supersedes_on_severity_between_unmerged() {
+        let crit = search("z", "free", "2020-01-01T00:00:00Z", "critical");
+        let high = search("a", "free", "2026-01-01T00:00:00Z", "high");
+        assert!(search_result_supersedes(&crit, &high));
+        assert!(!search_result_supersedes(&high, &crit));
+    }
+
+    #[test]
+    fn search_supersedes_on_a_real_later_date_only() {
+        let newer = search("z", "free", "2026-01-01T00:00:00Z", "high");
+        let older = search("a", "free", "2024-01-01T00:00:00Z", "high");
+        assert!(search_result_supersedes(&newer, &older));
+        assert!(!search_result_supersedes(&older, &newer));
+        let undated = search("z", "free", "", "high");
+        assert!(!search_result_supersedes(&undated, &older));
+        assert!(!search_result_supersedes(&newer, &undated));
+    }
+
+    #[test]
+    fn search_supersedes_ignores_tier_and_uuid_tiebreaks() {
+        let paid = search("a", "paid", "2026-01-01T00:00:00Z", "high");
+        let free = search("z", "free", "2026-01-01T00:00:00Z", "high");
+        assert_eq!(cmp_search_results(&paid, &free), Ordering::Less);
+        assert!(!search_result_supersedes(&paid, &free));
+        assert!(!search_result_supersedes(&free, &paid));
+        assert!(!search_result_supersedes(&paid, &paid));
     }
 
     #[test]

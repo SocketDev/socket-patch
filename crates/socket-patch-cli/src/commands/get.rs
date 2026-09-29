@@ -3590,6 +3590,8 @@ async fn run_get_hosted(
         &pairs,
         scan_result,
         None,
+        // `get` is explicit intent: the rollout cap never applies.
+        None,
     )
     .await
 }

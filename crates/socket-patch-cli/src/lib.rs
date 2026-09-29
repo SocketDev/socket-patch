@@ -182,6 +182,7 @@ fn short_help_hidden_own(sub: &str) -> &'static [&'static str] {
             "vex_compact",
             "no_socket_yml",
             "min_severity",
+            "max_new_patches",
         ],
         "get" => &["id", "cve", "ghsa", "package", "save_only", "all_releases"],
         "vex" => &["doc_id", "compact"],

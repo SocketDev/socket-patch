@@ -41,8 +41,12 @@ const MAX_PATH_DEPTH: usize = 64;
 /// The vendored-mode ledger (its presence refuses a vendored takeover).
 pub(crate) const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
 
+/// The agent-mode manifest: part of the recorded view the rollout cap
+/// classifies against (a package it records is not NEW).
+pub(crate) const MANIFEST_REL: &str = ".socket/manifest.json";
+
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
-const EXTRA_TEXT_FILES: [&str; 3] = [PNPM_WORKSPACE_REL, NPMRC_REL, VENDOR_STATE_REL];
+const EXTRA_TEXT_FILES: [&str; 4] = [PNPM_WORKSPACE_REL, NPMRC_REL, VENDOR_STATE_REL, MANIFEST_REL];
 
 /// The one directory name the disk Cargo member walk never enters (it
 /// follows `members`, `exclude`, path dependencies and `[patch]` paths

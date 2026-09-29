@@ -10,7 +10,9 @@
 //! Stdin: `{"files": {path: text}, "binaryFiles"?: {path: base64},
 //! "presentOnly"?: [path], "symlinks"?: [path], "projectRoots"?: [dir],
 //! "pipenvMajor"?: n, "batchSize"?: n, "noSocketYml"?: bool,
-//! "minSeverity"?: severity, "policyPaths"?: [path]}`. Stdout: the engine result
+//! "minSeverity"?: severity, "policyPaths"?: [path],
+//! "maxNewPatches"?: n | "none", "maxNewPatchesCap"?: n,
+//! "inFlightPatches"?: [purl]}`. Stdout: the engine result
 //! (`HostedScanResult`, binary contents base64), or
 //! `{"status":"error","error":{"code","message"}}` with exit 2 for bad
 //! credentials/bundle input, or exit 1 for an engine failure.
@@ -62,6 +64,12 @@ struct Bundle {
     policy_paths: Option<Vec<String>>,
     #[serde(default)]
     policy_sha256: Option<String>,
+    #[serde(default)]
+    max_new_patches: Option<crate::hosted_memory::MaxNewPatchesOption>,
+    #[serde(default)]
+    max_new_patches_cap: Option<u32>,
+    #[serde(default)]
+    in_flight_patches: Option<Vec<String>>,
 }
 
 fn print_error(code: &str, message: &str) {
@@ -134,6 +142,9 @@ pub async fn run(args: HostedBundleArgs) -> i32 {
         min_severity: bundle.min_severity.clone(),
         policy_paths: bundle.policy_paths.clone(),
         policy_sha256: bundle.policy_sha256.clone(),
+        max_new_patches: bundle.max_new_patches,
+        max_new_patches_cap: bundle.max_new_patches_cap,
+        in_flight_patches: bundle.in_flight_patches.clone(),
         ..HostedScanOptions::default()
     };
     let input = match build_input(bundle, options) {

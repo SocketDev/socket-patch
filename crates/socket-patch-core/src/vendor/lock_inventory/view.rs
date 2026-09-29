@@ -84,7 +84,6 @@ impl MemoryProject {
         matches!(self.entries.get(rel), Some(MemoryEntry::Symlink))
     }
 
-    #[cfg(test)]
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &MemoryEntry)> {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
     }

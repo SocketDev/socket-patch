@@ -61,7 +61,7 @@ pub(crate) fn bun_lockb_present(view: &ProjectView<'_>) -> bool {
 }
 
 /// What the artifact preflight decided for this run's npm candidates.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Preflight {
     /// Failed while vlt drives, or for a vlt-vendored takeover: withheld
     /// from every rewriter.

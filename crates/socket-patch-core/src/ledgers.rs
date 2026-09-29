@@ -22,6 +22,7 @@
 //! lockfile evidence (`vex`). The hosted records only ever join as the
 //! last store.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -368,6 +369,59 @@ pub fn uuid_only_record(uuid: &str) -> PatchRecord {
         license: String::new(),
         tier: String::new(),
     }
+}
+
+
+/// Fold the hosted pins and the vendor ledger's patch records into the
+/// manifest view update detection consults. Hosted mode records purl→uuid
+/// ONLY in the lockfiles (`hosted_pins`, uuid only; v5 keeps no hosted
+/// ledger) and vendored mode ONLY in `.socket/vendor/state.json`, so without
+/// this fold a pure hosted or vendored project's `updates[]` would always
+/// be empty. Precedence on a collision: manifest > hosted pins > vendor
+/// ledger (the live lock over a possibly superseded vendored entry); the
+/// vendor entries fold under the shared owner rule
+/// ([`Ledgers::owned`]), so one the manifest
+/// claims (its key or base purl) stays behind the manifest's record.
+/// Vendor entries are keyed by their ledger key (`detect_updates` bridges
+/// the spellings); a legacy entry without an embedded record contributes
+/// its uuid alone. Borrows the manifest untouched when nothing else
+/// contributes.
+pub fn merge_ledger_records_for_updates<'a>(
+    manifest: Option<&'a PatchManifest>,
+    vendor: Option<&VendorState>,
+    hosted_pins: &[(String, String)],
+) -> Option<Cow<'a, PatchManifest>> {
+    let vendor = vendor.filter(|s| !s.entries.is_empty());
+    if vendor.is_none() && hosted_pins.is_empty() {
+        return manifest.map(Cow::Borrowed);
+    }
+    let mut merged = manifest.cloned().unwrap_or_default();
+    for (purl, uuid) in hosted_pins {
+        merged
+            .patches
+            .entry(purl.clone())
+            .or_insert_with(|| uuid_only_record(uuid));
+    }
+    let ledgers = Ledgers {
+        manifest,
+        vendor,
+        redirect: None,
+    };
+    for owned in ledgers.owned() {
+        if owned.store == Store::Manifest {
+            continue;
+        }
+        merged
+            .patches
+            .entry(owned.key.to_string())
+            .or_insert_with(|| {
+                owned
+                    .record
+                    .cloned()
+                    .unwrap_or_else(|| uuid_only_record(owned.uuid))
+            });
+    }
+    Some(Cow::Owned(merged))
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ pub(crate) struct StageOptions {
 /// The vendored ledger's entries (the disk `vendor::load_state` parse,
 /// including its legacy `{mode}`-only shape); `None` when absent or
 /// unreadable.
-fn vendored_entries(project: &MemoryProject) -> Option<VendorState> {
+pub(crate) fn vendored_entries(project: &MemoryProject) -> Option<VendorState> {
     let bytes: Vec<u8> = match project.get(VENDOR_STATE_REL)? {
         MemoryEntry::Text(text) => text.as_bytes().to_vec(),
         MemoryEntry::Binary(bytes) => bytes.to_vec(),
@@ -142,7 +142,7 @@ fn refuse_takeovers(
 
 /// A project's state between the reference grants and the wheel-metadata
 /// fetch.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Planned {
     pub(crate) project: MemoryProject,
     pub(crate) candidates: Vec<Candidate>,

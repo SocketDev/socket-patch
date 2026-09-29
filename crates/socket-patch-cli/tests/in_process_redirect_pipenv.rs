@@ -99,6 +99,7 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
             vex_product: vex.map(|_| "pkg:pypi/pipenv-fixture@0.1.0".to_string()),
             ..Default::default()
         },
+        rollout: Default::default(),
     }
 }
 

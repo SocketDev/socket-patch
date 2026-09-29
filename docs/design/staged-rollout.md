@@ -1108,3 +1108,73 @@ Gaps and contradictions A resolved with the smallest reasonable decision
   the docs, to keep validators from drifting.
 - Recognizing a dependency version bump of an already-patched package as
   exempt from the cap (needs state hosted mode does not keep).
+
+## 11. Implementation notes (work item B)
+
+Where the plan left a gap, work item B made the smallest decision that
+keeps its rules intact:
+
+- **`updates[]` without by-package data.** A `--json` report-only run
+  (`--prune` / `--global` with no mode) fetches no by-package records, so
+  its `updates[]` stays on the batch rungs (`batch_supersedes`). In every
+  other run `updates[]` is the UPGRADE rows, plus the batch-derived entry
+  for a package the by-package lookup returned no offer for (nothing was
+  selected there to disagree with).
+- **Report-only and empty scans** carry the `rollout` block with zero
+  counts: they plan nothing.
+- **Unrecognized hosted pins.** Discovery only treats URLs on
+  `patch.socket.dev` or a `--patch-server-url` origin as hosted pins. A
+  scan against another server without that flag would read every pin as
+  NEW and re-spend the same N slots forever. The hosted gate therefore
+  also counts a NEW row as ALREADY when a lockfile names its selected
+  uuid (uuids are unique; one linear scan per file).
+- **In-memory recorded view.** The engine has no disk discovery, so a
+  root's hosted pins are the offered uuids of each purl that its own
+  files mention (nested roots' files excluded), merged with the tree's
+  `.socket/manifest.json` (now selected by `selectHostedScanPaths`) and
+  `.socket/vendor/state.json` at the disk precedence. A pin to a patch
+  the API no longer offers reads as NEW: it costs one slot once, and the
+  next run sees the new pin.
+- **Option source.** The in-memory `maxNewPatches` option reports
+  `source: "flag"` (it is the caller's explicit layer); `maxNewPatchesCap`
+  reports `cap` when it tightens the value.
+- **Key 6 across a base purl's rows.** Rows are sorted with
+  `rollout_cmp` and a base purl takes the rank of its first row, which is
+  the "minimum key over its rows" of 5.2; the uuid key only orders rows of
+  one base purl, which are admitted or deferred together.
+- **Reference failures.** On disk the reference lookup is one call; when
+  it fails in a capped run whose rows are all NEW, the rows are deferred
+  with `rollout_reference_failed` and `rollout_incomplete_lookup` instead
+  of failing the run. In memory the same rule applies per root.
+- **Human output.** The `Rollout:` line prints only when a cap is set.
+  Hosted mode appends the deferred lines to its existing next steps;
+  agent and vendored mode print them under a `Next steps:` heading.
+- **Lock.** A wet hosted run whose only candidates are NEW rows it cannot
+  admit (budget 0, or incomplete data) takes no apply lock and writes
+  nothing, `.socket/` included.
+- **Folding.** `canonical_base_purl` is discovery's, so a nuget or
+  composer pin (lowercased) and a pypi pin (PEP 503 name) match the API's
+  spelling, and a package in two spellings is one budget unit. Every hosted
+  pin joins the recorded index, not just the first per key, so both pinned
+  qualifier twins read ALREADY.
+- **Flag over env.** An explicit `--max-new-patches` wins without parsing
+  `SOCKET_MAX_NEW_PATCHES`; whitespace-only env values are unset.
+- **Known limits.** (1) In memory, the symlink / unreadable-file refusals
+  run inside the first rewrite, before the plan, so a candidate file that
+  only a deferred NEW row would rewrite still refuses its root (disk runs
+  its symlink guard after the gate). (2) On disk, a project directory that
+  fails outright spends nothing and does not freeze later directories. (3)
+  A NEW row that `mark_pinned` turns ALREADY in a run that could admit no
+  NEW row takes the apply lock only after its files were read. (4) Memory
+  pin evidence is any fetched text file of the root; disk's is its
+  discovery plus the candidate files. (5) No e2e case covers a
+  vlt-withheld top-ranked row; it takes the same ineligible path as the
+  withdrawn and `bad_purl` rows the e2e tests cover.
+- **socket.yml layer.** B resolves the cap as flag > env > file >
+  unlimited through `resolve_max_new`; the file value is A's
+  `SelectionPolicy::max_new_patches()` (none when bypassed). The rollout
+  classifies what A's selection keeps: a retained package is neither NEW
+  nor an UPGRADE, and a severity floor removes a NEW row before it can
+  take a slot (9.3). The in-memory engine resolves the cap after the
+  session's socket.yml loads; a session that fails on it has no
+  `rollout` block.

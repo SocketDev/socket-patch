@@ -322,6 +322,7 @@ fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
         mode: None,
         all_releases,
         vex: Default::default(),
+        rollout: Default::default(),
     }
 }
 
