@@ -44,9 +44,7 @@ pub mod npmrc;
 mod pdm;
 mod pipenv;
 pub mod presence;
-// The pnpm entry grammar and hosted planner live with the format's model.
-#[cfg(test)]
-use crate::formats::pnpm::grammar as pnpm;
+// The pnpm hosted planner lives with the format's model.
 use crate::formats::pnpm::plan_hosted;
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
@@ -63,8 +61,6 @@ mod poetry;
 #[cfg(test)]
 mod python_lock_equivalence_tests;
 mod requirements;
-#[cfg(test)]
-mod rewrite_oracle_support;
 mod staged;
 mod state;
 mod hosted_url;
@@ -82,6 +78,7 @@ pub(crate) use hosted_url::{hosted_url_names, hosted_url_version};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct Integrity {
     pub sha512: Option<String>,
@@ -99,6 +96,7 @@ pub struct Integrity {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryOverrideIdentifiers {
     pub name: String,
@@ -147,6 +145,7 @@ pub struct RegistryOverrideIdentifiers {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryOverride {
     pub kind: String,
@@ -156,6 +155,7 @@ pub struct RegistryOverride {
 
 /// One patched dependency to redirect (mirrors the TS `DepOverride`).
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct DepOverride {
     pub ecosystem: String,
@@ -196,6 +196,7 @@ pub struct RewriteWarning {
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
     pub files: BTreeMap<String, String>,

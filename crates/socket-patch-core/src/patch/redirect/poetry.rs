@@ -157,127 +157,6 @@ pub(super) fn rewrite_poetry(
     }
 }
 
-/// The previous [`rewrite_poetry`], which re-derived each rewrite's edits
-/// and re-judged the lock's writer after every rewrite, kept as the
-/// equivalence oracle.
-#[cfg(test)]
-fn rewrite_poetry_reference(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
-    use crate::utils::poetry_lock::{poetry_lock_edits, rewrite_poetry_lock};
-    let locks: Vec<(&String, &String)> = files
-        .iter()
-        .filter(|(path, _)| path.as_str() == "poetry.lock" || path.ends_with("/poetry.lock"))
-        .collect();
-    if locks.is_empty() {
-        return;
-    }
-    // Intake gate ONCE per dep, not once per lock file (uv parity).
-    let mut usable: Vec<(&DepOverride, &str)> = Vec::new();
-    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
-        result.python_lock_uuids.insert(dep.patch_uuid.clone());
-        match dep.integrity.sha256.as_deref() {
-            Some(sha256) => usable.push((dep, sha256)),
-            None => result.warnings.push(RewriteWarning {
-                code: "redirect_poetry_missing_sha256".into(),
-                detail: format!("{} has no SHA-256 integrity", dep.name),
-            }),
-        }
-    }
-    for (path, original) in locks {
-        let mut content = original.clone();
-        let mut stale_warned = false;
-        for &(dep, sha256) in &usable {
-            let filename = dep.artifact_url.rsplit('/').next().unwrap_or("");
-            match rewrite_poetry_lock(
-                &content,
-                &dep.name,
-                &dep.version,
-                "url",
-                &dep.artifact_url,
-                filename,
-                sha256,
-            ) {
-                Ok(Some(rewritten)) if rewritten != content => {
-                    match poetry_lock_edits(&content, &rewritten, &dep.name) {
-                        Ok(edits) => {
-                            for (original, new) in edits {
-                                result.edits.push(FileEdit {
-                                    path: path.clone(),
-                                    kind: "redirect_poetry_lock_package".into(),
-                                    action: "rewritten".into(),
-                                    key: Some(format!("{}@{}", dep.name, dep.version)),
-                                    original: Some(Value::String(original)),
-                                    new: Some(Value::String(new)),
-                                });
-                            }
-                        }
-                        Err(detail) => {
-                            result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
-                            result.warnings.push(RewriteWarning {
-                                code: "redirect_poetry_lock_unsupported".into(),
-                                detail: format!("{path}: {detail}"),
-                            });
-                            continue;
-                        }
-                    }
-                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
-                    content = rewritten;
-                    if !stale_warned {
-                        if let Some(format) = pre_1_4_writer(&content) {
-                            stale_warned = true;
-                            // Poetry 1.0 installs url sources through pip, which reads
-                            // the hash from the URL fragment; pip 22.3–23.0 take the
-                            // rest of the fragment (`&#egg=<name>`, appended by Poetry)
-                            // as part of the digest and refuse the install (measured;
-                            // pip <= 22.2 and >= 23.1 install and verify).
-                            let pip_note = if format == "1.0" {
-                                " Poetry 1.0 installs through pip: pip 22.3–23.0 misparse the \
-                                 hash fragment and refuse the install (fail-closed) — use pip \
-                                 <= 22.2 or >= 23.1 in the virtualenv."
-                            } else {
-                                ""
-                            };
-                            result.warnings.push(RewriteWarning {
-                                code: "redirect_poetry_stale_install_risk".into(),
-                                detail: format!(
-                                    "{path} was written by Poetry < 1.4, which does not replace \
-                                     an already-installed package at the same version: an \
-                                     existing virtualenv keeps the upstream {} until it is \
-                                     recreated (or the package is `pip uninstall`ed) before \
-                                     `poetry install`; fresh installs pick up the patched \
-                                     wheel.{pip_note}",
-                                    dep.name
-                                ),
-                            });
-                        }
-                    }
-                }
-                // Already redirected to this artifact (idempotent re-scan).
-                Ok(Some(_)) => {
-                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
-                }
-                Ok(None) => result.warnings.push(RewriteWarning {
-                    code: "redirect_poetry_entry_not_found".into(),
-                    detail: format!("no {path} entry for {}@{}", dep.name, dep.version),
-                }),
-                Err(detail) => {
-                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_poetry_lock_unsupported".into(),
-                        detail: format!("{path}: {detail}"),
-                    });
-                }
-            }
-        }
-        if content != *original {
-            result.files.insert(path.clone(), content);
-        }
-    }
-}
-
 #[cfg(test)]
 mod equivalence_tests {
     use super::*;
@@ -357,10 +236,14 @@ mod equivalence_tests {
     }
 
     /// Every lock generation, LF and CRLF, in two lock files, then again over
-    /// the rewritten output (the idempotent re-scan): the production
-    /// rewriter's files, edits, warnings and uuid sets equal the oracle's.
+    /// the rewritten output (the idempotent re-scan): the rewriter's files,
+    /// edits, warnings and uuid sets, pinned by golden.
     #[test]
-    fn rewrite_matches_reference_on_every_lock_generation() {
+    fn rewrite_matches_golden_on_every_lock_generation() {
+        let mut g = crate::golden::Golden::new(
+            "poetry_rewrite",
+            "One grown poetry.lock pair and its deps, rewritten, then re-run over the result.",
+        );
         for version in VERSIONS {
             for extra in [0, 3] {
                 for crlf in [false, true] {
@@ -375,21 +258,20 @@ mod equivalence_tests {
                     ]);
                     let deps = overrides(extra);
                     let what = format!("{version} extra={extra} crlf={crlf}");
-                    let want = run(rewrite_poetry_reference, &files, &deps);
                     let got = run(rewrite_poetry, &files, &deps);
-                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "{what}");
+                    g.case(&what, &(&files, &deps), &format!("{got:?}"));
                     assert!(
-                        version.starts_with("0.") || !want.edits.is_empty(),
+                        version.starts_with("0.") || !got.edits.is_empty(),
                         "{what}: the corpus exercises the rewrite path"
                     );
 
                     let mut again = files.clone();
-                    again.extend(want.files.clone());
-                    let want = run(rewrite_poetry_reference, &again, &deps);
+                    again.extend(got.files.clone());
                     let got = run(rewrite_poetry, &again, &deps);
-                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "{what} re-run");
+                    g.case(format!("{what}/re-run"), &(&again, &deps), &format!("{got:?}"));
                 }
             }
         }
+        g.finish();
     }
 }

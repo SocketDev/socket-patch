@@ -2842,7 +2842,7 @@ and regression tests were added throughout (the lib + integration suites grow by
 
 ### Tests
 
-- New `tests/telemetry_e2e.rs` end-to-end behavioral coverage:
+- New `tests/cli/telemetry_e2e.rs` end-to-end behavioral coverage:
   apply/scan/get/list emit telemetry against a wiremock recorder;
   `SOCKET_OFFLINE=1` produces zero telemetry POSTs across all four;
   scan falls back on 401 + tags the resulting event; scan does NOT
