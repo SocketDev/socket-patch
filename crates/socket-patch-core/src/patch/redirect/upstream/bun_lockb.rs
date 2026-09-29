@@ -186,7 +186,6 @@ mod tests {
             artifact_url: format!(
                 "https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/minimist-1.2.2.tgz"
             ),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(format!(

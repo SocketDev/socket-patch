@@ -31,8 +31,8 @@
 //!      `vendor --vex`.
 //!
 //! The detached twin (`yarn_classic_detached_scan_vendored_…`) produces the
-//! state with `scan --mode vendored` (plus the kept-for-compat no-op
-//! `--detached`) against a wiremock Socket API instead — the manifest-free
+//! state with `scan --mode vendored` against a wiremock Socket API
+//! instead — the manifest-free
 //! shape every vendored run has — and runs the
 //! same fresh-checkout install + manifest-less VEX matrix (plus the embedded
 //! re-scan).
@@ -622,7 +622,7 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
 
 // ── detached vendoring from the patch API (the manifest-less shape) ────
 
-/// `scan --mode vendored` (with the legacy no-op `--detached`) against a
+/// `scan --mode vendored` against a
 /// wiremock Socket API: vendored mode NEVER writes `.socket/manifest.json` (the vendor
 /// ledger embeds the record) — the shape a depscan-opened PR commits. The
 /// scan discovers the dep (batch search), the record (with `blobContent`)
@@ -732,7 +732,6 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
             "scan",
             "--mode",
             "vendored",
-            "--detached",
             "--json",
             "--yes",
             "--cwd",
@@ -749,7 +748,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     );
     assert_eq!(
         code, 0,
-        "scan --mode vendored --detached failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "scan --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
@@ -759,7 +758,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     );
     assert!(
         !proj.join(".socket/manifest.json").exists(),
-        "--detached must never write the manifest"
+        "vendored mode must never write the manifest"
     );
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
     assert!(proj.join(&tgz_rel).is_file(), "vendored tarball missing");
@@ -833,13 +832,12 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
             ("vendor --vex", via_vendor()),
             // The command that produced the state, re-run manifest-less.
             (
-                "scan --mode vendored --detached --vex",
+                "scan --mode vendored --vex",
                 Box::new(|run: vex_e2e_common::VexRun| {
                     let mut run = run
                         .via(vex_e2e_common::VexVia::Scan)
                         .arg("--mode")
                         .arg("vendored")
-                        .arg("--detached")
                         .arg("--vendor-source")
                         .arg("build")
                         .arg("--yes");

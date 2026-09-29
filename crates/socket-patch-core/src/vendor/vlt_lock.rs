@@ -1436,12 +1436,6 @@ pub async fn restore_vlt_uuid_metadata(
     super::npm_dir::restore_uuid_metadata(&project_root.join(uuid_dir)).await
 }
 
-/// Whether `text` passes the router sniff (a BOM-less JSON object
-/// with `lockfileVersion` 0 or 1).
-pub fn vlt_lock_sniff_ok(text: &str) -> bool {
-    sniff_vendor_lock(text).is_ok()
-}
-
 /// The importer package.json files of the project's canonical
 /// `vlt-lock.json`, project-relative: the root one plus every workspace
 /// importer its edges name. Just the root one when the lock is missing or

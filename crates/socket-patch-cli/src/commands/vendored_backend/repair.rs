@@ -1303,7 +1303,6 @@ mod tests {
                 token: String::new(),
                 patch_uuid: uuid.into(),
                 artifact_url: format!("./.socket/vendor/npm/{uuid}/minimist-1.2.2.tgz"),
-                berry_zip_url: None,
                 registry_override: None,
                 integrity: Integrity {
                     sha512: Some(format!("sha512-{}", "A".repeat(86) + "==")),

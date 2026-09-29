@@ -848,7 +848,6 @@ async fn repair_telemetry_attributed_to_env_credentials() {
     // below would fail for the wrong reason (`is_telemetry_disabled`
     // reads these at runtime — `VITEST=true` included).
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
     std::env::remove_var("SOCKET_OFFLINE");
     std::env::remove_var("VITEST");
     let code = repair_run(make_repair_args(tmp.path(), "file")).await;

@@ -104,7 +104,6 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             patch_server_url: Some("http://patch.test".to_string()),
             ..global(cwd, server.uri())
         },
-        one_off: false,
         preserve_state: false,
     })
     .await;
@@ -129,9 +128,7 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: VexEmbedArgs {
             vex: vex.map(Path::to_path_buf),

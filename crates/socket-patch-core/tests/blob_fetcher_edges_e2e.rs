@@ -181,7 +181,6 @@ async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
     std::fs::create_dir(&blobs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -581,7 +580,6 @@ async fn fetch_missing_sources_diff_downloads_and_writes_archive() {
     std::fs::create_dir(&diffs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };
@@ -634,7 +632,6 @@ async fn fetch_missing_sources_diff_404_is_failure_with_kind_message() {
     std::fs::create_dir(&diffs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };
@@ -677,7 +674,6 @@ async fn fetch_missing_sources_diff_invokes_progress_callback() {
     std::fs::create_dir(&diffs).unwrap();
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: Some(&diffs),
         mem_blobs: None,
     };

@@ -1,6 +1,6 @@
-//! In-process test for `socket-patch scan --redirect`: mocks the API
+//! In-process test for `socket-patch scan --mode hosted`: mocks the API
 //! (discovery + the `patches/package` reference endpoint) via wiremock, lays
-//! down an npm project with a lockfile, runs `scan --redirect`, and asserts the
+//! down an npm project with a lockfile, runs `scan --mode hosted`, and asserts the
 //! lockfile's patched-dependency entry was repointed at the hosted vendored
 //! patch (resolved URL + sha512 integrity) — and (v5) that NO redirect
 //! ledger was written: the lockfile pin is the whole hosted state, and
@@ -61,9 +61,7 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: true,
-        mode: None,
+        mode: Some(socket_patch_cli::commands::scan::ScanMode::Hosted),
         all_releases: false,
         vex: Default::default(),
     }
@@ -206,7 +204,7 @@ async fn scan_redirect_rewrites_lockfile_to_hosted_patch() {
     write_project(tmp.path());
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect should succeed");
+    assert_eq!(code, 0, "scan --mode hosted should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
@@ -225,7 +223,7 @@ async fn scan_redirect_rewrites_lockfile_to_hosted_patch() {
     vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
-/// `scan --redirect --vex` must emit a valid OpenVEX doc for the redirected
+/// `scan --mode hosted --vex` must emit a valid OpenVEX doc for the redirected
 /// patch. The redirected bytes aren't installed in-run, so this is a NO-VERIFY
 /// attestation built from the patch records this run fetched (held in memory
 /// — v5 writes no ledger); the statement carries the `(redirected)`
@@ -250,7 +248,7 @@ async fn scan_redirect_vex_emits_redirected_attestation() {
     };
 
     let code = run(args).await;
-    assert_eq!(code, 0, "scan --redirect --vex should succeed");
+    assert_eq!(code, 0, "scan --mode hosted --vex should succeed");
 
     // The record reached the attestation in memory: nothing persisted.
     vlt_hosted_common::assert_no_ledger(tmp.path());
@@ -318,7 +316,7 @@ fn write_installed(root: &Path, name: &str, version: &str, bytes: &[u8]) {
     std::fs::write(pkg.join("index.js"), bytes).unwrap();
 }
 
-/// Idempotency: a second `scan --redirect` run over the already-redirected
+/// Idempotency: a second `scan --mode hosted` run over the already-redirected
 /// lock plans from the current lock text (v5 keeps no ledger chain), so it
 /// succeeds, leaves the lock byte-identical and still writes no ledger.
 #[tokio::test]
@@ -333,12 +331,12 @@ async fn second_redirect_run_is_idempotent() {
     write_project(tmp.path());
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "first scan --redirect should succeed");
+    assert_eq!(code, 0, "first scan --mode hosted should succeed");
     let first = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(first.contains(HOSTED_URL), "{first}");
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "second scan --redirect should succeed");
+    assert_eq!(code, 0, "second scan --mode hosted should succeed");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
         first,
@@ -405,7 +403,7 @@ async fn no_lockfile_redirect_is_not_attested() {
 /// In-run `--vex` semantics: redirected PURLs are exempt from verification
 /// (their bytes are remote until install), but OTHER manifest patches still
 /// verify normally — an applied one attests plain, a not-applied one is
-/// omitted. This pins that `scan --redirect --vex` does NOT silently attest
+/// omitted. This pins that `scan --mode hosted --vex` does NOT silently attest
 /// the whole manifest unverified.
 #[tokio::test]
 #[serial]
@@ -463,7 +461,7 @@ async fn redirect_vex_verifies_manifest_patches_normally() {
         ..Default::default()
     };
     let code = run(args).await;
-    assert_eq!(code, 0, "scan --redirect --vex should succeed");
+    assert_eq!(code, 0, "scan --mode hosted --vex should succeed");
 
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
@@ -570,7 +568,7 @@ async fn redirect_vex_doc_id_and_compact_flags() {
         ..Default::default()
     };
     let code = run(args).await;
-    assert_eq!(code, 0, "scan --redirect --vex should succeed");
+    assert_eq!(code, 0, "scan --mode hosted --vex should succeed");
 
     let raw = std::fs::read_to_string(&vex_path).unwrap();
     assert_eq!(
@@ -708,7 +706,7 @@ async fn scan_redirect_rewrites_yarn_berry_lock() {
     write_berry_project(tmp.path());
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (berry) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (berry) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
     // yarn writes `__archiveUrl=<encodeURIComponent(url)>`; assert both the
@@ -898,7 +896,7 @@ async fn scan_redirect_rewrites_correct_entry_in_crlf_classic_lock() {
     std::fs::write(tmp.path().join("yarn.lock"), lock_lf.replace('\n', "\r\n")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (classic CRLF) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (classic CRLF) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
     assert!(
@@ -988,7 +986,7 @@ async fn scan_redirect_rewrites_bun_lock() {
     let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (bun) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (bun) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
     assert!(
@@ -1024,7 +1022,7 @@ async fn scan_redirect_rewrites_bun_lock_v2() {
     let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect (bun, lock v2) should succeed");
+    assert_eq!(code, 0, "scan --mode hosted (bun, lock v2) should succeed");
 
     let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
     assert!(
@@ -1293,7 +1291,7 @@ fn path_with_first(bin_dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(entries).expect("PATH entries join")
 }
 
-/// `scan --redirect --json --yes` as a subprocess with the given child PATH;
+/// `scan --mode hosted --json --yes` as a subprocess with the given child PATH;
 /// returns (exit code, parsed envelope, stderr). Asserts stdout IS JSON so a
 /// leaking shim (bun chatter on stdout) fails loudly.
 fn scan_redirect_json_with_path(
@@ -1304,7 +1302,7 @@ fn scan_redirect_json_with_path(
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--json",
             "--yes",
             "--cwd",
@@ -1785,7 +1783,7 @@ fn write_rush_project(root: &Path, with_repo_state: bool) {
     }
 }
 
-/// `scan --redirect` in a Rush monorepo rewrites BOTH the common
+/// `scan --mode hosted` in a Rush monorepo rewrites BOTH the common
 /// source-of-truth lock and every subspace lock in place (nested FileEdit
 /// paths), even though there is no root package.json/lock pair — the package
 /// is discovered from the Rush locks (lockfile supplement) and the pnpm
@@ -1803,7 +1801,7 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
     write_rush_project(tmp.path(), true);
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect should succeed in a Rush repo");
+    assert_eq!(code, 0, "scan --mode hosted should succeed in a Rush repo");
 
     // Both nested locks are rewritten in place (not a new root lock).
     for rel in [
@@ -1853,7 +1851,7 @@ fn run_redirect_subprocess_with(cwd: &Path, api_url: &str, extra: &[&str]) -> se
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--json",
             "--yes",
             "--cwd",
@@ -1871,13 +1869,13 @@ fn run_redirect_subprocess_with(cwd: &Path, api_url: &str, extra: &[&str]) -> se
     assert_eq!(
         out.status.code(),
         Some(0),
-        "scan --redirect must succeed; stdout=\n{}\nstderr=\n{}",
+        "scan --mode hosted must succeed; stdout=\n{}\nstderr=\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
-            "scan --redirect --json output is not JSON: {e}\nstdout:\n{}",
+            "scan --mode hosted --json output is not JSON: {e}\nstdout:\n{}",
             String::from_utf8_lossy(&out.stdout)
         )
     })
@@ -2055,7 +2053,7 @@ packages:
 /// `redirect_gradle_manual_snippet`, the missing-integrity family).
 /// Regression guard: the human branch printed skipped/record/rush warnings
 /// but dropped `rewrite.warnings` entirely, so a default-mode
-/// `scan --redirect` in a lockfile-less project reported "Redirected 0
+/// `scan --mode hosted` in a lockfile-less project reported "Redirected 0
 /// package(s)" with no explanation at all. Subprocess (not in-process) so
 /// stderr can be read back.
 #[tokio::test]
@@ -2086,7 +2084,7 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--cwd",
             tmp.path().to_str().unwrap(),
@@ -2143,7 +2141,7 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--cwd",
             tmp.path().to_str().unwrap(),
@@ -2176,7 +2174,7 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--cwd",
             tmp.path().to_str().unwrap(),
@@ -2960,7 +2958,7 @@ async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
     std::fs::write(tmp.path().join(".cargo/config"), "[net]\nretry = 3\n").unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 0, "scan --redirect should succeed");
+    assert_eq!(code, 0, "scan --mode hosted should succeed");
 
     let legacy = std::fs::read_to_string(tmp.path().join(".cargo/config")).unwrap();
     assert!(
@@ -2983,7 +2981,7 @@ async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
     );
 }
 
-/// `scan --redirect --json` must emit a machine-readable error envelope on
+/// `scan --mode hosted --json` must emit a machine-readable error envelope on
 /// stdout for EVERY failure exit, never empty stdout plus an exit code.
 ///
 /// Regression pin for the long-open hosted-mode JSON gap: the early
@@ -3048,7 +3046,7 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--cwd",
@@ -3077,7 +3075,7 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--cwd",
@@ -3122,13 +3120,13 @@ fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
     );
 }
 
-/// Shared driver for the write-failure legs: a hosted `scan --redirect --json`
+/// Shared driver for the write-failure legs: a hosted `scan --mode hosted --json`
 /// subprocess against the obstructed project in `tmp`.
 async fn run_hosted_json_scan(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
     scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--cwd",
@@ -3277,7 +3275,7 @@ async fn corrupt_pre_v5_ledger_dry_run_succeeds_without_touching_it() {
     let out = scrubbed_cli()
         .args([
             "scan",
-            "--redirect",
+            "--mode=hosted",
             "--yes",
             "--json",
             "--dry-run",

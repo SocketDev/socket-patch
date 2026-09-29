@@ -39,8 +39,6 @@ fn default_args(cwd: &Path) -> ScanArgs {
         prune: false,
         sync: false,
         vendor: false,
-        detached: false,
-        redirect: false,
         mode: None,
         all_releases: false,
         vex: Default::default(),

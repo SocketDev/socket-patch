@@ -38,7 +38,7 @@
 //!   7. **Revert proof**: `vendor --revert` restores composer.lock
 //!      byte-for-byte and removes `.socket/vendor/` entirely.
 //!
-//! A third twin drives `scan --vendor --detached --vex` (the depscan-style
+//! A third twin drives `scan --vendor --vex` (the depscan-style
 //! front door: batch discovery → vendored copy + lock wiring, NO manifest,
 //! embedded VEX in the same run) against the same mocked API, then the same
 //! fresh-checkout install and manifest-less VEX legs.
@@ -935,7 +935,7 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
     });
 }
 
-/// `scan --vendor --detached --vex` twin: batch discovery over the REAL
+/// `scan --vendor --vex` twin: batch discovery over the REAL
 /// install → the vendored copy + composer.lock wiring with NO manifest
 /// (detached), the in-run embedded VEX attesting `(vendored)`, then the same
 /// fresh-checkout install and manifest-less VEX legs.
@@ -972,7 +972,6 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
         &[
             "scan",
             "--vendor",
-            "--detached",
             "--vendor-source",
             "build",
             "--vex",
@@ -993,7 +992,7 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
     );
     assert_eq!(
         code, 0,
-        "scan --vendor --detached --vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "scan --vendor --vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["vex"]["statements"], 1, "in-run vex block: {env}");
@@ -1002,7 +1001,7 @@ async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
     assert_attested(&doc, &purl, UUID, Marker::Vendored, &[(GHSA, &[VEX_CVE])]);
     assert!(
         !proj.join(".socket/manifest.json").exists(),
-        "--detached must not write a manifest: {env}"
+        "scan --vendor must not write a manifest: {env}"
     );
     let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
     let entry = lock_entry(&lock_path, DEP);

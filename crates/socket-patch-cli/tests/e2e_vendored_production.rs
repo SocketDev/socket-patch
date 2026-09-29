@@ -1259,14 +1259,13 @@ fn yarn_classic_vendored_install_proof() {
             ("apply --vex", yarn_classic_vex::via_apply()),
             ("vendor --vex", yarn_classic_vex::via_vendor()),
             // The command the leg itself ran, re-run manifest-less
-            // (`--detached`: no manifest writes — the shape under test).
+            // (vendored mode writes no manifest — the shape under test).
             (
-                "scan --mode vendored --detached --vex",
+                "scan --mode vendored --vex",
                 Box::new(|run: vex_e2e_common::VexRun| {
                     run.via(vex_e2e_common::VexVia::Scan)
                         .arg("--mode")
                         .arg("vendored")
-                        .arg("--detached")
                         .arg("--yes")
                 }),
             ),

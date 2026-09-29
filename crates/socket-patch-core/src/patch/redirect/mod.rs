@@ -167,8 +167,6 @@ pub struct DepOverride {
     pub patch_uuid: String,
     pub artifact_url: String,
     #[serde(default)]
-    pub berry_zip_url: Option<String>,
-    #[serde(default)]
     pub registry_override: Option<RegistryOverride>,
     pub integrity: Integrity,
 }
@@ -6123,7 +6121,6 @@ mod tests {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: url.into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha512: Some(sha512.into()),
@@ -6141,7 +6138,6 @@ mod tests {
             token: String::new(),
             patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
             artifact_url: url.into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some(sha256.into()),
@@ -6292,7 +6288,6 @@ mod tests {
             artifact_url:
                 "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/tok/uuid/slf4j-api-1.7.36.jar"
                     .into(),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "maven2".into(),
                 index_url: "https://patch.socket.dev/patch-registry/maven/tok/uuid/maven2".into(),
@@ -6596,7 +6591,6 @@ mod tests {
             token: "tok".into(),
             patch_uuid: "uuid".into(),
             artifact_url: "https://patch.test/newtonsoft.json.13.0.3.nupkg".into(),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "nuget-v3".into(),
                 index_url: "https://patch.test/nuget/index.json".into(),
@@ -8091,7 +8085,6 @@ mod tests {
             token: "tok".into(),
             patch_uuid: CARGO_UUID.into(),
             artifact_url: "https://patch.test/serde-1.0.190.crate".into(),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "cargo-sparse".into(),
                 index_url: cargo_index_url(),
@@ -9839,7 +9832,6 @@ mod tests {
             token: "tok".into(),
             patch_uuid: "uuid".into(),
             artifact_url: format!("https://patch.test/{name}-{version}.gem"),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "rubygems-compact-index".into(),
                 index_url: "https://patch.test/gem/tok/uuid/".into(),
@@ -12073,7 +12065,6 @@ snapshots:
             token: String::new(),
             patch_uuid: "44444444-4444-4444-4444-444444444444".into(),
             artifact_url: COMPOSER_ARTIFACT_URL.into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha1: Some(COMPOSER_SHA1.into()),
@@ -13749,7 +13740,6 @@ packages:
                 "https://patch.socket.dev/patch-registry/golang/{}/@v/v1.4.2-socketpatch.1.zip",
                 golang_socket_module()
             ),
-            berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "goproxy".into(),
                 index_url: "https://patch.socket.dev/patch-registry/golang".into(),
@@ -16891,7 +16881,6 @@ mod python_lock_warning_tests {
             token: "11111111-1111-4111-8111-111111111111".into(),
             patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
             artifact_url: "https://patch.socket.dev/requests-2.28.1-py3-none-any.whl".into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity::default(),
         };
@@ -16933,7 +16922,6 @@ mod python_metadata_pairing_tests {
             token: "11111111-1111-4111-8111-111111111111".into(),
             patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
             artifact_url: "https://patch.socket.dev/click-8.1.7-py3-none-any.whl".into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity::default(),
         }
@@ -17035,7 +17023,6 @@ mod hatch_tests {
             token: String::new(),
             patch_uuid: "test-uuid".into(),
             artifact_url: "https://patch.test/urllib3-1.26.18-py2.py3-none-any.whl".into(),
-            berry_zip_url: None,
             registry_override: None,
             integrity: Integrity {
                 sha256: Some("a".repeat(64)),
