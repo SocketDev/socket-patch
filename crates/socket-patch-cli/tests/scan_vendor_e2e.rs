@@ -1404,6 +1404,143 @@ async fn vendor_auto_fetches_missing_package_from_lockfile() {
     );
 }
 
+/// A lockfile-only npm package the patch service serves prebuilt: the
+/// backend reads the pristine tarball only if the service falls back to a
+/// local build, so the registry download is deferred until then — here,
+/// never — and no `vendor_fetched_missing` is reported for it.
+#[tokio::test]
+async fn vendor_auto_takes_a_missing_package_from_the_service_without_the_registry() {
+    let registry = MockServer::start().await;
+    let tgz = pristine_tgz();
+    let integrity = sri_of(&tgz);
+    mount_registry_tarball(&registry, tgz).await;
+
+    let prebuilt = {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (path, bytes) in [
+            (
+                "package/package.json",
+                br#"{"name":"left-pad","version":"1.3.0"}"#.as_slice(),
+            ),
+            ("package/index.js", AFTER),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, bytes).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    let api = MockServer::start().await;
+    let serve_path = format!("/patch/npm/left-pad/1.3.0/tok/{UUID}/left-pad-1.3.0.tgz");
+    let serve_url = format!("{}{serve_path}", api.uri());
+    Mock::given(method("POST"))
+        .and(path("/v0/orgs/acme/patches/package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "granted", "url": serve_url, "purl": PURL,
+                "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                "integrity": { "sha512": sri_of(&prebuilt) } }]
+            }}
+        })))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(serve_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(prebuilt))
+        .mount(&api)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_lockfile_only_fixture(
+        tmp.path(),
+        &format!("{}/left-pad/-/left-pad-1.3.0.tgz", registry.uri()),
+        &integrity,
+    );
+    seed_manifest_and_blob(tmp.path());
+    let vendor = |extra: &[&str]| {
+        let mut cmd = Command::new(binary());
+        cmd.args([
+            "vendor",
+            "--json",
+            "--vendor-source",
+            "auto",
+            "--api-url",
+            &api.uri(),
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--org",
+            "acme",
+        ])
+        .args(extra)
+        .current_dir(tmp.path());
+        for (key, _) in std::env::vars() {
+            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
+                cmd.env_remove(key);
+            }
+        }
+        let out = cmd.env("SOCKET_TELEMETRY_DISABLED", "1").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{e}: {stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+        (out.status.code(), v)
+    };
+
+    // Offline, nothing is deferred to a service it cannot reach: the
+    // not-installed skip (exit 1, as before), and no request to either
+    // server.
+    let (code, v) = vendor(&["--offline"]);
+    assert_eq!(code, Some(1), "{v:#}");
+    assert!(
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["purl"] == PURL
+                && e["action"] == "skipped"
+                && e["errorCode"] == "package_not_installed"),
+        "{v:#}"
+    );
+    assert!(registry
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty());
+    assert!(api.received_requests().await.unwrap_or_default().is_empty());
+
+    let (code, v) = vendor(&[]);
+    assert_eq!(code, Some(0), "{v:#}");
+    let events = v["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == PURL),
+        "{v:#}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_fetched_missing"),
+        "no pristine fetch happened, so none is reported: {v:#}"
+    );
+    assert!(
+        registry
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the pristine tarball is never downloaded"
+    );
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+        .is_file());
+}
+
 /// Integrity mismatch between the lock and the served bytes is a distinct
 /// vendor_fetch_failed failure — and nothing is written.
 #[tokio::test]

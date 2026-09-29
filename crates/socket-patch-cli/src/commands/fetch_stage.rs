@@ -199,9 +199,10 @@ fn format_blob_fallback(diff_failed: usize, blobs: usize) -> String {
 }
 
 /// The manifest PURLs with no usable local source. A patch is "locally
-/// applicable" iff at least one of:
-///   - every `after_hash` blob it references is on disk, OR
-///   - its diff archive is on disk.
+/// applicable" iff every file it touches has its `after_hash` blob on
+/// disk or is covered by the patch's diff archive. A diff covers only files
+/// that exist before the patch: a created file (empty `before_hash`) has
+/// nothing to diff against, so it always needs its blob.
 ///
 /// The patch pipeline picks whichever is present per file. Shared by the
 /// offline gate (probed against `.socket/`) and the post-download gate
@@ -215,18 +216,45 @@ fn patches_without_source<'m>(
         .patches
         .iter()
         .filter_map(|(purl, record)| {
-            let all_blobs_present = record
-                .files
-                .values()
-                .all(|f| !missing_blobs.contains(&f.after_hash));
             let diff_present = !missing_diff_archives.contains(&record.uuid);
-            if all_blobs_present || diff_present {
+            let files_covered = record.files.values().all(|f| {
+                !missing_blobs.contains(&f.after_hash)
+                    || (diff_present && !f.before_hash.is_empty())
+            });
+            if files_covered {
                 None
             } else {
                 Some(purl.as_str())
             }
         })
         .collect()
+}
+
+/// `manifest` cut down to the files a diff archive cannot patch (created
+/// files, whose `before_hash` is empty): the blobs a diff-mode fetch still
+/// needs even when every diff archive is present.
+pub(crate) fn files_diffs_cannot_cover(manifest: &PatchManifest) -> PatchManifest {
+    let patches = manifest
+        .patches
+        .iter()
+        .filter_map(|(purl, record)| {
+            let files: HashMap<_, _> = record
+                .files
+                .iter()
+                .filter(|(_, f)| f.before_hash.is_empty())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (!files.is_empty()).then(|| {
+                let mut record = record.clone();
+                record.files = files;
+                (purl.clone(), record)
+            })
+        })
+        .collect();
+    PatchManifest {
+        patches,
+        setup: manifest.setup.clone(),
+    }
 }
 
 /// Mirror `src`'s files into `dst` by hardlink (copy fallback). Pre-seeds the
@@ -300,12 +328,14 @@ pub(crate) async fn stage_patch_sources(
     // locally. We honor `--download-mode` for the primary fetch when there's
     // actually a gap to close. Skip the archive fetch entirely when all file
     // blobs are already present locally — the pipeline will succeed via the
-    // blob path, so an archive fetch would be wasted round-trips.
+    // blob path, so an archive fetch would be wasted round-trips. Cached
+    // diff archives can still leave a patch uncovered (a created file), and
+    // the blob top-up below closes that gap.
     let download_needed = !common.offline
         && match download_mode {
             DownloadMode::File => !missing_blobs.is_empty(),
             DownloadMode::Diff if missing_blobs.is_empty() => false,
-            DownloadMode::Diff => !missing_diff_archives.is_empty(),
+            DownloadMode::Diff => !missing_diff_archives.is_empty() || !no_source_purls.is_empty(),
         };
 
     if !download_needed {
@@ -360,15 +390,25 @@ pub(crate) async fn stage_patch_sources(
     // For non-file modes, automatically fetch any still-missing file blobs as
     // a fallback. Patches that lack the requested mode on the server will
     // still apply via the legacy blob path.
+    //
+    // With every diff archive already cached, only the files no diff can
+    // patch are fetched: that is the gap that triggered this download.
     let mut blob_fetch_failed = false;
     if download_mode != DownloadMode::File {
-        let still_missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
+        let created_only;
+        let blob_scope = if missing_diff_archives.is_empty() {
+            created_only = files_diffs_cannot_cover(manifest);
+            &created_only
+        } else {
+            manifest
+        };
+        let still_missing_blobs = get_missing_blobs(blob_scope, &staged.blobs).await;
         if !still_missing_blobs.is_empty() {
             status.set(format_blob_fallback(
                 fetch_result.failed,
                 still_missing_blobs.len(),
             ));
-            let blob_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
+            let blob_result = fetch_missing_blobs(blob_scope, &staged.blobs, client, None).await;
             status.finish();
             if !quiet {
                 for line in format_fetch_summary(&blob_result, BLOB, true) {
@@ -943,6 +983,70 @@ mod tests {
             matches!(outcome, StageOutcome::Ready(_)),
             "a present diff archive is a usable source for the disk stager"
         );
+    }
+
+    /// A diff archive cannot patch a file the patch creates (nothing to diff
+    /// against), so it covers such a patch only together with the created
+    /// file's blob: without it, offline staging is Unavailable up front
+    /// instead of passing the gate and failing mid-apply.
+    #[tokio::test]
+    async fn stage_offline_diff_archive_does_not_cover_a_created_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket_dir.join("diffs")).unwrap();
+        std::fs::write(
+            socket_dir.join("diffs").join(format!("{UUID}.tar.gz")),
+            b"x",
+        )
+        .unwrap();
+        let created = "c".repeat(64);
+        let mut manifest = manifest_with_one_patch();
+        manifest
+            .patches
+            .get_mut("pkg:npm/left-pad@1.3.0")
+            .unwrap()
+            .files
+            .insert(
+                "new.js".to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: created.clone(),
+                },
+            );
+
+        let outcome =
+            stage_patch_sources(&offline_args(), &manifest, &socket_dir, &offline_client())
+                .await
+                .expect("no hard failure");
+        assert!(matches!(outcome, StageOutcome::Unavailable));
+
+        std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
+        std::fs::write(socket_dir.join("blobs").join(&created), b"new").unwrap();
+        let outcome =
+            stage_patch_sources(&offline_args(), &manifest, &socket_dir, &offline_client())
+                .await
+                .expect("no hard failure");
+        assert!(
+            matches!(outcome, StageOutcome::Ready(_)),
+            "diff for the modified file + blob for the created one covers the patch"
+        );
+    }
+
+    #[test]
+    fn files_diffs_cannot_cover_keeps_only_created_files() {
+        let mut manifest = manifest_with_one_patch();
+        assert!(files_diffs_cannot_cover(&manifest).patches.is_empty());
+        let record = manifest.patches.get_mut("pkg:npm/left-pad@1.3.0").unwrap();
+        record.files.insert(
+            "new.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: "c".repeat(64),
+            },
+        );
+        let cut = files_diffs_cannot_cover(&manifest);
+        let files: Vec<&String> = cut.patches["pkg:npm/left-pad@1.3.0"].files.keys().collect();
+        assert_eq!(files, ["new.js"]);
     }
 
     /// The vendor (in-memory) stager documents the opposite policy: a diff
