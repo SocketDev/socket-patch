@@ -64,6 +64,8 @@ sha1 = { workspace = true }
 # scan_vendor_e2e builds pristine registry tarballs for the auto-fetch tests.
 tar = { workspace = true }
 flate2 = { workspace = true }
+# diff_created_file_e2e builds a real diff archive.
+qbsdiff = { workspace = true }
 # update_fixture builds the Windows-shaped release archive for self-update e2e.
 zip = { workspace = true }
 hex = { workspace = true }

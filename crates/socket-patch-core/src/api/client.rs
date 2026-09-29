@@ -332,6 +332,21 @@ fn retry_after_secs(headers: &HeaderMap) -> Option<Duration> {
 /// without a hint).
 type VendorAttemptError = (ApiError, Option<Option<Duration>>);
 
+/// Most UUIDs the package-reference endpoint takes in one request.
+pub(crate) const MAX_REFERENCE_BATCH: usize = 500;
+
+/// Why a pypi reference is refused before its download: the served
+/// artifact is not a wheel.
+pub(crate) const PYPI_NOT_A_WHEEL: &str =
+    "the prebuilt artifact is not a .whl (pypi vendoring is wheel-based)";
+
+/// The last path segment of a serve URL, when it names a `.whl`.
+pub(crate) fn wheel_filename_from_url(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or("");
+    name.ends_with(".whl").then(|| name.to_string())
+}
+
 /// Body payload for the batch search POST endpoint.
 #[derive(Serialize)]
 struct BatchSearchBody {
@@ -740,8 +755,9 @@ impl ApiClient {
     /// Resolve hosted-patch references for a set of published-patch UUIDs
     /// (hosted-mode `scan`, the default for a bare `scan`). Uses the authenticated
     /// `POST /v0/orgs/{org}/patches/package` when a token+org are set, else the
-    /// public proxy `POST /patch/package` (free patches only). Returns a
-    /// UUID → reference map (missing/404 → empty).
+    /// public proxy `POST /patch/package` (free patches only), in requests
+    /// of at most [`MAX_REFERENCE_BATCH`] UUIDs (the endpoint rejects more).
+    /// Returns a UUID → reference map (missing/404 → empty).
     ///
     /// Uses the client's configured org slug; see
     /// [`Self::fetch_registry_references_for_org`] for a per-call override.
@@ -765,14 +781,18 @@ impl ApiClient {
             return Ok(std::collections::HashMap::new());
         }
         let path = self.patches_path(org_slug, "package");
-        let body = PackageVendorRequest {
-            uuids: uuids.to_vec(),
-            free_only: None,
-        };
-        let resp = self
-            .post_json::<PackageVendorResponse, _>(&path, &body)
-            .await?;
-        Ok(resp.map(|r| r.results).unwrap_or_default())
+        let mut results = std::collections::HashMap::new();
+        for chunk in uuids.chunks(MAX_REFERENCE_BATCH) {
+            let body = PackageVendorRequest {
+                uuids: chunk.to_vec(),
+                free_only: None,
+            };
+            let resp = self
+                .post_json::<PackageVendorResponse, _>(&path, &body)
+                .await?;
+            results.extend(resp.map(|r| r.results).unwrap_or_default());
+        }
+        Ok(results)
     }
 
     /// Internal: POST the batch search to the public proxy's
@@ -1306,6 +1326,16 @@ impl ApiClient {
             },
             None => download_url.to_string(),
         };
+        // pypi vendoring is wheel-based, so the sdist a qualifier-less pypi
+        // patch is served can never be used: refuse it before downloading.
+        if result
+            .purl
+            .as_deref()
+            .is_some_and(|purl| purl.starts_with("pkg:pypi/"))
+            && wheel_filename_from_url(&download_url).is_none()
+        {
+            return done(VendorServiceOutcome::Unavailable(PYPI_NOT_A_WHEEL.into()));
+        }
 
         // Surface the OTHER served artifacts (e.g. the gem path-source stub
         // gemspec) — their host-rewritten URL + normalized sha512 — so a
@@ -1398,21 +1428,54 @@ impl ApiClient {
 
     /// Step 1 of [`Self::fetch_vendor_package`], retried per the client's
     /// [`VendorRetryPolicy`]. `Err` carries whether the final failure was a
-    /// retryable (availability) one.
+    /// retryable (availability) one. A uuid the attached plan names is
+    /// answered from the plan's one reference batch (see
+    /// [`VendorPrefetch::reference`]).
     async fn request_vendor_package(
         &self,
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Result<PackageVendorResult, (ApiError, bool)> {
+        let plan = self
+            .vendor_prefetch
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(plan) = plan {
+            if let Some(result) = plan.reference(self, uuid, free_only, vendor_url).await {
+                return result;
+            }
+        }
+        let mut results = self
+            .request_vendor_references(&[uuid.to_string()], free_only, vendor_url)
+            .await?;
+        results.remove(uuid).ok_or_else(|| {
+            (
+                ApiError::Other(format!("package response missing a result for {uuid}")),
+                false,
+            )
+        })
+    }
+
+    /// One package-reference request for `uuids` (at most
+    /// [`MAX_REFERENCE_BATCH`]), retried per the client's
+    /// [`VendorRetryPolicy`]: the per-uuid results. `Err` carries whether
+    /// the final failure was a retryable (availability) one.
+    pub(crate) async fn request_vendor_references(
+        &self,
+        uuids: &[String],
+        free_only: bool,
+        vendor_url: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, PackageVendorResult>, (ApiError, bool)> {
         let attempts = self.vendor_retry.attempts.max(1);
         let mut attempt = 1;
         loop {
             match self
-                .request_vendor_package_once(uuid, free_only, vendor_url)
+                .request_vendor_references_once(uuids, free_only, vendor_url)
                 .await
             {
-                Ok(result) => return Ok(result),
+                Ok(results) => return Ok(results),
                 Err((e, Some(retry_after))) if attempt < attempts => {
                     debug_log(&format!(
                         "vendor package request attempt {attempt} failed: {e}"
@@ -1425,15 +1488,15 @@ impl ApiClient {
         }
     }
 
-    /// One package-reference POST: the single requested UUID's result.
-    async fn request_vendor_package_once(
+    /// One package-reference POST: the requested UUIDs' results.
+    async fn request_vendor_references_once(
         &self,
-        uuid: &str,
+        uuids: &[String],
         free_only: bool,
         vendor_url: Option<&str>,
-    ) -> Result<PackageVendorResult, VendorAttemptError> {
+    ) -> Result<std::collections::HashMap<String, PackageVendorResult>, VendorAttemptError> {
         let body = PackageVendorRequest {
-            uuids: vec![uuid.to_string()],
+            uuids: uuids.to_vec(),
             // Only send freeOnly when forcing it (the public-proxy contract);
             // the authenticated endpoint defaults to false.
             free_only: free_only.then_some(true),
@@ -1481,12 +1544,7 @@ impl ApiClient {
                     hint,
                 )
             })?;
-            return parsed.results.get(uuid).cloned().ok_or_else(|| {
-                (
-                    ApiError::Other(format!("package response missing a result for {uuid}")),
-                    None,
-                )
-            });
+            return Ok(parsed.results);
         }
         // 429 classifies as RateLimited but is still retried (the hint);
         // 401/403 carry no hint.
@@ -4581,6 +4639,48 @@ mod vendor_package_tests {
             .expect("proxy package-reference resolution must succeed");
         assert_eq!(map.len(), 1);
         assert_eq!(map[UUID].status, "granted");
+    }
+
+    /// The endpoint rejects more than [`MAX_REFERENCE_BATCH`] uuids per
+    /// request (400), so a larger scan goes out in capped chunks whose
+    /// results are merged.
+    #[tokio::test]
+    async fn fetch_registry_references_chunks_at_the_endpoint_cap() {
+        struct EchoGranted;
+        impl wiremock::Respond for EchoGranted {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let uuids = body["uuids"].as_array().unwrap();
+                if uuids.len() > MAX_REFERENCE_BATCH {
+                    return ResponseTemplate::new(400);
+                }
+                let results: serde_json::Map<String, serde_json::Value> = uuids
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.as_str().unwrap().to_string(),
+                            json!({ "status": "granted", "url": null, "artifacts": [] }),
+                        )
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "results": results }))
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/patch/package"))
+            .respond_with(EchoGranted)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let uuids: Vec<String> = (0..=MAX_REFERENCE_BATCH)
+            .map(|i| format!("{i:08x}-0000-4000-8000-{i:012x}"))
+            .collect();
+        let map = proxy_client(server.uri())
+            .fetch_registry_references(&uuids)
+            .await
+            .expect("chunked resolution succeeds");
+        assert_eq!(map.len(), uuids.len());
     }
 
     /// The package-reference route honors a per-call org override:
