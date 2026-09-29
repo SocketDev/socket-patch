@@ -39,6 +39,11 @@ const PACKAGE_LOCK: &str = r#"{
       "version": "0.5.0",
       "resolved": "git+ssh://git@github.com/x/git-dep.git#abc"
     },
+    "node_modules/local-tarball": {
+      "version": "1.0.0",
+      "resolved": "file:vendor/local-tarball-1.0.0.tgz",
+      "integrity": "sha512-local=="
+    },
     "node_modules/vendored": {
       "version": "3.0.0",
       "resolved": "file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/vendored-3.0.0.tgz",
@@ -80,6 +85,11 @@ async fn package_lock_inventories_registry_entries() {
     let git = entry(&entries, "git-dep");
     assert_eq!(git.resolved, None);
     assert_eq!(git.integrity, LockIntegrity::None);
+    // Nor does a local tarball: its integrity is of bytes no registry
+    // serves, so no registry fetch may be verified against it.
+    let local = entry(&entries, "local-tarball");
+    assert_eq!(local.resolved, None);
+    assert_eq!(local.integrity, LockIntegrity::None);
 
     // Workspace members, links, bundled deps, our vendored spec, the
     // unsafe-version entry, and the version-less node are all absent.
@@ -874,6 +884,69 @@ async fn yarn_classic_blocks_yield_resolved_sha1_and_integrity() {
     // `alias@npm:real@range` resolves to the real name.
     assert!(entries.iter().any(|e| e.name == "real-name"));
     assert_eq!(entry(&entries, "@scope/pkg").version, "2.0.0");
+}
+
+/// A git resolution's `#<commit>` fragment is not a tarball sha1: the
+/// entry carries no integrity, so no registry fetch (or fetch deferred
+/// behind the patch service) treats it as a verifiable registry package.
+#[tokio::test]
+async fn yarn_classic_git_resolution_fragment_is_not_an_integrity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "yarn.lock",
+        "# yarn lockfile v1\n\n\
+         \"from-git@git+https://github.com/o/from-git.git\":\n\
+         \x20 version \"1.0.0\"\n\
+         \x20 resolved \"git+https://github.com/o/from-git.git#0123456789abcdef0123456789abcdef01234567\"\n",
+    )
+    .await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    let e = entry(&entries, "from-git");
+    assert_eq!(e.resolved, None);
+    assert_eq!(e.integrity, LockIntegrity::None);
+}
+
+/// The same holds for a git repository reached over plain https (a
+/// `.git` URL or a codeload tarball), and an `integrity` field on such a
+/// block is not a registry integrity either; a registry tarball keeps
+/// both.
+#[tokio::test]
+async fn yarn_classic_https_git_resolutions_carry_no_integrity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "yarn.lock",
+        "# yarn lockfile v1\n\n\
+         \"https-git@https://github.com/o/https-git.git\":\n\
+         \x20 version \"1.0.0\"\n\
+         \x20 resolved \"https://github.com/o/https-git.git#0123456789abcdef0123456789abcdef01234567\"\n\
+         \x20 integrity sha512-fromgit==\n\n\
+         \"codeload@o/codeload\":\n\
+         \x20 version \"2.0.0\"\n\
+         \x20 resolved \"https://codeload.github.com/o/codeload/tar.gz/0123456789abcdef0123456789abcdef01234567\"\n\
+         \x20 integrity sha512-codeload==\n\n\
+         registry-pkg@^3.0.0:\n\
+         \x20 version \"3.0.0\"\n\
+         \x20 resolved \"https://registry.yarnpkg.com/registry-pkg/-/registry-pkg-3.0.0.tgz#dddddddddddddddddddddddddddddddddddddddd\"\n\
+         \x20 integrity sha512-registry==\n",
+    )
+    .await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    for name in ["https-git", "codeload"] {
+        let e = entry(&entries, name);
+        assert_eq!(e.resolved, None, "{name}");
+        assert_eq!(e.integrity, LockIntegrity::None, "{name}");
+    }
+    let registry = entry(&entries, "registry-pkg");
+    assert_eq!(
+        registry.resolved.as_deref(),
+        Some("https://registry.yarnpkg.com/registry-pkg/-/registry-pkg-3.0.0.tgz")
+    );
+    assert_eq!(
+        registry.integrity,
+        LockIntegrity::Sri("sha512-registry==".into())
+    );
 }
 
 // ── yarn berry ────────────────────────────────────────────────────────
