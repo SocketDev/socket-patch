@@ -221,7 +221,6 @@ fn binary_lock(release: &str, wiring: &Wiring) -> Vec<u8> {
         token: TOKEN.into(),
         patch_uuid: uuid,
         artifact_url,
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: Some(sri),
@@ -779,14 +778,14 @@ fn scan_hosted(cwd: &Path, flavor: Flavor, api: &Api) -> Vec<u8> {
 /// `scan --mode vendored --vendor-source build --vex` against an installed
 /// pristine minimist: the real engine builds + commits the tarball, rewires
 /// the lock, and the in-run VEX attests `(vendored)`. Vendored mode is
-/// manifest-free, so neither spelling writes a manifest (`--detached` is a
-/// hidden compatibility no-op). Returns the pre-scan lock bytes.
-fn scan_vendored(cwd: &Path, flavor: Flavor, api: &Api, detached: bool) -> Vec<u8> {
+/// manifest-free, so no manifest is written. Returns the pre-scan lock
+/// bytes.
+fn scan_vendored(cwd: &Path, flavor: Flavor, api: &Api) -> Vec<u8> {
     write_lock(cwd, flavor, &Wiring::Registry);
     install(cwd, PRISTINE);
     let registry_lock = std::fs::read(cwd.join(flavor.lock_file())).unwrap();
     api.serve_scan(tgz(PATCHED));
-    let mut args = vec![
+    let args = vec![
         "scan",
         "--mode",
         "vendored",
@@ -798,11 +797,8 @@ fn scan_vendored(cwd: &Path, flavor: Flavor, api: &Api, detached: bool) -> Vec<u
         "--vex-product",
         PRODUCT,
     ];
-    if detached {
-        args.push("--detached");
-    }
     let (code, env) = socket_json(cwd, api, &args);
-    let what = format!("{flavor:?} scan --mode vendored detached={detached} --vex");
+    let what = format!("{flavor:?} scan --mode vendored --vex");
     assert_eq!(code, Some(0), "{what}: {env}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "{what}: {env}");
     assert_eq!(env["vex"]["statements"], 1, "{what}: {env}");
@@ -895,77 +891,75 @@ fn c_d_hosted_real_scan_attests_online_only_and_dies_with_the_lock() {
 #[test]
 fn c_d_e_vendored_ledger_from_real_scan() {
     for flavor in FLAVORS {
-        for detached in [false, true] {
-            let what = format!("{flavor:?} vendored detached={detached}");
-            let tmp = project();
-            let cwd = tmp.path();
-            let api = Api::start();
-            let registry_lock = scan_vendored(cwd, flavor, &api, detached);
-            drop_manifest_and_install(cwd);
+        let what = format!("{flavor:?} vendored");
+        let tmp = project();
+        let cwd = tmp.path();
+        let api = Api::start();
+        let registry_lock = scan_vendored(cwd, flavor, &api);
+        drop_manifest_and_install(cwd);
 
-            // c) ledger + artifact, no manifest: offline.
-            let (code, env) = vex(cwd, &["--offline"]);
-            assert_attested(cwd, code, &env, UUID, "vendored", &format!("{what} ledger"));
+        // c) ledger + artifact, no manifest: offline.
+        let (code, env) = vex(cwd, &["--offline"]);
+        assert_attested(cwd, code, &env, UUID, "vendored", &format!("{what} ledger"));
 
-            // a) no ledger either: online from the API.
-            let saved = std::fs::read(cwd.join(".socket/vendor/state.json")).unwrap();
-            drop_ledgers(cwd);
-            let (code, env) = vex_online(cwd, &api, &[]);
-            assert_attested(
-                cwd,
-                code,
-                &env,
-                UUID,
-                "vendored",
-                &format!("{what} lock only"),
-            );
-            let (code, env) = vex(cwd, &["--offline"]);
+        // a) no ledger either: online from the API.
+        let saved = std::fs::read(cwd.join(".socket/vendor/state.json")).unwrap();
+        drop_ledgers(cwd);
+        let (code, env) = vex_online(cwd, &api, &[]);
+        assert_attested(
+            cwd,
+            code,
+            &env,
+            UUID,
+            "vendored",
+            &format!("{what} lock only"),
+        );
+        let (code, env) = vex(cwd, &["--offline"]);
+        assert_omitted(
+            cwd,
+            code,
+            &env,
+            "record_unavailable",
+            &format!("{what} offline"),
+        );
+        std::fs::write(cwd.join(".socket/vendor/state.json"), &saved).unwrap();
+
+        // e) a tampered member of the committed artifact: omitted with
+        // the ledger and without it.
+        let artifact = cwd.join(vendored_rel(UUID));
+        let honest = std::fs::read(&artifact).unwrap();
+        std::fs::write(&artifact, tgz(TAMPERED)).unwrap();
+        let (code, env) = vex(cwd, &["--offline"]);
+        assert_omitted(
+            cwd,
+            code,
+            &env,
+            "vendor_hash_mismatch",
+            &format!("{what} tamper"),
+        );
+        drop_ledgers(cwd);
+        let (code, env) = vex_online(cwd, &api, &[]);
+        assert_omitted(
+            cwd,
+            code,
+            &env,
+            "vendor_hash_mismatch",
+            &format!("{what} tamper lock only"),
+        );
+        std::fs::write(&artifact, honest).unwrap();
+        std::fs::write(cwd.join(".socket/vendor/state.json"), &saved).unwrap();
+
+        // d) lock reverted, ledger + artifact left behind.
+        std::fs::write(cwd.join(flavor.lock_file()), &registry_lock).unwrap();
+        for extra in [&[][..], &["--no-verify"][..]] {
+            let (code, env) = vex(cwd, &[&["--offline"][..], extra].concat());
             assert_omitted(
                 cwd,
                 code,
                 &env,
-                "record_unavailable",
-                &format!("{what} offline"),
+                "vendor_unwired",
+                &format!("{what} reverted {extra:?}"),
             );
-            std::fs::write(cwd.join(".socket/vendor/state.json"), &saved).unwrap();
-
-            // e) a tampered member of the committed artifact: omitted with
-            // the ledger and without it.
-            let artifact = cwd.join(vendored_rel(UUID));
-            let honest = std::fs::read(&artifact).unwrap();
-            std::fs::write(&artifact, tgz(TAMPERED)).unwrap();
-            let (code, env) = vex(cwd, &["--offline"]);
-            assert_omitted(
-                cwd,
-                code,
-                &env,
-                "vendor_hash_mismatch",
-                &format!("{what} tamper"),
-            );
-            drop_ledgers(cwd);
-            let (code, env) = vex_online(cwd, &api, &[]);
-            assert_omitted(
-                cwd,
-                code,
-                &env,
-                "vendor_hash_mismatch",
-                &format!("{what} tamper lock only"),
-            );
-            std::fs::write(&artifact, honest).unwrap();
-            std::fs::write(cwd.join(".socket/vendor/state.json"), &saved).unwrap();
-
-            // d) lock reverted, ledger + artifact left behind.
-            std::fs::write(cwd.join(flavor.lock_file()), &registry_lock).unwrap();
-            for extra in [&[][..], &["--no-verify"][..]] {
-                let (code, env) = vex(cwd, &[&["--offline"][..], extra].concat());
-                assert_omitted(
-                    cwd,
-                    code,
-                    &env,
-                    "vendor_unwired",
-                    &format!("{what} reverted {extra:?}"),
-                );
-            }
         }
     }
 }

@@ -11,7 +11,7 @@
 //! 2. the synthetic patch appends a marker to the INSTALLED `six.py`; a
 //!    wiremock Socket API serves discovery, the grant, the view and the
 //!    patched wheel itself;
-//! 3. hosted: `scan --redirect --vex` (same-run VEX attests); vendored:
+//! 3. hosted: `scan --mode hosted --vex` (same-run VEX attests); vendored:
 //!    `scan --vendor --vendor-source build --vex`;
 //! 4. a FRESH checkout of only the committable files (pyproject, pdm.lock,
 //!    `.socket/` minus the manifest) is installed by the real `pdm sync` —
@@ -25,7 +25,7 @@
 //!    `record_unavailable` with zero requests, and the lock reverted to the
 //!    registry (vendor ledger + artifacts kept) → `vendor_unwired` /
 //!    hosted: nothing names the patch, `--no-verify` included; plus a
-//!    manifest-less `scan --redirect|--vendor --vex` re-run.
+//!    manifest-less `scan --mode hosted|--vendor --vex` re-run.
 //!
 //! Releases whose lock format loses url/path identity (PDM 1.8 – 1.15 =
 //! 3.1, 2.0 – 2.7 = 4.0 – 4.2) must REFUSE both scans with the lock
@@ -310,7 +310,7 @@ fn patched_of(pristine: &[u8]) -> Vec<u8> {
 
 fn scan_mode_args(mode: Mode) -> Vec<&'static str> {
     match mode {
-        Mode::Hosted => vec!["--redirect"],
+        Mode::Hosted => vec!["--mode=hosted"],
         Mode::Vendored => vec!["--vendor", "--vendor-source", "build"],
     }
 }

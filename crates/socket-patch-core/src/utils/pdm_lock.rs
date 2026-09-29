@@ -3,7 +3,7 @@ use toml_edit::DocumentMut;
 use toml_edit::{value, Array, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::python_lock::preserve_line_endings;
+use crate::utils::python_lock::{is_prior_hosted_url, preserve_line_endings};
 
 pub fn lock_version(lock: &Table) -> Result<&str, String> {
     let version = lock
@@ -118,32 +118,6 @@ pub fn wheel_matches(filename: &str, name: &str, version: &str) -> bool {
         && matches!(parts.len(), 5 | 6)
         && canonicalize_pypi_name(parts[0]) == canonicalize_pypi_name(name)
         && parts[1] == version
-}
-
-/// Whether `existing` is an earlier hosted redirect of the SAME artifact:
-/// same origin (`scheme://host[:port]`) and same trailing wheel filename as the
-/// current artifact URL, fragments ignored. Grant tokens and patch uuids live
-/// in the path between them, so a rotated token or a superseded patch (new
-/// uuid) takes over the stale pin in place instead of being refused as a
-/// foreign source (the poetry / bun rewriters make the same call).
-fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
-    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return None;
-        }
-        let url = url.split('#').next()?;
-        let scheme_end = url.find("://")? + 3;
-        let path_start = url[scheme_end..].find('/')? + scheme_end;
-        let leaf = url[path_start..]
-            .rsplit('/')
-            .next()
-            .filter(|leaf| !leaf.is_empty())?;
-        Some((&url[..path_start], leaf))
-    }
-    match (origin_and_leaf(existing), origin_and_leaf(current)) {
-        (Some(old), Some(new)) => old == new,
-        _ => false,
-    }
 }
 
 pub fn rewrite_pdm_lock(

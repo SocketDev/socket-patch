@@ -1,14 +1,10 @@
-//! Package- and diff-archive tarball helpers.
+//! Patch-archive tarball helpers.
 //!
-//! Both package archives (`.socket/packages/<uuid>.tar.gz`) and diff
-//! archives (`.socket/diffs/<uuid>.tar.gz`) use the same on-disk format:
-//! a gzipped tar containing one entry per patched file. The entry's path
-//! matches the **normalized** relative file path (i.e. without the
-//! `package/` prefix used by the API).
-//!
-//! For package archives, each entry holds the patched file's full bytes.
-//! For diff archives, each entry holds a bsdiff delta that transforms the
-//! corresponding `beforeHash` content into the `afterHash` content.
+//! Diff archives (`.socket/diffs/<uuid>.tar.gz`) are a gzipped tar
+//! containing one entry per patched file. The entry's path matches the
+//! **normalized** relative file path (i.e. without the `package/` prefix
+//! used by the API), and each entry holds a bsdiff delta that transforms
+//! the corresponding `beforeHash` content into the `afterHash` content.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -35,7 +31,7 @@ const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 /// the in-memory `HashMap`.
 const MAX_ENTRIES: usize = 10_000;
 
-/// Errors produced while reading a package/diff archive.
+/// Errors produced while reading a patch archive.
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
     #[error("archive I/O error: {0}")]

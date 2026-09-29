@@ -547,7 +547,6 @@ fn stage(case: &Case, crlf: bool) -> Staged {
 async fn vendor(case: &Case, staged: &Staged) -> VendorOutcome {
     let sources = PatchSources {
         blobs_path: &staged.blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };

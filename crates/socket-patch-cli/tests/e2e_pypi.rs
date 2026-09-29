@@ -61,21 +61,11 @@ fn git_sha256_file(path: &Path) -> String {
     git_sha256(&content)
 }
 
-/// The three legacy `SOCKET_PATCH_*` names still honored at runtime via
-/// `socket_patch_core::utils::env_compat` — not in the clap-bound lists, so they
-/// need scrubbing separately.
-const LEGACY_ENV_VARS: &[&str] = &[
-    "SOCKET_PATCH_PROXY_URL",
-    "SOCKET_PATCH_DEBUG",
-    "SOCKET_PATCH_TELEMETRY_DISABLED",
-];
-
 /// Run the CLI binary with the given args, setting `cwd` as the working dir.
 ///
 /// The environment is pinned hard: every env var the CLI binds (the canonical
-/// `GLOBAL_ARG_ENV_VARS` / `LOCAL_ARG_ENV_VARS` lists plus [`LEGACY_ENV_VARS`])
-/// is scrubbed so ambient developer/CI configuration can't change the
-/// lifecycle under test. Scrubbing `SOCKET_API_TOKEN` also forces the
+/// `GLOBAL_ARG_ENV_VARS` / `LOCAL_ARG_ENV_VARS` lists) is scrubbed so ambient
+/// developer/CI configuration can't change the lifecycle under test. Scrubbing `SOCKET_API_TOKEN` also forces the
 /// public-proxy (free-tier) path this suite relies on. The stakes are higher
 /// here than in the offline suites: an inherited `SOCKET_GLOBAL=true` takes
 /// `get`/`apply` out of the temp venv and patches the host's real
@@ -94,11 +84,7 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         .env("SOCKET_DRY_RUN", "true")
         .env("SOCKET_SAVE_ONLY", "true")
         .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json");
-    for var in GLOBAL_ARG_ENV_VARS
-        .iter()
-        .chain(LOCAL_ARG_ENV_VARS)
-        .chain(LEGACY_ENV_VARS)
-    {
+    for var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS) {
         cmd.env_remove(var);
     }
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");

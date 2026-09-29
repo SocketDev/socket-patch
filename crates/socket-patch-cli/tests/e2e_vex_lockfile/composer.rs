@@ -377,7 +377,7 @@ fn honest_api() -> PatchApi {
     PatchApi::start(vec![(UUID.into(), view(UUID, PURL))])
 }
 
-/// `.socket/vendor/redirect-state.json` as `scan --redirect` writes it for a
+/// `.socket/vendor/redirect-state.json` as `scan --mode hosted` writes it for a
 /// composer redirect: the record plus the lock edit.
 fn write_redirect_ledger(cwd: &Path, key: &str, rec: PatchRecord) {
     let mut state = RedirectState::new();

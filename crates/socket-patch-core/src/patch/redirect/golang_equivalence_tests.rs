@@ -213,7 +213,6 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
         token: String::new(),
         patch_uuid: uuid(n),
         artifact_url: String::new(),
-        berry_zip_url: None,
         registry_override,
         integrity: Integrity {
             dirhash_h1: h1(rng),

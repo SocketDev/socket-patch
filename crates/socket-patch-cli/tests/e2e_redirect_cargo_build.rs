@@ -512,8 +512,7 @@ async fn redirect_scanned_project(
         .await;
 
     // The driver invocation. Scan: `--mode hosted --vex` — the three-file
-    // rewrite + the in-run (unverified) attestation (`--mode hosted` is the
-    // documented spelling of `--redirect`). Get: `get <uuid> --mode hosted`
+    // rewrite + the in-run (unverified) attestation. Get: `get <uuid> --mode hosted`
     // — same engine, get's confirm gate auto-accepted by --json/--yes, no
     // --vex (get has none).
     let server_uri = server.uri();

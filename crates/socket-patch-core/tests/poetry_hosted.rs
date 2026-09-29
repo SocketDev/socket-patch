@@ -29,7 +29,6 @@ fn patch() -> DepOverride {
         token: "7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e".into(),
         patch_uuid: "e828efa5-5c6d-43f3-9909-03f5ac232b98".into(),
         artifact_url: URL.into(),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some("a".repeat(64)),

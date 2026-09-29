@@ -335,7 +335,6 @@ fn dep(i: usize, v: &str, uuid: usize, rng: &mut Rng) -> DepOverride {
             "https://patch.socket.dev/patch/{uuid}/pkg-{i}-{v}{ext}{}",
             if rng.chance(10) { "?token=x#frag" } else { "" }
         ),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: (!rng.chance(5)).then(|| HEX.to_string()),
@@ -482,7 +481,6 @@ fn refusal_in_the_middle_leaves_the_prior_rewrite_intact() {
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
         artifact_url: format!("https://patch.socket.dev/{name}-1.0.0-py3-none-any.whl"),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha256: Some(HEX.into()),

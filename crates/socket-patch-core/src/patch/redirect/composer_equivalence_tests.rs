@@ -151,7 +151,6 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
         token: String::new(),
         patch_uuid: format!("00000000-0000-4000-8000-{n:012}"),
         artifact_url: url,
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha1: (!rng.chance(8)).then(|| {

@@ -319,7 +319,7 @@ fn seed_manifest(root: &Path, entries: &[(&str, &str)]) {
 // resolve_mode_flags — the remaining cross-mode conflict arms
 // ---------------------------------------------------------------------------
 // Only the `--mode hosted --vendor` arm is pinned in cli_parse_scan.rs;
-// these cover the --redirect / --apply / --sync booleans against a
+// these cover the --apply / --sync / --vendor booleans against a
 // different --mode, plus ScanMode::Agent.cli_name() rendering into the
 // message. Clap parses each combination fine (no value-dependent conflict
 // is expressible); the fold is what rejects them.
@@ -365,16 +365,6 @@ mod mode_fold {
     fn fold_err(extra: &[&str]) -> String {
         let mut args = parse_scan(extra);
         resolve_mode_flags(&mut args).expect_err("cross-mode contradiction must error")
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn mode_vendored_with_redirect_boolean_errors() {
-        let err = fold_err(&["--mode", "vendored", "--redirect"]);
-        assert!(
-            err.contains("--mode vendored cannot be used with --redirect"),
-            "clap-style 'cannot be used with' phrasing naming both spellings: {err}"
-        );
     }
 
     #[test]
@@ -2270,22 +2260,6 @@ fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
         "{stderr:?}"
     );
     assert!(!stderr.contains("--redirect"), "{stderr:?}");
-    // Typing the hidden --redirect gets it explained.
-    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "agent", "--redirect"]);
-    assert_eq!(code, 2);
-    assert!(
-        stderr.starts_with(
-            "Error: --mode agent cannot be used with --redirect: the flags select \
-             different modes (--redirect means --mode hosted)"
-        ),
-        "{stderr:?}"
-    );
-    let (code, _, stderr) = run_scan(tmp.path(), &["--detached"]);
-    assert_eq!(code, 2);
-    assert!(
-        stderr.starts_with("Error: --detached requires vendored mode"),
-        "{stderr:?}"
-    );
 }
 
 /// A selection the manifest already records at the same uuid is not

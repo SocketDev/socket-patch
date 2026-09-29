@@ -36,7 +36,9 @@ use super::common::{
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip_with_prefix};
-use super::service_fetch::{claim_prestaged, fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{
+    claim_prestaged, fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal,
+};
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -281,7 +283,7 @@ pub async fn vendor_go_module<'a>(
     )
     .await
     {
-        GoServiceRedirect::Used => {
+        GoServiceRedirect::Used(()) => {
             // No local apply to verify (the downloaded zip IS the patched
             // module), so every patched file reads as `AlreadyPatched` — trust
             // is the verified service integrity (sha512 + the `h1:` dirhash).
@@ -496,15 +498,9 @@ pub async fn vendor_go_module<'a>(
     done(result, Some(entry), warnings)
 }
 
-/// Outcome of attempting to materialise the go copy from the patch service.
-enum GoServiceRedirect {
-    /// The prebuilt module zip was extracted and the `replace` wired.
-    Used,
-    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
-    HardFail(Box<VendorOutcome>),
-    /// Fall back to copying + patching the pristine module source.
-    FallBack,
-}
+/// Outcome of attempting to materialise the go copy from the patch service
+/// (`Used`: the prebuilt module zip was extracted and the `replace` wired).
+type GoServiceRedirect = ServiceAttempt<()>;
 
 /// Download the prebuilt module zip, verify it (sha512 + the `h1:` dirhash,
 /// done by `fetch_verified_archive`), extract it into `copy_dir` (stripping its
@@ -547,188 +543,108 @@ async fn go_service_redirect(
     if !cfg.service_enabled() || record.files.is_empty() {
         return GoServiceRedirect::FallBack;
     }
-    fn hard(code: &'static str, detail: String) -> GoServiceRedirect {
-        GoServiceRedirect::HardFail(Box::new(refused(code, detail)))
-    }
-    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
-        if cfg.source.requires_service() {
-            hard("vendor_prebuilt_required", reason)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            GoServiceRedirect::FallBack
-        }
+    let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
+    let fetched = fetch_verified_archive(cfg, &record.uuid).await;
+    let subject = format!("module zip for {module}");
+    let mut archive = match policy.settle(fetched, "module zip", &subject, warnings) {
+        Ok(archive) => archive,
+        Err(attempt) => return attempt,
     };
-    match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(mut archive) => {
-            // Extract the module zip (strip its literal `{module}@{version}/`
-            // prefix) into a STAGE sibling of the copy dir and swap it into
-            // place only once verified — the cargo / composer / gem shape: a
-            // failed re-download never destroys a pre-existing copy the
-            // vendor `replace` still points at.
-            let stage = stage_dir_for(copy_dir);
-            let prefix = format!("{module}@{version}/");
-            // A tree the download plan already extracted from these bytes
-            // (see `prestage`) is moved into the stage instead; otherwise —
-            // or should the move fail — extract here, as always.
-            if !claim_prestaged(&mut archive, &stage, copy_dir).await {
-                let _ = remove_tree(&stage).await; // a crashed earlier run's litter
-                if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                    cleanup_failed_service_stage(
-                        &stage,
-                        project_root,
-                        base_rel,
-                        copy_dir,
-                        module,
-                        wired,
-                    )
-                    .await;
-                    return hard(
-                        "vendor_prebuilt_write_failed",
-                        format!("cannot create {}: {e}", stage.display()),
-                    );
-                }
-                let zip_bytes = std::mem::take(&mut archive.bytes);
-                let prefix_owned = prefix.clone();
-                if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, move |b, d| {
-                    extract_zip_with_prefix(b, d, &prefix_owned)
-                })
-                .await
-                {
-                    cleanup_failed_service_stage(
-                        &stage,
-                        project_root,
-                        base_rel,
-                        copy_dir,
-                        module,
-                        wired,
-                    )
-                    .await;
-                    return hard(
-                        "vendor_prebuilt_extract_failed",
-                        format!("cannot extract the prebuilt module zip: {e}"),
-                    );
-                }
-            }
-            // A `replace` target needs a go.mod declaring the module path;
-            // pre-modules zips may lack one — synthesize the minimal form.
-            if let Err(e) = ensure_module_go_mod(&stage, module).await {
-                cleanup_failed_service_stage(
-                    &stage,
-                    project_root,
-                    base_rel,
-                    copy_dir,
-                    module,
-                    wired,
-                )
+    // Extract the module zip (strip its literal `{module}@{version}/`
+    // prefix) into a STAGE sibling of the copy dir and swap it into
+    // place only once verified — the cargo / composer / gem shape: a
+    // failed re-download never destroys a pre-existing copy the
+    // vendor `replace` still points at.
+    let stage = stage_dir_for(copy_dir);
+    let prefix = format!("{module}@{version}/");
+    // A tree the download plan already extracted from these bytes
+    // (see `prestage`) is moved into the stage instead; otherwise —
+    // or should the move fail — extract here, as always.
+    if !claim_prestaged(&mut archive, &stage, copy_dir).await {
+        let _ = remove_tree(&stage).await; // a crashed earlier run's litter
+        if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+            cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
                 .await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot synthesize go.mod for the copy: {e}"),
-                );
-            }
-            // Verify the EXTRACTED TREE before it replaces the copy or the
-            // consumer's go.mod is wired: the SRI proves the zip bytes are
-            // intact, but an unexpected internal layout (the
-            // `{module}@{version}/` prefix strip mismatching) lands the
-            // patched files at the wrong paths, and the caller would
-            // synthesize success from `record.files` while the copy is
-            // wrong. Fail closed → `auto` falls back to the local build;
-            // nothing points at the bad stage. (Mirrors composer_lock.rs.)
-            if !copy_matches_after_hashes(&stage, &record.files).await {
-                cleanup_failed_service_stage(
-                    &stage,
-                    project_root,
-                    base_rel,
-                    copy_dir,
-                    module,
-                    wired,
-                )
-                .await;
-                return miss(
-                    warnings,
-                    "vendor_prebuilt_layout_mismatch",
-                    format!(
-                        "prebuilt module zip for {module} extracted to an \
-                         unexpected layout (patched files absent at their \
-                         recorded paths)"
-                    ),
-                );
-            }
-            if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
-                cleanup_failed_service_stage(
-                    &stage,
-                    project_root,
-                    base_rel,
-                    copy_dir,
-                    module,
-                    wired,
-                )
-                .await;
-                return hard(
-                    "vendor_prebuilt_write_failed",
-                    format!("cannot move the extracted module into place: {e}"),
-                );
-            }
-            if let Err(e) =
-                go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false)
-                    .await
-            {
-                // The verified copy is in place. A wired run's directive
-                // already targets this uuid's (now refreshed) copy, so both
-                // stay consistent as they are; a first run has nothing
-                // pointing at the copy — tear the uuid dir down so no orphan
-                // survives the wire failure.
-                if !wired {
-                    teardown_failed_service_copy(project_root, base_rel, module, false).await;
-                }
-                return hard(
-                    "vendor_prebuilt_wire_failed",
-                    format!("failed to update go.mod: {e}"),
-                );
-            }
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {module} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            GoServiceRedirect::Used
+            return policy.hard(
+                "vendor_prebuilt_write_failed",
+                format!("cannot create {}: {e}", stage.display()),
+            );
         }
-        // Bytes that fail integrity verification are an active tamper signal:
-        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
-        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
-        ServiceArtifact::IntegrityMismatch(reason) => hard(
-            "vendor_prebuilt_integrity_mismatch",
-            format!(
-                "prebuilt module zip for {module} failed integrity verification ({reason}); \
-                 refusing to fall back to a local build on tampered bytes"
-            ),
-        ),
-        ServiceArtifact::Pending => miss(
-            warnings,
-            "vendor_prebuilt_pending",
-            "prebuilt module zip is still building".to_string(),
-        ),
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt module zip unavailable: {reason}"),
-                )
-            } else {
-                GoServiceRedirect::FallBack
-            }
+        let zip_bytes = std::mem::take(&mut archive.bytes);
+        let prefix_owned = prefix.clone();
+        if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, move |b, d| {
+            extract_zip_with_prefix(b, d, &prefix_owned)
+        })
+        .await
+        {
+            cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
+                .await;
+            return policy.hard(
+                "vendor_prebuilt_extract_failed",
+                format!("cannot extract the prebuilt module zip: {e}"),
+            );
         }
-        ServiceArtifact::Failed(reason) => miss(
-            warnings,
-            "vendor_prebuilt_unavailable",
-            format!("patch service request failed ({reason})"),
-        ),
     }
+    // A `replace` target needs a go.mod declaring the module path;
+    // pre-modules zips may lack one — synthesize the minimal form.
+    if let Err(e) = ensure_module_go_mod(&stage, module).await {
+        cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired).await;
+        return policy.hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot synthesize go.mod for the copy: {e}"),
+        );
+    }
+    // Verify the EXTRACTED TREE before it replaces the copy or the
+    // consumer's go.mod is wired: the SRI proves the zip bytes are
+    // intact, but an unexpected internal layout (the
+    // `{module}@{version}/` prefix strip mismatching) lands the
+    // patched files at the wrong paths, and the caller would
+    // synthesize success from `record.files` while the copy is
+    // wrong. Fail closed → `auto` falls back to the local build;
+    // nothing points at the bad stage. (Mirrors composer_lock.rs.)
+    if !copy_matches_after_hashes(&stage, &record.files).await {
+        cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired).await;
+        return policy.miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!(
+                "prebuilt module zip for {module} extracted to an \
+                 unexpected layout (patched files absent at their \
+                 recorded paths)"
+            ),
+        );
+    }
+    if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+        cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired).await;
+        return policy.hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot move the extracted module into place: {e}"),
+        );
+    }
+    if let Err(e) =
+        go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false).await
+    {
+        // The verified copy is in place. A wired run's directive
+        // already targets this uuid's (now refreshed) copy, so both
+        // stay consistent as they are; a first run has nothing
+        // pointing at the copy — tear the uuid dir down so no orphan
+        // survives the wire failure.
+        if !wired {
+            teardown_failed_service_copy(project_root, base_rel, module, false).await;
+        }
+        return policy.hard(
+            "vendor_prebuilt_wire_failed",
+            format!("failed to update go.mod: {e}"),
+        );
+    }
+    warnings.push(VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!(
+            "vendored {module} from the patch service ({})",
+            archive.source_url
+        ),
+    ));
+    GoServiceRedirect::Used(())
 }
 
 /// Failure cleanup for the service legs (the vendor-side sibling of the

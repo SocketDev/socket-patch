@@ -400,11 +400,12 @@ fn make_two_entry_socket_dir(root: &Path) -> PathBuf {
     socket
 }
 
-/// The default cleanup now covers `.socket/diffs` and `.socket/packages`
-/// (`<uuid>.tar.gz`, kept iff the uuid is still referenced by the
-/// post-removal manifest) in addition to blobs. Removing A must sweep A's
-/// archives from BOTH dirs while B's — still referenced by the second
-/// manifest entry — survive; the artifact carrier reports the count.
+/// The default cleanup now covers `.socket/diffs` (`<uuid>.tar.gz`, kept iff
+/// the uuid is still referenced by the post-removal manifest) and the legacy
+/// `.socket/packages` (swept whole: v5.0 reads no package archives) in
+/// addition to blobs. Removing A must sweep A's diff archive while B's —
+/// still referenced by the second manifest entry — survives, and both
+/// package archives go; the artifact carrier reports the count.
 #[test]
 fn default_remove_sweeps_archives_too() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -436,7 +437,8 @@ fn default_remove_sweeps_archives_too() {
         "exactly A's manifest entry is removed"
     );
 
-    // A's archives are gone from BOTH archive dirs; B's survive in both.
+    // A's archives are gone from BOTH archive dirs; B's diff archive
+    // survives, its legacy package archive does not.
     for dir in ["diffs", "packages"] {
         assert!(
             !socket
@@ -445,24 +447,31 @@ fn default_remove_sweeps_archives_too() {
                 .exists(),
             "the removed entry's {dir} archive must be swept"
         );
-        assert!(
-            socket
-                .join(dir)
-                .join(format!("{ARCH_UUID_B}.tar.gz"))
-                .exists(),
-            "the kept entry's {dir} archive must survive"
-        );
     }
+    assert!(
+        socket
+            .join("diffs")
+            .join(format!("{ARCH_UUID_B}.tar.gz"))
+            .exists(),
+        "the kept entry's diff archive must survive"
+    );
+    assert!(
+        !socket
+            .join("packages")
+            .join(format!("{ARCH_UUID_B}.tar.gz"))
+            .exists(),
+        "a legacy package archive is swept even for a kept entry"
+    );
 
-    // The purl-less artifact carrier reports the two swept archives.
+    // The purl-less artifact carrier reports the three swept archives.
     let events = v["events"].as_array().expect("events array");
     let carrier = events
         .iter()
         .find(|e| e["action"] == "removed" && e["purl"].is_null())
         .unwrap_or_else(|| panic!("expected the artifact carrier event: {events:?}"));
     assert_eq!(
-        carrier["details"]["archivesRemoved"], 2,
-        "one diff + one package archive swept; carrier={carrier}"
+        carrier["details"]["archivesRemoved"], 3,
+        "one diff + two package archives swept; carrier={carrier}"
     );
 
     // The keep-rule really is manifest-anchored: B's entry survives.

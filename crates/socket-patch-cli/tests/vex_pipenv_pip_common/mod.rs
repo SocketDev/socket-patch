@@ -16,7 +16,7 @@
 //! mod vex_pipenv_pip_common;
 //! ```
 //!
-//! Every project is wired by the REAL CLI, not by hand: `scan --redirect`
+//! Every project is wired by the REAL CLI, not by hand: `scan --mode hosted`
 //! (hosted) or `scan --vendor --vendor-source build` (vendored) runs against
 //! a wiremock stand-in for the Socket API, with the package's pristine
 //! install in a fabricated `.venv` for the vendored build. The wired tree is
@@ -456,7 +456,7 @@ pub fn run_scan(
         cwd.to_str().unwrap(),
     ];
     match mode {
-        Mode::Hosted => args.push("--redirect"),
+        Mode::Hosted => args.push("--mode=hosted"),
         Mode::Vendored => args.extend(["--vendor", "--vendor-source", "build"]),
     }
     args.extend_from_slice(extra);
@@ -1227,16 +1227,16 @@ pub fn g_vendored_attests_over_a_pristine_venv_with_a_warning(flavors: &[Flavor]
     }
 }
 
-/// `scan --vendor --detached --vex` never writes a manifest; its own VEX
+/// `scan --vendor --vex` never writes a manifest; its own VEX
 /// and a later standalone `vex` both attest (ledger present, then gone).
 pub fn embedded_detached_vendor_scan_attests_without_a_manifest(flavors: &[Flavor]) {
     for flavor in flavors.iter().filter(|f| f.vendored) {
         let (_tmp, cwd) = fresh();
-        wire_into(&cwd, flavor, Mode::Vendored, &["--detached"]);
-        let what = format!("{} detached", flavor.label);
+        wire_into(&cwd, flavor, Mode::Vendored, &[]);
+        let what = format!("{} vendored", flavor.label);
         assert!(
             !cwd.join(".socket/manifest.json").exists(),
-            "{what}: detached writes no manifest"
+            "{what}: vendored mode writes no manifest"
         );
         let run = VexRun {
             offline: true,
@@ -1253,7 +1253,7 @@ pub fn embedded_detached_vendor_scan_attests_without_a_manifest(flavors: &[Flavo
     }
 }
 
-/// A CI re-run of `scan --redirect --vex` / `scan --vendor --vex` on a
+/// A CI re-run of `scan --mode hosted --vex` / `scan --vendor --vex` on a
 /// checkout whose `.socket/` was never committed (the wiring is already
 /// there): the embedded document still attests, and the re-scan leaves the
 /// wired lockfile byte-identical.

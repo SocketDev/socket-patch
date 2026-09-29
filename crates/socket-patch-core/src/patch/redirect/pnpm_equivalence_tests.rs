@@ -191,7 +191,6 @@ fn dep(p: &Pkg, uuid: usize, url_tag: &str, sha512: Option<&str>) -> DepOverride
             "https://patch.socket.dev/{url_tag}/{}-{}.tgz",
             p.name, p.version
         ),
-        berry_zip_url: None,
         registry_override: None,
         integrity: Integrity {
             sha512: sha512.map(str::to_string),

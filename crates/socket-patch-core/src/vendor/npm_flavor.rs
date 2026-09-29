@@ -565,7 +565,6 @@ pub async fn lock_text_refusals(
     let nowhere = nowhere_buf.as_path();
     let no_sources = PatchSources {
         blobs_path: nowhere,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };
@@ -783,7 +782,6 @@ mod lock_text_refusal_tests {
         let nowhere = root.join("not-installed");
         let sources = PatchSources {
             blobs_path: &nowhere,
-            packages_path: None,
             diffs_path: None,
             mem_blobs: None,
         };

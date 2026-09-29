@@ -27,8 +27,8 @@
 //! root-escaping path and mismatched records never attest; g) hosted
 //! installed-tree states (not installed → pin, patched → hashed, pristine →
 //! `not_applied`), pinless hosted needs an install, vendored over a pristine
-//! venv warns; plus the embedded `scan --redirect|--vendor --vex`,
-//! `scan --vendor --detached --vex`, `apply --vex` and `vendor --vex`.
+//! venv warns; plus the embedded `scan --mode hosted|--vendor --vex`,
+//! `apply --vex` and `vendor --vex`.
 //!
 //! The real-PDM counterpart (real `pdm lock` / `pdm sync`, per PDM release)
 //! is `e2e_vex_build/pdm.rs`.

@@ -66,7 +66,6 @@ async fn stage_tempdir_creation_failure_is_reported_not_fatal() {
     };
     let sources = PatchSources {
         blobs_path: &blobs,
-        packages_path: None,
         diffs_path: None,
         mem_blobs: None,
     };

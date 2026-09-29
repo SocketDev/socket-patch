@@ -960,40 +960,27 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
-async fn native_binary_scan_vendored_and_detached() {
-    for detached in [false, true] {
-        let Some(fixture) = Fixture::new("direct") else {
-            return;
-        };
-        let server = MockServer::start().await;
-        mock_api(&server, &fixture, "minimist").await;
-        let flags: &[&str] = if detached { &["--detached"] } else { &[] };
-        let result = scan(&fixture.project, &server, "vendored", flags);
-        assert_eq!(
-            result["vendor"]["summary"]["applied"], 1,
-            "scan vendored detached={detached}: {result}"
-        );
-        // Vendored mode is manifest-free either way: `--detached` is an
-        // accepted no-op.
-        assert!(
-            !fixture.project.join(".socket/manifest.json").exists(),
-            "vendored scan must not write a manifest (detached={detached})"
-        );
-        fixture.frozen("scan-vendored", &fixture.patched, "minimist");
-        fixture.manifestless_vex(
-            if detached {
-                "scan-vendored-detached"
-            } else {
-                "scan-vendored"
-            },
-            bun_vex::BunMode::Vendored,
-            &server.uri(),
-        );
-        let result = cli(&fixture.project, &["vendor", "--revert"]);
-        assert_eq!(result["summary"]["removed"], 1, "vendor revert: {result}");
-        fixture.pristine();
-        fixture.frozen("reverted", &fixture.original, "minimist");
-    }
+async fn native_binary_scan_vendored() {
+    let Some(fixture) = Fixture::new("direct") else {
+        return;
+    };
+    let server = MockServer::start().await;
+    mock_api(&server, &fixture, "minimist").await;
+    let result = scan(&fixture.project, &server, "vendored", &[]);
+    assert_eq!(
+        result["vendor"]["summary"]["applied"], 1,
+        "scan vendored: {result}"
+    );
+    assert!(
+        !fixture.project.join(".socket/manifest.json").exists(),
+        "vendored scan must not write a manifest"
+    );
+    fixture.frozen("scan-vendored", &fixture.patched, "minimist");
+    fixture.manifestless_vex("scan-vendored", bun_vex::BunMode::Vendored, &server.uri());
+    let result = cli(&fixture.project, &["vendor", "--revert"]);
+    assert_eq!(result["summary"]["removed"], 1, "vendor revert: {result}");
+    fixture.pristine();
+    fixture.frozen("reverted", &fixture.original, "minimist");
 }
 
 #[tokio::test(flavor = "multi_thread")]
