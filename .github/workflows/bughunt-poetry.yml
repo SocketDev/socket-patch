@@ -1,0 +1,151 @@
+name: bughunt poetry probe
+
+on:
+  push:
+    branches: ['bughunt/poetry/**']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        poetry: ['1.8.5', '2.4.3']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      SOCKET_NO_CONFIG: '1'
+      SOCKET_NO_UPDATE_CHECK: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bughunt-poetry
+          save-if: false
+      - run: cargo build --locked -p socket-patch-cli
+      - name: Install Poetry
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/poetry-venv"
+          if [ -x "$RUNNER_TEMP/poetry-venv/Scripts/python.exe" ]; then PY="$RUNNER_TEMP/poetry-venv/Scripts/python.exe"; P="$RUNNER_TEMP/poetry-venv/Scripts/poetry.exe"; else PY="$RUNNER_TEMP/poetry-venv/bin/python"; P="$RUNNER_TEMP/poetry-venv/bin/poetry"; fi
+          "$PY" -m pip install -q "poetry==${{ matrix.poetry }}"
+          echo "POETRY_BIN=$P" >> "$GITHUB_ENV"
+      - name: Probe Poetry agent/hosted/vendored
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/probe.py" <<'PROBE_EOF'
+          import base64, hashlib, io, json, os, re, shutil, subprocess, sys, tempfile, threading, urllib.request, zipfile
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          CLI = os.path.abspath(sys.argv[1]); POETRY = sys.argv[2]
+          UUID = "3c5e7a9b-1d3f-4b5d-8f7a-9b1d3f5a7c9e"
+          WHL = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl"
+          RAW = urllib.request.urlopen(WHL).read()
+          before = zipfile.ZipFile(io.BytesIO(RAW)).read("six.py")
+          after = before + b"\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n"
+          def build():
+              zin = zipfile.ZipFile(io.BytesIO(RAW)); out = io.BytesIO(); zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+              rec = [n for n in zin.namelist() if n.endswith(".dist-info/RECORD")][0]; lines = []
+              for n in zin.namelist():
+                  if n == rec: continue
+                  d = after if n == "six.py" else zin.read(n); zout.writestr(n, d)
+                  lines.append("%s,sha256=%s,%d" % (n, base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode(), len(d)))
+              lines.append(rec + ",,"); zout.writestr(rec, "\n".join(lines) + "\n"); zout.close(); return out.getvalue()
+          g = lambda b: hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          API_PURL = "pkg:pypi/six@1.16.0?artifact_id=py2-py3-none-any-whl"
+          VIEW = {"uuid": UUID, "purl": API_PURL, "publishedAt": "2026-09-01T00:00:00Z",
+                  "files": {"six.py": {"beforeHash": g(before), "afterHash": g(after), "blobContent": base64.b64encode(after).decode()}},
+                  "vulnerabilities": {"GHSA-aaaa-bbbb-cccc": {"cves": ["CVE-2026-0001"], "summary": "s", "severity": "high", "description": "d"}},
+                  "description": "x", "license": "MIT", "tier": "free"}
+          PATCH = {"uuid": UUID, "purl": API_PURL, "tier": "free", "cveIds": ["CVE-2026-0001"], "ghsaIds": ["GHSA-aaaa-bbbb-cccc"], "severity": "HIGH", "title": "t"}
+
+
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def out(self, obj):
+                  b = json.dumps(obj).encode(); self.send_response(200); self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_GET(self):
+                  if "/patches/view/" in self.path: return self.out(VIEW)
+                  if self.path.startswith("/patch/pypi/"):
+                      self.send_response(200); self.send_header("Content-Length", str(len(WHEEL))); self.end_headers(); self.wfile.write(WHEEL); return
+                  if "/by-package/" in self.path: return self.out({"patches": [dict(PATCH, publishedAt="2026-09-01T00:00:00Z", description="x", license="MIT", vulnerabilities={})], "canAccessPaidPatches": False})
+                  self.send_response(404); self.end_headers()
+              def do_POST(self):
+                  raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+                  if self.path.endswith("/patches/batch"):
+                      has = "pkg:pypi/six@1.16.0" in raw
+                      return self.out({"packages": [{"purl": "pkg:pypi/six@1.16.0", "patches": [PATCH]}] if has else [], "canAccessPaidPatches": False})
+                  if self.path.endswith("/patches/package"):
+                      url = API + "/patch/pypi/six/1.16.0/11111111-2222-4333-8444-555555555555/" + UUID + "/six-1.16.0-py2.py3-none-any.whl"
+                      return self.out({"results": {UUID: {"status": "granted", "url": url, "purl": "pkg:pypi/six@1.16.0",
+                          "artifacts": [{"kind": "tarball", "url": url, "integrity": {"sha256": hashlib.sha256(WHEEL).hexdigest()}}], "registryOverride": None}}})
+                  self.out({})
+
+
+          srv = ThreadingHTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+          API = "http://127.0.0.1:%d" % srv.server_address[1]
+          WHEEL = build()
+
+          NAMED = '[tool.poetry]\nname = "probe-named"\npackage-mode = false\n\n[tool.poetry.dependencies]\npython = ">=3.8"\nsix = "1.16.0"\n'
+          NAMELESS = '[tool.poetry]\npackage-mode = false\n\n[tool.poetry.dependencies]\npython = ">=3.8"\nsix = "1.16.0"\n'
+          BOTH = '[project]\nname = "pep-name"\nversion = "0.1.0"\nrequires-python = ">=3.8"\ndependencies = ["six==1.16.0"]\n\n[tool.poetry]\nname = "legacy-name"\npackage-mode = false\n'
+          env = {k: v for k, v in os.environ.items() if not k.startswith(("POETRY_", "VIRTUAL_ENV"))}
+          env.update(POETRY_NO_INTERACTION="1", SOCKET_API_URL=API, SOCKET_API_TOKEN="fake", SOCKET_ORG_SLUG="test-org",
+                     SOCKET_NO_CONFIG="1", SOCKET_NO_UPDATE_CHECK="1", SOCKET_TELEMETRY_DISABLED="1")
+          ver = subprocess.run([POETRY, "--version"], capture_output=True, text=True).stdout.strip()
+          base = os.path.realpath(os.path.join(os.environ.get("GITHUB_WORKSPACE", tempfile.gettempdir()), "..", "bughunt-probe"))
+          os.makedirs(base, exist_ok=True)
+          rows = []
+          def run(args, d, e=env):
+              return subprocess.run(args, cwd=d, env=e, capture_output=True, text=True)
+          def six_file(d, e=env):
+              return run([POETRY, "run", "python", "-c", "import six;print(six.__file__)"], d, e).stdout.strip()
+          def patched(f):
+              return "PATCHED" if f and os.path.isfile(f) and b"SOCKET_PATCHED" in open(f, "rb").read() else "UNPATCHED(%s)" % f
+          def j(s):
+              try: return json.loads(s.stdout[s.stdout.find("{"):])
+              except Exception: return {"nojson": (s.stdout + s.stderr)[-400:]}
+
+          d = os.path.join(base, "agent-named"); os.makedirs(d)
+          open(os.path.join(d, "pyproject.toml"), "w").write(NAMED)
+          run([POETRY, "install", "--no-root"], d)
+          venv = run([POETRY, "env", "info", "-p"], d).stdout.strip()
+          out = j(run([CLI, "scan", "--mode", "agent", "--json", "--yes"], d))
+          rows.append(("agent-named-longpath", str([(p.get("action"), p.get("errorCode")) for p in out.get("apply", {}).get("patches", [])]), "scanned=%s" % out.get("scannedPackages"), venv, patched(six_file(d))))
+          rows.append(("  realpath(cwd)", os.path.realpath(d), "", "", ""))
+
+          ienv = dict(env, POETRY_VIRTUALENVS_IN_PROJECT="true")
+          for mode in ("hosted", "vendored"):
+              for eol in ("lf", "crlf"):
+                  d = os.path.join(base, "%s-%s" % (mode, eol)); os.makedirs(d)
+                  open(os.path.join(d, "pyproject.toml"), "w").write(NAMED.replace("probe-named", "probe-%s-%s" % (mode, eol)))
+                  run([POETRY, "lock"], d, ienv)
+                  lock = os.path.join(d, "poetry.lock")
+                  if eol == "crlf":
+                      b = open(lock, "rb").read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"); open(lock, "wb").write(b)
+                  orig = open(lock, "rb").read()
+                  s = run([CLI, "scan", "--mode", mode, "--json", "--yes"], d, ienv); o = j(s)
+                  summ = o.get("redirect") or o.get("status")
+                  ev = [(e.get("action"), e.get("errorCode")) for e in o.get("vendor", {}).get("events", [])]
+                  chk = run([POETRY, "check", "--lock"], d, ienv)
+                  inst = run([POETRY, "install", "--no-root"], d, ienv)
+                  f = six_file(d, ienv)
+                  rb = run([CLI, "rollback", "--json", "--yes"], d, ienv)
+                  exact = open(lock, "rb").read() == orig
+                  rows.append(("%s-%s" % (mode, eol), "scan exit=%d %s %s" % (s.returncode, str(summ)[:160], ev),
+                               "check=%d install=%d %s" % (chk.returncode, inst.returncode, (inst.stdout + inst.stderr)[-200:].replace("\n", " ")),
+                               patched(f), "rollback exit=%d exact=%s" % (rb.returncode, exact)))
+          print("== %s | %s | base=%s" % (ver, sys.platform, base))
+          for r in rows: print(" | ".join(r))
+          PROBE_EOF
+          CLI="$PWD/target/debug/socket-patch"; [ -f "$CLI.exe" ] && CLI="$CLI.exe"
+          python "$RUNNER_TEMP/probe.py" "$CLI" "$POETRY_BIN"
