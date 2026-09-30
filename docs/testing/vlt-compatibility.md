@@ -75,7 +75,10 @@ asserted and each named test or row exists.
   collation golden, and the store linkers auto / hardlink / copy / unpack / a `/dev/shm`
   cache root; a cell `ci.yml`'s `e2e` rows run identically is left to them,
   see `scripts/ci-vlt-proof-suites.py`, except on dispatch); `native` (the backtest against production, artifacts
-  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape);
+  `vlt-results-<os>-<vlt>` in depscan's capture `result.json` shape; on macOS
+  it first pins the TLS-verified patch hosts in `/etc/hosts` through
+  `.github/actions/pin-socket-hosts`, because the hosted macOS resolver
+  intermittently loses `patch.socket.dev` for minutes while the service is up);
   `lock-diff` (the same cell's `vlt-lock.json` must be byte-identical on Linux,
   macOS and Windows); `matrix-coverage` (every era × suite × OS).
 - **Nightly:** `canary` runs every capstone on `vlt@latest` on 3 OS (only the
@@ -130,6 +133,13 @@ The capstones serve npmjs bytes from a local wiremock registry `R` and write
 | rc.7 … rc.29 | `{"config":{"registry": "https://registry.npmjs.org/"}}` | no: lock-driven installs reach public npm | the dead-registry assertions log `skip:non-hermetic-registry`; the patch service stays local |
 | rc.30 … rc.32 | `{"config":{"registry": R}}` | yes | URL-segment DepIDs |
 | ≥ rc.33 | `{"config":{"registries":{"npm": R}}}` (+ `config.registry = R` for rc.33 … 1.0.4) | yes | |
+
+The 0.0.0-1 and 0.0.0-11 writers can record an explicit npmjs tarball URL
+despite the configured harness registry. v5 rollback reconstructs the upstream
+pin without a saved lock fragment, so the rollback assertions allow that target
+URL to be omitted or restored on the harness registry. They still compare every
+other byte, including bystanders and CRLF line endings, and verify pristine
+package contents after a real install from the restored lock.
 
 `scripts/backtest-vlt.py`'s `write_vlt_json` follows the same table against
 public npm (a `registry` equal to vlt's npmjs default is left out: vlt strips

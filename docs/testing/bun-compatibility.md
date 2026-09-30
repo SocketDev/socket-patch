@@ -345,6 +345,18 @@ matrix to six concurrent jobs, with three cells per job. Each cell has its own
 temporary directory so historical Bun processes cannot collide while extracting
 identically named packages.
 
+On macOS the job first runs `.github/actions/pin-socket-hosts`
+(`scripts/pin-socket-hosts.py`): the hosted macOS resolver intermittently
+answers `patch.socket.dev` with EAI_NONAME for minutes at a time, at job start
+or mid-job, while the service is up, which failed every hosted cell in the
+window (`FailedToOpenSocket`, `[Errno 8] nodename nor servname provided`, or a
+Bun 1.3.x workspace install that never exits). The action resolves the patch
+hosts once (the system resolver, then DNS-over-HTTPS by IP literal), keeps only
+addresses whose TLS handshake verifies the hostname, and pins them in
+`/etc/hosts`, so cells still reach the production service over verified TLS
+without depending on the runner's resolver. The vlt and Poetry workflows run
+the same step.
+
 **Pinned versions:** 0.8.1, 1.0.0, 1.0.36, 1.1.0, 1.1.38 (binary lock),
 1.1.39 (first text lock, version 0), 1.1.43 (first `--lockfile-only`), 1.1.45
 (last version-0 writer), 1.2.0, 1.2.23, 1.3.0 (version 1), 1.3.9 / 1.3.10
