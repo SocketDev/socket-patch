@@ -1,0 +1,171 @@
+name: bughunt-bun probe
+on:
+  push:
+    branches: ['bughunt/bun/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bun-native
+          save-if: false
+      - name: Build CLI
+        run: cargo build --locked -p socket-patch-cli
+      - name: Probe
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bh"
+          cat > "$RUNNER_TEMP/bh/driver.py" <<'PYEOF'
+          import sys, os, json, io, tarfile, gzip, hashlib, base64, urllib.request, re, threading, shutil, subprocess, tempfile, urllib.parse
+          from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+          SP = os.path.abspath(sys.argv[1]); BUN = shutil.which("bun") if len(sys.argv) < 3 else sys.argv[2]
+          ROOT = tempfile.mkdtemp(prefix="bh-")
+          MARK = b"/* SOCKET-PATCHED */\n"; TOKEN = "22222222-2222-4222-8222-222222222222"
+          def gsha(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          SPECS = []
+          def mkpatch(name, ver, uuid):
+              raw = urllib.request.urlopen(f"https://registry.npmjs.org/{name}/-/{name}-{ver}.tgz").read()
+              tin = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz"); files = {}
+              for m in tin.getmembers():
+                  if m.isfile(): files[m.name] = tin.extractfile(m).read()
+              top = next(iter(files)).split('/')[0]; target = f"{top}/index.js"
+              before = files[target]; after = MARK + before
+              buf = io.BytesIO(); tout = tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT)
+              for rel, data in files.items():
+                  d = after if rel == target else data
+                  ti = tarfile.TarInfo(rel); ti.mode = 0o644; ti.mtime = 0; ti.size = len(d); tout.addfile(ti, io.BytesIO(d))
+              tout.close(); gz = io.BytesIO()
+              with gzip.GzipFile(fileobj=gz, mode="wb", mtime=0) as g: g.write(buf.getvalue())
+              tgz = gz.getvalue()
+              SPECS.append({"uuid": uuid, "purl": f"pkg:npm/{name}@{ver}", "name": name, "version": ver, "leaf": f"{name}-{ver}.tgz", "tgz": tgz,
+                            "sri": "sha512-" + base64.b64encode(hashlib.sha512(tgz).digest()).decode(),
+                            "files": {"package/index.js": {"beforeHash": gsha(before), "afterHash": gsha(after), "blobContent": base64.b64encode(after).decode()}}})
+          PORT = [0]
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def j(self, o, code=200):
+                  b = json.dumps(o).encode(); self.send_response(code); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+              def hosted(self, s): return f"http://127.0.0.1:{PORT[0]}/patch/npm/{s['name']}/{s['version']}/{TOKEN}/{s['uuid']}/{s['leaf']}"
+              def pinfo(self, s): return {"uuid": s["uuid"], "purl": s["purl"], "tier": "free", "cveIds": ["CVE-2026-0001"], "ghsaIds": ["GHSA-bunh-unt0-0001"], "severity": "high", "title": "bughunt fixture"}
+              def do_POST(self):
+                  p = urllib.parse.urlparse(self.path).path; n = int(self.headers.get("content-length") or 0); b = json.loads(self.rfile.read(n) or b"{}")
+                  if p.endswith("/patches/batch"):
+                      want = {c.get("purl") for c in b.get("components", [])}
+                      return self.j({"packages": [{"purl": s["purl"], "patches": [self.pinfo(s)]} for s in SPECS if s["purl"] in want], "canAccessPaidPatches": False})
+                  if p.endswith("/patches/package"):
+                      return self.j({"results": {s["uuid"]: {"status": "granted", "url": self.hosted(s), "purl": s["purl"], "artifacts": [{"kind": "tarball", "url": self.hosted(s), "integrity": {"sha512": s["sri"]}}], "registryOverride": None} for s in SPECS}})
+                  self.j({}, 404)
+              def do_GET(self):
+                  p = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+                  m = re.search(r"/patches/view/([0-9a-f-]+)$", p)
+                  if m:
+                      for s in SPECS:
+                          if s["uuid"] == m.group(1):
+                              return self.j({"uuid": s["uuid"], "purl": s["purl"], "publishedAt": "2026-01-01T00:00:00Z", "files": s["files"],
+                                             "vulnerabilities": {"GHSA-bunh-unt0-0001": {"cves": ["CVE-2026-0001"], "summary": "s", "severity": "high", "description": "d"}},
+                                             "description": "x", "license": "MIT", "tier": "free"})
+                  if "/patches/by-package/" in p:
+                      pu = p.split("/patches/by-package/", 1)[1]
+                      return self.j({"patches": [dict(self.pinfo(s), publishedAt="2026-01-01T00:00:00Z", description="x", license="MIT", vulnerabilities={}) for s in SPECS if s["purl"] == pu], "canAccessPaidPatches": False})
+                  m = re.match(r"/patch/npm/.+/([0-9a-f-]+)/[^/]+$", p)
+                  if m:
+                      for s in SPECS:
+                          if s["uuid"] == m.group(1):
+                              self.send_response(200); self.send_header("content-length", str(len(s["tgz"]))); self.end_headers(); self.wfile.write(s["tgz"]); return
+                  self.j({}, 404)
+          def run(cmd, cwd, env=None):
+              e = dict(os.environ); e.update(env or {}); e["SOCKET_TELEMETRY_DISABLED"] = "1"
+              r = subprocess.run(cmd, cwd=cwd, env=e, capture_output=True, text=True, encoding="utf-8", errors="replace")
+              return r.returncode, r.stdout, r.stderr
+          def sp(args, cwd):
+              return run([SP] + args + ["--api-url", f"http://127.0.0.1:{PORT[0]}", "--org", "test-org", "--api-token", "fake"], cwd)
+          def bun(args, cwd): return run([BUN] + args, cwd, {"BUN_INSTALL_CACHE_DIR": os.path.join(cwd, ".bun-cache")})
+          def marker(path):
+              try: return open(path, "rb").read().startswith(MARK)
+              except Exception as ex: return f"missing:{ex.__class__.__name__}"
+          def env_of(out):
+              try: return json.loads(out)
+              except Exception: return {"_raw": out[:500]}
+          RESULTS = []
+          def case_isolated(tag, files):
+              d = os.path.join(ROOT, tag); os.makedirs(d)
+              for rel, content in files.items():
+                  os.makedirs(os.path.dirname(os.path.join(d, rel)) or d, exist_ok=True); open(os.path.join(d, rel), "w").write(content)
+              rc, o, e = bun(["install"], d)
+              store = os.path.join(d, "node_modules", ".bun")
+              layout = sorted(os.listdir(store)) if os.path.isdir(store) else "no .bun store (hoisted)"
+              rc2, o2, e2 = sp(["scan", "--mode", "agent", "--json", "--yes"], d); env = env_of(o2)
+              acts = [(p.get("purl"), p.get("action"), p.get("errorCode")) for p in env.get("apply", {}).get("patches", [])]
+              mm = os.path.join(d, "node_modules", ".bun", "minimist@1.2.8", "node_modules", "minimist", "index.js")
+              if not os.path.exists(mm): mm = os.path.join(d, "node_modules", "minimist", "index.js")
+              RESULTS.append({"case": tag, "scan_stderr": e2[-400:], "bun_install_rc": rc, "layout": layout, "scan_rc": rc2, "status": env.get("status"),
+                              "lockfileOnly": env.get("lockfileOnlyPackages"), "apply": acts, "minimist_patched_on_disk": marker(mm)})
+          def case_bunpatch(mode):
+              d = os.path.join(ROOT, "bunpatch-" + mode); os.makedirs(d)
+              open(os.path.join(d, "package.json"), "w").write('{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}\n')
+              bun(["install"], d); bun(["patch", "left-pad"], d)
+              open(os.path.join(d, "node_modules", "left-pad", "index.js"), "a").write("// USER-BUN-PATCH\n")
+              rcp, op, ep = bun(["patch", "--commit", "node_modules/left-pad"], d)
+              has_patch = os.path.isdir(os.path.join(d, "patches"))
+              rc2, o2, e2 = sp(["scan", "--mode", mode, "--json", "--yes"], d); env = env_of(o2)
+              warns = env.get("redirect", {}).get("warnings") if mode == "hosted" else [x.get("errorCode") for x in env.get("vendor", {}).get("events", []) if x.get("errorCode")]
+              f = os.path.join(ROOT, "bunpatch-" + mode + "-fresh"); os.makedirs(f)
+              for n in ["package.json", "bun.lock", "bun.lockb", "patches", ".socket"]:
+                  src = os.path.join(d, n)
+                  if os.path.isdir(src): shutil.copytree(src, os.path.join(f, n))
+                  elif os.path.exists(src): shutil.copy2(src, os.path.join(f, n))
+              rc3, o3, e3 = bun(["install", "--frozen-lockfile"], f)
+              idx = os.path.join(f, "node_modules", "left-pad", "index.js")
+              try: body = open(idx, "rb").read()
+              except Exception: body = b""
+              RESULTS.append({"case": "bunpatch-" + mode, "bun_patch_committed": has_patch and rcp == 0, "scan_rc": rc2, "status": env.get("status"), "warnings": warns,
+                              "fresh_frozen_rc": rc3, "socket_patch_present": body.startswith(MARK), "user_bun_patch_present": b"USER-BUN-PATCH" in body,
+                              "frozen_stderr_tail": e3[-300:] if rc3 else ""})
+          if __name__ == "__main__":
+              mkpatch("left-pad", "1.3.0", "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"); mkpatch("minimist", "1.2.8", "11111111-2222-4333-8444-555555555555")
+              srv = ThreadingHTTPServer(("127.0.0.1", 0), H); PORT[0] = srv.server_address[1]; threading.Thread(target=srv.serve_forever, daemon=True).start()
+              print("bun", run([BUN, "--version"], ROOT)[1].strip(), "platform", sys.platform)
+              case_isolated("isolated-bunfig", {"package.json": '{"name":"app","version":"1.0.0","dependencies":{"mkdirp":"0.5.6","left-pad":"1.3.0"}}\n', "bunfig.toml": '[install]\nlinker = "isolated"\n'})
+              case_isolated("workspace-default-linker", {"package.json": '{"name":"root","private":true,"workspaces":["packages/*"]}\n', "packages/a/package.json": '{"name":"a","version":"1.0.0","dependencies":{"mkdirp":"0.5.6"}}\n'})
+              case_isolated("hoisted-control", {"package.json": '{"name":"app","version":"1.0.0","dependencies":{"mkdirp":"0.5.6","left-pad":"1.3.0"}}\n', "bunfig.toml": '[install]\nlinker = "hoisted"\n'})
+              for m in ("hosted", "vendored"): case_bunpatch(m)
+              print("RESULTS-JSON " + json.dumps(RESULTS))
+              for r in RESULTS: print(json.dumps(r))
+          PYEOF
+          cat > "$RUNNER_TEMP/bh/fetchbun.py" <<'PYEOF'
+          import sys, os, urllib.request, zipfile, io, platform
+          v, dest = sys.argv[1], sys.argv[2]
+          osn = {"linux": "linux", "darwin": "darwin", "win32": "windows"}[sys.platform]
+          arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+          name = f"bun-{osn}-{arch}"
+          for i in range(4):
+              try:
+                  data = urllib.request.urlopen(f"https://github.com/oven-sh/bun/releases/download/bun-v{v}/{name}.zip").read(); break
+              except Exception as e:
+                  print("retry", e)
+          zipfile.ZipFile(io.BytesIO(data)).extractall(dest)
+          exe = os.path.join(dest, name, "bun.exe" if osn == "windows" else "bun")
+          os.chmod(exe, 0o755); print(exe)
+          PYEOF
+          SP="$PWD/target/debug/socket-patch"; PY=python3; if [ "$RUNNER_OS" = "Windows" ]; then SP="$SP.exe"; PY=python; fi
+          for v in 1.2.23 1.3.14 1.4.2; do
+            echo "::group::bun $v"
+            BUNEXE=$("$PY" "$RUNNER_TEMP/bh/fetchbun.py" "$v" "$RUNNER_TEMP/bun-$v" | tail -1)
+            "$PY" "$RUNNER_TEMP/bh/driver.py" "$SP" "$BUNEXE" 2>&1 | tee "$RUNNER_TEMP/bh/out-$v.txt" || true
+            echo "::endgroup::"
+          done
+          echo "===== SUMMARY ====="
+          for v in 1.2.23 1.3.14 1.4.2; do echo "--- bun $v (${{ matrix.os }})"; grep '^{' "$RUNNER_TEMP/bh/out-$v.txt" | sed 's/"scan_stderr": "[^"]*", //' || true; done
