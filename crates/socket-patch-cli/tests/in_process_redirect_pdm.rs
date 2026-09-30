@@ -585,9 +585,9 @@ fn urllib3_unit(lock: &str) -> usize {
 
 /// What `pdm add six==1.16.0` leaves: a new content hash, a `six` unit ahead
 /// of `urllib3`, and the redirected `urllib3` unit re-laid by PDM — its
-/// `files` back in PDM's one-entry-per-line layout, the Socket `url` kept
-/// (2.26+) or dropped (2.12–2.20), and the patched sha256 kept either way.
-/// PDM always writes LF.
+/// `files` back in PDM's one-entry-per-line layout, the Socket `url` moved
+/// after `version` (2.26+) or dropped (2.12–2.20), and the patched sha256
+/// kept either way. PDM always writes LF. (Measured with real PDM 2.29.2.)
 fn pdm_add_rerender(redirected: &str, keep_url: bool) -> String {
     const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nrequires_python = \">=2.7, !=3.0.*, !=3.1.*, !=3.2.*\"\nsummary = \"Python 2 and 3 compatibility utilities\"\ngroups = [\"default\"]\nfiles = [\n    {file = \"six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\"},\n    {file = \"six-1.16.0.tar.gz\", hash = \"sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926\"},\n]\n\n";
     const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
@@ -606,11 +606,15 @@ fn pdm_add_rerender(redirected: &str, keep_url: bool) -> String {
         sha256()
     );
     assert!(unit.contains(&socket_files), "{unit}");
-    let mut unit = unit.replace(&socket_files, &pdm_files);
-    if !keep_url {
-        let url_line = format!("url = \"{HOSTED_URL}\"\n");
-        assert!(unit.contains(&url_line), "{unit}");
-        unit = unit.replace(&url_line, "");
+    let url_line = format!("url = \"{HOSTED_URL}\"\n");
+    assert!(unit.contains(&url_line), "{unit}");
+    let mut unit = unit
+        .replace(&socket_files, &pdm_files)
+        .replace(&url_line, "");
+    if keep_url {
+        // PDM's own key order puts the url right after the version.
+        let version = "version = \"1.26.18\"\n";
+        unit = unit.replacen(version, &format!("{version}{url_line}"), 1);
     }
     format!("{head}{SIX}{unit}")
 }
