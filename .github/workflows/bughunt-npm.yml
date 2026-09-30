@@ -1,0 +1,54 @@
+name: bughunt-npm
+on:
+  push:
+    branches: ['bughunt/npm/**']
+permissions:
+  contents: read
+jobs:
+  npm-e2e:
+    name: ${{ matrix.os }} npm ${{ matrix.npm }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-latest, npm: '6.14.18', node: '16.20.2'}
+          - {os: windows-latest, npm: '8.19.4', node: '16.20.2'}
+          - {os: windows-latest, npm: '10.9.9', node: '22.22.2'}
+          - {os: macos-latest, npm: '6.14.18', node: '16.20.2'}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.11.1'
+      - name: Install npm under test
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/npm-tool" --no-audit --no-fund "npm@${{ matrix.npm }}"
+          ls "$RUNNER_TEMP/npm-tool/node_modules/.bin" || true
+          ls "$RUNNER_TEMP/npm-tool/node_modules/npm/bin" || true
+          BIN=""
+          for c in node_modules/.bin/npm.cmd node_modules/npm/bin/npm.cmd node_modules/.bin/npm; do
+            if [ -f "$RUNNER_TEMP/npm-tool/$c" ]; then BIN="$RUNNER_TEMP/npm-tool/$c"; break; fi
+          done
+          [ "$RUNNER_OS" = "Windows" ] || BIN="$RUNNER_TEMP/npm-tool/node_modules/.bin/npm"
+          echo "BIN=$BIN"
+          echo "SOCKET_PATCH_NPM_E2E_BIN=$BIN" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Real-npm hosted + vendored e2e
+        shell: bash
+        env:
+          SOCKET_PATCH_NPM_E2E_VERSION: ${{ matrix.npm }}
+          SOCKET_PATCH_NPM_E2E_REQUIRED: '1'
+        run: |
+          "$SOCKET_PATCH_NPM_E2E_BIN" --version
+          npm --version
+          cargo test -p socket-patch-cli --test e2e_redirect_npm_build --test e2e_vendor_npm_build -- --include-ignored --test-threads 2 2>&1 | tee e2e.log
+          exit "${PIPESTATUS[0]}"
+      - name: Print failures
+        if: failure()
+        shell: bash
+        run: grep -n -E "panicked|FAILED|failures:|assert|left:|right:|Error" e2e.log | head -200 || true
