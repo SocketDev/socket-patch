@@ -1076,7 +1076,7 @@ fn node_loads(proj: &Path, from: &str, dep: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// #359: with `install-strategy=linked` (npm 9+), a transitive package
+/// #359: with `install-strategy=linked` (npm 9.4+), a transitive package
 /// is a real dir ONLY in `node_modules/.store`. `apply` must patch the
 /// copy Node loads, `rollback` must restore it, and `vendor` must build
 /// its tarball from it; before the fix all three reported
@@ -1087,8 +1087,13 @@ fn npm_linked_strategy_transitive_package_is_patched_rolled_back_and_vendored() 
     let Some(major) = npm_major_or_skip(suite) else {
         return;
     };
-    if major < 9 {
-        println!("SKIP {suite}: npm {major} has no install-strategy=linked");
+    // `install-strategy=linked` arrived in npm 9.4.0 (measured: 9.0-9.3
+    // ignore it and install the hoisted tree).
+    let minor: u32 = npm_e2e_common::npm_version()
+        .and_then(|v| v.split('.').nth(1)?.parse().ok())
+        .unwrap_or(0);
+    if major < 9 || (major == 9 && minor < 4) {
+        println!("SKIP {suite}: npm {major}.{minor} has no install-strategy=linked");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
