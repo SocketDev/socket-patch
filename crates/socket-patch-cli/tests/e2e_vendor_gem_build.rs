@@ -58,6 +58,9 @@
 //! required) or when the fixture install cannot reach rubygems.org; every
 //! assertion after that is hard.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -105,13 +108,14 @@ fn argv(args: &[String]) -> Vec<&str> {
 /// flip behavior) along with `VIRTUAL_ENV` (crawler discovery input).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -1147,29 +1151,37 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
     let purl = format!("pkg:gem/{DEP}@{version}");
 
     let server = MockServer::start().await;
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "lib/rack.rb": {
+                "beforeHash": git_sha256(&orig),
+                "afterHash": git_sha256(&patched),
+                "blobContent": b64(&patched),
+            }
+        },
+        "vulnerabilities": { GHSA: {
+            "cves": ["CVE-2026-55555"],
+            "summary": "gem capstone vex vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view_from_source(
+        &server,
+        &view,
+        None,
+        installed_rb.parent().and_then(Path::parent),
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "lib/rack.rb": {
-                    "beforeHash": git_sha256(&orig),
-                    "afterHash": git_sha256(&patched),
-                    "blobContent": b64(&patched),
-                }
-            },
-            "vulnerabilities": { GHSA: {
-                "cves": ["CVE-2026-55555"],
-                "summary": "gem capstone vex vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(&server)
         .await;
     let api_url = server.uri();
@@ -1178,9 +1190,8 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
     let gemfile_before = std::fs::read(&gemfile_path).unwrap();
 
     // 3. get <uuid> --mode vendored: record save + scan's whole-manifest
-    //    vendor step in one command. `--vendor-source build` keeps the
-    //    artifact build local (no vendoring-service mocks needed); the
-    //    staging fetches the blob content into MEMORY from the view mock.
+    //    vendor step in one command. The fixture service publishes the full
+    //    installed gem with its patched member, including unmodified files.
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[
@@ -1191,7 +1202,7 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
             "--json",
             "--yes",
             "--vendor-source",
-            "build",
+            "service",
             "--cwd",
             proj.to_str().unwrap(),
             "--api-url",

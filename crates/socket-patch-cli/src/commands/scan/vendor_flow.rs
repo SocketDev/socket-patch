@@ -33,9 +33,7 @@ use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
 use crate::commands::get::{download_patch_records_reusing, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{note_classic_migration_risk, track_outcomes_for_vendor};
-use crate::commands::vendored_backend::{
-    records_manifest, ApplyRequest, NoLocalSource, VendoredBackend, NO_LOCAL_SOURCE_MESSAGE,
-};
+use crate::commands::vendored_backend::{records_manifest, ApplyRequest, VendoredBackend};
 use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_selected};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
@@ -176,7 +174,6 @@ pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
 pub(crate) struct VendorStep<'a> {
     pub(crate) common: &'a GlobalArgs,
     pub(crate) records: HashMap<String, PatchRecord>,
-    pub(crate) seed: HashMap<String, Vec<u8>>,
     pub(crate) client: ApiClient,
     pub(crate) use_public_proxy: bool,
     /// Print "No vendorable patches in scope." when there are no records
@@ -215,7 +212,6 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
     let VendorStep {
         common,
         records,
-        seed,
         client,
         use_public_proxy,
         report_empty,
@@ -227,7 +223,6 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
     let outcome = vendor_under_lock(
         common,
         records,
-        seed,
         client,
         use_public_proxy,
         report_empty,
@@ -249,8 +244,7 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
             .await
         }
         Err((_, message, _)) => {
-            track_patch_vendor_failed(message, common.dry_run, telemetry_token, telemetry_org)
-                .await
+            track_patch_vendor_failed(message, common.dry_run, telemetry_token, telemetry_org).await
         }
     }
     outcome.map(|(vendor_errors, venv)| (download_errors || vendor_errors, venv))
@@ -260,7 +254,6 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
 async fn vendor_under_lock(
     common: &GlobalArgs,
     records: HashMap<String, PatchRecord>,
-    seed: HashMap<String, Vec<u8>>,
     client: ApiClient,
     use_public_proxy: bool,
     report_empty: bool,
@@ -301,7 +294,6 @@ async fn vendor_under_lock(
                 // Loaded ONCE under the lock: the staging harvest reads it,
                 // then the engine takes it over for its persists.
                 ledger: load_state(&common.cwd).await,
-                seed,
                 // Always detached: vendored mode is manifest-free.
                 detached: true,
                 force: false,
@@ -310,19 +302,7 @@ async fn vendor_under_lock(
             &mut env,
         )
         .await;
-    let has_errors = match applied {
-        Ok(has_errors) => has_errors,
-        Err(NoLocalSource) => {
-            // The step ran and is aborting: hand its envelope (demoted) to
-            // the caller's fold.
-            env.mark_partial_failure();
-            return Err((
-                "no_local_source",
-                NO_LOCAL_SOURCE_MESSAGE.to_string(),
-                Some(Box::new(env)),
-            ));
-        }
-    };
+    let has_errors = applied;
     migrate_legacy_manifest_records(common, &manifest_path, &manifest.patches, &mut env).await;
     if has_errors {
         env.mark_partial_failure();
@@ -572,7 +552,7 @@ async fn run_vendor_json_path(
     let params = download_params(
         args, /*save_only=*/ true, /*json=*/ true, /*silent=*/ true,
     );
-    let (dl_code, dl_json, records, blobs) =
+    let (dl_code, dl_json, records) =
         boxed_download_patch_records(&selected, &params, api_client, HashMap::new(), prior).await;
     result["download"] = dl_json;
 
@@ -581,7 +561,6 @@ async fn run_vendor_json_path(
     let vendor_code = match boxed_vendor_step(VendorStep {
         common: &args.common,
         records,
-        seed: blobs,
         client: api_client.clone(),
         use_public_proxy,
         report_empty: true,
@@ -674,7 +653,7 @@ async fn run_vendor_interactive_path(
             plural(selected.len(), "patch", "patches")
         );
     }
-    let (dl_code, dl_json, records, blobs) =
+    let (dl_code, dl_json, records) =
         boxed_download_patch_records(selected, params, api_client, prefetched, prior).await;
     // Patches the download phase could not get (it reported each one).
     let download_failed = dl_json["failed"].as_u64().unwrap_or(0);
@@ -684,7 +663,6 @@ async fn run_vendor_interactive_path(
     let code = match boxed_vendor_step(VendorStep {
         common: &args.common,
         records,
-        seed: blobs,
         client: api_client.clone(),
         use_public_proxy,
         report_empty: false,
@@ -976,6 +954,7 @@ mod migration_tests {
             base_purl: PURL.into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"),
                 sha256: String::new(),
                 size: None,

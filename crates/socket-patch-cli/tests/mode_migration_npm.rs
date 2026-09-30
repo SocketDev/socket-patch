@@ -22,6 +22,9 @@
 //! the registry is unreachable for the fixture install; all assertions after
 //! that are hard.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -118,11 +121,12 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// [`run_socket`] with extra env applied after the scrub.
 fn run_socket_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     scrub_socket_env(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, env);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -292,6 +296,14 @@ async fn mount_hosted_mocks(
     patched: &[u8],
     berry_checksum: Option<&str>,
 ) -> String {
+    prebuilt_common::mount_download(
+        server,
+        PURL,
+        UUID_V,
+        &format!("{DEP}-{DEP_VERSION}.tgz"),
+        tgz,
+    )
+    .await;
     let hosted_url = format!(
         "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID_H}/{DEP}-{DEP_VERSION}.tgz",
         server.uri()
@@ -331,6 +343,40 @@ async fn mount_hosted_mocks(
         "integrity": { "sha512": sha512_sri(tgz), "sha1": sha1_hex(tgz) }
     })];
     if let Some(checksum) = berry_checksum {
+        let client = reqwest::Client::new();
+        let metadata: serde_json::Value = client
+            .get(format!("https://registry.npmjs.org/{DEP}/{DEP_VERSION}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let upstream = client
+            .get(metadata["dist"]["tarball"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let upstream_checksum =
+            socket_patch_core::vendor::test_support::service_fixture::berry_checksum(
+                &upstream, DEP,
+            )
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/upstream/npm/{UUID_H}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": DEP, "version": DEP_VERSION,
+                "integrity": sha512_sri(&upstream), "yarnBerry10c0": upstream_checksum
+            })))
+            .mount(server)
+            .await;
         artifacts.push(serde_json::json!({
             "kind": "yarn-berry-zip", "url": hosted_url,
             "integrity": { "yarnBerry10c0": checksum }

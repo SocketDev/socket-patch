@@ -14,5 +14,7 @@ mod e2e_golang_redirect;
 mod in_process_vendor_bun;
 mod redirect_npm_allow_remote;
 mod vendor_gem_lockfile_only_e2e;
-mod vendor_pristine_fetch_order_e2e;
 mod vendor_rerun_no_network_e2e;
+
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;

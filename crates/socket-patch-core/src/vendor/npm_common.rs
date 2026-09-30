@@ -28,7 +28,7 @@ use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 use super::common::{
     already_patched_result, done, failed_result, refused, service_offline_conflict,
 };
-use super::npm_pack::{pack_deterministic, PackedTarball};
+use super::npm_pack::PackedTarball;
 use super::path::vendor_uuid_dir_rel;
 use super::reuse;
 use super::service_fetch::{
@@ -174,221 +174,46 @@ pub(super) struct NpmStagedPack {
     pub verified_bytes: Option<Vec<u8>>,
 }
 
-/// Stage → patch → pack one installed npm package.
-///
-/// Runs [`guard_coordinates`] first (pure and cheap — callers that already
-/// guarded simply re-validate), stages a fresh copy of `installed_dir` in a
-/// tempdir outside the project, prunes nested `node_modules`, refuses
-/// bundled-deps packages, applies the patch via the hardened apply pipeline,
-/// and packs the deterministic tarball into the uuid dir.
-///
-/// Result shape (mirrors how `npm_lock::vendor_npm` splits its phases):
-///
-/// * `Err(outcome)` — a refusal (`Refused`) or a hard pipeline failure
-///   (`Done` with a failed synthesized [`ApplyResult`]); bubble verbatim.
-///   Nothing inside the project was written.
-/// * `Ok((None, result))` — the patch step finished without packing: either
-///   `!result.success` (verify/patch failure; the caller wraps it with its
-///   accumulated warnings) or a successful dry run (stops after
-///   verification — no pack, no dirs created).
-/// * `Ok((Some(staged), result))` — full success: the tarball is on disk at
-///   `staged.rel_tgz` and the caller proceeds to its lockfile wiring.
+/// Reuse a verified committed tarball or download its immutable service artifact.
+/// A dry run verifies the download without writing into the project. The
+/// backend wires the returned artifact only after acquisition succeeds.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_pack(
     purl: &str,
-    installed_dir: PackageSource<'_>,
+    _installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     warnings: &mut Vec<VendorWarning>,
     service: Option<&VendorServiceConfig>,
 ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
     let coords = guard_coordinates(purl, record)?;
 
-    // ── Reuse the committed artifact (before any acquisition) ───────────
-    // A re-run whose tarball the ledger vouches for — sha256 anchored,
-    // every afterHash verified from the same bytes — keeps those bytes:
-    // no service call, no local pack, no write. Acquiring anew would make
-    // the lock's digests depend on which source answered THIS run (the
-    // service's prebuilt encoding and the local deterministic pack carry the
-    // same members but different bytes), so a service outage or its
-    // recovery would re-vendor every package. `--vendor-source` governs
-    // acquisition, not reuse; checked before `service_offline_conflict` so
-    // an in-sync `service` + `--offline` re-run succeeds. The probe is
-    // read-only and offline, so a dry run runs it too: on a hit it skips the
-    // offline refusal (the real run would not raise it) and keeps previewing
-    // the local build.
-    let mut reusable = false;
     if let Some(pair) = reuse_committed_pack(purl, project_root, &coords, record).await {
-        if !dry_run {
-            return Ok(pair);
-        }
-        reusable = true;
+        return Ok(if dry_run { (None, pair.1) } else { pair });
     }
 
-    // ── Service-download fast path (Tier A: write the prebuilt tarball) ──
-    // When the vendoring service is configured, try to download the already-
-    // built, integrity-verified tarball instead of staging+patching+packing
-    // locally. A dry run previews the local build (no network). Per the
-    // `auto`/`service` policy a non-fatal miss falls back to the local build
-    // below; under `service` it fails closed.
-    if let Some(refusal) = service_offline_conflict(service).filter(|_| !reusable) {
+    // Acquisition is service-only; verified committed artifacts returned above.
+    if let Some(refusal) = service_offline_conflict(service) {
         return Err(Box::new(refusal));
     }
     if let Some(cfg) = service {
-        if cfg.service_enabled() && !dry_run {
-            match try_service_pack(purl, project_root, &coords, record, cfg, warnings).await {
+        if cfg.service_enabled() {
+            match try_service_pack(purl, project_root, &coords, record, cfg, dry_run, warnings)
+                .await
+            {
                 ServicePackDecision::Used(pair) => return Ok(*pair),
                 ServicePackDecision::HardFail(outcome) => return Err(outcome),
-                ServicePackDecision::FallBack => { /* fall through to local build */ }
             }
         }
     }
 
-    // ── Stage + patch a private copy ────────────────────────────────────
-    // The stage lives in a tempdir OUTSIDE the project: nothing inside the
-    // project is written until the patched tarball verifies.
-    let stage_tmp = match tempfile::tempdir() {
-        Ok(t) => t,
-        Err(e) => {
-            return Err(Box::new(done_failure(
-                purl,
-                format!("cannot create staging tempdir: {e}"),
-            )))
-        }
-    };
-    let stage = stage_tmp.path().join("stage");
-    // The first branch that reads the source. An installed package is
-    // copied out of node_modules; a fetched one is written straight here
-    // from the verified tarball, instead of into a tempdir and copied out
-    // of it again.
-    if let Err(e) = installed_dir.stage_into(&stage, None).await {
-        return Err(Box::new(done_failure(
-            purl,
-            format!("cannot stage a copy of the installed package: {e}"),
-        )));
-    }
-    // The tarball must carry ONLY the package's own files: a nested
-    // node_modules (hoisting leftovers, file:-dep installs) would balloon
-    // the artifact and shadow the lock's own resolution.
-    if let Err(e) = remove_tree(&stage.join("node_modules")).await {
-        return Err(Box::new(done_failure(
-            purl,
-            format!("cannot prune staged node_modules: {e}"),
-        )));
-    }
-    // Bundled dependencies ship INSIDE the package tarball; since we just
-    // dropped nested node_modules, repacking would produce a tarball npm
-    // cannot satisfy those deps from. Refuse before patching.
-    if let Ok(bytes) = tokio::fs::read(stage.join("package.json")).await {
-        // npm and Node tolerate a leading UTF-8 BOM in package.json (and the
-        // crawler strips one, so a BOM'd install IS vendored), but serde_json
-        // rejects it — and a parse failure here fails OPEN, skipping the
-        // bundled-deps refusal below.
-        let text = String::from_utf8_lossy(&bytes);
-        if let Ok(pkg) =
-            serde_json::from_str::<Value>(crate::utils::serde::strip_bom(&text))
-        {
-            if declares_bundled_deps(&pkg) {
-                return Err(Box::new(refused(
-                    "vendor_bundled_deps_unsupported",
-                    format!(
-                        "{}@{} declares bundleDependencies; vendoring would repack \
-                         the tarball without its bundled node_modules and break installs",
-                        coords.name, coords.version
-                    ),
-                )));
-            }
-        }
-    }
-
-    // Delegate to the hardened apply pipeline (with the vendor auto-force
-    // policy — see `force_apply_staged`), pointed at the stage (which
-    // plays the role of the installed package dir — manifest npm keys carry
-    // the `package/` prefix and `apply` strips it via `normalize_file_path`,
-    // exactly as it does for an in-place npm apply).
-    let result = super::force_apply_staged(
-        purl,
-        &stage,
-        record,
-        sources,
-        dry_run,
-        force,
-        &coords.name,
-        &coords.version,
-        warnings,
-    )
-    .await;
-    // A failed patch never packs (wiring is last — the caller returns with
-    // the project byte-untouched); a dry run stops after the verify.
-    if !result.success || dry_run {
-        return Ok((None, result));
-    }
-
-    // ── Pack the deterministic tarball ──────────────────────────────────
-    // An Err past this point must unwind the uuid dir the pack is about to
-    // create inside the project (the `Err` contract above: "Nothing inside
-    // the project was written") — but never one that already existed (a
-    // same-uuid re-vendor's dir may still be referenced by live wiring).
-    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&coords.uuid_dir_rel))
-        .await
-        .is_ok();
-    let (rel_tgz, dest) = prepare_tgz_dest(purl, project_root, &coords).await?;
-    let packed = match pack_deterministic(&stage, &dest).await {
-        Ok(p) => p,
-        Err(e) => {
-            return Err(Box::new(
-                done_failure_unstage(
-                    purl,
-                    format!("cannot pack the vendored tarball: {e}"),
-                    project_root,
-                    &coords.uuid_dir_rel,
-                    uuid_dir_preexisted,
-                )
-                .await,
-            ))
-        }
-    };
-
-    // ── Patched package.json ⇒ the lock's dependency mirror is stale ────
-    let staged_pkg_json = if record
-        .files
-        .keys()
-        .any(|k| normalize_file_path(k) == "package.json")
-    {
-        match read_staged_package_json(&stage).await {
-            Ok(pkg) => Some(pkg),
-            Err(e) => {
-                return Err(Box::new(
-                    done_failure_unstage(
-                        purl,
-                        e,
-                        project_root,
-                        &coords.uuid_dir_rel,
-                        uuid_dir_preexisted,
-                    )
-                    .await,
-                ))
-            }
-        }
-    } else {
-        None
-    };
-
-    Ok((
-        Some(NpmStagedPack {
-            name: coords.name,
-            version: coords.version,
-            rel_tgz,
-            packed,
-            staged_pkg_json,
-            uuid_dir_preexisted,
-            verified_bytes: None,
-        }),
-        result,
-    ))
+    Err(Box::new(refused(
+        "vendor_prebuilt_required",
+        "vendoring requires a prebuilt artifact from the patch service".to_string(),
+    )))
 }
 
 /// The staged pack for a verified committed tarball (see
@@ -443,7 +268,11 @@ async fn reuse_committed_pack(
             name: coords.name.clone(),
             version: coords.version.clone(),
             rel_tgz,
-            packed: PackedTarball::from_bytes(&art.bytes),
+            packed: {
+                let mut packed = PackedTarball::from_bytes(&art.bytes);
+                packed.yarn_berry10c0 = art.entry.artifact.yarn_berry10c0.clone();
+                packed
+            },
             staged_pkg_json,
             uuid_dir_preexisted: true,
             verified_bytes: Some(art.bytes),
@@ -466,6 +295,7 @@ async fn try_service_pack(
     coords: &NpmCoords,
     record: &PatchRecord,
     cfg: &VendorServiceConfig,
+    dry_run: bool,
     warnings: &mut Vec<VendorWarning>,
 ) -> ServicePackDecision {
     let policy = ServicePolicy::new(cfg, ServiceTerminal::Failure(purl));
@@ -496,6 +326,16 @@ async fn try_service_pack(
             ),
         );
     }
+    if dry_run {
+        return ServicePackDecision::Used(Box::new((
+            None,
+            super::common::preview_result(
+                purl,
+                &project_root.join(&coords.uuid_dir_rel),
+                &record.files,
+            ),
+        )));
+    }
     match staged_pack_from_service_bytes(
         purl,
         project_root,
@@ -506,7 +346,8 @@ async fn try_service_pack(
     )
     .await
     {
-        Ok(staged) => {
+        Ok(mut staged) => {
+            staged.packed.yarn_berry10c0 = archive.yarn_berry10c0;
             warnings.push(VendorWarning::new(
                 "vendor_prebuilt_downloaded",
                 format!(
@@ -525,14 +366,6 @@ async fn try_service_pack(
     }
 }
 
-/// Build an [`NpmStagedPack`] from service-downloaded, sha512-verified tarball
-/// bytes: write the tarball to the vendor path and (when the patch rewrote
-/// `package.json`) extract it for the lockfile's dependency-mirror recompute.
-///
-/// Re-derives the [`PackedTarball`] facts from the bytes so the lockfile
-/// `integrity` is byte-identical to a local build, and asserts they match the
-/// integrity the service vouched for (the caller already verified the bytes
-/// against it — this guards the value actually written to the lock).
 async fn staged_pack_from_service_bytes(
     purl: &str,
     project_root: &Path,
@@ -743,14 +576,6 @@ pub(super) fn declares_bundled_deps(pkg: &Value) -> bool {
             Some(Value::Object(o)) => !o.is_empty(),
             _ => false,
         })
-}
-
-async fn read_staged_package_json(stage: &Path) -> Result<Value, String> {
-    let bytes = tokio::fs::read(stage.join("package.json"))
-        .await
-        .map_err(|e| format!("patched package.json unreadable in the stage: {e}"))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| format!("patched package.json is not parseable JSON: {e}"))
 }
 
 /// A backend failure after the refusal phase: `Done` with a failed
@@ -981,109 +806,6 @@ mod tests {
         assert!(!declares_bundled_deps(&serde_json::json!({})), "absent");
     }
 
-    /// An Err AFTER `prepare_tgz_dest` must unwind the uuid dir the pack
-    /// created inside the project — the module contract ("a refusal or
-    /// failure in this pipeline leaves the project byte-untouched", and the
-    /// `Err` arm's "Nothing inside the project was written") — instead of
-    /// stranding an unledgered, committable husk no `--revert` entry tracks.
-    /// Reachable shape: the
-    /// patch rewrites package/package.json to content that is not valid
-    /// JSON (apply is afterHash-gated only, never a JSON parse), so
-    /// `read_staged_package_json` errs after the tarball fully packed.
-    #[tokio::test]
-    async fn err_after_pack_unstages_the_uuid_dir() {
-        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-        use crate::patch::apply::PatchSources;
-
-        const ORIG_PKG: &[u8] = b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}\n";
-        const BAD_PKG: &[u8] = b"module.exports = 'not json';\n";
-
-        async fn build_fixture() -> (tempfile::TempDir, PatchRecord) {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path();
-            let installed = root.join("node_modules/left-pad");
-            tokio::fs::create_dir_all(&installed).await.unwrap();
-            tokio::fs::write(installed.join("package.json"), ORIG_PKG)
-                .await
-                .unwrap();
-            let blobs = root.join(".socket/blobs");
-            tokio::fs::create_dir_all(&blobs).await.unwrap();
-            let after_hash = compute_git_sha256_from_bytes(BAD_PKG);
-            tokio::fs::write(blobs.join(&after_hash), BAD_PKG)
-                .await
-                .unwrap();
-            let mut record = record_with_uuid(UUID);
-            record.files.clear();
-            record.files.insert(
-                "package/package.json".to_string(),
-                PatchFileInfo {
-                    before_hash: compute_git_sha256_from_bytes(ORIG_PKG),
-                    after_hash,
-                },
-            );
-            (tmp, record)
-        }
-
-        async fn run(root: &Path, record: &PatchRecord) -> Box<VendorOutcome> {
-            let blobs = root.join(".socket/blobs");
-            let sources = PatchSources::blobs_only(&blobs);
-            let mut warnings = Vec::new();
-            match stage_patch_pack(
-                "pkg:npm/left-pad@1.3.0",
-                (&root.join("node_modules/left-pad")).into(),
-                root,
-                record,
-                &sources,
-                false,
-                false,
-                &mut warnings,
-                None,
-            )
-            .await
-            {
-                Err(outcome) => outcome,
-                Ok(_) => panic!("expected the post-pack package.json parse to Err"),
-            }
-        }
-
-        // Fresh vendor: the post-pack failure must leave no husk at all.
-        let (tmp, record) = build_fixture().await;
-        match *run(tmp.path(), &record).await {
-            VendorOutcome::Done { result, entry, .. } => {
-                assert!(!result.success);
-                assert!(
-                    result
-                        .error
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("not parseable JSON"),
-                    "fails on the post-pack package.json parse: {:?}",
-                    result.error
-                );
-                assert!(entry.is_none());
-            }
-            other => panic!("expected Done failure, got {other:?}"),
-        }
-        assert!(
-            !tmp.path().join(".socket/vendor").exists(),
-            "no orphaned uuid-dir husk may remain after a post-pack failure"
-        );
-
-        // Same-uuid re-vendor: a PRE-EXISTING uuid dir is never unstaged
-        // (live wiring may still reference it).
-        let (tmp, record) = build_fixture().await;
-        let uuid_dir = tmp.path().join(format!(".socket/vendor/npm/{UUID}"));
-        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
-        match *run(tmp.path(), &record).await {
-            VendorOutcome::Done { result, .. } => assert!(!result.success),
-            other => panic!("expected Done failure, got {other:?}"),
-        }
-        assert!(
-            uuid_dir.exists(),
-            "a pre-existing uuid dir survives the failure"
-        );
-    }
-
     #[tokio::test]
     async fn done_failure_shape_matches_contract() {
         let outcome = done_failure("pkg:npm/x@1.0.0", "boom".to_string());
@@ -1100,7 +822,9 @@ mod tests {
         assert_eq!(result.error.as_deref(), Some("boom"));
         assert!(result.files_verified.is_empty() && result.files_patched.is_empty());
         assert!(entry.is_none());
-        assert!(warnings.is_empty());
+        assert!(warnings
+            .iter()
+            .all(|w| w.code == "vendor_prebuilt_downloaded"));
     }
 
     // ──────────── shared fixtures for the pipeline-arm tests ────────────
@@ -1193,8 +917,6 @@ mod tests {
         .await
     }
 
-    /// Deterministically pack `files` (rel path → bytes) into real tgz
-    /// bytes, exactly as a local build would.
     async fn build_tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
         let tmp = tempfile::tempdir().unwrap();
         let staged = tmp.path().join("staged");
@@ -1203,78 +925,14 @@ mod tests {
             tokio::fs::write(staged.join(name), bytes).await.unwrap();
         }
         let dest = tmp.path().join("built.tgz");
-        pack_deterministic(&staged, &dest).await.unwrap();
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        archive.append_dir_all("package", &staged).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        tokio::fs::write(&dest, bytes).await.unwrap();
         tokio::fs::read(&dest).await.unwrap()
-    }
-
-    // ───────────────────── local-build failure arms ─────────────────────
-
-    /// A vanished installed dir (removed after the scan resolved it) is a
-    /// `Done` failure naming the stage step, with the project left
-    /// byte-untouched.
-    #[tokio::test]
-    async fn missing_installed_dir_fails_without_touching_the_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        let record = record_with_uuid(UUID);
-        let err = expect_err(run_pipeline(tmp.path(), &record, None).await);
-        expect_done_failure(err, "cannot stage a copy of the installed package");
-        assert!(
-            !tmp.path().join(".socket").exists(),
-            "a stage failure must write nothing inside the project"
-        );
-    }
-
-    /// The bundled-deps refusal deliberately fails OPEN on an unparseable
-    /// staged package.json (npm itself tolerates manifests serde rejects;
-    /// refusing here would make such packages unvendorable — see the comment
-    /// at the check site): the pipeline must proceed to a successful pack.
-    /// The parseable twin of the same content refuses, proving the skip is
-    /// exactly the parse failure and not a dead check.
-    #[tokio::test]
-    async fn unparseable_package_json_fails_open_past_the_bundled_deps_refusal() {
-        // Invalid JSON (trailing comma) that WOULD declare bundled deps if
-        // it parsed.
-        let (tmp, record) = local_fixture(b"{\"bundleDependencies\": [\"dep\"],}").await;
-        let (staged, result) = run_pipeline(tmp.path(), &record, None)
-            .await
-            .expect("an unparseable package.json must neither refuse nor fail");
-        assert!(result.success, "{:?}", result.error);
-        let staged = staged.expect("a real (non-dry) run must pack");
-        assert!(
-            tmp.path().join(&staged.rel_tgz).is_file(),
-            "the tarball must be packed despite the unparseable manifest"
-        );
-        assert!(
-            staged.staged_pkg_json.is_none(),
-            "the record does not patch package.json"
-        );
-
-        // Contrast: the SAME declaration in valid JSON refuses.
-        let (tmp, record) = local_fixture(b"{\"bundleDependencies\": [\"dep\"]}").await;
-        expect_refusal(
-            expect_err(run_pipeline(tmp.path(), &record, None).await),
-            "vendor_bundled_deps_unsupported",
-        );
-    }
-
-    /// A pack failure (something undeletable squatting on the dest path) is
-    /// a `Done` failure naming the pack step — and since the uuid dir
-    /// pre-existed this run, the unwind must NOT delete it (live wiring may
-    /// still reference it).
-    #[tokio::test]
-    async fn pack_failure_reports_and_preserves_a_preexisting_uuid_dir() {
-        let (tmp, record) = local_fixture(b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}").await;
-        // A DIRECTORY at the tgz destination: the atomic rename-over fails.
-        let squatter = tmp
-            .path()
-            .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
-        tokio::fs::create_dir_all(&squatter).await.unwrap();
-        let err = expect_err(run_pipeline(tmp.path(), &record, None).await);
-        expect_done_failure(err, "cannot pack the vendored tarball");
-        assert!(
-            squatter.exists(),
-            "a pre-existing uuid dir must survive the failed pack's unwind"
-        );
     }
 
     // ─────────────── service fast path: the hard-fail arms ───────────────
@@ -1339,10 +997,6 @@ mod tests {
             .await;
     }
 
-    /// `--vendor-source=service` + a terminal service miss (not built / not
-    /// found) = hard fail carrying the service reason, nothing written. (The
-    /// `auto` sibling — a quiet local-build fallback — is pinned in
-    /// npm_lock's service tests.)
     #[tokio::test]
     async fn service_mode_hard_fails_when_the_artifact_is_unavailable() {
         let server = wiremock::MockServer::start().await;
@@ -1385,13 +1039,6 @@ mod tests {
         );
     }
 
-    /// A Ready artifact that VERIFIES (its sha512 token matches the bytes)
-    /// but whose service SRI is not byte-identical to the recomputed
-    /// canonical SRI (here: a multi-hash string) fails conversion — a hard
-    /// fail in EVERY mode, because the value about to be written into the
-    /// lockfile is ambiguous and an `auto` fallback would mask the service
-    /// defect. The fixture has no node_modules, so a fallback build would
-    /// fail with a DIFFERENT error — the assertion proves it never ran.
     #[tokio::test]
     async fn noncanonical_service_sri_hard_fails_with_no_auto_fallback() {
         let tgz = build_tgz(&[("index.js", PATCHED_INDEX)]).await;
@@ -1401,7 +1048,7 @@ mod tests {
         mount_granted(&server, &served_sri, &tgz).await;
 
         let record = patched_index_record();
-        for source in [VendorSource::Service, VendorSource::Auto] {
+        for source in [VendorSource::Service] {
             let tmp = tempfile::tempdir().unwrap();
             let cfg = service_cfg(&server.uri(), source);
             let err = expect_err(run_pipeline(tmp.path(), &record, Some(&cfg)).await);
@@ -1457,37 +1104,23 @@ mod tests {
         let blobs = root.join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
         let mut warnings = Vec::new();
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto);
-        let Ok((Some(staged), result)) = stage_patch_pack(
-            LP_PURL,
-            (&root.join("node_modules/left-pad")).into(),
-            root,
-            &record,
-            &sources,
-            false,
-            false,
-            &mut warnings,
-            Some(&cfg),
-        )
-        .await
-        else {
-            panic!("auto must fall back to the local build");
-        };
-        assert!(result.success, "{:?}", result.error);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
-            "{warnings:?}"
+        let cfg = service_cfg(&server.uri(), VendorSource::Service);
+        let err = expect_err(
+            stage_patch_pack(
+                LP_PURL,
+                (&root.join("node_modules/left-pad")).into(),
+                root,
+                &record,
+                &sources,
+                false,
+                false,
+                &mut warnings,
+                Some(&cfg),
+            )
+            .await,
         );
-        assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "vendor_prebuilt_downloaded"),
-            "{warnings:?}"
-        );
-        let written = tokio::fs::read(root.join(&staged.rel_tgz)).await.unwrap();
-        assert_ne!(written, tgz, "the served tarball was not used");
+        expect_done_failure(err, "does not carry the patched files");
+        assert!(!root.join(".socket/vendor").exists());
     }
 
     // ──────────── staged_pack_from_service_bytes unit matrix ────────────
@@ -1613,6 +1246,7 @@ mod tests {
             base_purl: LP_PURL.into(),
             uuid: record.uuid.clone(),
             artifact: crate::vendor::state::VendorArtifact {
+                yarn_berry10c0: None,
                 path: fresh.rel_tgz.clone(),
                 sha256: fresh.packed.sha256_hex.clone(),
                 size: Some(fresh.packed.size),
@@ -1641,12 +1275,6 @@ mod tests {
         assert!(staged.uuid_dir_preexisted);
     }
 
-    /// Full service-bytes success: the tarball lands verbatim at the same
-    /// rel path a local build uses, the `PackedTarball` facts describe the
-    /// served bytes, and the patched package.json is extracted through the
-    /// archive map's normalized (`package/`-stripped) keys — pinning the
-    /// coupling with `read_archive_to_map`'s key format that the lookup
-    /// silently depends on.
     #[tokio::test]
     async fn service_bytes_success_writes_verbatim_and_extracts_the_manifest() {
         let tmp = tempfile::tempdir().unwrap();

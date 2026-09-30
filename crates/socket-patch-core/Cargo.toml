@@ -15,8 +15,11 @@ readme = "README.md"
 # [dev-dependencies] only, so a `cargo build --release` / `cargo install`
 # binary never carries it.
 failpoints = []
+# Shared HTTP artifact fixtures, enabled only by the CLI dev-dependency.
+test-fixtures = ["dep:wiremock"]
 
 [dependencies]
+wiremock = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

@@ -914,7 +914,7 @@ fn production_defaults_populate_when_unset() {
     assert_eq!(c.api_url, None, "no clap default — resolved in core");
     assert_eq!(c.proxy_url, None, "no clap default — resolved in core");
     assert_eq!(c.download_mode, "diff");
-    assert_eq!(c.vendor_source, "auto");
+    assert_eq!(c.vendor_source, "service");
     assert!(c.vendor_url.is_none());
     assert!(c.patch_server_url.is_none());
     assert!(c.api_token.is_none());

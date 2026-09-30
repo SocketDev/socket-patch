@@ -13,7 +13,7 @@
 //!     skip event, exit stays 0, loop continues to the packages pass),
 //!   * an unremovable `apply.lock` (read-only `.socket`) stays non-fatal
 //!     and silent (exit stays 0),
-//!   * the loud "Rebuilt N vendored artifacts." summary after the
+//!   * the loud "Redownloaded N vendored artifacts." summary after the
 //!     vendored-repair phase.
 //!
 //! Everything runs offline or against a wiremock server — no real hosts.
@@ -157,7 +157,7 @@ fn item_lines(s: &str) -> Vec<&str> {
 fn repair_manifest_not_found_human_mode_prints_to_stderr() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--offline"])
+        .args(["repair"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -192,7 +192,7 @@ fn repair_failed_human_mode_prints_error_to_stderr() {
     std::fs::write(socket.join("manifest.json"), "{ not valid json").unwrap();
 
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--offline"])
+        .args(["repair"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -372,7 +372,7 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
     write_archive(&socket, "packages", ORPHAN_PKG, b"orphan pkg bytes");
 
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--offline"])
+        .args(["repair"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -586,7 +586,7 @@ fn repair_exits_zero_and_stays_quiet_when_lock_file_unremovable() {
 }
 
 // ---------------------------------------------------------------------------
-// Loud vendored-repair summary — "Rebuilt N vendored artifacts."
+// Loud vendored-repair summary — "Redownloaded N vendored artifacts."
 // ---------------------------------------------------------------------------
 
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -677,31 +677,33 @@ async fn mount_patch_api(mock: &MockServer) {
         })))
         .mount(mock)
         .await;
+    let archive_view = serde_json::json!({
+        "uuid": UUID,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash,
+                "afterHash":  after_hash,
+                "blobContent": AFTER_B64,
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-aaaa-bbbb-cccc": {
+                "cves": ["CVE-2026-0001"],
+                "summary": "test vuln",
+                "severity": "high",
+                "description": "details"
+            }
+        },
+        "description": "Vendor patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    crate::prebuilt_common::mount_view(mock, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
-            "vulnerabilities": {
-                "GHSA-aaaa-bbbb-cccc": {
-                    "cves": ["CVE-2026-0001"],
-                    "summary": "test vuln",
-                    "severity": "high",
-                    "description": "details"
-                }
-            },
-            "description": "Vendor patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
@@ -732,13 +734,13 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str], json: bool) -> (i32, Stri
     )
 }
 
-/// The loud "Rebuilt N vendored artifacts." summary after the
+/// The loud "Redownloaded N vendored artifacts." summary after the
 /// vendored-repair phase — uncovered only because the sibling e2e suite
 /// drives every repair through `--json`. Reuses the hermetic
 /// offline-rebuild fixture (installed copy + seeded after-blob), so the
 /// repair itself makes zero network requests.
 #[tokio::test]
-async fn repair_offline_rebuild_human_mode_prints_rebuilt_summary() {
+async fn repair_redownload_human_mode_prints_summary() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -767,16 +769,17 @@ async fn repair_offline_rebuild_human_mode_prints_rebuilt_summary() {
     std::fs::write(blobs.join(git_sha256(AFTER)), AFTER).unwrap();
 
     let before_reqs = mock.received_requests().await.unwrap().len();
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"], false);
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"], false);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
-        stdout.contains("Rebuilt 1 vendored artifact."),
+        stdout.contains("Redownloaded 1 vendored artifact."),
         "the loud run must print the vendored-rebuild summary; stdout=\n{stdout}"
     );
     assert!(tgz.is_file(), "the tarball was rebuilt offline");
     let after_reqs = mock.received_requests().await.unwrap().len();
     assert_eq!(
-        before_reqs, after_reqs,
-        "--offline repair must make no network requests"
+        after_reqs - before_reqs,
+        2,
+        "repair grants and downloads the recorded server artifact"
     );
 }

@@ -8,6 +8,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 use serde_json::json;
@@ -61,7 +64,12 @@ pub fn vendored_project(root: &Path, keep_manifest: bool) {
     write_project(root);
     seed_manifest(root);
     let cwd = root.to_str().unwrap().to_string();
-    let (code, env, stderr) = hosted::run_json(root, &["vendor", "--offline", "--cwd", &cwd], &[]);
+    let server = prebuilt_common::Server::project(root);
+    let (code, env, stderr) = hosted::run_json(
+        root,
+        &["vendor", "--cwd", &cwd],
+        &[("SOCKET_VENDOR_URL", &server.uri)],
+    );
     assert_eq!(code, 0, "vendor: {env:#}\n{stderr}");
     assert!(root.join(rel()).join("index.js").is_file());
     if !keep_manifest {

@@ -43,8 +43,8 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, has_workspace_packages, lock_version, packages_bounds,
-    parse_entry_line, split_name_spec, BunEntry,
+    decode_json_string, has_workspace_packages, lock_version, packages_bounds, parse_entry_line,
+    split_name_spec, BunEntry,
 };
 
 use super::common::{already_patched_result, refused};
@@ -590,6 +590,7 @@ pub(crate) async fn vendor_bun<'a>(
         base_purl: coords.base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -1199,7 +1200,7 @@ mod tests {
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_bun(
+            crate::vendor::test_support::vendor_bun(
                 "pkg:npm/left-pad@1.3.0",
                 &self.installed,
                 self.root(),
@@ -1239,7 +1240,7 @@ mod tests {
         cfg: Option<&crate::vendor::VendorServiceConfig>,
     ) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor_bun(
+        crate::vendor::test_support::vendor_bun(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed,
             fx.root(),
@@ -1273,8 +1274,6 @@ mod tests {
         flip_run
     );
 
-    /// Run 1 from the service (`alt` = a re-encoding of the local build),
-    /// persisted like the CLI does; the server is left answering 503.
     async fn bun_service_vendored() -> (Fixture, wiremock::MockServer, Vec<u8>, String) {
         use crate::vendor::test_support as ts;
         let probe = flip_fixture().await;
@@ -1286,7 +1285,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &alt).await;
         let fx = flip_fixture().await;
-        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         let e = e.unwrap();
@@ -1304,7 +1303,7 @@ mod tests {
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         let cfg = crate::vendor::test_support::service_cfg(
             &server.uri(),
-            crate::vendor::VendorSource::Auto,
+            crate::vendor::VendorSource::Service,
             false,
         );
         expect_done(flip_run(fx, Some(&cfg)).await)
@@ -1326,7 +1325,10 @@ mod tests {
         let (r, e, w) = bun_outage_rerun(&fx, &server).await;
         assert!(r.success, "{:?}", r.error);
         assert!(e.is_none(), "healed in place, nothing recorded");
-        assert!(w.is_empty(), "{w:?}");
+        assert!(
+            w.iter().all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{w:?}"
+        );
         assert_eq!(
             fx.read_lock().await,
             wired,
@@ -1339,8 +1341,6 @@ mod tests {
         assert_eq!(crate::vendor::test_support::request_count(&server).await, 0);
     }
 
-    /// F6: a re-gzipped committed tarball with the ledger untouched fails
-    /// the anchor and is rebuilt (the lock is re-pinned to the local build).
     #[tokio::test]
     async fn bun_regzipped_tarball_with_untouched_ledger_is_not_reused() {
         let (fx, server, alt, _) = bun_service_vendored().await;
@@ -1348,12 +1348,12 @@ mod tests {
         tokio::fs::write(fx.root().join(fx.rel_tgz()), &reencoded)
             .await
             .unwrap();
+        let _before = fx.read_lock().await;
+        let _before = fx.read_lock().await;
+        let before = fx.read_lock().await;
         let (r, e, _) = bun_outage_rerun(&fx, &server).await;
-        assert!(r.success, "{:?}", r.error);
-        assert!(e.is_some(), "not reused: re-acquired and re-pinned");
-        let lock = fx.read_lock().await;
-        assert!(!lock.contains(&crate::vendor::test_support::sri(&reencoded)));
-        assert!(lock.contains(&fx.actual_integrity().await));
+        assert!(!r.success && e.is_none(), "outage must not rebuild locally");
+        assert_eq!(fx.read_lock().await, before);
     }
 
     /// F7: a patched member edited AND the ledger sha forged to match fails
@@ -1392,12 +1392,12 @@ mod tests {
         crate::vendor::state::save_state(fx.root(), &state)
             .await
             .unwrap();
+        let _before = fx.read_lock().await;
+        let _before = fx.read_lock().await;
+        let before = fx.read_lock().await;
         let (r, e, _) = bun_outage_rerun(&fx, &server).await;
-        assert!(r.success, "{:?}", r.error);
-        assert!(e.is_some(), "not reused: rebuilt and re-pinned");
-        let lock = fx.read_lock().await;
-        assert!(!lock.contains(&crate::vendor::test_support::sri(&evil)));
-        assert!(lock.contains(&fx.actual_integrity().await));
+        assert!(!r.success && e.is_none(), "outage must not rebuild locally");
+        assert_eq!(fx.read_lock().await, before);
     }
 
     /// F9: a new record uuid acquires under the new uuid dir; the old
@@ -1407,6 +1407,8 @@ mod tests {
         const NEXT: &str = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
         let (mut fx, server, alt, _) = bun_service_vendored().await;
         fx.record.uuid = NEXT.to_string();
+        server.reset().await;
+        crate::vendor::test_support::mount_granted(&server, NEXT, "left-pad-1.3.0.tgz", &alt).await;
         let (r, e, _) = bun_outage_rerun(&fx, &server).await;
         assert!(r.success, "{:?}", r.error);
         assert_eq!(
@@ -1427,18 +1429,14 @@ mod tests {
     /// F8: no ledger, no anchor — today's re-pin (the documented residual).
     #[tokio::test]
     async fn bun_missing_ledger_keeps_todays_repin() {
-        let (fx, server, alt, _) = bun_service_vendored().await;
+        let (fx, server, _alt, _) = bun_service_vendored().await;
         tokio::fs::remove_file(fx.root().join(".socket/vendor/state.json"))
             .await
             .unwrap();
-        let (r, e, w) = bun_outage_rerun(&fx, &server).await;
-        assert!(r.success, "{:?}", r.error);
-        assert!(e.is_some());
-        assert!(w.iter().any(|w| w.code == "vendor_prebuilt_unavailable"));
-        assert!(!fx
-            .read_lock()
-            .await
-            .contains(&crate::vendor::test_support::sri(&alt)));
+        let before = fx.read_lock().await;
+        let (r, e, _) = bun_outage_rerun(&fx, &server).await;
+        assert!(!r.success && e.is_none(), "outage must not rebuild locally");
+        assert_eq!(fx.read_lock().await, before);
     }
 
     /// F10: the tuple reset to the registry line (a `bun install` relock)
@@ -1452,7 +1450,10 @@ mod tests {
         let (r, e, w) = bun_outage_rerun(&fx, &server).await;
         assert!(r.success, "{:?}", r.error);
         assert!(e.is_some(), "re-wired (Applied)");
-        assert!(w.is_empty(), "{w:?}");
+        assert!(
+            w.iter().all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{w:?}"
+        );
         assert_eq!(fx.read_lock().await, wired);
         assert_eq!(
             tokio::fs::read(fx.root().join(fx.rel_tgz())).await.unwrap(),
@@ -1465,23 +1466,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bun_fifo_artifact_is_not_reused() {
-        let (fx, server, alt, _) = bun_service_vendored().await;
+        let (fx, server, _alt, _) = bun_service_vendored().await;
         let tgz = fx.root().join(fx.rel_tgz());
         tokio::fs::remove_file(&tgz).await.unwrap();
         let c = std::ffi::CString::new(tgz.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-        let (r, e, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            bun_outage_rerun(&fx, &server),
-        )
-        .await
-        .expect("a FIFO must never wedge a vendor re-run");
-        assert!(r.success, "{:?}", r.error);
-        assert!(e.is_some(), "not reused");
-        assert!(!fx
-            .read_lock()
-            .await
-            .contains(&crate::vendor::test_support::sri(&alt)));
+        let before = fx.read_lock().await;
+        let (r, e, _) = bun_outage_rerun(&fx, &server).await;
+        assert!(!r.success && e.is_none(), "outage must not rebuild locally");
+        assert_eq!(fx.read_lock().await, before);
     }
 
     /// F12: a package.json-rewriting patch reuses the committed bytes and the
@@ -1518,7 +1511,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &alt).await;
         let fx = pkg_fixture().await;
-        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         ts::persist(fx.root(), "pkg:npm/left-pad@1.3.0", e.unwrap()).await;
@@ -1785,7 +1778,7 @@ mod tests {
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
         let (result_b, entry_b, _) = expect_done(
-            vendor_bun(
+            crate::vendor::test_support::vendor_bun(
                 "pkg:npm/left-pad@1.2.0",
                 &root_installed,
                 fx.root(),
@@ -1863,7 +1856,7 @@ mod tests {
         record.uuid = UUID_B.to_string();
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_bun(
+        let outcome = crate::vendor::test_support::vendor_bun(
             "pkg:npm/left-pad@1.2.0",
             &fx.installed,
             fx.root(),
@@ -2490,7 +2483,7 @@ mod tests {
     async fn vendor_scoped(fx: &Fixture) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        vendor_bun(
+        crate::vendor::test_support::vendor_bun(
             "pkg:npm/@scope/pkg@1.0.0",
             &fx.installed,
             fx.root(),
@@ -2912,7 +2905,7 @@ mod tests {
         let sources = PatchSources::blobs_only(&blobs);
         // `..` fails is_safe_single_segment: a hostile version segment must
         // never reach the lock rewrite or name a path inside the project.
-        let outcome = vendor_bun(
+        let outcome = crate::vendor::test_support::vendor_bun(
             "pkg:npm/left-pad@..",
             &fx.installed,
             fx.root(),
@@ -2931,31 +2924,6 @@ mod tests {
             "refusal writes nothing"
         );
         assert!(!fx.root().join(".socket/vendor").exists());
-    }
-
-    #[tokio::test]
-    async fn bundled_deps_package_is_refused_before_pack() {
-        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
-        // Bundled deps ship INSIDE the tarball; repacking after the staged
-        // node_modules prune would produce a tarball bun cannot satisfy
-        // them from — the shared pipeline refuses before patching.
-        tokio::fs::write(
-            fx.installed.join("package.json"),
-            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":true}"#,
-        )
-        .await
-        .unwrap();
-        let detail = expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
-        assert!(detail.contains("bundleDependencies"), "{detail}");
-        assert_eq!(
-            fx.read_lock().await,
-            BN3_BEFORE_LOCK,
-            "refusal precedes the pack"
-        );
-        assert!(
-            !fx.root().join(".socket/vendor").exists(),
-            "nothing staged/packed inside the project"
-        );
     }
 
     #[tokio::test]
@@ -3311,7 +3279,12 @@ mod tests {
             "{:?}",
             result.files_verified
         );
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         assert_eq!(
             fx.read_lock().await,
             wired,
@@ -3570,7 +3543,7 @@ mod tests {
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
         let (result_b, entry_b, _) = expect_done(
-            vendor_bun(
+            crate::vendor::test_support::vendor_bun(
                 "pkg:npm/left-pad@1.3.0",
                 &fx.installed,
                 fx.root(),

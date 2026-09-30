@@ -931,6 +931,7 @@ mod tests {
             base_purl: "pkg:pypi/six@1.16.0".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: REL_WHEEL.into(),
                 sha256: SHA.into(),
                 size: Some(11053),

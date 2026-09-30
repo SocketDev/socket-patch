@@ -390,7 +390,7 @@ fn deno_hosted_and_vendored_never_attest_manifest_mode_unchanged() {
         .map(|s| s.to_string())
         .collect();
         if mode == "vendored" {
-            a.extend(["--vendor-source".to_string(), "build".to_string()]);
+            a.extend(["--vendor-source".to_string(), "service".to_string()]);
         }
         a
     };

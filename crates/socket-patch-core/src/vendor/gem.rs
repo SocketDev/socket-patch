@@ -70,7 +70,6 @@ use super::common::{
     prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
-use crate::formats::gem::{is_plain_gem_token, split_checksum_entry, split_entry};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_gem_data, extract_on_blocking_pool};
 use super::service_fetch::{
@@ -82,6 +81,7 @@ use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+use crate::formats::gem::{is_plain_gem_token, split_checksum_entry, split_entry};
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
@@ -223,12 +223,12 @@ async fn gem_prelude(
         .unwrap_or_default();
     // Fail closed: only two dir names are legitimate here — the gem's own
     // `<name>-<version>` leaf (installed, or staged by
-    // registry_fetch::fetch_gem), and a literal `gem` staging dir, still
+    // a server download), and a literal `gem` staging dir, still
     // admitted for compatibility though fetch_gem no longer produces it.
     // Everything else is refused, including a `<name>-<version>-<platform>`
     // precompiled build; an allowlist (not a suffix match) means an unexpected
     // install dir name can never slip through into a vendored copy.
-    if dir_name != leaf && dir_name != "gem" {
+    if installed_path.is_dir() && dir_name != leaf && dir_name != "gem" {
         return Err(refused(
             "platform_gem_unsupported",
             format!(
@@ -274,23 +274,6 @@ async fn gem_prelude(
         }
     };
 
-    // ── stub gemspec (local) ─────────────────────────────────────────────
-    // `specifications/` is a sibling of `gems/`; derive it from installed_dir
-    // ONLY when installed_dir actually sits inside a gem home's `gems/` dir.
-    // SECURITY: the registry auto-fetch ladder stages a not-installed gem at
-    // `<private tempdir>/<name>-<version>` (registry_fetch::fetch_gem);
-    // walking two parents up from THERE escapes the private dir into the
-    // SHARED temp root, making `$TMPDIR/specifications/<leaf>.gemspec` a
-    // predictable, attacker-plantable path on multi-user hosts — one whose
-    // contents would be committed into the project and later eval'd as Ruby
-    // by every `bundle install`. A staging dir has no local stub, period.
-    //
-    // The read is non-fatal: the LOCAL build needs this stub, but the service
-    // path brings its own (the converter-generated `gem-stub-gemspec`), so an
-    // auto-fetched (not-installed) gem whose only `installed_dir` is a bare
-    // `data.tar.gz` extraction can still vendor via the service. The
-    // `gem_spec_missing` refusal moves into the local-build fallback, where the
-    // stub is actually required.
     let local_stub: Option<(PathBuf, String)> = {
         let spec_src = installed_path
             .parent()
@@ -445,26 +428,6 @@ pub(crate) async fn service_preflight(
     })
 }
 
-/// Vendor a gem: materialize a patched copy (plus its stub gemspec) under
-/// `.socket/vendor/gem/<uuid>/<name>-<version>` and pair-edit Gemfile +
-/// Gemfile.lock at it (see the module doc).
-///
-/// `installed_dir` is the crawler's gem dir (`<gem_home>/gems/<name>-<version>`,
-/// the same root `apply` patches — manifest file keys resolve relative to it);
-/// the LOCAL build's stub gemspec is derived from it
-/// (`<gem_home>/specifications/<name>-<version>.gemspec` — `specifications/`
-/// is a sibling of `gems/`).
-///
-/// `service` (when configured) lets the materialise step download the prebuilt
-/// patched `.gem` + the converter's `gem-stub-gemspec` second artifact from
-/// patch.socket.dev instead of copying + patching locally — no local install
-/// or stub needed (`auto` falls back to the local build on a miss, `service`
-/// fails closed). The wiring (Gemfile + Gemfile.lock pair edit) is identical
-/// either way; only how `copy_dir` + its `<name>.gemspec` are produced differs.
-///
-/// Edit order: materialise → Gemfile → Gemfile.lock; a lock-edit failure
-/// unwinds the Gemfile to its recorded original bytes, so the pair is never
-/// left half-wired.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_gem<'a>(
     purl: &str,
@@ -577,41 +540,17 @@ pub async fn vendor_gem<'a>(
         // Dry runs fall through to the verify-only preview below.
     }
 
-    // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
-        let mut dry_warnings: Vec<VendorWarning> = Vec::new();
-        // The verify reads the installed gem, so a lazily-fetched source
-        // materialises here — the one dry-run branch that touches it.
-        let installed_dir = match installed_dir.materialize().await {
-            Ok(dir) => dir,
-            Err(e) => {
-                return done(
-                    synthesized_result(
-                        purl,
-                        copy_dir,
-                        Vec::new(),
-                        false,
-                        Some(format!("failed to copy installed gem: {e}")),
-                    ),
-                    None,
-                    dry_warnings,
-                )
-            }
-        };
-        let mut result = super::force_apply_staged(
-            purl,
-            installed_dir,
-            record,
-            sources,
-            true,
-            force,
-            name,
-            version,
-            &mut dry_warnings,
-        )
-        .await;
-        result.package_path = copy_dir.display().to_string();
-        return done(result, None, dry_warnings);
+        if let Err(outcome) =
+            super::service_fetch::preview_service(service, record, extract_gem_data).await
+        {
+            return *outcome;
+        }
+        return done(
+            super::common::preview_result(purl, copy_dir, &record.files),
+            None,
+            Vec::new(),
+        );
     }
 
     // ── Gemfile + Gemfile.lock edits (pure, computed before any write) ────
@@ -854,6 +793,7 @@ fn gem_entry(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: copy_rel,
             sha256: String::new(), // dir-shaped: whole-tree integrity is the inventory
             size: None,
@@ -873,8 +813,6 @@ fn gem_entry(
         pipenv: None,
     }
 }
-
-// ── materialisation (service download / local build) ──────────────────────────
 
 /// Failure cleanup for a staged (re)build: always remove the stage, then
 /// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
@@ -897,20 +835,12 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
 pub(crate) const GEM_STUB_ARTIFACT_KIND: &str = "gem-stub-gemspec";
 
 /// Outcome of attempting to materialise the gem copy from the patch service.
-enum GemServiceCopy {
+pub(super) enum GemServiceCopy {
     /// The prebuilt `.gem` was extracted into `copy_dir` and the verified stub
     /// gemspec written as `<name>.gemspec`.
     Used,
     /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
     HardFail(Box<VendorOutcome>),
-    /// Fall back to copying the installed gem + local stub and patching it.
-    /// When the service DID serve a stub but it failed validation, the
-    /// payload carries the defect reason so a stub-less local
-    /// fallback can refuse truthfully — naming the served defect and the
-    /// install-the-gem remedy — instead of `gem_spec_missing`'s circular
-    /// "use --vendor-source=service" advice (a `Refused` outcome carries no
-    /// warnings, so without this the diagnostic never reaches the envelope).
-    FallBack(Option<String>),
 }
 
 /// Download the prebuilt `.gem` + its `gem-stub-gemspec` secondary artifact,
@@ -929,7 +859,7 @@ enum GemServiceCopy {
 /// `summary`/`authors` assignments — follows
 /// the same miss policy under its own `vendor_prebuilt_stub_invalid` code
 /// (always loud, even under `auto`).
-async fn gem_service_copy(
+pub(super) async fn gem_service_copy(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
     name: &str,
@@ -939,10 +869,10 @@ async fn gem_service_copy(
     warnings: &mut Vec<VendorWarning>,
 ) -> GemServiceCopy {
     let Some(cfg) = service else {
-        return GemServiceCopy::FallBack(None);
+        return GemServiceCopy::HardFail(Box::new(super::service_fetch::required()));
     };
     if !cfg.service_enabled() {
-        return GemServiceCopy::FallBack(None);
+        return GemServiceCopy::HardFail(Box::new(super::service_fetch::required()));
     }
     fn hard(code: &'static str, detail: String) -> GemServiceCopy {
         GemServiceCopy::HardFail(Box::new(refused(code, detail)))
@@ -953,26 +883,20 @@ async fn gem_service_copy(
     // build. `is_stub_defect` marks the misses where the service DID serve a
     // stub that failed validation — the reason then rides the `FallBack`
     // payload (see [`GemServiceCopy::FallBack`]).
-    let miss = |warnings: &mut Vec<VendorWarning>,
-                code: &'static str,
+    let miss = |_warnings: &mut Vec<VendorWarning>,
+                _code: &'static str,
                 refusal: (&'static str, &str),
                 reason: String,
-                is_stub_defect: bool| {
-        if cfg.source.requires_service() {
-            let (hard_code, remedy) = refusal;
-            let detail = if remedy.is_empty() {
+                _is_stub_defect: bool| {
+        let (code, remedy) = refusal;
+        hard(
+            code,
+            if remedy.is_empty() {
                 reason
             } else {
                 format!("{reason}. {remedy}")
-            };
-            hard(hard_code, detail)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            GemServiceCopy::FallBack(is_stub_defect.then_some(reason))
-        }
+            },
+        )
     };
 
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
@@ -982,8 +906,8 @@ async fn gem_service_copy(
     let mut archive = match policy.settle::<()>(fetched, ".gem", &subject, warnings) {
         Ok(archive) => archive,
         Err(ServiceAttempt::HardFail(outcome)) => return GemServiceCopy::HardFail(outcome),
-        Err(ServiceAttempt::Used(()) | ServiceAttempt::FallBack) => {
-            return GemServiceCopy::FallBack(None);
+        Err(ServiceAttempt::Used(())) => {
+            return GemServiceCopy::HardFail(Box::new(super::service_fetch::required()));
         }
     };
 
@@ -1063,8 +987,7 @@ async fn gem_service_copy(
             "vendor_prebuilt_stub_invalid",
             (
                 "vendor_prebuilt_stub_invalid",
-                "Re-run with --vendor-source=auto (or build) to vendor from the locally \
-                 installed gem until the service artifact is rebuilt",
+                "Retry after the patch service publishes a corrected artifact",
             ),
             reason,
             true,
@@ -1105,13 +1028,6 @@ async fn gem_service_copy(
             format!("cannot write the stub gemspec into the vendored dir: {e}"),
         );
     }
-    // Verify the EXTRACTED data.tar.gz tree, not just the .gem bytes: the
-    // SRI proves the download is intact, but an unexpected internal layout
-    // lands the patched files at the wrong paths and the caller would
-    // synthesize success from `record.files` while the copy is wrong. (The
-    // stub gemspec we just wrote is not in record.files, so it is not part
-    // of this check.) Fail closed → `auto` falls back to the local build.
-    // (Mirrors composer_lock.rs.)
     if !copy_matches_after_hashes(&stage, &record.files).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return miss(
@@ -1159,15 +1075,15 @@ async fn gem_service_copy(
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_copy(
     purl: &str,
-    installed_dir: PackageSource<'_>,
+    _installed_dir: PackageSource<'_>,
     copy_dir: &Path,
     uuid_dir: &Path,
     name: &str,
-    version: &str,
-    local_stub: Option<(&Path, &str)>,
+    _version: &str,
+    _local_stub: Option<(&Path, &str)>,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    force: bool,
+    _sources: &PatchSources<'_>,
+    _force: bool,
     unwind_uuid_dir: bool,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
@@ -1189,112 +1105,6 @@ async fn materialise_patched_copy(
             Ok(already_patched_result(purl, copy_dir, &record.files))
         }
         GemServiceCopy::HardFail(outcome) => Err(outcome),
-        GemServiceCopy::FallBack(served_stub_defect) => {
-            // The local build needs the stub gemspec from the installed gem's
-            // `specifications/` dir — absent for an auto-fetched (not-installed)
-            // gem, whose only route is the service path.
-            let Some((spec_path, spec_text)) = local_stub else {
-                return Err(Box::new(match served_stub_defect {
-                    // The service DID serve a stub — a defective one. Say
-                    // so: the generic advice below would send the user in a
-                    // circle (`--vendor-source=service` refuses on the same
-                    // defect), and a `Refused` outcome carries no warnings, so
-                    // this detail is the diagnostic's only route into the
-                    // envelope.
-                    Some(defect) => refused(
-                        "vendor_prebuilt_stub_invalid",
-                        format!(
-                            "{defect}; and {name}@{version} is not installed locally, so the \
-                             local-build fallback has no stub gemspec to derive from — install \
-                             the gem (e.g. `bundle install`) and re-run, or wait for the \
-                             rebuilt service artifact"
-                        ),
-                    ),
-                    None => refused(
-                        "gem_spec_missing",
-                        format!(
-                            "no local stub gemspec for {name}@{version} (a path source cannot \
-                             be wired without one); install the gem or use \
-                             --vendor-source=service"
-                        ),
-                    ),
-                }));
-            };
-            // The write choke point validates BOTH stub sources: the served
-            // stub is checked in `gem_service_copy`, and the locally-derived
-            // stub here — bundler rejects a path-source gemspec missing the
-            // required attributes wherever it came from. (A healthy rubygems
-            // install always writes a valid `specifications/` stub, so this
-            // only fires on a corrupted or hand-edited gem home.)
-            let missing = gemspec_missing_required_attrs(spec_text);
-            if !missing.is_empty() {
-                let served_note = match served_stub_defect {
-                    Some(defect) => {
-                        format!("; the patch service cannot supply one either ({defect})")
-                    }
-                    None => String::new(),
-                };
-                return Err(Box::new(refused(
-                    "gem_spec_invalid",
-                    format!(
-                        "the local stub gemspec at {} does not assign the rubygems-required \
-                         attribute(s) {} — bundler would refuse the vendored path source at \
-                         install time; reinstall the gem (`gem pristine {name}` or a fresh \
-                         `bundle install`) and re-run{served_note}",
-                        spec_path.display(),
-                        missing.join(", "),
-                    ),
-                )));
-            }
-            let stage = stage_dir_for(copy_dir);
-            // The local build is the first branch that reads the source. An
-            // installed gem is copied out of the gem home; a fetched one is
-            // written straight here from the verified `.gem`. `stage_into`
-            // removes + recreates the stage itself.
-            if let Err(e) = installed_dir.stage_into(&stage, None).await {
-                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-                return Ok(synthesized_result(
-                    purl,
-                    copy_dir,
-                    Vec::new(),
-                    false,
-                    Some(format!("failed to copy installed gem: {e}")),
-                ));
-            }
-            // The stage is freshly created and not yet referenced by
-            // anything, so a plain write suffices for the gemspec.
-            if let Err(e) = tokio::fs::write(stage.join(format!("{name}.gemspec")), spec_text).await
-            {
-                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-                return Ok(synthesized_result(
-                    purl,
-                    copy_dir,
-                    Vec::new(),
-                    false,
-                    Some(format!(
-                        "failed to copy the stub gemspec into the vendored dir: {e}"
-                    )),
-                ));
-            }
-            let mut result = super::force_apply_staged(
-                purl, &stage, record, sources, false, force, name, version, warnings,
-            )
-            .await;
-            result.package_path = copy_dir.display().to_string();
-            if !result.success {
-                // Don't leave a half-built stage; neither project file was
-                // touched, and any pre-existing copy is still in place.
-                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-                return Ok(result);
-            }
-            if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
-                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-                result.success = false;
-                result.error = Some(format!("failed to move the rebuilt copy into place: {e}"));
-                return Ok(result);
-            }
-            Ok(result)
-        }
     }
 }
 
@@ -2617,9 +2427,6 @@ mod tests {
     const PRISTINE: &[u8] = b"module Rack\n  VERSION = \"3.2.6\"\nend\n";
     const PATCHED: &[u8] = b"module Rack\n  SOCKET_PATCHED = true\n  VERSION = \"3.2.6\"\nend\n";
 
-    // Every local-stub fixture assigns the rubygems-required `summary` +
-    // `authors` — as any healthy rubygems-written `specifications/` stub does
-    // — because the local-build write choke point validates them too.
     const GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.version = \"3.2.6\"\n  s.summary = \"a modular Ruby web server interface\"\n  s.authors = [\"Rack maintainers\"]\n  s.require_paths = [\"lib\"]\nend\n";
 
     const GEMFILE_DIRECT: &str =
@@ -2722,7 +2529,7 @@ mod tests {
         let root = root.as_path();
         let server = wiremock::MockServer::start().await;
         mount_no_results(&server).await;
-        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
         let sources = PatchSources::blobs_only(&blobs);
         let cases = [
             (PURL, record.clone()),
@@ -2745,7 +2552,7 @@ mod tests {
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (sources, cfg) = (&sources, &cfg);
             Box::pin(async move {
-                vendor_gem(
+                crate::vendor::test_support::vendor_gem(
                     &purl,
                     installed.as_path(),
                     root,
@@ -2761,9 +2568,9 @@ mod tests {
         };
         let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
         assert_eq!(planned, vec![UUID.to_string()]);
-        // Vendored now: the re-run is in sync and asks nothing.
+        // A failed download leaves the same package eligible on retry.
         let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
-        assert!(rerun.is_empty(), "{rerun:?}");
+        assert_eq!(rerun, planned);
     }
 
     async fn run_vendor(
@@ -2786,7 +2593,7 @@ mod tests {
         dry_run: bool,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_gem(
+        crate::vendor::test_support::vendor_gem(
             purl,
             installed,
             root,
@@ -3167,7 +2974,7 @@ mod tests {
     }
 
     /// A pure-ruby gem in the legacy `gem` staging dir (still admitted, though
-    /// registry_fetch::fetch_gem now stages at `<name>-<version>`) vendors
+    /// a server download now stages at `<name>-<version>`) vendors
     /// with the purl's `?platform=ruby` (the portable default) — the staging
     /// dir name is not a platform signal.
     #[tokio::test]
@@ -3227,26 +3034,6 @@ mod tests {
             unwrap_refused(run_vendor(&root3, &blobs3, &installed3, &record3, false).await);
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("path:"), "{detail}");
-    }
-
-    #[tokio::test]
-    async fn test_refuses_missing_spec_file() {
-        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        tokio::fs::remove_file(
-            installed
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("specifications/rack-3.2.6.gemspec"),
-        )
-        .await
-        .unwrap();
-
-        let (code, _d) =
-            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "gem_spec_missing");
-        assert!(!root.join(".socket").exists());
     }
 
     /// SECURITY: a traversal uuid (tampered manifest) must be refused before
@@ -3641,7 +3428,7 @@ mod tests {
         dry_run: bool,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_gem(
+        crate::vendor::test_support::vendor_gem(
             PURL_318,
             installed,
             root,
@@ -4556,14 +4343,6 @@ mod tests {
         }
     }
 
-    // ─────────────── service-download path (Tier B: gem) ──────────────────
-    //
-    // gem vendors a patched source DIRECTORY plus a stub gemspec, so the
-    // service path downloads the prebuilt `.gem` AND the `gem-stub-gemspec`
-    // second artifact, verifies both, extracts the `.gem`'s data.tar.gz into the
-    // copy dir, and writes the stub as `<name>.gemspec`. Both the service path
-    // and the local-build fallback are exercised.
-
     use crate::api::client::{ApiClient, ApiClientOptions};
     use crate::vendor::VendorSource;
 
@@ -4736,7 +4515,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &missing_install(&root),
             &root,
@@ -4782,7 +4561,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &wrong, Some((SERVICE_STUB, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -4821,7 +4600,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &wrong_stub))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -4853,7 +4632,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, None).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -4874,10 +4653,8 @@ mod tests {
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
-    /// `auto` + a missing stub artifact falls back to the LOCAL build (which
-    /// copies the installed gem + local stub and patches it).
     #[tokio::test]
-    async fn service_stub_missing_auto_falls_back_to_build() {
+    async fn service_stub_missing_miss_refuses() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
         let sri = sri_sha512(&gem);
@@ -4885,7 +4662,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, None).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -4894,22 +4671,19 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let (result, entry, _) = unwrap_done(outcome);
-        assert!(result.success, "auto must fall back: {:?}", result.error);
-        assert!(entry.is_some());
-        // The locally-built copy carries the patched content + the LOCAL stub.
-        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
-        assert_eq!(
-            tokio::fs::read_to_string(copy_gemspec(&root))
-                .await
-                .unwrap(),
-            GEMSPEC
+        let error = crate::vendor::test_support::expect_failure(outcome);
+        assert!(
+            error.contains("prebuilt") || error.contains("patch service"),
+            "{error}"
         );
     }
-
     /// Explicit `service` mode + a served stub
     /// that never assigns the rubygems-required `summary`/`authors` refuses
     /// with its own `vendor_prebuilt_stub_invalid` code, naming the missing
@@ -4926,7 +4700,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -4958,13 +4732,8 @@ mod tests {
         );
     }
 
-    /// Under the default `auto`: an INVALID served stub is treated exactly
-    /// like a MISSING one — fall back to the LOCAL build (installed gem +
-    /// locally derived stub) — but with a LOUD `vendor_prebuilt_stub_invalid`
-    /// warning naming the served-stub defect. The vendored copy must carry the
-    /// valid local stub, never the invalid served bytes.
     #[tokio::test]
-    async fn service_stub_invalid_auto_falls_back_to_build() {
+    async fn service_stub_invalid_miss_refuses() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
         let sri = sri_sha512(&gem);
@@ -4973,7 +4742,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -4982,38 +4751,19 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let (result, entry, warnings) = unwrap_done(outcome);
-        assert!(result.success, "auto must fall back: {:?}", result.error);
-        assert!(entry.is_some());
-        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
-        assert_eq!(
-            tokio::fs::read_to_string(copy_gemspec(&root))
-                .await
-                .unwrap(),
-            GEMSPEC,
-            "the vendored gemspec must be the LOCAL stub, not the invalid served bytes"
-        );
-        let warning = warnings
-            .iter()
-            .find(|w| w.code == "vendor_prebuilt_stub_invalid")
-            .expect("auto fallback must warn loudly about the invalid served stub");
+        let error = crate::vendor::test_support::expect_failure(outcome);
         assert!(
-            warning.detail.contains("summary") && warning.detail.contains("authors"),
-            "the warning must name the missing attributes: {}",
-            warning.detail
+            error.contains("prebuilt") || error.contains("patch service"),
+            "{error}"
         );
     }
-
-    /// Invalid served stub + `auto` + the gem NOT installed (a `missing_install` staging-style
-    /// dir): the local-build fallback has no stub to derive, and the refusal
-    /// must be TRUTHFUL — it carries the served-stub defect (a `Refused`
-    /// outcome has no warnings channel, so the detail is the diagnostic's
-    /// only route into the envelope) and the install-the-gem remedy, never
-    /// `gem_spec_missing`'s circular "use --vendor-source=service" advice
-    /// (service refuses on the same defect).
     #[tokio::test]
     async fn service_stub_invalid_auto_not_installed_refuses_truthfully() {
         let (_tmp, root, _installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
@@ -5024,7 +4774,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &missing_install(&root),
             &root,
@@ -5033,7 +4783,11 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
         let (code, detail) = unwrap_refused(outcome);
@@ -5043,7 +4797,7 @@ mod tests {
             "the refusal must carry the served-stub defect: {detail}"
         );
         assert!(
-            detail.contains("not installed locally") && detail.contains("install the gem"),
+            detail.contains("Retry after the patch service"),
             "the refusal must advise installing the gem: {detail}"
         );
         assert!(
@@ -5066,7 +4820,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &missing_install(&root),
             &root,
@@ -5085,47 +4839,8 @@ mod tests {
         let (code, detail) = unwrap_refused(outcome);
         assert_eq!(code, "vendor_prebuilt_stub_invalid");
         assert!(
-            detail.contains("--vendor-source=auto"),
+            detail.contains("Retry after the patch service"),
             "the service refusal names the auto/build remedy: {detail}"
-        );
-        assert!(!root.join(".socket").exists());
-    }
-
-    /// SECURITY: the local stub gemspec is derived from `installed_dir` ONLY
-    /// when it sits inside a real gem home's `gems/` dir. For an auto-fetch
-    /// staging dir (`<private tempdir>/<name>-<version>`), walking two
-    /// parents up would escape into the SHARED temp root, where
-    /// `specifications/<leaf>.gemspec` is a predictable, attacker-plantable
-    /// path whose contents would be committed into the project and eval'd as
-    /// Ruby by every later `bundle install`. The planted spec must never be
-    /// consumed: with no service configured the vendor refuses
-    /// `gem_spec_missing`.
-    #[tokio::test]
-    async fn planted_spec_outside_gem_home_is_not_consumed() {
-        let (tmp, root, _installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        let base = tmp.path();
-        // The auto-fetch staging shape: <base>/stage/<name>-<version>, with
-        // the pristine bytes present (the parent is NOT named `gems`).
-        let staged = base.join("stage/rack-3.2.6");
-        tokio::fs::create_dir_all(staged.join("lib")).await.unwrap();
-        tokio::fs::write(staged.join("lib/rack.rb"), PRISTINE)
-            .await
-            .unwrap();
-        // The attacker's plant, at exactly where an unguarded
-        // parent-of-parent derivation would look: a VALID stub, so consuming
-        // it would "succeed".
-        tokio::fs::create_dir_all(base.join("specifications"))
-            .await
-            .unwrap();
-        tokio::fs::write(base.join("specifications/rack-3.2.6.gemspec"), GEMSPEC)
-            .await
-            .unwrap();
-
-        let (code, detail) =
-            unwrap_refused(run_vendor_purl(PURL, &root, &blobs, &staged, &record, false).await);
-        assert_eq!(
-            code, "gem_spec_missing",
-            "the planted spec outside a gem home must not be consumed: {detail}"
         );
         assert!(!root.join(".socket").exists());
     }
@@ -5152,11 +4867,11 @@ mod tests {
 
         let (code, detail) =
             unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "gem_spec_invalid");
+        assert_eq!(code, "vendor_prebuilt_stub_invalid");
         assert!(
             detail.contains("summary")
                 && detail.contains("authors")
-                && detail.contains("rack-3.2.6.gemspec"),
+                && detail.contains("served stub gemspec for rack"),
             "the refusal names the file and the missing attributes: {detail}"
         );
         assert!(!root.join(".socket").exists());
@@ -5250,7 +4965,9 @@ mod tests {
 
         let empty = root.join(".socket/empty-blobs");
         tokio::fs::create_dir_all(&empty).await.unwrap();
-        let (r2, e2, _) = unwrap_done(run_vendor(&root, &empty, &installed, &record, false).await);
+        let (r2, e2, _) = crate::vendor::test_support::expect_failed(
+            run_vendor(&root, &empty, &installed, &record, false).await,
+        );
         assert!(!r2.success, "rebuild must fail without patch content");
         assert!(e2.is_none());
 
@@ -5335,7 +5052,7 @@ mod tests {
         mount_gem_granted(&server, &garbage, &sri, Some((SERVICE_STUB, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -5369,15 +5086,14 @@ mod tests {
         );
     }
 
-    /// `auto` + a not-built service status falls back to the local build.
     #[tokio::test]
-    async fn service_unavailable_auto_falls_back_to_build() {
+    async fn service_unavailable_miss_refuses() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         let server = wiremock::MockServer::start().await;
         mount_gem_status(&server, "not_found").await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -5386,15 +5102,19 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let (result, entry, _) = unwrap_done(outcome);
-        assert!(result.success, "auto must fall back: {:?}", result.error);
-        assert!(entry.is_some());
-        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
+        let error = crate::vendor::test_support::expect_failure(outcome);
+        assert!(
+            error.contains("prebuilt") || error.contains("patch service"),
+            "{error}"
+        );
     }
-
     /// A served stub that declares native extensions is refused (defense in
     /// depth — the converter should never emit one).
     #[tokio::test]
@@ -5407,7 +5127,7 @@ mod tests {
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_NATIVE, &stub_sri))).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &missing_install(&root),
             &root,
@@ -5432,7 +5152,7 @@ mod tests {
     async fn offline_service_mode_refuses() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &installed,
             &root,
@@ -5741,7 +5461,7 @@ mod tests {
         cfg: &VendorServiceConfig,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_gem(
+        crate::vendor::test_support::vendor_gem(
             PURL,
             installed,
             root,
@@ -5820,7 +5540,12 @@ mod tests {
             unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_none(), "a no-op records no ledger entry");
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         assert!(!root.join(".socket").exists(), "no writes at all");
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -5921,58 +5646,21 @@ mod tests {
         );
     }
 
-    /// Wired pair + stale copy + no service and no local stub gemspec: the
-    /// artifact rebuild hard-fails `gem_spec_missing`, and the live pair
-    /// edit is left exactly as it was.
-    #[tokio::test]
-    async fn wired_missing_copy_rebuild_without_stub_refuses() {
-        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        let (r1, _, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
-        assert!(r1.success, "{:?}", r1.error);
-        let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
-        let lock1 = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
-        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
-            .await
-            .unwrap();
-        tokio::fs::remove_file(
-            installed
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("specifications/rack-3.2.6.gemspec"),
-        )
-        .await
-        .unwrap();
-
-        let (code, _d) =
-            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "gem_spec_missing");
-        assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
-        assert_eq!(
-            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
-            lock1
-        );
-    }
-
-    /// Local-build failure: the installed gem dir is gone (spec stub still
-    /// present). The result is an un-successful Done with no ledger entry,
-    /// the uuid dir (and the empty `.socket/vendor` levels this run created)
-    /// removed — no committable husk — and neither project file touched.
     #[tokio::test]
     async fn fresh_copy_failure_cleans_up_and_touches_nothing() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         tokio::fs::remove_dir_all(&installed).await.unwrap();
 
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) = crate::vendor::test_support::expect_failed(
+            run_vendor(&root, &blobs, &installed, &record, false).await,
+        );
         assert!(!result.success);
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("failed to copy installed gem"),
+                .contains("patch service request failed"),
             "{:?}",
             result.error
         );
@@ -5984,75 +5672,6 @@ mod tests {
         assert!(
             !root.join(".socket/vendor").exists(),
             "the empty vendor levels this run created are pruned"
-        );
-        assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
-            GEMFILE_DIRECT
-        );
-        assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
-                .await
-                .unwrap(),
-            LOCK_DIRECT
-        );
-    }
-
-    /// Local-build failure: the after-hash blob is missing, so the staged
-    /// apply fails. Same contract: un-successful Done, no entry, no husk,
-    /// pair untouched.
-    #[tokio::test]
-    async fn missing_blob_apply_failure_cleans_up_and_touches_nothing() {
-        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        let after = compute_git_sha256_from_bytes(PATCHED);
-        tokio::fs::remove_file(blobs.join(&after)).await.unwrap();
-
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
-        assert!(!result.success, "apply must fail without the blob");
-        assert!(result.error.is_some());
-        assert!(entry.is_none());
-        assert!(
-            !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
-            "no uuid-dir husk"
-        );
-        assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
-            GEMFILE_DIRECT
-        );
-        assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
-                .await
-                .unwrap(),
-            LOCK_DIRECT
-        );
-    }
-
-    /// Local-build failure: a DIRECTORY named `rack.gemspec` inside the
-    /// installed gem rides fresh_copy into the stage, so the stub-gemspec
-    /// write fails (EISDIR). Same cleanup contract.
-    #[tokio::test]
-    async fn stub_write_failure_cleans_up_and_touches_nothing() {
-        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        tokio::fs::create_dir_all(installed.join("rack.gemspec"))
-            .await
-            .unwrap();
-
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("failed to copy the stub gemspec"),
-            "{:?}",
-            result.error
-        );
-        assert!(entry.is_none());
-        assert!(
-            !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
-            "no uuid-dir husk"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -6098,45 +5717,6 @@ mod tests {
             tokio::fs::read(copy_lib(&root)).await.unwrap(),
             PATCHED,
             "copy still materialised"
-        );
-    }
-
-    /// An uninventoriable copy vendors like a pre-inventory entry (fail-soft
-    /// contract): a file over the inventory hash cap (a sparse `set_len`
-    /// file — no real disk use) makes `compute_dir_inventory` refuse, so the
-    /// entry records `file_inventory: None` plus the
-    /// `vendor_inventory_unrecorded` warning, while the vendor itself
-    /// succeeds.
-    #[tokio::test]
-    async fn uninventoriable_copy_degrades_to_warning() {
-        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        let big = std::fs::File::create(installed.join("lib/huge.bin")).unwrap();
-        big.set_len(512 * 1024 * 1024 + 1).unwrap();
-        drop(big);
-
-        let (result, entry, warnings) =
-            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
-        assert!(result.success, "{:?}", result.error);
-        let entry = entry.expect("vendor still records the entry");
-        assert!(
-            entry.artifact.file_inventory.is_none(),
-            "inventory must be absent, not partial"
-        );
-        let warning = warnings
-            .iter()
-            .find(|w| w.code == "vendor_inventory_unrecorded")
-            .expect("the gap is surfaced");
-        assert!(
-            warning.detail.contains("drift in its unpatched files"),
-            "{}",
-            warning.detail
-        );
-        // The pair edit itself is unaffected.
-        assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
-                .await
-                .unwrap(),
-            expected_lock_direct()
         );
     }
 
@@ -6235,37 +5815,22 @@ mod tests {
             .await;
     }
 
-    /// A configured-but-disabled service (`--vendor-source=build`, or `auto`
-    /// while offline) silently uses the local build: no request is made (the
-    /// URI is a dead port) and no `vendor_prebuilt_*` advisory fires.
     #[tokio::test]
     async fn disabled_service_config_silently_builds_locally() {
         for cfg in [
-            gem_service_cfg("http://127.0.0.1:1", VendorSource::Build, false),
-            gem_service_cfg("http://127.0.0.1:1", VendorSource::Auto, true),
+            gem_service_cfg("http://127.0.0.1:1", VendorSource::Service, false),
+            gem_service_cfg("http://127.0.0.1:1", VendorSource::Service, true),
         ] {
             let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-            let (result, entry, warnings) =
-                unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-            assert!(result.success, "{:?}: {:?}", cfg.source, result.error);
-            assert!(entry.is_some());
-            assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
-            assert_eq!(
-                tokio::fs::read_to_string(copy_gemspec(&root))
-                    .await
-                    .unwrap(),
-                GEMSPEC,
-                "the LOCAL stub is used"
+            let error = crate::vendor::test_support::expect_failure(
+                run_vendor_service(&root, &blobs, &installed, &record, &cfg).await,
             );
             assert!(
-                !warnings
-                    .iter()
-                    .any(|w| w.code.starts_with("vendor_prebuilt")),
-                "silent local fallback, no service advisories: {warnings:?}"
+                error.contains("prebuilt") || error.contains("service"),
+                "{error}"
             );
         }
     }
-
     /// `service` mode + a still-building archive (`pending_build`) refuses
     /// with the "still building" detail; nothing is written.
     #[tokio::test]
@@ -6288,31 +5853,21 @@ mod tests {
         );
     }
 
-    /// `auto` + `pending_build` warns under `vendor_prebuilt_pending` and
-    /// falls back to the local build.
     #[tokio::test]
     async fn service_pending_auto_warns_and_builds_locally() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         let server = wiremock::MockServer::start().await;
         mount_gem_status(&server, "pending_build").await;
-        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
 
-        let (result, entry, warnings) =
-            unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert!(result.success, "auto must fall back: {:?}", result.error);
-        assert!(entry.is_some());
-        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
-        let warning = warnings
-            .iter()
-            .find(|w| w.code == "vendor_prebuilt_pending")
-            .expect("the pending miss is surfaced");
+        let error = crate::vendor::test_support::expect_failure(
+            run_vendor_service(&root, &blobs, &installed, &record, &cfg).await,
+        );
         assert!(
-            warning.detail.contains("building locally instead"),
-            "{}",
-            warning.detail
+            error.contains("prebuilt") || error.contains("service"),
+            "{error}"
         );
     }
-
     /// `service` mode + a terminal miss (`not_found`) hard-fails naming the
     /// unavailability (the `auto` fallback leg is covered above).
     #[tokio::test]
@@ -6361,30 +5916,16 @@ mod tests {
         let stub_sri = sri_sha512(SERVICE_STUB);
         let server = wiremock::MockServer::start().await;
         mount_gem_granted_stub_get_fails(&server, &gem, &sri, &stub_sri).await;
-        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
 
-        let (result, entry, warnings) =
-            unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert!(result.success, "auto must fall back: {:?}", result.error);
-        assert!(entry.is_some());
-        assert_eq!(
-            tokio::fs::read_to_string(copy_gemspec(&root))
-                .await
-                .unwrap(),
-            GEMSPEC,
-            "the LOCAL stub is used"
+        let error = crate::vendor::test_support::expect_failure(
+            run_vendor_service(&root, &blobs, &installed, &record, &cfg).await,
         );
-        let warning = warnings
-            .iter()
-            .find(|w| w.code == "vendor_prebuilt_unavailable")
-            .expect("the fetch failure is surfaced");
         assert!(
-            warning.detail.contains("could not fetch the stub gemspec"),
-            "{}",
-            warning.detail
+            error.contains("prebuilt") || error.contains("service"),
+            "{error}"
         );
     }
-
     /// `service` mode + a served `.gem` whose extracted layout misses the
     /// recorded file paths fails closed (`vendor_prebuilt_layout_mismatch`
     /// miss → `vendor_prebuilt_required` refusal); no husk is left.
@@ -6421,29 +5962,16 @@ mod tests {
         let stub_sri = sri_sha512(SERVICE_STUB);
         let server = wiremock::MockServer::start().await;
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
-        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
 
-        let (result, entry, warnings) =
-            unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert!(result.success, "auto must fall back: {:?}", result.error);
-        assert!(entry.is_some());
-        assert_eq!(
-            tokio::fs::read(copy_lib(&root)).await.unwrap(),
-            PATCHED,
-            "the LOCAL build's patched file, at the recorded path"
+        let error = crate::vendor::test_support::expect_failure(
+            run_vendor_service(&root, &blobs, &installed, &record, &cfg).await,
         );
         assert!(
-            !root.join(copy_rel()).join("wrong/rack.rb").exists(),
-            "the mismatched service layout never lands"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
-            "{warnings:?}"
+            error.contains("prebuilt") || error.contains("service"),
+            "{error}"
         );
     }
-
     /// A served `.gem` whose data.tar.gz carries a DIRECTORY at the stub
     /// path (`rack.gemspec/…`) makes the stub write fail — a hard
     /// `vendor_prebuilt_write_failed`, no husk.
@@ -6536,10 +6064,6 @@ mod tests {
         assert!(!root.join(".socket").exists());
     }
 
-    /// Invalid served stub + `auto` + a CORRUPTED local stub: the local-build write choke
-    /// point refuses `gem_spec_invalid`, and the detail honestly notes the
-    /// service cannot supply a stub either (its served stub is defective) —
-    /// never circular "use --vendor-source=service" advice.
     #[tokio::test]
     async fn invalid_served_and_local_stub_refuses_with_honest_note() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
@@ -6559,13 +6083,13 @@ mod tests {
         let stub_sri = sri_sha512(SERVICE_STUB_INVALID);
         let server = wiremock::MockServer::start().await;
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
-        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
 
         let (code, detail) =
             unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert_eq!(code, "gem_spec_invalid");
+        assert_eq!(code, "vendor_prebuilt_stub_invalid");
         assert!(
-            detail.contains("cannot supply one either"),
+            detail.contains("Retry after the patch service publishes a corrected artifact"),
             "the served-stub defect must ride the local refusal: {detail}"
         );
         assert!(!root.join(".socket").exists());
@@ -7535,10 +7059,6 @@ mod tests {
         );
     }
 
-    /// The LOCAL build's final swap failing (a stale regular FILE squatting
-    /// the backup sibling — a dir-tree remover cannot clear it): the run
-    /// reports the move failure, wires neither project file, and unwinds the
-    /// fresh uuid dir.
     #[tokio::test]
     async fn local_swap_failure_reports_move_error_and_touches_nothing() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
@@ -7548,13 +7068,14 @@ mod tests {
             .await
             .unwrap();
 
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) = crate::vendor::test_support::expect_failed(
+            run_vendor(&root, &blobs, &installed, &record, false).await,
+        );
         assert!(!result.success, "the swap failure must fail the vendor");
         assert!(entry.is_none(), "no ledger entry for a failed vendor");
         let err = result.error.as_deref().unwrap_or("");
         assert!(
-            err.contains("failed to move the rebuilt copy into place"),
+            err.contains("cannot move the extracted .gem into place"),
             "{err}"
         );
         assert_eq!(
@@ -7592,7 +7113,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = vendor_gem(
+        let outcome = crate::vendor::test_support::vendor_gem(
             PURL,
             &missing_install(&root),
             &root,
@@ -7698,7 +7219,7 @@ mod tests {
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         let sources = PatchSources::blobs_only(blobs);
         unwrap_done(
-            vendor_gem(
+            crate::vendor::test_support::vendor_gem(
                 PURL,
                 installed,
                 root,
@@ -7707,7 +7228,11 @@ mod tests {
                 "2026-06-09T00:00:00Z",
                 false,
                 false,
-                Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+                Some(&gem_service_cfg(
+                    &server.uri(),
+                    VendorSource::Service,
+                    false,
+                )),
             )
             .await,
         )
@@ -7720,31 +7245,6 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
         server
-    }
-
-    #[tokio::test]
-    async fn flip_local_then_service_is_noop() {
-        use crate::vendor::test_support as ts;
-        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        let down = wiremock::MockServer::start().await;
-        ts::mount_503(&down).await;
-        let (r1, e1, w1) = flip_run(&root, &installed, &blobs, &record, &down).await;
-        assert!(r1.success && e1.is_some());
-        assert!(ts::has_warning(&w1, "vendor_prebuilt_unavailable"));
-        let before = ts::tree_snapshot(&root);
-        let up = flip_granted().await;
-        let (r2, e2, _) = flip_run(&root, &installed, &blobs, &record, &up).await;
-        assert!(r2.success, "{:?}", r2.error);
-        assert!(
-            e2.is_none(),
-            "re-run must be the in-sync no-op (entry None)"
-        );
-        assert!(r2
-            .files_verified
-            .iter()
-            .all(|f| f.status == VerifyStatus::AlreadyPatched));
-        assert_eq!(before, ts::tree_snapshot(&root), "tree byte-identical");
-        assert_eq!(ts::request_count(&up).await, 0);
     }
 
     #[tokio::test]
@@ -7765,7 +7265,10 @@ mod tests {
         let (r2, e2, w2) = flip_run(&root, &installed, &blobs, &record, &down).await;
         assert!(r2.success);
         assert!(e2.is_none());
-        assert!(w2.is_empty(), "{w2:?}");
+        assert!(
+            w2.iter().all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{w2:?}"
+        );
         assert_eq!(before, ts::tree_snapshot(&root));
         assert_eq!(ts::request_count(&down).await, 0);
     }
@@ -7841,8 +7344,6 @@ mod tests {
         );
     }
 
-    /// A `.gem` or stub that fails integrity verification is a hard
-    /// failure under `auto` too — never a quiet local-build fallback.
     #[tokio::test]
     async fn integrity_mismatch_hard_fails_under_auto() {
         let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
@@ -7855,7 +7356,7 @@ mod tests {
                 (sri_sha512(b"different bytes"), sri_sha512(SERVICE_STUB))
             };
             mount_gem_granted(&server, &gem, &gem_sri, Some((SERVICE_STUB, &stub_sri))).await;
-            let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+            let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
             let outcome = run_vendor_service(&root, &blobs, &installed, &record, &cfg).await;
             let VendorOutcome::Refused { code, .. } = outcome else {
                 panic!("bad_stub={bad_stub}: tampered bytes fell back: {outcome:?}");

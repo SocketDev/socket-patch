@@ -76,13 +76,7 @@
 //! So a crash can only lose an artifact nothing durable names yet, which
 //! the next run rebuilds exactly as it would one deleted by hand.
 //!
-//! The patched files the apply engine writes into a vendor stage are
-//! artifacts too: [`artifact_writes`] marks the vendor stage's apply calls,
-//! and the in-place `apply` of an installed tree (which has no later
-//! verifying run to fall back on) keeps its durable writes.
-
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -115,7 +109,11 @@ impl Pending {
         let mut touched = false;
         for file in self.files.iter_mut() {
             if let Ok(rest) = file.strip_prefix(from) {
-                *file = to.join(rest);
+                *file = if rest.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(rest)
+                };
                 touched = true;
             }
         }
@@ -315,22 +313,6 @@ fn device_flush(_handle: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-tokio::task_local! {
-    static ARTIFACT_SCOPE: ();
-}
-
-/// Run `f` with the apply engine's patched-file writes classed as artifact
-/// writes (see the module docs): the vendor stage's apply, whose output is
-/// re-verified on every later run.
-pub(crate) async fn artifact_writes<F: Future>(f: F) -> F::Output {
-    ARTIFACT_SCOPE.scope((), f).await
-}
-
-/// Whether the current task runs inside [`artifact_writes`].
-pub(crate) fn in_artifact_scope() -> bool {
-    ARTIFACT_SCOPE.try_with(|_| ()).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +337,23 @@ mod tests {
     }
 
     #[test]
+    fn moved_file_remains_syncable_without_a_trailing_separator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("download.whl");
+        let artifact = tmp.path().join("committed.whl");
+        std::fs::write(&stage, b"verified archive").unwrap();
+        let mut pending = Pending {
+            files: Vec::new(),
+            dirs: BTreeSet::new(),
+        };
+        pending.record(&stage);
+        std::fs::rename(&stage, &artifact).unwrap();
+        pending.moved(&stage, &artifact);
+        assert_eq!(pending.files, vec![artifact]);
+        sync_all_blocking(&pending.files, &pending.dirs).unwrap();
+    }
+
+    #[test]
     fn sync_skips_vanished_files_and_syncs_the_rest() {
         let tmp = tempfile::tempdir().unwrap();
         let kept = tmp.path().join("kept");
@@ -362,12 +361,5 @@ mod tests {
         let gone = tmp.path().join("gone");
         let dirs: BTreeSet<PathBuf> = [tmp.path().to_path_buf()].into();
         sync_all_blocking(&[kept.clone(), gone, kept], &dirs).unwrap();
-    }
-
-    #[tokio::test]
-    async fn artifact_scope_is_task_local() {
-        assert!(!in_artifact_scope());
-        artifact_writes(async { assert!(in_artifact_scope()) }).await;
-        assert!(!in_artifact_scope());
     }
 }

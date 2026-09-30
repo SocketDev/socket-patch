@@ -32,6 +32,9 @@
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -87,8 +90,13 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
             cmd.env_remove(&k);
         }
     }
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        cwd,
+        args,
+        &[("MAVEN_REPO_LOCAL", m2.to_str().unwrap())],
+    );
     let out = cmd
-        .args(args)
         .current_dir(cwd)
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NO_CONFIG", "1")

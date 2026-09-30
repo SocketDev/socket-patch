@@ -14,6 +14,9 @@
 //!    vendored preflight in front of a hosted revert, and the hosted
 //!    artifact preflight in front of a vendored revert.
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 use base64::Engine as _;
@@ -145,16 +148,18 @@ fn scan(root: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> (i32, V
 /// `vendor --offline`: nothing hosted to restore.
 fn vendor(root: &Path, extra: &[&str]) -> (i32, Value, String) {
     let cwd = root.to_str().unwrap().to_string();
-    let mut argv = vec!["vendor", "--offline", "--cwd", &cwd];
+    let fixture = prebuilt_common::Server::project(root);
+    let mut argv = vec!["vendor", "--cwd", &cwd];
     argv.extend_from_slice(extra);
-    hosted::run_json(root, &argv, &[])
+    hosted::run_json(root, &argv, &[("SOCKET_VENDOR_URL", &fixture.uri)])
 }
 
 /// `vendor` over a hosted pin on `server`: online, the takeover's upstream
 /// restore reads the registry mirror.
 fn vendor_online(root: &Path, server: &MockServer, extra: &[&str]) -> (i32, Value, String) {
     let cwd = root.to_str().unwrap().to_string();
-    let mut argv = vec!["vendor", "--cwd", &cwd];
+    let uri = server.uri();
+    let mut argv = args(&cwd, &uri, &["vendor"]);
     argv.extend_from_slice(extra);
     run_online(root, &argv, server)
 }

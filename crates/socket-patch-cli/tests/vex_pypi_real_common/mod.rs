@@ -360,6 +360,8 @@ pub struct RealApi {
 
 impl RealApi {
     pub fn start(uuid: &str, pristine: &[u8], patched: &[u8]) -> Self {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha512};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -369,6 +371,10 @@ impl RealApi {
             .unwrap();
         let server = rt.block_on(wiremock::MockServer::start());
         let wheel = build_wheel(patched);
+        let wheel_sha512 = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&wheel))
+        );
         let api = RealApi {
             rt,
             server,
@@ -405,7 +411,8 @@ impl RealApi {
                     "results": { uuid: {
                         "status": "granted", "url": url, "purl": PURL,
                         "artifacts": [{ "kind": "tarball", "url": url,
-                                        "integrity": { "sha256": api.wheel_sha256 } }],
+                                        "integrity": { "sha256": api.wheel_sha256,
+                                                       "sha512": wheel_sha512 } }],
                         "registryOverride": null
                     } }
                 }))),

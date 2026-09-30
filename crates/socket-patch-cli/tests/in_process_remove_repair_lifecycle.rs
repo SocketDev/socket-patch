@@ -5,6 +5,9 @@
 //! (file/diff) and checks that the removed `package` mode fails hard. Both are run in-process so
 //! coverage is captured.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 use serial_test::serial;
@@ -881,7 +884,7 @@ mod vlt_vendored;
 /// `remove` then reverts the vlt wiring and deletes the artifact.
 #[tokio::test]
 #[serial]
-async fn vlt_repair_rebuilds_the_dir_then_remove_reverts_it() {
+async fn vlt_repair_redownloads_the_dir_then_remove_reverts_it() {
     use vlt_hosted_common as hosted;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -890,7 +893,9 @@ async fn vlt_repair_rebuilds_the_dir_then_remove_reverts_it() {
     std::fs::remove_dir_all(&uuid_dir).unwrap();
 
     let mut args = make_repair_args(root, "diff");
-    args.common.offline = true;
+    let fixture = prebuilt_common::Server::project(root);
+    args.common.offline = false;
+    fixture.configure(&mut args.common);
     assert_eq!(repair_run(args).await, 0);
     assert_eq!(
         std::fs::read(root.join(vlt_vendored::rel()).join("index.js")).unwrap(),

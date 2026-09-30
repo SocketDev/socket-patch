@@ -299,8 +299,29 @@ impl<'a> ManifestlessVex<'a> {
     fn embedded_attest(&self, project: &Path, state: &str, keep_ledgers: bool) {
         let lock = std::fs::read(project.join("yarn.lock")).expect("yarn.lock");
         for (label, make) in &self.embedded {
-            let out = run_vex(&binary(), project, &make(self.online()));
-            self.attested(&out, &format!("embedded {label} ({state})"));
+            let run = make(self.online());
+            let missing_ledger = self.wiring == Wiring::Vendored
+                && !keep_ledgers
+                && matches!(run.via, crate::vex_e2e_common::VexVia::Scan);
+            if missing_ledger {
+                let output = project.join(
+                    run.output
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("out.vex.json")),
+                );
+                let _ = std::fs::remove_file(output);
+            }
+            let out = run_vex(&binary(), project, &run);
+            if missing_ledger {
+                assert_eq!(out.code, Some(1), "{out}");
+                assert_eq!(
+                    out.envelope["vendor"]["events"][0]["errorCode"], "vendor_ledger_entry_missing",
+                    "{out}"
+                );
+                assert!(out.doc.is_none(), "failed scan cannot emit VEX: {out}");
+            } else {
+                self.attested(&out, &format!("embedded {label} ({state})"));
+            }
             assert!(
                 !project.join(".socket/manifest.json").exists(),
                 "{}: embedded {label} ({state}) must not write a manifest",

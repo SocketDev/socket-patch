@@ -1,23 +1,11 @@
 //! The one vendored-mode backend: [`VendoredBackend`] with its three
 //! operations, shared by every command that vendors, un-vendors or repairs.
 //!
-//! * [`VendoredBackend::apply`] — stage the patch content in memory, run
-//!   the vendor engine ([`vendor_records_reusing`]), persist each ledger
-//!   entry. `vendor`, `scan --mode vendored` (JSON and interactive arms)
-//!   and `get --mode vendored` are its callers; they differ only in where
-//!   the patch records come from (the manifest, or the download phase's
-//!   in-memory records) and in their output shape.
-//! * [`VendoredBackend::revert`] — revert ledger entries through the
-//!   per-ecosystem backends (drift-keep, `--preserve-state` and dry-run
-//!   classification in one place). `vendor --revert`, the manifest
-//!   reconcile, `rollback`'s vendored leg and both of `remove`'s paths map
-//!   its [`VendorRevertStep`]s onto their own event vocabulary.
-//! * [`VendoredBackend::repair`] — health-check the ledger and re-vendor
-//!   missing or corrupt artifacts through `apply`, so a repair downloads
-//!   the patch service's prebuilt artifact exactly like the original
-//!   `vendor` did (local build as the `--vendor-source auto` fallback).
-//!   Lockfile references with no ledger entry are reported, never
-//!   re-synthesized (see [`repair`]).
+//! * [`VendoredBackend::apply`] downloads verified server artifacts and
+//!   persists their wiring and ledger entries through `vendor_records_reusing`.
+//! * [`VendoredBackend::revert`] restores the recorded project wiring.
+//! * [`VendoredBackend::repair`] redownloads missing or corrupt artifacts,
+//!   preserving their recorded identities, lockfiles and ledger.
 //!
 //! The backends themselves (`dispatch_vendor_one`, `dispatch_revert_one*`)
 //! stay in `vendor.rs`; this module is the policy layer over them.
@@ -33,15 +21,12 @@ use socket_patch_core::vendor::{
 };
 
 use crate::args::GlobalArgs;
-use crate::commands::fetch_stage::{
-    drop_unstageable, stage_vendor_sources_in_memory, MemStageOutcome,
-};
 use crate::commands::vendor::{dispatch_revert_one_opts, vendor_records_reusing};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::Envelope;
 
 /// The vendored-mode backend for one run: the run's global args and its
-/// patch-service config (`None` = build-only; `--revert` never needs one).
+/// patch-service config (`--revert` does not need one).
 pub(crate) struct VendoredBackend<'a> {
     pub(crate) common: &'a GlobalArgs,
     pub(crate) service: Option<&'a VendorServiceConfig>,
@@ -49,19 +34,11 @@ pub(crate) struct VendoredBackend<'a> {
 
 /// What [`VendoredBackend::apply`] vendors.
 pub(crate) struct ApplyRequest<'a> {
-    /// The patch records to vendor, keyed by (manifest-spelled) purl. A
-    /// manifest VIEW: staging probes blobs by the records' hashes.
+    /// Patch records keyed by manifest purl.
     pub(crate) manifest: &'a PatchManifest,
-    /// The `.socket/` dir whose committed blobs/diffs/packages staging
-    /// reads in place.
     pub(crate) socket_dir: &'a Path,
-    /// The vendor ledger, loaded ONCE by the caller under its apply lock:
-    /// the staging harvest reads it, then the engine takes it over for its
-    /// persists. An unreadable one is the engine's loud report.
+    /// Loaded once by the caller under the apply lock.
     pub(crate) ledger: std::io::Result<VendorState>,
-    /// Blob content the caller already holds (the download phase's), so
-    /// the stager fetches no view twice.
-    pub(crate) seed: HashMap<String, Vec<u8>>,
     /// `true` for manifest-free vendoring (`scan`/`get --mode vendored`,
     /// and repair of an entry with no manifest owner).
     pub(crate) detached: bool,
@@ -72,16 +49,6 @@ pub(crate) struct ApplyRequest<'a> {
     pub(crate) prior: Option<&'a NpmCrawlSnapshot>,
 }
 
-/// Staging obtained no patch content at all (offline, or every view fetch
-/// failed): nothing reached the engine. Callers report it as
-/// `no_local_source` in their own output shape.
-#[derive(Debug)]
-pub(crate) struct NoLocalSource;
-
-/// The contract message of [`NoLocalSource`].
-pub(crate) const NO_LOCAL_SOURCE_MESSAGE: &str =
-    "patch artifacts unavailable (offline or download failure)";
-
 impl<'a> VendoredBackend<'a> {
     pub(crate) fn new(common: &'a GlobalArgs, service: Option<&'a VendorServiceConfig>) -> Self {
         Self { common, service }
@@ -89,41 +56,24 @@ impl<'a> VendoredBackend<'a> {
 
     /// Vendor `req.manifest`'s records. The caller holds the apply lock.
     ///
-    /// Patch content is staged IN MEMORY (committed `.socket` artifacts read
-    /// in place, the rest fetched per patch over the service config's API
-    /// client) — vendoring never writes blobs. A record whose content could
-    /// not be obtained is reported per package (`no_local_source`) and left
-    /// out; the rest still vendors. `Ok(has_errors)` otherwise.
+    /// Each package fails closed if its server artifact is unavailable.
+    /// Returns whether any package failed.
     ///
     /// The engine future is boxed here — this is its transient frame, so no
     /// caller's poll frame embeds it (Windows' 1 MiB main-thread stack; see
     /// `scan_run_fits_windows_main_thread_stack`).
-    pub(crate) async fn apply(
-        &self,
-        req: ApplyRequest<'_>,
-        env: &mut Envelope,
-    ) -> Result<bool, NoLocalSource> {
+    pub(crate) async fn apply(&self, req: ApplyRequest<'_>, env: &mut Envelope) -> bool {
         let common = self.common;
-        let staged = match stage_vendor_sources_in_memory(
-            common,
-            req.manifest,
-            req.socket_dir,
-            &common.cwd,
-            req.ledger.as_ref().map(|s| &s.entries),
-            req.seed,
-            self.service.and_then(|s| s.client.as_ref()),
-        )
-        .await
-        {
-            MemStageOutcome::Ready(s) => s,
-            MemStageOutcome::Unavailable => return Err(NoLocalSource),
+        let blobs = req.socket_dir.join("blobs");
+        let sources = socket_patch_core::patch::apply::PatchSources {
+            blobs_path: &blobs,
+            diffs_path: None,
+            mem_blobs: None,
         };
-        let sources = staged.as_patch_sources();
-        let (records, staging_errors) =
-            drop_unstageable(env, &req.manifest.patches, staged.unavailable());
-        let engine_errors = Box::pin(vendor_records_reusing(
+        let records = &req.manifest.patches;
+        Box::pin(vendor_records_reusing(
             common,
-            &records,
+            records,
             &sources,
             req.detached,
             req.force,
@@ -132,8 +82,7 @@ impl<'a> VendoredBackend<'a> {
             req.ledger,
             req.prior,
         ))
-        .await;
-        Ok(staging_errors || engine_errors)
+        .await
     }
 
     /// Revert the ledger entries `keys` (in order) with `opts`, mutating

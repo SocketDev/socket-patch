@@ -589,14 +589,24 @@ fn auto_detect_multi_manifest_warning_reaches_json_envelope() {
         ])
         .output()
         .expect("invoke vex");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
     let w = env["warnings"]
         .as_array()
-        .and_then(|ws| ws.iter().find(|w| w["code"] == "product_multiple_manifests"))
+        .and_then(|ws| {
+            ws.iter()
+                .find(|w| w["code"] == "product_multiple_manifests")
+        })
         .unwrap_or_else(|| panic!("product_multiple_manifests warning expected: {env}"));
     assert!(
-        w["detail"].as_str().unwrap().contains("Multiple project manifests"),
+        w["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Multiple project manifests"),
         "{w}"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -681,6 +691,7 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
             base_purl: purl.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
                 size: None,

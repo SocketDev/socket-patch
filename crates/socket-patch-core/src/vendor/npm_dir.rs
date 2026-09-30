@@ -15,7 +15,7 @@
 //! packages publish) while keeping vlt's links out, and `<uuid>/.gitattributes`
 //! stops EOL conversion from rewriting the payload on a Windows checkout.
 //!
-//! One deterministic transform runs on every tree, service-built or local:
+//! One deterministic transform runs on every tree, downloaded from the service:
 //! the top-level `devDependencies` member is cut out of `package.json` (vlt
 //! installs a `file` node's devDependencies), and nothing else changes. The
 //! verifiers then apply the vlt manifest exemption ([`super::verify`]).
@@ -274,7 +274,7 @@ pub(crate) fn replace_dependency_token(
 
 /// The `devDependencies` strip on a staged tree's `package.json`. A
 /// refusal is the ready outcome.
-async fn apply_transforms(
+pub(super) async fn apply_transforms(
     stage: &Path,
     name: &str,
     version: &str,
@@ -538,12 +538,12 @@ pub(crate) fn gitignored_detail(rel: &str, rules: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_dir(
     purl: &str,
-    installed_dir: PackageSource<'_>,
+    _installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     warnings: &mut Vec<VendorWarning>,
     service: Option<&VendorServiceConfig>,
 ) -> Result<(Option<NpmStagedDir>, ApplyResult), Box<VendorOutcome>> {
@@ -556,7 +556,7 @@ pub(super) async fn stage_patch_dir(
         .keys()
         .any(|k| normalize_file_path(k) == "package.json");
 
-    let mut reusable = false;
+    let reusable = false;
     match super::reuse::reusable_committed_dir(project_root, record, &rel_dir).await {
         Ok(inventory) => {
             if !dry_run {
@@ -584,7 +584,7 @@ pub(super) async fn stage_patch_dir(
                     result,
                 ));
             }
-            reusable = true;
+            return Ok((None, already_patched_result(purl, &rel_abs, &record.files)));
         }
         Err(miss) => super::reuse::log_miss(purl, &miss),
     }
@@ -601,7 +601,7 @@ pub(super) async fn stage_patch_dir(
     })?;
     let stage = stage_tmp.path().join("stage");
     let mut result = None;
-    if let Some(cfg) = service.filter(|cfg| cfg.service_enabled() && !dry_run) {
+    if let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) {
         match try_service_dir(
             purl,
             record,
@@ -617,7 +617,6 @@ pub(super) async fn stage_patch_dir(
                 result = Some(already_patched_result(purl, &rel_abs, &record.files));
             }
             ServiceDir::HardFail(outcome) => return Err(outcome),
-            ServiceDir::FallBack => {}
         }
     }
     let result = match result {
@@ -626,32 +625,7 @@ pub(super) async fn stage_patch_dir(
             apply_transforms(&stage, &coords.name, &coords.version).await?;
             result
         }
-        None => {
-            if let Err(e) = installed_dir.stage_into(&stage, None).await {
-                return Err(Box::new(done_failure(
-                    purl,
-                    format!("cannot stage a copy of the installed package: {e}"),
-                )));
-            }
-            prune_staged_node_modules(purl, &stage, &coords.name, &coords.version).await?;
-            let result = super::force_apply_staged(
-                purl,
-                &stage,
-                record,
-                sources,
-                dry_run,
-                force,
-                &coords.name,
-                &coords.version,
-                warnings,
-            )
-            .await;
-            if !result.success {
-                return Ok((None, result));
-            }
-            apply_transforms(&stage, &coords.name, &coords.version).await?;
-            result
-        }
+        None => return Err(Box::new(super::service_fetch::required())),
     };
     if dry_run {
         return Ok((None, result));
@@ -885,7 +859,7 @@ type ServiceDir = ServiceAttempt<()>;
 /// afterHash-verified, extracted into `stage` with its first path component
 /// stripped whatever it is called. The fallback policy is the tarball
 /// backends' (`try_service_pack`).
-async fn try_service_dir(
+pub(super) async fn try_service_dir(
     purl: &str,
     record: &PatchRecord,
     cfg: &VendorServiceConfig,
@@ -1216,8 +1190,10 @@ mod tests {
         let why = gitignore_probe(&root, &outside).await.unwrap_err();
         assert!(why.contains("`git check-ignore` exited 128"), "{why}");
         assert_eq!(gitignored(&root, &outside).await, None);
-        assert!(gitignore_unchecked_detail(".socket/vendor/npm/u/a-1.0.0", &why)
-            .contains("make sure no ignore rule covers .socket/"));
+        assert!(
+            gitignore_unchecked_detail(".socket/vendor/npm/u/a-1.0.0", &why)
+                .contains("make sure no ignore rule covers .socket/")
+        );
     }
 
     #[cfg(unix)]

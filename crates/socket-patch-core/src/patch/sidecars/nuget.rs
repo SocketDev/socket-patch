@@ -28,7 +28,7 @@ use super::{
 };
 
 /// `pub(crate)`: the NuGet vendor backend materialises exactly these two
-/// package-root paths when a local rebuild keeps the package's parts in
+/// package-root paths when an in-memory patch engine keeps the package's parts in
 /// memory, so the fixup sees the same root a full extraction gave it. One
 /// definition, so the two cannot drift apart.
 pub(crate) const METADATA_FILE: &str = ".nupkg.metadata";

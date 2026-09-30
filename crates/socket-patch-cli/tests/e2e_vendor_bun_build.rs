@@ -39,7 +39,7 @@
 //!
 //! The get-driven twin (v3.6) replaces steps 2–3 with a wiremock
 //! `view/{uuid}` (same hashes, base64 `blobContent` of the after bytes) and
-//! `get <uuid> --mode vendored --vendor-source build` — scan's vendored
+//! `get <uuid> --mode vendored --vendor-source service` — scan's vendored
 //! posture end to end: committed artifact + ledger (detached record) + wired
 //! lock, NO manifest, NO `.socket/blobs` — then re-runs the same fresh-checkout install proof.
 //! The revert half is not repeated there: `vendor --revert` on the
@@ -73,6 +73,9 @@
 //! failures, and `SOCKET_PATCH_BUN_E2E_VERSION` (when set, non-empty) must
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -280,8 +283,10 @@ fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
 /// should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).arg("--no-telemetry").current_dir(cwd);
+    cmd.current_dir(cwd);
     cache_env::scrub_ambient_bun_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
+    cmd.arg("--no-telemetry");
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -1111,7 +1116,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     assert_eq!(renv["status"], "success", "repair envelope: {renv}");
     assert_eq!(
         renv["summary"]["rebuilt"], 1,
-        "repair must rebuild the one deleted artifact: {renv}"
+        "repair must redownload the one deleted artifact: {renv}"
     );
     assert!(
         renv["events"]
@@ -1301,27 +1306,29 @@ fn bun_vendor_tampered_tarball_digest_boundary() {
 /// to record the manifest and stage the patched content in memory (no
 /// `.socket/blobs` is ever written).
 async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8]) {
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": git_sha256(before),
+                "afterHash": git_sha256(after),
+                "blobContent": b64(after),
+            }
+        },
+        "vulnerabilities": { GHSA: {
+            "cves": [CVE], "summary": "vendor bun capstone vuln",
+            "severity": "high", "description": "d"
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": git_sha256(before),
-                    "afterHash": git_sha256(after),
-                    "blobContent": b64(after),
-                }
-            },
-            "vulnerabilities": { GHSA: {
-                "cves": [CVE], "summary": "vendor bun capstone vuln",
-                "severity": "high", "description": "d"
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
 }
@@ -1343,8 +1350,7 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
 
     // Steps 2–3, get-driven: the patch record comes from a mocked
     // `view/{uuid}` instead of a hand-staged `.socket/`, and the vendor step
-    // builds the artifact locally (`--vendor-source build` — no vendoring
-    // service, so no grant/tarball mocks are needed).
+    // downloads the published artifact from the fixture service.
     let server = MockServer::start().await;
     mock_view(&server, purl, &fx.orig, &fx.patched).await;
 
@@ -1367,7 +1373,7 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
             "--org",
             ORG,
             "--vendor-source",
-            "build",
+            "service",
         ],
     );
     assert_eq!(
@@ -1533,8 +1539,8 @@ fn fresh_frozen_install_with_local_deps(fx: &BunProject, name: &str, tgzs: &[Str
 /// WITHOUT its sha512 whenever the lock is re-saved for another reason
 /// (measured on 1.1.45, 1.2.23 and 1.3.9; 1.3.10+ keep it). The 2-tuple is
 /// still our wiring, so after a real re-save: the `vendor` re-run must stay
-/// a clean no-op that heals the digest, `repair` must rebuild a deleted
-/// artifact through it and re-pin the digest, a fresh frozen install must
+/// a clean no-op that heals the digest, `repair` must redownload a deleted
+/// artifact without changing the lock, a fresh frozen install must
 /// land the patched bytes, and — after bun drops the digest AGAIN —
 /// `vendor --revert` must restore the registry line inside the grown lock.
 /// On ≥ 1.3.10 the same steps are the no-regression twin (digest kept).
@@ -1589,9 +1595,12 @@ fn bun_vendor_survives_a_digest_dropping_lock_resave() {
     eprintln!("RE-VENDOR OK");
 
     // 3. Repair through a digest-less line: drop the digest again, delete
-    //    the artifact, rebuild.
+    //    the artifact, then redownload the exact published bytes.
     let tgz_b = grow_project_with_local_dep(&fx, 2);
     assert_resave_shape(&fx, &wired_line);
+    let lock_before_repair = std::fs::read_to_string(&lock_path).unwrap();
+    let artifact_before_repair = std::fs::read(vendored_tgz(&fx)).unwrap();
+    let ledger_before_repair = std::fs::read(proj.join(".socket/vendor/state.json")).unwrap();
     std::fs::remove_dir_all(vendored_dir(proj)).unwrap();
     let (code, stdout, stderr) = run_socket(
         proj,
@@ -1614,9 +1623,16 @@ fn bun_vendor_survives_a_digest_dropping_lock_resave() {
     assert!(vendored_tgz(&fx).is_file(), "the artifact must be rebuilt");
     let repaired = std::fs::read_to_string(&lock_path).unwrap();
     assert_eq!(
-        packages_line(&repaired, DEP),
-        wired_line,
-        "repair re-pins the digest into the healed 3-tuple:\n{repaired}"
+        repaired, lock_before_repair,
+        "repair must preserve the package-manager lock byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read(vendored_tgz(&fx)).unwrap(),
+        artifact_before_repair
+    );
+    assert_eq!(
+        std::fs::read(proj.join(".socket/vendor/state.json")).unwrap(),
+        ledger_before_repair
     );
     eprintln!("REPAIR THROUGH DIGEST-LESS LOCK OK");
 

@@ -15,6 +15,9 @@
 //! `get_api_client_with_overrides` in core for every command and is
 //! out of scope for `scan`'s `--silent` gating.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -144,24 +147,26 @@ async fn mount_one_patch_api(mock: &MockServer, purl: &str, before: &[u8]) {
         .await;
 
     // base64 of "after\n" — inline so the apply step needs no blob endpoint.
+    let archive_view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash,
+                "afterHash": after_hash,
+                "blobContent": "YWZ0ZXIK",
+            }
+        },
+        "vulnerabilities": {},
+        "description": "Silent test patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(mock, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash": after_hash,
-                    "blobContent": "YWZ0ZXIK",
-                }
-            },
-            "vulnerabilities": {},
-            "description": "Silent test patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }

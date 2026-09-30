@@ -111,7 +111,7 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
             format!("archive {} is not a regular file", archive_path.display()),
         )));
     }
-    read_archive_from_reader(file, false)
+    read_archive_from_reader(file, false, true)
 }
 
 /// [`read_archive_to_map`] over an in-memory `.tar.gz` — the same bomb caps,
@@ -119,7 +119,7 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
 /// decode the SAME bytes (a committed artifact read once, so no swap between
 /// the whole-file hash and the member check can go unnoticed).
 pub fn read_archive_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
-    read_archive_from_reader(bytes, false)
+    read_archive_from_reader(bytes, false, true)
 }
 
 /// [`read_archive_bytes_to_map`] that additionally refuses any archive an
@@ -142,7 +142,15 @@ pub fn read_archive_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>
 pub fn read_archive_bytes_to_map_strict(
     bytes: &[u8],
 ) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
-    read_archive_from_reader(bytes, true)
+    read_archive_from_reader(bytes, true, true)
+}
+
+/// Read a source distribution without npm's `package/` prefix convention.
+/// Uses the same strict member checks and decompression limits.
+pub(crate) fn read_sdist_tar_bytes_to_map_strict(
+    bytes: &[u8],
+) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    read_archive_from_reader(bytes, true, false)
 }
 
 /// The shared decoder behind [`read_archive_to_map`] and
@@ -152,6 +160,7 @@ pub fn read_archive_bytes_to_map_strict(
 fn read_archive_from_reader<R: Read>(
     reader: R,
     strict: bool,
+    strip_package_prefix: bool,
 ) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     // Hard-cap decompressed bytes to defuse gzip / tar bombs. Reads
     // beyond the limit yield EOF, which the tar parser surfaces as a
@@ -190,7 +199,12 @@ fn read_archive_from_reader<R: Read>(
                 }
                 // The installers strip the FIRST segment whatever it is;
                 // only `package/` maps onto the decoded key space.
-                let stripped = if is_dir && raw.trim_end_matches('/') == "package" {
+                let stripped = if !strip_package_prefix {
+                    if raw.starts_with(['/', '\\']) || !is_safe_relative_subpath(&raw) {
+                        return Err(ArchiveError::UnsafePath(raw));
+                    }
+                    Some(raw.as_str())
+                } else if is_dir && raw.trim_end_matches('/') == "package" {
                     None
                 } else if let Some(rest) = raw.strip_prefix("package/") {
                     Some(rest)
@@ -233,7 +247,12 @@ fn read_archive_from_reader<R: Read>(
         // absolute path `/etc/passwd`. `Path::join` resolves an absolute
         // right-hand side by discarding the base, so that would escape the
         // package directory entirely. Always validate post-normalization.
-        let normalized = normalize_file_path(&path_str).to_string();
+        let normalized = if strip_package_prefix {
+            normalize_file_path(&path_str)
+        } else {
+            &path_str
+        }
+        .to_string();
         let normalized_path = Path::new(&normalized);
 
         // This is THE path-safety chokepoint for archive entries (see the

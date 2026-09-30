@@ -53,6 +53,7 @@ use crate::utils::line_endings::LineEndings;
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::uri::encode_uri_component;
 
+#[cfg(test)]
 use super::berry_zip::berry_cache_checksum_10c0;
 use super::common::{already_patched_result, parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
@@ -235,7 +236,7 @@ pub async fn vendor_yarn_berry<'a>(
     };
     let uuid_dir_preexisted = staged.uuid_dir_preexisted;
     debug_assert_eq!(staged.rel_tgz, rel_tgz);
-    let packed = staged.packed;
+    let mut packed = staged.packed;
     let dest = project_root.join(&rel_tgz);
 
     // ── 8. Berry identity facts of the packed tarball ─────────────────────
@@ -273,18 +274,22 @@ pub async fn vendor_yarn_berry<'a>(
     // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
     // tamper guard on the tarball itself (flips on any byte edit).
     let hash6 = &tgz_sha512[..6];
-    let checksum = match berry_cache_checksum_10c0(&tgz_bytes, name) {
-        Ok(c) => checksum_in_lock_spelling(&lock_text, &c),
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot compute the berry cache checksum for {name}: {e}"),
-                project_root,
-                &uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
+    if packed.yarn_berry10c0.is_none() {
+        if let Some(cfg) = service.filter(|cfg| cfg.service_enabled()) {
+            if let super::service_fetch::ServiceArtifact::Ready(archive) =
+                super::service_fetch::fetch_verified_archive(cfg, &record.uuid).await
+            {
+                if hex::encode(Sha256::digest(&archive.bytes)) == packed.sha256_hex {
+                    packed.yarn_berry10c0 = archive.yarn_berry10c0;
+                }
+            }
         }
+    }
+    let checksum = match packed.yarn_berry10c0.as_deref().filter(|c| valid_berry_checksum(c)) {
+        Some(c) => checksum_in_lock_spelling(&lock_text, c),
+        None => return done_failure_unstage(purl,
+            format!("the patch service supplied no Yarn Berry checksum for {name}; retry after the server artifact is ready"),
+            project_root, &uuid_dir_rel, uuid_dir_preexisted).await,
     };
 
     // ── 9. The replacement lock entry (verbatim B3 shape) ─────────────────
@@ -418,6 +423,7 @@ pub async fn vendor_yarn_berry<'a>(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: packed.yarn_berry10c0.clone(),
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -1515,7 +1521,7 @@ __metadata:
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_yarn_berry(
+            crate::vendor::test_support::vendor_yarn_berry(
                 "pkg:npm/left-pad@1.3.0",
                 &self.installed(),
                 self.root(),
@@ -1571,7 +1577,7 @@ __metadata:
         cfg: Option<&crate::vendor::VendorServiceConfig>,
     ) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor_yarn_berry(
+        crate::vendor::test_support::vendor_yarn_berry(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -1689,7 +1695,12 @@ __metadata:
         let fx = fixture().await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         let entry = entry.expect("success carries a ledger entry");
 
         // package.json: byte-for-byte the B3 after fixture.
@@ -1981,7 +1992,7 @@ __metadata:
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("berry cache checksum"),
+                .contains("no Yarn Berry checksum"),
             "{:?}",
             result.error
         );
@@ -2004,7 +2015,12 @@ __metadata:
             entry.is_none(),
             "in-sync re-run must not produce a new ledger entry"
         );
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         assert!(
             result
                 .files_verified
@@ -2693,7 +2709,7 @@ __metadata:
         let fx = fixture().await;
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_yarn_berry(
+        let outcome = crate::vendor::test_support::vendor_yarn_berry(
             "pkg:gem/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -2758,19 +2774,6 @@ __metadata:
         let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
         assert!(detail.contains("is not an object"), "{detail}");
-        fx.assert_untouched().await;
-
-        // Bundled dependencies: stage_patch_pack's refusal bubbles verbatim
-        // before anything inside the project is written.
-        let fx = fixture().await;
-        tokio::fs::write(
-            fx.installed().join("package.json"),
-            br#"{"name":"left-pad","version":"1.3.0","bundledDependencies":["x"]}"#,
-        )
-        .await
-        .unwrap();
-        let detail = expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
-        assert!(detail.contains("bundleDependencies"), "{detail}");
         fx.assert_untouched().await;
     }
 
@@ -3598,7 +3601,12 @@ __metadata:
             let fx = fixture_with(&pkg_before, &lock_before).await;
             let (result, entry, warnings) = expect_done(fx.vendor(false).await);
             assert!(result.success, "{label}: {:?}", result.error);
-            assert!(warnings.is_empty(), "{label}: {warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| w.code == "vendor_prebuilt_downloaded"),
+                "{label}: {warnings:?}"
+            );
             let entry = entry.expect("a ledger entry");
 
             let (hash6, checksum) = fx.packed_berry_facts().await;
@@ -3974,4 +3982,10 @@ __metadata:
         assert_eq!(looped, Err("vendor_lockfile_missing"));
         assert_eq!(planned, looped, "a missing lock");
     }
+}
+
+pub(crate) fn valid_berry_checksum(value: &str) -> bool {
+    value
+        .strip_prefix("10c0/")
+        .is_some_and(|hash| hash.len() == 128 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
 }

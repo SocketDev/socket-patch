@@ -61,7 +61,7 @@ pub(super) async fn load(
             )
         })?;
         if leaf.contains(['/', '\\', '%', ':'])
-            || !leaf.ends_with(".whl")
+            || !super::pypi_distribution::supported(leaf)
             || hash.len() != 64
             || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
         {

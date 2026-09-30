@@ -122,7 +122,13 @@ fn v2_hits(
             });
         }
         if let Some(nested) = entry.get("dependencies").and_then(Value::as_object) {
-            v2_hits(nested, &format!("{pointer}/dependencies"), ctx, hits, depth + 1);
+            v2_hits(
+                nested,
+                &format!("{pointer}/dependencies"),
+                ctx,
+                hits,
+                depth + 1,
+            );
         }
     }
 }
@@ -174,7 +180,9 @@ pub(crate) async fn restore_npm_locks(
                 );
                 continue;
             };
-            let Some(entry) = lock.pointer_mut(&hit.pointer).and_then(Value::as_object_mut)
+            let Some(entry) = lock
+                .pointer_mut(&hit.pointer)
+                .and_then(Value::as_object_mut)
             else {
                 continue;
             };
@@ -428,9 +436,19 @@ async fn restore_berry(
         if result.refused.contains_key(&uuid) {
             continue;
         }
-        let checksum = match ctx.client.npm_tarball(&name, &version).await.and_then(|tgz| {
-            crate::vendor::berry_zip::berry_cache_checksum_10c0(&tgz, &name)
-        }) {
+        let checksum = match ctx
+            .client
+            .npm_berry_checksum(
+                &uuid,
+                &name,
+                &version,
+                ctx.origins
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("https://patch.socket.dev"),
+            )
+            .await
+        {
             Ok(c) => crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(&content, &c),
             Err(why) => {
                 result.refuse(&uuid, format!("{name}@{version}: {why}"));
@@ -451,10 +469,7 @@ async fn restore_berry(
         changed = true;
     }
     if changed {
-        view.write(
-            rel,
-            format!("{bom}{}", eol.restore(&blocks.join("\n\n"))),
-        );
+        view.write(rel, format!("{bom}{}", eol.restore(&blocks.join("\n\n"))));
     }
 }
 
@@ -513,8 +528,7 @@ pub(crate) async fn restore_pnpm_locks(
             let Some(resolution) = pnpm::resolution(&entry) else {
                 continue;
             };
-            let Some((_, uuid, name, version)) =
-                hits.iter().find(|(r, ..)| *r == resolution.range)
+            let Some((_, uuid, name, version)) = hits.iter().find(|(r, ..)| *r == resolution.range)
             else {
                 continue;
             };
@@ -616,7 +630,10 @@ pub(crate) async fn restore_bun_locks(
                 )),
                 _ => result.refuse(
                     &uuid,
-                    format!("the {rel} entry `{}` wiring it is not {}", entry.key, pin.purl),
+                    format!(
+                        "the {rel} entry `{}` wiring it is not {}",
+                        entry.key, pin.purl
+                    ),
                 ),
             }
         }
@@ -702,10 +719,7 @@ pub(crate) async fn cleanup_side_config(
         if let Ok(Some(npmrc)) = view.read(NPMRC_REL).await {
             if npmrc == NPMRC_CREATED {
                 view.remove(NPMRC_REL);
-            } else if npmrc
-                .lines()
-                .any(|l| l.trim() == NPMRC_ALLOW_REMOTE_LINE)
-            {
+            } else if npmrc.lines().any(|l| l.trim() == NPMRC_ALLOW_REMOTE_LINE) {
                 result.warnings.push((
                     "npm_allow_remote_left",
                     format!(
@@ -718,10 +732,7 @@ pub(crate) async fn cleanup_side_config(
         }
     }
 
-    let restored_pnpm = view
-        .staged
-        .keys()
-        .any(|k| k == "pnpm-lock.yaml");
+    let restored_pnpm = view.staged.keys().any(|k| k == "pnpm-lock.yaml");
     if restored_pnpm && !still_hosted(view, &["pnpm-lock.yaml"], ctx).await {
         const WORKSPACE: &str = "pnpm-workspace.yaml";
         if let Ok(Some(ws)) = view.read(WORKSPACE).await {

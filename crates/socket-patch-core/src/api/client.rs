@@ -338,13 +338,13 @@ pub(crate) const MAX_REFERENCE_BATCH: usize = 500;
 /// Why a pypi reference is refused before its download: the served
 /// artifact is not a wheel.
 pub(crate) const PYPI_NOT_A_WHEEL: &str =
-    "the prebuilt artifact is not a .whl (pypi vendoring is wheel-based)";
+    "the prebuilt artifact is not a supported Python distribution (.whl, .tar.gz, .tgz, .zip)";
 
 /// The last path segment of a serve URL, when it names a `.whl`.
 pub(crate) fn wheel_filename_from_url(url: &str) -> Option<String> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let name = path.rsplit('/').next().unwrap_or("");
-    name.ends_with(".whl").then(|| name.to_string())
+    crate::vendor::pypi_distribution::supported(name).then(|| name.to_string())
 }
 
 /// Body payload for the batch search POST endpoint.
@@ -1326,8 +1326,7 @@ impl ApiClient {
             },
             None => download_url.to_string(),
         };
-        // pypi vendoring is wheel-based, so the sdist a qualifier-less pypi
-        // patch is served can never be used: refuse it before downloading.
+        // Reject unsupported distribution names before downloading.
         if result
             .purl
             .as_deref()
@@ -1371,6 +1370,11 @@ impl ApiClient {
         match self.download_vendor_archive_retrying(&download_url).await {
             (ServeDownload::Ok(bytes), _) => {
                 done(VendorServiceOutcome::Ready(FetchedVendorPackage {
+                    yarn_berry10c0: result
+                        .artifacts
+                        .as_ref()
+                        .and_then(|arts| arts.iter().find(|a| a.kind == "yarn-berry-zip"))
+                        .and_then(|a| a.integrity.yarn_berry10c0.clone()),
                     tarball: bytes,
                     integrity_sri,
                     dirhash_h1: artifact.integrity.dirhash_h1.clone(),
@@ -1786,6 +1790,7 @@ pub(crate) const MAX_VENDOR_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// `h1:` dirhash) before writing/extracting.
 #[derive(Debug, Clone)]
 pub(crate) struct FetchedVendorPackage {
+    pub yarn_berry10c0: Option<String>,
     pub tarball: Vec<u8>,
     /// Normalized Subresource-Integrity string, always `sha512-<b64>`.
     pub integrity_sri: String,

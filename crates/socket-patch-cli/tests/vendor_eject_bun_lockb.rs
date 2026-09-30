@@ -21,6 +21,9 @@
 //! registry (`SOCKET_NPM_REGISTRY`) and the patch-server origin
 //! (`SOCKET_PATCH_SERVER_URL`) all point at a wiremock.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -97,7 +100,7 @@ impl Project {
             .env("SOCKET_ORG_SLUG", ORG)
             .env("SOCKET_NPM_REGISTRY", &uri)
             .env("SOCKET_PATCH_SERVER_URL", &uri)
-            .env("SOCKET_VENDOR_SOURCE", "build");
+            .env("SOCKET_VENDOR_SOURCE", "service");
         let out = cmd.output().expect("spawn socket-patch");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let env = serde_json::from_str(&stdout).unwrap_or_else(|e| {
@@ -180,6 +183,7 @@ async fn hosted_project(writer: &str) -> Project {
     let mut view = record();
     view["files"]["package/index.js"]["blobContent"] =
         json!(base64::engine::general_purpose::STANDARD.encode(PATCHED_INDEX));
+    prebuilt_common::mount_view(&project.server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(view))
@@ -337,12 +341,17 @@ async fn takeover_refuses_a_workspace_normalized_hosted_bun_lockb() {
             })
             .unwrap_or_else(|| panic!("expected redirect_revert_failed: {env:#}"));
         assert!(
-            refused["error"].as_str().is_some_and(|e| e
-                .contains("workspace dependency behaviors")
-                && e.contains("git checkout -- bun.lockb")),
+            refused["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("workspace dependency behaviors")
+                    && e.contains("git checkout -- bun.lockb")),
             "{env:#}"
         );
-        assert_eq!(p.lock(), hosted, "{extra:?}: a refused vendor writes nothing");
+        assert_eq!(
+            p.lock(),
+            hosted,
+            "{extra:?}: a refused vendor writes nothing"
+        );
         assert!(!p.root().join(".socket/vendor").exists());
     }
 }

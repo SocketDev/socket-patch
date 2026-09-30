@@ -10,6 +10,7 @@ fn entry(eco: &str, base_purl: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
         base_purl: base_purl.into(),
         uuid: UUID.into(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: format!(".socket/vendor/{eco}/{UUID}/x"),
             sha256: String::new(),
             size: None,

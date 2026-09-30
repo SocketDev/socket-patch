@@ -8,7 +8,7 @@
 //!   stage 1 (networked): `composer update` resolves a real psr/log 3.0.x
 //!     from packagist → a marker patch is hand-staged in-container (manifest
 //!     + blob; git-blob sha256 computed from the ACTUAL installed bytes) →
-//!     `socket-patch vendor --json --offline` (the binary baked into the
+//!     `socket-patch vendor --json` (the binary baked into the
 //!     image) → asserts: artifact dir + `socket-patch.vendor.json` +
 //!     `state.json`, and the composer.lock entry rewired to
 //!     `dist: {type: path, url: <copy>, reference: <patch-uuid>}` +
@@ -35,7 +35,7 @@
 //!     host-owned copy of that really-installed fresh checkout against a mock
 //!     patch API — manifest deleted, then both ledgers deleted (the lock path
 //!     dist + the API record attest), then `--offline` (zero requests).
-//!   stage 3 (`--network none`): re-vendor is idempotent (already_vendored,
+//!   stage 3 (service available): re-vendor is idempotent (already_vendored,
 //!     lock sha256-stable) → `vendor --revert` restores composer.lock
 //!     byte-identical to the pre-vendor snapshot and removes `.socket/vendor`
 //!     entirely → a re-vendor succeeds again.
@@ -56,8 +56,8 @@ mod docker_vendor_common;
 mod vex_e2e_common;
 
 use docker_vendor_common::{
-    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
-    skip_if_no_image, stage_patch_fn,
+    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image_network_none,
+    run_with_fixture, run_with_service, skip_if_no_image, stage_patch_fn,
 };
 
 const IMAGE: &str = "socket-patch-test-composer:latest";
@@ -83,13 +83,12 @@ fn render(stage_body: &str) -> String {
 }
 
 /// Stage 1: real fixture install (network OK) + staged marker patch +
-/// `vendor --json --offline` + artifact/wiring asserts + fresh-checkout
+/// `vendor --json` + artifact/wiring asserts + fresh-checkout
 /// staging of ONLY the committable files.
 const STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-# Keep the in-container socket-patch fully offline (also gates telemetry,
-# which keys off the env var rather than the --offline flag).
-export SOCKET_OFFLINE=1
+# Disable telemetry independently of artifact download access.
+export SOCKET_TELEMETRY_DISABLED=1
 
 cat > composer.json <<'EOF'
 {
@@ -144,8 +143,9 @@ cp composer.lock /workspace/snap/composer.lock.prevendor
 sha256sum /tmp/patched.php | cut -d' ' -f1 > /workspace/snap/patched.sha
 echo "$PSR_VER" > /workspace/snap/psr-ver
 
-# 3. Vendor (fully offline: the blob is staged locally).
-socket-patch vendor --json --offline > /tmp/vendor.json 2>/tmp/vendor.err
+# 3. Download the artifact published from the staged fixture.
+publish_fixture
+socket-patch vendor --json > /tmp/vendor.json 2>/tmp/vendor.err
 RC=$?; cat /tmp/vendor.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/vendor.json >&2; fail "vendor exited $RC (expected 0)"; }
 assert_json_field /tmp/vendor.json '"status": "success"'
@@ -301,11 +301,11 @@ echo "===MANIFESTLESS REVERTED VEX VERIFIED==="
 exit 0
 "#;
 
-/// Stage 3 (`--network none`): idempotent re-vendor → revert (byte-identical
+/// Stage 3 (service available): idempotent re-vendor → revert (byte-identical
 /// lock restore + full `.socket/vendor` removal) → re-vendor works again.
 const STAGE3: &str = r#"
 cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 PSR_VER=$(cat /workspace/snap/psr-ver)
 COPY_REL=".socket/vendor/composer/__UUID__/psr/log@$PSR_VER"
 
@@ -334,7 +334,7 @@ cmp -s composer.lock /workspace/snap/composer.lock.prevendor \
 echo "===REVERT VERIFIED==="
 
 # 3. Re-vendor after revert succeeds and rewires again.
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -492,9 +492,9 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     // confuse Docker Desktop's file-sharing allowlist.
     let host_dir = tmp.path().canonicalize().expect("canonicalize tempdir");
 
-    // Stage 1 — networked fixture install + offline vendor + wiring + VEX
+    // Stage 1 — networked fixture install + service download + wiring + VEX
     // asserts.
-    let out = run_in_image(IMAGE, &host_dir, &render(STAGE1));
+    let (out, service) = run_with_fixture(IMAGE, &host_dir, &render(STAGE1));
     assert_stage_markers(
         "composer stage 1 (install+vendor)",
         &out,
@@ -518,8 +518,8 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     );
     assert_manifestless_vex_from_host(&host_dir);
 
-    // Stage 3 — idempotency, revert, re-vendor (still no network).
-    let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE3));
+    // Stage 3 — idempotency, revert, redownload after revert.
+    let out = run_with_service(IMAGE, &host_dir, &render(STAGE3), &service.docker_uri());
     assert_stage_markers(
         "composer stage 3 (idempotent+revert+re-vendor)",
         &out,

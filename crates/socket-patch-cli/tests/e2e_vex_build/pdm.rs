@@ -311,7 +311,7 @@ fn patched_of(pristine: &[u8]) -> Vec<u8> {
 fn scan_mode_args(mode: Mode) -> Vec<&'static str> {
     match mode {
         Mode::Hosted => vec!["--mode=hosted"],
-        Mode::Vendored => vec!["--vendor", "--vendor-source", "build"],
+        Mode::Vendored => vec!["--vendor", "--vendor-source", "service"],
     }
 }
 

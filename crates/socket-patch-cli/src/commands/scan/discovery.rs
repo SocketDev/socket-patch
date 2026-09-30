@@ -220,29 +220,6 @@ async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
     out
 }
 
-/// Vendor-mode pre-flight check: uuids of selected patches whose installed
-/// files match NEITHER beforeHash nor afterHash — the patch was built
-/// against different bytes than the installed artifact. Vendoring still
-/// succeeds for these (the vendor stage force-applies the verified patched
-/// content; see `force_apply_staged`), but the user learns it before
-/// vendoring starts rather than from a post-hoc warning event.
-///
-/// Returns `(mismatched uuids, fetched views by uuid)`: the download phase
-/// serves its records from the views instead of fetching each one a second
-/// time. Only `Ok(Some)` views are cached — an errored or 404'd fetch is
-/// left for the download phase to retry and report per patch.
-///
-/// `vendor` is the run's ledger (`None` when unreadable — fail-open, the
-/// preflight reports the corruption): a purl the ledger already holds
-/// detached at the selected uuid with an embedded record is compared
-/// against that record's file hashes instead of fetching the view, so an
-/// idempotent re-run performs zero view fetches. Nothing is inserted into
-/// `views` for them.
-///
-/// Best-effort and read-only: a detail-fetch failure or an unresolvable
-/// installed path just skips the annotation — it never blocks the flow and
-/// writes nothing. One API round-trip per uncached patch, so progress
-/// shows on `status`.
 pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[PatchSearchResult],
@@ -369,7 +346,6 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 }
 
 pub(super) use socket_patch_core::ledgers::merge_ledger_records_for_updates;
-
 
 /// Cross-reference an existing manifest against discovery results to find
 /// PURLs whose newest available patch UUID differs from the locally-recorded
@@ -522,8 +498,8 @@ pub(super) fn severity_order(s: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
     use socket_patch_core::api::types::BatchPatchInfo;
+    use std::borrow::Cow;
 
     use crate::commands::scan::tests::manifest_with;
 
@@ -1784,6 +1760,7 @@ mod tests {
             base_purl: "pkg:npm/insync@1.0.0".into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{uuid}/insync-1.0.0.tgz"),
                 sha256: String::new(),
                 size: None,
@@ -1908,7 +1885,11 @@ mod tests {
                 "pkg:npm/lockonly@1.0.0",
                 std::path::PathBuf::from("/nonexistent"),
             ),
-            crawled_pkg("alpha", "pkg:npm/alpha@1.0.0", installed("alpha", "alpha.js")),
+            crawled_pkg(
+                "alpha",
+                "pkg:npm/alpha@1.0.0",
+                installed("alpha", "alpha.js"),
+            ),
             crawled_pkg(
                 "embedded",
                 "pkg:npm/embedded@1.0.0",
@@ -1932,6 +1913,7 @@ mod tests {
                 base_purl: "pkg:npm/embedded@1.0.0".into(),
                 uuid: "u-embedded".into(),
                 artifact: VendorArtifact {
+                    yarn_berry10c0: None,
                     path: ".socket/vendor/npm/u-embedded/embedded-1.0.0.tgz".into(),
                     sha256: String::new(),
                     size: None,

@@ -103,6 +103,28 @@ pub async fn verify_vendored_patch_record(
     if is_vlt_dir_entry(entry) {
         return verify_vlt_dir(project_root, &artifact, entry, record).await;
     }
+    if entry.ecosystem == "pypi" {
+        let name = entry.artifact.path.clone();
+        let members = tokio::task::spawn_blocking(move || {
+            let (file, meta) = crate::utils::fs::open_regular_file_sync(&artifact)
+                .map_err(|_| "vendor_artifact_unreadable")?;
+            if meta.len() > MAX_HEALTH_HASH_BYTES {
+                return Err("vendor_artifact_unreadable".into());
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_HEALTH_HASH_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "vendor_artifact_unreadable")?;
+            if bytes.len() as u64 > MAX_HEALTH_HASH_BYTES {
+                return Err("vendor_artifact_unreadable".into());
+            }
+            super::pypi_distribution::read_members(&bytes, &name)
+                .map_err(|_| "vendor_artifact_unreadable".to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        return super::pypi_distribution::verify_members(&members, &entry.artifact.path, record);
+    }
     let path_str = artifact.to_string_lossy();
     let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
     let is_zip =
@@ -501,6 +523,7 @@ pub fn artifact_is_file_shaped(path: &str) -> bool {
     norm.ends_with(".tgz")
         || norm.ends_with(".tar.gz")
         || norm.ends_with(".whl")
+        || norm.ends_with(".zip")
         || norm.ends_with(".nupkg")
         || norm.ends_with(".jar")
 }
@@ -594,7 +617,7 @@ async fn inventory_walk(
 /// before tagged versions keeps verifying once a re-run / repair tags it,
 /// while every other byte (including any other tag) stays pinned. So the
 /// tag step never re-baselines the inventory over bytes nobody verified.
-async fn verify_dir_inventory(
+pub(super) async fn verify_dir_inventory(
     dir: &Path,
     inventory: &BTreeMap<String, String>,
     cargo_uuid: Option<&str>,
@@ -830,6 +853,7 @@ mod tests {
             base_purl: "pkg:npm/x@1.0.0".into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.into(),
                 sha256: String::new(),
                 size: None,
@@ -1992,8 +2016,10 @@ mod tests {
         // Precondition: the zip reader tolerates the prefix, so member
         // verification alone would bless the artifact…
         assert!(
-            verify_vendored_patch_record(root, &ent, &rec).await.is_ok(),
-            "zip reader must resolve the archive offset past the sparse prefix"
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .is_err(),
+            "member verification also refuses oversized archives"
         );
         // …and only the whole-file arm catches it: file_sha256_hex bails
         // on the size cap, so the recorded sha is unverifiable.

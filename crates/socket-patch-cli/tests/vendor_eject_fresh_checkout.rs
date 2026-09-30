@@ -7,6 +7,9 @@
 //! from the registry (verified against that checksum) instead of requiring
 //! an installed tree. Every registry and API endpoint is a wiremock.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
@@ -38,25 +41,34 @@ fn tgz(prefix: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
-async fn mock_view(server: &MockServer, uuid: &str, purl: &str, file: &str, orig: &[u8], patched: &[u8]) {
+async fn mock_view(
+    server: &MockServer,
+    uuid: &str,
+    purl: &str,
+    file: &str,
+    orig: &[u8],
+    patched: &[u8],
+) {
+    let archive_view = json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            file: {
+                "beforeHash": compute_git_sha256_from_bytes(orig),
+                "afterHash": compute_git_sha256_from_bytes(patched),
+                "blobContent": base64::engine::general_purpose::STANDARD.encode(patched)
+            }
+        },
+        "vulnerabilities": {},
+        "description": "eject fixture",
+        "license": "MIT",
+        "tier": "free"
+    });
+    prebuilt_common::mount_view(server, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uuid": uuid,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                file: {
-                    "beforeHash": compute_git_sha256_from_bytes(orig),
-                    "afterHash": compute_git_sha256_from_bytes(patched),
-                    "blobContent": base64::engine::general_purpose::STANDARD.encode(patched)
-                }
-            },
-            "vulnerabilities": {},
-            "description": "eject fixture",
-            "license": "MIT",
-            "tier": "free"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(server)
         .await;
 }
@@ -96,7 +108,7 @@ fn run_json_with(
         .env("SOCKET_CRATES_INDEX", format!("{uri}/index"))
         .env("SOCKET_CRATES_REGISTRY", format!("{uri}/crates"))
         .env("SOCKET_PATCH_SERVER_URL", &uri)
-        .env("SOCKET_VENDOR_SOURCE", "build")
+        .env("SOCKET_VENDOR_SOURCE", "service")
         .env("CARGO_HOME", &cargo_home)
         .envs(extra.iter().map(|(k, v)| (*k, v.as_str())))
         .output()
@@ -112,9 +124,11 @@ fn run_json_with(
 }
 
 fn applied(env: &Value, purl: &str) -> bool {
-    env["events"]
-        .as_array()
-        .is_some_and(|events| events.iter().any(|e| e["action"] == "applied" && e["purl"] == purl))
+    env["events"].as_array().is_some_and(|events| {
+        events
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == purl)
+    })
 }
 
 /// npm: a hosted package-lock.json with NO `node_modules`. The pristine
@@ -190,7 +204,10 @@ async fn npm_eject_needs_no_installed_tree() {
     let artifact = root.join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
     assert!(artifact.is_file(), "the artifact lands in .socket/vendor/");
     let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
-    assert!(lock.contains(&format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")), "{lock}");
+    assert!(
+        lock.contains(&format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")),
+        "{lock}"
+    );
     assert!(!lock.contains(&hosted), "no hosted residue: {lock}");
 }
 
@@ -210,7 +227,10 @@ async fn cargo_eject_needs_no_cargo_home() {
     let root = tmp.path().join("proj");
     std::fs::create_dir_all(&root).unwrap();
 
-    let krate = tgz("serde-1.0.190", &[("Cargo.toml", TOML), ("src/lib.rs", ORIG)]);
+    let krate = tgz(
+        "serde-1.0.190",
+        &[("Cargo.toml", TOML), ("src/lib.rs", ORIG)],
+    );
     let checksum = hex::encode(Sha256::digest(&krate));
     Mock::given(method("GET"))
         .and(path("/index/se/rd/serde"))
@@ -236,7 +256,8 @@ async fn cargo_eject_needs_no_cargo_home() {
         ),
     )
     .unwrap();
-    let index = format!("sparse+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/");
+    let index =
+        format!("sparse+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/");
     std::fs::write(
         root.join("Cargo.lock"),
         format!(
@@ -255,8 +276,14 @@ async fn cargo_eject_needs_no_cargo_home() {
     assert!(applied(&env, PURL), "{env:#}");
     let toml = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
-    assert!(!toml.contains("socket-patch-"), "hosted registry key removed: {toml}");
-    assert!(!lock.contains("patch.socket.dev"), "no hosted residue: {lock}");
+    assert!(
+        !toml.contains("socket-patch-"),
+        "hosted registry key removed: {toml}"
+    );
+    assert!(
+        !lock.contains("patch.socket.dev"),
+        "no hosted residue: {lock}"
+    );
     assert!(
         std::fs::read_dir(root.join(".socket/vendor/cargo"))
             .map(|mut d| d.next().is_some())
@@ -343,14 +370,19 @@ async fn pypi_eject_needs_no_virtualenv() {
     )
     .unwrap();
 
-    let (code, env) = run_json_with(&root, &server, &["vendor"], &[(
-        "SOCKET_PYPI_JSON_API",
-        format!("{}/pypi", server.uri()),
-    )]);
+    let (code, env) = run_json_with(
+        &root,
+        &server,
+        &["vendor"],
+        &[("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()))],
+    );
     assert_eq!(code, 0, "a fresh hosted pypi checkout ejects: {env:#}");
     assert!(applied(&env, PURL), "{env:#}");
     let reqs = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
-    assert!(!reqs.contains("patch.socket.dev"), "no hosted residue: {reqs}");
+    assert!(
+        !reqs.contains("patch.socket.dev"),
+        "no hosted residue: {reqs}"
+    );
     assert!(
         reqs.contains(&format!(".socket/vendor/pypi/{UUID}/")),
         "the requirement is wired to the vendored wheel: {reqs}"

@@ -449,6 +449,7 @@ fn write_vendor_ledger(p: &Proj, sha: &str, record: PatchRecord) {
             base_purl: purl(),
             uuid: record.uuid.clone(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: vendored_rel(&record.uuid),
                 sha256: sha.to_string(),
                 size: None,
@@ -1017,9 +1018,8 @@ fn every_hosted_pin_spelling_attests_and_a_pinless_entry_needs_an_install() {
         // A `[metadata.files]` entry that listed files before the rewrite
         // keeps Poetry's one-file-per-line layout (rollback restores the full
         // list from it; an inline entry means the original was `[]`).
-        let metadata_block = format!(
-            "{PKG} = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{sha}\"}},\n]"
-        );
+        let metadata_block =
+            format!("{PKG} = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{sha}\"}},\n]");
         let fragment = format!("#sha256={sha}&");
         let spellings: Vec<(&str, &str)> = [
             ("package files", files_line.as_str()),
@@ -1273,9 +1273,13 @@ impl ScanApi {
             .build()
             .unwrap();
         let server = rt.block_on(wiremock::MockServer::start());
-        let artifact_url = artifact_url
-            .map(str::to_string)
-            .unwrap_or_else(|| hosted_url_on(&server.uri(), uuid));
+        let artifact_url = if uuid == VENDORED_UUID {
+            hosted_url_on(&server.uri(), uuid)
+        } else {
+            artifact_url
+                .map(str::to_string)
+                .unwrap_or_else(|| hosted_url_on(&server.uri(), uuid))
+        };
         let sha = sha256_hex(wheel);
         let mut full_view = view(uuid, &api_purl());
         full_view["files"][MODULE]["blobContent"] =
@@ -1322,7 +1326,7 @@ impl ScanApi {
                         "artifacts": [{
                             "kind": "tarball",
                             "url": artifact_url,
-                            "integrity": { "sha256": sha }
+                            "integrity": { "sha256": sha, "sha512": ({ use sha2::Digest; format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&wheel))) }) }
                         }],
                         "registryOverride": null
                     } }
@@ -1578,7 +1582,7 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
             "scan",
             "--vendor",
             "--vendor-source",
-            "build",
+            "service",
             "--vex",
             embedded_doc.to_str().unwrap(),
             "--vex-product",

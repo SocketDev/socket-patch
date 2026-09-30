@@ -3,6 +3,9 @@
 //! three packages per run, most severe first, in hosted, agent and vendored
 //! mode; a fourth run changes nothing. Mock API, the built binary.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -667,6 +670,14 @@ async fn agent_cap_rolls_forward_and_upgrades_ignore_the_cap() {
 async fn vendored_cap_rolls_forward_three_per_run() {
     let mock = MockServer::start().await;
     mount_api(&mock, |_| Grant::Granted).await;
+    for (name, severities) in PACKAGES {
+        let view = json!({
+            "uuid": uuid(name), "purl": purl(name), "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "package/index.js": { "beforeHash": git_sha256(&before(name)), "afterHash": git_sha256(&after(name)), "blobContent": b64(&after(name)) } },
+            "vulnerabilities": vulns(name, severities), "description": name, "license": "MIT", "tier": "free"
+        });
+        prebuilt_common::mount_view(&mock, &view, None).await;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let names9: Vec<&str> = PACKAGES.iter().map(|(n, _)| *n).collect();
     write_project(tmp.path(), &names9);

@@ -9,7 +9,7 @@
 //!      per-test local repository — the ACTUAL registry bytes.
 //!   2. A marker patch on the cached jar's `META-INF/NOTICE.txt` is staged
 //!      (manifest + blob, real git-sha256 before/after hashes), and
-//!      `vendor --json --offline --vex` (the real binary) rebuilds the jar
+//!      `vendor --json --vex` (the real binary) downloads the patched jar
 //!      into the committed maven2 tree `.socket/vendor/maven/<uuid>/…`,
 //!      inserts the `socket-patch-vendor-<uuid>` file:// `<repository>`, and
 //!      attests in-run `(vendored)`.
@@ -41,6 +41,8 @@
 
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -77,8 +79,13 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
             cmd.env_remove(&k);
         }
     }
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        cwd,
+        args,
+        &[("MAVEN_REPO_LOCAL", m2.to_str().unwrap())],
+    );
     let out = cmd
-        .args(args)
         .current_dir(cwd)
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NO_CONFIG", "1")
@@ -95,7 +102,7 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
 }
 
 /// What `get` saves for an agent-mode patch: the manifest record + the
-/// after-hash blob (so `vendor --offline` needs no network).
+/// after-hash blob (input to the artifact fixture service).
 fn stage_manifest(proj: &Path, member_before: &[u8], member_after: &[u8]) {
     let record = serde_json::json!({
         "uuid": UUID,

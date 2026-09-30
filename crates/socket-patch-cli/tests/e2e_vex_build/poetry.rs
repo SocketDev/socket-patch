@@ -472,7 +472,7 @@ impl PatchService {
                         "artifacts": [{
                             "kind": "tarball",
                             "url": artifact_url,
-                            "integrity": { "sha256": sha }
+                            "integrity": { "sha256": sha, "sha512": ({ use base64::Engine as _; use sha2::Digest; format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&wheel))) }) }
                         }],
                         "registryOverride": null
                     } }
@@ -933,7 +933,7 @@ fn poetry_vendored_fresh_install_then_manifestless_vex() {
             "scan",
             "--vendor",
             "--vendor-source",
-            "build",
+            "service",
             "--vex",
             embedded.to_str().unwrap(),
             "--vex-product",

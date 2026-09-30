@@ -378,25 +378,26 @@ async fn mount_patch_api_with(mock: &MockServer, extra: &[(&str, &[u8], &[u8])])
         })))
         .mount(mock)
         .await;
+    let archive_view = serde_json::json!({
+        "uuid": UUID,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": files,
+        "vulnerabilities": {
+            "GHSA-aaaa-bbbb-cccc": {
+                "cves": ["CVE-2026-0001"], "summary": "test vuln",
+                "severity": "high", "description": "details"
+            }
+        },
+        "description": "Vendor patch", "license": "MIT", "tier": "free",
+    });
+    crate::prebuilt_common::mount_view(mock, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": files,
-            "vulnerabilities": {
-                "GHSA-aaaa-bbbb-cccc": {
-                    "cves": ["CVE-2026-0001"], "summary": "test vuln",
-                    "severity": "high", "description": "details"
-                }
-            },
-            "description": "Vendor patch", "license": "MIT", "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
-
 
 /// Runs through `common::run_with_env`, which seed-then-scrubs the ambient
 /// `SOCKET_*` surface the binary binds via clap `env=` (SOCKET_DRY_RUN,
@@ -670,13 +671,14 @@ async fn tampered_ledger_fails_closed(flavor: Flavor) {
     assert!(
         events_of(&env)
             .iter()
-            .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_artifact_rebuild_failed"),
+            .any(|e| e["action"] == "failed"
+                && e["errorCode"] == "vendor_artifact_redownload_failed"),
         "{}: envelope={env}",
         flavor.tag()
     );
     assert!(
-        !tgz.exists(),
-        "{}: an unverifiable rebuild must not be left on disk",
+        tgz.is_file(),
+        "{}: a failed redownload must preserve the original artifact",
         flavor.tag()
     );
 }

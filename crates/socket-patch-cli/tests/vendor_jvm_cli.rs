@@ -8,6 +8,9 @@
 //! update re-wires and reverts to pristine, a re-run needs no jar source,
 //! and a tampered ledger or an escaping symlink is refused.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
@@ -155,9 +158,14 @@ fn socket(root: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value) {
         }
     }
     let proj = root.join("proj");
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        &proj,
+        args,
+        &[("MAVEN_REPO_LOCAL", root.join("m2").to_str().unwrap())],
+    );
     let out = cmd
-        .args(args)
-        .args(["--json", "--offline", "--cwd", proj.to_str().unwrap()])
+        .args(["--json", "--cwd", proj.to_str().unwrap()])
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NO_CONFIG", "1")
         .env("MAVEN_REPO_LOCAL", root.join("m2"))

@@ -161,17 +161,15 @@ pub struct GlobalArgs {
     )]
     pub download_mode: String,
 
-    /// Where `vendor` acquires the installable patched artifact. `auto`
-    /// (default) downloads the prebuilt archive from the patch.socket.dev
-    /// vendoring service and silently falls back to a local build on any miss;
-    /// `service` requires the service and fails closed; `build` always builds
-    /// locally. Only `vendor` and the vendored modes of `scan`/`get` use
-    /// this; other subcommands accept it silently.
+    /// Download installable patched artifacts from the patch service.
+    /// `service` is the default; `auto` is a compatibility alias. Local
+    /// artifact building is no longer supported. Healthy committed artifacts
+    /// can be reused offline; missing or corrupt artifacts require a download.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "vendor-source",
         env = "SOCKET_VENDOR_SOURCE",
-        default_value = "auto",
+        default_value = "service",
         value_parser = parse_vendor_source,
     )]
     pub vendor_source: String,
@@ -405,9 +403,9 @@ impl GlobalArgs {
     /// empty). The names are validated at parse time, so this is an exact
     /// match.
     pub(crate) fn ecosystem_selected(&self, eco: Ecosystem) -> bool {
-        self.ecosystems.as_ref().is_none_or(|list| {
-            list.is_empty() || list.iter().any(|name| name == eco.cli_name())
-        })
+        self.ecosystems
+            .as_ref()
+            .is_none_or(|list| list.is_empty() || list.iter().any(|name| name == eco.cli_name()))
     }
 
     /// [`Self::ecosystem_selected`] for the ecosystem of `purl`; a purl of
@@ -680,7 +678,7 @@ impl Default for GlobalArgs {
             proxy_url: None,
             ecosystems: None,
             download_mode: "diff".to_string(),
-            vendor_source: "auto".to_string(),
+            vendor_source: "service".to_string(),
             maven_config: None,
             vendor_url: None,
             patch_server_url: None,
@@ -937,7 +935,7 @@ mod tests {
             assert!(cli.common.ecosystems.is_none());
             assert_eq!(cli.common.download_mode, "diff");
             assert_eq!(
-                cli.common.vendor_source, "auto",
+                cli.common.vendor_source, "service",
                 "empty SOCKET_VENDOR_SOURCE must fall back to the `auto` default"
             );
             assert_eq!(cli.common.manifest_path, "keep.json");
@@ -952,7 +950,7 @@ mod tests {
         with_clean_socket_env(|| {
             // Default when unset.
             let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(cli.common.vendor_source, "auto");
+            assert_eq!(cli.common.vendor_source, "service");
 
             // CLI value, case-normalized to the canonical tag.
             let cli =
@@ -961,8 +959,7 @@ mod tests {
 
             // Env var honored.
             std::env::set_var("SOCKET_VENDOR_SOURCE", "build");
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(cli.common.vendor_source, "build");
+            assert!(TestCli::try_parse_from(["socket-patch"]).is_err());
             std::env::remove_var("SOCKET_VENDOR_SOURCE");
 
             // Garbage is rejected at parse time.
@@ -985,27 +982,20 @@ mod tests {
         }
     }
 
-    /// Regression: scan's vendored flow must build its service config FROM
-    /// `--vendor-source`, not hardcode build-only. Under the default (`auto`), the config must permit the
-    /// vendoring service exactly as the `vendor` command's default does —
-    /// otherwise `scan --mode vendored` silently builds locally while a
-    /// plain `vendor` service-downloads, and the two commit different bytes /
-    /// lock integrity for the same patch (lock churn / merge conflicts).
     #[test]
     fn vendor_service_config_default_source_permits_service() {
         let cfg = common_with_source("auto").vendor_service_config(None, false);
-        assert_eq!(cfg.source, VendorSource::Auto);
+        assert_eq!(cfg.source, VendorSource::Service);
         assert!(
             cfg.source.may_use_service(),
             "the default must be able to use the service (matching `vendor`)"
         );
-        assert!(!cfg.source.requires_service());
+        assert!(cfg.source.requires_service());
         assert!(cfg.client.is_none());
         assert!(!cfg.use_public_proxy);
     }
 
-    /// `--vendor-source service` reaches the fail-closed service path and
-    /// `--vendor-source build` never contacts the service.
+    /// The assembler fails closed even if a caller bypasses argument validation.
     #[test]
     fn vendor_service_config_honors_service_and_build_sources() {
         let cfg = common_with_source("service").vendor_service_config(None, true);
@@ -1017,8 +1007,8 @@ mod tests {
         );
 
         let cfg = common_with_source("build").vendor_service_config(None, false);
-        assert_eq!(cfg.source, VendorSource::Build);
-        assert!(!cfg.source.may_use_service());
+        assert_eq!(cfg.source, VendorSource::Service);
+        assert!(cfg.source.requires_service());
     }
 
     /// The service overrides (`--vendor-url` / `--patch-server-url` /

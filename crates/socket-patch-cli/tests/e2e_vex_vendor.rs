@@ -154,6 +154,7 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
             base_purl: purl.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
                 size: None,
@@ -609,6 +610,7 @@ fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: P
             base_purl: purl.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
                 size: None,
@@ -986,6 +988,7 @@ fn detached_matrix_entry(
         base_purl: purl.to_string(),
         uuid: uuid.to_string(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_path.to_string(),
             sha256,
             size: None,
@@ -1423,7 +1426,10 @@ fn agent_patch_without_install_hook_attests_and_replaces_stale_doc() {
     let doc: Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
             .expect("parse emitted VEX doc");
-    assert_ne!(doc["@id"], "urn:uuid:stale", "the stale doc is replaced: {doc}");
+    assert_ne!(
+        doc["@id"], "urn:uuid:stale",
+        "the stale doc is replaced: {doc}"
+    );
     let stmts = doc["statements"].as_array().unwrap();
     assert_eq!(stmts.len(), 1, "{doc}");
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-drop-aaaa", "{doc}");
@@ -1990,6 +1996,7 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
             base_purl: purl.to_string(),
             uuid: uuid.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel.clone(),
                 sha256: String::new(),
                 size: None,

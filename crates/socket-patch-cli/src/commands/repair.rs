@@ -81,7 +81,8 @@ pub async fn run(args: RepairArgs) -> i32 {
         let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
         if !has_vendor_traces {
             let refs =
-                crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd).await;
+                crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
+                    .await;
             has_vendor_traces = !refs.is_empty();
             vendor_references = Some(refs);
         }
@@ -151,7 +152,10 @@ pub async fn run(args: RepairArgs) -> i32 {
     // scanned this ledger-less project.
     let vendor_references = match vendor_references {
         Some(refs) => refs,
-        None => crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd).await,
+        None => {
+            crate::commands::vendored_backend::repair::scan_vendor_references(&args.common.cwd)
+                .await
+        }
     };
 
     // The API client is built lazily: `repair_inner` constructs it only on
@@ -595,26 +599,27 @@ async fn repair_inner(
     // ledger entry are reported. Runs under `--download-only` too:
     // restoring artifacts IS repair's download half. The reference scan
     // and ledger load above are handed over, not repeated.
-    let vendor_rebuilt = crate::commands::vendored_backend::VendoredBackend::new(
-        &args.common,
-        None,
-    )
-    .repair(
-        crate::commands::vendored_backend::repair::RepairRequest {
-            manifest: manifest.as_ref(),
-            socket_dir: &socket_dir,
-            references: &vendor_references,
-            ledger,
-            client: client.as_ref(),
-        },
-        &mut env,
-    )
-    .await;
-    if !quiet && vendor_rebuilt > 0 {
+    let vendor_redownloaded =
+        crate::commands::vendored_backend::VendoredBackend::new(&args.common, None)
+            .repair(
+                crate::commands::vendored_backend::repair::RepairRequest {
+                    manifest: manifest.as_ref(),
+                    references: &vendor_references,
+                    ledger,
+                    client: client.as_ref(),
+                },
+                &mut env,
+            )
+            .await;
+    if !quiet && vendor_redownloaded > 0 {
         stdout_started = true;
         println!(
-            "Rebuilt {}.",
-            crate::ui::plural(vendor_rebuilt, "vendored artifact", "vendored artifacts")
+            "Redownloaded {}.",
+            crate::ui::plural(
+                vendor_redownloaded,
+                "vendored artifact",
+                "vendored artifacts"
+            )
         );
     }
 
@@ -1031,7 +1036,10 @@ mod tests {
 
         // Both orphans and the legacy package archive go; the referenced
         // diff archive stays.
-        assert_eq!(counts.cleaned, 3, "orphans and legacy archives should be swept");
+        assert_eq!(
+            counts.cleaned, 3,
+            "orphans and legacy archives should be swept"
+        );
         assert_eq!(
             counts.bytes_freed,
             (orphan_diff.len() + orphan_pkg.len() + legacy_pkg.len()) as u64,

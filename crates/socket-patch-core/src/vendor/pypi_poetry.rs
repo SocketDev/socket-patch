@@ -858,6 +858,7 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             base_purl: "pkg:pypi/six@1.16.0".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: REL_WHEEL.into(),
                 sha256: WHEEL_SHA.into(),
                 size: Some(11053),

@@ -25,6 +25,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod bun_vex;
 #[path = "common/cache_env.rs"]
 mod cache_env;
+mod prebuilt_common;
 
 const ORG: &str = "binary-bun-test";
 const PURL: &str = "pkg:npm/minimist@1.2.2";
@@ -70,10 +71,10 @@ fn cli(project: &Path, args: &[&str]) -> Value {
 
 /// [`cli`] with extra environment variables.
 fn cli_env(project: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
+    let mut cmd = command(env!("CARGO_BIN_EXE_socket-patch"), project);
+    let _prebuilt = prebuilt_common::prepare_command(&mut cmd, project, args, envs);
     let output = require_success(
-        command(env!("CARGO_BIN_EXE_socket-patch"), project)
-            .envs(envs.iter().copied())
-            .args(args)
+        cmd.envs(envs.iter().copied())
             .args([
                 "--cwd",
                 project.to_str().unwrap(),
@@ -171,7 +172,7 @@ fn scan(project: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> Valu
         ORG,
     ];
     if mode == "vendored" {
-        args.extend(["--vendor-source", "build"]);
+        args.extend(["--vendor-source", "service"]);
     }
     args.extend_from_slice(extra);
     cli(project, &args)
@@ -673,6 +674,7 @@ fn file_mode(_p: &Path, name: &str) -> u32 {
 
 async fn mock_api(server: &MockServer, fixture: &Fixture, _target: &str) {
     let tgz = make_tgz_from_installed(&installed_target(&fixture.project), &fixture.patched);
+    prebuilt_common::mount_download(server, PURL, UUID, "minimist-1.2.2.tgz", &tgz).await;
     std::fs::write(fixture.temp.path().join("hosted.tgz"), &tgz).unwrap();
     let url = format!("{}/patch/npm/minimist/1.2.2/33333333-3333-4333-8333-333333333333/{UUID}/minimist-1.2.2.tgz", server.uri());
     let sri = format!(
@@ -796,7 +798,10 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         .decode(integrity.trim_start_matches("sha512-"))
         .unwrap();
     assert!(
-        fixture.original_lock.windows(64).any(|w| w == digest.as_slice()),
+        fixture
+            .original_lock
+            .windows(64)
+            .any(|w| w == digest.as_slice()),
         "the original lock pins the registry digest"
     );
     Mock::given(method("GET"))
@@ -808,7 +813,13 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         .await;
     let taken_over = cli_env(
         project,
-        &["vendor", "--patch-server-url", &uri, "--vendor-source", "build"],
+        &[
+            "vendor",
+            "--patch-server-url",
+            &uri,
+            "--vendor-source",
+            "service",
+        ],
         &[("SOCKET_NPM_REGISTRY", &uri)],
     );
     assert_eq!(
@@ -823,15 +834,12 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     );
     let vendor_lock = fixture.lock();
     assert!(
-        !vendor_lock
-            .windows(uri.len())
-            .any(|w| w == uri.as_bytes()),
+        !vendor_lock.windows(uri.len()).any(|w| w == uri.as_bytes()),
         "no hosted URL is left in bun.lockb"
     );
-    let state: Value = serde_json::from_slice(
-        &std::fs::read(project.join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap();
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(project.join(".socket/vendor/state.json")).unwrap())
+            .unwrap();
     let original = state["entries"][PURL]["wiring"]
         .as_array()
         .and_then(|w| w.iter().find(|r| r["kind"] == "bun_lockb_package"))
@@ -840,8 +848,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     assert_eq!(original["name"], "minimist", "{original}");
     assert_eq!(original["version"], "1.2.2", "{original}");
     assert_eq!(
-        original["resolution"],
-        "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
+        original["resolution"], "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
         "the vendor ledger records the registry record: {original}"
     );
     fixture.frozen("taken-over", &fixture.patched, "minimist");

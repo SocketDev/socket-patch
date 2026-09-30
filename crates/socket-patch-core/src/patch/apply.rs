@@ -495,14 +495,7 @@ pub(crate) async fn apply_file_patch_at(
     // `restore_file_permissions` re-applies the pre-patch mode + uid/gid.
     // The directory mode is restored whether or not the write succeeded,
     // before any failure propagates.
-    // Inside a vendor stage the copy is a content-verified artifact, written
-    // without an fsync (see `crate::utils::durability`); an in-place apply
-    // of an installed tree keeps the durable write.
-    let write_result = if crate::utils::durability::in_artifact_scope() {
-        crate::utils::fs::atomic_write_artifact(&filepath, patched_content).await
-    } else {
-        crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await
-    };
+    let write_result = crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await;
     dir_guard.restore().await;
     write_result?;
 
@@ -943,13 +936,13 @@ async fn apply_package_patch_at(
         let current_hash = verify_result.and_then(|v| v.current_hash.as_deref());
         let (patched_content, via): (Cow<'_, [u8]>, AppliedVia) = if let Some(bytes) =
             resolve_from_diff(
-            diff_entries.as_ref(),
-            normalized,
-            pkg_path,
-            file_info,
-            current_hash,
-        )
-        .await
+                diff_entries.as_ref(),
+                normalized,
+                pkg_path,
+                file_info,
+                current_hash,
+            )
+            .await
         {
             (Cow::Owned(bytes), AppliedVia::Diff)
         } else if let Some(bytes) = sources.mem_blobs.and_then(|m| m.get(&file_info.after_hash)) {
@@ -2192,20 +2185,13 @@ mod tests {
         );
 
         (
-            root,
-            pkg_dir,
-            blobs_dir,
-            diffs_dir,
-            files,
-            original,
-            patched,
+            root, pkg_dir, blobs_dir, diffs_dir, files, original, patched,
         )
     }
 
     #[tokio::test]
     async fn test_apply_via_diff_when_archive_present() {
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) =
-            make_fixture().await;
+        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
 
         let sources = PatchSources {
             blobs_path: &blobs_dir,
@@ -2231,8 +2217,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_falls_back_to_blob_when_no_archives() {
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) =
-            make_fixture().await;
+        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
         // Delete the diff archive.
         tokio::fs::remove_file(diffs_dir.join(format!("{TEST_UUID}.tar.gz")))
             .await
@@ -2264,8 +2249,7 @@ mod tests {
     async fn test_apply_uuid_none_disables_alt_sources() {
         // Even if archives exist, passing `uuid = None` must restrict the
         // pipeline to the blob path.
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, _patched) =
-            make_fixture().await;
+        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, _patched) = make_fixture().await;
 
         let sources = PatchSources {
             blobs_path: &blobs_dir,
@@ -2292,8 +2276,7 @@ mod tests {
         // Corrupt the on-disk file so its hash no longer matches
         // before_hash. Diff strategy must NOT run (its output would never
         // match after_hash), so we fall through to the blob.
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) =
-            make_fixture().await;
+        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
         // Overwrite on-disk content with garbage; use --force so verify
         // promotes the HashMismatch to Ready and the pipeline still tries
         // to apply.
@@ -3120,8 +3103,7 @@ mod tests {
     /// to the blob strategy and still patch successfully.
     #[tokio::test]
     async fn test_apply_corrupt_diff_falls_through_to_blob() {
-        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) =
-            make_fixture().await;
+        let (_root, pkg_dir, blobs_dir, diffs_dir, files, _orig, patched) = make_fixture().await;
         // Diff archive holds garbage delta bytes.
         write_uuid_archive(&diffs_dir, TEST_UUID, &[("index.js", b"garbage delta")]);
 
@@ -3301,8 +3283,7 @@ mod tests {
     /// never joined.
     #[tokio::test]
     async fn test_apply_unsafe_uuid_skips_archives() {
-        let (root, pkg_dir, blobs_dir, diffs_dir, files, original, patched) =
-            make_fixture().await;
+        let (root, pkg_dir, blobs_dir, diffs_dir, files, original, patched) = make_fixture().await;
         // `diffs/../escape/<TEST_UUID>.tar.gz` IS a valid diff archive.
         let escape_dir = root.path().join("escape");
         tokio::fs::create_dir_all(&escape_dir).await.unwrap();

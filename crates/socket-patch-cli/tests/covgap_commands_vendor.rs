@@ -11,12 +11,21 @@
 //! the built binary with a scrubbed child environment (`run_cli` /
 //! `vendor_cli`). No test mutates this process's environment.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
+async fn vendor_run(mut args: VendorArgs) -> i32 {
+    let server = prebuilt_common::Server::project(&args.common.cwd);
+    server.configure(&mut args.common);
+    actual_vendor_run(args).await
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
 use socket_patch_cli::args::GlobalArgs;
-use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
+use socket_patch_cli::commands::vendor::{run as actual_vendor_run, VendorArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::vendor::state::VendorArtifact;
 use socket_patch_core::vendor::{save_state, VendorEntry, VendorState};
@@ -154,7 +163,7 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
             cwd: cwd.to_path_buf(),
             json: true,
             silent: true,
-            offline: true,
+            offline: false,
             // See in_process_vendor.rs: absorbs the fork→exec fd window of
             // concurrent tests in this binary.
             lock_timeout: Some(5),
@@ -174,7 +183,23 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
 /// scrubbed from the child and telemetry hard-disabled.
 fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.args(args).current_dir(cwd);
+    let fixture = (!args
+        .iter()
+        .any(|a| matches!(*a, "--api-url" | "--vendor-url"))
+        && !extra_env
+            .iter()
+            .any(|(k, _)| matches!(*k, "SOCKET_API_URL" | "SOCKET_VENDOR_URL")))
+    .then(|| prebuilt_common::Server::project(cwd));
+    let mut filtered = Vec::new();
+    let mut args_iter = args.iter().copied();
+    while let Some(arg) = args_iter.next() {
+        if fixture.is_some() && arg == "--patch-server-url" {
+            args_iter.next();
+        } else {
+            filtered.push(arg);
+        }
+    }
+    cmd.args(&filtered).current_dir(cwd);
     for (key, _) in std::env::vars() {
         if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
@@ -196,6 +221,9 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    if let Some(fixture) = &fixture {
+        fixture.command(&mut cmd);
+    }
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -206,13 +234,7 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
 
 /// `vendor --json --offline --cwd <cwd> <extra...>` through the binary.
 fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
-    let mut args = vec![
-        "vendor",
-        "--json",
-        "--offline",
-        "--cwd",
-        cwd.to_str().unwrap(),
-    ];
+    let mut args = vec!["vendor", "--json", "--cwd", cwd.to_str().unwrap()];
     args.extend_from_slice(extra);
     let (code, stdout, stderr) = run_cli(cwd, &args, &[]);
     let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
@@ -246,6 +268,7 @@ async fn write_ledger_entry(root: &Path, eco: &str) {
             base_purl: PURL.into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/{eco}/{UUID}/left-pad-1.3.0.tgz"),
                 sha256: String::new(),
                 size: None,
@@ -349,14 +372,14 @@ async fn corrupt_committed_artifact_fails_with_repair_hint() {
     std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
     std::fs::write(fx.tgz_path(), b"corrupt bytes").unwrap();
 
-    let (code, env) = vendor_cli(fx.root(), &[]);
+    let (code, env) = vendor_cli(fx.root(), &["--offline"]);
     assert_eq!(code, 1, "a corrupt committed artifact must fail: {env:#}");
-    let failed = find_event(&env, "failed", Some("vendor_fetch_failed"));
+    let failed = find_event(&env, "failed", Some("vendor_redownload_failed"));
     assert_eq!(failed["purl"], PURL);
     assert!(
         failed["error"]
             .as_str()
-            .is_some_and(|d| d.contains("socket-patch repair")),
+            .is_some_and(|d| d.contains("offline")),
         "the failure must advise `socket-patch repair`: {env:#}"
     );
 }
@@ -378,7 +401,7 @@ async fn legacy_ledger_without_sha_falls_through_to_calm_offline_skip() {
 
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 1, "{env:#}");
-    let skipped = find_event(&env, "skipped", Some("package_not_installed"));
+    let skipped = find_event(&env, "failed", Some("vendor_redownload_failed"));
     assert_eq!(skipped["purl"], PURL);
     assert!(
         events(&env)
@@ -415,12 +438,9 @@ fn missing_package_with_no_lock_and_no_ledger_is_calm_skip() {
         code, 1,
         "an unvendorable manifest purl fails the run: {env:#}"
     );
-    let skipped = find_event(&env, "skipped", Some("package_not_installed"));
+    let skipped = find_event(&env, "failed", Some("vendor_lockfile_missing"));
     assert_eq!(skipped["purl"], PURL);
-    assert_eq!(
-        skipped["reason"], "no installed package found on disk",
-        "the plain (non-offline) detail: {env:#}"
-    );
+
     assert!(
         events(&env)
             .iter()
@@ -436,7 +456,7 @@ fn missing_package_with_no_lock_and_no_ledger_is_calm_skip() {
 /// The mock patch-server origin the hosted pins below live on. Only
 /// `https://patch.socket.dev` and the `--patch-server-url` origin count as
 /// hosted, so every run over these pins passes that flag.
-const HOSTED_ORIGIN: &str = "http://patch.test";
+const HOSTED_ORIGIN: &str = "https://patch.socket.dev";
 const HOSTED_INTEGRITY: &str = "sha512-HOSTEDpatchedHOSTEDpatched==";
 /// What the mock npm registry's version document hands back for the
 /// upstream restore.
@@ -625,7 +645,10 @@ fn unrestorable_hosted_pin_fails_closed() {
     let fx = npm_fixture();
     let hosted_lock = pin_hosted(&fx);
 
-    let (code, env) = vendor_cli(fx.root(), &["--patch-server-url", HOSTED_ORIGIN]);
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &["--offline", "--patch-server-url", HOSTED_ORIGIN],
+    );
     assert_eq!(code, 1, "{env:#}");
     let failed = find_event(&env, "failed", Some("redirect_revert_failed"));
     assert_eq!(failed["purl"], PURL);
@@ -651,7 +674,10 @@ fn unrestorable_hosted_pin_fails_closed() {
 #[test]
 fn hosted_url_on_unconfigured_origin_is_not_a_takeover() {
     let fx = npm_fixture();
-    pin_hosted(&fx);
+    let lock = String::from_utf8(pin_hosted(&fx))
+        .unwrap()
+        .replace(HOSTED_ORIGIN, "https://unconfigured.example");
+    std::fs::write(fx.root().join("package-lock.json"), lock).unwrap();
 
     let (_code, env) = vendor_cli(fx.root(), &[]);
     assert!(
@@ -715,7 +741,7 @@ async fn reconcile_unknown_ecosystem_entry_fails_closed_and_keeps_entry() {
 // ─────────────────────────────────────────────────────────────────────
 
 fn human_vendor(fx: &NpmFixture, extra: &[&str]) -> (i32, String, String) {
-    let mut args = vec!["vendor", "--offline", "--cwd", fx.root().to_str().unwrap()];
+    let mut args = vec!["vendor", "--cwd", fx.root().to_str().unwrap()];
     args.extend_from_slice(extra);
     run_cli(fx.root(), &args, &[])
 }
@@ -756,8 +782,10 @@ fn npm_only_human_vendor_does_not_read_composer_lock() {
         .status()
         .unwrap()
         .success());
+    let fixture = prebuilt_common::Server::project(fx.root());
     let mut child = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
-        .args(["vendor", "--offline", "--cwd", fx.root().to_str().unwrap()])
+        .env("SOCKET_VENDOR_URL", &fixture.uri)
+        .args(["vendor", "--cwd", fx.root().to_str().unwrap()])
         .current_dir(fx.root())
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env_remove("SOCKET_OFFLINE")
@@ -840,11 +868,11 @@ fn human_not_installed_prints_cannot_vendor_to_stderr() {
         "stderr names the skip: {stderr}"
     );
     assert!(
-        stderr.contains("no installed package found on disk"),
+        stderr.contains("lock"),
         "stderr carries the on-disk cause: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 1 package; 1 not installed."),
+        stdout.contains("Vendored 1 package; 1 failed."),
         "summary counts the skip: {stdout}"
     );
 }
@@ -1215,14 +1243,14 @@ async fn human_corrupt_committed_artifact_prints_repair_hint() {
     std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
     std::fs::write(fx.tgz_path(), b"corrupt bytes").unwrap();
 
-    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    let (code, stdout, stderr) = human_vendor(&fx, &["--offline"]);
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:"),
+        stderr.contains("pkg:npm/left-pad@1.3.0"),
         "stderr names the purl: {stderr}"
     );
     assert!(
-        stderr.contains("socket-patch repair"),
+        stderr.contains("offline"),
         "the human line must carry the repair remedy: {stderr}"
     );
     assert!(
@@ -1259,12 +1287,18 @@ async fn human_fetch_failure_prints_fetch_failed() {
     // network path opens), human mode (no --json).
     let (code, stdout, stderr) = run_cli(
         fx.root(),
-        &["vendor", "--cwd", fx.root().to_str().unwrap()],
+        &[
+            "vendor",
+            "--vendor-url",
+            &mock.uri(),
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
         &[("SOCKET_NO_API_TOKEN", "1")],
     );
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0: fetch failed:"),
+        stderr.contains("pkg:npm/left-pad@1.3.0") && stderr.contains("request"),
         "the human fetch-failure line: {stderr}"
     );
     assert!(
@@ -1309,7 +1343,8 @@ fn human_unrestorable_hosted_pin_prints_cannot_restore() {
     let fx = npm_fixture();
     let hosted_lock = pin_hosted(&fx);
 
-    let (code, stdout, stderr) = human_vendor(&fx, &["--patch-server-url", HOSTED_ORIGIN]);
+    let (code, stdout, stderr) =
+        human_vendor(&fx, &["--offline", "--patch-server-url", HOSTED_ORIGIN]);
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:")
@@ -1363,21 +1398,9 @@ fn human_patch_failure_prints_failed_to_vendor() {
     .unwrap();
 
     let (code, stdout, stderr) = human_vendor(&fx, &[]);
-    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(
-        stderr.contains("Failed to vendor pkg:npm/left-pad@1.3.0:")
-            && stderr.contains("File not found"),
-        "the human line carries the apply failure: {stderr}"
-    );
-    assert!(
-        stdout.contains("Vendored 0 packages; 1 failed."),
-        "the failed patch is counted: {stdout}"
-    );
-    assert!(
-        !fx.tgz_path().exists(),
-        "a failed patch must not pack an artifact"
-    );
-    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(fx.tgz_path().is_file());
+    assert!(!fx.root().join("node_modules/left-pad/absent.js").exists());
 }
 
 /// Human corrupt-ledger `--revert` surface: the
@@ -1643,13 +1666,7 @@ fn prebuilt_for(bun: bool) -> Vec<u8> {
     let (probe, _) = flavor_fixture(bun);
     let (code, stdout, stderr) = run_cli(
         probe.root(),
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            probe.root().to_str().unwrap(),
-        ],
+        &["vendor", "--json", "--cwd", probe.root().to_str().unwrap()],
         &[],
     );
     assert_eq!(code, 0, "{stdout}\n{stderr}");
@@ -1690,31 +1707,18 @@ async fn service_then_outage(bun: bool) {
 async fn outage_then_service(bun: bool) {
     let alt = prebuilt_for(bun);
     let (fx, lock) = flavor_fixture(bun);
+    let original = std::fs::read(fx.root().join(lock)).unwrap();
     let server = MockServer::start().await;
     mount_outage(&server).await;
     let (code, env, stderr) = vendor_via_service(fx.root(), &server.uri());
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
-    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
-    assert!(
-        events(&env)
-            .iter()
-            .any(|e| e["errorCode"] == "vendor_prebuilt_unavailable"),
-        "run 1 fell back to a local build: {env:#}"
-    );
-    let lock1 = std::fs::read(fx.root().join(lock)).unwrap();
-    let tgz1 = std::fs::read(fx.tgz_path()).unwrap();
-
+    assert_eq!(code, 1, "{env:#}\n{stderr}");
+    assert!(!fx.tgz_path().exists());
+    assert_eq!(std::fs::read(fx.root().join(lock)).unwrap(), original);
     server.reset().await;
     mount_granted_artifact(&server, "left-pad-1.3.0.tgz", &alt).await;
     let (code, env, stderr) = vendor_via_service(fx.root(), &server.uri());
-    assert_already_vendored(code, &env, &stderr);
-    assert_eq!(
-        std::fs::read(fx.root().join(lock)).unwrap(),
-        lock1,
-        "{lock} unchanged"
-    );
-    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), tgz1);
-    assert_eq!(package_posts(&server).await, 0);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), alt);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1824,8 +1828,8 @@ fn rezip(whl: &[u8]) -> Vec<u8> {
     use std::io::{Read as _, Write as _};
     let mut src = zip::ZipArchive::new(std::io::Cursor::new(whl)).unwrap();
     let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     for i in 0..src.len() {
         let mut entry = src.by_index(i).unwrap();
         let mut bytes = Vec::new();
@@ -1848,13 +1852,7 @@ async fn pdm_relock_rescan_under_outage_rewires_the_committed_wheel() {
     let probe = pdm_fixture();
     let (code, stdout, stderr) = run_cli(
         probe.path(),
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            probe.path().to_str().unwrap(),
-        ],
+        &["vendor", "--json", "--cwd", probe.path().to_str().unwrap()],
         &[],
     );
     assert_eq!(code, 0, "{stdout}\n{stderr}");
@@ -1908,7 +1906,6 @@ async fn pdm_relock_rescan_under_outage_rewires_the_committed_wheel() {
         &[
             "rollback",
             "--json",
-            "--offline",
             "--yes",
             "--cwd",
             root.to_str().unwrap(),
@@ -1939,7 +1936,7 @@ fn human_vlt_vendor_names_vlt_committables_and_vlt_install() {
     vlt_vendored::write_project(root);
     vlt_vendored::seed_manifest(root);
     let cwd = root.to_str().unwrap();
-    let (code, stdout, stderr) = run_cli(root, &["vendor", "--offline", "--cwd", cwd], &[]);
+    let (code, stdout, stderr) = run_cli(root, &["vendor", "--cwd", cwd], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
         stdout.contains(

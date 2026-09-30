@@ -5,6 +5,9 @@
 //! embedded records are the only state written. Mock API + a real npm lockfile fixture, driven
 //! through the built binary.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -122,31 +125,33 @@ async fn mount_patch_api(mock: &MockServer, uuid: &str) {
         })))
         .mount(mock)
         .await;
+    let archive_view = serde_json::json!({
+        "uuid": uuid,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash,
+                "afterHash":  after_hash,
+                "blobContent": AFTER_B64,
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-aaaa-bbbb-cccc": {
+                "cves": ["CVE-2026-0001"],
+                "summary": "test vuln",
+                "severity": "high",
+                "description": "details"
+            }
+        },
+        "description": "Vendor patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(mock, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
-            "vulnerabilities": {
-                "GHSA-aaaa-bbbb-cccc": {
-                    "cves": ["CVE-2026-0001"],
-                    "summary": "test vuln",
-                    "severity": "high",
-                    "description": "details"
-                }
-            },
-            "description": "Vendor patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
@@ -443,7 +448,7 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
     // The legacy state, produced by the (still manifest-driven) standalone
     // `vendor` command from a committed manifest + blob.
     seed_committed_manifest(tmp.path());
-    let (code, venv, stderr) = run_vendor(tmp.path(), &["--vendor-source", "build"]);
+    let (code, venv, stderr) = run_vendor(tmp.path(), &["--vendor-source", "service"]);
     assert_eq!(code, 0, "legacy setup: {venv:#} {stderr}");
     let state_path = tmp.path().join(".socket/vendor/state.json");
     let state: serde_json::Value =
@@ -524,11 +529,8 @@ async fn scan_vendor_writes_no_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
 
-    let (code, stdout, stderr) = run_scan_vendor(
-        tmp.path(),
-        &mock.uri(),
-        &["--vex", "out.vex.json"],
-    );
+    let (code, stdout, stderr) =
+        run_scan_vendor(tmp.path(), &mock.uri(), &["--vex", "out.vex.json"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
@@ -938,24 +940,26 @@ async fn mount_scoped_patch_api(mock: &MockServer, uuid: &str) {
         })))
         .mount(mock)
         .await;
+    let archive_view = serde_json::json!({
+        "uuid": uuid,
+        "purl": SCOPED_API_PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash,
+                "afterHash":  after_hash,
+                "blobContent": AFTER_B64,
+            }
+        },
+        "vulnerabilities": {},
+        "description": "Vendor patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(mock, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": SCOPED_API_PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
-            "vulnerabilities": {},
-            "description": "Vendor patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
@@ -1218,8 +1222,8 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
         "the annotation names the purl; stdout={stdout}"
     );
     assert!(
-        stderr.contains("vendored the patched content anyway"),
-        "overwrite warning surfaced; stderr={stderr}"
+        !stderr.contains("vendored the patched content anyway"),
+        "the server archive does not overwrite installed content; stderr={stderr}"
     );
     // Vendored despite the mismatch.
     assert!(tmp
@@ -1346,7 +1350,9 @@ async fn mount_registry_tarball(mock: &MockServer, tgz: Vec<u8>) {
 fn run_vendor(root: &Path, extra: &[&str]) -> (i32, serde_json::Value, String) {
     let mut argv = vec!["vendor", "--json"];
     argv.extend_from_slice(extra);
+    let fixture = prebuilt_common::Server::project(root);
     let out = Command::new(binary())
+        .env("SOCKET_VENDOR_URL", &fixture.uri)
         .args(&argv)
         .current_dir(root)
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -1363,7 +1369,7 @@ fn run_vendor(root: &Path, extra: &[&str]) -> (i32, serde_json::Value, String) {
 /// is fetched pristine from the registry (integrity-verified against the
 /// lock) and vendored — node_modules never appears.
 #[tokio::test]
-async fn vendor_auto_fetches_missing_package_from_lockfile() {
+async fn vendor_downloads_missing_package_without_fetching_pristine_sources() {
     let mock = MockServer::start().await;
     let tgz = pristine_tgz();
     let integrity = sri_of(&tgz);
@@ -1389,8 +1395,8 @@ async fn vendor_auto_fetches_missing_package_from_lockfile() {
     assert!(
         events
             .iter()
-            .any(|e| e["errorCode"] == "vendor_fetched_missing"),
-        "fetch surfaced as a warning event: {v:#}"
+            .any(|e| e["errorCode"] == "vendor_prebuilt_downloaded"),
+        "service download reported: {v:#}"
     );
     assert!(tmp
         .path()
@@ -1501,8 +1507,8 @@ async fn vendor_auto_takes_a_missing_package_from_the_service_without_the_regist
             .unwrap()
             .iter()
             .any(|e| e["purl"] == PURL
-                && e["action"] == "skipped"
-                && e["errorCode"] == "package_not_installed"),
+                && e["action"] == "failed"
+                && e["errorCode"] == "vendor_service_offline_conflict"),
         "{v:#}"
     );
     assert!(registry
@@ -1544,7 +1550,7 @@ async fn vendor_auto_takes_a_missing_package_from_the_service_without_the_regist
 /// Integrity mismatch between the lock and the served bytes is a distinct
 /// vendor_fetch_failed failure — and nothing is written.
 #[tokio::test]
-async fn vendor_fetch_integrity_mismatch_is_vendor_fetch_failed() {
+async fn vendor_uses_service_integrity_without_fetching_old_registry_bytes() {
     let mock = MockServer::start().await;
     mount_registry_tarball(&mock, pristine_tgz()).await;
 
@@ -1557,21 +1563,12 @@ async fn vendor_fetch_integrity_mismatch_is_vendor_fetch_failed() {
     seed_manifest_and_blob(tmp.path());
 
     let (code, v, _) = run_vendor(tmp.path(), &[]);
-    assert_ne!(code, 0, "{v:#}");
-    let events = v["events"].as_array().unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_fetch_failed"),
-        "{v:#}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|e| e["errorCode"] == "package_not_installed"),
-        "no duplicate not-installed skip: {v:#}"
-    );
-    assert!(!tmp.path().join(".socket/vendor").exists());
+    assert_eq!(code, 0, "{v:#}");
+    assert!(mock.received_requests().await.unwrap().is_empty());
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+        .is_file());
 }
 
 /// --offline refuses the fetch with a calm package_not_installed skip that
@@ -1589,24 +1586,13 @@ async fn vendor_offline_refuses_fetch_with_calm_skip() {
 
     let (code, v, _) = run_vendor(tmp.path(), &["--offline"]);
     assert_ne!(code, 0, "not-installed stays a non-benign skip: {v:#}");
-    let events = v["events"].as_array().unwrap();
-    let skip = events
-        .iter()
-        .find(|e| e["errorCode"] == "package_not_installed")
-        .unwrap_or_else(|| panic!("{v:#}"));
-    assert!(
-        skip["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("--offline prevents fetching"),
-        "offline detail names the lockfile resolution: {v:#}"
-    );
+    assert!(v["events"].as_array().unwrap().iter().any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_service_offline_conflict"), "{v:#}");
 }
 
 /// An entry whose lock records no integrity is never fetched (fail-closed)
 /// and keeps the plain not-installed outcome plus an explanatory warning.
 #[tokio::test]
-async fn vendor_fetch_unverifiable_lock_entry_stays_not_installed() {
+async fn vendor_verifies_server_artifact_without_old_lock_integrity() {
     let tmp = tempfile::tempdir().unwrap();
     // Hand-write a lock whose entry has no integrity field.
     std::fs::write(
@@ -1632,20 +1618,8 @@ async fn vendor_fetch_unverifiable_lock_entry_stays_not_installed() {
     seed_manifest_and_blob(tmp.path());
 
     let (code, v, _) = run_vendor(tmp.path(), &[]);
-    assert_ne!(code, 0, "{v:#}");
-    let events = v["events"].as_array().unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| e["errorCode"] == "vendor_fetch_unverifiable"),
-        "{v:#}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|e| e["errorCode"] == "package_not_installed"),
-        "{v:#}"
-    );
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["summary"]["applied"], 1, "{v:#}");
 }
 
 /// The headline flow: a COMPLETELY fresh clone (lockfile, no node_modules,
@@ -2038,7 +2012,7 @@ async fn scan_vendored_bun_silent_human_names_code_on_stderr() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--silent",
             "--yes",
             "--api-url",
@@ -2227,7 +2201,7 @@ async fn standalone_vendor_state_attests_from_the_embedded_record() {
     let pristine = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
     seed_manifest_and_blob_with_vuln(tmp.path());
 
-    let (code, v, stderr) = run_vendor(tmp.path(), &["--offline"]);
+    let (code, v, stderr) = run_vendor(tmp.path(), &[]);
     assert_eq!(code, 0, "{v:#}\n{stderr}");
     assert_eq!(v["summary"]["applied"], 1, "{v:#}");
     let state: serde_json::Value = serde_json::from_str(
@@ -2479,27 +2453,29 @@ snapshots:
                 })))
                 .mount(mock)
                 .await;
+            let archive_view = serde_json::json!({
+                "uuid": uuid,
+                "purl": purl(name),
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": before_hash,
+                        "afterHash": after_hash,
+                        "blobContent": AFTER_B64,
+                    }
+                },
+                "vulnerabilities": {
+                    "GHSA-aaaa-bbbb-cccc": {
+                        "cves": ["CVE-2026-0001"], "summary": "test vuln",
+                        "severity": "high", "description": "details"
+                    }
+                },
+                "description": "plan target", "license": "MIT", "tier": "free",
+            });
+            crate::prebuilt_common::mount_view(mock, &archive_view, None).await;
             Mock::given(method("GET"))
                 .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "uuid": uuid,
-                    "purl": purl(name),
-                    "publishedAt": "2026-01-01T00:00:00Z",
-                    "files": {
-                        "package/index.js": {
-                            "beforeHash": before_hash,
-                            "afterHash": after_hash,
-                            "blobContent": AFTER_B64,
-                        }
-                    },
-                    "vulnerabilities": {
-                        "GHSA-aaaa-bbbb-cccc": {
-                            "cves": ["CVE-2026-0001"], "summary": "test vuln",
-                            "severity": "high", "description": "details"
-                        }
-                    },
-                    "description": "plan target", "license": "MIT", "tier": "free",
-                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
                 .mount(mock)
                 .await;
         }
@@ -2655,27 +2631,29 @@ snapshots:
                 })))
                 .mount(mock)
                 .await;
+            let archive_view = serde_json::json!({
+                "uuid": uuid,
+                "purl": purl,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "files": {
+                    file: {
+                        "beforeHash": before_hash,
+                        "afterHash": after_hash,
+                        "blobContent": AFTER_B64,
+                    }
+                },
+                "vulnerabilities": {
+                    "GHSA-aaaa-bbbb-cccc": {
+                        "cves": ["CVE-2026-0001"], "summary": "test vuln",
+                        "severity": "high", "description": "details"
+                    }
+                },
+                "description": "plan target", "license": "MIT", "tier": "free",
+            });
+            crate::prebuilt_common::mount_view(mock, &archive_view, None).await;
             Mock::given(method("GET"))
                 .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "uuid": uuid,
-                    "purl": purl,
-                    "publishedAt": "2026-01-01T00:00:00Z",
-                    "files": {
-                        file: {
-                            "beforeHash": before_hash,
-                            "afterHash": after_hash,
-                            "blobContent": AFTER_B64,
-                        }
-                    },
-                    "vulnerabilities": {
-                        "GHSA-aaaa-bbbb-cccc": {
-                            "cves": ["CVE-2026-0001"], "summary": "test vuln",
-                            "severity": "high", "description": "details"
-                        }
-                    },
-                    "description": "plan target", "license": "MIT", "tier": "free",
-                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
                 .mount(mock)
                 .await;
         }
@@ -3014,14 +2992,14 @@ snapshots:
         );
         assert_eq!(
             events_for(&v, "pkg:npm/pkg-z@1.0.0"),
-            vec![("skipped", "package_not_installed")],
+            vec![("failed", "vendor_lock_entry_not_found")],
             "{v}"
         );
         assert!(events_for(&v, "pkg:npm/pkg-b@1.0.0").is_empty(), "{v}");
         assert!(events_for(&v, "pkg:npm/pkg-y@1.0.0").is_empty(), "{v}");
         assert_eq!(
             events_for(&v, "pkg:npm/pkg-a@1.0.0"),
-            vec![("applied", "")],
+            vec![("applied", ""), ("skipped", "vendor_prebuilt_downloaded")],
             "{v}"
         );
         assert_eq!(
@@ -3057,7 +3035,7 @@ snapshots:
         assert_eq!(v["failed"], 0, "{v}");
         assert_eq!(
             events_for(&v, "pkg:npm/pkg-z@1.0.0"),
-            vec![("skipped", "package_not_installed")],
+            vec![("failed", "vendor_lock_entry_not_found")],
             "{v}"
         );
 
@@ -3161,10 +3139,14 @@ snapshots:
             "{v}"
         );
         assert!(events_for(&v, CARGO_SCOPE[0].0).is_empty(), "{v}");
-        assert_eq!(record_for(dl, CARGO_SCOPE[1].0)["action"], "downloaded", "{v}");
+        assert_eq!(
+            record_for(dl, CARGO_SCOPE[1].0)["action"],
+            "downloaded",
+            "{v}"
+        );
         assert_eq!(
             events_for(&v, CARGO_SCOPE[1].0),
-            vec![("skipped", "package_not_installed")],
+            vec![("failed", "locked_version_mismatch")],
             "{v}"
         );
         assert_eq!(viewed_uuids(&mock).await, vec![UUID_Z.to_string()]);
@@ -3185,7 +3167,7 @@ snapshots:
         );
         assert_eq!(
             events_for(&v, CARGO_SCOPE[1].0),
-            vec![("skipped", "package_not_installed")],
+            vec![("failed", "locked_version_mismatch")],
             "{v}"
         );
         let v = run_json(

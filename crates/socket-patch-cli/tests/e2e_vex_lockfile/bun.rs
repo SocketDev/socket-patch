@@ -790,7 +790,7 @@ fn scan_vendored(cwd: &Path, flavor: Flavor, api: &Api) -> Vec<u8> {
         "--mode",
         "vendored",
         "--vendor-source",
-        "build",
+        "service",
         "--yes",
         "--vex",
         "out.vex.json",

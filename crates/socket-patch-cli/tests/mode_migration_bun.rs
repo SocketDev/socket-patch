@@ -400,9 +400,8 @@ fn hosted_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String) 
     run_socket(proj, &args)
 }
 
-/// `scan --mode vendored` builds the artifact locally (`--vendor-source
-/// build`): no vendoring-service round trip, so the only network is the
-/// wiremock patch API.
+/// `scan --mode vendored` downloads the immutable artifact from the
+/// fixture service mounted alongside the patch API.
 fn vendored_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec![
         "scan",
@@ -419,7 +418,7 @@ fn vendored_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String
         "--api-token",
         "fake",
         "--vendor-source",
-        "build",
+        "service",
     ];
     args.extend_from_slice(extra);
     run_socket(proj, &args)
@@ -993,6 +992,15 @@ async fn mount_hosted_api(
             .mount(server)
             .await;
     }
+    // Public service grants cover both the staged and API-discovered UUIDs.
+    for p in &patches {
+        results.insert(p.dep.uuid_v.to_string(), results[p.dep.uuid_h].clone());
+    }
+    Mock::given(method("POST"))
+        .and(path("/patch/package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": results })))
+        .mount(server)
+        .await;
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(
@@ -1030,6 +1038,7 @@ async fn mount_hosted_api(
     }
     *ONLINE_ENV.lock().unwrap_or_else(|e| e.into_inner()) = vec![
         ("SOCKET_PATCH_SERVER_URL".to_string(), server.uri()),
+        ("SOCKET_VENDOR_URL".to_string(), server.uri()),
         (
             "SOCKET_NPM_REGISTRY".to_string(),
             format!("{}/registry", server.uri()),
@@ -1520,6 +1529,9 @@ async fn bun_vendored_then_hosted_takeover_leaves_pure_hosted() {
     };
     let proj = fx.proj.clone();
 
+    let server = MockServer::start().await;
+    let patches = mount_hosted_api(&server, &fx, &[&DEP_A]).await;
+
     // A: vendor from the staged manifest.
     stage_manifest(&fx, &proj, &DEP_A);
     let (code, stdout, stderr) = vendor_cmd(&proj, &[]);
@@ -1538,8 +1550,6 @@ async fn bun_vendored_then_hosted_takeover_leaves_pure_hosted() {
 
     // B: hosted redirect over the vendored state — the takeover — then the
     //    fresh-checkout marker proof.
-    let server = MockServer::start().await;
-    let patches = mount_hosted_api(&server, &fx, &[&DEP_A]).await;
     take_over_to_hosted(&fx, &proj, &server.uri(), &patches[0], "rev");
 
     // C: unscoped rollback → pristine bytes, no vendor artifacts or

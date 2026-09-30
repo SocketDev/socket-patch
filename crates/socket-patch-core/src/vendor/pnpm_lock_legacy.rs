@@ -73,12 +73,8 @@ use super::npm_common::{
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
     apply_pkg_override, check_lock_override, classify_pkg_override, commit_surfaces, drifted,
-    guard_unwired_revert, lines_value, overrides_record, revert_overrides_line,
-    revert_pkg_record, value_lines, vendor_value_is_for, KIND_LOCK_OVERRIDES,
-};
-use crate::formats::pnpm::{sniff_lock_grammar, PnpmLock, PnpmLockGrammar};
-use crate::formats::pnpm::lines::{
-    next_block, parse_key_line, section_bounds, split_lines, yaml_key, yaml_key_like,
+    guard_unwired_revert, lines_value, overrides_record, revert_overrides_line, revert_pkg_record,
+    value_lines, vendor_value_is_for, KIND_LOCK_OVERRIDES,
 };
 use super::source::PackageSource;
 use super::state::{
@@ -87,6 +83,10 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
+use crate::formats::pnpm::lines::{
+    next_block, parse_key_line, section_bounds, split_lines, yaml_key, yaml_key_like,
+};
+use crate::formats::pnpm::{sniff_lock_grammar, PnpmLock, PnpmLockGrammar};
 
 const PACKAGE_JSON: &str = "package.json";
 
@@ -489,6 +489,7 @@ pub async fn vendor_pnpm_legacy<'a>(
         base_purl: coords.base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -2236,7 +2237,7 @@ packages:
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_pnpm_legacy(
+            crate::vendor::test_support::vendor_pnpm_legacy(
                 "pkg:npm/left-pad@1.3.0",
                 &self.installed(),
                 self.root(),
@@ -2276,7 +2277,7 @@ packages:
         cfg: Option<&crate::vendor::VendorServiceConfig>,
     ) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor_pnpm_legacy(
+        crate::vendor::test_support::vendor_pnpm_legacy(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -3393,22 +3394,12 @@ packages:
             .await
             .unwrap();
         let (result, entry, _) = expect_done(fx.vendor(false).await);
-        assert!(!result.success, "a missing target fails the vendor");
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(fx.root().join(fx.rel_tgz()).is_file());
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("File not found"),
-            "{:?}",
-            result.error
-        );
-        assert!(entry.is_none());
-        assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
-        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK);
-        assert!(
-            !fx.root().join(".socket/vendor").exists(),
-            "a failed apply packs nothing"
+            !fx.installed().join("index.js").exists(),
+            "installed bytes are untouched"
         );
     }
 
@@ -3488,27 +3479,6 @@ packages:
         let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
         assert!(detail.contains("does not match"), "{detail}");
         assert_eq!(fx.read(PNPM_LOCK).await, lock, "refusal writes nothing");
-    }
-
-    /// An installed package declaring bundleDependencies refuses before any
-    /// project write (the repack would drop its bundled node_modules).
-    #[tokio::test]
-    async fn bundled_deps_refuse_before_any_write() {
-        let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
-        tokio::fs::write(
-            fx.installed().join("package.json"),
-            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["x"]}"#,
-        )
-        .await
-        .unwrap();
-        let detail = expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
-        assert!(detail.contains("bundleDependencies"), "{detail}");
-        assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
-        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK);
-        assert!(
-            !fx.root().join(".socket/vendor").exists(),
-            "refusals write nothing"
-        );
     }
 
     /// A legacy lock with NO packages: section refuses through the
@@ -4568,7 +4538,7 @@ packages:
         let sources = PatchSources::blobs_only(&blobs);
         let mut record = fx.record.clone();
         record.uuid = "../escape".to_string();
-        let outcome = vendor_pnpm_legacy(
+        let outcome = crate::vendor::test_support::vendor_pnpm_legacy(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),

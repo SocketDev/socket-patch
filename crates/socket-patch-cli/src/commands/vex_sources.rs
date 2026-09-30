@@ -759,6 +759,7 @@ fn vendored_entry_for(cand: &Cand, vref: &PatchedRef) -> VendorEntry {
         base_purl: strip_purl_qualifiers(&cand.key).to_string(),
         uuid: vref.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: wired.to_string(),
             sha256: String::new(),
             size: None,
@@ -1307,6 +1308,7 @@ mod tests {
                 base_purl: key.into(),
                 uuid: U1.into(),
                 artifact: VendorArtifact {
+                    yarn_berry10c0: None,
                     path: format!(".socket/vendor/npm/{U1}/x-1.0.0.tgz"),
                     sha256: String::new(),
                     size: None,
@@ -1380,6 +1382,7 @@ mod tests {
                 base_purl: "pkg:npm/x@1.0.0".into(),
                 uuid: U1.into(),
                 artifact: VendorArtifact {
+                    yarn_berry10c0: None,
                     path: rel.clone(),
                     sha256: String::new(),
                     size: None,

@@ -24,8 +24,11 @@
 //! rollback restores the upstream registry entry from a mock npm registry
 //! (`SOCKET_NPM_REGISTRY`, see `NpmRegistry`).
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 #[path = "common/pty_io.rs"]
 mod pty_io;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -33,7 +36,20 @@ use serde_json::{json, Value};
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{envelope_error_code, git_sha256, json_string, run};
+use common::{envelope_error_code, git_sha256, json_string};
+fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
+    if args.first() == Some(&"vendor") {
+        let fixture = prebuilt_common::Server::project(root);
+        let args: Vec<_> = args
+            .iter()
+            .copied()
+            .filter(|arg| *arg != "--offline")
+            .collect();
+        common::run_with_env(root, &args, &[("SOCKET_VENDOR_URL", &fixture.uri)])
+    } else {
+        common::run(root, args)
+    }
+}
 
 // ───────────────────────── shared fixture helpers ─────────────────────────
 

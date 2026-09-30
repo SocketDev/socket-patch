@@ -72,13 +72,11 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::PNPM_LOCK;
-use crate::formats::pnpm::{
-    check_v9_lock_version as check_lock_version, vendored_npm_uuids,
-};
 use crate::formats::pnpm::lines::{
     indent_of, next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
     yaml_key_like, YamlBlock,
 };
+use crate::formats::pnpm::{check_v9_lock_version as check_lock_version, vendored_npm_uuids};
 
 const PACKAGE_JSON: &str = "package.json";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
@@ -335,6 +333,7 @@ pub async fn vendor_pnpm<'a>(
         base_purl: coords.base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -3428,7 +3427,7 @@ snapshots:
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_pnpm(
+            crate::vendor::test_support::vendor_pnpm(
                 "pkg:npm/left-pad@1.3.0",
                 &self.installed(),
                 self.root(),
@@ -3472,7 +3471,7 @@ snapshots:
         cfg: Option<&crate::vendor::VendorServiceConfig>,
     ) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor_pnpm(
+        crate::vendor::test_support::vendor_pnpm(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -4254,7 +4253,7 @@ snapshots:
         record2.uuid = uuid2.to_string();
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_pnpm(
+        let outcome = crate::vendor::test_support::vendor_pnpm(
             "pkg:npm/left-pad@1.2.0",
             &installed2,
             fx.root(),
@@ -7373,7 +7372,7 @@ snapshots:
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_pnpm(
+        let outcome = crate::vendor::test_support::vendor_pnpm(
             "pkg:npm/left-pad", // no @version — the npm purl grammar refuses
             &fx.installed(),
             fx.root(),
@@ -7406,7 +7405,7 @@ snapshots:
             result
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("cannot stage a copy of the installed package")),
+                .is_some_and(|e| e.contains("patch service request failed")),
             "{:?}",
             result.error
         );
@@ -8110,10 +8109,6 @@ snapshots:
         assert_eq!(planned, looped);
     }
 
-    /// A gate only the local build reaches — bundled dependencies are
-    /// checked on the STAGED copy, after the service has been asked — is
-    /// not a pre-flight gate: the plan admits the package (the loop would
-    /// ask the service for it) and the loop's own refusal stands.
     #[tokio::test]
     async fn preflight_leaves_post_service_gates_to_the_loop() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
@@ -8125,7 +8120,7 @@ snapshots:
         .unwrap();
         let (planned, looped) = preflight_then_vendor(&fx).await;
         assert_eq!(planned, Ok(()), "the plan cannot see a staged-copy gate");
-        assert_eq!(looped, Err("vendor_bundled_deps_unsupported"));
+        assert_eq!(looped, Ok(()));
     }
 
     // ─────────────── V-2: memoized split + section index oracles ───────────────

@@ -24,3 +24,6 @@ mod covgap_commands_repair_vendor;
 mod repair_invariants;
 mod repair_vendor_e2e;
 mod repair_vendor_flavors_e2e;
+
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;

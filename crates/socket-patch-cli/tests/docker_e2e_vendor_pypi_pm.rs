@@ -30,7 +30,7 @@
 //!     end of stage 2 (offline only); pipenv has its own stage 2b (offline
 //!     only; the online ledger-less step is covered by
 //!     e2e_vex_build/e2e_vex_lockfile).
-//!   stage 3 (`--network none`): re-vendor is idempotent (already_vendored,
+//!   stage 3 (service available): re-vendor is idempotent (already_vendored,
 //!     lock byte-stable) → `vendor --revert` restores the lock byte-identical
 //!     to the pre-vendor snapshot and removes `.socket/vendor` → re-vendor
 //!     succeeds again.
@@ -56,8 +56,8 @@ mod docker_vendor_common;
 mod vex_e2e_common;
 
 use docker_vendor_common::{
-    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
-    skip_if_no_image, stage_patch_fn,
+    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image_network_none,
+    run_with_fixture, run_with_service, skip_if_no_image, stage_patch_fn,
 };
 
 const IMAGE: &str = "socket-patch-test-pypi:latest";
@@ -83,7 +83,7 @@ const UUID_PIPENV: &str = "43434343-4343-4343-8343-434343434343";
 /// Shared bash that stages the six.py marker patch from the installed bytes.
 /// `$ORIG` must already point at the in-project venv's `six.py`. Defines
 /// `$PURL`, `$WHEEL`-independent snapshots in /workspace/snap, and runs the
-/// offline vendor producing /tmp/vendor.json. Caller asserts wiring after.
+/// service download producing /tmp/vendor.json. Caller asserts wiring after.
 const STAGE1_VENDOR_COMMON: &str = r#"
 [ -f "$ORIG" ] || fail "$ORIG missing after the fixture install"
 # Pristine pre-check: without this the post-vendor marker asserts are circular.
@@ -101,8 +101,9 @@ stage_patch "$PURL" "__UUID__" "six.py" "$ORIG" /tmp/patched.py
 mkdir -p /workspace/snap
 sha256sum /tmp/patched.py | cut -d' ' -f1 > /workspace/snap/patched.sha
 
-# Vendor (fully offline: the blob is staged locally).
-socket-patch vendor --json --offline > /tmp/vendor.json 2>/tmp/vendor.err
+# Download the artifact published from the staged fixture.
+publish_fixture
+socket-patch vendor --json > /tmp/vendor.json 2>/tmp/vendor.err
 RC=$?; cat /tmp/vendor.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/vendor.json >&2; fail "vendor exited $RC (expected 0)"; }
 assert_json_field /tmp/vendor.json '"status": "success"'
@@ -131,13 +132,13 @@ echo "===ARTIFACT VERIFIED==="
 // ── poetry ────────────────────────────────────────────────────────────────
 
 /// Poetry stage 1 (in-project venv): `poetry add six==1.16.0`, marker patch,
-/// offline vendor, the lock-only splice asserts, then fresh staging. Poetry's
+/// service download, the lock-only splice asserts, then fresh staging. Poetry's
 /// wiring (spike P1/P2) reduces the `files` array to the single patched-wheel
 /// `{file, hash}` element and appends a `package.source` table
 /// (`type = "file"`); pyproject and content-hash stay untouched.
 const POETRY_STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 # In-project venv so the crawler finds .venv/lib/pythonX/site-packages/six.py.
 export POETRY_VIRTUALENVS_IN_PROJECT=true
 export POETRY_CACHE_DIR=/tmp/poetry-cache-warm
@@ -296,11 +297,11 @@ chmod -R a+rwX /workspace/vex-ledger /workspace/vex-noledger /workspace/vex-reve
 exit 0
 "#;
 
-/// Poetry stage 3 (`--network none`): idempotent re-vendor → revert
+/// Poetry stage 3 (service available): idempotent re-vendor → revert
 /// (byte-identical lock restore + full `.socket/vendor` removal) → re-vendor.
 const POETRY_STAGE3: &str = r#"
 cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 
 LOCK_SHA_BEFORE=$(sha256sum poetry.lock | cut -d' ' -f1)
 socket-patch vendor --json --offline > /tmp/revendor.json 2>/tmp/revendor.err
@@ -321,7 +322,7 @@ cmp -s poetry.lock /workspace/snap/poetry.lock.prevendor \
 [ ! -e .socket/vendor ] || fail ".socket/vendor must be fully removed after revert"
 echo "===REVERT VERIFIED==="
 
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -335,13 +336,13 @@ exit 0
 // ── pdm ───────────────────────────────────────────────────────────────────
 
 /// PDM stage 1 (in-project venv): `pdm init -n`, `pdm add six==1.16.0`,
-/// marker patch, offline vendor, the lock-only splice asserts, then fresh
+/// marker patch, service download, the lock-only splice asserts, then fresh
 /// staging. PDM's wiring (spike D1) inserts a relative `path = "./…"` key
 /// after `requires_python` and reduces the `files` array to the single
 /// patched-wheel hash; pyproject and content_hash stay untouched.
 const PDM_STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 export PDM_CACHE_DIR=/tmp/pdm-cache-warm
 # In-project venv so the crawler finds .venv/.../site-packages/six.py.
 pdm config python.use_venv true >/dev/null 2>&1
@@ -465,10 +466,10 @@ echo "===VEX REVERTED VERIFIED==="
 exit 0
 "#;
 
-/// PDM stage 3 (`--network none`): idempotent → revert → re-vendor.
+/// PDM stage 3 (service available): idempotent → revert → re-vendor.
 const PDM_STAGE3: &str = r#"
 cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 
 LOCK_SHA_BEFORE=$(sha256sum pdm.lock | cut -d' ' -f1)
 socket-patch vendor --json --offline > /tmp/revendor.json 2>/tmp/revendor.err
@@ -489,7 +490,7 @@ cmp -s pdm.lock /workspace/snap/pdm.lock.prevendor \
 [ ! -e .socket/vendor ] || fail ".socket/vendor must be fully removed after revert"
 echo "===REVERT VERIFIED==="
 
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -503,14 +504,14 @@ exit 0
 // ── pipenv ──────────────────────────────────────────────────────────────────
 
 /// pipenv stage 1 (in-project venv): `pipenv install six==1.16.0`, marker
-/// patch, offline vendor, the lock-only entry-rewrite asserts, then fresh
+/// patch, service download, the lock-only entry-rewrite asserts, then fresh
 /// staging. pipenv's wiring (spike V1/V2) rewrites `default.six` to
 /// `{file: "./<wheel>", hashes: [sha256:<patched>], markers}` (dropping
 /// index and version); Pipfile stays untouched. The suite also asserts the
 /// `vendor_integrity_unverified` warning surfaces in the vendor envelope.
 const PIPENV_STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 export PIPENV_VENV_IN_PROJECT=1
 export PIPENV_CACHE_DIR=/tmp/pipenv-cache-warm
 export PIP_CACHE_DIR=/tmp/pip-cache-warm
@@ -691,10 +692,10 @@ echo "===VEX APPLY VERIFIED==="
 exit 0
 "#;
 
-/// pipenv stage 3 (`--network none`): idempotent → revert → re-vendor.
+/// pipenv stage 3 (service available): idempotent → revert → re-vendor.
 const PIPENV_STAGE3: &str = r#"
 cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 
 LOCK_SHA_BEFORE=$(sha256sum Pipfile.lock | cut -d' ' -f1)
 socket-patch vendor --json --offline > /tmp/revendor.json 2>/tmp/revendor.err
@@ -715,7 +716,7 @@ cmp -s Pipfile.lock /workspace/snap/Pipfile.lock.prevendor \
 [ ! -e .socket/vendor ] || fail ".socket/vendor must be fully removed after revert"
 echo "===REVERT VERIFIED==="
 
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -816,7 +817,7 @@ fn poetry_vendor_fresh_checkout_install_and_revert() {
     }
     let (_tmp, host) = host_dir();
 
-    let out = run_in_image(
+    let (out, service) = run_with_fixture(
         IMAGE,
         &host,
         &render_stage1(POETRY_STAGE1, UUID_POETRY)
@@ -844,7 +845,12 @@ fn poetry_vendor_fresh_checkout_install_and_revert() {
     );
     poetry_manifestless_vex_online(&host);
 
-    let out = run_in_image_network_none(IMAGE, &host, &render(POETRY_STAGE3, UUID_POETRY));
+    let out = run_with_service(
+        IMAGE,
+        &host,
+        &render(POETRY_STAGE3, UUID_POETRY),
+        &service.docker_uri(),
+    );
     assert_stage_markers(
         "poetry stage 3 (idempotent+revert+re-vendor)",
         &out,
@@ -859,7 +865,7 @@ fn pdm_vendor_fresh_checkout_install_and_revert() {
     }
     let (_tmp, host) = host_dir();
 
-    let out = run_in_image(IMAGE, &host, &render_stage1(PDM_STAGE1, UUID_PDM));
+    let (out, service) = run_with_fixture(IMAGE, &host, &render_stage1(PDM_STAGE1, UUID_PDM));
     assert_stage_markers(
         "pdm stage 1 (install+vendor)",
         &out,
@@ -880,7 +886,12 @@ fn pdm_vendor_fresh_checkout_install_and_revert() {
         ],
     );
 
-    let out = run_in_image_network_none(IMAGE, &host, &render(PDM_STAGE3, UUID_PDM));
+    let out = run_with_service(
+        IMAGE,
+        &host,
+        &render(PDM_STAGE3, UUID_PDM),
+        &service.docker_uri(),
+    );
     assert_stage_markers(
         "pdm stage 3 (idempotent+revert+re-vendor)",
         &out,
@@ -906,7 +917,7 @@ fn pipenv_vendor_fresh_checkout_install_and_revert() {
         r#""six.py" "$ORIG" /tmp/patched.py GHSA-dock-pipv-0001 CVE-2026-7501
 "#,
     );
-    let out = run_in_image(IMAGE, &host, &stage1);
+    let (out, service) = run_with_fixture(IMAGE, &host, &stage1);
     assert_stage_markers(
         "pipenv stage 1 (install+vendor)",
         &out,
@@ -938,7 +949,12 @@ fn pipenv_vendor_fresh_checkout_install_and_revert() {
         ],
     );
 
-    let out = run_in_image_network_none(IMAGE, &host, &render(PIPENV_STAGE3, UUID_PIPENV));
+    let out = run_with_service(
+        IMAGE,
+        &host,
+        &render(PIPENV_STAGE3, UUID_PIPENV),
+        &service.docker_uri(),
+    );
     assert_stage_markers(
         "pipenv stage 3 (idempotent+revert+re-vendor)",
         &out,

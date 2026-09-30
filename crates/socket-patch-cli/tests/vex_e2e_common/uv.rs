@@ -71,6 +71,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -655,9 +658,9 @@ impl ScanApi {
 fn socket_patch(cwd: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(binary());
     scrub_python_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_NO_CONFIG", "1")
-        .args(args)
         .current_dir(cwd)
         .output()
         .expect("spawn socket-patch")
@@ -1610,9 +1613,8 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
     if mode == Mode::Hosted {
         let env: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
-        let still_wired = |f: &str| {
-            String::from_utf8_lossy(&std::fs::read(proj.join(f)).unwrap()).contains(uuid)
-        };
+        let still_wired =
+            |f: &str| String::from_utf8_lossy(&std::fs::read(proj.join(f)).unwrap()).contains(uuid);
         match out.status.code() {
             Some(0) => {
                 assert_eq!(
@@ -1648,7 +1650,10 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                 assert_eq!(
                     snapshot(
                         &proj,
-                        &wired_files.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>()
+                        &wired_files
+                            .iter()
+                            .map(|(f, _)| f.as_str())
+                            .collect::<Vec<_>>()
                     ),
                     wired_files,
                     "{}: a refused pin writes nothing",

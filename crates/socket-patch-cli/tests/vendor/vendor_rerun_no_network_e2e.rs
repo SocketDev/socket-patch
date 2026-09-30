@@ -90,7 +90,7 @@ fn run_vendor(
         "vendor",
         "--json",
         "--vendor-source",
-        "build",
+        "service",
         "--api-url",
         dead,
         "--proxy-url",
@@ -117,6 +117,8 @@ fn run_vendor(
         .env("SOCKET_NPM_REGISTRY", dead)
         .env("GOFLAGS", "-mod=mod")
         .envs(env.iter().copied());
+    let fixture = crate::prebuilt_common::Server::project_with_env(root, env);
+    fixture.command(&mut cmd);
     let out = cmd.output().expect("run socket-patch vendor");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -301,24 +303,28 @@ fn pypi_rerun_over_a_tampered_wheel_is_not_called_in_sync() {
         .map(|e| e.path())
         .find(|p| p.extension().is_some_and(|x| x == "whl"))
         .expect("the committed wheel");
+    let original = std::fs::read(&wheel).unwrap();
+    let ledger = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
     std::fs::write(&wheel, b"garbage").unwrap();
-
-    for extra in [&[][..], &["--offline"][..]] {
-        let (code, v, stderr) = run_vendor(root, &dead, extra, &[]);
-        assert_eq!(code, 1, "{extra:?}: {v:#}\n{stderr}");
-        // Exactly what the eager ladder reports for it (the integrated
-        // base binary's events on this fixture).
-        let expected = if extra.is_empty() {
-            vec![
-                ("skipped", "vendor_fetch_unverifiable"),
-                ("skipped", "package_not_installed"),
-            ]
-        } else {
-            vec![("skipped", "package_not_installed")]
-        };
-        assert_eq!(purl_events(&v, SIX_PURL), expected, "{extra:?}: {v:#}");
-    }
+    let (code, v, stderr) = run_vendor(root, &dead, &["--offline"], &[]);
+    assert_eq!(code, 1, "{v:#}\n{stderr}");
+    assert_eq!(
+        purl_events(&v, SIX_PURL),
+        vec![("failed", "vendor_redownload_failed")],
+        "{v:#}"
+    );
     assert_eq!(std::fs::read(&wheel).unwrap(), b"garbage");
+    let (code, v, stderr) = run_vendor(root, &dead, &[], &[]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert!(
+        purl_events(&v, SIX_PURL).contains(&("rebuilt", "")),
+        "{v:#}"
+    );
+    assert_eq!(std::fs::read(&wheel).unwrap(), original);
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        ledger
+    );
 }
 
 // ── cargo ───────────────────────────────────────────────────────────────
@@ -517,7 +523,7 @@ fn gem_rerun_without_network_is_in_sync() {
 /// a downloaded `.gem`): build mode refuses it `gem_spec_missing` BEFORE
 /// downloading it, instead of downloading it and then refusing.
 #[tokio::test]
-async fn gem_build_mode_refuses_a_lockfile_only_gem_before_downloading_it() {
+async fn gem_service_vendors_a_lockfile_only_gem_without_registry_download() {
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
     let registry = MockServer::start().await;
     Mock::given(method("GET"))
@@ -534,7 +540,7 @@ async fn gem_build_mode_refuses_a_lockfile_only_gem_before_downloading_it() {
 
     let (code, v, stderr) = run_vendor(root, &dead_endpoint(), &[], &[]);
 
-    assert_eq!(code, 1, "{v:#}\n{stderr}");
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
     assert!(
         registry
             .received_requests()
@@ -545,10 +551,10 @@ async fn gem_build_mode_refuses_a_lockfile_only_gem_before_downloading_it() {
     );
     assert_eq!(
         purl_events(&v, GEM_PURL),
-        vec![("failed", "gem_spec_missing")],
+        vec![("applied", ""), ("skipped", "vendor_prebuilt_downloaded")],
         "{v:#}"
     );
-    assert!(!root.join(".socket/vendor").exists(), "nothing is written");
+    assert!(root.join(".socket/vendor/state.json").is_file());
 }
 
 /// A `.gem`: an uncompressed outer tar holding `metadata.gz` and a
@@ -581,7 +587,7 @@ fn make_gem(data_files: &[(&str, &[u8])]) -> Vec<u8> {
 /// `--dry-run` never refused, and still fetches the gem and previews it
 /// (`vendor_fetched_missing` + `verified`, exit 0) as it always did.
 #[tokio::test]
-async fn gem_build_mode_dry_run_still_fetches_and_previews() {
+async fn gem_service_dry_run_previews_without_registry_download() {
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
     let gem = make_gem(&[(GEM_LIB, GEM_PRISTINE)]);
     let checksum = hex::encode(Sha256::digest(&gem));
@@ -602,11 +608,7 @@ async fn gem_build_mode_dry_run_still_fetches_and_previews() {
     let (code, v, stderr) = run_vendor(root, &dead_endpoint(), &["--dry-run"], &[]);
 
     assert_eq!(code, 0, "{v:#}\n{stderr}");
-    assert_eq!(
-        purl_events(&v, GEM_PURL),
-        vec![("skipped", "vendor_fetched_missing"), ("verified", "")],
-        "{v:#}"
-    );
+    assert_eq!(purl_events(&v, GEM_PURL), vec![("verified", "")], "{v:#}");
     assert!(
         !root.join(".socket/vendor").exists(),
         "a dry run writes nothing"
@@ -668,21 +670,22 @@ fn cargo_rerun_over_a_drifted_copy_still_fetches_and_reports_it() {
     ));
     std::fs::write(&copy_lib, b"tampered\n").unwrap();
 
-    let (code, v, stderr) = run_vendor(&root, &dead, &[], &env);
-    assert_eq!(code, 1, "{v:#}\n{stderr}");
-    assert_eq!(
-        purl_events(&v, PURL),
-        vec![("failed", "vendor_fetch_failed")],
-        "{v:#}"
-    );
-    assert_eq!(std::fs::read(&copy_lib).unwrap(), b"tampered\n");
-
+    let ledger = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
     let (code, v, stderr) = run_vendor(&root, &dead, &["--offline"], &env);
     assert_eq!(code, 1, "{v:#}\n{stderr}");
     assert_eq!(
         purl_events(&v, PURL),
-        vec![("skipped", "package_not_installed")],
+        vec![("failed", "vendor_redownload_failed")],
         "{v:#}"
+    );
+    assert_eq!(std::fs::read(&copy_lib).unwrap(), b"tampered\n");
+    let (code, v, stderr) = run_vendor(&root, &dead, &[], &env);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert!(purl_events(&v, PURL).contains(&("rebuilt", "")), "{v:#}");
+    assert_eq!(std::fs::read(&copy_lib).unwrap(), PATCHED);
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        ledger
     );
 }
 
@@ -943,10 +946,7 @@ async fn cargo_service_never_vendors_a_git_or_custom_registry_crate() {
         assert_eq!(out.status.code(), Some(1), "{source}: {v:#}");
         assert_eq!(
             purl_events(&v, PURL),
-            vec![
-                ("skipped", "vendor_fetch_unverifiable"),
-                ("skipped", "package_not_installed"),
-            ],
+            vec![("failed", "vendor_source_unsupported")],
             "{source}: {v:#}"
         );
         assert_eq!(
@@ -1040,13 +1040,13 @@ async fn cargo_rerun_over_a_drifted_copy_reports_the_deferred_fetch_first() {
     assert_eq!(
         purl_events(&v, PURL),
         vec![
-            ("skipped", "vendor_fetched_missing"),
-            ("applied", ""),
-            ("skipped", "vendor_artifact_rebuilt"),
+            ("skipped", "vendor_prebuilt_downloaded"),
+            ("rebuilt", ""),
+            ("skipped", "already_vendored"),
         ],
         "the fetch is reported first, then the package's own events: {v:#}"
     );
-    assert_eq!(gets().await, before + 1, "one pristine download");
+    assert_eq!(gets().await, before, "no pristine download");
     assert_eq!(std::fs::read(&copy_lib).unwrap(), PATCHED, "rebuilt");
 }
 
@@ -1136,7 +1136,7 @@ fn a_package_absent_from_the_lock_keeps_the_not_installed_skip() {
     let (_code, v, stderr) = run_vendor(root, &dead, &[], &[]);
     assert_eq!(
         purl_events(&v, NPM_PURL),
-        vec![("skipped", "package_not_installed")],
+        vec![("failed", "vendor_lock_entry_not_found")],
         "{v:#}\n{stderr}"
     );
 
@@ -1173,11 +1173,10 @@ fn a_package_absent_from_the_lock_keeps_the_not_installed_skip() {
             b"after\n",
         );
         let home = cargo_home.to_string_lossy().into_owned();
-        let (_code, v, stderr) =
-            run_vendor(&root, &dead, &[], &[("CARGO_HOME", home.as_str())]);
+        let (_code, v, stderr) = run_vendor(&root, &dead, &[], &[("CARGO_HOME", home.as_str())]);
         assert_eq!(
             purl_events(&v, purl),
-            vec![("skipped", "package_not_installed")],
+            vec![("failed", "locked_version_mismatch")],
             "{purl}: {v:#}\n{stderr}"
         );
     }
@@ -1221,7 +1220,10 @@ fn a_stale_prestage_tree_is_swept_by_the_next_wet_run_only() {
 
     let (_code, v, stderr) = run_vendor(root, &dead, &["--dry-run"], &[]);
     for dir in &litter {
-        assert!(root.join(dir).exists(), "a dry run deletes nothing: {dir}\n{v:#}\n{stderr}");
+        assert!(
+            root.join(dir).exists(),
+            "a dry run deletes nothing: {dir}\n{v:#}\n{stderr}"
+        );
     }
     assert!(
         !v.to_string().contains("socket-prestage"),
@@ -1231,7 +1233,10 @@ fn a_stale_prestage_tree_is_swept_by_the_next_wet_run_only() {
     for extra in [&["--offline"][..], &[][..]] {
         let (_code, v, stderr) = run_vendor(root, &dead, extra, &[]);
         for dir in &litter {
-            assert!(!root.join(dir).exists(), "{extra:?} sweeps {dir}\n{v:#}\n{stderr}");
+            assert!(
+                !root.join(dir).exists(),
+                "{extra:?} sweeps {dir}\n{v:#}\n{stderr}"
+            );
         }
         assert!(
             !root.join(format!(".socket/vendor/composer/{OLD}")).exists(),

@@ -1,23 +1,4 @@
-//! `vendor --vendor-source build` on a gem the project only has in its
-//! lockfile.
-//!
-//! The local gem build needs the eval-able stub gemspec rubygems writes
-//! into `<gem home>/specifications/` when the gem is INSTALLED — a bundler
-//! path source will not load without one, and a downloaded `.gem` carries
-//! its gemspec only as YAML in `metadata.gz` (the vendoring service's
-//! converter is what turns that into the Ruby form, and serves it as the
-//! `gem-stub-gemspec` second artifact). So build mode cannot vendor a
-//! fetched gem, ever — and the vendor loop refuses it `gem_spec_missing`
-//! BEFORE downloading it (the X1b deferred-fetch gate).
-//! `vendor_rerun_no_network_e2e` pins the gate itself;
-//! this suite pins its SCOPE: `auto` still fetches, and the three runs a
-//! fetch would never have happened for (nothing resolves the gem, the lock
-//! cannot verify it, the ledger already vendors it) keep their own
-//! outcomes instead of a gemspec refusal.
-//!
-//! Hermetic: a `wiremock` stand-in for the rubygems download host, named by
-//! the lock's `remote:`, and a `.socket/blobs` entry so patch staging never
-//! reaches the API.
+//! Service vendoring of portable gems without a local install or registry fetch.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -181,6 +162,8 @@ fn run_vendor(root: &Path, source: &str, api_url: &str) -> (i32, serde_json::Val
         }
     }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let fixture = crate::prebuilt_common::Server::project(root);
+    fixture.command(&mut cmd);
     let out = cmd.output().expect("run socket-patch vendor");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -210,232 +193,77 @@ fn failed_event(v: &serde_json::Value) -> &serde_json::Value {
 }
 
 #[tokio::test]
-async fn build_mode_refuses_a_lockfile_only_gem_before_downloading_it() {
-    let mock = MockServer::start().await;
-    let gem = make_gem();
-    let sha = hex::encode(Sha256::digest(&gem));
-    mount_gem_download(&mock, gem).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(tmp.path(), &mock.uri(), &sha);
-
-    let (code, v, stderr) = run_vendor(tmp.path(), "build", &dead_endpoint());
-
-    assert_eq!(code, 1, "the refusal fails the run: {v:#}\n{stderr}");
-    assert!(
-        mock.received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty(),
-        "build mode cannot use a fetched gem, so it must not download one"
-    );
-    let failed = failed_event(&v);
-    assert_eq!(failed["purl"], PURL, "{v:#}");
-    assert_eq!(
-        failed["errorCode"], "gem_spec_missing",
-        "the backend's own refusal code, raised earlier: {v:#}"
-    );
-    let detail = failed["error"].as_str().unwrap_or_default();
-    assert!(
-        detail.contains("stub gemspec")
-            && detail.contains("install the gem")
-            && detail.contains("--vendor-source"),
-        "the refusal must say why and name the remedy: {detail}"
-    );
-    assert!(
-        !tmp.path().join(".socket/vendor").exists(),
-        "nothing is written: {v:#}"
-    );
-    let lock = std::fs::read_to_string(tmp.path().join("Gemfile.lock")).unwrap();
-    assert!(lock.contains("GEM\n"), "the lock is untouched: {lock}");
-}
-
-/// The gate is scoped to build-only runs: `auto` may still vendor this gem
-/// through the patch service, and the service path needs the fetched copy
-/// staged, so the download must still happen there.
-#[tokio::test]
-async fn auto_mode_still_fetches_a_lockfile_only_gem() {
-    let mock = MockServer::start().await;
-    let gem = make_gem();
-    let sha = hex::encode(Sha256::digest(&gem));
-    mount_gem_download(&mock, gem).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(tmp.path(), &mock.uri(), &sha);
-
-    // The patch service is unreachable, so `auto` falls back to the local
-    // build and lands on the same refusal — AFTER the fetch, which is the
-    // behavior this mode needs.
-    let (code, v, stderr) = run_vendor(tmp.path(), "auto", &dead_endpoint());
-
-    assert_eq!(code, 1, "{v:#}\n{stderr}");
-    assert_eq!(failed_event(&v)["purl"], PURL, "{v:#}");
-    assert_eq!(
-        mock.received_requests().await.unwrap_or_default().len(),
-        1,
-        "auto must still stage the pristine gem for the service path"
-    );
-}
-
-/// The gate is also scoped to gems a fetch would actually be attempted for.
-/// A gem that no lockfile resolves and no ledger entry recovers has nothing
-/// to fetch and nothing to say about gemspecs: it keeps the calm
-/// `package_not_installed` skip, not a gemspec refusal.
-#[tokio::test]
-async fn a_gem_that_resolves_from_nowhere_still_reports_not_installed() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(tmp.path(), "https://rubygems.org", &"0".repeat(64));
-    // No lockfile at all: nothing resolves the gem.
-    std::fs::remove_file(tmp.path().join("Gemfile.lock")).unwrap();
-
-    let (code, v, stderr) = run_vendor(tmp.path(), "build", &dead_endpoint());
-
-    assert_eq!(code, 1, "{v:#}\n{stderr}");
-    let event = v["events"]
-        .as_array()
-        .expect("events array")
-        .iter()
-        .find(|e| e["purl"] == PURL)
-        .unwrap_or_else(|| panic!("expected an event for {PURL} in:\n{v:#}"));
-    assert_eq!(event["action"], "skipped", "{v:#}");
-    assert_eq!(event["errorCode"], "package_not_installed", "{v:#}");
-}
-
-// ── scope guards ────────────────────────────────────────────────────────
-//
-// The refusal must fire ONLY where the wasted download it replaces would
-// really have happened: a gem the lock resolves WITH a verifier, and that
-// the run is not already vendoring from its committed artifact. The two
-// cases where no fetch ever happens keep the outcome they had before the
-// gate existed.
-
-/// A bundler < 2.6 `Gemfile.lock` (no `CHECKSUMS` section — the majority of
-/// real locks) resolves the gem but cannot VERIFY it, and
-/// `registry_fetch::fetch_and_stage` refuses such an entry before any
-/// network I/O. CLI_CONTRACT: "Entries the lock cannot verify are NEVER
-/// fetched (`vendor_fetch_unverifiable` warning + the calm
-/// `package_not_installed` skip)". There is no download to save here, so
-/// the gemspec refusal must not replace that documented pair — all the more
-/// so because its remedy (`--vendor-source=auto`) cannot work either: the
-/// purl never reaches the gem backend in any mode.
-#[tokio::test]
-async fn an_unverifiable_lock_entry_keeps_the_documented_skip_pair() {
+async fn service_vendors_a_lockfile_only_gem_with_its_server_stub() {
     let mock = MockServer::start().await;
     mount_gem_download(&mock, make_gem()).await;
-
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path(), &mock.uri(), &"0".repeat(64));
-    // Re-write the lock the way bundler < 2.6 does: no CHECKSUMS section.
-    std::fs::write(
-        tmp.path().join("Gemfile.lock"),
-        format!(
-            "GEM\n  remote: {}\n  specs:\n    {NAME} ({VERSION})\n\n\
-             PLATFORMS\n  ruby\n\n\
-             DEPENDENCIES\n  {NAME}\n\n\
-             BUNDLED WITH\n   2.4.10\n",
-            mock.uri()
-        ),
-    )
-    .unwrap();
+    let (code, v, stderr) = run_vendor(tmp.path(), "service", &dead_endpoint());
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    let dir = tmp
+        .path()
+        .join(format!(".socket/vendor/gem/{UUID}/{NAME}-{VERSION}"));
+    assert_eq!(std::fs::read(dir.join(LIB)).unwrap(), PATCHED);
+    assert!(dir.join(format!("{NAME}.gemspec")).is_file());
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
 
-    let (code, v, stderr) = run_vendor(tmp.path(), "build", &dead_endpoint());
+#[tokio::test]
+async fn auto_alias_does_not_fetch_the_registry_gem() {
+    let mock = MockServer::start().await;
+    mount_gem_download(&mock, make_gem()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path(), &mock.uri(), &"0".repeat(64));
+    let (code, v, stderr) = run_vendor(tmp.path(), "auto", &dead_endpoint());
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
 
+#[test]
+fn a_gem_without_a_lockfile_is_refused_before_downloading() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path(), "https://rubygems.org", &"0".repeat(64));
+    std::fs::remove_file(tmp.path().join("Gemfile.lock")).unwrap();
+    let (code, v, stderr) = run_vendor(tmp.path(), "service", &dead_endpoint());
     assert_eq!(code, 1, "{v:#}\n{stderr}");
-    assert!(
-        mock.received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty(),
-        "an unverifiable entry is never fetched: {v:#}"
-    );
-    let codes: Vec<(&str, &str)> = v["events"]
-        .as_array()
-        .expect("events array")
-        .iter()
-        .filter(|e| e["purl"] == PURL)
-        .map(|e| {
-            (
-                e["action"].as_str().unwrap_or_default(),
-                e["errorCode"].as_str().unwrap_or_default(),
-            )
-        })
-        .collect();
     assert_eq!(
-        codes,
-        vec![
-            ("skipped", "vendor_fetch_unverifiable"),
-            ("skipped", "package_not_installed"),
-        ],
-        "an unverifiable lock entry keeps its documented warning + calm \
-         skip, not a gemspec refusal: {v:#}"
+        failed_event(&v)["errorCode"],
+        "vendor_lockfile_missing",
+        "{v:#}"
     );
 }
 
-/// An ALREADY-VENDORED gem on a fresh clone (the committed
-/// `.socket/vendor/gem/<uuid>` copy is the dependency; no installed gem,
-/// because `bundle install` has not run yet) must re-scan green in build
-/// mode: the gem backend's idempotent hot path re-confirms the wired lock
-/// and returns `already_vendored` without ever needing a stub gemspec of
-/// its own. The ledger covers the record, so the pristine fetch is
-/// deferred and never needed: the re-run makes no registry request at all.
 #[tokio::test]
-async fn an_already_vendored_gem_re_runs_green_on_a_fresh_clone() {
+async fn service_integrity_supports_old_bundler_locks_without_checksums() {
     let mock = MockServer::start().await;
-    let gem = make_gem();
-    let sha = hex::encode(Sha256::digest(&gem));
-    mount_gem_download(&mock, gem).await;
-
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    write_fixture(root, &mock.uri(), &sha);
-    install_gem(root);
+    write_fixture(tmp.path(), &mock.uri(), &"0".repeat(64));
+    let lock = tmp.path().join("Gemfile.lock");
+    let text = std::fs::read_to_string(&lock).unwrap();
+    let start = text.find("CHECKSUMS\n").unwrap();
+    let end = text.find("BUNDLED WITH\n").unwrap();
+    std::fs::write(&lock, format!("{}{}", &text[..start], &text[end..])).unwrap();
+    let (code, v, stderr) = run_vendor(tmp.path(), "service", &dead_endpoint());
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
 
-    // Run 1: the gem is installed, so the local build vendors it.
-    let (code, v, stderr) = run_vendor(root, "build", &dead_endpoint());
-    assert_eq!(
-        code, 0,
-        "run 1 must vendor the installed gem: {v:#}\n{stderr}"
-    );
+#[test]
+fn an_already_vendored_gem_is_reused_without_an_installed_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path(), &dead_endpoint(), &"0".repeat(64));
+    install_gem(tmp.path());
+    let (code, v, stderr) = run_vendor(tmp.path(), "service", &dead_endpoint());
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    std::fs::remove_dir_all(tmp.path().join("vendor")).unwrap();
+    let (code, v, stderr) = run_vendor(tmp.path(), "service", &dead_endpoint());
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
     assert!(
-        root.join(format!(".socket/vendor/gem/{UUID}")).is_dir(),
-        "run 1 must commit the vendored copy: {v:#}"
-    );
-
-    // Fresh clone: the committed artifact and the wired lock are checked
-    // in, the installed gem is not.
-    std::fs::remove_dir_all(root.join("vendor")).unwrap();
-
-    let (code, v, stderr) = run_vendor(root, "build", &dead_endpoint());
-
-    assert_eq!(
-        code, 0,
-        "an in-sync re-run of an already-vendored gem is green: {v:#}\n{stderr}"
-    );
-    assert_eq!(v["status"], "success", "{v:#}\n{stderr}");
-    assert!(
-        mock.received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty(),
-        "the in-sync hot path answers from the committed copy, with no \
-         registry request: {v:#}"
-    );
-    let codes: Vec<(&str, &str)> = v["events"]
-        .as_array()
-        .expect("events array")
-        .iter()
-        .filter(|e| e["purl"] == PURL)
-        .map(|e| {
-            (
-                e["action"].as_str().unwrap_or_default(),
-                e["errorCode"].as_str().unwrap_or_default(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        codes,
-        vec![("skipped", "already_vendored")],
-        "the hot path reports the committed copy in sync, not a gemspec \
-         refusal: {v:#}"
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["errorCode"] == "already_vendored"),
+        "{v:#}"
     );
 }

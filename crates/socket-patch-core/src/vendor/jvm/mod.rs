@@ -14,7 +14,6 @@
 //! does the disk side.
 
 pub mod apply;
-pub(crate) mod archive;
 pub mod gradle;
 pub mod maven_reactor;
 
@@ -606,4 +605,15 @@ mod tests {
         let empty = |_: &str| None;
         assert_eq!(detect(&empty), Shape::Other);
     }
+}
+
+pub(crate) fn is_signature(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == ".SIGNATURE.P7S"
+        || upper.strip_prefix("META-INF/").is_some_and(|n| {
+            !n.contains('/')
+                && [".SF", ".RSA", ".DSA", ".EC"]
+                    .iter()
+                    .any(|ext| n.ends_with(ext))
+        })
 }

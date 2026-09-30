@@ -1226,6 +1226,7 @@ mod tests {
                 base_purl: PURL.into(),
                 uuid: UUID.into(),
                 artifact: socket_patch_core::vendor::state::VendorArtifact {
+                    yarn_berry10c0: None,
                     path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
                     sha256: String::new(),
                     size: None,
@@ -1346,6 +1347,7 @@ mod tests {
                 base_purl: PURL.into(),
                 uuid: UUID.into(),
                 artifact: socket_patch_core::vendor::state::VendorArtifact {
+                    yarn_berry10c0: None,
                     path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
                     sha256: String::new(),
                     size: None,

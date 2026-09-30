@@ -156,31 +156,33 @@ async fn mount_patch_api(mock: &MockServer) {
         })))
         .mount(mock)
         .await;
+    let archive_view = serde_json::json!({
+        "uuid": UUID,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash,
+                "afterHash":  after_hash,
+                "blobContent": AFTER_B64,
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-aaaa-bbbb-cccc": {
+                "cves": ["CVE-2026-0001"],
+                "summary": "test vuln",
+                "severity": "high",
+                "description": "details"
+            }
+        },
+        "description": "Vendor patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    crate::prebuilt_common::mount_view(mock, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
-            "vulnerabilities": {
-                "GHSA-aaaa-bbbb-cccc": {
-                    "cves": ["CVE-2026-0001"],
-                    "summary": "test vuln",
-                    "severity": "high",
-                    "description": "details"
-                }
-            },
-            "description": "Vendor patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
@@ -287,7 +289,7 @@ async fn repair_rebuilds_deleted_vendored_tarball() {
 /// 2. `repair --offline` rebuilds from purely local sources (installed copy
 ///    + seeded blob) with zero network.
 #[tokio::test]
-async fn repair_offline_rebuilds_from_local_sources() {
+async fn repair_offline_refuses_even_with_installed_tree_and_blobs() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -306,10 +308,10 @@ async fn repair_offline_rebuilds_from_local_sources() {
 
     let before_reqs = mock.received_requests().await.unwrap().len();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
-    assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
-    assert!(tgz.is_file(), "tarball rebuilt offline");
+    assert_eq!(v["summary"]["failed"], 1, "envelope={v}");
+    assert!(!tgz.exists(), "no local rebuild");
     let after_reqs = mock.received_requests().await.unwrap().len();
     assert_eq!(
         before_reqs, after_reqs,
@@ -410,25 +412,10 @@ async fn repair_keeps_corrupt_artifact_when_no_rebuild_source_exists() {
         "arm 2: an unrebuildable corrupt artifact must not be destroyed"
     );
 
-    // Heal: with the installed copy restored, the same repair rebuilds the
-    // recorded bytes — retention never wedges the corrupt→rebuild path.
-    let pkg = tmp.path().join("node_modules/left-pad");
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(
-        pkg.join("package.json"),
-        br#"{"name":"left-pad","version":"1.3.0"}"#,
-    )
-    .unwrap();
-    std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
-    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
-    assert_eq!(
-        std::fs::read(&tgz).unwrap(),
-        tgz_bytes,
-        "rebuild restores the recorded bytes once a source exists"
-    );
+    assert_eq!(std::fs::read(&tgz).unwrap(), tgz_bytes);
+    assert!(!tmp.path().join("node_modules").exists());
 }
 
 /// 4. A tampered ledger sha can never be satisfied: the rebuild is removed
@@ -457,12 +444,13 @@ async fn repair_fails_closed_on_tampered_ledger_sha() {
     assert!(
         events_of(&env)
             .iter()
-            .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_artifact_rebuild_failed"),
+            .any(|e| e["action"] == "failed"
+                && e["errorCode"] == "vendor_artifact_redownload_failed"),
         "envelope={env}"
     );
     assert!(
-        !tgz.exists(),
-        "an unverifiable rebuild must not be left on disk"
+        tgz.is_file(),
+        "a failed redownload must preserve the original artifact"
     );
 }
 
@@ -595,7 +583,10 @@ async fn repair_reports_missing_ledger_instead_of_reconstructing() {
         }
 
         let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-        assert_eq!(code, 1, "wholesale={wholesale} stdout={stdout} stderr={stderr}");
+        assert_eq!(
+            code, 1,
+            "wholesale={wholesale} stdout={stdout} stderr={stderr}"
+        );
         let v = parse_env(&stdout);
         let missing: Vec<_> = events_of(&v)
             .into_iter()
@@ -632,7 +623,11 @@ async fn repair_reports_missing_ledger_instead_of_reconstructing() {
             assert!(!tgz.exists(), "nothing is rebuilt without a ledger");
             continue;
         }
-        assert_eq!(std::fs::read(&tgz).unwrap(), tgz_bytes, "artifact untouched");
+        assert_eq!(
+            std::fs::read(&tgz).unwrap(),
+            tgz_bytes,
+            "artifact untouched"
+        );
 
         // Restoring the ledger from version control is the recovery.
         std::fs::write(&state_path, &state1).unwrap();
@@ -665,7 +660,7 @@ async fn repair_dry_run_previews_rebuild() {
     let v = parse_env(&stdout);
     assert!(
         events_of(&v).iter().any(|e| e["action"] == "verified"
-            && e["details"]["wouldRebuild"] == true
+            && e["details"]["wouldRedownload"] == true
             && e["purl"] == PURL),
         "envelope={v}"
     );
@@ -770,31 +765,33 @@ async fn mount_gem_patch_api(mock: &MockServer) {
         })))
         .mount(mock)
         .await;
+    let archive_view = serde_json::json!({
+        "uuid": GEM_UUID,
+        "purl": GEM_PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "lib/padlock.rb": {
+                "beforeHash": before_hash,
+                "afterHash":  after_hash,
+                "blobContent": AFTER_B64,
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-dddd-eeee-ffff": {
+                "cves": ["CVE-2026-0002"],
+                "summary": "gem test vuln",
+                "severity": "high",
+                "description": "details"
+            }
+        },
+        "description": "Gem vendor patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    crate::prebuilt_common::mount_view(mock, &archive_view, Some(GEMSPEC_STUB)).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{GEM_UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": GEM_UUID,
-            "purl": GEM_PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "lib/padlock.rb": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
-            "vulnerabilities": {
-                "GHSA-dddd-eeee-ffff": {
-                    "cves": ["CVE-2026-0002"],
-                    "summary": "gem test vuln",
-                    "severity": "high",
-                    "description": "details"
-                }
-            },
-            "description": "Gem vendor patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
@@ -1020,10 +1017,10 @@ async fn repair_gem_dir_tamper_matrix_and_vex_refusal() {
 ///     rebuild must refresh the stale inventory — loudly, with the
 ///     provenance named — instead of deleting the rebuild and stranding the
 ///     wired pair on a dead dir. RED without the refresh: exit 1
-///     vendor_artifact_rebuild_failed, artifact gone, and every subsequent
+///     vendor_artifact_redownload_failed, artifact gone, and every subsequent
 ///     repair loops the same failure.
 #[tokio::test]
-async fn repair_refreshes_stale_inventory_from_service_provenance() {
+async fn repair_refuses_changed_service_inventory() {
     const SERVICE_STUB: &[u8] = b"# converter-generated stub\nGem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.summary = \"repair fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
     let mock = MockServer::start().await;
     mount_gem_patch_api(&mock).await;
@@ -1053,54 +1050,12 @@ async fn repair_refreshes_stale_inventory_from_service_provenance() {
 
     std::fs::remove_dir_all(&copy).unwrap();
 
-    // THE pin: the local rebuild's stub differs from the recorded
-    // inventory; repair keeps the member-verified rebuild and refreshes
-    // the inventory rather than deleting it and failing forever.
+    let ledger_before = std::fs::read(&state_path).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    assert!(
-        events_of(&v)
-            .iter()
-            .any(|e| e["action"] == "rebuilt" && e["purl"] == GEM_PURL),
-        "envelope={v}"
-    );
-    assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
-            && e["errorCode"] == "vendor_inventory_refreshed"
-            && e["purl"] == GEM_PURL),
-        "the provenance switch must be surfaced: {v}"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("padlock.gemspec")).unwrap(),
-        GEMSPEC_STUB,
-        "the local rebuild's stub is kept"
-    );
-    assert_eq!(
-        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
-        AFTER,
-        "patched member intact"
-    );
-    let state: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
-    assert_eq!(
-        state["entries"][GEM_PURL]["artifact"]["fileInventory"]["padlock.gemspec"],
-        serde_json::json!(sha256_hex(GEMSPEC_STUB)),
-        "inventory refreshed from the verified rebuild: {state}"
-    );
-
-    // The loop is dead: the next repair is clean.
-    let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
-    assert_eq!(code, 0, "{stdout}");
-    let v = parse_env(&stdout);
-    assert!(
-        v["summary"]["rebuilt"].is_null() || v["summary"]["rebuilt"] == 0,
-        "no repair loop: {v}"
-    );
-    assert!(
-        !events_of(&v).iter().any(|e| e["action"] == "failed"),
-        "no repair loop: {v}"
-    );
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    assert!(stdout.contains("vendor_inventory_mismatch"));
+    assert!(!copy.exists());
+    assert_eq!(std::fs::read(&state_path).unwrap(), ledger_before);
 }
 
 /// G3b. Backward tolerance: a pre-inventory ledger entry (fileInventory
@@ -1265,7 +1220,7 @@ use crate::vlt_hosted_common;
 use crate::vlt_vendored;
 
 /// `repair --dry-run` over a deleted vlt directory artifact previews the
-/// rebuild (`wouldRebuild`, the dir path) and writes nothing; the wet run
+/// rebuild (`wouldRedownload`, the dir path) and writes nothing; the wet run
 /// rebuilds it offline from the installed copy.
 #[test]
 fn repair_previews_then_rebuilds_a_deleted_vlt_dir() {
@@ -1284,11 +1239,16 @@ fn repair_previews_then_rebuilds_a_deleted_vlt_dir() {
     assert_eq!(code, 0, "{v:#}\n{stderr}");
     let text = v.to_string();
     assert!(
-        text.contains("wouldRebuild") && text.contains(&vlt_vendored::rel()),
+        text.contains("wouldRedownload") && text.contains(&vlt_vendored::rel()),
         "{v:#}"
     );
     assert!(!uuid_dir.exists());
-    let (code, v, stderr) = hosted::run_json(root, &["repair", "--offline", "--cwd", &cwd], &[]);
+    let fixture = crate::prebuilt_common::Server::project(root);
+    let (code, v, stderr) = hosted::run_json(
+        root,
+        &["repair", "--cwd", &cwd],
+        &[("SOCKET_VENDOR_URL", &fixture.uri)],
+    );
     assert_eq!(code, 0, "{v:#}\n{stderr}");
     assert_eq!(
         std::fs::read(root.join(vlt_vendored::rel()).join("index.js")).unwrap(),
@@ -1320,7 +1280,9 @@ fn retar(tgz: &[u8], mtime: u32, edit: impl FnOnce(&mut Vec<(String, Vec<u8>)>))
         header.set_size(bytes.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        builder.append_data(&mut header, path, bytes.as_slice()).unwrap();
+        builder
+            .append_data(&mut header, path, bytes.as_slice())
+            .unwrap();
     }
     builder.into_inner().unwrap().finish().unwrap()
 }
@@ -1330,7 +1292,7 @@ fn retar(tgz: &[u8], mtime: u32, edit: impl FnOnce(&mut Vec<(String, Vec<u8>)>))
 /// patched bytes BEFORE setting the artifact aside, rebuilds from the
 /// pristine installed copy, and restores the byte-exact recorded archive.
 #[tokio::test]
-async fn repair_offline_harvests_a_corrupt_artifacts_valid_members() {
+async fn repair_offline_never_repacks_verified_members() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1351,10 +1313,14 @@ async fn repair_offline_harvests_a_corrupt_artifacts_valid_members() {
     std::fs::write(&tgz, &corrupt).unwrap();
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
-    assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
-    assert_eq!(std::fs::read(&tgz).unwrap(), tgz_bytes, "byte-exact archive");
+    assert_eq!(v["summary"]["failed"], 1, "envelope={v}");
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        corrupt,
+        "preserves the corrupt archive"
+    );
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock1
@@ -1430,7 +1396,11 @@ async fn identity_kept_over_different_service_bytes(symlinked_lock: bool) {
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
-    assert_eq!(std::fs::read(&tgz).unwrap(), tgz_bytes, "the recorded bytes");
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        tgz_bytes,
+        "the recorded bytes"
+    );
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock1,

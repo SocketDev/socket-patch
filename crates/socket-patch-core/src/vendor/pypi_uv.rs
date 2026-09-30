@@ -1078,13 +1078,19 @@ fn rewrite_target_package_unit(
     // rebuilt unit splices back in front of the same `\r\n`.
     let old_unit = lock_text[span].trim_end_matches('\r').to_string();
     let unit: Vec<&str> = old_unit.lines().collect();
-    let wheels_lines = [
-        "wheels = [".to_string(),
-        format!(
-            "    {{ filename = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\" }},"
-        ),
-        "]".to_string(),
-    ];
+    let wheels_lines = if wheel_file_name.ends_with(".whl") {
+        vec![
+            "wheels = [".to_string(),
+            format!(
+                "    {{ filename = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\" }},"
+            ),
+            "]".to_string(),
+        ]
+    } else {
+        vec![format!(
+            "sdist = {{ hash = \"sha256:{wheel_sha256_hex}\" }}"
+        )]
+    };
 
     let mut out: Vec<String> = Vec::new();
     let mut wheels_done = false;
@@ -1554,7 +1560,17 @@ struct MetaDep {
 /// the fixtures that pass no block stay byte-exact.
 pub(super) async fn wheel_metadata_block(wheel_path: &Path) -> Option<String> {
     let bytes = tokio::fs::read(wheel_path).await.ok()?;
-    let text = wheel_metadata_text(&bytes)?;
+    let text = if wheel_path.to_string_lossy().ends_with(".whl") {
+        wheel_metadata_text(&bytes)?
+    } else {
+        let members =
+            super::pypi_distribution::read_members(&bytes, &wheel_path.to_string_lossy()).ok()?;
+        let metadata = members.get("PKG-INFO")?;
+        if metadata.len() > 4 * 1024 * 1024 {
+            return None;
+        }
+        String::from_utf8(metadata.clone()).ok()?
+    };
     render_package_metadata_block(&text)
 }
 
@@ -1957,6 +1973,7 @@ wheels = [
             base_purl: "pkg:pypi/six@1.16.0".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: REL_WHEEL.into(),
                 sha256: WHEEL_SHA.into(),
                 size: Some(11053),

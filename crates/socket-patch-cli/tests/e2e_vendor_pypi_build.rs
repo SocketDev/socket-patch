@@ -54,6 +54,9 @@
 //! older releases, whose lanes run in the `vendored_uv_*` tests. The pip
 //! capstones below keep their own `uv` discovery.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -117,13 +120,14 @@ fn binary() -> PathBuf {
 /// the developer's shell).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -361,7 +365,7 @@ fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String)
                 "--org",
                 ORG,
                 "--vendor-source",
-                "build",
+                "service",
                 "--cwd",
                 proj.to_str().unwrap(),
             ],
@@ -378,27 +382,29 @@ fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String)
 async fn mount_view_mock(server: &MockServer, before: &[u8], after: &[u8]) {
     use base64::Engine as _;
     let blob_b64 = base64::engine::general_purpose::STANDARD.encode(after);
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "six.py": {
+            "beforeHash": git_sha256(before),
+            "afterHash": git_sha256(after),
+            "blobContent": blob_b64,
+        }},
+        "vulnerabilities": { "GHSA-vend-pypi-real": {
+            "cves": ["CVE-2024-88888"],
+            "summary": "capstone vex vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "six.py": {
-                "beforeHash": git_sha256(before),
-                "afterHash": git_sha256(after),
-                "blobContent": blob_b64,
-            }},
-            "vulnerabilities": { "GHSA-vend-pypi-real": {
-                "cves": ["CVE-2024-88888"],
-                "summary": "capstone vex vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
 }
