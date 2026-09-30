@@ -184,4 +184,68 @@ mod tests {
         let text = serialize(&ledger).unwrap();
         assert!(text.ends_with("}\n"));
     }
+
+    fn pdm(original: &str, new: &str) -> FileEdit {
+        FileEdit {
+            path: "pdm.lock".into(),
+            kind: "redirect_pdm_lock_package".into(),
+            action: "rewritten".into(),
+            key: Some("urllib3".into()),
+            original: Some(serde_json::json!(original)),
+            new: Some(serde_json::json!(new)),
+        }
+    }
+
+    /// #331: a drifted PDM unit that still carries the Socket url or the
+    /// patched sha256 (`pdm add`, `pdm lock --update-reuse`) keeps the
+    /// recorded pristine `original`, re-laid in the relocked line endings;
+    /// a clean relock (`pdm lock`) still adopts the fresh one.
+    #[test]
+    fn pdm_rebase_keeps_the_pristine_original_while_the_patch_survives() {
+        let url = "url = \"https://patch.test/u.whl\"\r\n";
+        let pristine = "files = [\"sha256:1111\"]\r\n";
+        let wired = format!("files = [\"sha256:cccc\"]\r\n{url}");
+        for (current, fresh_new, keeps) in [
+            // url + patched hash kept, re-laid.
+            (
+                "files = [ \"sha256:cccc\" ]\nurl = \"https://patch.test/u.whl\"\n",
+                "files = [\"sha256:cccc\"]\nurl = \"https://patch.test/u.whl\"\n",
+                true,
+            ),
+            // url dropped, patched hash kept.
+            (
+                "files = [ \"sha256:cccc\" ]\n",
+                "files = [\"sha256:cccc\"]\nurl = \"https://patch.test/u.whl\"\n",
+                true,
+            ),
+            // `pdm lock`: back on the registry.
+            (
+                "files = [ \"sha256:2222\" ]\n",
+                "files = [\"sha256:cccc\"]\nurl = \"https://patch.test/u.whl\"\n",
+                false,
+            ),
+        ] {
+            let mut ledger = RedirectState::new();
+            ledger.edits.push(pdm(pristine, &wired));
+            let files = BTreeMap::from([("pdm.lock".to_string(), current.to_string())]);
+            merge(
+                &mut ledger,
+                &[pdm(current, fresh_new)],
+                BTreeMap::new(),
+                &files,
+            );
+            assert_eq!(ledger.edits.len(), 1, "rebased, not appended");
+            let original = ledger.edits[0].original.as_ref().unwrap().as_str().unwrap();
+            let want = if keeps {
+                "files = [\"sha256:1111\"]\n"
+            } else {
+                current
+            };
+            assert_eq!(original, want, "current={current:?}");
+            assert_eq!(
+                ledger.edits[0].new.as_ref().unwrap().as_str().unwrap(),
+                fresh_new
+            );
+        }
+    }
 }

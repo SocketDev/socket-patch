@@ -556,3 +556,124 @@ async fn assert_relock_roundtrip(lock: &str, relocked: &str) {
         "rollback restores the relocked lock byte for byte"
     );
 }
+
+/// #331: `pdm add <other>` / `pdm lock --update-reuse` re-render the
+/// redirected unit but KEEP the patch data. PDM 2.26+ keeps the Socket `url`
+/// and the patched sha256; PDM 2.12–2.20 drop the `url` but keep the patched
+/// sha256. The re-scan then records that still-patched unit as its
+/// `original`, so a rebase that adopted it would make `rollback` "revert"
+/// patched → patched, report success and delete the ledger. The rebase must
+/// keep the ledger's pristine `original` instead (with the relocked line
+/// endings), so `rollback` lands on the upstream registry unit inside the
+/// user's re-rendered lock.
+#[tokio::test]
+#[serial]
+async fn rerender_keeping_the_patch_then_rescan_rolls_back_to_the_registry() {
+    for start in ["\r\n", "\n"] {
+        for keep_url in [true, false] {
+            let lock = LOCK.replace("\r\n", "\n").replace('\n', start);
+            assert_rerender_roundtrip(&lock, keep_url).await;
+        }
+    }
+}
+
+/// Where the `urllib3` unit starts in `lock` (it is the last unit).
+fn urllib3_unit(lock: &str) -> usize {
+    lock.find("[[package]]\nname = \"urllib3\"")
+        .expect("urllib3 unit")
+}
+
+/// What `pdm add six==1.16.0` leaves: a new content hash, a `six` unit ahead
+/// of `urllib3`, and the redirected `urllib3` unit re-laid by PDM — its
+/// `files` back in PDM's one-entry-per-line layout, the Socket `url` kept
+/// (2.26+) or dropped (2.12–2.20), and the patched sha256 kept either way.
+/// PDM always writes LF.
+fn pdm_add_rerender(redirected: &str, keep_url: bool) -> String {
+    const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nrequires_python = \">=2.7, !=3.0.*, !=3.1.*, !=3.2.*\"\nsummary = \"Python 2 and 3 compatibility utilities\"\ngroups = [\"default\"]\nfiles = [\n    {file = \"six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\"},\n    {file = \"six-1.16.0.tar.gz\", hash = \"sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926\"},\n]\n\n";
+    const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
+    let text = redirected.replace("\r\n", "\n").replace(
+        "68a0e962e677b7f765a49a6df99753b78d8a99dfe60e5694e6994dcc8efb44bc",
+        &"d".repeat(64),
+    );
+    let at = urllib3_unit(&text);
+    let (head, unit) = text.split_at(at);
+    let socket_files = format!(
+        "files = [{{ file = \"{WHEEL}\", hash = \"sha256:{}\" }}]\n",
+        sha256()
+    );
+    let pdm_files = format!(
+        "files = [\n    {{file = \"{WHEEL}\", hash = \"sha256:{}\"}},\n]\n",
+        sha256()
+    );
+    assert!(unit.contains(&socket_files), "{unit}");
+    let mut unit = unit.replace(&socket_files, &pdm_files);
+    if !keep_url {
+        let url_line = format!("url = \"{HOSTED_URL}\"\n");
+        assert!(unit.contains(&url_line), "{unit}");
+        unit = unit.replace(&url_line, "");
+    }
+    format!("{head}{SIX}{unit}")
+}
+
+async fn assert_rerender_roundtrip(lock: &str, keep_url: bool) {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path(), lock);
+    let lock_path = tmp.path().join("pdm.lock");
+    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
+    let case = format!("keep_url={keep_url} crlf={}", lock.contains('\r'));
+
+    assert_eq!(
+        run(hosted_args(tmp.path(), server.uri(), None)).await,
+        0,
+        "{case}"
+    );
+    let redirected = read(&lock_path);
+    assert!(redirected.contains(HOSTED_URL), "{case}");
+
+    let rerendered = pdm_add_rerender(&redirected, keep_url);
+    std::fs::write(&lock_path, &rerendered).unwrap();
+
+    // The re-scan converges the re-laid unit back onto the Socket wiring.
+    assert_eq!(
+        run(hosted_args(tmp.path(), server.uri(), None)).await,
+        0,
+        "{case}"
+    );
+    let rescanned = read(&lock_path);
+    assert!(rescanned.contains(HOSTED_URL), "{case}: {rescanned}");
+    let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
+    for edit in ledger["edits"].as_array().unwrap() {
+        let original = edit["original"].as_str().unwrap();
+        assert!(
+            !original.contains(HOSTED_URL) && !original.contains(&sha256()),
+            "{case}: the ledger's original must stay the pristine unit: {ledger}"
+        );
+    }
+
+    let code = rollback::run(RollbackArgs {
+        targets: Vec::new(),
+        common: global(tmp.path(), server.uri()),
+        one_off: false,
+        preserve_state: false,
+    })
+    .await;
+    assert_eq!(
+        code, 0,
+        "{case}: rollback after re-render + re-scan must succeed"
+    );
+    let rolled_back = read(&lock_path);
+    assert!(
+        !rolled_back.contains(HOSTED_URL) && !rolled_back.contains(&sha256()),
+        "{case}: rollback must remove the Socket url and patched hash: {rolled_back}"
+    );
+    // Exactly the user's re-rendered lock with the pristine (LF) unit back.
+    let pristine = LOCK.replace("\r\n", "\n");
+    let expected = format!(
+        "{}{}",
+        &rerendered[..urllib3_unit(&rerendered)],
+        &pristine[urllib3_unit(&pristine)..]
+    );
+    assert_eq!(rolled_back, expected, "{case}");
+}
