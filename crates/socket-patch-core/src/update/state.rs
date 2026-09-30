@@ -3,8 +3,7 @@
 //! notifier never nags about a version the user just installed).
 //!
 //! This is disposable *cache* state, not configuration: it lives under the
-//! per-user cache root (the same root the gem launcher uses for its
-//! binary cache) and every read tolerates absence, corruption, and
+//! per-user cache root and every read tolerates absence, corruption, and
 //! clock skew by degrading to "never checked". Nothing in here may ever
 //! fail a command — callers treat all errors as "skip the check".
 
@@ -51,8 +50,7 @@ pub fn unix_now() -> u64 {
 /// Directory holding the state file (and the update lock). Resolution:
 /// `SOCKET_UPDATE_STATE_DIR` (internal override so tests never touch the
 /// real per-user dir) → `$XDG_CACHE_HOME` → `~/.cache` (all Unix flavors,
-/// macOS included — deliberately the launchers' shared cache root, not
-/// `~/Library/Caches`) → `%LOCALAPPDATA%` → `%USERPROFILE%\AppData\Local`
+/// macOS included) → `%LOCALAPPDATA%` → `%USERPROFILE%\AppData\Local`
 /// (Windows). `None` = no resolvable base; callers silently skip.
 pub fn state_dir() -> Option<PathBuf> {
     fn env_dir(name: &str) -> Option<PathBuf> {

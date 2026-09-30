@@ -21,85 +21,37 @@ your repo when installs must work offline.
 
 ## Installation
 
-One-line install (macOS / Linux):
+Install the standalone binary (**recommended**, macOS / Linux):
 
 ```bash
 curl -fsSL https://install.socket.dev/patch | sh
 ```
 
-Detects your platform (macOS/Linux, x64/ARM64), downloads the latest binary, verifies it
-against the release's `SHA256SUMS`, and installs to `/usr/local/bin` or `~/.local/bin`.
-Use `sudo sh` instead of `sh` if `/usr/local/bin` requires root. Pin a version with
-`SOCKET_PATCH_VERSION=3.3.0 sh` instead of plain `sh`.
+The installer detects your platform, downloads the latest binary, verifies it against
+the release's `SHA256SUMS`, and installs to `/usr/local/bin` or `~/.local/bin`.
+It needs no language runtime. Set `SOCKET_PATCH_INSTALL_DIR` to choose a directory or
+`SOCKET_PATCH_VERSION` to pin a release; pass either variable to `sh` after the pipe.
+You can inspect the [installer source](scripts/install.sh) and read about
+[mirrors and restricted networks](docs/installer-hosting.md#installing-without-reaching-githubcom).
 
-On a network that blocks or distrusts `github.com`, set `SOCKET_PATCH_BASE_URL` so the
-archives come from Socket too — `install.socket.dev` relays them from the GitHub release,
-checksums included:
-
-```bash
-curl -fsSL https://install.socket.dev/patch \
-  | SOCKET_PATCH_BASE_URL=https://install.socket.dev/patch/SocketDev/socket-patch/releases sh
-```
-
-`install.socket.dev` serves a copy of [`scripts/install.sh`](scripts/install.sh) from
-this repository — read it before you run it, either there or at
-[install.socket.dev/patch](https://install.socket.dev/patch). If you would rather not
-depend on the Socket domain, `curl -fsSL
-https://raw.githubusercontent.com/SocketDev/socket-patch/main/scripts/install.sh | sh`
-does the same thing from the same bytes. See
-[docs/installer-hosting.md](docs/installer-hosting.md) for how the hosted copy is
-published.
-
-On Windows, install via npm (below), or grab a prebuilt
+On Windows, download a prebuilt
 `socket-patch-*-pc-windows-msvc.zip` from the
-[latest release](https://github.com/SocketDev/socket-patch/releases/latest).
+[latest release](https://github.com/SocketDev/socket-patch/releases/latest), extract it
+into a directory on your `PATH`, or install via npm below. The full
+[platform list](docs/ecosystems.md#supported-platforms) includes Linux, macOS, Windows,
+and Android release archives.
 
-Or install through your package manager:
+### Cargo and npm
+
+These are the supported package-manager distributions:
 
 | Package manager | Command |
 |-----------------|---------|
-| npm | `npm install -g @socketsecurity/socket-patch` (or one-shot: `npx @socketsecurity/socket-patch`) |
-| pip | `pip install socket-patch` |
 | cargo | `cargo install socket-patch-cli` (builds from source with every ecosystem compiled in) |
-| gem | `gem install socket-patch` |
+| npm | `npm install -g @socketsecurity/socket-patch` (or one-shot: `npx @socketsecurity/socket-patch`) |
 
-The gem package is a thin launcher: on first run it downloads the prebuilt binary for
-your platform from the matching GitHub release, verifies its SHA-256, caches it, and
-execs it. Set `SOCKET_PATCH_BIN` to an existing binary to skip the download.
-
-<details>
-<summary>Manual download</summary>
-
-Download a prebuilt binary from the [latest release](https://github.com/SocketDev/socket-patch/releases/latest):
-
-```bash
-# macOS (Apple Silicon)
-curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-aarch64-apple-darwin.tar.gz | tar xz
-
-# macOS (Intel)
-curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-x86_64-apple-darwin.tar.gz | tar xz
-
-# Linux (x86_64)
-curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-x86_64-unknown-linux-musl.tar.gz | tar xz
-
-# Linux (ARM64)
-curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-aarch64-unknown-linux-musl.tar.gz | tar xz
-```
-
-The musl builds are fully static and run on any distro; glibc (`-gnu`) variants are also
-on the releases page, alongside Windows (`socket-patch-x86_64-pc-windows-msvc.zip`) and
-other targets.
-
-Then move the binary onto your `PATH`:
-
-```bash
-sudo mv socket-patch /usr/local/bin/
-```
-
-The full list of prebuilt targets (Windows, 32-bit ARM, i686, Android) is in
-[docs/ecosystems.md](docs/ecosystems.md#supported-platforms).
-
-</details>
+The npm distribution also supplies Socket Patch to the official
+[Socket CLI](https://docs.socket.dev/docs/socket-cli).
 
 ### Updating
 
@@ -115,6 +67,19 @@ installs are detected and pointed at their own upgrade command instead (e.g.
 `npm update -g @socketsecurity/socket-patch`). When a newer release exists,
 interactive runs print a once-a-day reminder on stderr — set
 `SOCKET_NO_UPDATE_CHECK=1` to turn that off.
+
+### Migrating from PyPI or RubyGems
+
+Starting with v5, Socket Patch is distributed as standalone binaries, Cargo crates,
+and npm packages. The `socket-patch` PyPI package and Ruby gem, along with
+`socket-patch-hook` and `socket-patch-bundler`, are no longer published.
+Python and Ruby projects remain fully supported by all three distributions.
+
+Uninstall the old CLI with the manager that installed it (`pip uninstall socket-patch`,
+`pipx uninstall socket-patch`, or `gem uninstall socket-patch`), then use one of the
+installation methods above. Remove it from project dependencies and CI bootstrap
+commands too. Run `socket-patch --version` to confirm your shell finds the new binary.
+Projects that used install hooks should also follow [Upgrading from `setup`](#upgrading-from-setup).
 
 ## Five-minute tutorial
 
@@ -1259,8 +1224,9 @@ project that ran `setup`:
      `scripts.post-install-cmd` and `scripts.post-update-cmd`.
    - **Python**: remove `socket-patch[hook]` from `requirements.txt`, or from
      `[project].dependencies` / `[tool.poetry.dependencies]` in `pyproject.toml`, then
-     `pip uninstall socket-patch-hook` in each environment that has it (the wheel is no
-     longer published, so a fresh install fails while the dependency is still listed).
+     `pip uninstall socket-patch-hook` in each environment that has it. Those packages
+     no longer receive releases; install the CLI separately using the
+     [v5 installation methods](#installation).
    - **Bundler**: delete the managed `plugin "socket-patch", path: ...` block from the
      `Gemfile`, then `bundle plugin uninstall socket-patch`, and delete
      `.socket/bundler-plugin/`, `.socket/gem-plugin-stamp` and the `/gem-plugin-stamp`
