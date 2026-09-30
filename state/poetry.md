@@ -19,7 +19,7 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | macOS | 2.4.3 | untested | pass | fail #327 | pass (LF + CRLF) | pass (LF + CRLF) | untested | untested |
 | Windows | 1.8.5 | untested | fail #329 | fail #327 | pass (LF + CRLF) | pass (LF + CRLF) | untested | untested |
 | Windows | 2.0.1 | untested | fail #329 | fail #327 | untested | untested | untested | untested |
-| Windows | 2.4.3 | untested | fail #329 | fail #327 | untested (probe 2 cell still running at ledger time) | untested | untested | untested |
+| Windows | 2.4.3 | untested | fail #329 | fail #327 | pass (LF + CRLF) | pass (LF + CRLF) | untested | untested |
 
 ## Backlog
 
