@@ -2405,7 +2405,9 @@ mod tests {
             let files = fs(&[(rel, src)]);
             let err = run(&files, &patch()).unwrap_err();
             assert_eq!(err.code, "vendor_jvm_shape_unsupported", "{rel}");
-            assert!(err.detail.starts_with("reason: android_or_kmp: "), "{}", err.detail);
+            // The detail names the patch uuid: never print it (CodeQL
+            // rust/cleartext-logging).
+            assert!(err.detail.starts_with("reason: android_or_kmp: "), "{rel}: wrong reason");
         }
         let files = fs(&[(
             "build.gradle",
@@ -2424,8 +2426,7 @@ mod tests {
         assert!(
             err.detail
                 .starts_with("reason: gradle_exclusive_content_conflict: "),
-            "{}",
-            err.detail
+            "wrong refusal reason (the detail names the patch uuid, so it is not printed)"
         );
         let files = fs(&[(
             "settings.gradle",
@@ -2616,7 +2617,10 @@ mod tests {
         for bad in ["<verification-metadata/>", "<verification-metadata><components><component name=\"x\"></component></components></verification-metadata>"] {
             let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, bad)]);
             let err = run(&files, &patch()).unwrap_err();
-            assert!(err.detail.starts_with("reason: gradle_verification_unparseable: "), "{}", err.detail);
+            assert!(
+                err.detail.starts_with("reason: gradle_verification_unparseable: "),
+                "wrong refusal reason (the detail names the patch uuid, so it is not printed)"
+            );
         }
     }
 

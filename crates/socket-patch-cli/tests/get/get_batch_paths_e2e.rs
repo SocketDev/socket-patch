@@ -144,9 +144,10 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
     let opts = v["options"].as_array().expect("options must be an array");
     assert_eq!(opts.len(), 2, "both candidate patches must be listed");
     let uuids: HashSet<&str> = opts.iter().filter_map(|o| o["uuid"].as_str()).collect();
+    // Name the UUIDs, never print them (CodeQL rust/cleartext-logging).
     assert!(
         uuids.contains(UUID_A) && uuids.contains(UUID_B),
-        "options must list both candidate UUIDs; got {uuids:?}"
+        "options must list both candidate UUIDs"
     );
 
     // Each option must carry the full disambiguation payload — tier, the
