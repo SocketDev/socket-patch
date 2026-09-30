@@ -63,6 +63,21 @@ impl Server {
     }
 
     pub fn project_with_env(root: &Path, env: &[(&str, &str)]) -> Self {
+        Self::project_with_bind(root, env, false)
+    }
+
+    pub fn docker_project(root: &Path, env: &[(&str, &str)]) -> Self {
+        Self::project_with_bind(root, env, true)
+    }
+
+    pub fn docker_uri(&self) -> String {
+        format!(
+            "http://host.docker.internal:{}",
+            self.uri.rsplit(':').next().unwrap()
+        )
+    }
+
+    fn project_with_bind(root: &Path, env: &[(&str, &str)], docker: bool) -> Self {
         let root = root.to_path_buf();
         let extra: Vec<_> = env
             .iter()
@@ -89,7 +104,9 @@ impl Server {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                let server = MockServer::start().await;
+                let address = if docker { "0.0.0.0:0" } else { "127.0.0.1:0" };
+                let listener = std::net::TcpListener::bind(address).unwrap();
+                let server = MockServer::builder().listener(listener).start().await;
                 mount_project_with_roots(&server, &root, extra).await;
                 ready_tx.send(server.uri()).unwrap();
                 // The HTTP worker runs on the runtime's worker thread.
@@ -204,6 +221,9 @@ async fn mount_project_with_roots(server: &MockServer, root: &Path, extra: Vec<P
             .await;
     }
     for (purl, record) in records {
+        if purl.starts_with("pkg:jsr/") {
+            continue;
+        }
         let key = (root.to_path_buf(), record.uuid.clone());
         let cached = PUBLISHED
             .get_or_init(Default::default)
@@ -473,6 +493,15 @@ fn source_dir(root: &Path, paths: &[PathBuf], purl: &str) -> PathBuf {
 }
 
 pub async fn mount_view(server: &MockServer, view: &serde_json::Value, gemspec: Option<&[u8]>) {
+    mount_view_from_source(server, view, gemspec, None).await;
+}
+
+pub async fn mount_view_from_source(
+    server: &MockServer,
+    view: &serde_json::Value,
+    gemspec: Option<&[u8]>,
+    installed: Option<&Path>,
+) {
     let purl = view["purl"].as_str().unwrap();
     let mut manifest_record = view.clone();
     manifest_record["exportedAt"] = view["publishedAt"].clone();
@@ -495,7 +524,7 @@ pub async fn mount_view(server: &MockServer, view: &serde_json::Value, gemspec: 
     let (name, version) = package.rsplit_once('@').unwrap();
     let name = name.replace("%40", "@");
     let layout = package_layout(purl);
-    copy_tree(layout.path(), &source);
+    copy_tree(installed.unwrap_or(layout.path()), &source);
     if let Some(gemspec) = gemspec {
         std::fs::create_dir_all(tmp.path().join("specifications")).unwrap();
         std::fs::write(

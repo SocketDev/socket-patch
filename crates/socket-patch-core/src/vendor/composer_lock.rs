@@ -384,6 +384,11 @@ pub async fn vendor_composer<'a>(
         return refused("vendor_composer_mirror_filter_conflict", detail);
     }
 
+    let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
+        Ok(inventory) => inventory,
+        Err(error) => return refused("vendor_inventory_unavailable", error),
+    };
+
     // ── lock rewrite ─────────────────────────────────────────────────────
     // The memo hands the parse out shared; this is the one branch that
     // mutates it, so it takes its own copy.
@@ -442,10 +447,10 @@ pub async fn vendor_composer<'a>(
         artifact: VendorArtifact {
             yarn_berry10c0: None,
             path: copy_rel,
-            sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
+            sha256: String::new(), // Directory integrity uses the complete inventory.
             size: None,
             platform_locked: None,
-            file_inventory: None,
+            file_inventory: Some(file_inventory),
         },
         wiring: vec![WiringRecord {
             file: COMPOSER_LOCK.to_string(),
@@ -4098,6 +4103,64 @@ mod tests {
 
     /// The vendored copy ships filter files Composer's path mirror honours:
     /// they are neutralized before the lock is wired, and warned about.
+    #[tokio::test]
+    async fn fresh_composer_inventory_allows_exact_repair_after_filter_changes() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        tokio::fs::write(installed.join(".gitattributes"), "/src export-ignore\n")
+            .await
+            .unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+        let (leaf, bytes, _) = crate::vendor::test_support::service_fixture::archive(
+            PURL, &installed, &record, &sources,
+        )
+        .await
+        .unwrap();
+        let server = wiremock::MockServer::start().await;
+        crate::vendor::test_support::mount_granted(&server, UUID, &leaf, &bytes).await;
+        let cfg = crate::vendor::test_support::service_cfg(
+            &server.uri(),
+            crate::vendor::VendorSource::Service,
+            false,
+        );
+        let (result, entry, _) =
+            unwrap_done(vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let copy = root.join(&entry.artifact.path);
+        let inventory = super::super::verify::compute_dir_inventory(&copy)
+            .await
+            .unwrap();
+        assert_eq!(entry.artifact.file_inventory.as_ref(), Some(&inventory));
+        assert!(inventory.contains_key("composer.json"));
+        assert_eq!(
+            tokio::fs::read(copy.join(".gitattributes")).await.unwrap(),
+            b""
+        );
+        let lock_before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let ledger = root.join(".socket/vendor/state.json");
+        let ledger_before = serde_json::to_vec(&entry).unwrap();
+        tokio::fs::write(&ledger, &ledger_before).await.unwrap();
+        tokio::fs::remove_dir_all(&copy).await.unwrap();
+        tokio::fs::remove_dir_all(installed).await.unwrap();
+        tokio::fs::remove_dir_all(blobs).await.unwrap();
+        super::super::redownload::restore(root, &entry, &record, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::verify::compute_dir_inventory(&copy)
+                .await
+                .unwrap(),
+            inventory
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_before
+        );
+        assert_eq!(tokio::fs::read(ledger).await.unwrap(), ledger_before);
+    }
+
     #[tokio::test]
     async fn fresh_vendor_neutralizes_mirror_filters() {
         let lock = lock_value("psr/log", "3.0.2", false);

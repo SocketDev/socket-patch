@@ -8,7 +8,9 @@ use crate::utils::purl::{
 };
 
 use super::common::{copy_matches_after_hashes, swap_stage_into_place};
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact, ServiceAttempt};
+use super::service_fetch::{
+    fetch_verified_archive, ServiceAttempt, ServicePolicy, ServiceTerminal, VerifiedArchive,
+};
 use super::state::VendorEntry;
 use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -26,6 +28,23 @@ fn used<T>(attempt: ServiceAttempt<T>) -> Result<T, String> {
         ServiceAttempt::Used(value) => Ok(value),
         ServiceAttempt::HardFail(outcome) => Err(detail(*outcome)),
     }
+}
+
+async fn download_archive(
+    service: &VendorServiceConfig,
+    record: &PatchRecord,
+    noun: &str,
+    subject: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<VerifiedArchive, String> {
+    ServicePolicy::new(service, ServiceTerminal::Refused)
+        .settle(
+            fetch_verified_archive(service, &record.uuid).await,
+            noun,
+            subject,
+            warnings,
+        )
+        .or_else(used)
 }
 
 /// Restore only the recorded artifact. Project wiring and ledger are never written.
@@ -91,15 +110,14 @@ pub async fn restore(
     let uuid_dir = stage.parent().ok_or("artifact has no parent")?;
     let mut warnings = Vec::new();
     if file_shaped {
-        let archive = match fetch_verified_archive(service, &record.uuid).await {
-            ServiceArtifact::Ready(archive) => archive,
-            ServiceArtifact::Pending => {
-                return Err("the server artifact is still building; retry once it is ready".into())
-            }
-            ServiceArtifact::Unavailable(reason)
-            | ServiceArtifact::Failed(reason)
-            | ServiceArtifact::IntegrityMismatch(reason) => return Err(reason),
-        };
+        let archive = download_archive(
+            service,
+            record,
+            "archive",
+            &format!("archive for {}", entry.base_purl),
+            &mut warnings,
+        )
+        .await?;
         if entry.artifact.sha256.is_empty()
             || !hex::encode(Sha256::digest(&archive.bytes))
                 .eq_ignore_ascii_case(&entry.artifact.sha256)
@@ -225,10 +243,14 @@ pub async fn restore(
             "golang" => {
                 let (module, version) =
                     parse_golang_purl(&entry.base_purl).ok_or("invalid Go coordinates")?;
-                let archive = match fetch_verified_archive(service, &record.uuid).await {
-                    ServiceArtifact::Ready(archive) => archive,
-                    other => return Err(format!("server module unavailable: {other:?}")),
-                };
+                let archive = download_archive(
+                    service,
+                    record,
+                    "module zip",
+                    &format!("module zip for {module}"),
+                    &mut warnings,
+                )
+                .await?;
                 let prefix = format!("{module}@{version}/");
                 tokio::fs::create_dir_all(&stage)
                     .await
@@ -685,5 +707,73 @@ mod tests {
         .unwrap_err()
         .contains("identity"));
         assert_eq!(tree_snapshot(root.path()), before);
+    }
+    #[tokio::test]
+    async fn go_restore_uses_shared_service_policy_without_mutating_the_tree() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let root = tempfile::tempdir().unwrap();
+        let mut entry = entry(b"unused");
+        entry.ecosystem = "golang".into();
+        entry.base_purl = "pkg:golang/example.com/library@v1.0.0".into();
+        entry.flavor = None;
+        entry.artifact.path = format!(".socket/vendor/golang/{UUID}/example.com/library@v1.0.0");
+        entry.artifact.sha256.clear();
+        entry.artifact.size = None;
+        entry.artifact.file_inventory = Some(Default::default());
+        let copy = root.path().join(&entry.artifact.path);
+        tokio::fs::create_dir_all(&copy).await.unwrap();
+        tokio::fs::write(copy.join("index.js"), b"existing bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("go.mod"), b"module consumer\n")
+            .await
+            .unwrap();
+        let before = tree_snapshot(root.path());
+        let server = wiremock::MockServer::start().await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
+        for (status, expected) in [
+            (
+                "pending_build",
+                "vendor_prebuilt_required: prebuilt module zip is still building",
+            ),
+            (
+                "not_found",
+                "vendor_prebuilt_required: prebuilt module zip unavailable",
+            ),
+            (
+                "transport",
+                "vendor_prebuilt_required: patch service request failed",
+            ),
+            ("tampered", "vendor_prebuilt_integrity_mismatch"),
+        ] {
+            server.reset().await;
+            if status == "transport" {
+                crate::vendor::test_support::mount_503(&server).await;
+            } else if status == "tampered" {
+                mount_granted(&server, UUID, "v1.0.0.zip", b"promised bytes").await;
+                Mock::given(method("GET"))
+                    .and(path(format!("/serve/{UUID}/v1.0.0.zip")))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_bytes(b"different bytes".to_vec()),
+                    )
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            } else {
+                Mock::given(method("POST"))
+                    .and(path(crate::vendor::test_support::PACKAGE_PATH))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "results": { UUID: { "status": status } }
+                    })))
+                    .mount(&server)
+                    .await;
+            }
+            let error = restore(root.path(), &entry, &record(), &cfg)
+                .await
+                .unwrap_err();
+            assert!(error.contains(expected), "{status}: {error}");
+            assert_eq!(tree_snapshot(root.path()), before, "{status}");
+        }
     }
 }

@@ -235,7 +235,7 @@ async fn vlt_pinned_matrix_vendored_scan_fresh_ci() {
     };
     let fx = left_pad_fixture(leg).await;
     let doc = vendor_scan(&fx);
-    assert!(!event_codes(&doc)
+    assert!(event_codes(&doc)
         .iter()
         .any(|c| c == "vendor_prebuilt_downloaded"));
     assert_vendored(&fx, fx.t(), "");

@@ -1172,7 +1172,13 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
         "license": "MIT",
         "tier": "free",
     });
-    prebuilt_common::mount_view(&server, &view, None).await;
+    prebuilt_common::mount_view_from_source(
+        &server,
+        &view,
+        None,
+        installed_rb.parent().and_then(Path::parent),
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
@@ -1184,9 +1190,8 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
     let gemfile_before = std::fs::read(&gemfile_path).unwrap();
 
     // 3. get <uuid> --mode vendored: record save + scan's whole-manifest
-    //    vendor step in one command. `--vendor-source build` keeps the
-    //    artifact build local (no vendoring-service mocks needed); the
-    //    staging fetches the blob content into MEMORY from the view mock.
+    //    vendor step in one command. The fixture service publishes the full
+    //    installed gem with its patched member, including unmodified files.
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[

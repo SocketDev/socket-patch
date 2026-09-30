@@ -22,7 +22,7 @@
 //!     without touching either package.json; a fresh checkout of only the
 //!     committable files installs the patched bytes offline-from-registry,
 //!     and the member resolves them through `yarn node`.
-//!   * vendored — `vendor --offline` wires the ROOT package.json
+//!   * vendored — `vendor` wires the ROOT package.json
 //!     `resolutions` + the root lock `file:` locator (member package.json
 //!     byte-identical); fresh `--immutable --check-cache` installs the
 //!     patched bytes, the member resolves them, and `--revert` restores
@@ -51,6 +51,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -150,8 +152,9 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -665,7 +668,7 @@ fn yarn4_workspaces_vendor_wires_root_and_member_installs_patched_bytes() {
     let root_pkg_before = std::fs::read(&root_pkg_path).unwrap();
     let member_pkg_before = std::fs::read(&member_pkg_path).unwrap();
 
-    // Vendor (offline) from the WORKSPACE ROOT.
+    // Download the vendored artifact from the WORKSPACE ROOT.
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[

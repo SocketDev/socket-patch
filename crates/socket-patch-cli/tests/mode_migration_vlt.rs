@@ -753,14 +753,14 @@ async fn vlt_pinned_matrix_migration_flavor_changed() {
     );
     assert_ok(&npm, "npm install");
     stage_manifest(&dir, &[fx.t()]);
-    let out = vendor_cmd(&dir, &[]);
+    let out = vendor_upstream(&fx, &dir, &[]);
     assert_eq!(out.code, 0, "{out}");
     let ledger = std::fs::read_to_string(dir.join(".socket/vendor/state.json")).unwrap();
     assert!(ledger.contains("\"npm\""), "{ledger}");
     write_vlt_json(&dir, fx.leg.version(), &fx.reg.url(), &VltJson::default());
     std::fs::remove_dir_all(dir.join("node_modules")).unwrap();
     fx.vlt_ok(&dir, &["install"]);
-    let out = vendor_cmd(&dir, &["--force"]);
+    let out = vendor_upstream(&fx, &dir, &["--force"]);
     assert!(has_code(&out.json(), "vendor_flavor_changed"), "{out}");
     fx.leg.ran();
 }

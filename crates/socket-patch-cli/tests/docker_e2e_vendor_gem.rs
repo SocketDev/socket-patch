@@ -30,7 +30,7 @@
 //!     the record to `vex` and `apply --vex`; `--offline` without a ledger
 //!     → `record_unavailable`, zero requests; pair reverted → `vendor_unwired`
 //!     (also `--no-verify`). Both flavors; documents re-asserted host-side.
-//!   stage 3 (`--network none`): re-vendor idempotent (already_vendored,
+//!   stage 3 (service available): re-vendor idempotent (already_vendored,
 //!     Gemfile + lock byte-stable) → `vendor --revert` byte-restores BOTH
 //!     Gemfile and Gemfile.lock and removes `.socket/vendor` entirely →
 //!     re-vendor succeeds again.
@@ -53,8 +53,8 @@
 mod docker_vendor_common;
 
 use docker_vendor_common::{
-    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
-    skip_if_no_image, stage_patch_fn,
+    assert_stage_markers, bash_prelude, json_assert_fns, run_in_image_network_none,
+    run_with_fixture, run_with_service, skip_if_no_image, stage_patch_fn,
 };
 
 const IMAGE: &str = "socket-patch-test-gem:latest";
@@ -89,12 +89,11 @@ fn render(stage_body: &str) -> String {
 }
 
 /// Stage 1: real bundler fixture (network OK) + staged marker patch +
-/// `vendor --json --offline` + pair-edit asserts + fresh-checkout staging.
+/// `vendor --json` + pair-edit asserts + fresh-checkout staging.
 const STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-# Keep the in-container socket-patch fully offline (also gates telemetry,
-# which keys off the env var rather than the --offline flag).
-export SOCKET_OFFLINE=1
+# Disable telemetry independently of artifact download access.
+export SOCKET_TELEMETRY_DISABLED=1
 # The official ruby image points BUNDLE_APP_CONFIG at /usr/local/bundle,
 # which would hijack `bundle config set --local`; pin it back to the
 # project so .bundle/config is a real committable file.
@@ -154,8 +153,9 @@ cp Gemfile.lock /workspace/snap/Gemfile.lock.prevendor
 sha256sum /tmp/patched.rb | cut -d' ' -f1 > /workspace/snap/patched.sha
 echo "$RACK_VER" > /workspace/snap/rack-ver
 
-# 3. Vendor (fully offline: the blob is staged locally).
-socket-patch vendor --json --offline > /tmp/vendor.json 2>/tmp/vendor.err
+# 3. Download the artifact published from the staged fixture.
+publish_fixture
+socket-patch vendor --json > /tmp/vendor.json 2>/tmp/vendor.err
 RC=$?; cat /tmp/vendor.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/vendor.json >&2; fail "vendor exited $RC (expected 0)"; }
 assert_json_field /tmp/vendor.json '"status": "success"'
@@ -395,11 +395,11 @@ fn assert_manifestless_vex_from_host(host_dir: &std::path::Path, uuid: &str, ghs
     }
 }
 
-/// Stage 3 (`--network none`): idempotent re-vendor → revert byte-restores
+/// Stage 3 (service available): idempotent re-vendor → revert byte-restores
 /// the Gemfile + lock pair and removes `.socket/vendor` → re-vendor again.
 const STAGE3: &str = r#"
 cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 export BUNDLE_APP_CONFIG="$PWD/.bundle"
 RACK_VER=$(cat /workspace/snap/rack-ver)
 COPY_REL=".socket/vendor/gem/__UUID__/rack-$RACK_VER"
@@ -430,7 +430,7 @@ cmp -s Gemfile.lock /workspace/snap/Gemfile.lock.prevendor \
 echo "===REVERT VERIFIED==="
 
 # 3. Re-vendor after revert succeeds and re-wires the pair.
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -519,7 +519,7 @@ fn assert_vex_attested_from_host(host_dir: &std::path::Path) {
 /// while landing the same pair edit as the no-CHECKSUMS flavor.
 const STAGE1_CK: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 export BUNDLE_APP_CONFIG="$PWD/.bundle"
 
 cat > Gemfile <<'EOF'
@@ -569,8 +569,9 @@ cp Gemfile.lock /workspace/snap/Gemfile.lock.prevendor
 printf '%s\n' "$UPSTREAM_LINE" > /workspace/snap/upstream-checksum-line
 echo "$RACK_VER" > /workspace/snap/rack-ver
 
-# 3. Vendor (fully offline).
-socket-patch vendor --json --offline > /tmp/vendor.json 2>/tmp/vendor.err
+# 3. Download the artifact published from the staged fixture.
+publish_fixture
+socket-patch vendor --json > /tmp/vendor.json 2>/tmp/vendor.err
 RC=$?; cat /tmp/vendor.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/vendor.json >&2; fail "vendor exited $RC (expected 0)"; }
 assert_json_field /tmp/vendor.json '"status": "success"'
@@ -644,12 +645,12 @@ echo "===RUNTIME MARKER VERIFIED==="
 exit 0
 "#;
 
-/// Stage 3 of the twin (`--network none`): idempotent re-vendor → revert
+/// Stage 3 of the twin (service available): idempotent re-vendor → revert
 /// restores the registry `sha256=` CHECKSUMS line VERBATIM (byte-identical
 /// files) → re-vendor rewrites it back to the bare form.
 const STAGE3_CK: &str = r#"
 cd /workspace/proj
-export SOCKET_OFFLINE=1
+export SOCKET_TELEMETRY_DISABLED=1
 export BUNDLE_APP_CONFIG="$PWD/.bundle"
 RACK_VER=$(cat /workspace/snap/rack-ver)
 UPSTREAM_LINE=$(cat /workspace/snap/upstream-checksum-line)
@@ -683,7 +684,7 @@ grep -qxF "$UPSTREAM_LINE" Gemfile.lock \
 echo "===REVERT VERIFIED==="
 
 # 3. Re-vendor after revert: the CHECKSUMS entry goes bare again.
-socket-patch vendor --json --offline > /tmp/revendor2.json 2>/tmp/revendor2.err
+socket-patch vendor --json > /tmp/revendor2.json 2>/tmp/revendor2.err
 RC=$?; cat /tmp/revendor2.err >&2
 [ "$RC" -eq 0 ] || { cat /tmp/revendor2.json >&2; fail "post-revert re-vendor exited $RC"; }
 assert_summary /tmp/revendor2.json applied 1
@@ -743,9 +744,9 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     // confuse Docker Desktop's file-sharing allowlist.
     let host_dir = tmp.path().canonicalize().expect("canonicalize tempdir");
 
-    // Stage 1 — networked fixture install + offline vendor + pair-edit +
+    // Stage 1 — networked fixture install + service download + pair-edit +
     // VEX asserts.
-    let out = run_in_image(IMAGE, &host_dir, &render(STAGE1));
+    let (out, service) = run_with_fixture(IMAGE, &host_dir, &render(STAGE1));
     assert_stage_markers(
         "gem stage 1 (install+vendor)",
         &out,
@@ -771,8 +772,8 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     );
     assert_manifestless_vex_from_host(&host_dir, UUID, GHSA);
 
-    // Stage 3 — idempotency, revert, re-vendor (still no network).
-    let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE3));
+    // Stage 3 — idempotency, revert, redownload after revert.
+    let out = run_with_service(IMAGE, &host_dir, &render(STAGE3), &service.docker_uri());
     assert_stage_markers(
         "gem stage 3 (idempotent+revert+re-vendor)",
         &out,
@@ -795,9 +796,10 @@ fn gem_vendor_lockfile_checksums_fresh_checkout_and_revert() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let host_dir = tmp.path().canonicalize().expect("canonicalize tempdir");
 
-    // Stage 1 — networked fixture install + --add-checksums + offline vendor
+    // Stage 1 — networked fixture install + --add-checksums + service download
     // + CHECKSUMS-rewrite + pair-edit asserts.
-    let out = run_in_image(IMAGE, &host_dir, &render_with(STAGE1_CK, CK_UUID, CK_GHSA));
+    let (out, service) =
+        run_with_fixture(IMAGE, &host_dir, &render_with(STAGE1_CK, CK_UUID, CK_GHSA));
     assert_stage_markers(
         "gem ck stage 1 (install+add-checksums+vendor)",
         &out,
@@ -826,8 +828,12 @@ fn gem_vendor_lockfile_checksums_fresh_checkout_and_revert() {
     assert_manifestless_vex_from_host(&host_dir, CK_UUID, CK_GHSA);
 
     // Stage 3 — idempotency, revert (verbatim sha256= restore), re-vendor.
-    let out =
-        run_in_image_network_none(IMAGE, &host_dir, &render_with(STAGE3_CK, CK_UUID, CK_GHSA));
+    let out = run_with_service(
+        IMAGE,
+        &host_dir,
+        &render_with(STAGE3_CK, CK_UUID, CK_GHSA),
+        &service.docker_uri(),
+    );
     assert_stage_markers(
         "gem ck stage 3 (idempotent+revert+re-vendor)",
         &out,

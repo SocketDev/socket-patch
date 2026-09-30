@@ -25,6 +25,9 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "docker_vendor_common/mod.rs"]
+mod docker_vendor_common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -859,10 +862,10 @@ exit 0
 
 /// Vendored berry leg: the container twin of `e2e_vendor_yarn_berry_build.rs`.
 /// Real yarn 4 install → stage a `.socket/` manifest + blob from the ACTUAL
-/// installed bytes (no API) → `vendor --offline` → fresh-checkout
+/// installed bytes → service download → fresh-checkout
 /// `yarn install --immutable --check-cache` (offline global cache) must
 /// install the PATCHED bytes from the vendored tarball. This proves the
-/// vendored `10c0/<hex>` checksum the CLI computes offline is exactly what a
+/// vendored `10c0/<hex>` checksum served with the artifact is exactly what a
 /// real yarn 4 accepts under `--check-cache`.
 fn make_berry_vendor_script() -> String {
     // git-sha256 in bash: sha256("blob <len>\0" ++ bytes).
@@ -911,8 +914,9 @@ LOCK_BEFORE=$(sha256sum yarn.lock | cut -d' ' -f1)
 cp yarn.lock /tmp/registry-yarn.lock
 cp package.json /tmp/registry-package.json
 
-# 3. Vendor (offline: builds the tarball + rewrites yarn.lock + package.json).
-socket-patch vendor --json --offline --cwd "$PWD" >/tmp/vendor.out 2>/tmp/vendor.err
+# 3. Download the published tarball and wire yarn.lock + package.json.
+publish_fixture
+socket-patch vendor --json --cwd "$PWD" >/tmp/vendor.out 2>/tmp/vendor.err
 VRC=$?
 echo "vendor exit=$VRC" >&2; cat /tmp/vendor.out >&2 || true; cat /tmp/vendor.err >&2 || true
 if [ "$VRC" -ne 0 ]; then echo "FAIL: berry vendor exited $VRC" >&2; exit 1; fi
@@ -1002,8 +1006,8 @@ async fn npm_berry_agent_install_apply_chain() {
 }
 
 /// Vendored berry offline-frozen-install chain in Docker (container twin of
-/// `e2e_vendor_yarn_berry_build.rs`). No API — the manifest is staged from the
-/// installed bytes in-container.
+/// `e2e_vendor_yarn_berry_build.rs`). The fixture service publishes the staged
+/// patch from the actual installed bytes in-container.
 #[tokio::test]
 async fn npm_berry_vendor_frozen_install_chain() {
     if host_mode() {
@@ -1012,7 +1016,15 @@ async fn npm_berry_vendor_frozen_install_chain() {
     if skip_if_no_docker_image() {
         return;
     }
-    let out = run_in_container(&make_berry_vendor_script());
+    let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().canonicalize().unwrap();
+    let script = format!(
+        "{}\n{}",
+        docker_vendor_common::bash_prelude(),
+        make_berry_vendor_script()
+    );
+    let (out, _service) =
+        docker_vendor_common::run_with_fixture("socket-patch-test-npm:latest", &host, &script);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

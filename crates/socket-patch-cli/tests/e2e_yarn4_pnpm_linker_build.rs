@@ -18,7 +18,7 @@
 //!     redirect sibling); a fresh checkout of only the committable files
 //!     passes `yarn install --immutable --check-cache` offline-from-registry
 //!     and serves the patched bytes THROUGH the `.store` symlink layout.
-//!   * vendored — `vendor --offline` wires `resolutions` + the `file:`
+//!   * vendored — `vendor` wires `resolutions` + the `file:`
 //!     locator; the fresh `--immutable --check-cache` install lands the
 //!     patched bytes in a `left-pad-file-<hash>` store entry, and
 //!     `--revert` restores package.json AND yarn.lock byte-for-byte.
@@ -49,6 +49,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -152,8 +154,9 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -659,7 +662,7 @@ fn yarn4_pnpm_linker_vendor_fresh_checkout_installs_patched_bytes_and_reverts() 
     let lock_before = std::fs::read(&lock_path).unwrap();
     let pkg_before = std::fs::read(&pkg_path).unwrap();
 
-    // Vendor (offline) — discovery must crawl the .store layout.
+    // Download the vendored artifact — discovery must crawl the .store layout.
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[
