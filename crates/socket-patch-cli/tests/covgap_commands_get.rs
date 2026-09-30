@@ -13,6 +13,9 @@
 //! `common::run_with_env`, which scrubs the ambient `SOCKET_*` surface and
 //! spawns a hermetic child, so they need no serialization.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -397,6 +400,8 @@ fn write_project(root: &Path) {
 /// `view/{uuid}` with REAL git-blob hashes over the project fixture's bytes,
 /// so the vendored staging hash-gates pass.
 async fn mount_real_view(server: &MockServer, uuid: &str, purl: &str) {
+    let files = serde_json::json!({"package/index.js":{"beforeHash":git_hash(BEFORE_BYTES),"afterHash":git_hash(AFTER_BYTES),"blobContent":b64(AFTER_BYTES)}});
+    prebuilt_common::mount_view(server, &view_json(uuid, purl, files), None).await;
     mount_view_files(
         server,
         uuid,
@@ -611,7 +616,7 @@ async fn get_uuid_socket_path_occupied_by_file_fails_closed() {
         args.common.api_url = Some(uri.clone());
         args.save_only = false;
         args.mode = Some(ScanMode::Vendored);
-        args.common.vendor_source = "build".to_string();
+        args.common.vendor_source = "service".to_string();
         let code = run(args).await;
         assert_eq!(code, 1, "vendored run must fail when .socket is a file");
         assert_eq!(
@@ -1379,7 +1384,7 @@ async fn engine_variant_view_fetch_error_keeps_errored_variant() {
 fn vendored_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
     let mut args = default_args(identifier, cwd);
     args.common.api_url = Some(api_url);
-    args.common.vendor_source = "build".to_string();
+    args.common.vendor_source = "service".to_string();
     args.save_only = false;
     args.mode = Some(ScanMode::Vendored);
     args
@@ -1464,7 +1469,7 @@ fn vendored_json_args(uuid: &str) -> [&str; 6] {
         "--mode",
         "vendored",
         "--vendor-source",
-        "build",
+        "service",
         "--json",
     ]
 }
@@ -1615,10 +1620,10 @@ fn assert_legacy_state_untouched(root: &Path, manifest_before: &str, state_befor
 }
 
 fn assert_vendor_error_envelope(v: &serde_json::Value) {
-    assert_eq!(v["status"], "error", "envelope={v}");
+    assert_eq!(v["status"], "partial_failure", "envelope={v}");
     assert_eq!(
-        v["error"]["code"], "no_local_source",
-        "the staging refusal must be the error code; envelope={v}"
+        v["vendor"]["events"][0]["errorCode"], "vendor_lockfile_missing",
+        "{v}"
     );
     assert_eq!(
         v["vendor"]["status"], "partialFailure",
@@ -1676,7 +1681,7 @@ async fn get_search_vendored_vendor_step_error_leaves_legacy_state_alone() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
             "--json",
         ],
@@ -1702,7 +1707,7 @@ async fn human_vendored_uuid_prints_fetch_and_vendor_error_without_manifest_note
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     assert!(
@@ -1718,8 +1723,8 @@ async fn human_vendored_uuid_prints_fetch_and_vendor_error_without_manifest_note
         "there is no whole-manifest scope to warn about; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Error (no_local_source):"),
-        "the vendor-step error must print with its code; stderr={stderr}"
+        stderr.contains("no package-lock.json"),
+        "the vendor-step error must explain the missing lockfile; stderr={stderr}"
     );
     assert_legacy_state_untouched(tmp.path(), &manifest_before, &state_before);
 }
@@ -2171,7 +2176,7 @@ async fn human_vendored_search_success_commits_artifact_without_blast_radius_not
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[GHSA, "--mode", "vendored", "--vendor-source", "build"],
+        &[GHSA, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let artifact = tmp
@@ -2218,7 +2223,7 @@ async fn vendored_search_ignores_corrupt_manifest_and_vendors() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
             "--json",
         ],
@@ -2260,7 +2265,7 @@ async fn vendored_search_json_download_failure_with_clean_vendor_is_partial_fail
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
             "--json",
         ],
@@ -2337,7 +2342,7 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--all-releases",
                 "--json",
             ],
@@ -2367,7 +2372,7 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--all-releases",
             ],
         );
@@ -2526,7 +2531,7 @@ async fn human_vendored_uuid_supersede_prints_replacing_and_vendors() {
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
@@ -2563,7 +2568,7 @@ async fn human_vendored_uuid_rerun_prints_already_vendored_skip() {
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+        &[UUID, "--mode", "vendored", "--vendor-source", "service"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
@@ -3050,7 +3055,7 @@ async fn human_vendored_search_all_downloads_failed_prints_empty_run_line() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--all-releases",
         ],
     );

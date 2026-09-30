@@ -1,25 +1,7 @@
-//! Coverage-gap tests for `commands/scan/vendor_flow.rs`.
-//!
-//! Pins the otherwise-untested surfaces of `scan --vendor`:
-//!
-//! * the `already_vendored` dry-run preview arm (the sibling
-//!   `would_vendor` / `would_revendor` arms are pinned by
-//!   `scan_vendor_e2e.rs`);
-//! * the legal-but-never-executed `--dry-run --prune` combination in the
-//!   vendor JSON path (GC preview field names, nothing mutated);
-//! * every error constructor of `run_vendor_step` — `lock_held`,
-//!   `lock_io` (a directory squatting on `apply.lock`; a file squatting on
-//!   `.socket` itself) and `no_local_source` — through the JSON error fold
-//!   (a lock failure precedes the step and carries NO `vendor` key; a
-//!   staging failure carries the step's envelope demoted to
-//!   `partialFailure`, events-less because nothing mutates before staging)
-//!   and the interactive `Error (code): message` line;
-//! * a corrupt legacy manifest, which vendored mode reports and steps
-//!   around (the manifest is not its record source).
-//!
-//! Fixtures are clones of `scan_vendor_e2e.rs` (each e2e file carries its
-//! own copy — the established pattern), plus `e2e_safety_lock.rs`'s
-//! external-flock trick for lock contention. Mock API only; no real hosts.
+//! Scan vendoring previews, lock failures and corrupt legacy manifests.
+
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -143,11 +125,8 @@ async fn mount_discovery(mock: &MockServer, uuid: &str) {
 }
 
 /// Mount the full patch view for `uuid`. Without `with_blob_content` the
-/// view carries the file hashes but no `blobContent`: the download phase
-/// still records the patch (it needs only the hashes), but the vendor
-/// step cannot obtain the patched bytes and staging fails
-/// (`no_local_source`) — independent of how many times the view is
-/// fetched along the way.
+/// view carries only metadata. Positive fixtures also publish the complete
+/// server archive; clients never need to stage these blobs.
 async fn mount_view(mock: &MockServer, uuid: &str, with_blob_content: bool) {
     let mut file = serde_json::json!({
         "beforeHash": git_sha256(BEFORE),
@@ -156,18 +135,22 @@ async fn mount_view(mock: &MockServer, uuid: &str, with_blob_content: bool) {
     if with_blob_content {
         file["blobContent"] = serde_json::json!(AFTER_B64);
     }
+    let view = serde_json::json!({
+        "uuid": uuid,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "package/index.js": file },
+        "vulnerabilities": {},
+        "description": "Vendor patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    if with_blob_content {
+        prebuilt_common::mount_view(mock, &view, None).await;
+    }
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "package/index.js": file },
-            "vulnerabilities": {},
-            "description": "Vendor patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view))
         .mount(mock)
         .await;
 }
@@ -323,23 +306,6 @@ fn assert_no_vendor_envelope(v: &serde_json::Value) {
     assert!(
         !v.as_object().unwrap().contains_key("vendor"),
         "a pre-lock failure has no vendor envelope to carry; envelope={v}"
-    );
-}
-
-/// A staging failure happens AFTER the lock, inside the step: the fold
-/// carries the step's envelope demoted to `partialFailure` (a consumer
-/// reading `.vendor.status` inside a `"status":"error"` result must not
-/// see the fresh-envelope default `success`) and events-less — nothing
-/// mutates before staging, so there is no work to report.
-fn assert_demoted_empty_vendor_envelope(v: &serde_json::Value) {
-    assert_eq!(
-        v["vendor"]["status"], "partialFailure",
-        "the carried envelope's status must be demoted; envelope={v}"
-    );
-    assert_eq!(
-        v["vendor"]["events"],
-        serde_json::json!([]),
-        "nothing mutates before staging, so the aborted step reports no events; envelope={v}"
     );
 }
 
@@ -578,85 +544,6 @@ async fn scan_vendor_socket_dir_file_reports_lock_io() {
         std::fs::read(tmp.path().join(".socket")).unwrap(),
         b"not a dir",
         "the squatting file survives"
-    );
-}
-
-/// The JSON vendor-step error fold for a staging failure: the download
-/// phase recorded the patch (hashes only), but the view serves no blob
-/// content, so the vendor step cannot stage it and the run aborts
-/// `no_local_source` with a `download` object and the step's own `vendor`
-/// envelope carried through the fold — demoted to `partialFailure`, with
-/// no events (nothing mutated before staging) — and creates nothing under
-/// `.socket/`. Contract: the `vendor` sub-object is present whenever the
-/// step ran; `get --mode vendored` shares the fold
-/// (`covgap_commands_get::get_uuid_vendored_vendor_step_error_leaves_legacy_state_alone`).
-#[tokio::test]
-async fn scan_vendor_staging_error_reports_json_error() {
-    let mock = MockServer::start().await;
-    mount_discovery(&mock, UUID).await;
-    mount_view(&mock, UUID, /*with_blob_content=*/ false).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(tmp.path());
-
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
-    let v = assert_vendor_step_error(code, &stdout, &stderr, "no_local_source");
-    assert_demoted_empty_vendor_envelope(&v);
-    assert_eq!(
-        v["error"]["message"], "patch artifacts unavailable (offline or download failure)",
-        "envelope={v}"
-    );
-    assert_eq!(v["download"]["downloaded"], 1, "envelope={v}");
-    assert!(
-        !tmp.path().join(".socket").exists(),
-        "an aborted step leaves no .socket/ behind (lock file and empty dir removed)"
-    );
-}
-
-/// The interactive (non-JSON) twin of the staging failure: exit 1 with
-/// the `Error (code): message` line on stderr, no JSON envelope on
-/// stdout, nothing vendored.
-#[tokio::test]
-async fn scan_vendor_staging_error_interactive_prints_error_line() {
-    let mock = MockServer::start().await;
-    mount_discovery(&mock, UUID).await;
-    mount_view(&mock, UUID, /*with_blob_content=*/ false).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_fixture(tmp.path());
-
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &[
-            "scan",
-            "--vendor",
-            "--yes",
-            "--api-url",
-            &mock.uri(),
-            "--api-token",
-            "fake-token",
-            "--org",
-            ORG_SLUG,
-        ],
-    );
-
-    assert_eq!(
-        code, 1,
-        "an unstageable record must fail the run; stdout={stdout}; stderr={stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "Error (no_local_source): Patch artifacts unavailable (offline or download failure)."
-        ),
-        "the human arm must name the code and message on stderr; \
-         stdout={stdout}; stderr={stderr}"
-    );
-    // Human mode: no JSON envelope on stdout.
-    assert!(
-        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
-        "the interactive arm must not print a JSON envelope; stdout={stdout}"
-    );
-    assert!(
-        !tmp.path().join(".socket").exists(),
-        "an aborted step leaves no .socket/ behind; stdout={stdout}; stderr={stderr}"
     );
 }
 

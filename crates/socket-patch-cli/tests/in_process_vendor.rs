@@ -19,13 +19,22 @@
 //! No test mutates this process's environment, so none of them need
 //! `#[serial]` — each runs in its own tempdir.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
+async fn vendor_run(mut args: VendorArgs) -> i32 {
+    let server = prebuilt_common::Server::project(&args.common.cwd);
+    server.configure(&mut args.common);
+    actual_vendor_run(args).await
+}
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use socket_patch_cli::args::GlobalArgs;
-use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
+use socket_patch_cli::commands::vendor::{run as actual_vendor_run, VendorArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
 #[path = "npm_e2e_common/manifestless.rs"]
@@ -203,7 +212,7 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
             cwd: cwd.to_path_buf(),
             json: true,
             silent: true,
-            offline: true,
+            offline: false,
             // flock guards are OFD-based: when a CONCURRENT test in this
             // binary forks a subprocess, the pre-exec child briefly holds
             // copies of every parent fd — including this test's just-dropped
@@ -256,6 +265,13 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    let server = prebuilt_common::Server::project(cwd);
+    if !args.contains(&"--api-url")
+        && !args.contains(&"--vendor-url")
+        && !extra_env.iter().any(|(k, _)| *k == "SOCKET_VENDOR_URL")
+    {
+        server.command(&mut cmd);
+    }
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -267,13 +283,7 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
 /// `vendor --json --offline --cwd <cwd> <extra...>` through the binary,
 /// returning `(exit_code, parsed envelope)`.
 fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
-    let mut args = vec![
-        "vendor",
-        "--json",
-        "--offline",
-        "--cwd",
-        cwd.to_str().unwrap(),
-    ];
+    let mut args = vec!["vendor", "--json", "--cwd", cwd.to_str().unwrap()];
     args.extend_from_slice(extra);
     let (code, stdout, stderr) = run_cli(cwd, &args, &[]);
     let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
@@ -554,7 +564,7 @@ async fn unsupported_ecosystem_purl_is_a_benign_skip() {
 // ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn package_not_installed_fails() {
+async fn package_absent_from_lockfile_fails() {
     // The manifest names a package that is nowhere in node_modules. The
     // user asked for it to be vendored and it wasn't — that is a partial
     // failure (exit 1), surfaced as a skipped event with the stable code.
@@ -565,7 +575,7 @@ async fn package_not_installed_fails() {
         "an unsatisfiable manifest entry must exit 1: {env:#}"
     );
     assert_eq!(env["status"], "partialFailure");
-    let skipped = find_event(&env, "skipped", Some("package_not_installed"));
+    let skipped = find_event(&env, "failed", Some("vendor_lock_entry_not_found"));
     assert_eq!(skipped["purl"], "pkg:npm/ghost-pkg@9.9.9");
     assert!(
         !fx.vendor_dir().exists(),
@@ -1158,6 +1168,12 @@ async fn mount_npm_registry(
     let tarball = format!("{}{tarball_path}", server.uri());
     let integrity = sri_sha512(&tgz);
     Mock::given(method("GET"))
+        .and(path(format!("/upstream/npm/{UUID}.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": name, "version": version, "integrity": integrity,
+            "yarnBerry10c0": socket_patch_core::vendor::test_support::service_fixture::berry_checksum(&tgz, name).unwrap()
+        }))).mount(server).await;
+    Mock::given(method("GET"))
         .and(path(format!("/{name}/{version}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "name": name,
@@ -1195,7 +1211,14 @@ fn vendor_online_cli(
     let mut args = vec!["vendor", "--json", "--cwd", cwd.to_str().unwrap()];
     args.extend_from_slice(extra);
     let env = online_env(registry, patch_server);
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut env: Vec<(&str, &str)> = env
+        .iter()
+        .filter(|(k, v)| !(*k == "SOCKET_PATCH_SERVER_URL" && v == "https://patch.socket.dev"))
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    if patch_server != "https://patch.socket.dev" {
+        env.push(("SOCKET_VENDOR_URL", patch_server));
+    }
     let (code, stdout, stderr) = run_cli(cwd, &args, &env);
     let envelope: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("vendor --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
@@ -1268,6 +1291,7 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
         "hosted mode writes no ledger"
     );
 
+    prebuilt_common::mount_project(&server, root).await;
     let (code, env) = vendor_online_cli(root, &server.uri(), &server.uri(), &[]);
     assert_eq!(code, 0, "vendor over the hosted pin: {env:#}");
     assert_eq!(env["summary"]["applied"], 1, "{env:#}");
@@ -1306,6 +1330,15 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     stage_berry_project(root, &pkg, &lock);
     let (code, env) = vendor_cli(root, &[]);
     assert_eq!(code, 0, "vendor: {env:#}");
+    server.reset().await;
+    mount_berry_hosted_api(&server).await;
+    mount_npm_registry(
+        &server,
+        "left-pad",
+        "1.3.0",
+        npm_tgz("left-pad", "1.3.0", ORIG_INDEX),
+    )
+    .await;
     let (code, env) = hosted_scan_cli(root, &server.uri());
     assert_eq!(code, 0, "hosted scan over the vendored pair: {env:#}");
     assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
@@ -1560,21 +1593,14 @@ async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
 // ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn offline_missing_source_fails() {
+async fn offline_missing_artifact_fails() {
     let fx = npm_fixture();
-    // Remove the staged blob: offline + no blob/diff/package ⇒ the patch has
-    // no usable local source and vendor must fail loudly, not guess.
-    std::fs::remove_file(fx.root().join(".socket/blobs").join(&fx.after_hash)).unwrap();
-
-    let (code, env) = vendor_cli(fx.root(), &[]);
-    assert_eq!(code, 1, "offline with no local source must exit 1: {env:#}");
-    assert_eq!(env["status"], "error");
-    assert_eq!(env["error"]["code"], "no_local_source");
-    assert!(
-        !fx.vendor_dir().exists(),
-        "a failed staging must write nothing"
-    );
-    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+    let (code, env) = vendor_cli(fx.root(), &["--offline"]);
+    assert_eq!(code, 1, "{env:#}");
+    assert_eq!(env["status"], "partialFailure");
+    find_event(&env, "failed", Some("vendor_service_offline_conflict"));
+    assert!(!fx.vendor_dir().exists());
+    assert_eq!(fx.lock_bytes(), fx.original_lock);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1968,6 +1994,7 @@ async fn vendored_golang_purl_skipped_by_apply() {
             base_purl: purl.clone(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/golang/{UUID}/{MODULE}@{VERSION}"),
                 sha256: String::new(),
                 size: None,
@@ -2198,7 +2225,7 @@ fn vendor_after_in_place_apply_emits_applied_event() {
 /// 0 with an `applied` event, and the overwrite surfaces as a
 /// `vendor_content_mismatch_overwritten` warning event.
 #[test]
-fn mismatched_baseline_vendors_with_warning_event() {
+fn mismatched_install_does_not_change_the_server_artifact() {
     let fx = npm_fixture();
     std::fs::write(
         fx.installed_index(),
@@ -2210,7 +2237,7 @@ fn mismatched_baseline_vendors_with_warning_event() {
     assert_eq!(code, 0, "{env:#}");
     let applied = find_event(&env, "applied", None);
     assert_eq!(applied["purl"], PURL);
-    let warning = find_event(&env, "skipped", Some("vendor_content_mismatch_overwritten"));
+    let warning = find_event(&env, "skipped", Some("vendor_prebuilt_downloaded"));
     assert!(
         warning["reason"]
             .as_str()
@@ -2229,43 +2256,17 @@ fn mismatched_baseline_vendors_with_warning_event() {
     );
 }
 
-/// A patch-target file MISSING from the installed package still fails closed
-/// (auto-force must not inherit `--force`'s silent NotFound skip — the
-/// tarball would ship without the fix); `--force` keeps that tolerance.
+/// Vendoring does not require the patch target in the installed package.
 #[test]
-fn vendor_missing_file_fails_closed_without_force() {
-    let fx = npm_fixture();
-    std::fs::remove_file(fx.installed_index()).unwrap();
-
-    let (code, env) = vendor_cli(fx.root(), &[]);
-    assert_ne!(code, 0, "missing patch target must fail: {env:#}");
-    // CONTRACT: even a run where EVERY outcome failed reports
-    // "partialFailure". The envelope has no "completed with zero successes"
-    // status, and status=error is reserved for pre-event failures (it implies
-    // a top-level error payload and empty events[] — json_envelope.rs), so
-    // escalating this run to "error" would violate the contract and diverge
-    // from scan --vendor and vendor --revert, which report the same outcome
-    // as partialFailure. Exit code 1 carries the failure signal.
-    assert_eq!(
-        env["status"], "partialFailure",
-        "all-failed vendor runs report partialFailure per the envelope contract: {env:#}"
-    );
-    let failed = find_event(&env, "failed", None);
-    assert!(
-        failed["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("File not found"),
-        "{env:#}"
-    );
-    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock byte-untouched");
-    assert!(!fx.vendor_dir().exists(), "no artifacts on failure");
-
-    // --force: the missing file is tolerated (skipped) and the vendor lands.
-    let fx2 = npm_fixture();
-    std::fs::remove_file(fx2.installed_index()).unwrap();
-    let (code, env) = vendor_cli(fx2.root(), &["--force"]);
-    assert_eq!(code, 0, "{env:#}");
+fn vendor_uses_server_artifact_when_installed_file_is_missing() {
+    for extra in [vec![], vec!["--force"]] {
+        let fx = npm_fixture();
+        std::fs::remove_file(fx.installed_index()).unwrap();
+        let (code, env) = vendor_cli(fx.root(), &extra);
+        assert_eq!(code, 0, "{env:#}");
+        assert!(fx.tgz_path().exists());
+        assert!(!fx.installed_index().exists());
+    }
 }
 
 // ──────────────── percent-encoded scoped purls (Fix A integration) ────────────────
@@ -2475,6 +2476,7 @@ async fn offline_service_mode_refuses_instead_of_building() {
     let fx = npm_fixture();
     let mut args = vendor_args(fx.root());
     args.common.vendor_source = "service".to_string();
+    args.common.offline = true;
 
     let code = vendor_run(args).await;
     assert_ne!(
@@ -2567,6 +2569,29 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
+    let fx = gem_fixture();
+    let record: socket_patch_core::manifest::schema::PatchRecord = serde_json::from_value(json!({
+        "uuid": GEM_UUID, "exportedAt": "2026-01-01T00:00:00Z",
+        "files": { "lib/demo_gem.rb": { "beforeHash": compute_git_sha256_from_bytes(GEM_ORIG), "afterHash": compute_git_sha256_from_bytes(GEM_PATCHED) } },
+        "vulnerabilities": {}, "description": "gem vendor patch", "license": "MIT", "tier": "free"
+    })).unwrap();
+    let blobs = std::collections::HashMap::from([(
+        compute_git_sha256_from_bytes(GEM_PATCHED),
+        GEM_PATCHED.to_vec(),
+    )]);
+    let sources = socket_patch_core::patch::apply::PatchSources {
+        blobs_path: fx.root(),
+        diffs_path: None,
+        mem_blobs: Some(&blobs),
+    };
+    prebuilt_common::mount_record(
+        mock,
+        patch_purl,
+        &record,
+        fx.installed_lib().parent().unwrap().parent().unwrap(),
+        &sources,
+    )
+    .await;
     const ORG_SLUG: &str = "test-org";
     /// The exact percent-encoded by-package path segment for the BARE purl —
     /// the spelling the crawler synthesizes and the CLI queries with (the
@@ -3030,12 +3055,9 @@ async fn scan_vendor_gem_artifact_rebuild_without_ledger_entry_records_none() {
     std::fs::remove_file(fx.state_path()).unwrap();
     std::fs::remove_file(fx.vendored_lib()).unwrap();
     let (code, env2) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "rebuild run: {env2:#}");
-    assert_eq!(
-        std::fs::read(fx.vendored_lib()).unwrap(),
-        GEM_PATCHED,
-        "the copy is still rebuilt"
-    );
+    assert_eq!(code, 1, "redownload refuses missing identity: {env2:#}");
+    assert!(env2.to_string().contains("vendor_ledger_entry_missing"));
+    assert!(!fx.vendored_lib().exists());
     let recorded = std::fs::read(fx.state_path())
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -3070,12 +3092,9 @@ async fn scan_vendor_gem_artifact_rebuild_over_other_uuid_entry_keeps_ledger() {
     std::fs::remove_file(fx.vendored_lib()).unwrap();
 
     let (code, env2) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "rebuild run: {env2:#}");
-    assert_eq!(
-        std::fs::read(fx.vendored_lib()).unwrap(),
-        GEM_PATCHED,
-        "the copy is still rebuilt"
-    );
+    assert_eq!(code, 1, "redownload refuses missing identity: {env2:#}");
+    assert!(env2.to_string().contains("vendor_ledger_entry_missing"));
+    assert!(!fx.vendored_lib().exists());
     let after: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     assert_eq!(
         after["entries"][GEM_PURL]["uuid"], other,
@@ -3122,7 +3141,7 @@ mod hosted_to_vendor_conversion {
     const CONV_VERSION: &str = "1.0.0";
     const CONV_PURL: &str = "pkg:npm/conv-pnpm-takeover@1.0.0";
     const CONV_UUID: &str = "44444444-4444-4444-8444-444444444444";
-    const HOSTED_URL: &str = "http://patch.test/patch/npm/conv-pnpm-takeover/1.0.0/55555555-5555-4555-8555-555555555555/44444444-4444-4444-8444-444444444444/conv-pnpm-takeover-1.0.0.tgz";
+    const HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/conv-pnpm-takeover/1.0.0/55555555-5555-4555-8555-555555555555/44444444-4444-4444-8444-444444444444/conv-pnpm-takeover-1.0.0.tgz";
     const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
     const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 
@@ -3306,7 +3325,7 @@ snapshots:
     /// The hosted URLs above live on this origin: only
     /// `https://patch.socket.dev` and the configured patch-server origin
     /// count as hosted, so every post-scan run passes it.
-    const PATCH_ORIGIN: &str = "http://patch.test";
+    const PATCH_ORIGIN: &str = "https://patch.socket.dev";
 
     /// The npm registry's version document for the fixture package, as the
     /// v5 upstream restore reads it (`SOCKET_NPM_REGISTRY`): it hands back
@@ -3436,7 +3455,7 @@ snapshots:
         let hosted_lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
 
         seed_manifest_and_blob(root);
-        let (code, env) = vendor_cli(root, &["--patch-server-url", PATCH_ORIGIN]);
+        let (code, env) = vendor_cli(root, &["--offline", "--patch-server-url", PATCH_ORIGIN]);
         assert_eq!(code, 1, "{env:#}");
         let failed = find_event(&env, "failed", Some("redirect_revert_failed"));
         assert!(

@@ -10,6 +10,9 @@
 //! Run: `SOCKET_PATCH_VLT_E2E_JS=<vlt.js> cargo test -p socket-patch-cli
 //! --test e2e_vendor_vlt_build -- --include-ignored vlt_pinned_matrix`.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -95,7 +98,7 @@ fn vendor_scan(fx: &Fixture) -> Value {
         &fx.proj,
         &fx.svc,
         &["scan", "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     assert_eq!(out.code, 0, "scan --mode vendored: {out}");
     out.json()
@@ -268,17 +271,17 @@ async fn get_vendored(name: &'static str, source: &str) {
     let served = event_codes(&doc)
         .iter()
         .any(|c| c == "vendor_prebuilt_downloaded");
-    assert_eq!(served, source == "service", "{doc:#}");
+    assert!(served, "{doc:#}");
     assert_vendored(&fx, fx.t(), "");
     assert_fresh_vendored(&fx, fx.t(), "fresh-get");
     fx.leg.ran();
 }
 
-/// `get <uuid> --mode vendored --vendor-source build`.
+/// `auto` remains a compatibility alias for service downloads.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_vendored_get_build_fresh_ci() {
-    get_vendored("get_build_fresh_ci", "build").await;
+async fn vlt_pinned_matrix_vendored_get_auto_fresh_ci() {
+    get_vendored("get_auto_fresh_ci", "auto").await;
 }
 
 /// `get <uuid> --mode vendored --vendor-source service`: the service's
@@ -952,7 +955,7 @@ async fn vlt_pinned_matrix_vendored_package_json_devdeps_patch() {
         &fx.proj,
         &svc,
         &["scan", "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     assert_eq!(out.code, 0, "{out}");
     let payload = package_files(&fx.proj.join(rel(&t2)));
@@ -1298,7 +1301,7 @@ async fn vlt_pinned_matrix_vendored_transitive_refused() {
         &fx.proj,
         &fx.svc,
         &["scan", "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     let doc = out.json();
     assert_eq!(
@@ -1422,7 +1425,7 @@ async fn vlt_pinned_matrix_vendored_absent_version_refused() {
         &fx.proj,
         &fx.svc,
         &["scan", "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     let doc = out.json();
     assert_eq!(

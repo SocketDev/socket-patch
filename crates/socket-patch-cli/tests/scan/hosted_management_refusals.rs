@@ -146,11 +146,18 @@ async fn offline_eject_refuses_before_any_request() {
         std::fs::write(tmp.path().join("package-lock.json"), hosted_lock()).unwrap();
         let before = snapshot(tmp.path());
         let mut cmd = cli();
-        cmd.args(["vendor", "--json", "--org", "test-org", "--api-token", "fake"])
-            .arg("--api-url")
-            .arg(server.uri())
-            .arg("--cwd")
-            .arg(tmp.path());
+        cmd.args([
+            "vendor",
+            "--json",
+            "--org",
+            "test-org",
+            "--api-token",
+            "fake",
+        ])
+        .arg("--api-url")
+        .arg(server.uri())
+        .arg("--cwd")
+        .arg(tmp.path());
         if flag {
             cmd.arg("--offline");
         }
@@ -167,7 +174,11 @@ async fn offline_eject_refuses_before_any_request() {
                 String::from_utf8_lossy(&out.stdout)
             )
         });
-        assert_eq!(out.status.code(), Some(1), "flag={flag} env={env} dry={dry}: {v}");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "flag={flag} env={env} dry={dry}: {v}"
+        );
         assert_eq!(v["error"]["code"], "offline_eject_unavailable", "{v}");
         assert_eq!(snapshot(tmp.path()), before);
     }
@@ -175,7 +186,10 @@ async fn offline_eject_refuses_before_any_request() {
     assert!(
         received.is_empty(),
         "an offline eject must not touch the network: {:?}",
-        received.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
+        received
+            .iter()
+            .map(|r| r.url.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -189,9 +203,7 @@ const MOCK_PATCH: &str = "33333333-3333-4333-8333-333333333333";
 fn write_fresh_hosted_checkout(root: &Path, patch_origin: &str) -> String {
     write_package_json(root);
     let lock = lock(
-        &format!(
-            "{patch_origin}/patch/npm/left-pad/1.3.0/{GRANT}/{MOCK_PATCH}/left-pad-1.3.0.tgz"
-        ),
+        &format!("{patch_origin}/patch/npm/left-pad/1.3.0/{GRANT}/{MOCK_PATCH}/left-pad-1.3.0.tgz"),
         "sha512-patched==",
     );
     std::fs::write(root.join("package-lock.json"), &lock).unwrap();
@@ -235,14 +247,17 @@ async fn mount_view_and_registry(server: &MockServer, tarball_status: u16) {
 fn eject_cmd(server: &MockServer, cwd: &Path, dry: bool) -> Command {
     let mut cmd = cli();
     cmd.args(["vendor", "--json", "--org", ORG, "--api-token", "fake"])
-        .args(["--vendor-source", "build"])
+        .args(["--vendor-source", "service"])
         .arg("--api-url")
         .arg(server.uri())
         .arg("--patch-server-url")
         .arg(server.uri())
         .arg("--cwd")
         .arg(cwd)
-        .env("SOCKET_NPM_REGISTRY", format!("{}/npm-registry", server.uri()));
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", server.uri()),
+        );
     if dry {
         cmd.arg("--dry-run");
     }
@@ -314,5 +329,8 @@ async fn dry_run_eject_verifies_the_plan_and_writes_nothing() {
         std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
         hosted
     );
-    assert!(!tmp.path().join(".socket").exists(), "a dry run creates no .socket/");
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a dry run creates no .socket/"
+    );
 }

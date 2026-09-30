@@ -248,6 +248,7 @@ pub async fn vendor_yarn_classic<'a>(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: rel_tgz,
             sha256: packed.sha256_hex,
             size: Some(packed.size),
@@ -1234,7 +1235,7 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
             let blobs = self.root().join(".socket/blobs");
             let sources = PatchSources::blobs_only(&blobs);
-            vendor_yarn_classic(
+            crate::vendor::test_support::vendor_yarn_classic(
                 "pkg:npm/left-pad@1.3.0",
                 &self.installed(),
                 self.root(),
@@ -1274,7 +1275,7 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         cfg: Option<&crate::vendor::VendorServiceConfig>,
     ) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
-        vendor_yarn_classic(
+        crate::vendor::test_support::vendor_yarn_classic(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -1383,7 +1384,12 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         let fx = fixture_with_lock(Y2_BEFORE).await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         let entry = entry.expect("success carries a ledger entry");
 
         // Byte-for-byte the spike's after-lock, modulo the recomputed hashes.
@@ -1441,7 +1447,12 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         assert!(result.success, "{:?}", result.error);
         // The folder dep `dep-a@file:./dep-a` is name-mismatched, not a
         // candidate — no skip warning either.
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         let entry = entry.unwrap();
 
         let (sha1, sri) = fx.packed_hashes().await;
@@ -1585,7 +1596,7 @@ left-pad@^1.3.0:
             .unwrap();
         let server = wiremock::MockServer::start().await;
         ts::mount_503(&server).await;
-        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
         let (r, e, w) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         assert!(e.is_some(), "the relocked block is re-wired");
@@ -1618,7 +1629,12 @@ left-pad@^1.3.0:
             entry.is_none(),
             "in-sync re-run must not produce a new ledger entry"
         );
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         assert!(
             result
                 .files_verified
@@ -2616,7 +2632,12 @@ left-pad@^1.3.0:
         let (changed, text, warnings) = run(Y2_AFTER, &rec);
         assert!(changed, "control record must restore");
         assert_eq!(text, Y2_BEFORE);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
     }
 
     /// Re-vendoring over our own stale edit (a new patch uuid for the same
@@ -2635,7 +2656,7 @@ left-pad@^1.3.0:
         record_b.uuid = UUID_B.to_string();
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_yarn_classic(
+        let outcome = crate::vendor::test_support::vendor_yarn_classic(
             "pkg:npm/left-pad@1.3.0",
             &fx.installed(),
             fx.root(),
@@ -2699,7 +2720,7 @@ left-pad@^1.3.0:
         let fx = fixture_with_lock(Y2_BEFORE).await;
         let blobs = fx.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_yarn_classic(
+        let outcome = crate::vendor::test_support::vendor_yarn_classic(
             "pkg:npm/left-pad@../evil",
             &fx.installed(),
             fx.root(),
@@ -2727,7 +2748,7 @@ left-pad@^1.3.0:
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("cannot stage a copy of the installed package"),
+                .contains("patch service request failed"),
             "{:?}",
             result.error
         );

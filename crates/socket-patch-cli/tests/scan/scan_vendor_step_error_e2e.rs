@@ -1,22 +1,4 @@
-//! Regression: the vendor step's ERROR returns must still hand the JSON
-//! consumer the step's `vendor` envelope — demoted — instead of dropping it.
-//!
-//! `scan --vendor`'s vendor step (`run_vendor_step`) takes the apply
-//! lock, stages the fetched records' patch content in memory, then drives
-//! the vendor engine. Vendored mode is manifest-free: the step never reads
-//! the manifest and never reconciles ledger entries against it, so a
-//! staging failure (`no_local_source`: the API serves the patch view
-//! without blob content) aborts a run that has mutated nothing. The run
-//! DID enter the step, though, and the contract's `vendor` sub-object
-//! rides the error fold: `status` demoted to `partialFailure` (a consumer
-//! reading `.vendor.status` inside a `"status":"error"` result must not
-//! see the fresh-envelope default of `success`) and `events[]` present —
-//! empty, and in particular holding no revert of a ledger entry the run
-//! did not select. The `vendor` command prints its envelope on the same
-//! failure (`vendor::run` emits `env` whatever `run_vendor` returned);
-//! scan's JSON arm must not be the one place it vanishes. `get --mode
-//! vendored` shares the fold
-//! (`covgap_commands_get::get_uuid_vendored_vendor_step_error_leaves_legacy_state_alone`).
+//! A failed artifact download preserves the vendor envelope and unrelated ledger entries.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -208,7 +190,7 @@ fn run_cli(root: &Path, argv: &[&str]) -> (i32, String, String) {
 }
 
 #[tokio::test]
-async fn scan_vendor_staging_error_still_carries_the_demoted_vendor_envelope() {
+async fn scan_vendor_download_error_preserves_the_vendor_envelope() {
     let mock = MockServer::start().await;
     mount_discovery(&mock).await;
     mount_contentless_view(&mock).await;
@@ -238,38 +220,15 @@ async fn scan_vendor_staging_error_still_carries_the_demoted_vendor_envelope() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout must be one JSON object ({e}); stdout={stdout}"));
-    assert_eq!(v["status"], "error", "envelope={v}");
-    assert_eq!(
-        v["error"]["code"], "no_local_source",
-        "precondition: the run must abort at staging; envelope={v}"
-    );
-
-    // Non-vacuous: the run got PAST the download phase (the record was
-    // fetched — hashes only — into memory, detached) and INTO the step.
-    assert_eq!(v["download"]["downloaded"], 1, "envelope={v}");
-    assert_eq!(v["download"]["detached"], true, "envelope={v}");
-
-    // The carried envelope must not claim the vendor step succeeded: the
-    // run aborted at staging, so a consumer reading `.vendor.status` inside
-    // a `"status":"error"` result must see the demoted status, not the
-    // fresh-envelope default of "success".
-    assert_eq!(
-        v["vendor"]["status"], "partialFailure",
-        "the carried envelope's own status must be demoted; envelope={v}"
-    );
-
-    // The point: the envelope survives the error fold — `events[]` is where
-    // any pre-failure work would be reported — and the manifest-free step
-    // reconciles nothing: no event names the unselected legacy entry, whose
-    // ledger bytes are untouched.
-    let events = v["vendor"]["events"].as_array().unwrap_or_else(|| {
-        panic!("the vendor envelope must survive the staging error; envelope={v}")
-    });
-    assert!(
-        events.is_empty(),
-        "nothing mutates before staging — in particular the unselected {UNSELECTED_PURL} \
-         is never reconciled; envelope={v}"
-    );
+    assert_eq!(v["status"], "partial_failure", "{v}");
+    assert_eq!(v["download"]["downloaded"], 1, "{v}");
+    assert_eq!(v["download"]["detached"], true, "{v}");
+    assert_eq!(v["vendor"]["status"], "partialFailure", "{v}");
+    let events = v["vendor"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{v}");
+    assert_eq!(events[0]["purl"], PURL, "{v}");
+    assert_eq!(events[0]["errorCode"], "apply_failed", "{v}");
+    assert!(events[0]["error"].as_str().unwrap().contains("404"));
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
         ledger_before,

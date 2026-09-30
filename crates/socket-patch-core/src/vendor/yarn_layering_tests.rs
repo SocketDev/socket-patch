@@ -42,8 +42,8 @@ use crate::patch::redirect::{rewrite_registry_redirect, DepOverride, Integrity};
 use crate::utils::uri::encode_uri_component;
 use crate::vendor::lock_inventory::{inventory_npm_lock, LockIntegrity};
 use crate::vendor::npm_flavor::NpmLockFlavor;
-use crate::vendor::yarn_berry_lock::{revert_yarn_berry, vendor_yarn_berry};
-use crate::vendor::yarn_classic_lock::{revert_yarn_classic, vendor_yarn_classic};
+use crate::vendor::yarn_berry_lock::revert_yarn_berry;
+use crate::vendor::yarn_classic_lock::revert_yarn_classic;
 use crate::vendor::{RevertOutcome, VendorEntry, VendorOutcome};
 
 /// Canonical-grammar patch uuid (the vendor path layer validates the shape
@@ -205,7 +205,7 @@ impl ClassicFx {
     async fn vendor(&self) -> VendorOutcome {
         let blobs = self.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
-        vendor_yarn_classic(
+        crate::vendor::test_support::vendor_yarn_classic(
             "pkg:npm/ansi-regex@4.1.0",
             &self.root().join("node_modules/ansi-regex"),
             self.root(),
@@ -750,7 +750,7 @@ impl BerryFx {
         let blobs = self.root().join(".socket/blobs");
         let sources = PatchSources::blobs_only(&blobs);
         let purl = format!("pkg:npm/{name}@{version}");
-        vendor_yarn_berry(
+        crate::vendor::test_support::vendor_yarn_berry(
             &purl,
             &self.root().join("node_modules").join(name),
             self.root(),

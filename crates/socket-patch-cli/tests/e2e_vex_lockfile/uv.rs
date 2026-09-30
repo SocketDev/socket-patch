@@ -555,6 +555,7 @@ fn write_vendor_ledger(p: &Proj, flavor: Flavor, rel: &str, sha: &str, record: P
             base_purl: flavor.purl(),
             uuid: record.uuid.clone(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel.to_string(),
                 sha256: sha.to_string(),
                 size: None,
@@ -1396,6 +1397,12 @@ impl Api {
         let mut full_view = view(uuid, &qualified);
         full_view["files"][MODULE]["blobContent"] =
             Value::String(base64::engine::general_purpose::STANDARD.encode(PATCHED));
+        let downloaded_url = if uuid == VENDORED_UUID {
+            hosted_url_on(&self.uri(), flavor, uuid)
+        } else {
+            artifact_url.to_string()
+        };
+        let artifact_url = downloaded_url.as_str();
         let artifact_path = artifact_url.strip_prefix(&self.uri()).map(str::to_string);
         self.rt.block_on(async {
             Mock::given(method("POST"))
@@ -1438,7 +1445,7 @@ impl Api {
                         "artifacts": [{
                             "kind": "tarball",
                             "url": artifact_url,
-                            "integrity": { "sha256": sha }
+                            "integrity": { "sha256": sha, "sha512": ({ use sha2::Digest; format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&wheel))) }) }
                         }],
                         "registryOverride": null
                     } }
@@ -1657,7 +1664,7 @@ fn scan_vendor_wiring_attests_without_manifest_or_ledger() {
             "scan",
             "--vendor",
             "--vendor-source",
-            "build",
+            "service",
             "--vex",
             embedded.to_str().unwrap(),
             "--vex-product",

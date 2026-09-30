@@ -38,13 +38,7 @@ not prevent this proof. Per-release coverage lives in the
 
 ### RubyGems artifact validation
 
-A vendored Bundler path source needs a valid stub gemspec. The CLI validates
-service and local stubs before writing them. An invalid service stub causes
-`--vendor-source auto` to try a local build when possible;
-`--vendor-source service` refuses with `vendor_prebuilt_stub_invalid`.
-A missing local source can prevent that fallback. The production test accepts
-and checks the actual acquisition route, so it does not assume a previously
-observed server defect is still present.
+A vendored Bundler path source needs the server's valid stub gemspec. The CLI downloads and validates it with the archive. Missing or invalid server stubs fail closed; there is no local gem build fallback.
 
 ## Running
 

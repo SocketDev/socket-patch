@@ -284,6 +284,7 @@ fn deno_ledger_claims_are_dead() {
             base_purl: JSR_PURL.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel.clone(),
                 sha256: "0".repeat(64),
                 size: None,

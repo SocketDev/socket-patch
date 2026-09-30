@@ -7,6 +7,9 @@
 //! patch API. No go toolchain is needed: every assertion is on the files
 //! the CLI writes and on its JSON envelope.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 #[path = "common/mod.rs"]
@@ -98,7 +101,7 @@ async fn mount_sumdb(server: &MockServer) {
 }
 
 fn get_hosted(consumer: &Path, server: &MockServer, modcache: &Path) -> serde_json::Value {
-    let (code, stdout, stderr) = common::run_with_env(
+    let (code, stdout, stderr) = run_with_prebuilt(
         consumer,
         &[
             "get",
@@ -266,7 +269,7 @@ async fn hosted_takeover_of_vendored_module_removes_vendored_state() {
     .unwrap();
     std::fs::write(socket.join("blobs").join(&after), PATCHED_LIB).unwrap();
 
-    let (code, stdout, stderr) = common::run_with_env(
+    let (code, stdout, stderr) = run_with_prebuilt(
         &consumer,
         &[
             "vendor",
@@ -360,7 +363,7 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
         args.extend_from_slice(extra);
         let mut env_full = vec![("GOMODCACHE", modcache.to_str().unwrap())];
         env_full.extend_from_slice(env);
-        common::run_with_env(&consumer, &args, &env_full)
+        run_with_prebuilt(&consumer, &args, &env_full)
     };
 
     let (code, stdout, stderr) = rollback(&["--offline"], &[]);
@@ -462,7 +465,7 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
 
     // Online: the takeover's upstream restore consults the (mocked)
     // checksum database; the patch itself comes from the local manifest.
-    let (code, stdout, stderr) = common::run_with_env(
+    let (code, stdout, stderr) = run_with_prebuilt(
         &consumer,
         &["vendor", "--json", "--cwd", consumer.to_str().unwrap()],
         &[
@@ -492,4 +495,23 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
         "go.sum is back to its pre-redirect bytes"
     );
     assert!(!ledger_path.exists(), "no hosted ledger is ever written");
+}
+
+fn run_with_prebuilt(
+    cwd: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let fixture = (args.first() == Some(&"vendor") && !args.contains(&"--revert"))
+        .then(|| prebuilt_common::Server::project_with_env(cwd, env));
+    let args: Vec<_> = args
+        .iter()
+        .copied()
+        .filter(|a| fixture.is_none() || *a != "--offline")
+        .collect();
+    let mut env = env.to_vec();
+    if let Some(fixture) = &fixture {
+        env.push(("SOCKET_VENDOR_URL", &fixture.uri));
+    }
+    common::run_with_env(cwd, &args, &env)
 }

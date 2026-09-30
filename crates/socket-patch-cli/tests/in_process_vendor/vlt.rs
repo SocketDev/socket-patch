@@ -511,7 +511,7 @@ fn vendor_vlt_package_json_patch_with_devdeps_verifies() {
         &[],
     );
     assert_eq!(code, 0, "{env:#}");
-    assert!(env.to_string().contains("wouldRebuild"), "{env:#}");
+    assert!(env.to_string().contains("wouldRedownload"), "{env:#}");
 }
 
 // ── refusals ─────────────────────────────────────────────────────────────
@@ -822,13 +822,14 @@ fn vendor_vlt_auto_fetch_stages_the_committed_dir_artifact() {
     std::os::unix::fs::symlink(root.join(&rel), &link).unwrap();
     #[cfg(windows)]
     std::os::windows::fs::symlink_dir(root.join(&rel), &link).unwrap();
+    let ledger = read(root, ".socket/vendor/state.json");
     std::fs::write(root.join(&rel).join("extra.js"), "tampered\n").unwrap();
     let (code, env, _) = vendor(root, &[]);
-    assert_eq!(code, 1, "{env:#}");
-    let (got, detail) = failure(&env, PURL);
-    assert_eq!(got, "vendor_fetch_failed", "{env:#}");
-    assert!(detail.contains("socket-patch repair"), "{detail}");
+    assert_eq!(code, 0, "{env:#}");
+    assert!(env.to_string().contains("redownloaded"), "{env:#}");
+    assert!(!root.join(&rel).join("extra.js").exists());
     assert_eq!(read(root, VLT_LOCK), lock);
+    assert_eq!(read(root, ".socket/vendor/state.json"), ledger);
 }
 
 #[test]
@@ -977,19 +978,10 @@ fn vendor_vlt_revendor_new_uuid_never_builds_from_the_old_dir() {
     let root = tmp.path();
     superseded_linked_project(root, &direct_lock());
     let lock = read(root, VLT_LOCK);
-    let (code, env, _) = vendor(root, &[]);
+    let (code, env, _) = vendor(root, &["--offline"]);
     assert_eq!(code, 1, "{env:#}");
-    let skip = events(&env)
-        .into_iter()
-        .find(|e| e["errorCode"] == "package_not_installed")
-        .unwrap_or_else(|| panic!("{env:#}"));
-    assert_eq!(
-        skip["reason"],
-        format!(
-            "the only installed copy is the vendored artifact .socket/vendor/npm/{UUID}/ of \
-             patch {UUID}, which is not a pristine source for this patch; --offline prevents \
-             fetching the pristine artifact from the registry"
-        ),
+    assert!(
+        env.to_string().contains("vendor_service_offline_conflict"),
         "{env:#}"
     );
     assert!(!uuid_dir(root, UUID2).exists(), "{env:#}");
@@ -998,60 +990,45 @@ fn vendor_vlt_revendor_new_uuid_never_builds_from_the_old_dir() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn vendor_vlt_revendor_new_uuid_fetches_the_pristine_package() {
+async fn vendor_vlt_new_uuid_downloads_independent_server_artifact() {
     let server = MockServer::start().await;
-    let pristine = tarball(
-        &[
-            (
-                "package/package.json",
-                b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}\n",
-            ),
-            ("package/index.js", PRISTINE),
-            ("package/extra.js", EXTRA.1),
-        ],
-        &[],
-    );
-    Mock::given(method("GET"))
-        .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(pristine.clone()))
-        .mount(&server)
-        .await;
-    let url = format!("{}/left-pad/-/left-pad-1.3.0.tgz", server.uri());
-    let lock = Lock::v1(
-        &[&format!(
-            "\"~npm~left-pad@1.3.0\": [0,\"{NAME}\",\"{}\",\"{url}\"]",
-            sri(&pristine)
-        )],
-        &["\"file~_d left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0\""],
-    );
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    superseded_linked_project(root, &lock);
-    let cwd = root.to_str().unwrap().to_string();
-    let (code, env, stderr) = socket(
-        root,
-        &[
-            "vendor",
-            "--json",
-            "--vendor-source",
-            "build",
-            "--cwd",
-            &cwd,
-        ],
-        &[],
-    );
+    superseded_linked_project(root, &direct_lock());
+    let package = tempfile::tempdir().unwrap();
+    std::fs::write(
+        package.path().join("package.json"),
+        b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}",
+    )
+    .unwrap();
+    std::fs::write(package.path().join("index.js"), PRISTINE).unwrap();
+    std::fs::write(package.path().join("extra.js"), EXTRA.1).unwrap();
+    let manifest: socket_patch_core::manifest::schema::PatchManifest =
+        serde_json::from_slice(&std::fs::read(root.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    let blobs = root.join(".socket/blobs");
+    let sources = socket_patch_core::patch::apply::PatchSources {
+        blobs_path: &blobs,
+        diffs_path: None,
+        mem_blobs: None,
+    };
+    crate::prebuilt_common::mount_record(
+        &server,
+        PURL,
+        &manifest.patches[PURL],
+        package.path(),
+        &sources,
+    )
+    .await;
+    let (code, env, stderr) = vendor_via_service(root, &server.uri(), &[]);
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     assert!(
-        codes(&env).contains(&"vendor_fetched_missing".to_string()),
+        codes(&env).contains(&"vendor_prebuilt_downloaded".to_string()),
         "{env:#}"
     );
     let rel2 = rel_dir(UUID2, NAME, VERSION);
     assert_eq!(read(root, &format!("{rel2}/index.js")).as_bytes(), PATCHED);
-    assert_eq!(
-        read(root, &format!("{rel2}/extra.js")).as_bytes(),
-        EXTRA.1,
-        "the old patch's extra.js never reaches the new artifact"
-    );
+    assert_eq!(read(root, &format!("{rel2}/extra.js")).as_bytes(), EXTRA.1);
     assert!(!uuid_dir(root, UUID).exists());
     assert_eq!(ledger_entry(root, PURL)["uuid"], UUID2);
 }
@@ -1413,24 +1390,23 @@ async fn vendor_vlt_service_policy_fail_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn vendor_vlt_service_auto_falls_back_to_build() {
+async fn vendor_vlt_service_auto_refuses_without_local_build() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     direct_project(root);
     let server = MockServer::start().await;
     mount_status(&server, 503, json!({"error": "down"})).await;
     let (code, env, stderr) = vendor_via_service(root, &server.uri(), &[]);
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(code, 1, "{env:#}\n{stderr}");
     assert!(
-        codes(&env).contains(&"vendor_prebuilt_unavailable".to_string()),
+        env.to_string().contains("patch service request failed"),
         "{env:#}"
     );
-    let rel = rel_dir(UUID, NAME, VERSION);
-    assert_eq!(read(root, &format!("{rel}/index.js")).as_bytes(), PATCHED);
+    assert!(!uuid_dir(root, UUID).exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn vendor_vlt_service_pending_falls_back_to_build() {
+async fn vendor_vlt_service_pending_refuses_without_local_build() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     direct_project(root);
@@ -1442,11 +1418,9 @@ async fn vendor_vlt_service_pending_falls_back_to_build() {
     )
     .await;
     let (code, env, stderr) = vendor_via_service(root, &server.uri(), &[]);
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
-    assert!(
-        codes(&env).contains(&"vendor_prebuilt_pending".to_string()),
-        "{env:#}"
-    );
+    assert_eq!(code, 1, "{env:#}\n{stderr}");
+    assert!(env.to_string().contains("still building"), "{env:#}");
+    assert!(!uuid_dir(root, UUID).exists());
 }
 
 async fn assert_archive_refused(special: (&str, tar::EntryType, &str)) {
@@ -1500,7 +1474,7 @@ fn vendor_vlt_human_hints_name_vlt_files_and_install() {
     let tmp = tempfile::tempdir().unwrap();
     direct_project(tmp.path());
     let cwd = tmp.path().to_str().unwrap();
-    let (code, stdout, stderr) = socket_human(tmp.path(), &["vendor", "--offline", "--cwd", cwd]);
+    let (code, stdout, stderr) = socket_human(tmp.path(), &["vendor", "--cwd", cwd]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
         stdout.contains("vlt-lock.json and .socket/vendor/") && stdout.contains("CI: `vlt ci`"),

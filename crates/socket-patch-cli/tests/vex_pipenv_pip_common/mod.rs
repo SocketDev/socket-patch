@@ -41,6 +41,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -363,6 +366,13 @@ impl ScanApi {
             .unwrap();
         let server = rt.block_on(wiremock::MockServer::start());
         let api = ScanApi { rt, server };
+        if uuid == Mode::Vendored.uuid() {
+            api.rt.block_on(prebuilt_common::mount_view(
+                &api.server,
+                &view(uuid, PURL),
+                None,
+            ));
+        }
         api.mount(
             Mock::given(method("POST"))
                 .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -457,7 +467,7 @@ pub fn run_scan(
     ];
     match mode {
         Mode::Hosted => args.push("--mode=hosted"),
-        Mode::Vendored => args.extend(["--vendor", "--vendor-source", "build"]),
+        Mode::Vendored => args.extend(["--vendor", "--vendor-source", "service"]),
     }
     args.extend_from_slice(extra);
     let out = cli(cwd.parent().unwrap())
@@ -1275,12 +1285,24 @@ pub fn embedded_rescan_of_a_manifest_less_checkout(flavors: &[Flavor]) {
             mode,
             &["--vex", vex_out.to_str().unwrap(), "--vex-product", PRODUCT],
         );
-        assert_eq!(code, Some(0), "{what}: {env}\n{stderr}");
-        let doc: Value = serde_json::from_slice(
-            &std::fs::read(&vex_out).unwrap_or_else(|e| panic!("{what}: ({e}) {env}\n{stderr}")),
-        )
-        .unwrap();
-        assert_statement(&doc, mode, &what);
+        if mode == Mode::Vendored {
+            assert_eq!(code, Some(1), "{what}: {env}\n{stderr}");
+            assert_eq!(
+                env["vendor"]["events"][0]["errorCode"], "vendor_ledger_entry_missing",
+                "{env}"
+            );
+            assert!(!vex_out.exists(), "failed scan cannot emit VEX");
+            let patch_api = api_with(mode.uuid(), PURL);
+            assert_ok_attested(&vex(&cwd, &vex_run(Some(&patch_api))), mode, &what);
+        } else {
+            assert_eq!(code, Some(0), "{what}: {env}\n{stderr}");
+            let doc: Value = serde_json::from_slice(
+                &std::fs::read(&vex_out)
+                    .unwrap_or_else(|e| panic!("{what}: ({e}) {env}\n{stderr}")),
+            )
+            .unwrap();
+            assert_statement(&doc, mode, &what);
+        }
         for rel in wired.changed_files() {
             assert_eq!(
                 text(&std::fs::read(cwd.join(rel)).unwrap()),

@@ -15,7 +15,7 @@
 //! `rollback`, `remove`) restores the registry 4-tuple, re-resolving the
 //! integrity from the npm registry: here one shared wiremock mirror
 //! ([`registry_uri`], `SOCKET_NPM_REGISTRY`) serving the pristine
-//! integrities, with the `http://patch.test` origin named hosted via
+//! integrities, with the `https://patch.socket.dev` origin named hosted via
 //! `SOCKET_PATCH_SERVER_URL`.
 //!
 //! Scenarios:
@@ -38,6 +38,9 @@
 //!
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
+
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
 
 use std::path::Path;
 use std::process::Command;
@@ -62,7 +65,7 @@ const PURL: &str = "pkg:npm/left-pad@1.3.0";
 /// Canonical-grammar patch uuid (the vendor path layer validates the uuid
 /// path level fail-closed).
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.3.0/55555555-5555-4555-8555-555555555555/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+const HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/55555555-5555-4555-8555-555555555555/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";
 const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
@@ -74,7 +77,7 @@ const CVE: &str = "CVE-2026-5555";
 /// The second hosted record of the scoped-unwind scenarios.
 const OTHER_NAME: &str = "other";
 const OTHER_PURL: &str = "pkg:npm/other@1.0.0";
-const OTHER_HOSTED_URL: &str = "http://patch.test/patch/npm/other/1.0.0/55555555-5555-4555-8555-555555555555/0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d/other-1.0.0.tgz";
+const OTHER_HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/other/1.0.0/55555555-5555-4555-8555-555555555555/0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d/other-1.0.0.tgz";
 
 /// The registry 4-tuple lines exactly as bun 1.4.2 emits them (matrix
 /// capture grammar; the `""` registry field is the default registry).
@@ -279,7 +282,7 @@ fn manifestless_vex(
         vulns: &[(GHSA, &[CVE])],
         lock: "bun.lock",
         registry_lock: pristine.to_vec(),
-        patch_server_url: Some("http://patch.test".to_string()),
+        patch_server_url: Some("https://patch.socket.dev".to_string()),
     };
     bun_vex::run_bun_vex_matrix(root, scratch, &case, |_| {});
 }
@@ -340,20 +343,20 @@ fn registry_uri() -> &'static str {
 
 /// Run the built `socket-patch` binary with every ambient `SOCKET_*` var
 /// scrubbed (except the hermetic `SOCKET_NO_CONFIG`) and telemetry
-/// hard-disabled; `http://patch.test` counts as the patch server
+/// hard-disabled; `https://patch.socket.dev` counts as the patch server
 /// (`SOCKET_PATCH_SERVER_URL`) and the registry is the shared mirror
 /// (`SOCKET_NPM_REGISTRY`). Returns `(exit_code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (key, _) in std::env::vars() {
         if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
         }
     }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_PATCH_SERVER_URL", "http://patch.test")
         .env("SOCKET_NPM_REGISTRY", registry_uri());
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -392,6 +395,17 @@ fn scan_mode(cwd: &Path, api_url: &str, mode: &str, extra: &[&str]) -> (i32, Val
         "--cwd",
         cwd.to_str().unwrap(),
     ];
+    let fixture = (mode == "vendored").then(|| {
+        let mut view = patch_record(UUID);
+        view["purl"] = json!(PURL);
+        view["publishedAt"] = json!("2024-01-01T00:00:00Z");
+        view["files"]["package/index.js"]["blobContent"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(PATCHED_INDEX));
+        prebuilt_common::Server::view(view)
+    });
+    if let Some(fixture) = &fixture {
+        args.extend(["--vendor-url", &fixture.uri]);
+    }
     args.extend_from_slice(extra);
     run_json(cwd, &args)
 }
@@ -979,7 +993,7 @@ async fn bun_hosted_refusal_preserves_vendored_v0_workspace() {
         .replace("  \"configVersion\": 1,\n", "");
     write_bun_project(root, &direct, &[(NAME, VERSION)]);
     seed_manifest_and_blob(root);
-    let (code, env) = vendor_cli(root, &["--vendor-source", "build"]);
+    let (code, env) = vendor_cli(root, &["--vendor-source", "service"]);
     assert_eq!(code, 0, "{env:#}");
 
     // Bun 1.1.45 preserves the local tuple when a direct project grows an

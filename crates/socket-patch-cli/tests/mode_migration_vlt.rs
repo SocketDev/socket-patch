@@ -143,7 +143,7 @@ fn remove_upstream(fx: &Fixture, dir: &Path, purl: &str) -> SocketOut {
 }
 
 fn vendored_scan(fx: &Fixture, dir: &Path, extra: &[&str]) -> SocketOut {
-    let mut args = vec!["--vendor-source", "build"];
+    let mut args = vec!["--vendor-source", "service"];
     args.extend_from_slice(extra);
     api_upstream(fx, dir, &["scan", "--mode", "vendored"], &args)
 }
@@ -486,7 +486,7 @@ async fn vlt_pinned_matrix_migration_rollback_from_mixed() {
         &fx,
         &fx.proj,
         &["get", &a.uuid, "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     assert_eq!(out.code, 0, "{out}");
     assert_pure_vendored(&fx.proj, &a);
@@ -636,7 +636,7 @@ async fn vlt_pinned_matrix_migration_agent_rollback_after_takeovers() {
         &fx,
         &dir,
         &["get", &b.uuid, "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     assert_eq!(out.code, 0, "{out}");
     for t in [&a, &b] {

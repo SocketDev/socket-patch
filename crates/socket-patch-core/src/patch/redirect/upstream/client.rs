@@ -156,7 +156,7 @@ pub(crate) struct UpstreamClient {
     http: RegistryClient,
     offline: bool,
     npm: Cache<NpmDist>,
-    npm_tarballs: Cache<Vec<u8>>,
+    npm_berry: Cache<String>,
     cargo: Cache<String>,
     go: Cache<GoSums>,
     rubygems: Cache<String>,
@@ -171,7 +171,7 @@ impl UpstreamClient {
             http: build_registry_client(),
             offline,
             npm: Mutex::default(),
-            npm_tarballs: Mutex::default(),
+            npm_berry: Mutex::default(),
             cargo: Mutex::default(),
             go: Mutex::default(),
             rubygems: Mutex::default(),
@@ -231,8 +231,8 @@ impl UpstreamClient {
             .get("dist")
             .ok_or_else(|| format!("{url} carries no `dist` block"))?;
         let str_field = |k: &str| dist.get(k).and_then(Value::as_str).map(str::to_string);
-        let tarball = str_field("tarball")
-            .ok_or_else(|| format!("{url} carries no `dist.tarball`"))?;
+        let tarball =
+            str_field("tarball").ok_or_else(|| format!("{url} carries no `dist.tarball`"))?;
         Ok(NpmDist {
             tarball,
             integrity: str_field("integrity"),
@@ -240,25 +240,67 @@ impl UpstreamClient {
         })
     }
 
-    /// The verified upstream tarball bytes of `name@version` (checked
-    /// against the registry's `dist.integrity`).
-    pub(crate) async fn npm_tarball(&self, name: &str, version: &str) -> Result<Vec<u8>, String> {
+    pub(crate) async fn npm_berry_checksum(
+        &self,
+        uuid: &str,
+        name: &str,
+        version: &str,
+        origin: &str,
+    ) -> Result<String, String> {
+        if self.offline {
+            return Err(OFFLINE.into());
+        }
         let key = (name.to_string(), version.to_string());
-        if let Some(hit) = self.npm_tarballs.lock().await.get(&key) {
+        if let Some(hit) = self.npm_berry.lock().await.get(&key) {
             return hit.clone();
         }
         let result = async {
+            let url = format!("{}/upstream/npm/{uuid}.json", origin.trim_end_matches('/'));
+            let metadata = self.get_json(&url).await?;
+            if metadata["name"].as_str() != Some(name)
+                || metadata["version"].as_str() != Some(version)
+            {
+                return Err("upstream checksum metadata names a different package".into());
+            }
+            let checksum = metadata["yarnBerry10c0"]
+                .as_str()
+                .filter(|c| crate::vendor::yarn_berry_lock::valid_berry_checksum(c))
+                .ok_or("the patch service supplied no valid upstream Berry checksum")?;
+            let integrity = metadata["integrity"]
+                .as_str()
+                .filter(|s| s.starts_with("sha512-"))
+                .ok_or("upstream checksum metadata has no archive integrity")?;
+            use base64::Engine as _;
+            if !base64::engine::general_purpose::STANDARD
+                .decode(&integrity[7..])
+                .is_ok_and(|bytes| bytes.len() == 64)
+            {
+                return Err("upstream checksum metadata has invalid SHA-512 integrity".into());
+            }
             let dist = self.npm_dist(name, version).await?;
-            let integrity = dist
+            if !dist
                 .integrity
-                .clone()
-                .ok_or_else(|| format!("the registry records no integrity for {name}@{version}"))?;
-            let bytes = crate::vendor::registry_fetch::download(&self.http, &dist.tarball).await?;
-            crate::vendor::registry_fetch::verify_sri(&bytes, &integrity)?;
-            Ok(bytes)
+                .as_deref()
+                .is_some_and(|s| s.split_whitespace().any(|v| v == integrity))
+            {
+                let bytes =
+                    crate::vendor::registry_fetch::download(&self.http, &dist.tarball).await?;
+                crate::vendor::registry_fetch::verify_sri(&bytes, integrity)?;
+                if let Some(sri) = dist.integrity.as_deref() {
+                    crate::vendor::registry_fetch::verify_sri(&bytes, sri)?;
+                } else if let Some(sha1) = dist.shasum.as_deref() {
+                    use sha1::Digest as _;
+                    if hex::encode(sha1::Sha1::digest(&bytes)) != sha1 {
+                        return Err("registry archive checksum mismatch".into());
+                    }
+                } else {
+                    return Err("the registry supplied no archive integrity".into());
+                }
+            }
+            Ok(checksum.to_string())
         }
         .await;
-        self.npm_tarballs.lock().await.insert(key, result.clone());
+        self.npm_berry.lock().await.insert(key, result.clone());
         result
     }
 
@@ -355,15 +397,17 @@ impl UpstreamClient {
                 };
                 return match (pick(&zip_key), pick(&mod_key)) {
                     (Some(zip_h1), Some(mod_h1)) => Ok(GoSums { zip_h1, mod_h1 }),
-                    _ => Err(format!("{url} does not list both go.sum lines of {module} {version}")),
+                    _ => Err(format!(
+                        "{url} does not list both go.sum lines of {module} {version}"
+                    )),
                 };
             }
             let proxy = crate::vendor::registry_fetch::goproxy_base(module)?;
             let escaped = crate::crawlers::go_crawler::encode_module_path(module);
             let escaped_version = crate::crawlers::go_crawler::encode_module_path(version);
             let base = format!("{proxy}/{escaped}/@v/{escaped_version}");
-            let zip = crate::vendor::registry_fetch::download(&self.http, &format!("{base}.zip"))
-                .await?;
+            let zip =
+                crate::vendor::registry_fetch::download(&self.http, &format!("{base}.zip")).await?;
             let zip_h1 = crate::vendor::registry_fetch::go_h1_of_zip(&zip)?;
             let go_mod =
                 crate::vendor::registry_fetch::download(&self.http, &format!("{base}.mod")).await?;
@@ -379,7 +423,11 @@ impl UpstreamClient {
 
     /// The rubygems.org sha256 of the ruby-platform `name-version.gem`,
     /// from the compact index bundler itself reads (`info/<name>`).
-    pub(crate) async fn rubygems_sha256(&self, name: &str, version: &str) -> Result<String, String> {
+    pub(crate) async fn rubygems_sha256(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<String, String> {
         let key = (name.to_string(), version.to_string());
         if let Some(hit) = self.rubygems.lock().await.get(&key) {
             return hit.clone();
@@ -404,7 +452,11 @@ impl UpstreamClient {
     /// Every version packagist serves for the composer package `name`
     /// (lowercase `vendor/package`), expanded: the stable `p2/<name>.json`
     /// list, or the `~dev` one when `dev` (composer splits branches out).
-    pub(crate) async fn packagist_versions(&self, name: &str, dev: bool) -> Result<Vec<Value>, String> {
+    pub(crate) async fn packagist_versions(
+        &self,
+        name: &str,
+        dev: bool,
+    ) -> Result<Vec<Value>, String> {
         let key = (name.to_string(), if dev { "~dev" } else { "" }.to_string());
         if let Some(hit) = self.packagist.lock().await.get(&key) {
             return hit.clone();
@@ -443,7 +495,11 @@ impl UpstreamClient {
     /// (base64 sha512 of the `.nupkg`): the `packageHash` of the catalog
     /// entry its registration leaf points at — the hash nuget.org computed
     /// over the repository-signed package, without downloading it.
-    pub(crate) async fn nuget_content_hash(&self, id: &str, version: &str) -> Result<String, String> {
+    pub(crate) async fn nuget_content_hash(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<String, String> {
         let key = (id.to_ascii_lowercase(), version.to_ascii_lowercase());
         if let Some(hit) = self.nuget.lock().await.get(&key) {
             return hit.clone();
@@ -477,7 +533,9 @@ impl UpstreamClient {
                         .eq_ignore_ascii_case(version_lower)
                 });
             if !same_id || !same_version {
-                return Err(format!("{catalog} is not the catalog entry of {id} {version}"));
+                return Err(format!(
+                    "{catalog} is not the catalog entry of {id} {version}"
+                ));
             }
             let sha512 = entry
                 .get("packageHashAlgorithm")
@@ -677,5 +735,107 @@ mod tests {
         // -json` output for a one-line module file.
         let h1 = go_mod_h1(b"module example.com/m\n");
         assert!(h1.starts_with("h1:") && h1.ends_with('='), "{h1}");
+    }
+    #[tokio::test]
+    async fn berry_metadata_is_registry_anchored_without_repacking() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let bytes = b"registry archive";
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes))
+        );
+        let checksum = format!("10c0/{}", "a".repeat(128));
+        for (registry_sri, registry_sha1, expected_downloads) in [
+            (Some(integrity.clone()), None, 0),
+            (None, Some(hex::encode(sha1::Sha1::digest(bytes))), 1),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET")).and(path("/upstream/npm/uuid.json")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name":"left-pad", "version":"1.3.0", "integrity":integrity, "yarnBerry10c0":checksum
+            }))).expect(1).mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/archive.tgz"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+                .expect(expected_downloads)
+                .mount(&server)
+                .await;
+            let client = UpstreamClient::new(false);
+            client.npm.lock().await.insert(
+                ("left-pad".into(), "1.3.0".into()),
+                Ok(NpmDist {
+                    tarball: format!("{}/archive.tgz", server.uri()),
+                    integrity: registry_sri,
+                    shasum: registry_sha1,
+                }),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    client
+                        .npm_berry_checksum("uuid", "left-pad", "1.3.0", &server.uri())
+                        .await
+                        .unwrap(),
+                    checksum
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn berry_metadata_refuses_wrong_identity_integrity_and_unavailable_service() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"expected"))
+        );
+        let valid = serde_json::json!({"name":"left-pad", "version":"1.3.0", "integrity":integrity, "yarnBerry10c0":format!("10c0/{}", "a".repeat(128))});
+        for kind in [
+            "name",
+            "version",
+            "integrity",
+            "yarnBerry10c0",
+            "unavailable",
+            "registry_mismatch",
+        ] {
+            let server = MockServer::start().await;
+            let mut body = valid.clone();
+            if body.get(kind).is_some() {
+                body[kind] = serde_json::json!("invalid");
+            }
+            Mock::given(method("GET"))
+                .and(path("/upstream/npm/uuid.json"))
+                .respond_with(
+                    ResponseTemplate::new(if kind == "unavailable" { 503 } else { 200 })
+                        .set_body_json(body),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/archive.tgz"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"different".as_slice()))
+                .mount(&server)
+                .await;
+            let client = UpstreamClient::new(false);
+            client.npm.lock().await.insert(
+                ("left-pad".into(), "1.3.0".into()),
+                Ok(NpmDist {
+                    tarball: format!("{}/archive.tgz", server.uri()),
+                    integrity: Some("sha512-other".into()),
+                    shasum: None,
+                }),
+            );
+            assert!(
+                client
+                    .npm_berry_checksum("uuid", "left-pad", "1.3.0", &server.uri())
+                    .await
+                    .is_err(),
+                "{kind}"
+            );
+        }
     }
 }

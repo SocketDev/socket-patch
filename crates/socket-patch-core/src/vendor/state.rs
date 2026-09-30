@@ -51,6 +51,8 @@ const VENDOR_STATE_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VendorArtifact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yarn_berry10c0: Option<String>,
     /// Project-relative, forward-slashed path of the artifact
     /// (`.socket/vendor/<eco>/<uuid>/<leaf>`).
     pub path: String,
@@ -832,6 +834,7 @@ mod tests {
             base_purl: "pkg:npm/lodash@4.17.21".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{UUID}/lodash-4.17.21.tgz"),
                 sha256: "ab".repeat(32),
                 size: Some(3668),
@@ -887,6 +890,7 @@ mod tests {
             base_purl: "pkg:cargo/cfg-if@1.0.4".into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
                 sha256: String::new(),
                 size: None,

@@ -419,7 +419,7 @@ fn vendored_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String
         "--api-token",
         "fake",
         "--vendor-source",
-        "build",
+        "service",
     ];
     args.extend_from_slice(extra);
     run_socket(proj, &args)

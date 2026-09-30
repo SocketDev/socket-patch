@@ -414,7 +414,7 @@ async fn vlt_pinned_matrix_safety_vendored_build() {
         &fx.proj,
         &fx.svc,
         &["scan", "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     assert_eq!(out.code, 0, "{out}");
     pair.assert_untouched(&before, "the vendored build");
@@ -437,7 +437,7 @@ async fn vlt_pinned_matrix_safety_vendor_revert_and_repair() {
         &fx.proj,
         &fx.svc,
         &["scan", "--mode", "vendored"],
-        &["--vendor-source", "build"],
+        &["--vendor-source", "service"],
     );
     assert_eq!(out.code, 0, "{out}");
     fx.vlt_ok(&fx.proj, &["install"]);

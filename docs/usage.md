@@ -92,18 +92,23 @@ mirror or package-manager cache, and test a clean offline install before relying
 on an airgapped build. Integrity enforcement and cache behavior differ by package
 manager; see [ecosystem support](ecosystems.md).
 
-Artifact acquisition is controlled by `--vendor-source`:
+Vendoring downloads prebuilt artifacts from the patch service and verifies
+archive integrity and patched file hashes before installation. The service
+owns archive construction, including Yarn Berry cache checksums. Python
+vendoring accepts both wheels and source distributions supplied by the service.
 
-| Value | Behavior |
-| --- | --- |
-| `auto` (default) | Use a service artifact when available, with local building as a fallback for eligible misses |
-| `service` | Require a service artifact; refuse if unavailable |
-| `build` | Build locally from available package and patch data |
+`--vendor-source service` is the default. `auto` remains an alias for the same
+behavior; `build` is rejected. A missing artifact, pending build, network error,
+or integrity mismatch fails without a local build fallback. Healthy committed
+artifacts can be reused offline.
 
-An integrity failure is refused rather than bypassed with a fallback. Offline
-operation never fetches missing inputs. `repair` can restore missing or corrupt
-artifacts from a valid ledger when sufficient inputs are available; it cannot
-reconstruct a lost vendor ledger. Restore a lost ledger from version control.
+`repair` redownloads missing or corrupt artifacts and checks them against the
+existing ledger before replacement. It preserves project wiring and recorded
+integrity; different archive bytes require an explicit new vendoring operation.
+Repair cannot reconstruct a lost vendor ledger. Restore it from version control.
+
+The N-API crate and in-memory patch engine remain available for hosted GitHub
+App workflows. Removing local vendoring builders does not remove those APIs.
 
 ### Maven reactors and Gradle
 

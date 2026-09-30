@@ -385,13 +385,7 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   client-side content pin (vendored surfaces this as a `vendor_nuget_no_lockfile`
   warning; the feed + source mapping still force the patched copy).
 
-* **NuGet package signatures (local vendoring).** Rebuilding a `.nupkg` changes
-  its contents, so the local builder removes the upstream `.signature.p7s` rather
-  than retaining an invalid signature. Environments requiring signed packages need
-  a compatible signing policy or an appropriate service artifact; local vendoring
-  does not preserve the upstream author's signature. Service artifacts are copied
-  without local repacking. The current implementation uses a folder feed with
-  source mapping.
+* **NuGet package signatures.** The server constructs the patched `.nupkg` and removes invalidated upstream signatures. The CLI verifies and stores the served archive without repacking it. Vendoring uses a folder feed with source mapping; installations requiring signed packages need an appropriate server artifact and signing policy.
 
 ## Cargo: shared registry cache
 

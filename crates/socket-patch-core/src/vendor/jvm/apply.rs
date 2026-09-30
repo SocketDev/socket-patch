@@ -809,7 +809,11 @@ pub fn check_entry(
 /// The vendored jar of the JVM `entry` for `uuid`, project-relative: the
 /// artifact path must be the entry's own tree jar (the Maven directory
 /// carries the uuid; the Gradle one's marker must name it).
-pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<String, String> {
+pub(crate) fn checked_tree_jar_path(
+    root: &Path,
+    entry: &VendorEntry,
+    uuid: &str,
+) -> Result<String, String> {
     let unsafe_path = || "vendor_path_unsafe".to_string();
     if !is_jvm_entry(entry) {
         return Err(unsafe_path());
@@ -840,16 +844,29 @@ pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<
     if rel != gradle_jar {
         return Err(unsafe_path());
     }
-    let marker = ProjectReader::new(root)
-        .read(&format!("{}/{}", gradle::tree_dir(&c), gradle::MARKER_NAME))
-        .and_then(|m| serde_json::from_slice::<Value>(&m).ok());
-    match marker
-        .as_ref()
-        .and_then(|m| m.get("uuid"))
-        .and_then(Value::as_str)
-    {
-        Some(u) if u == uuid => Ok(gradle_jar),
-        _ => Err("vendor_uuid_mismatch".to_string()),
+    Ok(gradle_jar)
+}
+
+pub fn checked_tree_jar(root: &Path, entry: &VendorEntry, uuid: &str) -> Result<String, String> {
+    let rel = checked_tree_jar_path(root, entry, uuid)?;
+    if rel.starts_with(".socket/vendor/maven2/") {
+        return Ok(rel);
+    }
+    let marker_path = format!(
+        "{}/{}",
+        rel.rsplit_once('/').ok_or("vendor_path_unsafe")?.0,
+        gradle::MARKER_NAME
+    );
+    let reader = ProjectReader::new(root);
+    let bytes = reader.read(&marker_path).ok_or("vendor_artifact_missing")?;
+    if reader.escaped().is_some() {
+        return Err("vendor_path_unsafe".into());
+    }
+    let marker: Value = serde_json::from_slice(&bytes).map_err(|_| "vendor_artifact_unreadable")?;
+    match marker.get("uuid").and_then(Value::as_str) {
+        Some(u) if u == uuid => Ok(rel),
+        Some(_) => Err("vendor_uuid_mismatch".into()),
+        None => Err("vendor_artifact_unreadable".into()),
     }
 }
 

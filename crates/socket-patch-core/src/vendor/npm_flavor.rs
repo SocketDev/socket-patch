@@ -25,14 +25,14 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
-use crate::formats::pnpm::PnpmLockGrammar;
-use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
     bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, vlt_lock, yarn_berry_lock, yarn_classic_lock,
     RevertOpts, RevertOutcome, VendorOutcome, VendorWarning,
 };
+use crate::formats::pnpm::PnpmLockGrammar;
+use crate::formats::yarn::{sniff_grammar, YarnLockGrammar, UNIDENTIFIED_DETAIL};
 
 /// Which lockfile flavor drives this project's npm installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,29 +474,6 @@ pub async fn vlt_routes(project_root: &Path) -> Option<Result<(), (&'static str,
     }
 }
 
-/// Which of `packages` — npm purls with their records, in vendor-loop
-/// order — [`vendor_npm_any`] would refuse before it first asks the patch
-/// service for a prebuilt archive. `Ok(())` means the loop reaches the
-/// service for that package; `Err(code)` names the refusing gate. The
-/// vendor loop's download plan consults this so it never asks the service
-/// for a package the loop then refuses: a download grant can start a
-/// server-side build and counts against quota.
-///
-/// Every gate is the loop's own, evaluated against the project as it is
-/// when the plan is built, in the loop's order: the flavor probe (a probe
-/// refusal refuses every package), then per package the coordinates guard
-/// — the flavors' first gate, ahead of any read, so a malformed record in
-/// a project the flavor refuses carries `unsafe_coordinates` as the loop
-/// would report it — then the flavor's project read (lock present,
-/// parseable, supported version, line endings, cache configuration) and
-/// its per-package pre-flight (the entry present and rewritable, override
-/// conflicts, workspace gates). The project is read once for the whole
-/// plan. Gates the loop can only evaluate after the service has answered,
-/// or that only a local build reaches — the bundled-dependencies refusal,
-/// the prebuilt archive's afterHash check — are not pre-flight gates and
-/// stay in the loop: they run after the loop has already taken its planned
-/// download, so the refusal is the loop's own and costs no request the
-/// serial loop would not have made.
 pub async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
@@ -789,7 +766,7 @@ mod lock_text_refusal_tests {
             (1, "vendor_lock_entry_unsupported"),
             (2, "vendor_lock_entry_not_found"),
         ] {
-            let backend = vendor_npm_any(
+            let backend = crate::vendor::test_support::vendor_npm_any(
                 purls[i],
                 nowhere.as_path(),
                 root,
@@ -991,13 +968,20 @@ mod tests {
         touch(tmp.path(), "bun.lock", "{\n  \"lockfileVersion\": 1\n}\n").await;
         let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
-        assert!(warnings.is_empty());
+        assert!(warnings
+            .iter()
+            .all(|w| w.code == "vendor_prebuilt_downloaded"));
 
         // bun.lock wins over a stray bun.lockb (no warning for the sibling).
         touch(tmp.path(), "bun.lockb", "binary").await;
         let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
 
         // Binary-only trees reach the native parser; malformed content is
         // diagnosed there rather than mistaken for an unsupported format.
@@ -1005,7 +989,9 @@ mod tests {
         touch(tmp.path(), "bun.lockb", "binary").await;
         let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
-        assert!(warnings.is_empty());
+        assert!(warnings
+            .iter()
+            .all(|w| w.code == "vendor_prebuilt_downloaded"));
     }
 
     #[tokio::test]
@@ -1105,7 +1091,12 @@ mod tests {
         touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
         let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnBerry);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
 
         // Genuinely unwired siblings still warn — exactly one, for the
         // stray package-lock.json, never for yarn.lock.
@@ -1133,12 +1124,19 @@ mod tests {
         touch(tmp.path(), "npm-shrinkwrap.json", "{}").await;
         let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::PackageLock);
-        assert!(warnings.is_empty());
+        assert!(warnings
+            .iter()
+            .all(|w| w.code == "vendor_prebuilt_downloaded"));
 
         // Shrinkwrap + package-lock are the same family: no self-warning.
         touch(tmp.path(), "package-lock.json", "{}").await;
         let (_, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
@@ -1194,7 +1192,9 @@ mod tests {
                 NpmLockFlavor::Vlt,
                 "{version}: layout is not checked here"
             );
-            assert!(warnings.is_empty());
+            assert!(warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"));
         }
         for (lock, needle) in [
             ("{\"nodes\": {}}", "has no lockfileVersion (vlt ≤ 0.0.0-18)"),
@@ -1433,7 +1433,7 @@ mod tests {
     ) -> VendorOutcome {
         let blobs = root.join(".socket/blobs");
         let sources = crate::patch::apply::PatchSources::blobs_only(&blobs);
-        vendor_npm_any(
+        crate::vendor::test_support::vendor_npm_any(
             "pkg:npm/left-pad@1.3.0",
             &root.join("node_modules/left-pad"),
             root,
@@ -1465,7 +1465,12 @@ mod tests {
             panic!("expected Done, got {outcome:?}");
         };
         assert!(result.success, "{:?}", result.error);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         let entry = entry.expect("success carries a ledger entry");
         assert_eq!(entry.flavor.as_deref(), Some("package-lock"));
         // The lock really was wired (the backend ran).
@@ -1586,6 +1591,7 @@ mod tests {
             base_purl: "pkg:npm/left-pad@1.3.0".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
                 sha256: String::new(),
                 size: None,

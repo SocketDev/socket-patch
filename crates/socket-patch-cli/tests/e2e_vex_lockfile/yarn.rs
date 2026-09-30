@@ -485,6 +485,7 @@ fn write_vendor_ledger(cwd: &Path, flavor: Flavor, rel: &str, rec: PatchRecord) 
             base_purl: PURL.to_string(),
             uuid: rec.uuid.clone(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel.to_string(),
                 sha256: String::new(),
                 size: None,

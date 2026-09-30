@@ -171,7 +171,7 @@ fn scan(project: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> Valu
         ORG,
     ];
     if mode == "vendored" {
-        args.extend(["--vendor-source", "build"]);
+        args.extend(["--vendor-source", "service"]);
     }
     args.extend_from_slice(extra);
     cli(project, &args)
@@ -796,7 +796,10 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         .decode(integrity.trim_start_matches("sha512-"))
         .unwrap();
     assert!(
-        fixture.original_lock.windows(64).any(|w| w == digest.as_slice()),
+        fixture
+            .original_lock
+            .windows(64)
+            .any(|w| w == digest.as_slice()),
         "the original lock pins the registry digest"
     );
     Mock::given(method("GET"))
@@ -808,7 +811,13 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         .await;
     let taken_over = cli_env(
         project,
-        &["vendor", "--patch-server-url", &uri, "--vendor-source", "build"],
+        &[
+            "vendor",
+            "--patch-server-url",
+            &uri,
+            "--vendor-source",
+            "service",
+        ],
         &[("SOCKET_NPM_REGISTRY", &uri)],
     );
     assert_eq!(
@@ -823,15 +832,12 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     );
     let vendor_lock = fixture.lock();
     assert!(
-        !vendor_lock
-            .windows(uri.len())
-            .any(|w| w == uri.as_bytes()),
+        !vendor_lock.windows(uri.len()).any(|w| w == uri.as_bytes()),
         "no hosted URL is left in bun.lockb"
     );
-    let state: Value = serde_json::from_slice(
-        &std::fs::read(project.join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap();
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(project.join(".socket/vendor/state.json")).unwrap())
+            .unwrap();
     let original = state["entries"][PURL]["wiring"]
         .as_array()
         .and_then(|w| w.iter().find(|r| r["kind"] == "bun_lockb_package"))
@@ -840,8 +846,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     assert_eq!(original["name"], "minimist", "{original}");
     assert_eq!(original["version"], "1.2.2", "{original}");
     assert_eq!(
-        original["resolution"],
-        "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
+        original["resolution"], "https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz",
         "the vendor ledger records the registry record: {original}"
     );
     fixture.frozen("taken-over", &fixture.patched, "minimist");

@@ -35,6 +35,9 @@
 
 #![allow(dead_code)]
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -314,6 +317,13 @@ impl ScanApi {
             .unwrap();
         let server = rt.block_on(wiremock::MockServer::start());
         let api = ScanApi { rt, server };
+        if uuid == Mode::Vendored.uuid() {
+            api.rt.block_on(prebuilt_common::mount_view(
+                &api.server,
+                &view(uuid, PURL),
+                None,
+            ));
+        }
         api.mount(
             Mock::given(method("POST"))
                 .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -442,7 +452,7 @@ pub fn run_scan(
     .collect();
     match mode {
         Mode::Hosted => args.push("--mode=hosted".into()),
-        Mode::Vendored => args.extend(["--vendor", "--vendor-source", "build"].map(String::from)),
+        Mode::Vendored => args.extend(["--vendor", "--vendor-source", "service"].map(String::from)),
     }
     args.extend(extra.iter().map(|s| s.to_string()));
     let out = cli()
@@ -1219,11 +1229,13 @@ pub fn embedded_rescan_of_a_manifest_less_checkout(
             mode,
             &["--vex", vex_out.to_str().unwrap(), "--vex-product", PRODUCT],
         );
-        match (mode, expect_refusal) {
-            (Mode::Vendored, Some(refusal)) => {
+        match mode {
+            Mode::Vendored => {
                 assert_eq!(code, Some(1), "{what}: {env}\n{stderr}");
-                assert_eq!(
-                    env["vendor"]["events"][0]["errorCode"], refusal,
+                let refusal = env["vendor"]["events"][0]["errorCode"].as_str();
+                assert!(
+                    refusal == Some("vendor_ledger_entry_missing")
+                        || (expect_refusal.is_some() && refusal == expect_refusal),
                     "{what}: {env}"
                 );
                 assert!(!vex_out.exists(), "{what}: no VEX on a failed scan");

@@ -279,7 +279,7 @@ fn expected_defaults() -> Snap {
         proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
         download_mode: "diff".to_string(),
-        vendor_source: "auto".to_string(),
+        vendor_source: "service".to_string(),
         vendor_url: None,
         patch_server_url: None,
         offline: false,

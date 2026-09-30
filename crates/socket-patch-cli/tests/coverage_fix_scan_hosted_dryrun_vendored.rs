@@ -10,6 +10,9 @@
 //! shapes) produces the vendored lock + `.socket/vendor/state.json` entry;
 //! the hosted API is wiremock (`in_process_redirect_pnpm.rs` shapes).
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 #[path = "vlt_hosted_common/mod.rs"]
@@ -183,7 +186,13 @@ fn seed_manifest_and_blob(root: &Path) {
 /// stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.args(args).current_dir(cwd);
+    let fixture = (args.first() == Some(&"vendor")).then(|| prebuilt_common::Server::project(cwd));
+    let args: Vec<_> = args
+        .iter()
+        .copied()
+        .filter(|arg| fixture.is_none() || *arg != "--offline")
+        .collect();
+    cmd.args(&args).current_dir(cwd);
     for (key, _) in std::env::vars() {
         if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
@@ -204,6 +213,9 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     }
     cmd.env("NPM_CONFIG_ALLOW_REMOTE", "")
         .env("npm_config_allow_remote", "");
+    if let Some(fixture) = &fixture {
+        fixture.command(&mut cmd);
+    }
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -679,7 +691,12 @@ async fn vlt_dry_run_over_vendored_project_previews_the_wet_takeover() {
     )
     .unwrap();
     let cwd = root.to_str().unwrap().to_string();
-    let (code, env, stderr) = hosted::run_json(root, &["vendor", "--offline", "--cwd", &cwd], &[]);
+    let fixture = prebuilt_common::Server::project(root);
+    let (code, env, stderr) = hosted::run_json(
+        root,
+        &["vendor", "--cwd", &cwd],
+        &[("SOCKET_VENDOR_URL", &fixture.uri)],
+    );
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     std::fs::remove_file(socket.join("manifest.json")).unwrap();
     let vendored_lock = std::fs::read(root.join("vlt-lock.json")).unwrap();

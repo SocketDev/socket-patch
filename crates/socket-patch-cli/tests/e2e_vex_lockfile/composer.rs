@@ -410,6 +410,7 @@ fn write_vendor_ledger(cwd: &Path, key: &str, rec: PatchRecord) {
             base_purl: key.to_string(),
             uuid: rec.uuid.clone(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: artifact_rel(&rec.uuid),
                 sha256: String::new(),
                 size: None,

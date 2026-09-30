@@ -24,6 +24,9 @@
 //! GOPROXY, per-"machine" caches, wiremock API). Needs Go 1.18+ (`go.work`);
 //! the release is whatever `go` is on `PATH` (see `golang_e2e_matrix`).
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -292,7 +295,7 @@ fn move_replace_to_go_work(root: &Path, sums_of: Option<&str>) -> String {
 /// Run socket-patch (SOCKET_* scrubbed, hermetic config) in `cwd`.
 fn socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, serde_json::Value, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") {
             cmd.env_remove(&k);
@@ -303,6 +306,12 @@ fn socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, serde_json::Value
         .env("GOMODCACHE", modcache)
         .env("GOFLAGS", "")
         .env_remove("VIRTUAL_ENV");
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        cwd,
+        args,
+        &[("GOMODCACHE", modcache.to_str().unwrap())],
+    );
     let out = cmd.output().expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

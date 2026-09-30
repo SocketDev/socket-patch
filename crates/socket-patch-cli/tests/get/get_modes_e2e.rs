@@ -16,6 +16,9 @@
 //! No `#[serial]`: the child gets a scrubbed env copy (`run_bin_with_env`
 //! via `run_with_env`); the parent process env is never mutated.
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 use wiremock::matchers::{method, path};
@@ -50,34 +53,36 @@ fn b64(bytes: &[u8]) -> String {
 /// `view/{uuid}` with REAL git-blob hashes and inline blob content, so the
 /// vendored flow's staging hash-gates pass (the hosted flow only needs the
 /// record fields). Same recipe as the in-process suite.
-async fn mock_view(server: &MockServer, uuid: &str, purl: &str) {
+async fn mock_view(server: &MockServer, uuid: &str, purl: &str) -> serde_json::Value {
+    let view = serde_json::json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": common::git_sha256(BEFORE_BYTES),
+                "afterHash": common::git_sha256(AFTER_BYTES),
+                "blobContent": b64(AFTER_BYTES),
+            }
+        },
+        "vulnerabilities": {
+            GHSA: {
+                "cves": ["CVE-2024-1234"],
+                "summary": "get-modes fixture",
+                "severity": "high",
+                "description": "d"
+            }
+        },
+        "description": "get-modes fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": purl,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": common::git_sha256(BEFORE_BYTES),
-                    "afterHash": common::git_sha256(AFTER_BYTES),
-                    "blobContent": b64(AFTER_BYTES),
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": ["CVE-2024-1234"],
-                    "summary": "get-modes fixture",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "get-modes fixture",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
+    view
 }
 
 /// `by-ghsa/{GHSA}`: the two-version fan-out — 1.0.0 (installable in the
@@ -307,7 +312,8 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
 #[tokio::test]
 async fn get_uuid_vendored_json_envelope_nests_vendor() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    let fixture = prebuilt_common::Server::view(view);
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
@@ -319,8 +325,10 @@ async fn get_uuid_vendored_json_envelope_nests_vendor() {
             UUID1,
             "--mode",
             "vendored",
+            "--vendor-url",
+            &fixture.uri,
             "--vendor-source",
-            "build",
+            "service",
             "--json",
         ],
     );
@@ -662,7 +670,7 @@ async fn get_vendored_dry_run_json_envelope() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--dry-run",
             "--json",
         ],
@@ -711,7 +719,8 @@ async fn get_vendored_dry_run_json_envelope() {
 #[tokio::test]
 async fn get_vendored_then_hosted_takes_over_cleanly() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    let fixture = prebuilt_common::Server::view(view);
     mock_reference(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -725,9 +734,11 @@ async fn get_vendored_then_hosted_takes_over_cleanly() {
             UUID1,
             "--mode",
             "vendored",
+            "--vendor-url",
+            &fixture.uri,
             "--json",
             "--vendor-source",
-            "build",
+            "service",
         ],
     );
     assert_eq!(code, 0, "vendored step failed: {stderr}");
@@ -982,7 +993,7 @@ async fn get_vendored_refusal_visible_under_silent() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--silent",
             ],
         );
@@ -1037,7 +1048,7 @@ async fn get_vendored_dry_run_reports_bun_refusal() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--dry-run",
                 "--json",
             ],
@@ -1148,7 +1159,7 @@ async fn get_vendored_vlt_refusal_visible_under_silent() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--silent",
             ],
         );
@@ -1224,9 +1235,11 @@ async fn get_save_only_agent_ignores_vlt_preflight() {
 async fn get_modes_state_attests_manifest_less() {
     for hosted in [true, false] {
         let server = MockServer::start().await;
-        mock_view(&server, UUID1, PURL1).await;
+        let view = mock_view(&server, UUID1, PURL1).await;
         if hosted {
             mock_reference(&server).await;
+        } else {
+            prebuilt_common::mount_view(&server, &view, None).await;
         }
         let tmp = tempfile::tempdir().unwrap();
         write_project(tmp.path());
@@ -1239,7 +1252,7 @@ async fn get_modes_state_attests_manifest_less() {
                 "--mode",
                 "vendored",
                 "--vendor-source",
-                "build",
+                "service",
                 "--json",
             ]
         };

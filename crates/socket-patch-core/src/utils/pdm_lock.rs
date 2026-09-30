@@ -219,7 +219,7 @@ pub fn rewrite_pdm_lock_in<'a>(
     {
         return Err("invalid PDM artifact source or SHA-256".into());
     }
-    if !wheel_matches(filename, name, version) {
+    if !crate::vendor::pypi_distribution::matches(filename, name, version) {
         return Err("PDM patch wheel does not match package".into());
     }
     let doc = match parse.doc.take() {
@@ -332,9 +332,11 @@ fn plan_pdm_rewrite(
         .filter_map(|&index| packages.get(index)?.get("version").and_then(Item::as_str))
         .collect();
     if locked_versions.len() > 1 {
-        return Err("PDM lock resolves this package at multiple versions (a marker or \
+        return Err(
+            "PDM lock resolves this package at multiple versions (a marker or \
                     multi-target fork); patching one fork would leave the others unpatched"
-            .into());
+                .into(),
+        );
     }
     let mut variants = std::collections::BTreeSet::new();
     let mut edits = Vec::new();
@@ -749,7 +751,10 @@ mod tests {
             &"a".repeat(64),
         )
         .unwrap();
-        assert!(rewired.contains(&fresh) && !rewired.contains(&stale), "{rewired}");
+        assert!(
+            rewired.contains(&fresh) && !rewired.contains(&stale),
+            "{rewired}"
+        );
         // A foreign (non-Socket) existing url is still refused.
         let foreign = fixture("2.29.2").replace(
             "name = \"urllib3\"",

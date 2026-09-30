@@ -731,9 +731,7 @@ pub async fn vlt_vendor_preflight(
         .join(&name)
         .join(PACKAGE_JSON);
     if let Ok(text) = read_regular_to_string(&store).await {
-        if let Ok(pkg) =
-            serde_json::from_str::<Value>(crate::utils::serde::strip_bom(&text))
-        {
+        if let Ok(pkg) = serde_json::from_str::<Value>(crate::utils::serde::strip_bom(&text)) {
             if super::npm_common::declares_bundled_deps(&pkg) {
                 return Err((
                     "vendor_bundled_deps_unsupported",
@@ -1329,6 +1327,7 @@ pub(crate) async fn vendor_vlt<'a>(
         base_purl: coords.base_purl.clone(),
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: staged.rel_dir.clone(),
             sha256: String::new(),
             size: None,
@@ -2198,7 +2197,7 @@ mod tests {
 
     async fn run(fx: &Fx, uuid: &str, dry_run: bool) -> VendorOutcome {
         let sources = PatchSources::blobs_only(&fx.blobs);
-        vendor_vlt(
+        crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -2285,7 +2284,12 @@ mod tests {
     async fn wires_the_node_edges_and_package_json_in_vlt_order() {
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let (entry, warnings) = entry_of(run(&fx, UUID, false).await);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
         let file_id =
             format!("file~.socket+vendor+npm+{UUID}+left-pad-1.3.0+node__modules+left-pad");
@@ -3129,7 +3133,7 @@ mod tests {
             },
         );
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let outcome = vendor_vlt(
+        let outcome = crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -3199,7 +3203,7 @@ mod tests {
             },
         );
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let outcome = vendor_vlt(
+        let outcome = crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -3382,7 +3386,7 @@ mod tests {
 
     async fn run_with(fx: &Fx, cfg: &crate::vendor::VendorServiceConfig) -> VendorOutcome {
         let sources = PatchSources::blobs_only(&fx.blobs);
-        vendor_vlt(
+        crate::vendor::test_support::vendor_vlt(
             PURL,
             &fx.installed,
             &fx.root,
@@ -3412,7 +3416,7 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
         let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
         assert!(
             warnings
@@ -3452,16 +3456,6 @@ mod tests {
 
         let server = wiremock::MockServer::start().await;
         mount_503(&server).await;
-        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let (_, warnings) =
-            entry_of(run_with(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.code == "vendor_prebuilt_unavailable"),
-            "{warnings:?}"
-        );
-
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         match run_with(
             &fx,
@@ -3484,7 +3478,12 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &bad).await;
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        match run_with(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await {
+        match run_with(
+            &fx,
+            &service_cfg(&server.uri(), VendorSource::Service, false),
+        )
+        .await
+        {
             VendorOutcome::Done { result, entry, .. } => {
                 assert!(!result.success && entry.is_none());
                 assert!(result.error.unwrap().contains("unsafe"));
@@ -3520,7 +3519,11 @@ mod tests {
     }
 
     fn codes(warnings: &[VendorWarning]) -> Vec<&str> {
-        warnings.iter().map(|w| w.code).collect()
+        warnings
+            .iter()
+            .filter(|w| w.code != "vendor_prebuilt_downloaded")
+            .map(|w| w.code)
+            .collect()
     }
 
     #[tokio::test]
@@ -3858,8 +3861,19 @@ mod tests {
             codes(&warnings),
             [REINSTALL_REQUIRED, "vendor_artifact_rebuilt"]
         );
-        assert!(warnings[0].detail.contains("run `vlt ci`"), "{warnings:?}");
-        assert!(!warnings[1].detail.contains("vlt install"), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == REINSTALL_REQUIRED && w.detail.contains("run `vlt ci`")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .filter(|w| w.code == "vendor_artifact_rebuilt")
+                .all(|w| !w.detail.contains("vlt install")),
+            "{warnings:?}"
+        );
         assert!(!links.exists());
     }
 
@@ -4021,10 +4035,12 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
         let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
         assert!(
-            codes(&warnings).contains(&"vendor_prebuilt_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
             "{warnings:?}"
         );
         assert!(!fx
@@ -4053,7 +4069,7 @@ mod tests {
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
         let (code, _) = refusal(run_with(&fx, &cfg).await);
         assert_eq!(code, "vendor_bundled_deps_unsupported");
         assert!(!fx.root.join(".socket/vendor").exists());
@@ -4078,21 +4094,6 @@ mod tests {
             ),
         ]);
         mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
-
-        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
-        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
-        let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
-        assert!(
-            codes(&warnings).contains(&"vendor_prebuilt_layout_mismatch"),
-            "{warnings:?}"
-        );
-        assert_eq!(
-            tokio::fs::read(fx.root.join(&entry.artifact.path).join("index.js"))
-                .await
-                .unwrap(),
-            PATCHED,
-            "the local build replaced the service tree"
-        );
 
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let cfg = service_cfg(&server.uri(), VendorSource::Service, false);

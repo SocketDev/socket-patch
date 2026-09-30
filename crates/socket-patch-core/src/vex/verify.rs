@@ -1104,6 +1104,7 @@ mod tests {
             base_purl: purl.to_string(),
             uuid: VUUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: rel_path.to_string(),
                 sha256: String::new(),
                 size: None,

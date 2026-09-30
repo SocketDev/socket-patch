@@ -45,6 +45,9 @@
 //! `scripts/yarn-berry-vex-matrix.sh`); `SOCKET_PATCH_YARN_E2E_REQUIRED=1`
 //! turns every soft-skip into a failure.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -144,8 +147,9 @@ fn scrub_socket_env(cmd: &mut Command) {
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -199,27 +203,29 @@ fn b64(bytes: &[u8]) -> String {
 /// build` stages the patched content entirely from the mock — no blob
 /// endpoint, no vendoring service. Metadata mirrors `stage_patch`.
 async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8]) {
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": git_sha256(before),
+                "afterHash": git_sha256(after),
+                "blobContent": b64(after),
+            }
+        },
+        "vulnerabilities": { GHSA: {
+            "cves": [CVE], "summary": "vendor berry capstone vuln",
+            "severity": "high", "description": "d",
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": git_sha256(before),
-                    "afterHash": git_sha256(after),
-                    "blobContent": b64(after),
-                }
-            },
-            "vulnerabilities": { GHSA: {
-                "cves": [CVE], "summary": "vendor berry capstone vuln",
-                "severity": "high", "description": "d",
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view))
         .mount(server)
         .await;
 }
@@ -406,7 +412,7 @@ async fn run_berry_capstone(driver: VendorDriver) {
                     "--org",
                     ORG,
                     "--vendor-source",
-                    "build",
+                    "service",
                     "--cwd",
                     proj.to_str().unwrap(),
                 ],

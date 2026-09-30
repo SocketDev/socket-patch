@@ -15,9 +15,7 @@ use socket_patch_core::formats::pnpm::PnpmLock;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 pub(crate) use socket_patch_core::manifest::records::record_from_patch_response;
 use socket_patch_core::manifest::records::{build_patch_record, files_for_manifest};
-use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord,
-};
+use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
@@ -390,7 +388,6 @@ fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInf
     }
     files
 }
-
 
 #[derive(Args)]
 pub struct GetArgs {
@@ -1744,24 +1741,23 @@ async fn lock_text_refusals_for(
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> LockRefusals {
     let cwd = params.cwd.as_path();
-    let claimed: Vec<String> =
-        socket_patch_core::patch::redirect::upstream::HostedPin::all(
-            &socket_patch_core::vex::discover_patched_refs_with(
-                cwd,
-                &socket_patch_core::vex::DiscoverOptions {
-                    patch_server_origins: params
-                        .patch_server_url
-                        .iter()
-                        .filter(|url| !url.trim().is_empty())
-                        .cloned()
-                        .collect(),
-                },
-            )
-            .await,
+    let claimed: Vec<String> = socket_patch_core::patch::redirect::upstream::HostedPin::all(
+        &socket_patch_core::vex::discover_patched_refs_with(
+            cwd,
+            &socket_patch_core::vex::DiscoverOptions {
+                patch_server_origins: params
+                    .patch_server_url
+                    .iter()
+                    .filter(|url| !url.trim().is_empty())
+                    .cloned()
+                    .collect(),
+            },
         )
-        .into_iter()
-        .map(|pin| canonical_purl(&pin.purl))
-        .collect();
+        .await,
+    )
+    .into_iter()
+    .map(|pin| canonical_purl(&pin.purl))
+    .collect();
     let candidates: Vec<(&str, &str)> = selected
         .iter()
         .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
@@ -2086,17 +2082,8 @@ async fn fetch_selected_patches(
     batch
 }
 
-/// The vendored download phase's result: `(exit code, download JSON,
-/// records by purl, blob seed)` — the seed is every fetched view's decoded
-/// `blobContent` keyed by after-hash, for the vendor stager
-/// (`fetch_stage::stage_vendor_sources_in_memory`), so the step never
-/// fetches a view this phase already holds.
-pub(crate) type DetachedDownload = (
-    i32,
-    serde_json::Value,
-    HashMap<String, PatchRecord>,
-    HashMap<String, Vec<u8>>,
-);
+/// Download status and patch records used to verify server artifacts.
+pub(crate) type DetachedDownload = (i32, serde_json::Value, HashMap<String, PatchRecord>);
 
 /// Download patches WITHOUT touching the manifest and return the fetched
 /// records keyed by purl — the download phase of every vendored run
@@ -2114,9 +2101,6 @@ pub(crate) type DetachedDownload = (
 /// from). The ledger idempotency check runs before the cache lookup, and a
 /// cache miss still fetches.
 ///
-/// The blob seed is best-effort: an undecodable or missing `blobContent`
-/// contributes nothing and is NOT a failed record (the stager reports what
-/// it cannot source).
 pub(crate) async fn download_patch_records_with(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
@@ -2211,21 +2195,7 @@ async fn download_patch_records_preflighted(
 
     let downloaded = batch.fetched.len();
     let mut records: HashMap<String, PatchRecord> = batch.reused.into_iter().collect();
-    let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
     for FetchedPatch { patch, files, .. } in batch.fetched {
-        for info in patch.files.values() {
-            // Same key guard as the blob writers: the hash names the lookup
-            // key the apply pipeline gates writes on.
-            let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
-                continue;
-            };
-            if !is_valid_blob_hash(hash) || blobs.contains_key(hash) {
-                continue;
-            }
-            if let Ok(bytes) = base64_decode(b64) {
-                blobs.insert(hash.clone(), bytes);
-            }
-        }
         records.insert(patch.purl.clone(), build_patch_record(&patch, files));
     }
     let mut result_json = serde_json::json!({
@@ -2239,7 +2209,7 @@ async fn download_patch_records_preflighted(
     if !batch.warnings.is_empty() {
         result_json["warnings"] = serde_json::json!(batch.warnings);
     }
-    (i32::from(batch.failed > 0), result_json, records, blobs)
+    (i32::from(batch.failed > 0), result_json, records)
 }
 
 /// Emit a warning (stderr `[note]` + `warnings[]`) for every added/updated
@@ -2551,11 +2521,13 @@ pub async fn run(args: GetArgs) -> i32 {
     // v5: hosted by default, like scan. `--save-only` (records a manifest
     // entry) and global installs (no project lockfile) mean agent mode.
     // Usage errors exit 2, like clap's and scan's (v5.0).
-    let mode = args.mode.unwrap_or(if args.save_only || args.common.is_global() {
-        super::scan::ScanMode::Agent
-    } else {
-        super::scan::ScanMode::Hosted
-    });
+    let mode = args
+        .mode
+        .unwrap_or(if args.save_only || args.common.is_global() {
+            super::scan::ScanMode::Agent
+        } else {
+            super::scan::ScanMode::Hosted
+        });
     if args.save_only && mode != super::scan::ScanMode::Agent {
         report_error(
             args.common.json,
@@ -2809,8 +2781,7 @@ pub async fn run(args: GetArgs) -> i32 {
         }
         IdentifierType::Package => {
             status.set("Enumerating packages...");
-            let (all_packages, _, _) =
-                crawl_all_ecosystems(&args.common.crawler_options()).await;
+            let (all_packages, _, _) = crawl_all_ecosystems(&args.common.crawler_options()).await;
 
             if all_packages.is_empty() {
                 status.finish();
@@ -2957,7 +2928,10 @@ pub async fn run(args: GetArgs) -> i32 {
         (kept_accessible, narrowing.kept, skips, narrowing.warnings)
     };
     // `get` bypasses the repo's socket.yml policy, but says so.
-    narrow_warnings.extend(super::scan::policy::policy_bypass_warnings(&args.common, &accessible));
+    narrow_warnings.extend(super::scan::policy::policy_bypass_warnings(
+        &args.common,
+        &accessible,
+    ));
     // Layout refusals print even when informational output is quieted only
     // by --json (stderr; the envelope carries them too) — but --silent
     // mutes them like scan does.
@@ -3729,7 +3703,7 @@ async fn run_get_vendored(
     let prefetched_views: HashMap<String, PatchResponse> = prefetched
         .map(|p| HashMap::from([(p.uuid.clone(), p.clone())]))
         .unwrap_or_default();
-    let (dl_code, mut result, records, blobs) = if prefetched.is_some() {
+    let (dl_code, mut result, records) = if prefetched.is_some() {
         // The preflight above already read the lock: hand its outcome down.
         let vendor_state = load_state(&args.common.cwd).await;
         Box::pin(download_patch_records_preflighted(
@@ -3764,7 +3738,6 @@ async fn run_get_vendored(
     match super::scan::boxed_vendor_step(super::scan::VendorStep {
         common: &args.common,
         records,
-        seed: blobs,
         client: api_client.clone(),
         use_public_proxy,
         report_empty: true,
@@ -5312,8 +5285,14 @@ mod tests {
 
     #[test]
     fn confirm_prompts_agent_mode() {
-        assert_eq!(format_confirm_prompt(false, 1), "Download and apply 1 patch?");
-        assert_eq!(format_confirm_prompt(false, 2), "Download and apply 2 patches?");
+        assert_eq!(
+            format_confirm_prompt(false, 1),
+            "Download and apply 1 patch?"
+        );
+        assert_eq!(
+            format_confirm_prompt(false, 2),
+            "Download and apply 2 patches?"
+        );
         assert_eq!(format_confirm_prompt(true, 1), "Download 1 patch?");
     }
 
@@ -5664,7 +5643,7 @@ mod tests {
         server_url: &str,
     ) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
         let api_client = test_client(server_url).await;
-        let (code, json, records, _blobs) =
+        let (code, json, records) =
             download_patch_records_with(selected, params, &api_client, HashMap::new()).await;
         (code, json, records)
     }
@@ -6697,19 +6676,12 @@ mod tests {
         let client = test_client(&server.uri()).await;
         let prefetched = HashMap::from([(patch.uuid.clone(), patch.clone())]);
 
-        let (code, json, records, blobs) =
+        let (code, json, records) =
             download_patch_records_with(&selected, &params, &client, prefetched).await;
 
         assert_eq!(code, 0, "json={json}");
         assert_eq!(json["downloaded"], 1, "json={json}");
-        // The blob seed carries every served `blobContent` by after-hash —
-        // decoded — and only those; the vendor stager starts from it.
-        assert_eq!(
-            blobs.get(&"1".repeat(64)).map(Vec::as_slice),
-            Some(&b"patched"[..]),
-            "the served blob is seeded under its after-hash"
-        );
-        assert_eq!(blobs.len(), 1, "a file with no blobContent seeds nothing");
+        assert!(!tmp.path().join(".socket/blobs").exists());
         assert_eq!(json["detached"], true, "json={json}");
         assert_eq!(json["patches"][0]["action"], "downloaded", "json={json}");
         assert!(
@@ -6929,7 +6901,7 @@ mod tests {
         .map(|(u, n)| mk_patch(u, &purl(n), "free", "2024-01-01"))
         .collect();
         let client = test_client(&server.uri()).await;
-        let (_code, json, records, _blobs) = download_patch_records_with(
+        let (_code, json, records) = download_patch_records_with(
             &selected,
             &detached_params(tmp.path()),
             &client,
@@ -6995,8 +6967,11 @@ mod tests {
         let installed = |name: &str, body: &[u8]| {
             let dist = site.path().join(format!("{name}-1.0.0.dist-info"));
             std::fs::create_dir_all(&dist).unwrap();
-            std::fs::write(dist.join("METADATA"), format!("Name: {name}\nVersion: 1.0.0\n"))
-                .unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Name: {name}\nVersion: 1.0.0\n"),
+            )
+            .unwrap();
             std::fs::write(site.path().join(format!("{name}.py")), body).unwrap();
             compute_git_sha256_from_bytes(body)
         };
@@ -7040,7 +7015,10 @@ mod tests {
         mount(uuid("bs"), "beta_sdist.py".into(), "0".repeat(64), 0).await;
         for n in ["gw", "gs"] {
             Mock::given(method("GET"))
-                .and(wm_path(format!("/v0/orgs/test-org/patches/view/{}", uuid(n))))
+                .and(wm_path(format!(
+                    "/v0/orgs/test-org/patches/view/{}",
+                    uuid(n)
+                )))
                 .respond_with(ResponseTemplate::new(500))
                 .expect(0)
                 .mount(&server)

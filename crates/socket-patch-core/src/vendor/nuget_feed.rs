@@ -1,49 +1,3 @@
-//! NuGet vendor backend: a committed flat-folder package feed plus
-//! `nuget.config` source wiring and (when present) `packages.lock.json`
-//! content-hash pinning pointing every restore of the patched package id at a
-//! rebuilt, patched `.nupkg`.
-//!
-//! Mechanism (verified against .NET SDK 8.0 in the docker capstone):
-//!
-//! * artifact — a single rebuilt `.nupkg` at the stable path
-//!   `.socket/vendor/nuget/<uuid>/<idLower>.<versionNorm>.nupkg`. The uuid dir
-//!   IS a NuGet *local folder feed* (NuGet enumerates its `*.nupkg` files and
-//!   reads each embedded `.nuspec` for id/version, so the filename casing is
-//!   cosmetic — the marker sibling `socket-patch.vendor.json` is ignored).
-//!   The `.nupkg` is rebuilt by extracting the cached pristine package,
-//!   force-applying the patch, and re-zipping deterministically (so a re-run
-//!   never churns the committed bytes). The embedded package signature
-//!   (`.signature.p7s`) is dropped: the bytes changed, so it is no longer the
-//!   signed original — an unsigned package is accepted under NuGet's default
-//!   `accept` validation mode, whereas a stale signature could be rejected.
-//!
-//! * `nuget.config` — the source `<add key="socket-patch-<uuid>"
-//!   value=".socket/vendor/nuget/<uuid>"/>` (relative paths resolve against
-//!   the config file's directory) plus a `packageSourceMapping` routing the
-//!   patched id to that source. `packageSourceMapping` is EXCLUSIVE: once ANY
-//!   mapping exists, every package must map to a source or restore hard-fails
-//!   NU1100. So when the pre-vendor config had NO mapping, we ALSO emit a
-//!   catch-all `<package pattern="*"/>` mapped to every pre-existing source
-//!   (this catch-all rule is load-bearing). A more specific id pattern beats
-//!   `*` by NuGet's longest-prefix match, so the patched id resolves from our
-//!   feed while everything else keeps its original source.
-//!
-//! * `packages.lock.json` (when present) — every framework entry for the id
-//!   whose `resolved` equals the vendored version gets its `contentHash`
-//!   rewritten to `base64(sha512(vendored nupkg bytes))`; `resolved` and the
-//!   rest are untouched. `dotnet restore --locked-mode` recomputes the nupkg's
-//!   hash and compares it to this pin (a tampered nupkg then fails NU1403).
-//!   An absent lockfile is tolerated with a `vendor_nuget_no_lockfile`
-//!   warning — the feed + mapping still force the patched id from our copy,
-//!   just without the content-hash pin.
-//!
-//! Edit order: artifact → nuget.config → packages.lock.json. Any failure after
-//! the artifact removes the uuid dir; a lock-write failure additionally unwinds
-//! the config to its recorded pre-vendor bytes, so the pair is never half-wired.
-//! (On the wired hot path the config is already correct and stays, so a lock
-//! re-pin failure there keeps the rebuilt artifact — deleting it would leave
-//! the wired config pointing at nothing.)
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -56,32 +10,18 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-// The two package-root paths the NuGet sidecar fixup reads while the apply
-// runs over the stage: it deletes the first and reports an advisory when a
-// file matching the second sits beside it. A local rebuild that keeps the
-// package's parts in memory materialises both, so the fixup sees the same
-// package root a full extraction would have given it. (Neither normally rides
-// INSIDE a `.nupkg` — they are install-dir bookkeeping — but a crafted package
-// can carry them, and the staging decision must not turn on that.)
-use crate::patch::sidecars::nuget::{
-    METADATA_FILE as SIDECAR_METADATA_PART,
-    SIGNATURE_MARKER_SUFFIX as SIDECAR_SIGNATURE_MARKER_SUFFIX,
-};
 use crate::utils::fs::{
-    atomic_write_artifact, atomic_write_bytes_preserving_mode, list_dir_entries,
-    read_regular_to_bytes, read_regular_to_string,
+    atomic_write_artifact, atomic_write_bytes_preserving_mode, read_regular_to_string,
 };
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, any_live_file_references, done, failed_result, prepare_memory_repack,
-    prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
-    write_zip_entries, zip_bytes_match_after_hashes, MemoryRepack, Stage,
+    already_patched_result, any_live_file_references, done, prune_empty_vendor_levels,
+    read_zip_artifact, refused, synthesized_result, zip_bytes_match_after_hashes,
 };
 use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
-use super::registry_fetch::extract_zip;
 use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -101,11 +41,6 @@ const PACKAGES_LOCK: &str = "packages.lock.json";
 const CONFIG_SOURCE_WIRING_KIND: &str = "nuget_config_source";
 const CONFIG_MAPPING_WIRING_KIND: &str = "nuget_config_mapping";
 const LOCK_WIRING_KIND: &str = "nuget_lock_entry";
-
-/// The embedded package signature part; dropped from the rebuilt nupkg so the
-/// patched (content-changed) package reads as unsigned rather than
-/// invalid-signed.
-const SIGNATURE_PART: &str = ".signature.p7s";
 
 /// The implicit default public NuGet source, seeded as the catch-all target
 /// when a from-scratch `<packageSourceMapping>` would otherwise have no
@@ -534,26 +469,23 @@ pub async fn vendor_nuget(
         // Dry runs fall through to the verify-only preview below.
     }
 
-    // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
-        let mut dry_warnings: Vec<VendorWarning> = Vec::new();
-        let mut result = super::force_apply_staged(
-            purl,
-            installed_dir,
-            record,
-            sources,
-            true,
-            force,
-            name,
-            version,
-            &mut dry_warnings,
-        )
-        .await;
-        result.package_path = nupkg_path.display().to_string();
-        return done(result, None, dry_warnings);
+        if let Err(outcome) =
+            super::service_fetch::preview_service(service, record, |bytes, dest| {
+                super::registry_fetch::extract_zip(bytes, dest, false)
+            })
+            .await
+        {
+            return *outcome;
+        }
+        return done(
+            super::common::preview_result(purl, &nupkg_path, &record.files),
+            None,
+            Vec::new(),
+        );
     }
 
-    // ── materialise the patched nupkg (service download / local rebuild) ──
+    // ── materialise the patched nupkg (service download) ──
     let mut warnings: Vec<VendorWarning> = Vec::new();
     let (nupkg_bytes, mut result) = match materialise_patched_nupkg(
         purl,
@@ -722,6 +654,7 @@ fn nuget_entry(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             // A `.nupkg` is a single verifiable file; record its plain sha256
             // for tooling (harvest re-derives per-entry git hashes from the
             // zip, so the vendored copy is self-describing without a network).
@@ -875,30 +808,19 @@ pub async fn revert_nuget_opts(
     outcome
 }
 
-// ── materialisation (service download / local rebuild) ─────────────────────────
+// ── materialisation (service download) ─────────────────────────
 
-/// Produce the patched `.nupkg` bytes at `nupkg_path` — service download first
-/// (Tier A: the served archive IS the patched nupkg, written verbatim), local
-/// rebuild otherwise (extract the cached pristine nupkg → force-apply → re-zip
-/// deterministically). Returns `(bytes, ApplyResult)`, or a terminal
-/// [`VendorOutcome`] to bubble. On a non-fatal rebuild failure the returned
-/// `ApplyResult.success` is false and the partial uuid dir is cleaned up —
-/// UNLESS `config_wired`: on the wired hot path nuget.config already routes
-/// the patched id exclusively at this dir, so removing it (the marker AND a
-/// previously servable committed nupkg) would leave the wired config pointing
-/// at nothing and brick every cold restore (the module-doc invariant stated
-/// for the lock re-pin failure).
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_nupkg(
     purl: &str,
-    installed_dir: &Path,
+    _installed_dir: &Path,
     uuid_dir: &Path,
     nupkg_path: &Path,
     name: &str,
-    version: &str,
+    _version: &str,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    force: bool,
+    _sources: &PatchSources<'_>,
+    _force: bool,
     service: Option<&VendorServiceConfig>,
     config_wired: bool,
     warnings: &mut Vec<VendorWarning>,
@@ -918,157 +840,7 @@ async fn materialise_patched_nupkg(
             ))
         }
         ServiceCopy::HardFail(outcome) => Err(outcome),
-        ServiceCopy::FallBack => {
-            local_rebuild(
-                purl,
-                installed_dir,
-                uuid_dir,
-                nupkg_path,
-                name,
-                version,
-                record,
-                sources,
-                force,
-                config_wired,
-                warnings,
-            )
-            .await
-        }
     }
-}
-
-/// Local rebuild: locate the cached pristine `.nupkg` in `installed_dir`, read
-/// it for a private stage — only the paths the apply pipeline and the sidecar
-/// fixup resolve are materialised there, see [`prepare_memory_repack`] —
-/// force-apply the patch, and re-zip deterministically. The `.signature.p7s`
-/// part is dropped (see the module doc). Returns `(bytes, ApplyResult)`; a
-/// failure surfaces as an un-successful `ApplyResult` (partial uuid dir cleaned
-/// up — unless `config_wired`, see [`materialise_patched_nupkg`]), or a refusal
-/// to bubble.
-#[allow(clippy::too_many_arguments)]
-async fn local_rebuild(
-    purl: &str,
-    installed_dir: &Path,
-    uuid_dir: &Path,
-    nupkg_path: &Path,
-    name: &str,
-    version: &str,
-    record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    force: bool,
-    config_wired: bool,
-    warnings: &mut Vec<VendorWarning>,
-) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
-    let Some(src_nupkg) = locate_cached_nupkg(installed_dir).await else {
-        return Err(Box::new(refused(
-            "vendor_nupkg_not_found",
-            format!(
-                "no cached .nupkg under {} to rebuild {name}@{version} from (a patched feed \
-                 needs the pristine package; restore it or use --vendor-source=service)",
-                installed_dir.display()
-            ),
-        )));
-    };
-    let bytes = match read_regular_to_bytes(&src_nupkg).await {
-        Ok(b) => b,
-        Err(e) => {
-            return Ok((
-                Vec::new(),
-                failed_result(
-                    purl,
-                    nupkg_path,
-                    format!("cannot read {}: {e}", src_nupkg.display()),
-                ),
-            ));
-        }
-    };
-    let stage = match Stage::new() {
-        Ok(dir) => dir,
-        Err(e) => {
-            return Ok((
-                Vec::new(),
-                failed_result(purl, nupkg_path, format!("cannot create stage dir: {e}")),
-            ));
-        }
-    };
-    // The nupkg carries content at the archive root (no strip). Both staging
-    // paths are traversal-guarded and refuse an escaping entry fail-closed
-    // with the same message: `prepare_memory_repack` keeps the parts in
-    // memory and materialises only what the apply pipeline resolves, while a
-    // package whose part names a filesystem could fold together or re-spell
-    // is extracted whole, the shape the in-memory repack is defined against.
-    // The sidecar fixup deletes `.nupkg.metadata` and looks beside it for a
-    // `*.nupkg.sha512` marker, so both have to be on disk for it to see
-    // exactly what a full extraction would have shown it.
-    let mut repack = match prepare_memory_repack(&bytes, &record.files, &[SIDECAR_METADATA_PART])
-        .map_err(|e| format!("cannot extract {}: {e}", src_nupkg.display()))
-    {
-        Ok(repack) => repack,
-        Err(e) => return Ok((Vec::new(), failed_result(purl, nupkg_path, e))),
-    };
-    let staged = match repack.as_mut() {
-        Some(repack) => {
-            let markers: Vec<String> = repack
-                .member_names()
-                .filter(|n| !n.contains('/') && n.ends_with(SIDECAR_SIGNATURE_MARKER_SUFFIX))
-                .map(str::to_string)
-                .collect();
-            for marker in &markers {
-                repack.also_stage(marker);
-            }
-            repack.stage_into(stage.path()).await
-        }
-        None => extract_zip(&bytes, stage.path(), /*strip_first=*/ false),
-    };
-    if let Err(e) = staged {
-        return Ok((
-            Vec::new(),
-            failed_result(
-                purl,
-                nupkg_path,
-                format!("cannot extract {}: {e}", src_nupkg.display()),
-            ),
-        ));
-    }
-    // The compressed package has been read out; the in-memory repack holds
-    // the parts it needs, so don't carry a second copy through the apply.
-    drop(bytes);
-
-    let result = super::force_apply_staged(
-        purl,
-        stage.path(),
-        record,
-        sources,
-        false,
-        force,
-        name,
-        version,
-        warnings,
-    )
-    .await;
-    if !result.success {
-        stage.dispose().await;
-        return Ok((Vec::new(), result));
-    }
-
-    let rebuilt = rebuild_nupkg_bytes(repack, stage.path()).await;
-    stage.dispose().await;
-    let nupkg_bytes = match rebuilt {
-        Ok(bytes) => bytes,
-        Err(e) => return Ok((Vec::new(), failed_result(purl, nupkg_path, e))),
-    };
-
-    if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &nupkg_bytes).await {
-        // atomic_write_artifact cleans up its own stage file, so an existing
-        // committed nupkg in the dir is intact; on the wired hot path it (and
-        // the marker) must stay — the config still routes restores here.
-        if !config_wired {
-            let _ = remove_tree(uuid_dir).await;
-            prune_empty_vendor_levels(uuid_dir).await;
-        }
-        return Ok((Vec::new(), failed_result(purl, nupkg_path, e)));
-    }
-    Ok((nupkg_bytes, result))
 }
 
 /// Deterministic re-zip of the patched stage (RECORD-free — a nupkg is a plain
@@ -1076,30 +848,6 @@ async fn local_rebuild(
 /// lexicographic for stable bytes across re-runs). The in-memory repack
 /// assembles the same entry list from the parts it never wrote out; a package
 /// that had to be extracted is walked from the stage on disk.
-async fn rebuild_nupkg_bytes(
-    repack: Option<MemoryRepack>,
-    stage: &Path,
-) -> Result<Vec<u8>, String> {
-    let rezip = match repack {
-        Some(repack) => {
-            let entries = repack
-                .into_entries(stage, Some(SIGNATURE_PART))
-                .await
-                .map_err(|e| format!("nupkg re-zip failed: {e}"))?;
-            tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await
-        }
-        None => {
-            let stage_path = stage.to_path_buf();
-            tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, Some(SIGNATURE_PART)))
-                .await
-        }
-    };
-    match rezip {
-        Ok(Ok(bytes)) => Ok(bytes),
-        Ok(Err(e)) => Err(format!("nupkg re-zip failed: {e}")),
-        Err(e) => Err(format!("nupkg re-zip task failed: {e}")),
-    }
-}
 
 /// Write `bytes` to `nupkg_path`, creating the uuid dir. Errors are strings.
 async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1115,20 +863,6 @@ async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result
 /// sha512 of the whole `.nupkg`.
 fn content_hash(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
-}
-
-/// Locate the single cached pristine `.nupkg` inside a crawler package dir
-/// (NuGet keeps `<idLower>.<verLower>.nupkg` alongside the extracted files in
-/// both the global cache and the legacy `packages/` layout).
-async fn locate_cached_nupkg(installed_dir: &Path) -> Option<PathBuf> {
-    for entry in list_dir_entries(installed_dir).await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // `.nupkg.metadata` / `.nupkg.sha512` are sidecars, not packages.
-        if name.to_ascii_lowercase().ends_with(".nupkg") {
-            return Some(entry.path());
-        }
-    }
-    None
 }
 
 // ── nuget.config editing ───────────────────────────────────────────────────────
@@ -2100,44 +1834,6 @@ mod tests {
         zw.finish().unwrap().into_inner()
     }
 
-    /// A nupkg carrying every spelling the in-memory repack and the
-    /// extract-to-disk rebuild could disagree on: a zero-length part, a
-    /// STORED part, an exec-bit part, a nested tree, a part large enough to
-    /// span several read buffers, the signature part the rebuild drops, and
-    /// the two package-root paths the sidecar fixup reads.
-    fn make_rich_nupkg(license: &[u8]) -> Vec<u8> {
-        use zip::CompressionMethod::{Deflated, Stored};
-        let big = vec![b'z'; 3 * 1024 * 1024];
-        let entries: &[(&str, &[u8], zip::CompressionMethod, u32)] = &[
-            ("[Content_Types].xml", b"<?xml version=\"1.0\"?><Types/>", Deflated, 0o644),
-            ("_rels/.rels", b"<?xml version=\"1.0\"?><Relationships/>", Deflated, 0o644),
-            (
-                "Newtonsoft.Json.nuspec",
-                b"<?xml version=\"1.0\"?><package><metadata><id>Newtonsoft.Json</id><version>13.0.3</version></metadata></package>",
-                Deflated,
-                0o644,
-            ),
-            (".signature.p7s", b"FAKE-SIGNATURE-BYTES", Deflated, 0o644),
-            (".nupkg.metadata", b"{\"contentHash\":\"stale\"}", Deflated, 0o644),
-            ("newtonsoft.json.13.0.3.nupkg.sha512", b"marker", Deflated, 0o644),
-            ("lib/net6.0/Newtonsoft.Json.dll", b"MZ-fake-assembly", Deflated, 0o644),
-            ("lib/net6.0/empty.xml", b"", Deflated, 0o644),
-            ("lib/net6.0/stored.bin", b"stored bytes", Stored, 0o644),
-            ("tools/run.sh", b"#!/bin/sh\nexit 0\n", Deflated, 0o755),
-            ("lib/net6.0/big.bin", &big, Deflated, 0o644),
-            ("LICENSE.md", license, Deflated, 0o644),
-        ];
-        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        for (name, bytes, method, mode) in entries {
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(*method)
-                .unix_permissions(*mode);
-            zw.start_file(*name, opts).unwrap();
-            zw.write_all(bytes).unwrap();
-        }
-        zw.finish().unwrap().into_inner()
-    }
-
     async fn fixture(
         with_lock: bool,
         with_config: Option<&str>,
@@ -2252,7 +1948,7 @@ mod tests {
         let root = dir.path();
         let server = wiremock::MockServer::start().await;
         mount_no_results(&server).await;
-        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
         let sources = PatchSources::blobs_only(&blobs);
         let cases = [
             (PURL, record.clone()),
@@ -2269,7 +1965,7 @@ mod tests {
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (installed, sources, cfg) = (&installed, &sources, &cfg);
             Box::pin(async move {
-                vendor_nuget(
+                crate::vendor::test_support::vendor_nuget(
                     &purl,
                     installed.as_path(),
                     root,
@@ -2285,9 +1981,9 @@ mod tests {
         };
         let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
         assert_eq!(planned, vec![UUID.to_string()]);
-        // Vendored now: the re-run is in sync and asks nothing.
+        // A failed download leaves the same package eligible on retry.
         let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
-        assert!(rerun.is_empty(), "{rerun:?}");
+        assert_eq!(rerun, planned);
     }
 
     async fn run_vendor(
@@ -2298,7 +1994,7 @@ mod tests {
         dry_run: bool,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_nuget(
+        crate::vendor::test_support::vendor_nuget(
             PURL,
             installed,
             root,
@@ -2319,67 +2015,6 @@ mod tests {
     /// two paths the sidecar fixup reads: `.nupkg.metadata` (deleted, so it
     /// must drop out of the rebuild) and the `*.nupkg.sha512` marker (which
     /// must still raise the signed-package advisory).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn in_memory_nupkg_rebuild_matches_the_on_disk_rebuild_byte_for_byte() {
-        async fn rebuild(on_disk: bool) -> (Vec<u8>, ApplyResult) {
-            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
-            let before = crate::vendor::common::in_memory_repacks();
-            let (dir, blobs, installed, record) = fixture(true, None).await;
-            tokio::fs::write(
-                installed.join("newtonsoft.json.13.0.3.nupkg"),
-                make_rich_nupkg(PRISTINE),
-            )
-            .await
-            .unwrap();
-            let (result, entry, _w) =
-                unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
-            assert!(result.success, "{:?}", result.error);
-            assert!(entry.is_some(), "a successful rebuild records an entry");
-            // Without this the comparison is vacuous: a fixture part name the
-            // gate later rejects would send BOTH runs to disk and the test
-            // would keep passing while asserting nothing.
-            assert_eq!(
-                crate::vendor::common::in_memory_repacks() > before,
-                !on_disk,
-                "this run took the wrong staging path (on_disk={on_disk})"
-            );
-            let bytes = tokio::fs::read(dir.path().join(copy_rel())).await.unwrap();
-            (bytes, result)
-        }
-
-        let (fast, fast_result) = rebuild(false).await;
-        let (oracle, oracle_result) = rebuild(true).await;
-        assert_eq!(
-            fast, oracle,
-            "the in-memory rebuild must be byte-identical to the extracted one"
-        );
-        assert_eq!(
-            format!("{:?}", fast_result.sidecar),
-            format!("{:?}", oracle_result.sidecar),
-            "the sidecar fixup must see the same package root either way"
-        );
-        assert_eq!(
-            read_nupkg_entry(&fast, "LICENSE.md").as_deref(),
-            Some(PATCHED)
-        );
-        assert!(
-            read_nupkg_entry(&fast, SIGNATURE_PART).is_none(),
-            "the signature part is dropped"
-        );
-        assert!(
-            read_nupkg_entry(&fast, ".nupkg.metadata").is_none(),
-            "the sidecar fixup deleted it, so it leaves the rebuild"
-        );
-        assert_eq!(
-            read_nupkg_entry(&fast, "lib/net6.0/empty.xml").as_deref(),
-            Some(&[][..])
-        );
-        assert_eq!(
-            read_nupkg_entry(&fast, "lib/net6.0/stored.bin").as_deref(),
-            Some(&b"stored bytes"[..])
-        );
-    }
 
     fn read_nupkg_entry(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).ok()?;
@@ -2753,7 +2388,7 @@ mod tests {
         // A traversal/injection in the coordinate name is refused too.
         let sources = PatchSources::blobs_only(&blobs);
         let (code, _d) = unwrap_refused(
-            vendor_nuget(
+            crate::vendor::test_support::vendor_nuget(
                 "pkg:nuget/../evil@1.0.0",
                 &installed,
                 root,
@@ -2767,20 +2402,6 @@ mod tests {
             .await,
         );
         assert_eq!(code, "unsafe_coordinates");
-    }
-
-    #[tokio::test]
-    async fn missing_cached_nupkg_refuses() {
-        let (dir, blobs, installed, record) = fixture(true, None).await;
-        let root = dir.path();
-        // Remove the cached .nupkg so the rebuild has no pristine source.
-        tokio::fs::remove_file(installed.join("newtonsoft.json.13.0.3.nupkg"))
-            .await
-            .unwrap();
-        let (code, _d) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "vendor_nupkg_not_found");
-        assert!(!root.join(".socket").exists());
-        assert!(!root.join("nuget.config").exists());
     }
 
     // ── comment-blind wiring ───────────────────────────────────────────────
@@ -3116,7 +2737,7 @@ mod tests {
         let outcome = run_vendor(root, &blobs, &installed, &record, false).await;
         let _ = tokio::fs::set_permissions(&uuid_dir, std::fs::Permissions::from_mode(0o755)).await;
 
-        let (r2, _e2, _w2) = unwrap_done(outcome);
+        let (r2, _e2, _w2) = crate::vendor::test_support::expect_failed(outcome);
         assert!(!r2.success, "the failed rebuild write must be reported");
         // nuget.config (from run 1) still routes the patched id EXCLUSIVELY at
         // this dir: deleting it on the wired path would leave the mapping
@@ -3153,6 +2774,7 @@ mod tests {
             base_purl: PURL.to_string(),
             uuid: UUID.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: copy_rel(),
                 sha256: String::new(),
                 size: None,
@@ -3511,41 +3133,6 @@ mod tests {
         );
     }
 
-    /// A FIFO planted as the cached `~/.nuget` nupkg passes the filename probe
-    /// but must fail the stage read fast instead of wedging the rebuild
-    /// forever.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fifo_cached_nupkg_fails_fast_in_local_rebuild() {
-        let (dir, blobs, installed, record) = fixture(true, None).await;
-        let root = dir.path();
-        let cached = installed.join("newtonsoft.json.13.0.3.nupkg");
-        tokio::fs::remove_file(&cached).await.unwrap();
-        mkfifo(&cached);
-
-        let outcome = expect_fast(
-            run_vendor(root, &blobs, &installed, &record, false),
-            &cached,
-            "the local rebuild must fail fast on a FIFO cached nupkg, not wedge",
-        )
-        .await;
-        let (result, entry, _w) = unwrap_done(outcome);
-        assert!(!result.success, "a FIFO nupkg cannot be staged");
-        assert!(entry.is_none());
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("cannot read")),
-            "failure names the unreadable nupkg: {:?}",
-            result.error
-        );
-        assert!(
-            !root.join("nuget.config").exists(),
-            "no config may be written after a failed rebuild"
-        );
-    }
-
     /// A FIFO planted as `nuget.config` must fail the revert fast and loudly —
     /// keeping the uuid dir for a retry — instead of wedging `--revert`
     /// forever.
@@ -3640,7 +3227,7 @@ mod tests {
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
         let (code, detail) = unwrap_refused(
-            vendor_nuget(
+            crate::vendor::test_support::vendor_nuget(
                 "pkg:npm/foo@1.0.0",
                 &installed,
                 root,
@@ -3671,7 +3258,12 @@ mod tests {
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_none(), "no ledger entry for an empty patch");
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
         assert!(!root.join(".socket").exists(), "no artifact written");
         assert!(!root.join("nuget.config").exists(), "no config written");
         assert_eq!(
@@ -3732,32 +3324,6 @@ mod tests {
         );
     }
 
-    // ── wired hot-path rebuild failure legs ────────────────────────────────
-
-    /// Wired + stale with the cached pristine nupkg ALSO gone: the rebuild leg
-    /// bubbles the terminal refusal, and the wired config stays untouched.
-    #[tokio::test]
-    async fn wired_rebuild_missing_cached_nupkg_refuses_keeps_config() {
-        let (dir, blobs, installed, record) = fixture(true, None).await;
-        let root = dir.path();
-        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert!(r1.success);
-        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
-        tokio::fs::remove_file(installed.join("newtonsoft.json.13.0.3.nupkg"))
-            .await
-            .unwrap();
-
-        let (code, _d) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "vendor_nupkg_not_found");
-        let cfg = tokio::fs::read_to_string(root.join("nuget.config"))
-            .await
-            .unwrap();
-        assert!(
-            cfg.contains(&source_key()),
-            "wired config untouched by the refusal: {cfg}"
-        );
-    }
-
     /// Wired + stale with the blob store emptied: the rebuild's apply failure
     /// comes back as an un-successful ApplyResult; the config and lock stay as
     /// run 1 left them.
@@ -3773,11 +3339,11 @@ mod tests {
 
         let empty = tempfile::tempdir().unwrap();
         let sources = PatchSources::blobs_only(empty.path());
-        let outcome = vendor_nuget(
+        let outcome = crate::vendor::test_support::vendor_nuget(
             PURL, &installed, root, &record, &sources, "t", false, false, None,
         )
         .await;
-        let (r2, e2, _w2) = unwrap_done(outcome);
+        let (r2, e2, _w2) = crate::vendor::test_support::expect_failed(outcome);
         assert!(!r2.success, "a failed apply must be reported");
         assert!(r2.error.is_some());
         assert!(e2.is_none());
@@ -4022,6 +3588,7 @@ mod tests {
             base_purl: PURL.to_string(),
             uuid: uuid.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: copy_rel(),
                 sha256: String::new(),
                 size: None,
@@ -4302,68 +3869,6 @@ mod tests {
         assert!(root.join(format!(".socket/vendor/nuget/{UUID}")).exists());
     }
 
-    // ── local-rebuild failure shapes ───────────────────────────────────────
-
-    /// A cached .nupkg that is not a zip cannot be staged: failed result, and
-    /// no project file (or artifact dir) is written after the failure.
-    #[tokio::test]
-    async fn corrupt_cached_nupkg_fails_before_any_wiring() {
-        let (dir, blobs, installed, record) = fixture(true, None).await;
-        let root = dir.path();
-        tokio::fs::write(
-            installed.join("newtonsoft.json.13.0.3.nupkg"),
-            b"not a zip archive",
-        )
-        .await
-        .unwrap();
-
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert!(!result.success);
-        assert!(entry.is_none());
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("cannot extract"),
-            "{:?}",
-            result.error
-        );
-        assert!(
-            !root.join("nuget.config").exists(),
-            "no config after a failed rebuild"
-        );
-        assert!(
-            !root.join(".socket").exists(),
-            "no artifact dir after a failed extract"
-        );
-    }
-
-    /// An empty blob store fails the force-apply: failed result, no wiring.
-    #[tokio::test]
-    async fn missing_blob_apply_failure_writes_no_config() {
-        let (dir, _blobs, installed, record) = fixture(true, None).await;
-        let root = dir.path();
-        let empty = tempfile::tempdir().unwrap();
-        let sources = PatchSources::blobs_only(empty.path());
-        let outcome = vendor_nuget(
-            PURL, &installed, root, &record, &sources, "t", false, false, None,
-        )
-        .await;
-        let (result, entry, _w) = unwrap_done(outcome);
-        assert!(
-            !result.success,
-            "a missing after-hash blob must fail the apply"
-        );
-        assert!(result.error.is_some());
-        assert!(entry.is_none());
-        assert!(
-            !root.join("nuget.config").exists(),
-            "no config after a failed apply"
-        );
-    }
-
     /// A regular FILE squatting the uuid dir path: create_dir_all fails, the
     /// vendor reports it, and no config is written. (The squatting file itself
     /// survives — remove_tree removes trees, not files: pinned as the current
@@ -4378,8 +3883,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) = crate::vendor::test_support::expect_failed(
+            run_vendor(root, &blobs, &installed, &record, false).await,
+        );
         assert!(!result.success);
         assert!(entry.is_none());
         assert!(
@@ -4455,7 +3961,7 @@ mod tests {
         };
 
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_nuget(
+        let outcome = crate::vendor::test_support::vendor_nuget(
             PURL,
             &installed,
             root,
@@ -4537,7 +4043,7 @@ mod tests {
         };
 
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_nuget(
+        let outcome = crate::vendor::test_support::vendor_nuget(
             PURL,
             &installed,
             root,
@@ -5028,7 +4534,7 @@ mod tests {
         };
 
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_nuget(
+        let outcome = crate::vendor::test_support::vendor_nuget(
             PURL,
             &installed,
             root,
@@ -5159,12 +4665,12 @@ mod tests {
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         let cfg = crate::vendor::test_support::service_cfg(
             &s.uri(),
-            crate::vendor::VendorSource::Auto,
+            crate::vendor::VendorSource::Service,
             false,
         );
         let sources = PatchSources::blobs_only(blobs);
         unwrap_done(
-            vendor_nuget(
+            crate::vendor::test_support::vendor_nuget(
                 PURL,
                 installed,
                 root,
@@ -5177,26 +4683,6 @@ mod tests {
             )
             .await,
         )
-    }
-
-    #[tokio::test]
-    async fn flip_local_then_service_is_noop() {
-        use crate::vendor::test_support as ts;
-        let (dir, blobs, installed, record) = fixture(true, None).await;
-        let root = dir.path();
-        let down = wiremock::MockServer::start().await;
-        ts::mount_503(&down).await;
-        let (r1, e1, _) = flip_run(root, &blobs, &installed, &record, &down).await;
-        assert!(r1.success && e1.is_some());
-        let local = tokio::fs::read(root.join(copy_rel())).await.unwrap();
-        let before = ts::tree_snapshot(root);
-        let (up, served) = flip_granted_nupkg().await;
-        assert_ne!(local, served);
-        let (r2, e2, _) = flip_run(root, &blobs, &installed, &record, &up).await;
-        assert!(r2.success);
-        assert!(e2.is_none());
-        assert_eq!(before, ts::tree_snapshot(root));
-        assert_eq!(ts::request_count(&up).await, 0);
     }
 
     #[tokio::test]
@@ -5280,7 +4766,7 @@ mod tests {
         cfg: Option<&VendorServiceConfig>,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_nuget(
+        crate::vendor::test_support::vendor_nuget(
             PURL,
             installed,
             root,

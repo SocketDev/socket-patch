@@ -38,6 +38,9 @@
 //! the fixture build (a failure instead under
 //! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -82,7 +85,7 @@ fn run_socket_env(
     env: &[(&str, &str)],
 ) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
@@ -93,6 +96,12 @@ fn run_socket_env(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        cwd,
+        args,
+        &[("CARGO_HOME", cargo_home.to_str().unwrap())],
+    );
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -287,6 +296,14 @@ async fn mount_hosted_mocks(
     orig: &[u8],
     patched: &[u8],
 ) -> String {
+    prebuilt_common::mount_download(
+        server,
+        purl,
+        UUID_V,
+        &format!("{DEP}-{version}.crate"),
+        crate_bytes,
+    )
+    .await;
     let cksum = sha256_hex(crate_bytes);
     // Production-shaped index path: manifest-less VEX reads the hosted
     // uuid out of the lock's `source` (with `--patch-server-url`).

@@ -126,6 +126,7 @@ async fn python_document_recovery_canonicalizes_the_purl_name() {
         base_purl: "pkg:pypi/PyYAML@6.0.1".into(),
         uuid: "11111111-1111-4111-8111-111111111111".into(),
         artifact: crate::vendor::state::VendorArtifact {
+            yarn_berry10c0: None,
             path: ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/PyYAML-6.0.1-py3-none-any.whl".into(),
             sha256: String::new(),
             size: None,

@@ -57,13 +57,9 @@
 //!
 //! * **gem** — full coverage (only non-`ruby` platform qualifiers are
 //!   refused): [`gem_bundler_vendored_install_proof`] runs the complete vendored
-//!   loop including the fresh-dir `bundle install` delivery proof. While
-//!   production's served `gem-stub-gemspec` remains invalid (D4: missing the
-//!   rubygems-required `summary`/`authors`), the leg passes via the CLI's
-//!   invalid-stub hardening — `--vendor-source auto` detects the defect and
-//!   falls back to the local build (`vendor_prebuilt_stub_invalid` warning);
-//!   once the server-side stub fix deploys and the artifacts rebuild, the
-//!   same leg exercises the service artifact directly.
+//!   loop including the fresh-dir `bundle install` delivery proof. The server
+//!   must provide a valid `gem-stub-gemspec` with summary and authors; invalid
+//!   stubs fail closed without constructing a local replacement.
 //! * **golang** — vendored mode *works* (directory `replace`), but production
 //!   publishes no free golang patches, so there is nothing to vendor.
 //!   [`golang_vendored_finds_no_free_patches`] asserts exactly that (zero
@@ -2148,20 +2144,8 @@ fn pypi_uv_lock_vendored_install_proof() {
 /// rubygems.org — a path source only pins the one gem), and the file the
 /// patch rewrites must carry the `Socket Community Patch` header.
 ///
-/// # How the leg passes while production's served stub is invalid (D4)
-///
-/// The `gem-stub-gemspec` artifact production currently serves omits the
-/// rubygems-required `summary`/`authors`, so writing it verbatim would make
-/// the frozen `bundle install` below exit 1 on every bundler major. The CLI's
-/// invalid-stub hardening is what this leg regression-tests live: under the
-/// default `--vendor-source auto` the scan detects the defective stub, warns
-/// (`vendor_prebuilt_stub_invalid`), and falls back to the LOCAL build
-/// (installed gem + locally derived stub), which installs green. That is also
-/// why the leg installs in bundler's deployment layout (`vendor/bundle`
-/// inside the project): the crawler only sees a project-local install, and
-/// the fallback needs the install's `specifications/` stub. Once the
-/// server-side stub fix (depscan) deploys and the artifacts rebuild, the same
-/// leg exercises the service artifact directly — no test change needed.
+/// The service must supply both the patched archive and a valid stub gemspec.
+/// A defective stub is a server failure; the CLI cannot build a replacement.
 #[test]
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
 fn gem_bundler_vendored_install_proof() {

@@ -37,6 +37,9 @@
 //! without a `contentHash` pin, and agent-mode (`apply`) patches, which
 //! have no lockfile wiring to discover.
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -362,6 +365,7 @@ fn write_vendor_ledger(
             base_purl: purl.to_string(),
             uuid: uuid.to_string(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: artifact_rel.to_string(),
                 sha256,
                 size: None,
@@ -1053,7 +1057,8 @@ impl Fx {
     /// Run the real binary with `args` (hermetic stores, no ambient token).
     fn run(&self, args: &[&str]) -> (Option<i32>, Value, String) {
         let mut cmd = cli(&self.store());
-        cmd.args(args).current_dir(&self.cwd);
+        let _fixture = prebuilt_common::prepare_command(&mut cmd, &self.cwd, args, &[]);
+        cmd.current_dir(&self.cwd);
         let out = cmd.output().expect("invoke socket-patch");
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         let env = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {

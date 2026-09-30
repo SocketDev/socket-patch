@@ -135,6 +135,15 @@ fn source_sha(table: &Table) -> Option<String> {
     {
         return Some(sha.to_string());
     }
+    if let Some(hash) = table
+        .get("sdist")
+        .and_then(Item::as_inline_table)
+        .and_then(|sdist| sdist.get("hash"))
+        .and_then(toml_edit::Value::as_str)
+        .and_then(|h| h.strip_prefix("sha256:"))
+    {
+        return Some(hash.to_string());
+    }
     table.get("wheels")?.as_array()?.iter().find_map(|wheel| {
         wheel
             .as_inline_table()?

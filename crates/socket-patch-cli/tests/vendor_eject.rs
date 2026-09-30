@@ -13,6 +13,9 @@
 //! hosted) all point at a wiremock; `SOCKET_VENDOR_SOURCE=build` keeps the
 //! vendoring service out of it.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -86,7 +89,7 @@ impl Project {
             .env("SOCKET_ORG_SLUG", ORG)
             .env("SOCKET_NPM_REGISTRY", &uri)
             .env("SOCKET_PATCH_SERVER_URL", &uri)
-            .env("SOCKET_VENDOR_SOURCE", "build");
+            .env("SOCKET_VENDOR_SOURCE", "service");
         let out = cmd.output().expect("spawn socket-patch");
         (
             out.status.code().unwrap_or(-1),
@@ -174,24 +177,26 @@ async fn mock_registry(p: &Project) {
 async fn mock_view(p: &Project) {
     let before = compute_git_sha256_from_bytes(ORIG_INDEX);
     let after = compute_git_sha256_from_bytes(PATCHED_INDEX);
+    let archive_view = json!({
+        "uuid": UUID,
+        "purl": PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before,
+                "afterHash": after,
+                "blobContent": base64::engine::general_purpose::STANDARD.encode(PATCHED_INDEX)
+            }
+        },
+        "vulnerabilities": {},
+        "description": "eject fixture",
+        "license": "MIT",
+        "tier": "free"
+    });
+    prebuilt_common::mount_view(&p.server, &archive_view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uuid": UUID,
-            "purl": PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before,
-                    "afterHash": after,
-                    "blobContent": base64::engine::general_purpose::STANDARD.encode(PATCHED_INDEX)
-                }
-            },
-            "vulnerabilities": {},
-            "description": "eject fixture",
-            "license": "MIT",
-            "tier": "free"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(&p.server)
         .await;
 }
@@ -225,7 +230,8 @@ async fn eject_vendors_hosted_pins_and_revert_returns_to_upstream() {
     // The eject restores upstream as its own planned step before vendoring,
     // so the per-purl takeover warning never fires.
     assert!(
-        !env.to_string().contains("vendor_takeover_reverted_redirect"),
+        !env.to_string()
+            .contains("vendor_takeover_reverted_redirect"),
         "{env:#}"
     );
     assert!(

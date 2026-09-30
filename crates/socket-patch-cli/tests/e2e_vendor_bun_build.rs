@@ -74,6 +74,9 @@
 //! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
 //! or no bun at all.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -280,8 +283,9 @@ fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
 /// should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).arg("--no-telemetry").current_dir(cwd);
+    cmd.arg("--no-telemetry").current_dir(cwd);
     cache_env::scrub_ambient_bun_env(&mut cmd);
+    let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -1301,27 +1305,29 @@ fn bun_vendor_tampered_tarball_digest_boundary() {
 /// to record the manifest and stage the patched content in memory (no
 /// `.socket/blobs` is ever written).
 async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8]) {
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": purl,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": git_sha256(before),
+                "afterHash": git_sha256(after),
+                "blobContent": b64(after),
+            }
+        },
+        "vulnerabilities": { GHSA: {
+            "cves": [CVE], "summary": "vendor bun capstone vuln",
+            "severity": "high", "description": "d"
+        }},
+        "description": "capstone marker patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": purl,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": git_sha256(before),
-                    "afterHash": git_sha256(after),
-                    "blobContent": b64(after),
-                }
-            },
-            "vulnerabilities": { GHSA: {
-                "cves": [CVE], "summary": "vendor bun capstone vuln",
-                "severity": "high", "description": "d"
-            }},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
 }
@@ -1367,7 +1373,7 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
             "--org",
             ORG,
             "--vendor-source",
-            "build",
+            "service",
         ],
     );
     assert_eq!(

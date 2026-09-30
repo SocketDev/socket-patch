@@ -3,6 +3,9 @@
 //! scanned through the real binary in hosted, agent and vendored mode
 //! against a mock patch API that serves a small catalog.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -974,7 +977,12 @@ async fn narrowing_after_vendoring_leaves_the_vendored_package_byte_identical() 
         "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free"
     }}});
     std::fs::write(web.join(".socket/manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
-    let (code, stdout, stderr) = run_cli(&web, &["vendor", "--json", "--offline", "--cwd", web.to_str().unwrap()], &[]);
+    let fixture = prebuilt_common::Server::project(&web);
+    let (code, stdout, stderr) = run_cli(
+        &web,
+        &["vendor", "--json", "--cwd", web.to_str().unwrap()],
+        &[("SOCKET_VENDOR_URL", &fixture.uri), ("SOCKET_PATCH_SERVER_URL", &fixture.uri)],
+    );
     assert_eq!(code, 0, "vendor fixture: {stdout}\n{stderr}");
     assert!(repo.lock("services/web").contains(".socket/vendor/"), "vendored lock");
     let snapshot = repo.snapshot();

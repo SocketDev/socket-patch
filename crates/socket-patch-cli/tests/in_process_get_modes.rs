@@ -9,6 +9,9 @@
 //!
 //! `#[serial]`: `get::run` mirrors env toggles into process-global env vars.
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::Path;
 
 use serial_test::serial;
@@ -57,9 +60,7 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
             api_url: Some(api_url),
             json: true,
             download_mode: "diff".to_string(),
-            // Local build so the vendored tests never reach the vendoring
-            // service (no grant/tarball mocks needed).
-            vendor_source: "build".to_string(),
+            vendor_source: "service".to_string(),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         identifier: identifier.to_string(),
@@ -75,34 +76,36 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
 
 /// `view/{uuid}` with REAL git-blob hashes and inline blob content, so the
 /// vendored flow's staging hash-gates pass and the agent flow can apply.
-async fn mock_view(server: &MockServer, uuid: &str, purl: &str) {
+async fn mock_view(server: &MockServer, uuid: &str, purl: &str) -> serde_json::Value {
+    let view = serde_json::json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": before_hash(),
+                "afterHash": after_hash(),
+                "blobContent": b64(AFTER_BYTES),
+            }
+        },
+        "vulnerabilities": {
+            GHSA: {
+                "cves": ["CVE-2024-1234"],
+                "summary": "get-modes fixture",
+                "severity": "high",
+                "description": "d"
+            }
+        },
+        "description": "get-modes fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": purl,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash(),
-                    "afterHash": after_hash(),
-                    "blobContent": b64(AFTER_BYTES),
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": ["CVE-2024-1234"],
-                    "summary": "get-modes fixture",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "get-modes fixture",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(server)
         .await;
+    view
 }
 
 /// `by-ghsa/{GHSA}`: the two-version fan-out — the installed 1.0.0 and the
@@ -374,7 +377,8 @@ async fn get_uuid_hosted_dry_run_writes_nothing() {
 #[serial]
 async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    prebuilt_common::mount_view(&server, &view, None).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
@@ -436,7 +440,8 @@ async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
 #[serial]
 async fn get_uuid_vendored_rerun_is_idempotent() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    prebuilt_common::mount_view(&server, &view, None).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
@@ -652,7 +657,10 @@ async fn mode_with_save_only_conflicts_exit_one_before_network() {
         args.mode = Some(mode);
         args.save_only = true;
         let code = socket_patch_cli::commands::get::run(args).await;
-        assert_eq!(code, 2, "--save-only + --mode {mode:?} must be rejected (usage, exit 2)");
+        assert_eq!(
+            code, 2,
+            "--save-only + --mode {mode:?} must be rejected (usage, exit 2)"
+        );
     }
     assert!(
         server
@@ -985,7 +993,8 @@ fn write_vlt_project(root: &Path, spec: &str) {
 #[serial]
 async fn get_uuid_vendored_vlt_vendors_refuses_and_agent_bypasses() {
     let server = MockServer::start().await;
-    mock_view(&server, UUID1, PURL1).await;
+    let view = mock_view(&server, UUID1, PURL1).await;
+    prebuilt_common::mount_view(&server, &view, None).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_vlt_project(tmp.path(), "1.0.0");

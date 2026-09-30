@@ -48,6 +48,7 @@
 pub mod path;
 pub mod state;
 
+#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) mod berry_zip;
 mod bun_binary;
 pub mod bun_lock;
@@ -81,6 +82,7 @@ pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod prestage;
 pub mod pypi;
+pub(crate) mod pypi_distribution;
 mod pypi_hatch;
 mod pypi_lock;
 pub mod pypi_pdm;
@@ -89,12 +91,15 @@ pub mod pypi_poetry;
 pub(crate) mod pypi_requirements;
 mod pypi_uv;
 mod pypi_wheel;
+pub mod redownload;
 pub mod registry_fetch;
 pub(crate) mod reuse;
 pub(crate) mod service_fetch;
 pub mod source;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+#[allow(dead_code, unused_imports)]
+pub mod test_support;
 mod toml_surgery;
 pub(crate) mod verify;
 pub mod vlt_lock;
@@ -107,7 +112,7 @@ mod yarn_layering_tests;
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
 #[cfg(test)]
 pub(crate) use pypi_lock::restore_document as restore_python_document;
-pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
+pub use source::PackageSource;
 // `vex::discover` validates lockfile-recorded npm names with the same rule the
 // npm backends apply to their own coordinates.
 pub(crate) use npm_common::is_safe_npm_name;
@@ -127,11 +132,8 @@ pub use yarn_berry_lock::yarn_berry_vendor_preflight;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
-    VerifyStatus,
-};
+use crate::manifest::schema::PatchRecord;
+use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path, ApplyResult};
 use crate::utils::fs::read_regular_to_string_sync;
 use crate::utils::purl::strip_purl_qualifiers;
 
@@ -204,73 +206,43 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
     ))
 }
 
-/// Where `vendor` acquires the installable patched artifact for a package.
-///
-/// * `Auto` (default) — try the patch.socket.dev vendoring service first and
-///   silently fall back to a local build on any non-fatal miss (offline,
-///   pending build, not found, network error). The downloaded bytes are always
-///   integrity-verified before use.
-/// * `Service` — require the vendoring service; fail closed on a miss. Useful
-///   for CI / exercising the service path exclusively.
-/// * `Build` — always build the artifact locally (never contacts the
-///   vendoring service).
+/// Vendoring acquires immutable artifacts from the patch service.
+/// `auto` remains a command-line compatibility alias for `service`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VendorSource {
     #[default]
-    Auto,
     Service,
-    Build,
 }
 
 impl VendorSource {
-    /// Short lowercase tag, suitable for JSON output and `--vendor-source`
-    /// flag values.
     pub fn as_tag(&self) -> &'static str {
-        match self {
-            VendorSource::Auto => "auto",
-            VendorSource::Service => "service",
-            VendorSource::Build => "build",
+        "service"
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "service" => Ok(Self::Service),
+            "build" => Err("local artifact construction was removed; vendoring downloads prebuilt artifacts from the patch service".into()),
+            other => Err(format!("unknown vendor source '{other}'. Expected service (or the compatibility alias auto).")),
         }
     }
 
-    /// Parse a `--vendor-source` / `SOCKET_VENDOR_SOURCE` token (case-insensitive,
-    /// surrounding whitespace trimmed).
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(VendorSource::Auto),
-            "service" => Ok(VendorSource::Service),
-            "build" => Ok(VendorSource::Build),
-            other => Err(format!(
-                "unknown vendor source '{other}'. Expected auto, service, or build."
-            )),
-        }
-    }
-
-    /// Whether this mode may contact the vendoring service at all.
     pub fn may_use_service(&self) -> bool {
-        matches!(self, VendorSource::Auto | VendorSource::Service)
+        true
     }
-
-    /// Whether a service miss must fail closed (no local-build fallback).
     pub fn requires_service(&self) -> bool {
-        matches!(self, VendorSource::Service)
+        true
     }
 }
 
-/// Everything the vendor backends need to (optionally) download a prebuilt
-/// patched archive from the patch.socket.dev vendoring service.
-///
-/// Built once per `vendor` run in the CLI and threaded as
-/// `Option<&VendorServiceConfig>` through the dispatch chain — `None` means
-/// "build-only".
 #[derive(Debug, Clone)]
 pub struct VendorServiceConfig {
     /// Override Maven config wiring; None preserves the recorded choice (auto for new projects).
     pub maven_config: Option<bool>,
-    /// The `auto` / `service` / `build` policy.
+    /// Server artifact acquisition policy.
     pub source: VendorSource,
     /// The run-level API client (reused from the CLI). `None` disables the
-    /// service path even under `auto`/`service` (treated as a miss / refusal).
+    /// service path (reported as a refusal).
     pub client: Option<crate::api::client::ApiClient>,
     /// True when the client targets the public proxy (tokenless) — drives
     /// `freeOnly` on the package-reference request.
@@ -341,84 +313,6 @@ impl VendorServiceConfig {
             ARCHIVE_PREFETCH_BYTES,
         ))
     }
-}
-
-/// One warning per staged file whose pre-patch content matched NEITHER
-/// `beforeHash` nor `afterHash` and was overwritten with the verified
-/// patched content (vendor staging always force-applies — the stage is a
-/// private copy, and every apply write path is hash-gated to exactly
-/// `afterHash`).
-///
-/// Detection rides the verify signature `apply_package_patch` leaves
-/// behind: a force-promoted file keeps `status: Ready` WITH
-/// `expected_hash: Some(..)` and a differing `current_hash`, whereas a
-/// cleanly-verified file carries `expected_hash: None` (see
-/// `verify_file_patch`).
-pub(crate) fn mismatch_overwrite_warnings(
-    result: &ApplyResult,
-    name: &str,
-    version: &str,
-) -> Vec<VendorWarning> {
-    let mut warnings: Vec<VendorWarning> = result
-        .files_verified
-        .iter()
-        .filter(|v| {
-            v.status == VerifyStatus::Ready
-                && v.expected_hash.is_some()
-                && v.current_hash != v.expected_hash
-        })
-        .map(|v| {
-            VendorWarning::new(
-                "vendor_content_mismatch_overwritten",
-                format!(
-                    "installed {name}@{version} does not match this patch's expected original \
-                     ({}); vendored the patched content anyway",
-                    v.file
-                ),
-            )
-        })
-        .collect();
-    // HashMap-driven verify order is randomized; keep warning order stable.
-    warnings.sort_by(|a, b| a.detail.cmp(&b.detail));
-    warnings
-}
-
-/// Patch-target files (non-empty `beforeHash`) absent from the staged
-/// copy — or present but not hashable (a directory, a non-regular file,
-/// an unreadable file). Vendor staging force-applies (see
-/// [`force_apply_staged`]), and force silently SKIPS every file verify
-/// reports as `NotFound` — both truly-missing files AND hash failures —
-/// which would pack an artifact without the fix. This pre-check restores
-/// the strict apply's fail-closed behavior for the non-`--force` path.
-/// Unsafe keys are skipped here: the apply pipeline itself rejects them
-/// fail-closed.
-pub(crate) async fn missing_existing_patch_files(
-    staged_dir: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-) -> Vec<String> {
-    let mut missing: Vec<String> = Vec::new();
-    for (file_name, info) in files {
-        if info.before_hash.is_empty() {
-            continue; // a new file is expected to not exist yet
-        }
-        let normalized = normalize_file_path(file_name);
-        if !is_safe_relative_subpath(normalized) {
-            continue;
-        }
-        let path = staged_dir.join(normalized);
-        let hashable = match tokio::fs::metadata(&path).await {
-            Err(_) => false,
-            // The is_file gate must come BEFORE the open probe: opening a
-            // non-regular file (FIFO) can block indefinitely.
-            Ok(m) if !m.is_file() => false,
-            Ok(_) => tokio::fs::File::open(&path).await.is_ok(),
-        };
-        if !hashable {
-            missing.push(file_name.clone());
-        }
-    }
-    missing.sort();
-    missing
 }
 
 /// Patched-content blobs harvested from the committed vendor artifacts:
@@ -713,65 +607,6 @@ fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String
     out
 }
 
-/// Run the hardened apply pipeline against a vendor stage/copy with the
-/// vendor auto-force policy:
-///
-/// * Missing patch-target files fail closed unless the caller's own
-///   `--force` asked for that skip tolerance.
-/// * The apply itself ALWAYS forces: the stage is a private copy (never
-///   the user's tree), and every apply write path is hash-gated to
-///   exactly `afterHash` (the archive and blob paths verify content
-///   BEFORE writing; the diff path self-disables on a base mismatch) —
-///   forcing can only produce the verified patched content or fail
-///   closed. This is what lets vendor succeed on a package already
-///   patched in place by `apply`, or on a patch whose `beforeHash` was
-///   built against different bytes than the installed artifact.
-/// * Every force-overwritten file (content matched NEITHER hash) emits a
-///   `vendor_content_mismatch_overwritten` warning — including on dry
-///   runs, so previews predict the real outcome.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn force_apply_staged(
-    purl: &str,
-    staged_dir: &Path,
-    record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    dry_run: bool,
-    force: bool,
-    name: &str,
-    version: &str,
-    warnings: &mut Vec<VendorWarning>,
-) -> ApplyResult {
-    if !force {
-        let missing = missing_existing_patch_files(staged_dir, &record.files).await;
-        if let Some(first) = missing.first() {
-            return common::failed_result(
-                purl,
-                Path::new(""),
-                format!("Cannot apply patch: {first} - File not found"),
-            );
-        }
-    }
-    // The stage becomes a content-verified artifact: its patched files are
-    // written without an fsync (see `crate::utils::durability`).
-    let result = crate::utils::durability::artifact_writes(apply_package_patch(
-        purl,
-        staged_dir,
-        &record.files,
-        sources,
-        Some(&record.uuid),
-        dry_run,
-        // The stage is private and every write path is afterHash-gated;
-        // Force additionally covers the caller's --force NotFound-skip
-        // (the missing-file pre-check above handles the default case).
-        crate::patch::apply::MismatchPolicy::Force,
-    ))
-    .await;
-    if result.success {
-        warnings.extend(mismatch_overwrite_warnings(&result, name, version));
-    }
-    result
-}
-
 /// The result of one backend `vendor_*` call.
 //
 // `large_enum_variant`: `Done` is much bigger than `Refused` because it carries
@@ -1002,240 +837,19 @@ pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<String> {
 }
 
 #[cfg(test)]
-mod policy_tests {
-    use super::*;
-    use crate::patch::apply::VerifyResult;
-
-    fn verify(status: VerifyStatus, expected: Option<&str>, current: Option<&str>) -> VerifyResult {
-        VerifyResult {
-            file: "package/index.js".to_string(),
-            status,
-            message: None,
-            current_hash: current.map(str::to_string),
-            expected_hash: expected.map(str::to_string),
-            target_hash: None,
-        }
-    }
-
-    fn result_with(files_verified: Vec<VerifyResult>) -> ApplyResult {
-        ApplyResult {
-            package_key: "pkg:npm/x@1.0.0".to_string(),
-            package_path: String::new(),
-            success: true,
-            files_verified,
-            files_patched: Vec::new(),
-            applied_via: HashMap::new(),
-            error: None,
-            sidecar: None,
-        }
-    }
-
-    /// Only the force-promoted signature (`Ready` + `expected_hash: Some` +
-    /// differing `current_hash`) flags an overwrite; clean verifies and
-    /// AlreadyPatched files never do.
-    #[test]
-    fn mismatch_overwrite_warnings_detects_promoted_ready() {
-        // Force-promoted mismatch: flagged.
-        let r = result_with(vec![verify(VerifyStatus::Ready, Some("aa"), Some("bb"))]);
-        let w = mismatch_overwrite_warnings(&r, "left-pad", "1.3.0");
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].code, "vendor_content_mismatch_overwritten");
-        assert!(w[0].detail.contains("left-pad@1.3.0"));
-        assert!(w[0].detail.contains("package/index.js"));
-
-        // Clean Ready (verify matched beforeHash): expected_hash is None.
-        let r = result_with(vec![verify(VerifyStatus::Ready, None, Some("aa"))]);
-        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
-
-        // AlreadyPatched (afterHash content): not a mismatch.
-        let r = result_with(vec![verify(
-            VerifyStatus::AlreadyPatched,
-            None,
-            Some("after"),
-        )]);
-        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
-
-        // NotFound (force-skipped): not an overwrite.
-        let r = result_with(vec![verify(VerifyStatus::NotFound, None, None)]);
-        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
-    }
-}
-
-#[cfg(test)]
 mod vendor_source_tests {
-    use super::*;
+    use super::VendorSource;
 
     #[test]
-    fn parse_accepts_known_tokens_case_insensitively() {
-        assert_eq!(VendorSource::parse("auto").unwrap(), VendorSource::Auto);
-        assert_eq!(VendorSource::parse("AUTO").unwrap(), VendorSource::Auto);
-        assert_eq!(
-            VendorSource::parse(" service ").unwrap(),
-            VendorSource::Service
-        );
-        assert_eq!(VendorSource::parse("Build").unwrap(), VendorSource::Build);
-    }
-
-    #[test]
-    fn parse_rejects_unknown_tokens() {
-        let err = VendorSource::parse("download").unwrap_err();
-        assert!(err.contains("download"), "echoes the bad token: {err}");
-        assert!(
-            err.contains("auto, service, or build"),
-            "lists the set: {err}"
-        );
-        assert!(VendorSource::parse("").is_err());
-    }
-
-    #[test]
-    fn as_tag_round_trips_through_parse() {
-        for s in [
-            VendorSource::Auto,
-            VendorSource::Service,
-            VendorSource::Build,
-        ] {
-            assert_eq!(VendorSource::parse(s.as_tag()).unwrap(), s);
+    fn service_is_the_only_artifact_source() {
+        for token in ["service", " SERVICE ", "auto", "AUTO"] {
+            assert_eq!(VendorSource::parse(token).unwrap(), VendorSource::Service);
         }
-    }
-
-    #[test]
-    fn default_is_auto_and_mode_predicates_hold() {
-        assert_eq!(VendorSource::default(), VendorSource::Auto);
-        assert!(VendorSource::Auto.may_use_service());
-        assert!(VendorSource::Service.may_use_service());
-        assert!(!VendorSource::Build.may_use_service());
-        assert!(VendorSource::Service.requires_service());
-        assert!(!VendorSource::Auto.requires_service());
-        assert!(!VendorSource::Build.requires_service());
-    }
-}
-
-#[cfg(test)]
-mod staging_tests {
-    use super::*;
-    use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-
-    fn one_file_record(file: &str) -> PatchRecord {
-        let mut files = HashMap::new();
-        files.insert(
-            file.to_string(),
-            PatchFileInfo {
-                before_hash: "aa".repeat(32),
-                after_hash: "bb".repeat(32),
-            },
-        );
-        PatchRecord {
-            uuid: "11111111-2222-4333-8444-555555555555".to_string(),
-            exported_at: "2024-01-01T00:00:00Z".to_string(),
-            files,
-            vulnerabilities: HashMap::new(),
-            description: String::new(),
-            license: "MIT".to_string(),
-            tier: "free".to_string(),
-        }
-    }
-
-    /// A patch target that EXISTS but cannot be hashed (here: a directory
-    /// where a file is expected) must fail the pre-check. The forced apply
-    /// downgrades verify's hash failure to a silent NotFound skip, which
-    /// would pack an artifact WITHOUT the fix while reporting success.
-    #[tokio::test]
-    async fn directory_at_patch_target_is_flagged_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("index.js")).unwrap();
-        let record = one_file_record("index.js");
-        let missing = missing_existing_patch_files(tmp.path(), &record.files).await;
-        assert_eq!(missing, vec!["index.js".to_string()]);
-    }
-
-    /// Same class via file permissions: an unreadable staged file hash-fails
-    /// in verify and would be force-skipped silently.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unreadable_patch_target_is_flagged_missing() {
-        use std::os::unix::fs::PermissionsExt as _;
-        if unsafe { libc::geteuid() } == 0 {
-            return; // root reads anything; the probe can't fail
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("index.js");
-        std::fs::write(&target, b"original").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let record = one_file_record("index.js");
-        let missing = missing_existing_patch_files(tmp.path(), &record.files).await;
-        assert_eq!(missing, vec!["index.js".to_string()]);
-    }
-
-    /// An unsafe record key (escaping or absolute) is SKIPPED by the
-    /// pre-check, never flagged missing: the apply pipeline itself rejects
-    /// unsafe keys fail-closed, and reporting them as "missing" would
-    /// misdiagnose a poisoned manifest as an incomplete stage.
-    #[tokio::test]
-    async fn unsafe_relative_key_is_not_flagged_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut record = one_file_record("../evil.js");
-        record.files.insert(
-            "/abs/evil.js".to_string(),
-            PatchFileInfo {
-                before_hash: "aa".repeat(32),
-                after_hash: "bb".repeat(32),
-            },
-        );
-        let missing = missing_existing_patch_files(tmp.path(), &record.files).await;
-        assert!(
-            missing.is_empty(),
-            "unsafe keys are the apply pipeline's fail-closed job, not the \
-             missing list's: {missing:?}"
-        );
-    }
-
-    /// A readable staged file (even with mismatched content) is NOT flagged —
-    /// that's the force-overwrite path, not the missing path.
-    #[tokio::test]
-    async fn readable_target_is_not_flagged() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("index.js"), b"whatever").unwrap();
-        let record = one_file_record("index.js");
-        assert!(missing_existing_patch_files(tmp.path(), &record.files)
-            .await
-            .is_empty());
-    }
-
-    /// End-to-end through the vendor staging entrypoint: without `--force`,
-    /// an unhashable target must fail the whole staged apply closed rather
-    /// than succeed with the file silently skipped.
-    #[tokio::test]
-    async fn force_apply_staged_fails_closed_on_unhashable_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let staged = tmp.path().join("stage");
-        std::fs::create_dir_all(staged.join("index.js")).unwrap();
-        let blobs = tmp.path().join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
-        let record = one_file_record("index.js");
-        let sources = PatchSources::blobs_only(&blobs);
-
-        let mut warnings = Vec::new();
-        let result = force_apply_staged(
-            "pkg:npm/x@1.0.0",
-            &staged,
-            &record,
-            &sources,
-            false,
-            false,
-            "x",
-            "1.0.0",
-            &mut warnings,
-        )
-        .await;
-        assert!(
-            !result.success,
-            "an unhashable patch target must fail the staged apply closed, got {result:?}"
-        );
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("index.js"),
-            "error names the file: {:?}",
-            result.error
-        );
+        assert!(VendorSource::parse("build")
+            .unwrap_err()
+            .contains("removed"));
+        assert!(VendorSource::parse("download").is_err());
+        assert_eq!(VendorSource::default().as_tag(), "service");
     }
 }
 

@@ -357,6 +357,7 @@ async fn mount_patch_api(mock: &MockServer) {
 }
 
 async fn mount_view(mock: &MockServer, uuid: &str, purl: &str) {
+    crate::prebuilt_common::mount_view(mock, &view_body(uuid, purl), None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(view_body(uuid, purl)))
@@ -397,7 +398,7 @@ fn with_api<'a>(argv: &[&'a str], uri: &'a str) -> Vec<&'a str> {
 }
 
 fn scan_vendored(root: &Path, uri: &str, extra: &[&str]) -> (i32, String, String) {
-    let mut argv = vec!["scan", "--mode", "vendored", "--vendor-source", "build"];
+    let mut argv = vec!["scan", "--mode", "vendored", "--vendor-source", "service"];
     argv.extend_from_slice(extra);
     run(root, &with_api(&argv, uri))
 }
@@ -409,7 +410,7 @@ fn get_vendored(root: &Path, uri: &str, ident: &str, extra: &[&str]) -> (i32, St
         "--mode",
         "vendored",
         "--vendor-source",
-        "build",
+        "service",
     ];
     argv.extend_from_slice(extra);
     run(root, &with_api(&argv, uri))
@@ -775,7 +776,7 @@ async fn silent_refusals_stay_visible_on_stderr_with_empty_stdout() {
         let tmp = tempfile::tempdir().unwrap();
         write_bun_project(tmp.path(), LockShape::V1Workspace);
         let mut argv = argv;
-        argv.extend_from_slice(&["--vendor-source", "build"]);
+        argv.extend_from_slice(&["--vendor-source", "service"]);
         let (exit, stdout, stderr) = run(tmp.path(), &with_api(&argv, &mock.uri()));
         assert_eq!(exit, 1, "{label}: stdout={stdout}\nstderr={stderr}");
         assert!(
@@ -1510,10 +1511,11 @@ async fn repair_rebuilds_a_deleted_artifact_through_a_digestless_lock() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
-    let (_, wired, _) = vendor_then_drop_digest(tmp.path(), &mock.uri());
+    let (_, _, _) = vendor_then_drop_digest(tmp.path(), &mock.uri());
     let tgz = tmp
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
+    let lock_before = lock_bytes(tmp.path());
     std::fs::remove_file(&tgz).unwrap();
 
     // `scan --mode vendored` keeps no local blob in this harness, so the
@@ -1533,9 +1535,9 @@ async fn repair_rebuilds_a_deleted_artifact_through_a_digestless_lock() {
     );
     assert!(tgz.is_file(), "the artifact must be rebuilt");
     assert_eq!(
-        String::from_utf8(lock_bytes(tmp.path())).unwrap(),
-        wired,
-        "the rebuild re-pins the digest into the healed 3-tuple"
+        lock_bytes(tmp.path()),
+        lock_before,
+        "redownload preserves the existing lockfile exactly"
     );
 }
 
@@ -1673,7 +1675,7 @@ async fn fifo_bun_lock_is_refused_without_blocking() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--json",
         ],
         &uri,
@@ -1696,7 +1698,7 @@ async fn fifo_bun_lock_is_refused_without_blocking() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--json",
         ],
         &uri,

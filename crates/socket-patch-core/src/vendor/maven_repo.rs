@@ -1,60 +1,3 @@
-//! Maven vendor backend: a committed maven2-layout repository plus a surgical
-//! `<repository>` insert into the project's `pom.xml` pointing every resolve of
-//! the patched GAV at a rebuilt, patched `.jar` served from the tree.
-//!
-//! Mechanism (verified against Apache Maven inside the docker capstone):
-//!
-//! * artifact — the uuid dir IS a maven2 *repository root*. Maven's standard
-//!   layout is `<groupId-as-path>/<artifactId>/<version>/<a>-<v>.jar` (+ the
-//!   companion `<a>-<v>.pom`), so laying the files at
-//!   `.socket/vendor/maven/<uuid>/<g>/<a>/<v>/…` makes the uuid dir a fully
-//!   valid `file://` repository with no index needed. The `.jar` is rebuilt by
-//!   extracting the cached `~/.m2` jar, force-applying the patch, and re-zipping
-//!   deterministically (so a re-run never churns the committed bytes) — the
-//!   twin of the NuGet feed's `.nupkg` rebuild.
-//!
-//! * pom — the vendored `<a>-<v>.pom` MUST be the REAL upstream pom (copied
-//!   verbatim from `~/.m2`, or downloaded from the maven2 registry). Maven reads
-//!   it to discover the artifact's TRANSITIVE dependencies; a hand-authored
-//!   minimal pom would silently drop them and break the consumer's build. When
-//!   neither source can supply it we refuse (`vendor_maven_pom_unavailable`)
-//!   rather than fabricate one.
-//!
-//! * checksums — each committed file carries a `<file>.sha1` sidecar (the hex
-//!   sha1 of its bytes). Our injected `<repository>` sets
-//!   `checksumPolicy=fail`, so Maven fetches the sidecar and hard-fails the
-//!   resolve if the jar/pom bytes don't match it (a tampered jar → checksum
-//!   failure). sha1 is the checksum Maven validates first; an `.md5` twin is
-//!   not written (it would need a new workspace dependency and Maven treats
-//!   sha1 as authoritative — the capstone proves `checksumPolicy=fail` is
-//!   fully enforced by the sha1 sidecar alone).
-//!
-//! * `pom.xml` — a single `<repository>` is inserted:
-//!   `id=socket-patch-vendor-<uuid>`,
-//!   `url=file://${project.basedir}/.socket/vendor/maven/<uuid>`,
-//!   `checksumPolicy=fail`, `<snapshots><enabled>false`. `${project.basedir}`
-//!   interpolates to the pom's own dir, so the file:// url resolves relative to
-//!   the committed tree on any checkout.
-//!
-//! Refusals (fail-closed, before any write):
-//! * a root pom declaring `<modules>` (an aggregator) —
-//!   `vendor_maven_multimodule_unsupported`: `${project.basedir}` would
-//!   interpolate to each SUBMODULE's dir, not the root, so the file:// url would
-//!   point at the wrong place per module.
-//! * a gradle-only project (a `build.gradle*` but no `pom.xml`) —
-//!   `vendor_gradle_unsupported`: there is no `<repositories>` block to wire and
-//!   Gradle ignores it.
-//!
-//! Always-on advisory: `vendor_maven_local_cache_shadow`. Maven checks the LOCAL
-//! repository (`~/.m2`) BEFORE any configured `<repository>`, so a warm
-//! `~/.m2` copy of the same GAV silently wins over our patched file:// artifact.
-//! The warning carries the `mvn dependency:purge-local-repository` one-liner to
-//! clear it.
-//!
-//! Edit order: artifact (jar + pom + sidecars) → `pom.xml`. Any failure after
-//! the artifact removes the uuid dir; the `pom.xml` edit runs last so a failed
-//! artifact never leaves a dangling `<repository>`.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -76,12 +19,11 @@ use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, any_live_file_references, done, failed_result, prepare_memory_repack,
-    prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
-    write_zip_entries, zip_bytes_match_after_hashes, MemoryRepack, Stage,
+    already_patched_result, any_live_file_references, done, failed_result,
+    prune_empty_vendor_levels, read_zip_artifact, refused, synthesized_result,
+    zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
-use super::registry_fetch::extract_zip;
 use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -476,22 +418,20 @@ pub async fn vendor_maven(
         // Dry runs fall through to the verify-only preview below.
     }
 
-    // ── dry run: verify-only against the extracted local jar, no writes ───
     if dry_run {
-        let mut dry_warnings: Vec<VendorWarning> = vec![shadow_warning];
-        let result = dry_run_verify(
-            purl,
-            installed_dir,
-            &jar_path,
-            artifact_id,
-            version,
-            record,
-            sources,
-            force,
-            &mut dry_warnings,
-        )
-        .await;
-        return done(result, None, dry_warnings);
+        if let Err(outcome) =
+            super::service_fetch::preview_service(service, record, |bytes, dest| {
+                super::registry_fetch::extract_zip(bytes, dest, false)
+            })
+            .await
+        {
+            return *outcome;
+        }
+        return done(
+            super::common::preview_result(purl, &jar_path, &record.files),
+            None,
+            vec![shadow_warning],
+        );
     }
 
     // ── materialise the patched jar + real pom + sidecars ─────────────────
@@ -588,6 +528,7 @@ fn maven_entry(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             // A `.jar` is a single verifiable file; record its plain sha256 for
             // tooling (harvest re-derives per-entry git hashes from the zip, so
             // the vendored copy is self-describing without a network).
@@ -798,9 +739,8 @@ async fn jvm_committed_patch(
 
 /// Vendor into a multi-module reactor or a Gradle build through the
 /// [`super::jvm`] backend. The jar and pom come from the committed
-/// tree when it already holds this patch, else from the same service /
-/// local-rebuild rungs as the legacy path; nothing is written for a
-/// refused plan.
+/// tree when it already holds this patch, otherwise from the service and
+/// authenticated upstream metadata; nothing is written for a refused plan.
 #[allow(clippy::too_many_arguments)]
 async fn vendor_maven_jvm(
     shape: super::jvm::Shape,
@@ -808,9 +748,9 @@ async fn vendor_maven_jvm(
     installed_dir: &Path,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
@@ -887,55 +827,6 @@ async fn vendor_maven_jvm(
                         already_patched_result(purl, &display_path, &record.files),
                     ),
                     ServiceCopy::HardFail(outcome) => return *outcome,
-                    ServiceCopy::FallBack => {
-                        match local_rebuild_jar(
-                            purl,
-                            installed_dir,
-                            &display_path,
-                            &artifact_id,
-                            &version,
-                            record,
-                            sources,
-                            force,
-                            &mut warnings,
-                        )
-                        .await
-                        {
-                            Ok((bytes, result)) if result.success => {
-                                let upstream = match read_regular_to_bytes(
-                                    &installed_dir.join(format!("{artifact_id}-{version}.jar")),
-                                )
-                                .await
-                                {
-                                    Ok(bytes) => bytes,
-                                    Err(e) => {
-                                        return refused(
-                                            "vendor_jvm_upstream_unavailable",
-                                            e.to_string(),
-                                        )
-                                    }
-                                };
-                                if let Err(e) = verify_jvm_upstream(
-                                    &upstream,
-                                    &group_id,
-                                    &artifact_id,
-                                    &version,
-                                    "jar",
-                                    service,
-                                )
-                                .await
-                                {
-                                    return refused("vendor_prebuilt_integrity_mismatch", e);
-                                }
-                                match super::jvm::archive::canonical_jar(&upstream, &bytes) {
-                                    Ok(bytes) => (bytes, result),
-                                    Err(e) => return refused("vendor_jvm_upstream_unavailable", e),
-                                }
-                            }
-                            Ok(pair) => pair,
-                            Err(outcome) => return jvm_refusal(*outcome),
-                        }
-                    }
                 };
             if !result.success {
                 return done(result, None, warnings);
@@ -1173,7 +1064,11 @@ async fn vendor_maven_jvm(
         );
     }
     if dry_run {
-        return done(result, None, warnings);
+        return done(
+            super::common::preview_result(purl, &jar_path, &record.files),
+            None,
+            warnings,
+        );
     }
     let mut wiring = match super::jvm::apply::write_plan(project_root, &plan).await {
         Ok(records) => records,
@@ -1204,7 +1099,7 @@ fn verify_unpatched_jar_members(
     let mut original = super::verify::read_zip_bytes_to_map(upstream)?;
     let mut committed = super::verify::read_zip_bytes_to_map(patched)?;
     let retain = |name: &String, _: &mut Vec<u8>| {
-        !record.files.contains_key(name) && !super::jvm::archive::is_signature(name)
+        !record.files.contains_key(name) && !super::jvm::is_signature(name)
     };
     original.retain(retain);
     committed.retain(retain);
@@ -1252,7 +1147,7 @@ async fn verify_jvm_upstream(
     Ok(())
 }
 
-async fn acquire_jvm_metadata(
+pub(super) async fn acquire_jvm_metadata(
     dir: &Path,
     g: &str,
     a: &str,
@@ -1390,27 +1285,11 @@ async fn collect_metadata_artifacts(
     Ok(())
 }
 
-/// A legacy jar refusal in the JVM backend's codes.
-fn jvm_refusal(outcome: VendorOutcome) -> VendorOutcome {
-    match outcome {
-        VendorOutcome::Refused {
-            code: "vendor_maven_jar_not_found",
-            detail,
-        } => refused(
-            "vendor_jvm_upstream_unavailable",
-            format!("reason: no_base_jar: {detail}"),
-        ),
-        other => other,
-    }
-}
-
-// ── materialisation (service download / local rebuild) ──────────────────────────
+// ── materialisation (service download) ──────────────────────────
 
 /// Produce the patched jar bytes + the real upstream pom, then write both (with
 /// their `.sha1` sidecars) into the maven2 leaf dir. Returns `(jar_bytes,
-/// ApplyResult)`, or a terminal [`VendorOutcome`] to bubble. On a non-fatal
-/// rebuild failure the returned `ApplyResult.success` is false and the partial
-/// uuid dir is cleaned up.
+/// ApplyResult)`, or a terminal [`VendorOutcome`] to bubble.
 #[allow(clippy::too_many_arguments)]
 async fn materialise_and_write(
     purl: &str,
@@ -1425,44 +1304,18 @@ async fn materialise_and_write(
     version: &str,
     group_path: &str,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    force: bool,
+    _sources: &PatchSources<'_>,
+    _force: bool,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
-    // The patched jar first (service Tier A, else local rebuild). A non-fatal
-    // failure returns an un-successful ApplyResult with nothing written.
     let (jar_bytes, result) =
         match service_archive_copy(service, record, artifact_id, ".jar", warnings).await {
             ServiceCopy::Used(bytes) => {
                 (bytes, already_patched_result(purl, jar_path, &record.files))
             }
             ServiceCopy::HardFail(outcome) => return Err(outcome),
-            ServiceCopy::FallBack => {
-                match local_rebuild_jar(
-                    purl,
-                    installed_dir,
-                    jar_path,
-                    artifact_id,
-                    version,
-                    record,
-                    sources,
-                    force,
-                    warnings,
-                )
-                .await
-                {
-                    Ok(pair) => pair,
-                    Err(outcome) => return Err(outcome),
-                }
-            }
         };
-    if !result.success {
-        // Local rebuild reported a failure; nothing on disk to clean up (the
-        // jar is rebuilt in memory and only written below on success).
-        return Ok((jar_bytes, result));
-    }
-
     // The REAL upstream pom (transitive-deps correctness). A miss is terminal:
     // refuse rather than fabricate a minimal pom.
     let pom_bytes = match acquire_upstream_pom(
@@ -1490,93 +1343,11 @@ async fn materialise_and_write(
     Ok((jar_bytes, result))
 }
 
-/// Local rebuild: locate the cached pristine `<a>-<v>.jar` in `installed_dir`,
-/// read it for a private stage — only the paths the apply pipeline resolves
-/// are materialised there, see [`stage_local_jar`] — force-apply the patch,
-/// and re-zip deterministically. Returns `(bytes, ApplyResult)`; a failure
-/// surfaces as an un-successful `ApplyResult`, or a refusal to bubble.
-#[allow(clippy::too_many_arguments)]
-async fn local_rebuild_jar(
-    purl: &str,
-    installed_dir: &Path,
-    jar_path: &Path,
-    artifact_id: &str,
-    version: &str,
-    record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    force: bool,
-    warnings: &mut Vec<VendorWarning>,
-) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
-    let src_jar = installed_dir.join(format!("{artifact_id}-{version}.jar"));
-    if tokio::fs::metadata(&src_jar).await.is_err() {
-        return Err(Box::new(refused(
-            "vendor_maven_jar_not_found",
-            format!(
-                "no cached {} under {} to rebuild the patched artifact from (a vendored feed \
-                 needs the pristine jar; re-resolve it or use --vendor-source=service)",
-                src_jar
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                installed_dir.display()
-            ),
-        )));
-    }
-    let JarStage { stage, repack } = match stage_local_jar(&src_jar, &record.files).await {
-        Ok(staged) => staged,
-        Err(e) => return Ok((Vec::new(), failed_result(purl, jar_path, e))),
-    };
-
-    let result = super::force_apply_staged(
-        purl,
-        stage.path(),
-        record,
-        sources,
-        /*dry_run=*/ false,
-        force,
-        artifact_id,
-        version,
-        warnings,
-    )
-    .await;
-    if !result.success {
-        stage.dispose().await;
-        return Ok((Vec::new(), result));
-    }
-
-    let rebuilt = rebuild_jar_bytes(repack, stage.path()).await;
-    stage.dispose().await;
-    match rebuilt {
-        Ok(jar_bytes) => Ok((jar_bytes, result)),
-        Err(e) => Ok((Vec::new(), failed_result(purl, jar_path, e))),
-    }
-}
-
 /// Deterministic re-zip of the patched stage (a jar is a plain zip; a
 /// dependency resolve reads the central directory, so lexicographic entry
 /// order + fixed timestamps yield stable bytes across re-runs). The in-memory
 /// repack assembles the same entry list from the members it never wrote out;
 /// an archive that had to be extracted is walked on disk.
-async fn rebuild_jar_bytes(repack: Option<MemoryRepack>, stage: &Path) -> Result<Vec<u8>, String> {
-    let rezip = match repack {
-        Some(repack) => {
-            let entries = repack
-                .into_entries(stage, None)
-                .await
-                .map_err(|e| format!("jar re-zip failed: {e}"))?;
-            tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await
-        }
-        None => {
-            let stage_path = stage.to_path_buf();
-            tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, None)).await
-        }
-    };
-    match rezip {
-        Ok(Ok(bytes)) => Ok(bytes),
-        Ok(Err(e)) => Err(format!("jar re-zip failed: {e}")),
-        Err(e) => Err(format!("jar re-zip task failed: {e}")),
-    }
-}
 
 /// Acquire the REAL upstream pom bytes: the cached `~/.m2` copy first (the
 /// common case — the package was resolved locally), then a maven2 registry
@@ -1657,91 +1428,9 @@ async fn fetch_registry_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("{url}: {e}"))
 }
 
-/// Dry-run verify-only: extract the local jar to a private stage and run the
-/// apply pipeline in preview mode. A missing local jar surfaces as a failed
-/// result (the preview cannot predict a rebuild it cannot stage).
-#[allow(clippy::too_many_arguments)]
-async fn dry_run_verify(
-    purl: &str,
-    installed_dir: &Path,
-    jar_path: &Path,
-    artifact_id: &str,
-    version: &str,
-    record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    force: bool,
-    warnings: &mut Vec<VendorWarning>,
-) -> ApplyResult {
-    let src_jar = installed_dir.join(format!("{artifact_id}-{version}.jar"));
-    if tokio::fs::metadata(&src_jar).await.is_err() {
-        return failed_result(
-            purl,
-            jar_path,
-            format!(
-                "no cached {}-{}.jar under {} to preview the vendored artifact",
-                artifact_id,
-                version,
-                installed_dir.display()
-            ),
-        );
-    }
-    let JarStage { stage, .. } = match stage_local_jar(&src_jar, &record.files).await {
-        Ok(staged) => staged,
-        Err(e) => return failed_result(purl, jar_path, e),
-    };
-    let mut result = super::force_apply_staged(
-        purl,
-        stage.path(),
-        record,
-        sources,
-        /*dry_run=*/ true,
-        force,
-        artifact_id,
-        version,
-        warnings,
-    )
-    .await;
-    stage.dispose().await;
-    result.package_path = jar_path.display().to_string();
-    result
-}
-
-// ── artifact helpers ─────────────────────────────────────────────────────────────
-
-/// The stage a local jar rebuild (or its dry-run preview) applies into: the
-/// live [`Stage`] the caller holds for its lifetime, plus the in-memory
-/// members when the repack could stay off disk.
-struct JarStage {
-    stage: Stage,
-    repack: Option<MemoryRepack>,
-}
-
-/// Read a jar (a plain zip; content at the archive root — no strip) for a
-/// local rebuild. `prepare_memory_repack` keeps the members in memory and
-/// materialises only the paths the apply pipeline resolves; a jar whose entry
-/// names a filesystem could fold together or re-spell is extracted whole
-/// instead, the shape this one is defined against. Both are traversal-guarded
-/// and refuse an escaping entry fail-closed, with the same message.
-async fn stage_local_jar(
-    src_jar: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-) -> Result<JarStage, String> {
-    let bytes = read_regular_to_bytes(src_jar)
-        .await
-        .map_err(|e| format!("cannot read {}: {e}", src_jar.display()))?;
-    let stage = Stage::new().map_err(|e| format!("cannot create stage dir: {e}"))?;
-    let unreadable = |e| format!("cannot extract {}: {e}", src_jar.display());
-    let repack = prepare_memory_repack(&bytes, files, &[]).map_err(unreadable)?;
-    match &repack {
-        Some(repack) => repack.stage_into(stage.path()).await.map_err(unreadable)?,
-        None => extract_zip(&bytes, stage.path(), /*strip_first=*/ false).map_err(unreadable)?,
-    }
-    Ok(JarStage { stage, repack })
-}
-
 /// Write the jar + pom + their `.sha1` sidecars into the maven2 leaf dir,
 /// creating it. Errors are strings.
-async fn write_maven_artifact(
+pub(super) async fn write_maven_artifact(
     leaf_dir: &Path,
     jar_leaf: &str,
     jar_bytes: &[u8],
@@ -2213,44 +1902,6 @@ mod tests {
         zw.finish().unwrap().into_inner()
     }
 
-    /// A jar carrying every spelling the in-memory repack and the
-    /// extract-to-disk rebuild could disagree on: a zero-length member, a
-    /// STORED (uncompressed) member, an exec-bit member, a nested tree, a
-    /// member large enough to span several read buffers, and the patch
-    /// target.
-    fn make_rich_jar(notice: &[u8]) -> Vec<u8> {
-        use zip::CompressionMethod::{Deflated, Stored};
-        let big = vec![b'z'; 3 * 1024 * 1024];
-        let entries: &[(&str, &[u8], zip::CompressionMethod, u32)] = &[
-            (
-                "META-INF/MANIFEST.MF",
-                b"Manifest-Version: 1.0\n",
-                Deflated,
-                0o644,
-            ),
-            (JAR_FILE, notice, Deflated, 0o644),
-            ("META-INF/empty", b"", Deflated, 0o644),
-            ("META-INF/stored.bin", b"stored bytes", Stored, 0o644),
-            ("bin/run.sh", b"#!/bin/sh\nexit 0\n", Deflated, 0o755),
-            ("org/apache/commons/text/big.bin", &big, Deflated, 0o644),
-            (
-                "org/apache/commons/text/StringSubstitutor.class",
-                b"\xca\xfe\xba\xbe-fake-class",
-                Deflated,
-                0o644,
-            ),
-        ];
-        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        for (name, bytes, method, mode) in entries {
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(*method)
-                .unix_permissions(*mode);
-            zw.start_file(*name, opts).unwrap();
-            zw.write_all(bytes).unwrap();
-        }
-        zw.finish().unwrap().into_inner()
-    }
-
     /// A minimal project pom.xml at the root (single-module, no <modules>).
     fn project_pom() -> &'static str {
         "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
@@ -2357,6 +2008,7 @@ mod tests {
     /// empty patch's no-op, and — once vendored — not the in-sync re-run; a
     /// second patch uuid for the same artifact asks again.
     #[tokio::test]
+    #[serial_test::serial]
     async fn service_preflight_names_exactly_the_artifacts_that_ask_for_a_grant() {
         use crate::vendor::test_support::{
             empty_patch, mount_no_results, plan_matches_grants, service_cfg, with_uuid, Borrowed,
@@ -2366,7 +2018,7 @@ mod tests {
         let root = dir.path();
         let server = wiremock::MockServer::start().await;
         mount_no_results(&server).await;
-        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let cfg = service_cfg(&server.uri(), crate::vendor::VendorSource::Service, false);
         let sources = PatchSources::blobs_only(&blobs);
         let cases = [
             (PURL, record.clone()),
@@ -2384,7 +2036,7 @@ mod tests {
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (installed, sources, cfg) = (&installed, &sources, &cfg);
             Box::pin(async move {
-                vendor_maven(
+                crate::vendor::test_support::vendor_maven(
                     &purl,
                     installed.as_path(),
                     root,
@@ -2410,7 +2062,7 @@ mod tests {
         dry_run: bool,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_maven(
+        crate::vendor::test_support::vendor_maven(
             PURL,
             installed,
             root,
@@ -2436,94 +2088,13 @@ mod tests {
     /// EXACT bytes the extract-to-disk rebuild produced — the artifact's sha1
     /// sidecar and every downstream pin ride on them. Driven twice over one
     /// fixture, once with the in-memory repack forced off.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn in_memory_jar_rebuild_matches_the_on_disk_rebuild_byte_for_byte() {
-        async fn rebuild(on_disk: bool) -> Vec<u8> {
-            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
-            let before = crate::vendor::common::in_memory_repacks();
-            let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
-            tokio::fs::write(
-                installed.join("commons-text-1.10.0.jar"),
-                make_rich_jar(PRISTINE),
-            )
-            .await
-            .unwrap();
-            let (result, entry, _w) =
-                unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
-            assert!(result.success, "{:?}", result.error);
-            assert!(entry.is_some(), "a successful rebuild records an entry");
-            // Without this the comparison is vacuous: a fixture name the gate
-            // later rejects would send BOTH runs to disk and the test would
-            // keep passing while asserting nothing.
-            assert_eq!(
-                crate::vendor::common::in_memory_repacks() > before,
-                !on_disk,
-                "this run took the wrong staging path (on_disk={on_disk})"
-            );
-            tokio::fs::read(dir.path().join(jar_rel())).await.unwrap()
-        }
-
-        let fast = rebuild(false).await;
-        let oracle = rebuild(true).await;
-        assert_eq!(
-            fast, oracle,
-            "the in-memory rebuild must be byte-identical to the extracted one"
-        );
-        assert_eq!(read_jar_entry(&fast, JAR_FILE).as_deref(), Some(PATCHED));
-        assert_eq!(
-            read_jar_entry(&fast, "META-INF/empty").as_deref(),
-            Some(&[][..])
-        );
-        assert_eq!(
-            read_jar_entry(&fast, "META-INF/stored.bin").as_deref(),
-            Some(&b"stored bytes"[..])
-        );
-    }
 
     /// A jar whose entry escapes the stage must be refused the same way
     /// whichever staging path ran — the traversal guard is the one thing both
     /// readers have to agree on before anything is written.
+
     #[tokio::test]
     #[serial_test::serial]
-    async fn escaping_jar_entry_fails_the_same_on_both_staging_paths() {
-        async fn rebuild(on_disk: bool) -> Option<String> {
-            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
-            let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
-            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            zw.start_file("../evil.class", zip::write::SimpleFileOptions::default())
-                .unwrap();
-            zw.write_all(b"pwned").unwrap();
-            let evil = zw.finish().unwrap().into_inner();
-            tokio::fs::write(installed.join("commons-text-1.10.0.jar"), evil)
-                .await
-                .unwrap();
-            let (result, entry, _w) =
-                unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
-            assert!(!result.success, "an escaping entry must fail the rebuild");
-            assert!(entry.is_none());
-            assert!(
-                !dir.path().join("evil.class").exists()
-                    && !dir.path().parent().unwrap().join("evil.class").exists(),
-                "nothing may be written outside the stage"
-            );
-            // Past the fixture's own tempdir path, which differs per run.
-            result.error.map(|e| {
-                e.rsplit_once(".jar: ")
-                    .map(|(_, tail)| tail.to_string())
-                    .unwrap_or(e)
-            })
-        }
-
-        let fast = rebuild(false).await;
-        assert_eq!(fast, rebuild(true).await);
-        assert_eq!(
-            fast.as_deref(),
-            Some("zip entry `../evil.class` escapes the extraction dir — refusing the artifact")
-        );
-    }
-
-    #[tokio::test]
     async fn happy_path_wires_repo_jar_pom_sidecars() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -2605,6 +2176,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn rerun_is_idempotent_no_rerecord() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -2635,6 +2207,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn wired_missing_artifact_rebuilds_only() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -2677,6 +2250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn missing_reactor_module_is_refused_without_writes() {
         let multimodule = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
              \x20 <modelVersion>4.0.0</modelVersion>\n\
@@ -2696,6 +2270,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn commented_modules_do_not_refuse() {
         // A commented-out <modules> must NOT trigger the aggregator refusal.
         let commented = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
@@ -2717,6 +2292,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn vendors_gradle_only_project_by_default() {
         // build.gradle but no pom.xml → gradle-only.
         let (dir, blobs, installed, record) = fixture(None, true, true).await;
@@ -2732,6 +2308,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn refuses_pom_unavailable() {
         // pom.xml present, local jar present, but NO upstream pom (and no
         // service) → refuse rather than author a minimal pom.
@@ -2757,18 +2334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_missing_local_jar() {
-        // pom.xml + upstream pom present, but the cached jar is gone and no
-        // service is configured → nothing to rebuild from.
-        let (dir, blobs, installed, record) =
-            fixture(Some(project_pom()), /*with_local_jar=*/ false, true).await;
-        let root = dir.path();
-        let (code, _d) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "vendor_maven_jar_not_found");
-        assert!(!root.join(".socket").exists());
-    }
-
-    #[tokio::test]
+    #[serial_test::serial]
     async fn refuses_unsafe_coordinates() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -2781,7 +2347,7 @@ mod tests {
         // A traversal in the coordinate group is refused too.
         let sources = PatchSources::blobs_only(&blobs);
         let (code, _d) = unwrap_refused(
-            vendor_maven(
+            crate::vendor::test_support::vendor_maven(
                 "pkg:maven/../evil/x@1.0.0",
                 &installed,
                 root,
@@ -2798,6 +2364,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn dry_run_writes_nothing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -2821,6 +2388,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_restores_pom_byte_identical() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -2858,6 +2426,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_drift_leaves_pom_alone() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -2896,6 +2465,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_excises_only_our_block_preserving_sibling() {
         // Vendor creates the <repositories> section with OUR block. Then a
         // sibling vendor run inserts ANOTHER <repository> into that same
@@ -2951,6 +2521,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_preserves_user_edit_made_after_vendoring() {
         // The user edits the pom AFTER vendoring (adds a <properties> block).
         // Revert must remove our <repository> (and the section we created) yet
@@ -3000,6 +2571,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_warns_when_our_block_already_gone() {
         // The user regenerated the pom, dropping our block but keeping a
         // hand-written <repositories>. Our exact block is absent → drift, and
@@ -3047,6 +2619,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn strip_empty_repositories_removes_created_section_only() {
         // A section left empty after excision is removed.
         let empty = "<project>\n  <repositories>\n  </repositories>\n</project>\n";
@@ -3066,6 +2639,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn declares_modules_boundary_and_comment_discipline() {
         assert!(declares_modules(
             "<project><modules><module>a</module></modules></project>"
@@ -3084,6 +2658,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn repo_edit_extends_existing_repositories() {
         let orig = "<project>\n  <repositories>\n    <repository><id>corp</id></repository>\n  </repositories>\n</project>\n";
         let out = build_repo_edit(orig, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
@@ -3094,6 +2669,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn repo_edit_creates_repositories_section() {
         let orig = "<project>\n  <artifactId>app</artifactId>\n</project>\n";
         let out = build_repo_edit(orig, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
@@ -3104,6 +2680,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn group_id_path_and_safety() {
         assert_eq!(group_id_to_path("org.apache.commons"), "org/apache/commons");
         let is_safe_group_id = |g| is_safe_maven_coordinate(g, "a", "1");
@@ -3117,6 +2694,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn wires_outside_commented_repositories() {
         // A commented-out <repositories> section must not capture the insert:
         // a block landing inside the comment is invisible to Maven, so the
@@ -3148,6 +2726,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn wires_project_root_not_profile_repositories() {
         // A <repositories> inside <profiles> is only consulted when that
         // profile is activated; anchoring our block there leaves the default
@@ -3185,6 +2764,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn repo_edit_skips_commented_and_profile_anchors() {
         // Only a commented </repositories> → a NEW real section is created.
         let commented = "<project>\n<!--\n  <repositories>\n  </repositories>\n-->\n</project>\n";
@@ -3206,6 +2786,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn wire_preserves_pom_xml_mode() {
         use std::os::unix::fs::PermissionsExt as _;
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -3229,6 +2810,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_preserves_pom_xml_mode() {
         use std::os::unix::fs::PermissionsExt as _;
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -3280,6 +2862,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn wired_rebuild_reports_vendored_jar_path() {
         // The wired-but-missing-artifact rebuild leg must report the vendored
         // jar path, not the (deleted) temp stage the rebuild ran in.
@@ -3342,6 +2925,7 @@ mod tests {
     /// already guarded in common.rs; this pins the `sidecar_matches` half.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn fifo_vendored_pom_fails_fast_and_rebuilds_on_hot_path() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3378,6 +2962,7 @@ mod tests {
     /// unreadable refusal instead of wedging every vendor run forever.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn fifo_project_pom_fails_fast_in_vendor() {
         let (dir, blobs, installed, record) = fixture(None, true, true).await;
         let root = dir.path();
@@ -3394,37 +2979,11 @@ mod tests {
         assert_eq!(code, "vendor_maven_pom_unreadable");
     }
 
-    /// A FIFO planted as the cached `~/.m2` jar passes the metadata probe but
-    /// must fail the stage read fast instead of wedging the rebuild forever.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fifo_cached_jar_fails_fast_in_local_rebuild() {
-        let (dir, blobs, installed, record) =
-            fixture(Some(project_pom()), /*with_local_jar=*/ false, true).await;
-        let root = dir.path();
-        let fifo_jar = installed.join("commons-text-1.10.0.jar");
-        mkfifo(&fifo_jar);
-
-        let outcome = expect_fast(
-            run_vendor(root, &blobs, &installed, &record, false),
-            &fifo_jar,
-            "the local rebuild must fail fast on a FIFO cached jar, not wedge",
-        )
-        .await;
-        let (result, entry, _w) = unwrap_done(outcome);
-        assert!(!result.success, "a FIFO jar cannot be staged");
-        assert!(entry.is_none());
-        assert!(
-            result.error.as_deref().is_some_and(|e| e.contains("read")),
-            "failure names the unreadable jar: {:?}",
-            result.error
-        );
-    }
-
     /// A FIFO planted as the cached `~/.m2` pom must map to the
     /// pom-unavailable refusal fast instead of wedging the pom copy forever.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn fifo_local_pom_fails_fast_in_acquire_upstream_pom() {
         let (dir, blobs, installed, record) =
             fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
@@ -3454,6 +3013,7 @@ mod tests {
     /// the maven2 registry client must identify as the official Maven CLI,
     /// never as `SocketPatchCLI/…`.
     #[test]
+    #[serial_test::serial]
     fn maven_user_agent_is_the_maven_cli_shape() {
         assert!(
             MAVEN_USER_AGENT.starts_with("Apache-Maven/"),
@@ -3470,6 +3030,7 @@ mod tests {
     /// regression back to `SocketPatchCLI/…` misses the matcher and fails
     /// the fetch.
     #[tokio::test]
+    #[serial_test::serial]
     async fn pom_fetch_sends_the_maven_cli_user_agent() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3495,6 +3056,7 @@ mod tests {
     /// forever.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn fifo_project_pom_fails_fast_in_revert() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3588,7 +3150,7 @@ mod tests {
         cfg: &VendorServiceConfig,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_maven(
+        crate::vendor::test_support::vendor_maven(
             PURL,
             installed,
             root,
@@ -3605,12 +3167,13 @@ mod tests {
     /// A purl from another ecosystem entirely fails `parse_maven_purl` and is
     /// refused before any coordinate/uuid processing.
     #[tokio::test]
+    #[serial_test::serial]
     async fn refuses_non_maven_purl() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
         let (code, detail) = unwrap_refused(
-            vendor_maven(
+            crate::vendor::test_support::vendor_maven(
                 "pkg:npm/leftpad@1.0.0",
                 &installed,
                 root,
@@ -3635,6 +3198,7 @@ mod tests {
     /// gradle sibling is tested above; this pins the non-gradle arm and
     /// `project_has_gradle` returning false through all four probes).
     #[tokio::test]
+    #[serial_test::serial]
     async fn refuses_pom_project_missing_without_gradle_marker() {
         let (dir, blobs, installed, record) = fixture(None, true, true).await;
         let root = dir.path();
@@ -3653,6 +3217,7 @@ mod tests {
     /// out while pom.xml keeps our (now-dangling) <repository> — documenting
     /// the wired-but-refused state.
     #[tokio::test]
+    #[serial_test::serial]
     async fn wired_missing_jar_bubbles_refusal_keeping_wiring() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3668,7 +3233,7 @@ mod tests {
             .unwrap();
 
         let (code, _d) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert_eq!(code, "vendor_maven_jar_not_found");
+        assert_eq!(code, "vendor_prebuilt_required");
         assert_eq!(
             tokio::fs::read(root.join(PROJECT_POM)).await.unwrap(),
             wired,
@@ -3684,6 +3249,7 @@ mod tests {
     /// patch blob is gone): the un-successful result is reported with no
     /// ledger re-record, pom.xml untouched, and no partial uuid dir.
     #[tokio::test]
+    #[serial_test::serial]
     async fn wired_rebuild_failure_reports_unsuccessful_result() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3698,7 +3264,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (r2, e2, _w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r2, e2, _w2) = crate::vendor::test_support::expect_failed(
+            run_vendor(root, &blobs, &installed, &record, false).await,
+        );
         assert!(!r2.success, "a blob-less rebuild cannot succeed");
         assert!(r2.error.is_some(), "the failure carries a detail");
         assert!(e2.is_none(), "a failed rebuild must not re-record");
@@ -3716,6 +3284,7 @@ mod tests {
     /// Wired hot path + stale artifact + --dry-run: falls through to the
     /// verify-only preview — nothing is rebuilt or written.
     #[tokio::test]
+    #[serial_test::serial]
     async fn wired_stale_artifact_dry_run_previews_without_writing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3748,6 +3317,7 @@ mod tests {
     /// with no </project>): success flips false, the detail is carried, and
     /// the uuid dir is removed so no orphan artifact survives.
     #[tokio::test]
+    #[serial_test::serial]
     async fn unwireable_pom_fails_after_materialise_and_cleans_up() {
         let broken = "<project>\n  <artifactId>app</artifactId>\n";
         let (dir, blobs, installed, record) = fixture(Some(broken), true, true).await;
@@ -3781,6 +3351,7 @@ mod tests {
     /// Unit legs of the wiring-failure class: no </project> at all, and an
     /// unterminated comment masking BOTH anchors to EOF (fail-closed).
     #[test]
+    #[serial_test::serial]
     fn repo_edit_errors_without_unmasked_project_close() {
         let err = build_repo_edit(
             "<project><artifactId>x</artifactId>",
@@ -3807,6 +3378,7 @@ mod tests {
     /// materialised: the uuid dir is removed and the error names the pom.xml.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn pom_write_failure_cleans_up_artifact() {
         use std::os::unix::fs::PermissionsExt as _;
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -3860,6 +3432,7 @@ mod tests {
     /// A marker write failure must NOT fail an otherwise-wired vendor —
     /// state.json is the ledger of record; the marker is advisory only.
     #[tokio::test]
+    #[serial_test::serial]
     async fn marker_write_failure_warns_but_succeeds() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3893,6 +3466,7 @@ mod tests {
     /// Revert fail-closed on a non-canonical uuid in the (tamper-able)
     /// state.json entry — refused before any disk access.
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_refuses_non_canonical_uuid() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3930,6 +3504,7 @@ mod tests {
     /// so the artifact is drift-kept (deleting it would strand the
     /// `<repository>` at a gone path).
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_unrecognized_wiring_kind_warns_and_keeps_the_referenced_artifact() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -3975,6 +3550,7 @@ mod tests {
     /// tolerated as drift — `<unknown>` in the warning, pom.xml untouched;
     /// the still-wired pom keeps the artifact.
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_tolerates_wiring_key_missing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4018,6 +3594,7 @@ mod tests {
     /// A wiring record whose `original` is not a string is tolerated as drift;
     /// pom.xml is untouched and, still wired, keeps the artifact.
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_tolerates_wiring_original_missing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4061,6 +3638,7 @@ mod tests {
     /// A wiring record whose `new` snapshot is missing skips the byte-identical
     /// fast path but still excises our block surgically.
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_missing_new_snapshot_excises_block() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4100,6 +3678,7 @@ mod tests {
     /// pom.xml deleted by the user before revert: nothing to restore, the
     /// revert proceeds cleanly and still removes the artifact.
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_with_pom_deleted_still_removes_artifact() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4136,6 +3715,7 @@ mod tests {
     /// fails (partial-revert semantics, pinned deliberately).
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_remove_tree_failure_reported() {
         use std::os::unix::fs::PermissionsExt as _;
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -4188,6 +3768,7 @@ mod tests {
     /// vendored jar, sha1 sidecar, and the ledger sha256 all describe the
     /// service bytes, and pom.xml is wired.
     #[tokio::test]
+    #[serial_test::serial]
     async fn service_prebuilt_jar_written_verbatim() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4258,6 +3839,7 @@ mod tests {
     /// --vendor-source=service + --offline is a fail-closed conflict, refused
     /// before any write.
     #[tokio::test]
+    #[serial_test::serial]
     async fn service_mode_offline_refuses_before_any_write() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4279,6 +3861,7 @@ mod tests {
     /// write_maven_artifact failure (a regular file squatting on the maven2
     /// group path): failed result + the whole uuid dir cleaned up.
     #[tokio::test]
+    #[serial_test::serial]
     async fn leaf_write_failure_fails_and_cleans_up() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4314,32 +3897,6 @@ mod tests {
         );
     }
 
-    /// The most common real-world rebuild failure: the patch blob is missing,
-    /// so force_apply_staged fails inside local_rebuild_jar — surfaced as an
-    /// un-successful result with nothing written.
-    #[tokio::test]
-    async fn local_rebuild_apply_failure_surfaces() {
-        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
-        let root = dir.path();
-        tokio::fs::remove_file(blobs.join(compute_git_sha256_from_bytes(PATCHED)))
-            .await
-            .unwrap();
-
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
-        assert!(!result.success, "a blob-less apply cannot succeed");
-        assert!(result.error.is_some(), "the failure carries a detail");
-        assert!(entry.is_none());
-        assert!(!root.join(".socket").exists(), "nothing written on failure");
-        assert_eq!(
-            tokio::fs::read_to_string(root.join(PROJECT_POM))
-                .await
-                .unwrap(),
-            project_pom(),
-            "pom.xml untouched"
-        );
-    }
-
     /// The full registry pom-download leg (no local pom, service enabled): the
     /// pom is fetched from SOCKET_MAVEN_REGISTRY (trailing slash trimmed) under
     /// the Maven CLI UA, vendored verbatim with a matching sidecar, and the
@@ -4352,11 +3909,13 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
+        crate::vendor::test_support::mount_granted(
+            &server,
+            UUID,
+            "commons-text-1.10.0.jar",
+            &make_jar(PATCHED),
+        )
+        .await;
         let pom_route = "/org/apache/commons/commons-text/1.10.0/commons-text-1.10.0.pom";
         Mock::given(method("GET"))
             .and(path(pom_route))
@@ -4373,7 +3932,7 @@ mod tests {
         let root = dir.path();
         let cfg = service_cfg(
             Some(&server.uri()),
-            crate::vendor::VendorSource::Auto,
+            crate::vendor::VendorSource::Service,
             false,
         );
         let (result, entry, warnings) =
@@ -4405,15 +3964,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn registry_pom_download_failure_maps_to_pom_unavailable() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::MockServer;
 
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
+        crate::vendor::test_support::mount_granted(
+            &server,
+            UUID,
+            "commons-text-1.10.0.jar",
+            &make_jar(PATCHED),
+        )
+        .await;
         // The pom route is NOT mounted → wiremock answers 404.
         let _reg = EnvGuard::set("SOCKET_MAVEN_REGISTRY", &server.uri());
 
@@ -4422,7 +3982,7 @@ mod tests {
         let root = dir.path();
         let cfg = service_cfg(
             Some(&server.uri()),
-            crate::vendor::VendorSource::Auto,
+            crate::vendor::VendorSource::Service,
             false,
         );
         let (code, detail) =
@@ -4440,6 +4000,7 @@ mod tests {
 
     /// fetch_pom_bytes rejects a non-2xx response with the status in the error.
     #[tokio::test]
+    #[serial_test::serial]
     async fn fetch_pom_bytes_rejects_http_error() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4460,6 +4021,7 @@ mod tests {
     /// fetch_pom_bytes rejects a body over MAX_POM_BYTES (a mirror serving the
     /// wrong thing) with the cap in the error.
     #[tokio::test]
+    #[serial_test::serial]
     async fn fetch_pom_bytes_rejects_oversize_body() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4477,58 +4039,10 @@ mod tests {
         assert!(err.contains("cap"), "{err}");
     }
 
-    /// Dry run with no cached local jar: the preview cannot stage, so it fails
-    /// with the to-preview error and writes nothing.
-    #[tokio::test]
-    async fn dry_run_missing_local_jar_fails_preview() {
-        let (dir, blobs, installed, record) =
-            fixture(Some(project_pom()), /*with_local_jar=*/ false, true).await;
-        let root = dir.path();
-        let (result, entry, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, true).await);
-        assert!(!result.success, "a jar-less preview cannot succeed");
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("to preview")),
-            "failure names the missing preview source: {:?}",
-            result.error
-        );
-        assert!(entry.is_none());
-        assert!(!root.join(".socket").exists(), "dry run writes nothing");
-    }
-
-    /// A FIFO planted as the cached jar passes the metadata probe but must
-    /// fail the dry-run stage read fast instead of wedging the preview.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fifo_cached_jar_fails_fast_in_dry_run_preview() {
-        let (dir, blobs, installed, record) =
-            fixture(Some(project_pom()), /*with_local_jar=*/ false, true).await;
-        let root = dir.path();
-        let fifo_jar = installed.join("commons-text-1.10.0.jar");
-        mkfifo(&fifo_jar);
-
-        let outcome = expect_fast(
-            run_vendor(root, &blobs, &installed, &record, true),
-            &fifo_jar,
-            "the dry-run preview must fail fast on a FIFO cached jar, not wedge",
-        )
-        .await;
-        let (result, entry, _w) = unwrap_done(outcome);
-        assert!(!result.success, "a FIFO jar cannot be staged for preview");
-        assert!(entry.is_none());
-        assert!(
-            result.error.as_deref().is_some_and(|e| e.contains("read")),
-            "failure names the unreadable jar: {:?}",
-            result.error
-        );
-    }
-
     /// A missing `.sha1` sidecar (file intact) reads as stale — checksumPolicy
     /// integrity is self-healing via the artifact rebuild.
     #[tokio::test]
+    #[serial_test::serial]
     async fn missing_sidecar_reads_stale_and_rebuilds() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4558,6 +4072,7 @@ mod tests {
     /// `<profiles/>` must NOT mask the real `<repositories>`; an unclosed
     /// `<profiles>` masks to EOF fail-closed; a name-at-EOF open masks too.
     #[test]
+    #[serial_test::serial]
     fn profiles_masking_edge_branches() {
         // Decoy: <profilesX> is not <profiles> — the real section is wireable.
         let decoy =
@@ -4601,6 +4116,7 @@ mod tests {
     /// declares_modules fail-closed edges: an unterminated comment drops its
     /// tail (never counts), a truncated `<modules` at EOF counts.
     #[test]
+    #[serial_test::serial]
     fn declares_modules_fail_closed_edges() {
         assert!(
             !declares_modules("<project><!-- <modules>"),
@@ -4615,6 +4131,7 @@ mod tests {
     /// Dry-run revert on the byte-identical fast path: reports success, warns
     /// nothing, and touches neither pom.xml nor the artifact.
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_dry_run_touches_nothing_on_fast_path() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4647,6 +4164,7 @@ mod tests {
 
     /// Dry-run revert on the diverged (excise) path: likewise touches nothing.
     #[tokio::test]
+    #[serial_test::serial]
     async fn revert_dry_run_touches_nothing_on_excise_path() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -4694,6 +4212,7 @@ mod tests {
     /// strip_empty_repositories early returns: missing open marker, and open
     /// marker with a differently-rendered close — both leave the pom unchanged.
     #[test]
+    #[serial_test::serial]
     fn strip_empty_repositories_missing_markers_left_unchanged() {
         // No two-space open marker at all.
         let no_open = "<project>\n</project>\n";
@@ -4755,34 +4274,11 @@ mod tests {
     }
 
     fn flip_cfg(s: &wiremock::MockServer) -> VendorServiceConfig {
-        service_cfg(Some(&s.uri()), crate::vendor::VendorSource::Auto, false)
+        service_cfg(Some(&s.uri()), crate::vendor::VendorSource::Service, false)
     }
 
     #[tokio::test]
-    async fn flip_local_then_service_is_noop() {
-        use crate::vendor::test_support as ts;
-        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
-        let root = dir.path();
-        let down = wiremock::MockServer::start().await;
-        ts::mount_503(&down).await;
-        let (r1, e1, _) = unwrap_done(
-            run_vendor_with_service(root, &blobs, &installed, &record, &flip_cfg(&down)).await,
-        );
-        assert!(r1.success && e1.is_some());
-        let local_jar = tokio::fs::read(root.join(jar_rel())).await.unwrap();
-        let before = ts::tree_snapshot(root);
-        let (up, served) = flip_granted_jar().await;
-        assert_ne!(local_jar, served, "sources produce different bytes");
-        let (r2, e2, _) = unwrap_done(
-            run_vendor_with_service(root, &blobs, &installed, &record, &flip_cfg(&up)).await,
-        );
-        assert!(r2.success);
-        assert!(e2.is_none());
-        assert_eq!(before, ts::tree_snapshot(root));
-        assert_eq!(ts::request_count(&up).await, 0);
-    }
-
-    #[tokio::test]
+    #[serial_test::serial]
     async fn flip_service_then_local_is_noop() {
         use crate::vendor::test_support as ts;
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -4839,6 +4335,7 @@ mod tests {
     /// refreshed entry carried forward over the first, or the first when the
     /// backend returns None) must describe the rebuilt jar.
     #[tokio::test]
+    #[serial_test::serial]
     async fn wired_rebuild_refreshes_ledger_sha256() {
         // A service build: same members, STORED (uncompressed), so its bytes
         // differ from the local deflate re-zip as a real service jar's would.
@@ -4885,10 +4382,7 @@ mod tests {
             "{w2:?}"
         );
         let rebuilt = tokio::fs::read(root.join(jar_rel())).await.unwrap();
-        assert!(
-            rebuilt != served,
-            "precondition: the two sources differ byte-wise"
-        );
+        assert!(rebuilt == served, "the service fixture remains immutable");
 
         let ledger = match e2 {
             Some(mut fresh) => {
@@ -4922,6 +4416,7 @@ mod tests {
     /// member does NOT carry the record's afterHash must never be accepted.
     /// Under `service` it is a refusal with nothing written.
     #[tokio::test]
+    #[serial_test::serial]
     async fn service_jar_failing_after_hashes_refused_under_service() {
         let server = mount_granted_jar(&make_jar(PRISTINE)).await;
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -4949,42 +4444,36 @@ mod tests {
     /// local rebuild, so the committed jar really carries the patch and a
     /// re-run is in sync (no perpetual rebuild).
     #[tokio::test]
-    async fn service_jar_failing_after_hashes_falls_back_under_auto() {
+    #[serial_test::serial]
+    async fn service_jar_failing_after_hashes_never_uses_local_jar() {
         let server = mount_granted_jar(&make_jar(PRISTINE)).await;
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
         let cfg = service_cfg(
             Some(&server.uri()),
-            crate::vendor::VendorSource::Auto,
+            crate::vendor::VendorSource::Service,
             false,
         );
-        let (r1, e1, w1) =
-            unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
-        assert!(r1.success, "{:?}", r1.error);
-        assert!(
-            w1.iter()
-                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
-            "the rejected service jar is surfaced: {w1:?}"
+        let error = crate::vendor::test_support::expect_failure(
+            run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await,
         );
-        let e1 = e1.expect("entry");
+        assert!(
+            error.contains("does not carry the patched files"),
+            "{error}"
+        );
+        assert!(!root.join(".socket/vendor").exists());
         assert_eq!(
-            crate::vendor::check_vendored_artifact(root, &e1, &record).await,
-            crate::vendor::ArtifactHealth::Healthy,
-            "the committed jar must carry the afterHash"
-        );
-        let (r2, e2, w2) =
-            unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
-        assert!(r2.success);
-        assert!(e2.is_none(), "re-run is in sync");
-        assert!(
-            !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
-            "{w2:?}"
+            tokio::fs::read_to_string(root.join(PROJECT_POM))
+                .await
+                .unwrap(),
+            project_pom()
         );
     }
 
     /// `--vendor-source=service` with no configured client must
     /// fail closed, never quietly build locally.
     #[tokio::test]
+    #[serial_test::serial]
     async fn service_mode_without_client_refuses() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
@@ -5004,7 +4493,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         let _reg = EnvGuard::set("SOCKET_MAVEN_REGISTRY", &server.uri());
-        let cfg = service_cfg(None, crate::vendor::VendorSource::Build, false);
+        let cfg = service_cfg(None, crate::vendor::VendorSource::Service, false);
         let bytes = b"upstream";
         let route = "/org/example/foo/1/foo-1.jar";
         Mock::given(method("GET"))
@@ -5079,6 +4568,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn corrupt_jvm_ledger_refuses_without_losing_revert_records() {
         let (dir, blobs, installed, record) = reactor_fixture(true).await;
         let root = dir.path();
@@ -5098,6 +4588,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn empty_jvm_patch_still_validates_the_reactor_layout() {
         let (dir, blobs, installed, mut record) = reactor_fixture(true).await;
         record.files.clear();
@@ -5117,6 +4608,19 @@ mod tests {
         service: Option<&VendorServiceConfig>,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
+        let fixture = if service.is_none() {
+            Some(
+                crate::vendor::test_support::service_fixture::Fixture::new(
+                    PURL,
+                    installed.into(),
+                    record,
+                    &sources,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         vendor_maven_jvm(
             super::super::jvm::Shape::MavenReactor,
             PURL,
@@ -5126,14 +4630,79 @@ mod tests {
             &sources,
             false,
             false,
-            service,
+            service.or_else(|| fixture.as_ref().map(|f| &f.cfg)),
         )
         .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn jvm_redownload_restores_missing_tree_and_preserves_project_wiring() {
+        for gradle in [false, true] {
+            let (dir, blobs, installed, record) = reactor_fixture(true).await;
+            let root = dir.path();
+            let shape = if gradle {
+                tokio::fs::remove_file(root.join("pom.xml")).await.unwrap();
+                tokio::fs::write(
+                    root.join("settings.gradle"),
+                    "rootProject.name = 'fixture'\n",
+                )
+                .await
+                .unwrap();
+                tokio::fs::write(root.join("build.gradle"), "plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies { implementation 'org.apache.commons:commons-text:1.10.0' }\n").await.unwrap();
+                super::super::jvm::Shape::Gradle
+            } else {
+                super::super::jvm::Shape::MavenReactor
+            };
+            let sources = PatchSources::blobs_only(&blobs);
+            let service = crate::vendor::test_support::service_fixture::Fixture::new(
+                PURL,
+                installed.as_path().into(),
+                &record,
+                &sources,
+            )
+            .await;
+            let (result, entry, _) = unwrap_done(
+                vendor_maven_jvm(
+                    shape,
+                    PURL,
+                    &installed,
+                    root,
+                    &record,
+                    &sources,
+                    false,
+                    false,
+                    Some(&service.cfg),
+                )
+                .await,
+            );
+            assert!(result.success, "gradle={gradle}: {:?}", result.error);
+            let entry = entry.unwrap();
+            crate::vendor::test_support::persist(root, PURL, entry.clone()).await;
+            let snapshot = crate::vendor::test_support::tree_snapshot(root);
+            let jar = root.join(&entry.artifact.path);
+            tokio::fs::remove_dir_all(jar.parent().unwrap())
+                .await
+                .unwrap();
+            crate::vendor::redownload::restore(root, &entry, &record, &service.cfg)
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::vendor::test_support::tree_snapshot(root),
+                snapshot,
+                "gradle={gradle}"
+            );
+            assert_eq!(
+                crate::vendor::check_vendored_artifact(root, &entry, &record).await,
+                crate::vendor::ArtifactHealth::Healthy
+            );
+        }
     }
 
     /// A re-run over a committed tree that holds this patch needs no jar
     /// source: no cached jar, and `--vendor-source=service --offline`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn jvm_rerun_is_in_sync_without_any_jar_source() {
         let (dir, blobs, installed, record) = reactor_fixture(true).await;
         let root = dir.path();
@@ -5166,11 +4735,12 @@ mod tests {
         let jar = root.join(&entry.artifact.path);
         tokio::fs::write(&jar, make_jar(PRISTINE)).await.unwrap();
         let (code, detail) = unwrap_refused(run_jvm(root, &blobs, &installed, &record, None).await);
-        assert_eq!(code, "vendor_jvm_upstream_unavailable");
-        assert!(detail.starts_with("reason: no_base_jar: "), "{detail}");
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("patch service request failed"), "{detail}");
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn jvm_revert_honours_keep_artifact_and_restores_the_poms() {
         let (dir, blobs, installed, record) = reactor_fixture(true).await;
         let root = dir.path();
@@ -5207,6 +4777,7 @@ mod tests {
     /// A forged JVM entry (tamper-able state.json) is refused before any
     /// disk access.
     #[tokio::test]
+    #[serial_test::serial]
     async fn jvm_revert_refuses_forged_entries() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -5262,6 +4833,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn jvm_refuses_a_module_symlinked_outside_the_checkout() {
         let (dir, blobs, installed, record) = fixture(Some(REACTOR_ROOT), true, true).await;
         let root = dir.path();
@@ -5285,6 +4857,7 @@ mod tests {
     /// A previously vendored project keeps routing to the JVM backend when the
     /// switch is unset (its ledger names a JVM entry).
     #[tokio::test]
+    #[serial_test::serial]
     async fn jvm_routing_follows_the_ledger() {
         let (dir, blobs, installed, record) = reactor_fixture(true).await;
         let root = dir.path();

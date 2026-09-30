@@ -45,6 +45,9 @@
 //!
 //!   The shared matrix also runs over a vendored checkout.
 
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 
 use wiremock::MockServer;
@@ -368,7 +371,12 @@ fn vendored_project(root: &Path, era: Era) -> String {
     )
     .unwrap();
     let cwd = root.to_str().unwrap().to_string();
-    let (code, env, stderr) = hosted::run_json(root, &["vendor", "--offline", "--cwd", &cwd], &[]);
+    let fixture = prebuilt_common::Server::project(root);
+    let (code, env, stderr) = hosted::run_json(
+        root,
+        &["vendor", "--cwd", &cwd],
+        &[("SOCKET_VENDOR_URL", &fixture.uri)],
+    );
     assert_eq!(code, 0, "vendor: {env:#}\n{stderr}");
     assert_eq!(env["summary"]["applied"], 1, "vendor: {env:#}");
     assert!(root.join(vendored_rel()).join("index.js").is_file());

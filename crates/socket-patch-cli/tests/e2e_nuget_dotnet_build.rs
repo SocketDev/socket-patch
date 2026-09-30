@@ -863,7 +863,9 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
     let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
     let mut patched = pristine.clone();
     patched.extend_from_slice(MARKER);
-    let backend = Backend::start(VENDORED_UUID, &pristine, &patched, None);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(VENDORED_UUID, &pristine, &patched, Some(&nupkg));
     let uri = backend.uri();
 
     // `scan --mode vendored --vendor-source build --vex`: the real backend
@@ -877,7 +879,7 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
             "--mode",
             "vendored",
             "--vendor-source",
-            "build",
+            "service",
             "--json",
             "--yes",
             "--api-url",

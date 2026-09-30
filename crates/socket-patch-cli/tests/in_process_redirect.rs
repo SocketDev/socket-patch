@@ -629,16 +629,20 @@ const BERRY_CHECKSUM: &str = "10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0
 /// yarn-berry-zip artifact (yarnBerry10c0) — the berry rewriter pins the zip
 /// checksum, not the tarball's.
 async fn mock_reference_with_berry(server: &MockServer) {
+    mock_reference_with_berry_url(server, HOSTED_URL).await;
+}
+
+async fn mock_reference_with_berry_url(server: &MockServer, hosted_url: &str) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "results": {
                 UUID: {
                     "status": "granted",
-                    "url": HOSTED_URL,
+                    "url": hosted_url,
                     "purl": PURL,
                     "artifacts": [
-                        { "kind": "tarball", "url": HOSTED_URL,
+                        { "kind": "tarball", "url": hosted_url,
                           "integrity": { "sha512": PATCHED_SHA512 } },
                         { "kind": "yarn-berry-zip", "url": "http://patch.test/berry.zip",
                           "integrity": { "yarnBerry10c0": BERRY_CHECKSUM } }
@@ -753,7 +757,11 @@ async fn scan_redirect_rewrites_yarn_berry_lock() {
 async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_restores_them() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    mock_reference_with_berry(&server).await;
+    mock_reference_with_berry_url(
+        &server,
+        &HOSTED_URL.replace("http://patch.test", &server.uri()),
+    )
+    .await;
     mock_view(&server).await;
     let tarball = upstream_tarball();
     mock_npm_registry(
@@ -762,7 +770,9 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         Some(tarball),
     )
     .await;
-    let encoded = socket_patch_core::utils::uri::encode_uri_component(HOSTED_URL);
+    let encoded = socket_patch_core::utils::uri::encode_uri_component(
+        &HOSTED_URL.replace("http://patch.test", &server.uri()),
+    );
 
     for (label, bom) in [("crlf", ""), ("bom+crlf", "\u{feff}")] {
         let tmp = tempfile::tempdir().unwrap();
@@ -770,7 +780,11 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         let lock_path = tmp.path().join("yarn.lock");
         let pristine = std::fs::read(&lock_path).unwrap();
 
-        let env = run_redirect_subprocess(tmp.path(), &server.uri());
+        let env = run_redirect_subprocess_with(
+            tmp.path(),
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
         assert_eq!(env["redirect"]["redirected"], 1, "{label}: {env:#}");
         assert!(
             warning_codes(&env).is_empty(),
@@ -792,7 +806,11 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         vlt_hosted_common::assert_no_ledger(tmp.path());
 
         // Re-run: in sync, byte-stable.
-        let env = run_redirect_subprocess(tmp.path(), &server.uri());
+        let env = run_redirect_subprocess_with(
+            tmp.path(),
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
         assert_eq!(env["redirect"]["redirected"], 1, "{label}: {env:#}");
         assert_eq!(
             std::fs::read_to_string(&lock_path).unwrap(),
@@ -801,17 +819,25 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         );
         vlt_hosted_common::assert_no_ledger(tmp.path());
 
-        let (code, env) = rollback_json(tmp.path(), &server);
+        let (code, env) = rollback_json_with_origin(tmp.path(), &server, &server.uri());
         assert_eq!(code, Some(0), "{label}: rollback: {env:#}");
-        assert_eq!(env["hosted"]["reverted"], serde_json::json!([PURL]), "{label}: {env:#}");
+        assert_eq!(
+            env["hosted"]["reverted"],
+            serde_json::json!([PURL]),
+            "{label}: {env:#}"
+        );
         let restored = std::fs::read_to_string(&lock_path).unwrap();
         let checksum = berry_checksum_of(&restored);
-        assert_ne!(checksum, BERRY_CHECKSUM, "{label}: the patched checksum is gone");
+        assert_ne!(
+            checksum, BERRY_CHECKSUM,
+            "{label}: the patched checksum is gone"
+        );
         assert_eq!(
             restored,
-            String::from_utf8(pristine.clone())
-                .unwrap()
-                .replace(&format!("10c0/{}", "3".repeat(128)), &format!("10c0/{checksum}")),
+            String::from_utf8(pristine.clone()).unwrap().replace(
+                &format!("10c0/{}", "3".repeat(128)),
+                &format!("10c0/{checksum}")
+            ),
             "{label}: rollback restores the pristine CRLF lock (upstream checksum \
              re-derived from the registry tarball)"
         );
@@ -1198,13 +1224,21 @@ const INVALID_LOCKB_BYTES: &[u8] = b"\x00BUN-BINARY\xff\xfe\x00LOCK";
 /// pointed at `registry` (`SOCKET_NPM_REGISTRY`, see [`mock_npm_registry`]);
 /// returns (exit code, parsed envelope).
 fn rollback_json(cwd: &Path, registry: &MockServer) -> (Option<i32>, serde_json::Value) {
+    rollback_json_with_origin(cwd, registry, "http://patch.test")
+}
+
+fn rollback_json_with_origin(
+    cwd: &Path,
+    registry: &MockServer,
+    origin: &str,
+) -> (Option<i32>, serde_json::Value) {
     let out = scrubbed_cli()
         .args([
             "rollback",
             "--json",
             "--yes",
             "--patch-server-url",
-            "http://patch.test",
+            origin,
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -1245,6 +1279,16 @@ async fn mock_npm_registry(server: &MockServer, integrity: &str, tarball: Option
         .mount(server)
         .await;
     if let Some(bytes) = tarball {
+        let checksum =
+            socket_patch_core::vendor::test_support::service_fixture::berry_checksum(&bytes, NAME)
+                .unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/upstream/npm/{UUID}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": NAME, "version": VERSION, "integrity": integrity, "yarnBerry10c0": checksum
+            })))
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path(tarball_path))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
@@ -1260,7 +1304,10 @@ fn upstream_tarball() -> Vec<u8> {
     let package_json = format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#);
     for (name, data) in [
         ("package/package.json", package_json.as_bytes()),
-        ("package/index.js", b"module.exports = 'upstream'\n".as_slice()),
+        (
+            "package/index.js",
+            b"module.exports = 'upstream'\n".as_slice(),
+        ),
     ] {
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
@@ -1279,7 +1326,11 @@ fn berry_checksum_of(lock: &str) -> String {
     let rest = &lock[at..];
     let line = rest
         .split('\n')
-        .find_map(|l| l.trim_end_matches('\r').trim().strip_prefix("checksum: 10c0/"))
+        .find_map(|l| {
+            l.trim_end_matches('\r')
+                .trim()
+                .strip_prefix("checksum: 10c0/")
+        })
         .unwrap_or_else(|| panic!("no checksum in {rest:?}"));
     line.to_string()
 }
@@ -1679,7 +1730,10 @@ async fn directory_at_the_legacy_ledger_path_does_not_block_the_run() {
     let code = run(redirect_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "the legacy ledger path is not consulted");
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
-    assert!(lock.contains(HOSTED_URL), "the lock is redirected; got:\n{lock}");
+    assert!(
+        lock.contains(HOSTED_URL),
+        "the lock is redirected; got:\n{lock}"
+    );
     assert!(squatter.is_dir(), "the squatting directory is untouched");
 }
 
@@ -3239,7 +3293,11 @@ async fn corrupt_pre_v5_ledger_is_ignored_and_left_untouched() {
     let out = run_hosted_json_scan(tmp.path(), &server).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("parseable envelope");
     assert_eq!(v["status"], "success", "{v:#}");
     assert_eq!(v["redirect"]["redirected"], 1, "{v:#}");

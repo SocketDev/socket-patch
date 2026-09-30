@@ -21,14 +21,13 @@
 //! manifest (`cargo_wiring_migrated`), and every revert removes both
 //! spellings ([`super::cargo_config`] owns the legacy reader and cleanup).
 //!
-//! The copy is produced by **delegating to the hardened
-//! [`apply_package_patch`] pipeline** pointed at the fresh copy, so all the
-//! verify → package/diff/blob → atomic-write machinery is reused unchanged.
+//! The server archive is verified, extracted into a private stage, and
+//! atomically installed before the project wiring is committed.
 
 use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources};
+use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{is_symlink, read_regular_to_string};
@@ -326,11 +325,9 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
 type CargoServiceCopy = ServiceAttempt<()>;
 
 /// Download the prebuilt `.crate`, integrity-verify it, and extract it into
-/// `copy_dir` (a path-dep copy must carry no `.cargo-checksum.json`). Maps each
-/// service outcome onto the `auto` / `service` fallback policy. The extracted
-/// crate IS the patched package the converter built, so it needs no pristine
-/// source — which is the point of the service path.
-async fn cargo_service_copy(
+/// `copy_dir` (a path-dep copy must carry no `.cargo-checksum.json`). The extracted
+/// crate is the patched package built by the server.
+pub(super) async fn cargo_service_copy(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
     name: &str,
@@ -340,10 +337,10 @@ async fn cargo_service_copy(
     warnings: &mut Vec<VendorWarning>,
 ) -> CargoServiceCopy {
     let Some(cfg) = service else {
-        return CargoServiceCopy::FallBack;
+        return CargoServiceCopy::HardFail(Box::new(super::service_fetch::required()));
     };
     if !cfg.service_enabled() {
-        return CargoServiceCopy::FallBack;
+        return CargoServiceCopy::HardFail(Box::new(super::service_fetch::required()));
     }
     let policy = ServicePolicy::new(cfg, ServiceTerminal::Refused);
     let fetched = fetch_verified_archive(cfg, &record.uuid).await;
@@ -379,13 +376,6 @@ async fn cargo_service_copy(
         }
     }
     let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
-    // Verify the EXTRACTED TREE, not just the archive bytes: the SRI proves
-    // the download is intact, but an unexpected internal layout (the single
-    // `{name}-{version}/` strip leaving an extra wrapper, or an over-strip)
-    // lands the patched files at the wrong paths and the caller would
-    // synthesize success from `record.files` while the copy is wrong. Fail
-    // closed → `auto` falls back to the local build. (Mirrors
-    // composer_lock.rs.)
     if !copy_matches_after_hashes(&stage, &record.files).await {
         cleanup_failed_stage(&stage, uuid_dir, false).await;
         return policy.miss(
@@ -422,84 +412,6 @@ async fn cargo_service_copy(
         ),
     ));
     CargoServiceCopy::Used(())
-}
-
-/// Copy the pristine source into a STAGE sibling of `copy_dir`, run the
-/// hardened apply pipeline against it (vendor auto-force policy — see
-/// [`super::force_apply_staged`]), and swap the stage into `copy_dir` only on
-/// success. A failed (re)build therefore never destroys a pre-existing copy:
-/// with `unwind_uuid_dir` (a fresh vendor — nothing pre-existing to keep) the
-/// whole uuid dir is removed, without it (a live-wired rebuild) the previous
-/// copy, marker, and wiring are left exactly as they were; either way no
-/// partial copy or empty `<uuid>/` husk — which verify/sweep would misjudge —
-/// survives, and the failed [`ApplyResult`] is the `Err` for the caller to
-/// bubble. On success the copy carries no `.cargo-checksum.json` (a path-dep
-/// copy must never have one; the fresh copy excludes it, and it is re-removed
-/// defensively in case the patch recreated it) and its `Cargo.toml` version
-/// is tagged for the patch uuid.
-#[allow(clippy::too_many_arguments)]
-async fn copy_and_patch(
-    purl: &str,
-    pristine_src: PackageSource<'_>,
-    copy_dir: &Path,
-    uuid_dir: &Path,
-    record: &PatchRecord,
-    sources: &PatchSources<'_>,
-    force: bool,
-    unwind_uuid_dir: bool,
-    name: &str,
-    version: &str,
-    warnings: &mut Vec<VendorWarning>,
-) -> Result<ApplyResult, ApplyResult> {
-    let stage = stage_dir_for(copy_dir);
-    // The local build is the first branch that reads the pristine tree. An
-    // installed crate is copied out of the registry cache; a fetched one is
-    // written straight here from the verified `.crate`, instead of into a
-    // tempdir and copied out of it again. `stage_into` removes + recreates
-    // the stage itself.
-    if let Err(e) = pristine_src
-        .stage_into(&stage, Some(".cargo-checksum.json"))
-        .await
-    {
-        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        return Err(synthesized_result(
-            purl,
-            copy_dir,
-            Vec::new(),
-            false,
-            Some(format!("failed to copy pristine source: {e}")),
-        ));
-    }
-    let mut result = super::force_apply_staged(
-        purl, &stage, record, sources, false, force, name, version, warnings,
-    )
-    .await;
-    result.package_path = copy_dir.display().to_string();
-    if !result.success {
-        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        return Err(result);
-    }
-    let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
-    // Tag the copy's version in the stage (after the patch applied, so the
-    // patch pipeline verified the untagged bytes).
-    if let Err(e) = cargo_tag::tag_copy_manifest(&stage, version, &record.uuid).await {
-        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        result.success = false;
-        result.error = Some(format!("{COPY_UNTAGGABLE}: {e}"));
-        return Err(result);
-    }
-    if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
-        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-        result.success = false;
-        result.error = Some(format!("failed to move the rebuilt copy into place: {e}"));
-        return Err(result);
-    }
-    debug_assert!(
-        result.sidecar.is_none(),
-        "vendor copy must not produce a cargo sidecar"
-    );
-    result.sidecar = None;
-    Ok(result)
 }
 
 /// Everything [`vendor_cargo_crate`] decides before its dry-run branch: the
@@ -758,6 +670,15 @@ async fn cargo_wet_preflight(
             ),
         ));
     }
+    if let cargo_lock::LockEntryProbe::Source(source) =
+        cargo_lock::probe_lock_entry(project_root, name, version).await
+    {
+        if source != "registry+https://github.com/rust-lang/crates.io-index"
+            && source != "sparse+https://index.crates.io/"
+        {
+            return Err(refused("vendor_source_unsupported", format!("{name}@{version} resolves from {source}; server patches require the crates.io package")));
+        }
+    }
     match lock_tag_preflight(project_root, name, version, uuid).await {
         (_, Some(refusal)) => Err(refusal),
         (probe, None) => Ok(probe),
@@ -821,13 +742,11 @@ pub(crate) async fn service_preflight(
 /// Vendor one cargo crate: patched copy + `[patch.crates-io]` entry +
 /// `Cargo.lock` surgery + marker, returning the ledger entry to persist.
 ///
-/// * `pristine_src` — the pristine registry/vendor source dir (the crawler's
-///   `pkg_path`). It is copied, never mutated.
+/// * `pristine_src` — retained for caller compatibility; acquisition uses the service.
 /// * `vendored_at` — caller-formatted RFC3339 timestamp for the marker.
 ///
-/// `dry_run` writes nothing (it verifies against `pristine_src` for an
-/// accurate report). On the in-sync hot path (re-run with everything already
-/// wired) `entry` is `None` — the lock originals are only recoverable from
+/// `dry_run` verifies the server artifact without writes. On an in-sync re-run,
+/// `entry` is `None` — the lock originals are only recoverable from
 /// the existing ledger entry, so the caller must keep it, not overwrite it.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_cargo_crate<'a>(
@@ -835,13 +754,13 @@ pub async fn vendor_cargo_crate<'a>(
     pristine_src: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
-    sources: &PatchSources<'_>,
+    _sources: &PatchSources<'_>,
     vendored_at: &str,
     dry_run: bool,
-    force: bool,
+    _force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
-    let pristine_src = pristine_src.into();
+    let _pristine_src = pristine_src.into();
     let CargoPrelude {
         name,
         version,
@@ -861,44 +780,15 @@ pub async fn vendor_cargo_crate<'a>(
     let (name, version) = (name.as_str(), version.as_str());
 
     if dry_run {
-        // Verify (read-only) against the pristine source — the apply
-        // pipeline never writes when dry_run — for an accurate "would
-        // patch" report (including the auto-force overwrite warnings the
-        // real run would emit), without creating the copy or editing
-        // manifest/config/lock.
-        let mut dry_warnings: Vec<VendorWarning> = Vec::new();
-        // The verify reads the pristine tree, so a lazily-fetched source
-        // materialises here — the one dry-run branch that touches it.
-        let pristine_src = match pristine_src.materialize().await {
-            Ok(dir) => dir,
-            Err(e) => {
-                return done(
-                    synthesized_result(
-                        purl,
-                        &copy_dir,
-                        Vec::new(),
-                        false,
-                        Some(format!("failed to copy pristine source: {e}")),
-                    ),
-                    None,
-                    dry_warnings,
-                )
+        let mut dry_warnings = Vec::new();
+        if !cargo_copy_matches(&copy_dir, &record.files).await {
+            if let Err(outcome) =
+                super::service_fetch::preview_service(service, record, extract_tgz).await
+            {
+                return *outcome;
             }
-        };
-        let mut result = super::force_apply_staged(
-            purl,
-            pristine_src,
-            record,
-            sources,
-            true,
-            force,
-            name,
-            version,
-            &mut dry_warnings,
-        )
-        .await;
-        result.package_path = copy_dir.display().to_string();
-        result.sidecar = None;
+        }
+        let mut result = super::common::preview_result(purl, &copy_dir, &record.files);
         if !legacy_paths.is_empty() {
             dry_warnings.push(migration_warning(project_root, name, version, true).await);
         }
@@ -986,8 +876,7 @@ pub async fn vendor_cargo_crate<'a>(
             // staged: a failure must leave the previous (drifted-but-
             // buildable) copy and the live wiring exactly as they were,
             // never a deleted copy under a still-pointing `[patch]` entry.
-            // Service-preferred like the full path, so
-            // `--vendor-source=service` never quietly builds locally.
+            // Acquisition uses the same verified server archive as the full path.
             if let Some(refusal) = service_offline_conflict(service) {
                 return refusal;
             }
@@ -1007,26 +896,6 @@ pub async fn vendor_cargo_crate<'a>(
                     already_patched_result(purl, &copy_dir, &record.files)
                 }
                 CargoServiceCopy::HardFail(outcome) => return *outcome,
-                CargoServiceCopy::FallBack => {
-                    match copy_and_patch(
-                        purl,
-                        pristine_src,
-                        &copy_dir,
-                        &uuid_dir,
-                        record,
-                        sources,
-                        force,
-                        false, // live-wired: never unwind the uuid dir on failure
-                        name,
-                        version,
-                        &mut warnings,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(result) => return done(result, None, warnings),
-                    }
-                }
             };
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
@@ -1157,26 +1026,11 @@ pub async fn vendor_cargo_crate<'a>(
             already_patched_result(purl, &copy_dir, &record.files)
         }
         CargoServiceCopy::HardFail(outcome) => return *outcome,
-        CargoServiceCopy::FallBack => {
-            match copy_and_patch(
-                purl,
-                pristine_src,
-                &copy_dir,
-                &uuid_dir,
-                record,
-                sources,
-                force,
-                !prior_points_here,
-                name,
-                version,
-                &mut warnings,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(result) => return done(result, None, warnings),
-            }
-        }
+    };
+
+    let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
+        Ok(inventory) => inventory,
+        Err(error) => return refused("vendor_inventory_unavailable", error),
     };
 
     // ── wire the manifest entry ───────────────────────────────────────────
@@ -1327,7 +1181,8 @@ pub async fn vendor_cargo_crate<'a>(
     let marker = VendorMarker::new("cargo", strip_purl_qualifiers(purl), record, vendored_at);
     write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
-    let entry = cargo_entry(purl, record, &copy_rel, &ensured, lock_original);
+    let mut entry = cargo_entry(purl, record, &copy_rel, &ensured, lock_original);
+    entry.artifact.file_inventory = Some(file_inventory);
     done(result, Some(entry), warnings)
 }
 
@@ -1361,6 +1216,7 @@ fn cargo_entry(
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
+            yarn_berry10c0: None,
             path: copy_rel.to_string(),
             sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
             size: None,
@@ -2193,6 +2049,7 @@ mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
+    use crate::patch::apply::ApplyResult;
     use crate::vendor::common::backup_dir_for;
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
@@ -2473,7 +2330,7 @@ mod tests {
         dry_run: bool,
     ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
-        vendor_cargo_crate(
+        crate::vendor::test_support::vendor_cargo_crate(
             purl,
             pristine,
             root,
@@ -2526,7 +2383,12 @@ mod tests {
         let (result, entry, warnings) =
             expect_done(run_vendor(&qualified, root, &blobs, &pristine, &record, false).await);
         assert!(result.success, "vendor failed: {:?}", result.error);
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == "vendor_prebuilt_downloaded"),
+            "unexpected warnings: {warnings:?}"
+        );
 
         // Copy holds the patched bytes and NO checksum sidecar.
         let copy = root.join(copy_rel());
@@ -2731,35 +2593,6 @@ mod tests {
         assert!(manifest_path(root).await.is_some());
     }
 
-    #[tokio::test]
-    async fn test_half_build_rolls_back_copy() {
-        let (dir, _blobs, pristine, record) = fixture().await;
-        let root = dir.path();
-        // Empty blobs dir → the blob read fails mid-apply.
-        let empty = root.join(".socket/empty-blobs");
-        tokio::fs::create_dir_all(&empty).await.unwrap();
-
-        let (result, entry, _warnings) =
-            expect_done(run_vendor(PURL, root, &empty, &pristine, &record, false).await);
-        assert!(!result.success);
-        assert!(entry.is_none());
-        assert!(
-            !root
-                .join(format!(".socket/vendor/cargo/{UUID}"))
-                .join("cfg-if-1.0.4")
-                .exists(),
-            "half-built copy must be rolled back"
-        );
-        // No manifest [patch] entry, lock untouched.
-        assert!(manifest_path(root).await.is_none());
-        assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock"))
-                .await
-                .unwrap(),
-            lock_body()
-        );
-    }
-
     /// A failed FRESH vendor unwinds the whole `<uuid>/` dir with
     /// `remove_tree`, then prunes — the prune must still remove the empty
     /// `.socket/vendor/cargo/` and `.socket/vendor/` levels this run
@@ -2773,8 +2606,9 @@ mod tests {
         let empty = root.join(".socket/empty-blobs");
         tokio::fs::create_dir_all(&empty).await.unwrap();
 
-        let (result, entry, _warnings) =
-            expect_done(run_vendor(PURL, root, &empty, &pristine, &record, false).await);
+        let (result, entry, _warnings) = crate::vendor::test_support::expect_failed(
+            run_vendor(PURL, root, &empty, &pristine, &record, false).await,
+        );
         assert!(!result.success);
         assert!(entry.is_none());
         assert!(
@@ -2899,8 +2733,9 @@ mod tests {
 
         let empty = root.join(".socket/empty-blobs");
         tokio::fs::create_dir_all(&empty).await.unwrap();
-        let (result, entry, _warnings) =
-            expect_done(run_vendor(PURL, root, &empty, &pristine, &record, false).await);
+        let (result, entry, _warnings) = crate::vendor::test_support::expect_failed(
+            run_vendor(PURL, root, &empty, &pristine, &record, false).await,
+        );
         assert!(!result.success, "rebuild must fail without patch content");
         assert!(entry.is_none());
 
@@ -3144,7 +2979,9 @@ mod tests {
             entry.is_none(),
             "hot path must not emit a fresh entry (it would clobber the ledger's lock originals)"
         );
-        assert!(warnings.is_empty());
+        assert!(warnings
+            .iter()
+            .all(|w| w.code == "vendor_prebuilt_downloaded"));
         assert_eq!(
             tokio::fs::read(&copy).await.unwrap(),
             copy1,
@@ -3544,7 +3381,9 @@ mod tests {
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
         assert!(result.success);
         assert!(entry.is_none());
-        assert!(warnings.is_empty());
+        assert!(warnings
+            .iter()
+            .all(|w| w.code == "vendor_prebuilt_downloaded"));
         assert!(!root.join(".cargo").exists());
         assert_eq!(
             tokio::fs::read_to_string(root.join("Cargo.lock"))
@@ -3553,12 +3392,6 @@ mod tests {
             lock_body()
         );
     }
-
-    // ─────────────── service-download path (Tier B: cargo) ───────────────
-    //
-    // cargo vendors a patched source DIRECTORY, so the service path downloads
-    // the prebuilt `.crate`, verifies it, and extracts it into the copy dir.
-    // Both the service path AND the local-build fallback are exercised.
 
     use crate::api::client::{ApiClient, ApiClientOptions};
     use crate::vendor::{VendorServiceConfig, VendorSource};
@@ -3695,7 +3528,7 @@ mod tests {
         let root = dir.path();
         let server = wiremock::MockServer::start().await;
         mount_no_results(&server).await;
-        let cfg = cargo_service_cfg(&server.uri(), VendorSource::Auto, false);
+        let cfg = cargo_service_cfg(&server.uri(), VendorSource::Service, false);
         let sources = PatchSources::blobs_only(&blobs);
         let cases = [
             (PURL, record.clone()),
@@ -3710,7 +3543,7 @@ mod tests {
         let vendor = |purl: String, rec: PatchRecord| -> Borrowed<'_, VendorOutcome> {
             let (pristine, sources, cfg) = (&pristine, &sources, &cfg);
             Box::pin(async move {
-                vendor_cargo_crate(
+                crate::vendor::test_support::vendor_cargo_crate(
                     &purl,
                     pristine,
                     root,
@@ -3726,9 +3559,9 @@ mod tests {
         };
         let planned = plan_matches_grants(&server, &cases, gate, vendor).await;
         assert_eq!(planned, vec![UUID.to_string()]);
-        // Vendored now: the re-run is in sync and asks nothing.
+        // A failed download leaves the same package eligible on retry.
         let rerun = plan_matches_grants(&server, &cases[..1], gate, vendor).await;
-        assert!(rerun.is_empty(), "{rerun:?}");
+        assert_eq!(rerun, planned);
     }
 
     /// Every entry under `root` with its bytes (dirs included, so a husk
@@ -3797,7 +3630,7 @@ mod tests {
                 });
                 let claims_before = super::super::prestage::CLAIMS.with(|c| c.get());
                 let sources = PatchSources::blobs_only(&blobs);
-                let outcome = vendor_cargo_crate(
+                let outcome = crate::vendor::test_support::vendor_cargo_crate(
                     PURL,
                     &pristine,
                     root,
@@ -3858,7 +3691,7 @@ mod tests {
 
         // A deliberately-missing pristine source: the service path must not need it.
         let bogus_pristine = root.join("no-such-pristine");
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &bogus_pristine,
             root,
@@ -3909,7 +3742,7 @@ mod tests {
         mount_cargo_granted(&server, &wrong, &crate_tgz).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -3943,7 +3776,7 @@ mod tests {
         mount_cargo_granted(&server, &wrong, &crate_tgz).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -3952,7 +3785,11 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
         expect_refused(outcome, "vendor_prebuilt_integrity_mismatch");
@@ -3979,7 +3816,7 @@ mod tests {
         mount_cargo_granted(&server, &sri, &crate_tgz).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4007,17 +3844,15 @@ mod tests {
         assert!(!root.join(".cargo").exists());
     }
 
-    /// `auto` + a not-built service status falls back to the local build (which
-    /// copies the pristine source + patches it).
     #[tokio::test]
-    async fn service_unavailable_auto_falls_back_to_build() {
+    async fn service_unavailable_miss_refuses() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let server = wiremock::MockServer::start().await;
         mount_cargo_status(&server, "not_found").await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4026,27 +3861,26 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let (result, entry, _) = expect_done(outcome);
+        let error = crate::vendor::test_support::expect_failure(outcome);
         assert!(
-            result.success,
-            "auto must fall back to the local build: {:?}",
-            result.error
+            error.contains("prebuilt") || error.contains("patch service"),
+            "{error}"
         );
-        assert!(entry.is_some());
-        // The locally-built copy has the patched content.
-        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
     }
-
     /// `--offline` + `--vendor-source=service` refuses without any network.
     #[tokio::test]
     async fn offline_service_mode_refuses() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4073,6 +3907,7 @@ mod tests {
             base_purl: PURL.into(),
             uuid: uuid.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
                 sha256: String::new(),
                 size: None,
@@ -4373,14 +4208,14 @@ mod tests {
     /// `auto` + a still-building service artifact falls back to the local
     /// build with a `vendor_prebuilt_pending` advisory explaining why.
     #[tokio::test]
-    async fn service_pending_auto_falls_back_with_warning() {
+    async fn service_pending_miss_refuses() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let server = wiremock::MockServer::start().await;
         mount_cargo_status(&server, "pending_build").await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4389,32 +4224,19 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let (result, entry, warnings) = expect_done(outcome);
+        let error = crate::vendor::test_support::expect_failure(outcome);
         assert!(
-            result.success,
-            "auto must fall back to the local build: {:?}",
-            result.error
-        );
-        assert!(entry.is_some());
-        // The locally-built copy has the patched content.
-        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "vendor_prebuilt_pending")
-            .unwrap_or_else(|| panic!("missing pending warning: {warnings:?}"));
-        assert!(w.detail.contains("still building"), "{}", w.detail);
-        assert!(
-            w.detail.ends_with("; building locally instead"),
-            "{}",
-            w.detail
+            error.contains("prebuilt") || error.contains("patch service"),
+            "{error}"
         );
     }
-
-    /// `service` mode + a still-building artifact hard-fails (no local-build
-    /// fallback), writing nothing.
     #[tokio::test]
     async fn service_pending_service_mode_hard_fails() {
         let (dir, blobs, pristine, record) = fixture().await;
@@ -4423,7 +4245,7 @@ mod tests {
         mount_cargo_status(&server, "pending_build").await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4462,7 +4284,7 @@ mod tests {
         mount_cargo_status(&server, "not_found").await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4493,18 +4315,15 @@ mod tests {
         );
     }
 
-    /// `auto` + a request-level service failure (`forbidden` →
-    /// `ServiceArtifact::Failed`) falls back to the local build with a
-    /// `vendor_prebuilt_unavailable` advisory.
     #[tokio::test]
-    async fn service_failed_auto_falls_back_with_warning() {
+    async fn service_failed_miss_refuses() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let server = wiremock::MockServer::start().await;
         mount_cargo_status(&server, "forbidden").await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4513,33 +4332,19 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let (result, entry, warnings) = expect_done(outcome);
+        let error = crate::vendor::test_support::expect_failure(outcome);
         assert!(
-            result.success,
-            "auto must fall back to the local build: {:?}",
-            result.error
-        );
-        assert!(entry.is_some());
-        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "vendor_prebuilt_unavailable")
-            .unwrap_or_else(|| panic!("missing unavailable warning: {warnings:?}"));
-        assert!(
-            w.detail.contains("patch service request failed"),
-            "{}",
-            w.detail
-        );
-        assert!(
-            w.detail.ends_with("; building locally instead"),
-            "{}",
-            w.detail
+            error.contains("prebuilt") || error.contains("patch service"),
+            "{error}"
         );
     }
-
     /// A downloaded archive that PASSES SRI verification but is not a valid
     /// tar.gz hard-fails (`vendor_prebuilt_extract_failed`) in every mode —
     /// and the failed run leaves no vendor husk, wiring, or lock edit behind.
@@ -4552,7 +4357,7 @@ mod tests {
         mount_cargo_granted(&server, &sri_sha512(bytes), bytes).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4609,7 +4414,7 @@ mod tests {
         mount_cargo_granted(&server, &sri, &crate_tgz).await;
         let sources = PatchSources::blobs_only(&blobs);
 
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -4636,53 +4441,6 @@ mod tests {
         );
     }
 
-    // ── local-build + wiring error paths ──────────────────────────────────
-
-    /// A missing pristine source (the crawler's pkg_path was deleted between
-    /// scan and vendor, no service configured) fails cleanly: a synthesized
-    /// "failed to copy pristine source" result and a full unwind — no vendor
-    /// husk, no wiring, lock untouched.
-    #[tokio::test]
-    async fn local_build_missing_pristine_fails_cleanly() {
-        let (dir, blobs, _pristine, record) = fixture().await;
-        let root = dir.path();
-        let bogus_pristine = root.join("no-such-pristine");
-
-        let (result, entry, _warnings) =
-            expect_done(run_vendor(PURL, root, &blobs, &bogus_pristine, &record, false).await);
-        assert!(!result.success);
-        assert!(entry.is_none());
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("failed to copy pristine source"),
-            "error names the copy step: {:?}",
-            result.error
-        );
-        assert_eq!(
-            result.package_path,
-            root.join(copy_rel()).display().to_string(),
-            "the synthesized result reports the copy path"
-        );
-        assert!(
-            !root.join(".socket/vendor").exists(),
-            "the vendor levels created by this failed run are pruned"
-        );
-        assert!(!root.join(".cargo").exists(), "nothing wired");
-        assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock"))
-                .await
-                .unwrap(),
-            lock_body()
-        );
-    }
-
-    /// A manifest WRITE failure after a successful local build (the
-    /// project root is read-only, so the atomic rewrite cannot stage its
-    /// sibling file, while `.socket/` stays writable) unwinds the copy and
-    /// prunes the husks; the manifest and the lock are never touched.
     #[cfg(unix)]
     #[tokio::test]
     async fn manifest_write_failure_unwinds_copy() {
@@ -5404,7 +5162,7 @@ mod tests {
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         let sources = PatchSources::blobs_only(blobs);
         expect_done(
-            vendor_cargo_crate(
+            crate::vendor::test_support::vendor_cargo_crate(
                 PURL,
                 pristine,
                 root,
@@ -5413,13 +5171,12 @@ mod tests {
                 "2026-06-09T00:00:00Z",
                 false,
                 false,
-                Some(&cargo_service_cfg(uri, VendorSource::Auto, false)),
+                Some(&cargo_service_cfg(uri, VendorSource::Service, false)),
             )
             .await,
         )
     }
 
-    /// A service crate that differs from the local build in NON-patched bytes.
     fn flip_service_crate() -> Vec<u8> {
         make_crate_tgz(
             "cfg-if-1.0.4",
@@ -5432,25 +5189,6 @@ mod tests {
                 ("README.service.md", b"built by the service\n"),
             ],
         )
-    }
-
-    #[tokio::test]
-    async fn flip_local_then_service_is_noop() {
-        use crate::vendor::test_support as ts;
-        let (dir, blobs, pristine, record) = fixture().await;
-        let root = dir.path();
-        let down = wiremock::MockServer::start().await;
-        ts::mount_503(&down).await;
-        let (r1, e1, _) = flip_run(root, &blobs, &pristine, &record, &down.uri()).await;
-        assert!(r1.success && e1.is_some());
-        let before = ts::tree_snapshot(root);
-        let up = wiremock::MockServer::start().await;
-        let tgz = flip_service_crate();
-        mount_cargo_granted(&up, &sri_sha512(&tgz), &tgz).await;
-        let (r2, e2, w2) = flip_run(root, &blobs, &pristine, &record, &up.uri()).await;
-        assert!(r2.success && e2.is_none() && r2.files_patched.is_empty() && w2.is_empty());
-        assert_eq!(ts::tree_snapshot(root), before, "tree byte-identical");
-        assert_eq!(ts::request_count(&up).await, 0);
     }
 
     #[tokio::test]
@@ -5482,7 +5220,7 @@ mod tests {
         let mut cfg = cargo_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
         cfg.client = None;
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -5525,7 +5263,7 @@ mod tests {
                 cfg.client = None;
             }
             let sources = PatchSources::blobs_only(&blobs);
-            let outcome = vendor_cargo_crate(
+            let outcome = crate::vendor::test_support::vendor_cargo_crate(
                 PURL,
                 &pristine,
                 root,
@@ -5564,7 +5302,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mount_cargo_granted(&server, &sri_sha512(&crate_tgz), &crate_tgz).await;
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &root.join("no-such-pristine"),
             root,
@@ -6691,12 +6429,6 @@ mod tests {
         assert_eq!(lock_text(root).await, lock);
     }
 
-    /// A pristine crate whose `Cargo.toml` cannot take the tag
-    /// (a workspace-inherited version) fails the local build with
-    /// `cargo_copy_untaggable`: nothing is swapped in, no stage or vendor
-    /// dir survives, and the manifest and lock are untouched. The same
-    /// crate from the patch service is a MISS: auto mode falls back to the
-    /// local build.
     #[tokio::test]
     async fn an_untaggable_copy_manifest_swaps_nothing_in() {
         let (dir, blobs, pristine, record) = fixture().await;
@@ -6708,14 +6440,15 @@ mod tests {
         .await
         .unwrap();
         let manifest = tokio::fs::read(root.join("Cargo.toml")).await.unwrap();
-        let (result, entry, _) =
-            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let (result, entry, _) = crate::vendor::test_support::expect_failed(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+        );
         assert!(!result.success && entry.is_none());
         assert!(
             result
                 .error
                 .as_deref()
-                .is_some_and(|e| e.starts_with(COPY_UNTAGGABLE)),
+                .is_some_and(|e| e.contains("cannot tag")),
             "{:?}",
             result.error
         );
@@ -6746,7 +6479,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mount_cargo_granted(&server, &sri, &crate_tgz).await;
         let sources = PatchSources::blobs_only(&blobs);
-        let outcome = vendor_cargo_crate(
+        let outcome = crate::vendor::test_support::vendor_cargo_crate(
             PURL,
             &pristine,
             root,
@@ -6755,24 +6488,16 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let (result, entry, warnings) = expect_done(outcome);
-        assert!(result.success, "{:?}", result.error);
-        assert!(entry.is_some());
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"
-                    && w.detail.contains("cannot tag its version")),
-            "{warnings:?}"
-        );
-        assert!(
-            copy_toml(root).await.contains(&tagged(UUID)),
-            "the local build"
-        );
-        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
+        let error = crate::vendor::test_support::expect_failure(outcome);
+        assert!(error.contains("cannot tag its version"), "{error}");
+        assert!(!root.join(".socket/vendor").exists());
     }
 
     /// V-7: the per-manifest pin extraction answers

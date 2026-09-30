@@ -273,7 +273,7 @@ fn check_target_unit(
             Some(parts)
                 if parts.eco == "pypi"
                     && parts.uuid == record_uuid
-                    && crate::utils::pdm_lock::wheel_matches(&parts.leaf, canon_name, version) =>
+                    && super::pypi_distribution::matches(&parts.leaf, canon_name, version) =>
             {
                 Ok(PdmTarget::InSync)
             }
@@ -718,6 +718,7 @@ distribution = false
             base_purl: "pkg:pypi/six@1.16.0".into(),
             uuid: UUID.into(),
             artifact: VendorArtifact {
+                yarn_berry10c0: None,
                 path: REL_WHEEL.into(),
                 sha256: WHEEL_SHA.into(),
                 size: Some(11053),

@@ -113,31 +113,33 @@ async fn mount_gem_patch_api(mock: &MockServer) {
         })))
         .mount(mock)
         .await;
+    let archive_view = serde_json::json!({
+        "uuid": GEM_UUID,
+        "purl": GEM_PURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "lib/padlock.rb": {
+                "beforeHash": before_hash,
+                "afterHash":  after_hash,
+                "blobContent": AFTER_B64,
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-dddd-eeee-ffff": {
+                "cves": ["CVE-2026-0002"],
+                "summary": "gem test vuln",
+                "severity": "high",
+                "description": "details"
+            }
+        },
+        "description": "Gem vendor patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    crate::prebuilt_common::mount_view(mock, &archive_view, Some(GEMSPEC_STUB)).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{GEM_UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": GEM_UUID,
-            "purl": GEM_PURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "lib/padlock.rb": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
-            "vulnerabilities": {
-                "GHSA-dddd-eeee-ffff": {
-                    "cves": ["CVE-2026-0002"],
-                    "summary": "gem test vuln",
-                    "severity": "high",
-                    "description": "details"
-                }
-            },
-            "description": "Gem vendor patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(archive_view))
         .mount(mock)
         .await;
 }
@@ -226,6 +228,7 @@ async fn repair_keeps_corrupt_forensic_bytes_when_rebuild_dispatch_refuses() {
     )))
     .unwrap();
 
+    mock.reset().await;
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);

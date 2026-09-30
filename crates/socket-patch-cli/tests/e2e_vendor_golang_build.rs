@@ -25,6 +25,9 @@
 //! record, never with a tampered artifact member or a reverted go.mod. The
 //! Go release is whatever `go` is on `PATH` (see `golang_e2e_matrix`).
 
+#[path = "prebuilt_common/mod.rs"]
+mod prebuilt_common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -60,7 +63,7 @@ fn binary() -> PathBuf {
 /// go crawler resolves installed modules through it).
 fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
@@ -68,6 +71,12 @@ fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, Strin
     }
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env("GOMODCACHE", modcache);
+    let _fixture = prebuilt_common::prepare_command(
+        &mut cmd,
+        cwd,
+        args,
+        &[("GOMODCACHE", modcache.to_str().unwrap())],
+    );
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -614,27 +623,29 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
     // inline blobContent, so the vendor step's in-memory staging hash-gates
     // pass with no `.socket/` seed on disk.
     let server = MockServer::start().await;
+    let view = serde_json::json!({
+        "uuid": UUID,
+        "purl": UPURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "lib.go": {
+            "beforeHash": git_sha256(PRISTINE_LIB.as_bytes()),
+            "afterHash": git_sha256(PATCHED_LIB.as_bytes()),
+            "blobContent": b64(PATCHED_LIB.as_bytes()),
+        }},
+        "vulnerabilities": { "GHSA-vend-golang-get1": {
+            "cves": ["CVE-2026-77777"],
+            "summary": "get-vendored capstone vuln",
+            "severity": "high",
+            "description": "d",
+        }},
+        "description": "get-vendored capstone patch",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view(&server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": UPURL,
-            "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "lib.go": {
-                "beforeHash": git_sha256(PRISTINE_LIB.as_bytes()),
-                "afterHash": git_sha256(PATCHED_LIB.as_bytes()),
-                "blobContent": b64(PATCHED_LIB.as_bytes()),
-            }},
-            "vulnerabilities": { "GHSA-vend-golang-get1": {
-                "cves": ["CVE-2026-77777"],
-                "summary": "get-vendored capstone vuln",
-                "severity": "high",
-                "description": "d",
-            }},
-            "description": "get-vendored capstone patch",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
         .mount(&server)
         .await;
 
@@ -648,7 +659,7 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
             "--json",
             "--yes",
             "--vendor-source",
-            "build",
+            "service",
             "--cwd",
             consumer.to_str().unwrap(),
             "--api-url",
