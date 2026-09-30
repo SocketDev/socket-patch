@@ -914,6 +914,17 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Agent mode finds packages in npm's linked store and a relocated pnpm
+  virtual store.** With npm's `install-strategy=linked`, transitive
+  packages live only in `node_modules/.store`. With a pnpm
+  `virtualStoreDir` setting, they live wherever `node_modules/.modules.yaml`
+  says. The crawler only knew `node_modules/.pnpm` (and `.vlt`), so
+  `scan`, `apply`, `rollback` and `vendor` reported those packages
+  `package_not_installed` and left them unpatched (#359, #362). Both
+  stores are now walked. A recorded store outside the project, such as
+  pnpm's global virtual store (`enableGlobalVirtualStore`), is shared
+  with other projects and is still not patched in place.
+
 - **Hosted nuget redirects survive a `<clear />` in `nuget.config`.** The
   Socket source (and, in an existing `<packageSourceMapping>`, its
   mapping) was inserted ahead of the section's `<clear />`, which NuGet
