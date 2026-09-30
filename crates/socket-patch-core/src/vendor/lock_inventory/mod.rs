@@ -71,7 +71,7 @@ pub(crate) mod wired;
 pub(crate) mod yarn;
 
 pub(crate) use self::composer::{composer_lock_packages, ComposerLockPackage};
-pub(crate) use self::npm::{npm_lock_nodes, NpmLockNode};
+pub(crate) use self::npm::{npm_lock_bundled_nodes, npm_lock_nodes, NpmLockNode};
 #[cfg(test)]
 pub(crate) use self::npm_family::inventory_npm_lock;
 pub(crate) use self::pnpm::pnpm_registry_key;

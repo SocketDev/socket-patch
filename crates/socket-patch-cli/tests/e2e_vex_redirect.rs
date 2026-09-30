@@ -1617,6 +1617,61 @@ fn a_sibling_lock_resolving_the_registry_contests_a_ledger_record() {
     }
 }
 
+/// REGRESSION (#325): the hosted rewriter rewires the hoisted
+/// `left-pad@1.3.0` and skips a parent's bundled copy of the same version
+/// (`redirect_npm_bundled_instance_skipped`: npm unpacks it from the
+/// parent's tarball, so it stays unpatched). The ledger record must be dead
+/// (`redirect_unwired`, naming the bundled copy), not attested from the
+/// lock basis. Without the bundled copy the same ledger attests.
+#[test]
+fn hosted_npm_patch_with_an_unpatched_bundled_copy_is_not_attested() {
+    let purl = "pkg:npm/left-pad@1.3.0";
+    for bundled in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        write_hosted_package_lock(cwd, &[("left-pad", "1.3.0", UUID)], true);
+        if bundled {
+            let lock_path = cwd.join("package-lock.json");
+            let mut lock: Value =
+                serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+            let packages = lock["packages"].as_object_mut().unwrap();
+            packages.insert(
+                "node_modules/bund".to_string(),
+                serde_json::json!({ "version": "1.0.0", "resolved": "file:bund-1.0.0.tgz" }),
+            );
+            packages.insert(
+                "node_modules/bund/node_modules/left-pad".to_string(),
+                serde_json::json!({
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "inBundle": true
+                }),
+            );
+            std::fs::write(&lock_path, lock.to_string()).unwrap();
+        }
+        write_redirect_ledger(
+            cwd,
+            &[(
+                purl,
+                make_record(UUID, &"b".repeat(64), "GHSA-bndl-host", &["CVE-2026-325"]),
+            )],
+            &[("package-lock.json", "npm_lock_entry")],
+        );
+        let (code, env) = vex_json(cwd, &["--offline", "--no-verify"]);
+        if !bundled {
+            assert_eq!(code, Some(0), "control: {env}");
+            continue;
+        }
+        assert_eq!(code, Some(1), "{env}");
+        assert_eq!(skipped_reason(&env, purl), "redirect_unwired", "{env}");
+        assert!(
+            env.to_string()
+                .contains("node_modules/bund/node_modules/left-pad"),
+            "the bundled copy is named: {env}"
+        );
+    }
+}
+
 /// REGRESSION: a hosted pin with NO lock at all is the rewriters' ordinary
 /// output, not a stale shape — `rewrite_nuget` edits only nuget.config for a
 /// project without RestorePackagesWithLockFile, `rewrite_cargo` only
