@@ -1195,7 +1195,12 @@ fn pip_vendored_requirements_evaluate_environment_markers() {
             "install upstream six",
         );
         let patched = stage_patch(&project, &site_packages(&venv).join("six.py"));
-        let original = format!("six==1.16.0 ; {marker}\n");
+        // Hash-pinned (pip-compile style), so the fresh install below can run
+        // `--require-hashes`: a hashed file keeps the vendor line hashed
+        // (#376), and the marker must survive next to the `--hash`.
+        let original = format!(
+            "six==1.16.0 ; {marker} \\\n    --hash=sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\n"
+        );
         std::fs::write(project.join("requirements.txt"), &original).unwrap();
         let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &project);
         assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");

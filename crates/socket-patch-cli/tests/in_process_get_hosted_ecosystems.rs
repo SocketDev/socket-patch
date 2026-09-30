@@ -184,8 +184,10 @@ fn assert_no_manifest_no_blobs(cwd: &Path) {
 // ---------------------------------------------------------------------------
 
 /// A pip project pinning `requests==2.31.0`: the hosted grant must rewrite
-/// that one line to `requests @ <hosted-url> --hash=sha256:<hex>` (the
-/// integrity pin fails closed on tampered bytes), leave the bystander line
+/// that one line to `requests @ <hosted-url>#sha256=<hex>` (the integrity
+/// pin fails closed on tampered bytes; a url fragment, not `--hash`, since
+/// one `--hash` would put pip in hash-checking mode for the unhashed
+/// `flask` line too — #376), leave the bystander line
 /// byte-identical, record the ledger — and write no manifest.
 #[tokio::test]
 #[serial]
@@ -221,7 +223,7 @@ async fn pypi_requirements_hosted_rewrites_pinned_line() {
     assert_eq!(code, 0, "get <uuid> --mode hosted (pypi) should succeed");
 
     let reqs = std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
-    let expected_line = format!("requests @ {url} --hash=sha256:{SHA256}");
+    let expected_line = format!("requests @ {url}#sha256={SHA256}");
     assert!(
         reqs.lines().any(|l| l == expected_line),
         "requirements.txt must pin the hosted wheel URL + sha256; got:\n{reqs}"
