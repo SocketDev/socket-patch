@@ -37,6 +37,55 @@ pub(crate) const REBASE_KINDS: &[&str] = &[
     socket_patch_core::patch::redirect::vlt::KIND,
 ];
 
+/// The `original` a rebased PDM lock edit keeps: `recorded` is the ledger's
+/// edit, `fresh` this run's edit for the same drifted unit.
+///
+/// `pdm lock` re-resolves to the registry (and may reflow CRLF → LF), so the
+/// fresh `original` IS the relocked-registry rollback target. But `pdm add
+/// <other>` and `pdm lock --update-reuse` re-lay the unit while keeping the
+/// patch: PDM 2.26+ keeps the Socket `url` and patched sha256, 2.12–2.20 keep
+/// just the patched sha256. Adopting that still-patched fragment would make
+/// rollback "revert" patched → patched and report success (#331). While the
+/// fresh `original` still carries any string the recorded edit introduced
+/// (a quoted value in its `new` that its `original` lacks: the url, the
+/// patched hash), keep the recorded pristine `original`, re-laid in the
+/// fresh fragment's line endings so it splices into the relocked text.
+pub(crate) fn rebased_pdm_original(
+    recorded: &socket_patch_core::patch::redirect::FileEdit,
+    fresh: &socket_patch_core::patch::redirect::FileEdit,
+) -> Option<serde_json::Value> {
+    let as_str =
+        |v: &Option<serde_json::Value>| v.as_ref().and_then(|v| v.as_str().map(str::to_owned));
+    let (Some(pristine), Some(wired), Some(current)) = (
+        as_str(&recorded.original),
+        as_str(&recorded.new),
+        as_str(&fresh.original),
+    ) else {
+        return fresh.original.clone();
+    };
+    let introduced = ['"', '\''].into_iter().flat_map(|quote| {
+        wired
+            .split(quote)
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    let still_patched = introduced
+        .filter(|token| !token.is_empty() && !pristine.contains(token.as_str()))
+        .any(|token| current.contains(token.as_str()));
+    if !still_patched {
+        return fresh.original.clone();
+    }
+    let lf = pristine.replace("\r\n", "\n");
+    let relaid = if current.contains("\r\n") {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    };
+    Some(serde_json::Value::String(relaid))
+}
+
 pub(crate) const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -2997,17 +3046,14 @@ pub(crate) async fn run_redirect_selected(
                     .unwrap_or(0);
                 if let Some(&target) = siblings.get(nth) {
                     if !rebased.contains(&target) {
-                        // `pdm lock` fully un-patches the lock (registry source
-                        // restored) and may reflow line endings (CRLF → LF), so
-                        // the fresh run's `original` IS the correct
-                        // relocked-registry rollback target and the stale
-                        // recorded one would restore a mismatched fragment.
-                        // Poetry's relock instead KEEPS the Socket source (it
-                        // only drops the inserted `files` line), so its oldest
+                        // Poetry's relock KEEPS the Socket source (it only
+                        // drops the inserted `files` line), so its oldest
                         // `original` — the true pre-patch fragment — must
-                        // survive; only its `new` is refreshed.
+                        // survive; only its `new` is refreshed. PDM's depends
+                        // on what the relock did: see `rebased_pdm_original`.
                         if edit.kind == "redirect_pdm_lock_package" {
-                            ledger.edits[target].original = edit.original.clone();
+                            ledger.edits[target].original =
+                                rebased_pdm_original(&ledger.edits[target], edit);
                         }
                         ledger.edits[target].new = edit.new.clone();
                         ledger.edits[target].action = edit.action.clone();

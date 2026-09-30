@@ -12,7 +12,7 @@ use socket_patch_core::patch::redirect::{
 };
 use socket_patch_core::vendor::lock_inventory::{MemoryEntry, MemoryProject};
 
-use crate::commands::scan::hosted::{rebase_vlt_edits, REBASE_KINDS};
+use crate::commands::scan::hosted::{rebase_vlt_edits, rebased_pdm_original, REBASE_KINDS};
 
 /// Load the project's ledger: `Ok(None)` when absent, `Err` (the disk
 /// message) when present but unreadable or malformed.
@@ -92,7 +92,8 @@ pub(crate) fn merge(
         if let Some(&target) = siblings.get(nth) {
             if !rebased.contains(&target) {
                 if edit.kind == "redirect_pdm_lock_package" {
-                    ledger.edits[target].original = edit.original.clone();
+                    ledger.edits[target].original =
+                        rebased_pdm_original(&ledger.edits[target], edit);
                 }
                 ledger.edits[target].new = edit.new.clone();
                 ledger.edits[target].action = edit.action.clone();

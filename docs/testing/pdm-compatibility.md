@@ -66,6 +66,14 @@ Measured details:
   (pristine → current, never an appended chain), so `rollback` still lands on the
   pristine lock afterwards. This matters most for CRLF locks, which PDM
   re-renders to a different byte layout on relock.
+- **`pdm add` and `pdm lock --update-reuse` keep the patch but re-lay its
+  unit.** PDM 2.26+ keeps the Socket `url` and patched hash; 2.12–2.20 drop
+  the `url` and keep the patched hash (a registry unit pinned to the patched
+  wheel, which `pdm sync` refuses). The re-scan rewires the unit and keeps
+  the ledger's recorded pristine unit, in the relocked line endings, as the
+  rollback target. It adopts the re-laid unit only once that unit no longer
+  carries anything the redirect introduced. So `rollback` restores the
+  upstream unit inside the user's re-rendered lock.
 - **Hosted mode verifies the lock's file hash** on install for every supported
   release (tamper the hash and `pdm sync` fails closed). Vendored mode's
   protection is the committed wheel bytes, verified by the same hash.

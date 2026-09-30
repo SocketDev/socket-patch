@@ -914,6 +914,15 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Hosted PDM `rollback` removes the patch after `pdm add` and a re-scan.**
+  `pdm add <other>` and `pdm lock --update-reuse` re-lay the redirected
+  `pdm.lock` unit but keep Socket's `url` and patched hash (PDM 2.26+), or
+  just the patched hash (2.12–2.20). A re-scan then recorded that
+  still-patched unit as the pristine one, so `rollback` reported success
+  and deleted the ledger while the lock stayed patched, or, on 2.12–2.20,
+  stopped installing. The re-scan now keeps the recorded pristine unit
+  whenever the re-laid one still carries the patch.
+
 - **Hosted nuget redirects survive a `<clear />` in `nuget.config`.** The
   Socket source (and, in an existing `<packageSourceMapping>`, its
   mapping) was inserted ahead of the section's `<clear />`, which NuGet
