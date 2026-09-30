@@ -914,6 +914,16 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **`vex` no longer attests an npm package that also ships a bundled,
+  unpatched copy.** When a lock rewires `name@version` to a Socket patch
+  and another package bundles the same `name@version` (`inBundle: true`,
+  or v1 `bundled: true`), npm unpacks that copy from the parent's tarball
+  and it stays unpatched. The rewriters warned about it, but `vex` and
+  `scan --vex` still attested the package `not_affected`. The reference is
+  now reported `patched_ref_unattributable`, naming the bundled copy, and
+  is not attested, in hosted and vendored mode, with or without
+  `node_modules` (#325).
+
 - **Hosted nuget redirects survive a `<clear />` in `nuget.config`.** The
   Socket source (and, in an existing `<packageSourceMapping>`, its
   mapping) was inserted ahead of the section's `<clear />`, which NuGet
