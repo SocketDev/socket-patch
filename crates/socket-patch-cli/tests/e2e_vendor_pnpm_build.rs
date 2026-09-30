@@ -1791,3 +1791,85 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
     assert!(!proj.join(".socket/vendor").exists());
     eprintln!("REVERT OK ({pm})");
 }
+
+/// #362: pnpm's `virtualStoreDir` moves the virtual store, and a
+/// transitive dependency lives only there. Agent-mode `apply` must find
+/// it through `node_modules/.modules.yaml` and patch the copy Node
+/// loads, and `rollback` must restore it: both for a store next to
+/// `node_modules` and for one inside it under a custom hidden name.
+#[test]
+fn pnpm_agent_apply_patches_a_transitive_dep_in_a_relocated_virtual_store() {
+    if !has_corepack_pm(PNPM_PRIMARY) {
+        println!("SKIP: `corepack {PNPM_PRIMARY}` unavailable");
+        return;
+    }
+    for (setting, store_rel) in [
+        (".vstore", ".vstore"),
+        ("node_modules/.custom", "node_modules/.custom"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            r#"{"name":"vsd","version":"0.0.0","private":true,"dependencies":{"is-odd":"3.0.1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("pnpm-workspace.yaml"),
+            format!("virtualStoreDir: {setting}\n"),
+        )
+        .unwrap();
+        let store = tmp.path().join("pnpm-store");
+        let install = corepack(
+            &proj,
+            PNPM_PRIMARY,
+            &["install", "--store-dir", store.to_str().unwrap()],
+        );
+        if !install.status.success() {
+            assert!(!pnpm_required(), "fixture install failed: {install:?}");
+            println!("SKIP: fixture `pnpm install` failed: {install:?}");
+            return;
+        }
+        // is-odd@3.0.1 depends on is-number@6.0.0: transitive, store-only.
+        let copy = proj
+            .join(store_rel)
+            .join("is-number@6.0.0/node_modules/is-number");
+        let index = copy.join("index.js");
+        let orig = std::fs::read(&index)
+            .unwrap_or_else(|e| panic!("{setting}: pnpm put is-number at {}: {e}", copy.display()));
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        stage_patch(
+            &proj,
+            "pkg:npm/is-number@6.0.0",
+            "package/index.js",
+            &orig,
+            &patched,
+        );
+        std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+        let cwd = proj.to_str().unwrap();
+
+        let (code, stdout, stderr) =
+            run_socket(&proj, &["apply", "--json", "--offline", "--cwd", cwd]);
+        assert_eq!(code, 0, "{setting}: apply failed.\n{stdout}\n{stderr}");
+        let env = parse_envelope(&stdout);
+        assert_eq!(env["summary"]["applied"], 1, "{setting}: {env}");
+        assert_eq!(std::fs::read(&index).unwrap(), patched, "{setting}");
+        // Node loads that very copy.
+        let script = "const p=require('path');process.stdout.write(require('fs').readFileSync(\
+             require.resolve('is-number',{paths:[p.dirname(require.resolve('is-odd'))]}),'utf8'))";
+        let out = Command::new("node")
+            .args(["-e", script])
+            .current_dir(&proj)
+            .output()
+            .expect("node runs");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with(MARKER),
+            "{setting}: {out:?}"
+        );
+
+        let (code, stdout, stderr) = run_socket(&proj, &["rollback", "--json", "--cwd", cwd]);
+        assert_eq!(code, 0, "{setting}: rollback failed.\n{stdout}\n{stderr}");
+        assert_eq!(std::fs::read(&index).unwrap(), orig, "{setting}");
+    }
+}
