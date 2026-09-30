@@ -1392,7 +1392,7 @@ jobs:
           SOCKET_PATCH_BUNDLER_E2E_VERSION: ${{ matrix.bundler }}
           SOCKET_PATCH_COMPOSER_E2E_REQUIRED: ${{ matrix.composer != '' && '1' || '' }}
           SOCKET_PATCH_COMPOSER_E2E_VERSION: ${{ matrix.composer }}
-          SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ matrix.maven != '' && '1' || '' }}
+          SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ (matrix.maven != '' || matrix.gradle != '') && '1' || '' }}
           SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ matrix.maven }}
           SOCKET_PATCH_GRADLE_E2E_REQUIRED: ${{ matrix.gradle != '' && '1' || '' }}
           SOCKET_PATCH_GRADLE_E2E_VERSION: ${{ matrix.gradle }}

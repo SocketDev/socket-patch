@@ -1364,7 +1364,8 @@ fn composer_vendor_keeps_files_mirror_filters_would_drop() {
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning (vendor_composer_mirror_filters_neutralized)"),
+        stderr.contains("Warning:")
+            && stderr.contains("Composer's path mirror would have skipped files"),
         "the neutralization is surfaced:\n{stderr}"
     );
     assert!(

@@ -840,13 +840,14 @@ async fn vendor_maven_jvm(
     let display_path = project_root.join(".socket/vendor");
     if record.files.is_empty() {
         let reader = super::jvm::apply::ProjectReader::new(project_root);
+        let probe_pom = format!("<project><groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{version}</version></project>");
         let patch = super::jvm::JvmPatch {
             group_id: &group_id,
             artifact_id: &artifact_id,
             version: &version,
             uuid: &record.uuid,
             jar: &[],
-            upstream_pom: b"<project></project>",
+            upstream_pom: probe_pom.as_bytes(),
             upstream_module: None,
         };
         let plan = super::jvm::plan(shape, &|rel| reader.read(rel), &patch);
