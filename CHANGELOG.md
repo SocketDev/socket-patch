@@ -914,6 +914,18 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Hosted Maven warns when your Maven ignores the Trusted Checksums
+  pin.** Maven 3.9.0 to 3.9.3 do not enforce the `.mvn/maven.config` and
+  `.mvn/checksums/checksums.sha256` pair that hosted mode writes. 3.9.0
+  and 3.9.1 never find the summary file, and 3.9.2 and 3.9.3 check SHA-1
+  only. On those releases a re-signed jar with a matching `.sha1` installs
+  without error. The 4.0.0 notes and `docs/ecosystems.md` wrongly said
+  every 3.9 release enforces the pin; enforcement starts at 3.9.4. When
+  `.mvn/wrapper/maven-wrapper.properties` pins an older Maven, `scan
+  --mode hosted` now warns `redirect_maven_trusted_checksums_unenforced`.
+  It still writes the files, and the version suffixing still fails closed.
+  CI now runs the real-Maven hosted capstone on 3.9.3 and 3.9.4 (#258).
+
 - **Hosted nuget redirects survive a `<clear />` in `nuget.config`.** The
   Socket source (and, in an existing `<packageSourceMapping>`, its
   mapping) was inserted ahead of the section's `<clear />`, which NuGet
