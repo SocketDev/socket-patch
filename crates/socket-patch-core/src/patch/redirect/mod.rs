@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
-use crate::vendor::npm_origin::npm_non_registry_entries;
+use crate::vendor::npm_origin::{legacy_packages_key, npm_non_registry_entries};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -944,6 +944,8 @@ fn rewrite_one_npm_lock(
         if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
             changed = rewrite_npm_v2_deps(
                 deps,
+                "",
+                &non_registry,
                 &fname,
                 dep,
                 &sha512,
@@ -1018,8 +1020,11 @@ fn rewrite_npm_entry(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_npm_v2_deps(
     deps: &mut serde_json::Map<String, Value>,
+    parent_key: &str,
+    non_registry: &BTreeMap<String, String>,
     fname: &str,
     dep: &DepOverride,
     sha512: &str,
@@ -1029,6 +1034,7 @@ fn rewrite_npm_v2_deps(
 ) -> bool {
     let mut changed = false;
     for (name, entry) in deps.iter_mut() {
+        let packages_key = legacy_packages_key(parent_key, name);
         if name == fname
             && entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str())
         {
@@ -1044,6 +1050,12 @@ fn rewrite_npm_v2_deps(
                          or update the bundling parent to cover it"
                     ),
                 });
+            } else if non_registry.contains_key(&packages_key) {
+                // The mirror of a `packages` entry npm installs from a git /
+                // url / `file:` spec: that twin was skipped (and warned about)
+                // above, so rewriting this copy would only record an edit for
+                // bytes that never install.
+                *matched_any = true;
             } else {
                 *matched_any = true;
                 if let Some(edit) =
@@ -1055,9 +1067,17 @@ fn rewrite_npm_v2_deps(
             }
         }
         if let Some(nested) = entry.get_mut("dependencies").and_then(Value::as_object_mut) {
-            changed =
-                rewrite_npm_v2_deps(nested, fname, dep, sha512, lockfile, result, matched_any)
-                    || changed;
+            changed = rewrite_npm_v2_deps(
+                nested,
+                &packages_key,
+                non_registry,
+                fname,
+                dep,
+                sha512,
+                lockfile,
+                result,
+                matched_any,
+            ) || changed;
         }
     }
     changed
@@ -13243,6 +13263,82 @@ mod tests {
                 r.warnings
             );
         }
+    }
+
+    /// #326, lockfileVersion 2: the legacy `dependencies` mirror of a
+    /// non-registry `packages` entry is left alone too, even when it stores
+    /// the plain version, while the registry copy's mirror is rewired.
+    #[test]
+    fn npm_v2_legacy_mirror_of_a_non_registry_entry_is_not_rewired() {
+        let registry = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let git = "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 2,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0",
+                      "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-A==",
+                    "dependencies": { "left-pad": "stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/a/node_modules/left-pad": { "version": "1.3.0", "resolved": git },
+                "node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": registry, "integrity": "sha512-UPSTREAM=="
+                }
+            },
+            "dependencies": {
+                "a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-A==",
+                    "requires": { "left-pad": "stevemao/left-pad#v1.3.0" },
+                    "dependencies": {
+                        "left-pad": { "version": "1.3.0", "resolved": git }
+                    }
+                },
+                "left-pad": {
+                    "version": "1.3.0", "resolved": registry, "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let keys: Vec<_> = r
+            .edits
+            .iter()
+            .map(|e| (e.kind.as_str(), e.key.as_deref()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("redirect_npm_lock_entry", Some("node_modules/left-pad")),
+                ("redirect_npm_lock_dep", Some("left-pad")),
+            ],
+            "only the registry copy and its mirror are rewired"
+        );
+        let out: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        assert_eq!(
+            out["dependencies"]["a"]["dependencies"]["left-pad"],
+            lock["dependencies"]["a"]["dependencies"]["left-pad"],
+            "the git copy's legacy mirror is byte-untouched"
+        );
+        assert_eq!(
+            out["dependencies"]["left-pad"]["resolved"],
+            "http://patch.test/lp.tgz"
+        );
     }
 
     /// #326, transitive: a nested git copy is skipped while the hoisted

@@ -14,6 +14,7 @@
 //! bytes — no error, no patch. Every rewrite therefore carries the packed
 //! tarball's own hash, never an inherited one.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::Value;
@@ -28,7 +29,7 @@ use super::common::{already_patched_result, detect_indent, done, refused, serial
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
-use super::npm_origin::npm_non_registry_entries;
+use super::npm_origin::{legacy_packages_key, npm_non_registry_entries};
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -953,6 +954,8 @@ fn recompute_dep_fields(live: &mut serde_json::Map<String, Value>, staged_pkg: &
 fn rewrite_legacy_tree(
     deps: &mut serde_json::Map<String, Value>,
     pointer_base: &str,
+    parent_key: &str,
+    non_registry: &BTreeMap<String, String>,
     name: &str,
     version: &str,
     resolved: &str,
@@ -970,6 +973,7 @@ fn rewrite_legacy_tree(
             continue;
         };
         let pointer = format!("{pointer_base}/{}", escape_json_pointer_token(dep_name));
+        let packages_key = legacy_packages_key(parent_key, dep_name);
         let node_version = obj.get("version").and_then(Value::as_str);
         if node_version == Some(alias_version.as_str()) {
             // An aliased consumer of the patched package. The modern
@@ -999,6 +1003,14 @@ fn rewrite_legacy_tree(
             // stays-UNPATCHED warning.)
         } else if dep_name == name
             && node_version == Some(version)
+            && non_registry.contains_key(&packages_key)
+        {
+            // The mirror of a `packages` entry npm installs from a git / url
+            // / `file:` spec (#326): its twin was skipped with
+            // `vendor_non_registry_entry_skipped`, so rewiring this copy
+            // would record wiring for bytes that never install.
+        } else if dep_name == name
+            && node_version == Some(version)
             && !entry_in_sync(obj, resolved, integrity)
         {
             let was_vendored = entry_points_into_vendor(obj);
@@ -1022,6 +1034,8 @@ fn rewrite_legacy_tree(
             rewrite_legacy_tree(
                 sub,
                 &format!("{pointer}/dependencies"),
+                &packages_key,
+                non_registry,
                 name,
                 version,
                 resolved,
@@ -1241,6 +1255,8 @@ impl LockRewire<'_> {
         recomputed_deps: &mut bool,
         warnings: &mut Vec<VendorWarning>,
     ) -> Result<(), String> {
+        // Taken before any rewrite, for the legacy mirror below.
+        let non_registry = npm_non_registry_entries(lock);
         let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
             return Err("lock `packages` object vanished mid-rewrite".to_string());
         };
@@ -1291,6 +1307,8 @@ impl LockRewire<'_> {
                 rewrite_legacy_tree(
                     deps,
                     "/dependencies",
+                    "",
+                    &non_registry,
                     self.name,
                     self.version,
                     self.resolved,
@@ -2759,6 +2777,72 @@ mod tests {
         assert_eq!(
             live["dependencies"]["left-pad"]["resolved"],
             json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+    }
+
+    /// #326, v2 legacy mirror: the mirror of a non-registry `packages`
+    /// entry is not rewired either, even when it stores the plain version.
+    #[tokio::test]
+    async fn v2_legacy_mirror_of_a_git_instance_is_not_rewritten() {
+        let git = "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba";
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0",
+                      "dependencies": { "foo": "^2.0.0", "left-pad": "^1.3.0" } },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                },
+                "node_modules/foo": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/foo/-/foo-2.0.0.tgz",
+                    "integrity": "sha512-foo==",
+                    "dependencies": { "left-pad": "github:stevemao/left-pad#v1.3.0" }
+                },
+                "node_modules/foo/node_modules/left-pad": { "version": "1.3.0", "resolved": git }
+            },
+            "dependencies": {
+                "foo": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/foo/-/foo-2.0.0.tgz",
+                    "integrity": "sha512-foo==",
+                    "requires": { "left-pad": "github:stevemao/left-pad#v1.3.0" },
+                    "dependencies": {
+                        "left-pad": { "version": "1.3.0", "resolved": git }
+                    }
+                },
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let legacy_keys: Vec<String> = entry
+            .unwrap()
+            .wiring
+            .iter()
+            .filter(|r| r.kind == KIND_LOCK_LEGACY_ENTRY)
+            .filter_map(|r| r.key.clone())
+            .collect();
+        assert_eq!(
+            legacy_keys,
+            ["/dependencies/left-pad"],
+            "only the registry copy's mirror"
+        );
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["dependencies"]["foo"]["dependencies"]["left-pad"],
+            lock["dependencies"]["foo"]["dependencies"]["left-pad"],
+            "the git copy's legacy mirror is byte-untouched"
         );
     }
 

@@ -359,8 +359,12 @@ fn rewrite_one_npm_lock_oracle(
         }
         // v2 legacy `dependencies` tree (keyed by name), recursive.
         if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
+            // The randomized locks carry only registry specs, so the #326
+            // non-registry guard never fires and the oracle passes none.
             changed = rewrite_npm_v2_deps(
                 deps,
+                "",
+                &BTreeMap::new(),
                 &fname,
                 dep,
                 &sha512,

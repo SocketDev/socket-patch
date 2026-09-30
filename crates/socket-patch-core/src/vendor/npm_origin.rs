@@ -38,6 +38,17 @@ const EDGE_FIELDS: [&str; 4] = [
     "peerDependencies",
 ];
 
+/// The `packages` key a lockfileVersion 2 legacy `dependencies` node
+/// mirrors: `parent` is the mirrored key of the enclosing node (`""` at the
+/// top of the tree), `name` the node's key in its `dependencies` map.
+pub(crate) fn legacy_packages_key(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        format!("node_modules/{name}")
+    } else {
+        format!("{parent}/node_modules/{name}")
+    }
+}
+
 /// Every `packages` key npm installs from a non-registry source, mapped to
 /// the reason (for the skip warnings). Empty for a lock without `packages`:
 /// in a lockfileVersion 1 `dependencies` tree a git / URL / `file:` entry's
