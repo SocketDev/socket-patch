@@ -6703,6 +6703,10 @@ fn rewrite_maven_pom(
     let mut checksum_entries: Vec<(String, String)> = vec![];
     let gradle_build_present = GRADLE_FILES.iter().any(|f| files.contains_key(*f));
     let mut warned_no_pom = false;
+    // Local-repo paths of the suffixed jars this run's Trusted Checksums pin
+    // covers, whether the pin lands now or a prior run wrote it: the
+    // unenforced-pin warning must fire on re-scans too.
+    let mut pinned_jar_paths: Vec<String> = vec![];
 
     for dep in &maven {
         let Some(ov) = registry_override_of_kind(dep, "maven2") else {
@@ -6952,6 +6956,15 @@ fn rewrite_maven_pom(
             });
         }
 
+        if jar_sha256.is_some() && pom_sha256.is_some() {
+            pinned_jar_paths.push(local_repo_artifact_path(
+                &group_id,
+                &artifact_id,
+                &suffixed_version,
+                "jar",
+            ));
+        }
+
         // A pin landed this run: inject the repository (idempotent via the <id>
         // guard) and emit trusted checksums. When the pin was already present
         // from a prior run, `pin_landed` stays false and both are skipped,
@@ -7039,25 +7052,36 @@ fn rewrite_maven_pom(
             original: None,
             new: None,
         });
-        // The pin is written regardless (a later wrapper upgrade enforces
-        // it, and the version suffix is fail-closed on its own), but a
-        // project whose wrapper pins a Maven that ignores it must not read
-        // it as client-side content pinning.
-        if let Some(version) = files
-            .get(MVN_WRAPPER_PROPERTIES)
-            .and_then(|props| maven_wrapper_version(props))
-            .filter(|v| !maven_enforces_trusted_checksums(v))
-        {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_maven_trusted_checksums_unenforced".into(),
-                detail: format!(
-                    "{MVN_WRAPPER_PROPERTIES} pins Maven {version}, which does not enforce the \
-                     Trusted Checksums pin in {MVN_CHECKSUMS} (Maven enforces it from 3.9.4); \
-                     only the transport .sha1 check guards the Socket-served artifacts. \
-                     Upgrade the Maven Wrapper to 3.9.4 or later"
-                ),
-            });
-        }
+    }
+
+    // The pin is written regardless (a later wrapper upgrade enforces it, and
+    // the version suffix is fail-closed on its own), but a project whose
+    // wrapper pins a Maven that ignores it must not read it as client-side
+    // content pinning. Judged on the files as they stand after this run, so a
+    // re-scan of an already-pinned project warns as well.
+    let final_text = |rel: &str| result.files.get(rel).or_else(|| files.get(rel));
+    let pin_in_place = final_text(MVN_CONFIG)
+        .is_some_and(|c| c.lines().any(|l| l.trim() == TRUSTED_CHECKSUMS_ON))
+        && final_text(MVN_CHECKSUMS).is_some_and(|c| {
+            pinned_jar_paths.iter().any(|p| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(p.as_str()))
+            })
+        });
+    if let Some(version) = files
+        .get(MVN_WRAPPER_PROPERTIES)
+        .and_then(|props| maven_wrapper_version(props))
+        .filter(|v| pin_in_place && !maven_enforces_trusted_checksums(v))
+    {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_maven_trusted_checksums_unenforced".into(),
+            detail: format!(
+                "{MVN_WRAPPER_PROPERTIES} pins Maven {version}, which does not enforce the \
+                 Trusted Checksums pin in {MVN_CHECKSUMS} (Maven enforces it from 3.9.4); \
+                 only the transport .sha1 check guards the Socket-served artifacts. \
+                 Upgrade the Maven Wrapper to 3.9.4 or later"
+            ),
+        });
     }
 }
 
@@ -7985,6 +8009,44 @@ mod tests {
             );
             assert!(detail.contains(MVN_WRAPPER_PROPERTIES), "{detail}");
         }
+    }
+
+    /// A re-scan of a project a prior run already pinned writes nothing, but
+    /// the wrapper's Maven still ignores the pin, so it still warns. Without
+    /// the Socket checksum entry (or with Trusted Checksums switched off) there
+    /// is no pin to call inert, and nothing is said.
+    #[test]
+    fn maven_pom_trusted_checksums_unenforced_warning_survives_a_rescan() {
+        let first = rewrite_with_wrapper(&maven_wrapper("3.9.3"));
+        let mut again = BTreeMap::new();
+        for (rel, text) in &first.files {
+            again.insert(rel.clone(), text.clone());
+        }
+        again.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper("3.9.3"));
+        let second = rewrite_registry_redirect(&again, &[maven_override()]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-scan is edit-free: {:?}",
+            second.edits
+        );
+        assert_eq!(
+            warning_codes(&second),
+            vec!["redirect_maven_trusted_checksums_unenforced"]
+        );
+
+        let mut no_entry = again.clone();
+        no_entry.insert(MVN_CHECKSUMS.to_string(), String::new());
+        let r = rewrite_registry_redirect(&no_entry, &[maven_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        let mut switched_off = again.clone();
+        switched_off.remove(MVN_CONFIG);
+        let r = rewrite_registry_redirect(&switched_off, &[maven_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        again.insert(MVN_WRAPPER_PROPERTIES.to_string(), maven_wrapper("3.9.4"));
+        let r = rewrite_registry_redirect(&again, &[maven_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     /// 3.9.4 is the first release that rejects a mismatch; newer lines
