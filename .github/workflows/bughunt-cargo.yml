@@ -1,0 +1,60 @@
+name: bughunt-cargo probe
+on:
+  push:
+    branches: ['bughunt/cargo/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build socket-patch
+        run: cargo build --release -p socket-patch-cli
+      - name: Install probe toolchains
+        run: rustup toolchain install 1.56.1 --profile minimal && rustup toolchain install stable --profile minimal
+      - name: Probe custom cargo-vendor directory
+        run: |
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          cat > "$RUNNER_TEMP/stage.py" <<'PY'
+          import sys, json, hashlib, os
+          proj, purl, src, rel = sys.argv[1:5]
+          def g(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          before = open(os.path.join(src, rel), "rb").read()
+          after = before + b"\n/// socket marker\npub fn socket_patched() -> u32 { 1 }\n"
+          s = os.path.join(proj, ".socket"); os.makedirs(os.path.join(s, "blobs"), exist_ok=True)
+          m = {"setup": {"manual": ["cargo"]}, "patches": {purl: {"uuid": "11111111-2222-4333-8444-555555555555",
+               "exportedAt": "2026-01-01T00:00:00Z", "files": {rel: {"beforeHash": g(before), "afterHash": g(after)}},
+               "vulnerabilities": {"GHSA-xxxx-xxxx-xxxx": {"cves": ["CVE-2024-1"], "summary": "s", "severity": "high", "description": "d"}},
+               "description": "m", "license": "MIT", "tier": "free"}}}
+          json.dump(m, open(os.path.join(s, "manifest.json"), "w"), indent=2)
+          for b in (before, after): open(os.path.join(s, "blobs", g(b)), "wb").write(b)
+          PY
+          for TC in 1.56.1 stable; do
+            for D in vendor third_party; do
+              W="$RUNNER_TEMP/w-$TC-$D"; rm -rf "$W"; mkdir -p "$W/src" "$W/.cargo"; cd "$W"
+              export CARGO_HOME="$W/cargo-home"
+              printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2018"\n\n[dependencies]\ncfg-if = "=1.0.0"\n' > Cargo.toml
+              echo 'fn main(){ println!("{}", cfg_if::socket_patched()); }' > src/main.rs
+              cargo +$TC generate-lockfile -q
+              cargo +$TC vendor -q "$D" > /dev/null
+              printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "%s"\n' "$D" > .cargo/config.toml
+              python "$RUNNER_TEMP/stage.py" . pkg:cargo/cfg-if@1.0.0 "$D/cfg-if" src/lib.rs
+              ST=$("$SP" apply --json --offline 2>/dev/null | grep -m1 '"status"' | tr -d ' ,')
+              INV=$(grep -c socket_patched "$D/cfg-if/src/lib.rs")
+              INC=$(cat "$CARGO_HOME"/registry/src/*/cfg-if-1.0.0/src/lib.rs 2>/dev/null | grep -c socket_patched)
+              if cargo +$TC build -q --frozen --offline >/dev/null 2>&1; then B=ok; else B=FAIL; fi
+              "$SP" vex --offline -O vex.json >/dev/null 2>&1; VX=$(grep -o '"status": "[a-z_]*"' vex.json 2>/dev/null | tr -d ' "')
+              echo "RESULT os=${{ matrix.os }} cargo=$TC dir=$D apply=$ST patched_in_dir=$INV patched_in_cache=$INC build=$B vex=$VX"
+              cd "$RUNNER_TEMP"
+            done
+          done
