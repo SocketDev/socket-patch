@@ -992,13 +992,20 @@ class Cell:
         self.record = ctx['record']
         self.envelopes = []
         self.fresh_patched = {}
+        self.cli_failures = []
 
     # CLI -------------------------------------------------------------------
     def cli(self, args, cwd=None):
         command = [self.ctx['cli'], *args, '--json', '--no-telemetry']
         if self.ctx.get('patch_server_url'):
             command += ['--patch-server-url', self.ctx['patch_server_url']]
-        return run(command, cwd or self.project, self.ctx['cli_env'], self.log)
+        code, out, err = run(command, cwd or self.project, self.ctx['cli_env'], self.log)
+        if code:
+            # --json errors go to stdout, including on repeat/revert calls.
+            # Keep them on the result row so the transport retry sees them.
+            self.cli_failures.append(dict(command=str(args[0]), exitCode=code,
+                                          envelope=parse_envelope(out), stderr=tail(err, 3000)))
+        return code, out, err
 
     def patch_run(self, mode, cwd=None):
         cwd = cwd or self.project
@@ -1195,6 +1202,8 @@ class Cell:
         return clean
 
     def finish(self, row, checks, started):
+        if self.cli_failures:
+            row['cliFailures'] = self.cli_failures
         row['failingChecks'] = [k for k, v in checks.items() if v is False]
         row['notEvaluated'] = [k for k, v in checks.items() if v is None]
         row.setdefault('codes', [])
