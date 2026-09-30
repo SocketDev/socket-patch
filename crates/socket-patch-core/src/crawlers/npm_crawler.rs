@@ -2215,7 +2215,10 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
     // store that holds the primary itself counts (a transitive copy, or a
     // direct dep's link target on the canonical chain): an enclosing
     // project's `.modules.yaml` further up names a store this project
-    // does not use.
+    // does not use. Containment is also checked canonically, so a store
+    // named through a linked ancestor (macOS `/var` → `/private/var`)
+    // is kept in the same spelling as the other layouts' stores.
+    let canonical_start = canonical_pkg.clone();
     let candidates: Vec<(PathBuf, PathBuf)> = chains
         .into_iter()
         .flatten()
@@ -2230,7 +2233,12 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
         candidates
             .iter()
             .filter_map(|(start, nm)| {
-                relocated_pnpm_virtual_store_sync(nm).filter(|store| start.starts_with(store))
+                relocated_pnpm_virtual_store_sync(nm).filter(|store| {
+                    start.starts_with(store)
+                        || canonical_start.as_ref().is_some_and(|canon| {
+                            std::fs::canonicalize(store).is_ok_and(|s| canon.starts_with(s))
+                        })
+                })
             })
             .collect::<Vec<_>>()
     })
@@ -3868,7 +3876,14 @@ mod tests {
             ),
         ] {
             let tmp = tempfile::tempdir().unwrap();
-            let root: PathBuf = tmp.path().components().collect();
+            let base: PathBuf = tmp.path().components().collect();
+            // Reach the project through a linked ancestor, as macOS's
+            // `/var` → `/private/var` temp dirs do: reported copies keep
+            // the spelling the caller used.
+            let real = base.join("real");
+            std::fs::create_dir_all(&real).unwrap();
+            let root = base.join("linked");
+            link_dir(&real, &root);
             let nm = root.join("node_modules");
             let store = root.join(store_rel);
             let odd_entry = store.join("is-odd@3.0.1/node_modules");
