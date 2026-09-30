@@ -1,0 +1,70 @@
+name: bughunt-deno
+on:
+  push:
+    branches: ['bughunt/deno/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        deno: ['1.46.3', '2.2.15', '2.9.6']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.deno }}
+      - name: build
+        run: cargo build --release -p socket-patch-cli
+      - name: probe
+        run: |
+          set -u
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          T="$RUNNER_TEMP/t"; mkdir -p "$T"
+          cat > "$T/mkman.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          # usage: mkman.py <projdir> <purl>=<pkgdir>[:file] ...  -> writes .socket/manifest.json + blobs (before+after)
+          import sys, os, json, hashlib
+          def gh(b): return hashlib.sha256(b"blob %d\0" % len(b) + b).hexdigest()
+          proj = sys.argv[1]; soc = os.path.join(proj, ".socket"); os.makedirs(os.path.join(soc,"blobs"), exist_ok=True)
+          man = {"patches": {}}
+          for i, arg in enumerate(sys.argv[2:]):
+              purl, rest = arg.split("=",1)
+              pkgdir, _, f = rest.partition(":"); f = f or "index.js"
+              orig = open(os.path.join(pkgdir, f),"rb").read()
+              nm = purl.split("/")[-1].split("@")[0]
+              patched = ("/* SOCKET-MARKER */ globalThis.__SP=(globalThis.__SP||[]).concat([\"%s\"]);\n" % nm).encode() + orig
+              bh, ah = gh(orig), gh(patched)
+              open(os.path.join(soc,"blobs",bh),"wb").write(orig); open(os.path.join(soc,"blobs",ah),"wb").write(patched)
+              man["patches"][purl] = {"uuid": "1111111%d-1111-4111-8111-111111111111" % i, "exportedAt":"2024-01-01T00:00:00Z",
+                "files": {"package/"+f: {"beforeHash": bh, "afterHash": ah}},
+                "vulnerabilities": {"GHSA-xxxx-xxxx-xxxx": {"cves":["CVE-2099-0001"],"summary":"t","severity":"high","description":"t"}},
+                "description":"t","license":"MIT","tier":"free"}
+          json.dump(man, open(os.path.join(soc,"manifest.json"),"w"), indent=2)
+          PYEOF
+          PY=python3; command -v python3 >/dev/null || PY=python
+          deno --version | head -1
+          for MODE in auto manual; do
+            W="$T/$MODE"; mkdir -p "$W"; cd "$W"; export DENO_DIR="$T/denodir-$MODE"
+            case "${{ matrix.deno }}" in 1.*) NMD=true ;; *) NMD='"auto"' ;; esac
+            if [ $MODE = auto ]; then echo "{\"nodeModulesDir\":$NMD,\"imports\":{\"is-odd\":\"npm:is-odd@3.0.1\"}}" > deno.json
+            else echo "{\"nodeModulesDir\":$NMD}" > deno.json; echo '{"dependencies":{"is-odd":"3.0.1"}}' > package.json; fi
+            echo 'import isOdd from "is-odd"; isOdd(3); console.log("loaded-patched=" + JSON.stringify((globalThis as any).__SP || []));' > probe.ts
+            if [ $MODE = auto ]; then deno cache probe.ts; else deno install || deno cache probe.ts; fi
+            S=node_modules/.deno
+            if [ ! -f $S/is-number@6.0.0/node_modules/is-number/index.js ]; then echo "CELL $MODE: SETUP-FAIL"; ls -la node_modules $S || true; continue; fi
+            $PY "$T/mkman.py" . "pkg:npm/is-odd@3.0.1=$S/is-odd@3.0.1/node_modules/is-odd" "pkg:npm/is-number@6.0.0=$S/is-number@6.0.0/node_modules/is-number"
+            "$SP" apply --offline --json > apply.json; RC=$?
+            cat apply.json
+            OUT=$(deno run -A probe.ts 2>&1 | tail -1)
+            EV=$($PY -c "import json;d=json.load(open('apply.json'));print(d['status'],[(e['purl'],e['action'],e.get('errorCode')) for e in d['events']])")
+            echo "CELL ${{ matrix.os }} deno=${{ matrix.deno }} $MODE rc=$RC $EV runtime=$OUT"
+          done
