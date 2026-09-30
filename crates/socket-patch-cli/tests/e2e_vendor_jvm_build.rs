@@ -1006,10 +1006,12 @@ fn gradle_multi_project_vendor_locked_offline_tamper_and_byte_exact_revert() {
         !ok(&out),
         "the index must reject a tampered jar even with Gradle verification off: {log}"
     );
+    // Java prints native separators, while a Windows PathBuf can retain the
+    // forward slashes in the fixture's relative repository path.
     assert!(
-        log.contains(&format!(
+        log.replace('\\', "/").contains(&format!(
             "socket-patch: {} has sha256 {}, pinned {}",
-            jar_path.display(),
+            jar_path.to_string_lossy().replace('\\', "/"),
             sha256_hex(&tampered),
             sha256_hex(vendored_jar)
         )),
