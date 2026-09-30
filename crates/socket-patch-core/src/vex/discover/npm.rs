@@ -194,10 +194,10 @@ fn drop_non_registry_installs(
             DIAG_REF_UNATTRIBUTABLE,
             file,
             format!(
-                "{file}: {} is wired to Socket patch {} but lock entry `{key}` is not \
+                "{file}: {} is wired to a Socket patch but lock entry `{key}` is not \
                  installed from the registry ({reason}); npm installs it from that spec, so \
                  that copy stays UNPATCHED and nothing is attested",
-                r.purl, r.uuid
+                r.purl
             ),
         );
         false
@@ -910,7 +910,7 @@ mod tests {
             tarball,
             "file:../left-pad-1.3.0.tgz",
         ] {
-            for resolved in [&hosted, &vendored] {
+            for (wiring, resolved) in [("hosted", &hosted), ("vendored", &vendored)] {
                 let p = Project::new();
                 p.write(
                     "package-lock.json",
@@ -923,11 +923,15 @@ mod tests {
                     })),
                 );
                 let out = run(&p).await;
-                assert!(out.refs.is_empty(), "{spec} / {resolved}: {:#?}", out.refs);
+                assert!(
+                    out.refs.is_empty(),
+                    "{spec} / {wiring}: {} refs",
+                    out.refs.len()
+                );
                 assert!(
                     diag_codes(&out).contains(&DIAG_REF_UNATTRIBUTABLE),
-                    "{spec} / {resolved}: {:?}",
-                    out.diagnostics
+                    "{spec} / {wiring}: {:?}",
+                    diag_codes(&out)
                 );
             }
         }
@@ -952,7 +956,7 @@ mod tests {
             })),
         );
         let out = run(&p).await;
-        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert!(out.refs.is_empty(), "{} refs", out.refs.len());
         let diag = out
             .diagnostics
             .iter()

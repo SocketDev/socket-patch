@@ -614,7 +614,24 @@ fn npm_vendor_refuses_a_remote_tarball_dependency() {
     .unwrap();
     let cache = tmp.path().join("npm-cache");
     let url = format!("https://registry.npmjs.org/{DEP}/-/{DEP}-{DEP_VERSION}.tgz");
-    if !npm_e2e_common::install_fixture(suite, &proj, &cache, &url) {
+    // npm 12 refuses remote-tarball specs unless `allow-remote` permits them.
+    let spec = if major >= 12 {
+        format!("{url} --allow-remote=all")
+    } else {
+        url.clone()
+    };
+    let mut args = vec!["install", "--no-audit", "--no-fund", "--cache"];
+    args.push(cache.to_str().unwrap());
+    args.extend(spec.split(' '));
+    let out = npm(&proj, &args);
+    if !out.status.success() {
+        npm_e2e_common::skip(
+            suite,
+            &format!(
+                "`npm install {spec}` failed (registry unreachable?):\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        );
         return;
     }
     let pkg: serde_json::Value =
