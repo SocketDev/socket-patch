@@ -1,0 +1,71 @@
+name: bughunt nuget probe
+on:
+  push:
+    branches: ['bughunt/nuget/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, dotnet: '6'}
+          - {os: ubuntu-latest, dotnet: '9'}
+          - {os: ubuntu-latest, dotnet: '10'}
+          - {os: macos-latest, dotnet: '8'}
+          - {os: macos-latest, dotnet: '9'}
+          - {os: windows-latest, dotnet: '8'}
+          - {os: windows-latest, dotnet: '9'}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ matrix.dotnet }}.0.x
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        shell: bash
+        env:
+          M: ${{ matrix.dotnet }}
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_NOLOGO: '1'
+          SOCKET_OFFLINE: '1'
+        run: |
+          set +e +o pipefail
+          unset NUGET_PACKAGES
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          W="$RUNNER_TEMP/bh"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
+          SDKV=$(dotnet --list-sdks | awk '{print $1}' | grep "^$M\." | sort -V | tail -1)
+          echo "{\"sdk\":{\"version\":\"$SDKV\",\"rollForward\":\"latestFeature\"}}" > global.json
+          dotnet --version
+          DEF="$HOME/.nuget/packages"; [ -n "${USERPROFILE:-}" ] && command -v cygpath >/dev/null && DEF="$(cygpath -u "$USERPROFILE")/.nuget/packages"
+          echo "default cache: $DEF"
+          blob(){ local l; l=$(wc -c < "$1" | tr -d ' '); { printf 'blob %s\0' "$l"; cat "$1"; } | sha256sum | cut -d' ' -f1; }
+          stage(){ local o="$1" p="$2" bh ah; bh=$(blob "$o"); ah=$(blob "$p")
+            mkdir -p .socket/blobs; cp "$p" ".socket/blobs/$ah"
+            printf '{"patches":{"pkg:nuget/Newtonsoft.Json@13.0.3":{"uuid":"11111111-1111-4111-8111-111111111111","exportedAt":"2026-01-01T00:00:00Z","files":{"LICENSE.md":{"beforeHash":"%s","afterHash":"%s"}},"vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2099-0001"],"summary":"s","severity":"high","description":"d"}},"description":"m","license":"MIT","tier":"free"}},"setup":{"manual":["nuget"]}}' "$bh" "$ah" > .socket/manifest.json; }
+          mkproj(){ mkdir -p "$1"; printf '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net%s.0</TargetFramework><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>' "$M" > "$1/app.csproj"; echo 'System.Console.WriteLine("ok");' > "$1/Program.cs"; }
+          res(){ echo "RESULT[$M/$RUNNER_OS] $*"; }
+          warm(){ rm -rf "$DEF/newtonsoft.json/13.0.3"; mkproj "$W/warm"; (cd "$W/warm" && cp ../global.json . && dotnet restore --force > r.log 2>&1 || cat r.log); }
+          for P in . src/App; do
+            warm
+            T="$W/t$(echo $P | tr -d './')"; mkdir -p "$T"; cd "$T"; cp "$W/global.json" .
+            printf '<?xml version="1.0" encoding="utf-8"?>\n<configuration>\n  <config><add key="globalPackagesFolder" value=".nuget/packages" /></config>\n</configuration>\n' > nuget.config
+            mkproj "$P"; dotnet new sln -n App > /dev/null; SLN=$(ls App.sln* | head -1); dotnet sln "$SLN" add "$P/app.csproj" > /dev/null
+            dotnet restore "$SLN" > r.log 2>&1 || cat r.log
+            L=".nuget/packages/newtonsoft.json/13.0.3/LICENSE.md"
+            [ -f "$L" ] || { res "[$P] project-local cache missing"; ls -la .nuget; }
+            cp "$L" "$W/pr.md"; cp "$W/pr.md" "$W/pa.md"; printf '\nSOCKET-MARKER\n' >> "$W/pa.md"; stage "$W/pr.md" "$W/pa.md"
+            "$SP" apply --offline > a.log 2>&1; rc=$?; tail -2 a.log
+            grep -q SOCKET-MARKER "$L" && pl=PATCHED || pl=UNPATCHED
+            grep -q SOCKET-MARKER "$DEF/newtonsoft.json/13.0.3/LICENSE.md" && dl=PATCHED || dl=untouched
+            "$SP" vex --offline --product pkg:nuget/App@1.0.0 > vex.json 2> vex.err; vs=$(grep -o '"status": *"[a-z_]*"' vex.json | head -1)
+            res "[$P] apply rc=$rc project-cache=$pl default-cache=$dl vex=$vs"
+            cd "$W"
+          done
+          echo "==== summary"; true
