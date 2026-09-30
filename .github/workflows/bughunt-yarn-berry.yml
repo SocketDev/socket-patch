@@ -1,0 +1,131 @@
+name: bughunt yarn-berry probe
+on:
+  push:
+    branches: ['bughunt/yarn-berry/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: false
+      - name: Build CLI
+        shell: bash
+        run: cargo build --release -p socket-patch-cli
+      - name: Write probe
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/probe.sh" <<'EOS'
+          #!/bin/bash
+          # self-contained probe: SP=<socket-patch bin> YV=<yarn version> WORK=<dir>
+          set -u
+          PY=$(command -v python3 || command -v python)
+          W=${WORK:-$PWD/work}; mkdir -p $W/yarn; cd $W/yarn
+          [ -f package/bin/yarn.js ] || { npm pack @yarnpkg/cli-dist@$YV --silent >/dev/null 2>&1 && tar xzf yarnpkg-cli-dist-$YV.tgz; }
+          YJ=$W/yarn/package/bin/yarn.js
+          y() { node "$YJ" "$@"; }
+          export NO_PROXY="127.0.0.1,localhost" no_proxy="127.0.0.1,localhost" YARN_ENABLE_TELEMETRY=0
+          cat > $W/mock.py <<'EOF'
+          import os, json
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          E=os.environ; PURL=E['PURL']; UUID=E['UUID']; PORT=int(E['PORT']); ORG='test-org'; TOKEN='22222222-2222-4222-8222-222222222222'
+          name,ver=PURL[len('pkg:npm/'):].rsplit('@',1); leaf=name.split('/')[-1]
+          HOSTED=f"http://127.0.0.1:{PORT}/patch/npm/{name}/{ver}/{TOKEN}/{UUID}/{leaf}-{ver}.tgz"
+          TGZ=open('patched.tgz','rb').read()
+          class H(BaseHTTPRequestHandler):
+              def j(self,o):
+                  b=json.dumps(o).encode(); self.send_response(200); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(b))); self.end_headers(); self.wfile.write(b)
+              def do_POST(self):
+                  self.rfile.read(int(self.headers.get('content-length') or 0)); p=self.path.split('?')[0]
+                  if p.endswith('/patches/batch'): return self.j({"packages":[{"purl":PURL,"patches":[{"uuid":UUID,"purl":PURL,"tier":"free","cveIds":[],"ghsaIds":[],"severity":"high","title":"t"}]}],"canAccessPaidPatches":False})
+                  if p.endswith('/patches/package'): return self.j({"results":{UUID:{"status":"granted","url":HOSTED,"purl":PURL,"artifacts":[{"kind":"tarball","url":HOSTED,"integrity":{"sha512":"sha512-unused=="}},{"kind":"yarn-berry-zip","url":HOSTED,"integrity":{"yarnBerry10c0":E['CHECKSUM']}}],"registryOverride":None}}})
+                  self.send_response(404); self.end_headers()
+              def do_GET(self):
+                  p=self.path.split('?')[0]
+                  if '/patches/by-package/' in p: return self.j({"patches":[{"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","description":"x","license":"MIT","tier":"free","vulnerabilities":{}}],"canAccessPaidPatches":False})
+                  if p.endswith('/patches/view/'+UUID): return self.j({"uuid":UUID,"purl":PURL,"publishedAt":"2026-01-01T00:00:00Z","files":{E['FILEKEY']:{"beforeHash":E['BEFORE'],"afterHash":E['AFTER']}},"vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2099-1"],"summary":"s","severity":"high","description":"d"}},"description":"x","license":"MIT","tier":"free"})
+                  if p.startswith('/patch/npm/'):
+                      self.send_response(200); self.send_header('content-type','application/octet-stream'); self.send_header('content-length',str(len(TGZ))); self.end_headers(); self.wfile.write(TGZ); return
+                  self.send_response(404); self.end_headers()
+              def log_message(self,*a): pass
+          ThreadingHTTPServer(('127.0.0.1',PORT),H).serve_forever()
+          EOF
+          gs() { $PY -c "import hashlib,sys;c=open(sys.argv[1],'rb').read();print(hashlib.sha256(b'blob %d\0'%len(c)+c).hexdigest())" "$1"; }
+          # hosted CASE PKG VER FILE PORT ROOTPKGJSON [MEMBERPKGJSON]
+          hosted() {
+            local C=$1 PKG=$2 VER=$3 FILE=$4 PORT=$5 RP=$6 MP=${7:-}
+            local D=$W/$C; rm -rf $D; mkdir -p $D/proj $D/boot $D/tgz; cd $D/proj
+            echo "$RP" > package.json; [ -n "$MP" ] && mkdir -p pkgs/a && echo "$MP" > pkgs/a/package.json
+            printf 'nodeLinker: node-modules\nenableGlobalCache: false\nunsafeHttpWhitelist:\n  - "127.0.0.1"\n' > .yarnrc.yml; touch yarn.lock
+            y install > i1.log 2>&1 || { echo "[$C] install1 FAIL"; tail -5 i1.log; }
+            echo "[$C] yarn.lock EOL: $(grep -c $'\r' yarn.lock) CR lines; cacheKey $(grep cacheKey yarn.lock)"
+            cd $D/tgz && npm pack $PKG@$VER --silent >/dev/null 2>&1 && tar xzf *.tgz && cp package/$FILE $D/before && $PY -c "
+          p='package/$FILE';b=open(p,'rb').read();open(p,'wb').write(b'/* SOCKET-PATCHED */\n'+b)" && cp package/$FILE $D/after && tar czf $D/patched.tgz package
+            cd $D/boot && cp $D/patched.tgz . && echo "{\"name\":\"boot\",\"version\":\"0.0.0\",\"private\":true,\"dependencies\":{\"$PKG\":\"$VER\"},\"resolutions\":{\"$PKG\":\"file:./patched.tgz\"}}" > package.json && printf 'nodeLinker: node-modules\nenableGlobalCache: false\n' > .yarnrc.yml && touch yarn.lock && y install > b.log 2>&1 || tail -3 b.log
+            local CK=$($PY -c "
+          import re
+          t=open('yarn.lock').read().replace('\r\n','\n')
+          for blk in t.split('\n\n'):
+              if blk.startswith('\"$PKG@file:'):
+                  c=re.search(r'checksum: (\S+)',blk).group(1); print(c if '/' in c else '10c0/'+c)")
+            cd $D
+            PURL="pkg:npm/$PKG@$VER" UUID=5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d CHECKSUM=$CK BEFORE=$(gs before) AFTER=$(gs after) FILEKEY=package/$FILE PORT=$PORT $PY mock.py 2>/dev/null & 
+            MOCK=$!; cp $W/mock.py $D/ 2>/dev/null; sleep 3
+            cd $D/proj; cp yarn.lock $D/lock.orig
+            "$SP" scan --mode hosted --json --yes --api-url http://127.0.0.1:$PORT --org test-org --api-token fake --vex out.vex.json --vex-product pkg:npm/app@1.0.0 > scan.json 2> scan.err
+            echo "[$C] scan exit=$? $($PY -c "import json;d=json.load(open('scan.json'));r=d.get('redirect') or {};print('status',d.get('status'),'redirected',r.get('redirected'),[w['code'] for w in r.get('warnings',[])])")"
+            $PY -c "import json;d=json.load(open('out.vex.json'));print('[$C] in-run VEX:',[s.get('status') for s in d.get('statements',[])])" 2>/dev/null
+            echo "[$C] archiveUrl entries in lock: $(grep -c __archiveUrl yarn.lock)"
+          }
+          fresh() { # CASE -> fresh immutable install
+            local C=$1 PKG=$2 FILE=$3; local D=$W/$C; rm -rf $D/fresh; mkdir -p $D/fresh; cd $D/proj; cp -r package.json yarn.lock .yarnrc.yml .socket $D/fresh/ 2>/dev/null; [ -d pkgs ] && cp -r pkgs $D/fresh/
+            cd $D/fresh; y install --immutable > i2.log 2>&1; echo "[$C] fresh 'yarn install --immutable' exit=$?"; grep 'YN0028' i2.log | head -4
+            [ -f node_modules/$PKG/$FILE ] && echo "[$C] node_modules/$PKG/$FILE starts: $(head -c 20 node_modules/$PKG/$FILE | tr -d '\r\n')"
+          }
+          echo "===== yarn $(y --version) on $(uname -s) ====="
+          # Case A: hosted redirect of a yarn builtin-compat-patched package (resolve)
+          hosted A-resolve resolve 1.22.8 index.js 18801 '{"name":"app","version":"1.0.0","dependencies":{"resolve":"1.22.8"}}'
+          [ -n "${MOCK:-}" ] ; fresh A-resolve resolve index.js; kill %1 2>/dev/null; kill $MOCK 2>/dev/null; wait 2>/dev/null
+          # Case A control: left-pad
+          hosted A-leftpad left-pad 1.3.0 index.js 18802 '{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}'
+          fresh A-leftpad left-pad index.js; kill %1 2>/dev/null; wait 2>/dev/null
+          # Case B: hosted -> vendored takeover where vendoring refuses per-target (second left-pad version)
+          hosted B-takeover left-pad 1.3.0 index.js 18803 '{"name":"app","version":"1.0.0","private":true,"workspaces":["pkgs/*"],"dependencies":{"left-pad":"1.3.0"}}' '{"name":"a","version":"1.0.0","dependencies":{"left-pad":"1.1.3"}}'
+          fresh B-takeover left-pad index.js
+          cd $W/B-takeover/proj
+          $PY - "$(gs $W/B-takeover/before)" "$(gs $W/B-takeover/after)" <<'EOF'
+          import json,os,sys
+          b,a=sys.argv[1:3]
+          os.makedirs('.socket/blobs',exist_ok=True)
+          m={"patches":{"pkg:npm/left-pad@1.3.0":{"uuid":"5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d","exportedAt":"2026-01-01T00:00:00Z","files":{"package/index.js":{"beforeHash":b,"afterHash":a}},"vulnerabilities":{"GHSA-aaaa-bbbb-cccc":{"cves":["CVE-2099-1"],"summary":"s","severity":"high","description":"d"}},"description":"x","license":"MIT","tier":"free"}}}
+          json.dump(m,open('.socket/manifest.json','w'),indent=2)
+          EOF
+          cp $W/B-takeover/after .socket/blobs/$(gs $W/B-takeover/after)
+          "$SP" vendor --json --offline > vt.json 2>&1
+          echo "[B-takeover] vendor exit=$? $($PY -c "import json;d=json.load(open('vt.json'));print(d['status'],[(e.get('action'),e.get('errorCode')) for e in d.get('events',[])])")"
+          echo "[B-takeover] archiveUrl entries in lock after vendor: $(grep -c __archiveUrl yarn.lock); lock == pre-hosted registry lock: $(cmp -s yarn.lock $W/B-takeover/lock.orig && echo yes || echo no)"
+          kill %1 2>/dev/null; wait 2>/dev/null
+          exit 0
+          EOS
+      - name: Probe
+        shell: bash
+        run: |
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          [ -f "$SP.exe" ] && SP="$SP.exe"
+          for v in 4.12.0 4.18.1; do
+            SP="$SP" YV=$v WORK="$RUNNER_TEMP/w-$v" bash "$RUNNER_TEMP/probe.sh" 2>&1 | tee -a "$RUNNER_TEMP/probe.log"
+          done
