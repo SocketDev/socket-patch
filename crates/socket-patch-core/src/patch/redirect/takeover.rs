@@ -800,7 +800,7 @@ pub async fn revert_npm_redirect_purl(
             let text = read_rel(project_root, &e.path).await?;
             let parsed = text
                 .as_deref()
-                .and_then(|c| serde_json::from_str::<Value>(c).ok());
+                .and_then(|c| crate::vendor::common::parse_json_text(c).ok());
             disk_texts.insert(e.path.clone(), text);
             disk_locks.insert(e.path.clone(), parsed);
         }
@@ -1219,7 +1219,7 @@ async fn revert_npm_json_edit(
             edit.path
         ));
     };
-    let mut lock: Value = serde_json::from_str(&content).map_err(|e| {
+    let mut lock: Value = crate::vendor::common::parse_json_text(&content).map_err(|e| {
         format!(
             "{} is not valid JSON ({e}); cannot revert the recorded hosted \
              redirect for {name}@{version}",
@@ -1273,7 +1273,10 @@ async fn revert_npm_json_edit(
         }
     };
     if changed {
-        staged.insert(edit.path.clone(), Some(super::serialize_json(&lock)));
+        staged.insert(
+            edit.path.clone(),
+            Some(super::serialize_json_like(&lock, &content)),
+        );
         out.reverted_files.push(edit.path.clone());
     }
     Ok(())

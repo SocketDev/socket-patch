@@ -170,6 +170,11 @@ pub(crate) fn parse_json_manifest(bytes: &[u8]) -> serde_json::Result<Value> {
     serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes))
 }
 
+/// [`parse_json_manifest`] for text already decoded as UTF-8.
+pub(crate) fn parse_json_text(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
+}
+
 /// The byte layout a re-serialized JSON manifest keeps from the text it
 /// replaces, so a vendor edit and its revert change nothing but the edited
 /// keys: the leading UTF-8 BOM, the indent unit ([`detect_indent`]), the

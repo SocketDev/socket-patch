@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -273,6 +274,17 @@ fn serialize_json(value: &Value) -> String {
         "{}\n",
         serde_json::to_string_pretty(value).expect("serde_json::Value serializes infallibly")
     )
+}
+
+/// `value` pretty-printed in the layout of `original`, the text it replaces
+/// (BOM, indent, line ending and trailer; see [`JsonLayout`]), so a rewrite
+/// and its revert change nothing but the edited values. npm keeps a lock's
+/// CRLF and tab indent on its own rewrites, and so must we.
+fn serialize_json_like(value: &Value, original: &str) -> String {
+    let bytes = JsonLayout::of(original)
+        .render(value)
+        .expect("serde_json::Value serializes infallibly");
+    String::from_utf8(bytes).expect("rendered JSON is UTF-8")
 }
 
 /// The dep's registry override when it is of `kind`. `None` for an absent
@@ -816,7 +828,8 @@ fn rewrite_one_npm_lock(
     npm: &[&DepOverride],
     result: &mut RewriteResult,
 ) {
-    let Ok(mut lock) = serde_json::from_str::<Value>(content) else {
+    // npm reads past a leading UTF-8 BOM; so do we.
+    let Ok(mut lock) = parse_json_text(content) else {
         // A corrupt lockfile is strictly worse than a missing one (which
         // warns in the caller) — never skip the whole npm redirect silently.
         result.warnings.push(RewriteWarning {
@@ -962,7 +975,9 @@ fn rewrite_one_npm_lock(
                 ),
             });
         }
-        result.files.insert(lockfile.into(), serialize_json(&lock));
+        result
+            .files
+            .insert(lockfile.into(), serialize_json_like(&lock, content));
     }
 }
 

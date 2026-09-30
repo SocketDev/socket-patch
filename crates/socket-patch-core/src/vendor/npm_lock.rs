@@ -24,7 +24,7 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::common::{already_patched_result, done, parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
@@ -131,7 +131,7 @@ pub async fn vendor_npm<'a>(
             );
         }
     };
-    let lock = match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
+    let lock = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
         Ok(v) => v,
         Err(e) => {
             return refused(
@@ -265,8 +265,8 @@ pub async fn vendor_npm<'a>(
         }
         if sib_changed {
             changed = true;
-            let indent = detect_indent(&String::from_utf8_lossy(&sib.bytes));
-            match serialize_json(&sib.lock, &indent) {
+            let layout = JsonLayout::of(&String::from_utf8_lossy(&sib.bytes));
+            match layout.render(&sib.lock) {
                 Ok(out) => sibling_writes.push((sib.name.clone(), sib.bytes.clone(), out)),
                 Err(e) => {
                     return done_failure_unstage(
@@ -306,8 +306,8 @@ pub async fn vendor_npm<'a>(
         );
     }
 
-    let indent = detect_indent(&String::from_utf8_lossy(&lock_bytes));
-    let out = match serialize_json(&lock, &indent) {
+    let layout = JsonLayout::of(&String::from_utf8_lossy(&lock_bytes));
+    let out = match layout.render(&lock) {
         Ok(out) => out,
         Err(e) => {
             return done_failure_unstage(
@@ -506,7 +506,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, 
         Ok(None) | Err(_) => return Err("vendor_lockfile_missing"),
     };
     let lock = LOCK_MEMO
-        .parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes))
+        .parse(&lock_bytes, || parse_json_manifest(&lock_bytes))
         .map_err(|_| "vendor_lockfile_version_unsupported")?;
     lock_version_gate(&lock, &lock_name).map_err(|o| super::npm_common::refusal_code(&o))?;
     Ok(NpmLockProject { lock_name, lock })
@@ -696,17 +696,16 @@ pub async fn revert_npm_opts(
             }
             Err(e) => return RevertOutcome::failed(format!("cannot read {lock_name}: {e}")),
         };
-        let mut lock =
-            match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
-                Ok(v) => (*v).clone(),
-                // Fail-closed: editing a lock we cannot parse risks destroying
-                // it; the user must repair it before revert can restore.
-                Err(e) => {
-                    return RevertOutcome::failed(format!(
-                        "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
-                    ))
-                }
-            };
+        let mut lock = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
+            Ok(v) => (*v).clone(),
+            // Fail-closed: editing a lock we cannot parse risks destroying
+            // it; the user must repair it before revert can restore.
+            Err(e) => {
+                return RevertOutcome::failed(format!(
+                    "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
+                ))
+            }
+        };
 
         let mut changed = false;
         // Reverse application order, like every backend's revert.
@@ -721,8 +720,8 @@ pub async fn revert_npm_opts(
         }
 
         if changed {
-            let indent = detect_indent(&String::from_utf8_lossy(&lock_bytes));
-            let out = match serialize_json(&lock, &indent) {
+            let layout = JsonLayout::of(&String::from_utf8_lossy(&lock_bytes));
+            let out = match layout.render(&lock) {
                 Ok(out) => out,
                 Err(e) => {
                     return RevertOutcome::failed(format!("cannot serialize {lock_name}: {e}"))
@@ -1173,7 +1172,7 @@ fn sibling_lock_target(
 ) -> Result<SiblingLock, String> {
     let bytes = sib_bytes.map_err(|e| format!("it cannot be read: {e}"))?;
     let lock = (*LOCK_MEMO
-        .parse(&bytes, || serde_json::from_slice::<Value>(&bytes))
+        .parse(&bytes, || parse_json_manifest(&bytes))
         .map_err(|e| format!("it is not parseable JSON: {e}"))?)
     .clone();
     let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
@@ -1292,6 +1291,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use crate::vendor::common::{detect_indent, serialize_json};
     use base64::Engine as _;
     use serde_json::json;
     use sha2::{Digest, Sha512};

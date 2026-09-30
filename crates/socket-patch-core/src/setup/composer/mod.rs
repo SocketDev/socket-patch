@@ -170,9 +170,7 @@ fn splice_scripts(original: &str, scripts: Option<&Value>) -> Option<String> {
             .all(|b| b == b' ' || b == b'\t')
             .then_some(base)
     };
-    let render = |value: &Value, base: &str| {
-        render_in_style_of(original, value, &unit, base, eol)
-    };
+    let render = |value: &Value, base: &str| render_in_style_of(original, value, &unit, base, eol);
     // serde_json keeps the last of a repeated key, so edit that one.
     let existing = members.iter().rposition(|m| m.key == "scripts");
     match (existing, scripts) {
