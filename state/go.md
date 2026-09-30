@@ -8,11 +8,11 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 
 | OS | go | Agent `apply` (plain) | Agent edge shapes (uppercase, /v2, pseudo, gopkg.in, CRLF, tidy, idempotent, rollback) | Vendored `vendor` (plain) | Committed `vendor/` dir | `go env -w` settings | Upgrade drift → VEX | Hosted |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.16.15 | pass (probe) | untested | pass (probe) | fail #343 | fail #344 | untested | untested |
+| Linux | 1.16.15 | untested | untested | untested | fail #343 | fail #344 | untested | untested |
 | Linux | 1.21.13 | pass (probe) | untested | pass (probe) | fail #343 | fail #344 | untested | untested |
 | Linux | 1.24.7 | pass | pass | pass | fail #343 | fail #344 | fail (agent attests; not filed yet, backlog 1) / vendored pass | untested |
 | Linux | 1.26.3 | pass (probe) | untested | pass (probe) | fail #343 | fail #344 | untested | untested |
-| macOS | 1.24.13 / 1.26.3 | pass (probe) | untested | pass (probe) | fail #343 | fail #344 | untested | untested |
+| macOS | 1.24.13 / 1.26.3 | untested (plain; the vendor/-dir cell got as far as apply exit 0) | untested | untested | fail #343 | fail #344 | untested | untested |
 | Windows | 1.16.15 / 1.21.13 / 1.26.3 | fail #346 | blocked by #346 | fail #346 | blocked by #346 | fail #344 | untested | untested |
 
 ## Backlog
