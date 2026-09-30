@@ -5868,7 +5868,7 @@ fn go_token_safe(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-// The committable shape (validated empirically — `docs/design/golang-hosted.md`):
+// The committable shape (validated empirically — `docs/ecosystems.md#go-directory-replaces-and-gosum`):
 //
 //   go.mod:  replace <orig> <ver> => patch.socket.dev/gopatch/<uuid> <sver>
 //   go.sum:  patch.socket.dev/gopatch/<uuid> <sver> h1:…          (zip dirhash)

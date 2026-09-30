@@ -1,6 +1,6 @@
 //! The repository's patch policy: the `patches` block and
 //! `projectIgnorePaths` of the root `socket.yml`, plus the built-in default
-//! path ignores. See `docs/design/staged-rollout.md` §3-§4.
+//! path ignores. See `docs/configuration.md#repository-patch-policy`.
 //!
 //! A policy only ever **narrows** what `scan` patches (trust boundary,
 //! CLI_CONTRACT.md): nothing here names an endpoint, a credential, a mode

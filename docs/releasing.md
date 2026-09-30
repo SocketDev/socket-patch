@@ -11,7 +11,7 @@ The CLI publishes to three channels, all from that single dispatch:
 
 The npm distribution is also required by the official Socket CLI. v5 no longer
 builds or publishes the PyPI and RubyGems CLI packages or their install hooks.
-See the [migration instructions](../README.md#migrating-from-pypi-or-rubygems).
+See the [migration instructions](migrating-to-v5.md#installation-channels).
 
 ## 1. Write the release notes
 

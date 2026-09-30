@@ -1,11 +1,11 @@
 # Ecosystem & platform support
 
 This is the detailed support matrix for `socket-patch`: which package ecosystems work
-with which [patch mode](../README.md#three-patch-modes), the per-ecosystem caveats, and
+with which [patch mode](../README.md#patch-modes), the per-ecosystem caveats, and
 the platforms the binary ships for.
 
 For what the three modes *are* and how to choose between them, see
-[How Socket Patch works](../README.md#how-socket-patch-works) in the README.
+[Patch modes](../README.md#patch-modes) in the README.
 
 ## Mode × ecosystem matrix
 
@@ -18,7 +18,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
 | RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
-| Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [golang-hosted.md](design/golang-hosted.md). Paid tier stays ❌ ([golang-hosted-no-go.md](design/golang-hosted-no-go.md)); `redirect_golang_unsupported` names the vendored remedy |
+| Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) | ✅ in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
 | NuGet (`nuget`) | ✅ in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
 | Composer (`composer`) | ✅ in place (`vendor/`) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite; the entry's `source` and `dist.mirrors` are removed. See [composer-compatibility.md](testing/composer-compatibility.md) |
@@ -384,6 +384,14 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   client-side content pin (vendored surfaces this as a `vendor_nuget_no_lockfile`
   warning; the feed + source mapping still force the patched copy).
 
+* **NuGet package signatures (local vendoring).** Rebuilding a `.nupkg` changes
+  its contents, so the local builder removes the upstream `.signature.p7s` rather
+  than retaining an invalid signature. Environments requiring signed packages need
+  a compatible signing policy or an appropriate service artifact; local vendoring
+  does not preserve the upstream author's signature. Service artifacts are copied
+  without local repacking. The current implementation uses a folder feed with
+  source mapping.
+
 ## Cargo: shared registry cache
 
 Agent mode patches the crate in place wherever the crawler finds it. For a non-vendored
@@ -523,17 +531,46 @@ commit it, and review it like any other vendored code. The wiring survives
 `go mod tidy`, and `apply --check` gives CI a read-only audit that the committed
 redirects still match the manifest.
 
-Hosted mode uses Go's other native `replace` form — a fork-style
-module-to-module directive onto a Socket-published, content-addressed module
-(`replace <mod> <ver> => patch.socket.dev/gopatch/<uuid> <ver>-socketpatch.<n>`)
-plus the module's two committed `go.sum` lines. Because go consults the
-checksum database only for modules *absent* from `go.sum`, the committed pair
-is the complete day-2 state: fresh clones and CI build the patched module with
-no machine-local configuration, and a tampered hash still fails closed with
-go's checksum `SECURITY ERROR`. Free tier only; the paid-tier analysis (and
-the ephemeral-CI workaround) is in
-[golang-hosted-no-go.md](design/golang-hosted-no-go.md), the full free-tier
-design in [golang-hosted.md](design/golang-hosted.md).
+Hosted mode uses a fork-style module replacement and two committed checksums:
+
+```text
+# go.mod
+replace example.com/module v1.4.2 => patch.socket.dev/gopatch/<uuid> v1.4.2-socketpatch.1
+
+# go.sum
+patch.socket.dev/gopatch/<uuid> v1.4.2-socketpatch.1 h1:<module-zip-hash>
+patch.socket.dev/gopatch/<uuid> v1.4.2-socketpatch.1/go.mod h1:<module-file-hash>
+```
+
+The service supplies the replacement path, version, and both hashes; the example
+version is illustrative. Both hashes must be present before the CLI writes the
+replacement. Go uses committed `go.sum` entries without consulting the checksum
+database for those entries, so a fresh checkout needs no per-machine checksum
+exemption. A mismatched checksum still fails the build. The rewriter removes the
+replaced version's original sum lines to keep the result stable under `go mod tidy`.
+
+This requires a free, publicly retrievable patch reference carrying a `goproxy`
+override. CLI support does not imply a patch is published for a particular module.
+Paid hosted Go references are unsupported: embedding credentials in module paths
+would expose them to module proxies and change module identity. Use vendored mode
+for those patches; the CLI reports `redirect_golang_unsupported` when the required
+hosted reference is absent.
+
+Important limits:
+
+- A replacement targets an exact original module version. Updating the `require`
+  can leave it unused; re-scan and regenerate VEX after dependency updates.
+- An internal `GOPROXY` must be able to serve or forward the Socket module path.
+  Comma-separated proxy fallbacks do not recover from every HTTP error.
+- User-authored conflicting replacements are preserved and the patch is refused.
+  Missing module metadata, untrusted Socket module paths, or missing integrity
+  values are also refused before writing.
+- Local directory replacements in agent and vendored mode are not checked against
+  `go.sum`; commit and review those trees. Hosted replacements use the module
+  checksum mechanism above.
+
+The implemented hosted shape and fresh-checkout behavior are exercised by
+[`e2e_golang_hosted_build.rs`](../crates/socket-patch-cli/tests/e2e_golang_hosted_build.rs).
 
 ## Supported platforms
 

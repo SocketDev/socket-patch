@@ -1,5 +1,5 @@
-//! `scan --max-new-patches` (work item B of the staged-rollout design,
-//! `docs/design/staged-rollout.md` §5).
+//! `scan --max-new-patches` (see the rollout guide,
+//! `docs/configuration.md#gradual-rollout`).
 
 
 use clap::Args;
