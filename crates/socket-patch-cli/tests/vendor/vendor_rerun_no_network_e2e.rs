@@ -689,6 +689,76 @@ fn cargo_rerun_over_a_drifted_copy_still_fetches_and_reports_it() {
     );
 }
 
+/// A copy vendored before inventories were recorded (a 4.0.0 ledger entry
+/// has no `fileInventory`) gives an exact redownload nothing to check, so a
+/// re-vendor over its deleted copy rebuilds it through the backend from a
+/// fresh verified download instead of refusing on every run.
+#[test]
+fn cargo_rerun_over_a_missing_pre_inventory_copy_rebuilds_it() {
+    const PURL: &str = "pkg:cargo/cfg-if@1.0.4";
+    const UUID: &str = "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d0c";
+    const PRISTINE: &[u8] = b"pub fn cfg() {}\n";
+    const PATCHED: &[u8] = b"pub fn cfg() { /* patched */ }\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let cargo_home = tmp.path().join("cargo-home");
+    let krate = cargo_home.join("registry/src/index.crates.io-6f17d22bba15001f/cfg-if-1.0.4");
+    std::fs::create_dir_all(krate.join("src")).unwrap();
+    std::fs::write(krate.join("src/lib.rs"), PRISTINE).unwrap();
+    std::fs::write(
+        krate.join("Cargo.toml"),
+        "[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.lock"),
+        format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [\n \"cfg-if\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"{}\"\n",
+            "9".repeat(64)
+        ),
+    )
+    .unwrap();
+    write_manifest(&root, PURL, UUID, "package/src/lib.rs", PRISTINE, PATCHED);
+    let home = cargo_home.to_string_lossy().into_owned();
+    let env = [("CARGO_HOME", home.as_str())];
+    let dead = dead_endpoint();
+
+    let (code, v, stderr) = run_vendor(&root, &dead, &[], &env);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    std::fs::remove_dir_all(&krate).unwrap();
+    let state_path = root.join(".socket/vendor/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    let artifact = state["entries"][PURL]["artifact"]
+        .as_object_mut()
+        .expect("the ledger records the crate");
+    assert!(artifact.remove("fileInventory").is_some(), "{v:#}");
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::remove_dir_all(root.join(format!(".socket/vendor/cargo/{UUID}"))).unwrap();
+
+    let (code, v, stderr) = run_vendor(&root, &dead, &[], &env);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert!(
+        !purl_events(&v, PURL).contains(&("failed", "vendor_redownload_failed")),
+        "{v:#}"
+    );
+    let copy_lib = root.join(format!(
+        ".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/src/lib.rs"
+    ));
+    assert_eq!(std::fs::read(&copy_lib).unwrap(), PATCHED);
+}
+
 // ── cargo: the service path needs no pristine source ─────────────────────
 
 /// A `.crate`: a tar.gz with a single `{prefix}/` top-level dir.

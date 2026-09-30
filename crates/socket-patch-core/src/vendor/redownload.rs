@@ -47,6 +47,16 @@ async fn download_archive(
         .or_else(used)
 }
 
+// Without the ledger's fingerprint no download can be proven to be the
+// recorded artifact. A revert drops the entry, so the following `vendor`
+// downloads afresh and records a new fingerprint.
+const NO_ARCHIVE_SHA256: &str = "the ledger has no archive SHA-256; restore it from version \
+     control, or run `socket-patch vendor --revert` and then `socket-patch vendor` to vendor \
+     it again";
+const NO_FILE_INVENTORY: &str = "the ledger has no complete file inventory; restore it from \
+     version control, or run `socket-patch vendor --revert` and then `socket-patch vendor` to \
+     vendor it again";
+
 /// Restore only the recorded artifact. Project wiring and ledger are never written.
 pub async fn restore(
     root: &Path,
@@ -93,10 +103,10 @@ pub async fn restore(
     let file_shaped = !super::verify::is_vlt_dir_entry(entry)
         && super::verify::artifact_is_file_shaped(&entry.artifact.path);
     if file_shaped && entry.artifact.sha256.is_empty() {
-        return Err("the ledger has no archive SHA-256; restore from version control or explicitly re-vendor".into());
+        return Err(NO_ARCHIVE_SHA256.into());
     }
     if !file_shaped && entry.artifact.file_inventory.is_none() {
-        return Err("the ledger has no complete file inventory; restore from version control or explicitly re-vendor".into());
+        return Err(NO_FILE_INVENTORY.into());
     }
     let socket = root.join(".socket");
     tokio::fs::create_dir_all(&socket)
@@ -278,7 +288,11 @@ pub async fn restore(
             }
         }
         {
-            let inventory = entry.artifact.file_inventory.as_ref().ok_or("the ledger has no complete file inventory; restore from version control or explicitly re-vendor")?;
+            let inventory = entry
+                .artifact
+                .file_inventory
+                .as_ref()
+                .ok_or(NO_FILE_INVENTORY)?;
             let uuid = (entry.ecosystem == "cargo").then_some(entry.uuid.as_str());
             super::verify::verify_dir_inventory(&stage, inventory, uuid).await?;
         }
@@ -566,6 +580,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("no archive SHA-256"), "{error}");
+        assert!(
+            error.contains("`socket-patch vendor --revert` and then `socket-patch vendor`"),
+            "the refusal names the remedy that records a new fingerprint: {error}"
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
         assert_eq!(tree_snapshot(root.path()), before);
     }
@@ -685,15 +703,19 @@ mod tests {
         let before = tree_snapshot(root.path());
         entry.artifact.file_inventory = None;
         server.reset().await;
-        assert!(restore(
+        let error = restore(
             root.path(),
             &entry,
             &record(),
-            &service_cfg(&server.uri(), VendorSource::Service, false)
+            &service_cfg(&server.uri(), VendorSource::Service, false),
         )
         .await
-        .unwrap_err()
-        .contains("no complete file inventory"));
+        .unwrap_err();
+        assert!(error.contains("no complete file inventory"), "{error}");
+        assert!(
+            error.contains("`socket-patch vendor --revert` and then `socket-patch vendor`"),
+            "the refusal names the remedy that records a new inventory: {error}"
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
         assert_eq!(tree_snapshot(root.path()), before);
         entry.ecosystem = "npm".into();

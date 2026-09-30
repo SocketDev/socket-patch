@@ -2445,9 +2445,15 @@ pub(crate) async fn vendor_records_reusing(
                 }
             }
 
-            if let Some(entry) =
-                lookup_entry(&state.entries, candidate).filter(|entry| entry.uuid == record.uuid)
-            {
+            // A dir-shaped entry with no file inventory (vendored before
+            // inventories were recorded, or past the inventory cap) gives an
+            // exact restore nothing to check a download against: the backend
+            // below rebuilds its copy from a fresh verified download instead.
+            if let Some(entry) = lookup_entry(&state.entries, candidate).filter(|entry| {
+                entry.uuid == record.uuid
+                    && (entry.artifact.file_inventory.is_some()
+                        || vendor::artifact_is_file_shaped(&entry.artifact.path))
+            }) {
                 if vendor::check_vendored_artifact(&common.cwd, entry, record).await
                     != vendor::ArtifactHealth::Healthy
                     || (entry.artifact.sha256.is_empty()
