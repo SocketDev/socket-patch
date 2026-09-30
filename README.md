@@ -333,7 +333,11 @@ Fresh checkouts work in every mode: a clone with only `Pipfile` +
 `Pipfile.lock` is discovered from the lock (hosted redirects it, vendored
 fetches the pristine wheel by one of the lock's recorded digests), and agent
 mode finds Pipenv's default out-of-tree virtualenv under `WORKON_HOME`
-without `pipenv run`.
+without `pipenv run`. Agent mode picks the venv the way Pipenv does: an
+activated `VIRTUAL_ENV` only without `PIPENV_ACTIVE` /
+`PIPENV_IGNORE_VIRTUALENVS`, `./.venv` subject to `PIPENV_VENV_IN_PROJECT`
+and the Pipfile's `[pipenv] venv_in_project`, and never a `venv/`
+directory.
 
 Pipenv never reinstalls a release that is already present: `pipenv install`,
 `pipenv install --deploy` and `pipenv sync` all exit 0 and keep the installed
