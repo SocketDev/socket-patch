@@ -640,9 +640,10 @@ async fn cargo_prelude(
 }
 
 /// The wet run's refusals past the dry-run branch and before the first
-/// service call: a live hosted redirect nothing can revert, and a lock entry
-/// the vendored copy's version tag cannot be written into. `Ok` is the lock
-/// probe the hot path routes on.
+/// service call: a live hosted redirect nothing can revert, a lock entry
+/// resolved outside crates.io, and a lock entry the vendored copy's version
+/// tag cannot be written into. `Ok` is the lock probe the hot path routes
+/// on.
 async fn cargo_wet_preflight(
     project_root: &Path,
     name: &str,
@@ -670,19 +671,34 @@ async fn cargo_wet_preflight(
             ),
         ));
     }
+    if let Some(refusal) = lock_source_refusal(project_root, name, version).await {
+        return Err(refusal);
+    }
+    match lock_tag_preflight(project_root, name, version, uuid).await {
+        (_, Some(refusal)) => Err(refusal),
+        (probe, None) => Ok(probe),
+    }
+}
+
+/// A lock entry resolved from anywhere but crates.io (a git fork, another
+/// registry): server patches require the crates.io package. The dry run
+/// raises it too, unless a live hosted redirect owns the entry (the wet run
+/// restores that first).
+async fn lock_source_refusal(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Option<VendorOutcome> {
     if let cargo_lock::LockEntryProbe::Source(source) =
         cargo_lock::probe_lock_entry(project_root, name, version).await
     {
         if source != "registry+https://github.com/rust-lang/crates.io-index"
             && source != "sparse+https://index.crates.io/"
         {
-            return Err(refused("vendor_source_unsupported", format!("{name}@{version} resolves from {source}; server patches require the crates.io package")));
+            return Some(refused("vendor_source_unsupported", format!("{name}@{version} resolves from {source}; server patches require the crates.io package")));
         }
     }
-    match lock_tag_preflight(project_root, name, version, uuid).await {
-        (_, Some(refusal)) => Err(refusal),
-        (probe, None) => Ok(probe),
-    }
+    None
 }
 
 /// The cargo backend's locked-version refusal of `record` — `Cargo.lock`
@@ -780,6 +796,14 @@ pub async fn vendor_cargo_crate<'a>(
     let (name, version) = (name.as_str(), version.as_str());
 
     if dry_run {
+        let hosted_live = hosted_redirect_residue(project_root, name, version)
+            .await
+            .is_some();
+        if !hosted_live {
+            if let Some(refusal) = lock_source_refusal(project_root, name, version).await {
+                return refusal;
+            }
+        }
         let mut dry_warnings = Vec::new();
         if !cargo_copy_matches(&copy_dir, &record.files).await {
             if let Err(outcome) =
@@ -798,10 +822,7 @@ pub async fn vendor_cargo_crate<'a>(
         // Preview the wet run's lock edit — unless a live hosted redirect
         // still owns the lock entry: the wet run reverts it from the
         // redirect ledger first, so its lock is not this one.
-        if hosted_redirect_residue(project_root, name, version)
-            .await
-            .is_none()
-        {
+        if !hosted_live {
             let (lock_probe, refusal) =
                 lock_tag_preflight(project_root, name, version, &record.uuid).await;
             if let Some(refusal) = refusal {
@@ -2510,6 +2531,50 @@ mod tests {
         );
         assert_eq!(manifest_path(root).await, Some(copy_rel()));
         assert!(lock_text(root).await.contains(&tagged(UUID)));
+    }
+
+    /// A lock entry resolved from outside crates.io is refused by the dry
+    /// run exactly as by the wet run, before either asks the service.
+    #[tokio::test]
+    async fn dry_run_refuses_a_non_crates_io_source_like_the_wet_run() {
+        for source in [
+            "git+https://example.com/fork/cfg-if#abc123",
+            "registry+https://my-registry.example/index",
+        ] {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            let lock = lock_body().replace(SOURCE, source);
+            tokio::fs::write(root.join("Cargo.lock"), &lock)
+                .await
+                .unwrap();
+            let server = wiremock::MockServer::start().await;
+            crate::vendor::test_support::mount_no_results(&server).await;
+            let cfg = crate::vendor::test_support::service_cfg(
+                &server.uri(),
+                crate::vendor::VendorSource::Service,
+                false,
+            );
+            let sources = PatchSources::blobs_only(&blobs);
+            for dry_run in [true, false] {
+                let outcome = crate::vendor::test_support::vendor_cargo_crate(
+                    PURL,
+                    pristine.as_path(),
+                    root,
+                    &record,
+                    &sources,
+                    "2026-06-09T00:00:00Z",
+                    dry_run,
+                    false,
+                    Some(&cfg),
+                )
+                .await;
+                let detail = expect_refused(outcome, "vendor_source_unsupported");
+                assert!(detail.contains(source), "{dry_run}: {detail}");
+            }
+            assert_eq!(crate::vendor::test_support::request_count(&server).await, 0);
+            assert_eq!(lock_text(root).await, lock);
+            assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+        }
     }
 
     #[tokio::test]
