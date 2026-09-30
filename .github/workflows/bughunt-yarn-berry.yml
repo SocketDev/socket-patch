@@ -38,7 +38,7 @@ jobs:
           [ -f package/bin/yarn.js ] || { npm pack @yarnpkg/cli-dist@$YV --silent >/dev/null 2>&1 && tar xzf yarnpkg-cli-dist-$YV.tgz; }
           YJ=$W/yarn/package/bin/yarn.js
           y() { node "$YJ" "$@"; }
-          export NO_PROXY="127.0.0.1,localhost" no_proxy="127.0.0.1,localhost" YARN_ENABLE_TELEMETRY=0
+          export NO_PROXY="127.0.0.1,localhost" no_proxy="127.0.0.1,localhost" YARN_ENABLE_TELEMETRY=0 YARN_ENABLE_IMMUTABLE_INSTALLS=false
           cat > $W/mock.py <<'EOF'
           import os, json
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -74,7 +74,7 @@ jobs:
             y install > i1.log 2>&1 || { echo "[$C] install1 FAIL"; tail -5 i1.log; }
             echo "[$C] yarn.lock EOL: $(grep -c $'\r' yarn.lock) CR lines; cacheKey $(grep cacheKey yarn.lock)"
             cd $D/tgz && npm pack $PKG@$VER --silent >/dev/null 2>&1 && tar xzf *.tgz && cp package/$FILE $D/before && $PY -c "
-          p='package/$FILE';b=open(p,'rb').read();open(p,'wb').write(b'/* SOCKET-PATCHED */\n'+b)" && cp package/$FILE $D/after && tar czf $D/patched.tgz package
+          p='package/$FILE';b=open(p,'rb').read();open(p,'wb').write(b'/* SOCKET-PATCHED */\n'+b)" && cp package/$FILE $D/after && tar czf ../patched.tgz package
             cd $D/boot && cp $D/patched.tgz . && echo "{\"name\":\"boot\",\"version\":\"0.0.0\",\"private\":true,\"dependencies\":{\"$PKG\":\"$VER\"},\"resolutions\":{\"$PKG\":\"file:./patched.tgz\"}}" > package.json && printf 'nodeLinker: node-modules\nenableGlobalCache: false\n' > .yarnrc.yml && touch yarn.lock && y install > b.log 2>&1 || tail -3 b.log
             local CK=$($PY -c "
           import re
