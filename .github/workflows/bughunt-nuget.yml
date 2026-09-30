@@ -1,0 +1,61 @@
+name: bughunt nuget probe
+on:
+  push:
+    branches: ['bughunt/nuget/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-latest}
+          - {os: windows-2022}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        shell: bash
+        env:
+          SOCKET_OFFLINE: '1'
+        run: |
+          set +e +o pipefail
+          unset NUGET_PACKAGES
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          W="$RUNNER_TEMP/bh"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
+          curl -sSL -o nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe; ./nuget.exe help | head -1
+          DEF="$(cygpath -u "$USERPROFILE")/.nuget/packages"
+          blob(){ local l; l=$(wc -c < "$1" | tr -d ' '); { printf 'blob %s\0' "$l"; cat "$1"; } | sha256sum | cut -d' ' -f1; }
+          stage(){ local o="$1" p="$2" bh ah; bh=$(blob "$o"); ah=$(blob "$p")
+            mkdir -p .socket/blobs; cp "$p" ".socket/blobs/$ah"; cp "$o" ".socket/blobs/$bh"
+            printf '{"patches":{"pkg:nuget/Newtonsoft.Json@13.0.3":{"uuid":"11111111-1111-4111-8111-111111111111","exportedAt":"2026-01-01T00:00:00Z","files":{"LICENSE.md":{"beforeHash":"%s","afterHash":"%s"}},"vulnerabilities":{},"description":"m","license":"MIT","tier":"free"}}}' "$bh" "$ah" > .socket/manifest.json; }
+          res(){ echo "RESULT[$ImageOS] $*"; }
+          mk(){ # $1 dir, $2 repositoryPath or empty
+            mkdir -p "$1/App"; cd "$1"
+            printf '<?xml version="1.0" encoding="utf-8"?>\n<packages>\n  <package id="Newtonsoft.Json" version="13.0.3" targetFramework="net472" />\n</packages>\n' > App/packages.config
+            printf '<?xml version="1.0" encoding="utf-8"?>\n<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">\n  <PropertyGroup><ProjectGuid>{11111111-2222-3333-4444-555555555555}</ProjectGuid><OutputType>Library</OutputType><TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion></PropertyGroup>\n  <ItemGroup><None Include="packages.config" /></ItemGroup>\n</Project>\n' > App/App.csproj
+            printf 'Microsoft Visual Studio Solution File, Format Version 12.00\r\nProject("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "App", "App\\App.csproj", "{11111111-2222-3333-4444-555555555555}"\r\nEndProject\r\n' > App.sln
+            if [ -n "$2" ]; then printf '<?xml version="1.0" encoding="utf-8"?>\n<configuration>\n  <config><add key="repositoryPath" value="%s" /></config>\n</configuration>\n' "$2" > nuget.config; fi
+            "$W/nuget.exe" restore App.sln -NonInteractive > r.log 2>&1 || cat r.log
+            find . -name LICENSE.md -path '*ewtonsoft*' | head -3; }
+          warm(){ rm -rf "$DEF/newtonsoft.json/13.0.3"; mkdir -p "$W/warm"; (cd "$W/warm"; printf '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>' > w.csproj; dotnet restore --force > r.log 2>&1 || cat r.log); }
+          for CASE in "default|" "repopath|lib/pkgs" "warmrepopath|lib/pkgs"; do
+            N=${CASE%%|*}; RP=${CASE#*|}
+            case $N in warm*) warm;; *) rm -rf "$DEF/newtonsoft.json/13.0.3";; esac
+            mk "$W/$N" "$RP"
+            L=$(find . -name LICENSE.md -path '*ewtonsoft.Json.13.0.3*' | head -1)
+            [ -n "$L" ] || { res "[$N] nuget.exe restore did not produce package"; cd "$W"; continue; }
+            cp "$L" "$W/pr.md"; cp "$W/pr.md" "$W/pa.md"; printf '\nSOCKET-MARKER\n' >> "$W/pa.md"; stage "$W/pr.md" "$W/pa.md"
+            "$SP" apply --offline > a.log 2>&1; rc=$?; tail -3 a.log
+            grep -q SOCKET-MARKER "$L" && pl=PATCHED || pl=UNPATCHED
+            [ -f "$DEF/newtonsoft.json/13.0.3/LICENSE.md" ] && { grep -q SOCKET-MARKER "$DEF/newtonsoft.json/13.0.3/LICENSE.md" && dl=PATCHED || dl=untouched; } || dl=absent
+            res "[$N] repositoryPath='$RP' copy=$L apply rc=$rc repo-copy=$pl default-cache=$dl"
+            cd "$W"
+          done
+          echo "==== summary"; true
