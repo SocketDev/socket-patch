@@ -1777,10 +1777,8 @@ async fn acquire_patched_wheel(
 /// they are large).
 type PypiServiceWheel = ServiceAttempt<Box<AcquiredWheel>>;
 
-/// Download + verify the prebuilt wheel for `record.uuid`, mapping each service
-/// outcome onto the `auto` / `service` policy. Only `.whl` artifacts are usable
-/// (pypi vendoring is wheel-based); an sdist (or any miss) is a fallback under
-/// `auto` and a hard fail under `service`.
+/// Download and verify the server wheel or sdist for `record.uuid`.
+#[allow(clippy::too_many_arguments)]
 async fn try_pypi_service_wheel(
     base: &str,
     uuid_dir_rel: &str,

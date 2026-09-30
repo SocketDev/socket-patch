@@ -843,12 +843,6 @@ async fn materialise_patched_nupkg(
     }
 }
 
-/// Deterministic re-zip of the patched stage (RECORD-free — a nupkg is a plain
-/// OPC zip; NuGet reads the central directory, so entry order is free to be
-/// lexicographic for stable bytes across re-runs). The in-memory repack
-/// assembles the same entry list from the parts it never wrote out; a package
-/// that had to be extracted is walked from the stage on disk.
-
 /// Write `bytes` to `nupkg_path`, creating the uuid dir. Errors are strings.
 async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result<(), String> {
     tokio::fs::create_dir_all(uuid_dir)

@@ -242,7 +242,7 @@
     ],
     "vendored/get": [
       "get_uuid_vendored_vlt_vendors_refuses_and_agent_bypasses",
-      "vlt_pinned_matrix_vendored_get_build_fresh_ci",
+      "vlt_pinned_matrix_vendored_get_auto_fresh_ci",
       "vlt_pinned_matrix_vendored_get_service_fresh_ci"
     ],
     "vendored/revert": [

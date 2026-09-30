@@ -769,8 +769,6 @@ pub(crate) fn pypi_json_api_base() -> String {
         .unwrap_or_else(|| DEFAULT_PYPI_JSON_API.to_string())
 }
 
-/// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
-
 /// go's default module proxy (the first element of go's default
 /// `GOPROXY=https://proxy.golang.org,direct`).
 pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";

@@ -1343,12 +1343,6 @@ async fn materialise_and_write(
     Ok((jar_bytes, result))
 }
 
-/// Deterministic re-zip of the patched stage (a jar is a plain zip; a
-/// dependency resolve reads the central directory, so lexicographic entry
-/// order + fixed timestamps yield stable bytes across re-runs). The in-memory
-/// repack assembles the same entry list from the members it never wrote out;
-/// an archive that had to be extracted is walked on disk.
-
 /// Acquire the REAL upstream pom bytes: the cached `~/.m2` copy first (the
 /// common case — the package was resolved locally), then a maven2 registry
 /// download when the service is enabled. An `Err(detail)` maps to a

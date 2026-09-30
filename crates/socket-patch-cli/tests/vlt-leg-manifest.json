@@ -46,7 +46,7 @@
     "e2e_vendor_vlt_build": {
       "vendored": [
         "scan_fresh_ci",
-        "get_build_fresh_ci",
+        "get_auto_fresh_ci",
         "get_service_fresh_ci",
         "durability",
         "workspace_member_selfref",
@@ -178,7 +178,7 @@
     ],
     "vendored": [
       "scan_fresh_ci",
-      "get_build_fresh_ci",
+      "get_auto_fresh_ci",
       "get_service_fresh_ci",
       "durability",
       "workspace_member_selfref",

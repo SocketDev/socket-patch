@@ -162,8 +162,6 @@ fn format_fetch_failures(result: &FetchMissingBlobsResult, (one, many): Noun) ->
 /// The disk stager's status line while it downloads what `.socket/` lacks.
 const DOWNLOADING_ARTIFACTS: &str = "Downloading missing patch artifacts...";
 
-/// The in-memory stager's status line while it fetches patch views.
-
 /// Announce the per-file blob top-up that follows a diff-mode fetch. It
 /// runs even when every diff archive arrived — a diff cannot patch a file
 /// whose bytes differ from `beforeHash`, and the pipeline then falls back
