@@ -1886,8 +1886,9 @@ fn pypi_requirements_txt_vendored_install_proof() {
         "{LEG}: requirements.txt was not rewired to the vendored wheel:\n{reqs}"
     );
     assert!(
-        reqs.contains("--hash=sha256:"),
-        "{LEG}: rewritten requirements.txt carries no --hash pin:\n{reqs}"
+        !reqs.contains("--hash"),
+        "{LEG}: an unhashed requirements.txt must stay unhashed, or pip's \
+         hash-checking mode refuses every other requirement (#376):\n{reqs}"
     );
 
     // DELIVERY PROOF: requirements.txt + .socket only, fresh venv, --no-index
