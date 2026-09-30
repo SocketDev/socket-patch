@@ -1385,6 +1385,16 @@ async fn run_project_dirs(
         );
         return 2;
     }
+    // `--vex <path>` names one document: each directory's run would write
+    // (or, on a failed generation, remove) the same file, so the last run
+    // would silently clobber the others' attestations.
+    if args.vex.vex.is_some() && dirs.len() > 1 {
+        eprintln!(
+            "Error: --vex takes one project directory ({} given); run one scan per directory",
+            dirs.len()
+        );
+        return 2;
+    }
     // One budget per invocation (§5.2): the directories spend it in sorted
     // order, and a package admitted in one is admitted free in the next.
     let configured = match args.rollout.resolve_from_env(invocation.policy.max_new_patches()) {

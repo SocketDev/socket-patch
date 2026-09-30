@@ -17,7 +17,8 @@
 //!   `path_scope_excluded_supplements` run-level warning;
 //! * in hosted/vendored mode (including a bare scan) PATHS are project
 //!   directories: a PATH that is not a directory, more than one directory
-//!   under `--json`, or an unparseable glob is a usage error (exit 2).
+//!   under `--json` or `--vex`, or an unparseable glob is a usage error
+//!   (exit 2).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -581,6 +582,43 @@ async fn paths_with_hosted_or_vendored_mode_name_project_directories() {
         "stderr={stderr}"
     );
     assert!(stdout.trim().is_empty(), "stdout={stdout}");
+
+    // --vex names one output document, so it takes one project directory
+    // too: two runs would overwrite (or on a failure remove) the same file.
+    let out = scan_cmd(tmp.path())
+        .args([
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--api-token",
+            "fake-token-for-test",
+            "--org",
+            ORG,
+            "--vex",
+            "out.vex.json",
+            "apps/*",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let (code, stdout, stderr) = (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    );
+    assert_eq!(code, 2, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stderr.contains("--vex takes one project directory (2 given)"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !tmp.path().join("out.vex.json").exists(),
+        "the refusal fires before any document is written"
+    );
+    for app in ["apps/a", "apps/b"] {
+        assert!(
+            !tmp.path().join(app).join(".socket").exists(),
+            "the refusal fires before any project is touched ({app})"
+        );
+    }
 
     // An unparseable glob is the same exit-2 usage-error shape.
     let (code, stdout, stderr) = run_scan(tmp.path(), "http://127.0.0.1:1", &["x["]);
