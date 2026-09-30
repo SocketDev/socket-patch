@@ -82,9 +82,9 @@ jobs:
           for blk in t.split('\n\n'):
               if blk.startswith('\"$PKG@file:'):
                   c=re.search(r'checksum: (\S+)',blk).group(1); print(c if '/' in c else '10c0/'+c)")
-            cd $D
+            cd $D; cp $W/mock.py $D/
             PURL="pkg:npm/$PKG@$VER" UUID=5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d CHECKSUM=$CK BEFORE=$(gs before) AFTER=$(gs after) FILEKEY=package/$FILE PORT=$PORT $PY mock.py 2>/dev/null & 
-            MOCK=$!; cp $W/mock.py $D/ 2>/dev/null; sleep 3
+            MOCK=$!; sleep 3
             cd $D/proj; cp yarn.lock $D/lock.orig
             "$SP" scan --mode hosted --json --yes --api-url http://127.0.0.1:$PORT --org test-org --api-token fake --vex out.vex.json --vex-product pkg:npm/app@1.0.0 > scan.json 2> scan.err
             echo "[$C] scan exit=$? $($PY -c "import json;d=json.load(open('scan.json'));r=d.get('redirect') or {};print('status',d.get('status'),'redirected',r.get('redirected'),[w['code'] for w in r.get('warnings',[])])")"
