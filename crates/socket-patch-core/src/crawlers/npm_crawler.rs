@@ -211,6 +211,123 @@ fn is_legacy_pnpm_store_dir_name(name: &str) -> bool {
 /// The `node_modules` child that is vlt's per-project package store.
 const VLT_STORE_NAME: &str = ".vlt";
 
+/// The `node_modules` child that is npm's `install-strategy=linked` store.
+const NPM_LINKED_STORE_NAME: &str = ".store";
+
+/// Length of the hash suffix npm's linked strategy appends to a store key:
+/// the base64url of a 16-byte shake256 digest, unpadded (arborist's
+/// `isolated-reifier.js` `getKey`).
+const NPM_STORE_KEY_HASH_LEN: usize = 22;
+
+/// Decode an npm linked-store key (`<name>@<version>-<hash>`, scoped
+/// `@scope/<leaf>@<version>-<hash>`) into the `(package_name, version)` it
+/// advertises. The hash is base64url, so it may itself hold `-`/`_`: it
+/// is cut by its fixed length, never by searching for a separator.
+///
+/// `None` for anything else, e.g. the un-hashed `<name>@<version>` dir
+/// npm extracts a shrinkwrapped dependency into, or a non-semver version.
+/// Like the pnpm decoder the result is advisory: the package.json probe
+/// stays the authority, and `None` means "unknowable", never "empty".
+fn decode_npm_store_entry_name(entry_name: &str) -> Option<(String, String)> {
+    let cut = entry_name.len().checked_sub(NPM_STORE_KEY_HASH_LEN + 1)?;
+    let (key, hash) = (entry_name.get(..cut)?, entry_name.get(cut..)?);
+    let hash = hash.strip_prefix('-')?;
+    if !hash
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let at = key.rfind('@')?;
+    if at == 0 || key[..at].ends_with('/') {
+        return None;
+    }
+    let version = &key[at + 1..];
+    if !is_semver_triple(version) {
+        return None;
+    }
+    Some((key[..at].to_string(), version.to_string()))
+}
+
+/// The `node_modules` child in which pnpm records its install state,
+/// including where the virtual store lives.
+const PNPM_MODULES_YAML: &str = ".modules.yaml";
+
+/// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
+/// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).
+fn parse_modules_yaml_virtual_store_dir(text: &str) -> Option<String> {
+    let text = crate::package_json::detect::strip_bom(text);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return value
+            .get("virtualStoreDir")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    let raw = text
+        .lines()
+        .find_map(|line| line.strip_prefix("virtualStoreDir:"))?
+        .trim();
+    let value = if raw.starts_with('"') {
+        serde_json::from_str::<String>(raw).ok()?
+    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        inner.replace("''", "'")
+    } else {
+        raw.to_string()
+    };
+    (!value.is_empty()).then_some(value)
+}
+
+/// `path` with `.` and `..` resolved lexically (no filesystem access), so
+/// a recorded `../.vstore` joins to the same spelling the walks use.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A pnpm virtual store that `node_modules/.modules.yaml` relocates away
+/// from the default `node_modules/.pnpm` (pnpm's `virtualStoreDir`
+/// setting, stored relative to `node_modules`, or absolute on old pnpm).
+///
+/// Only a store INSIDE the importer (the directory holding `nm`) counts,
+/// reached through real directories only. Anything else, notably pnpm's
+/// global virtual store (`<store-dir>/v10/links`), is shared by other
+/// projects on the machine: patching it would patch them too, so agent
+/// mode leaves it alone. `None` also for the default location, which the
+/// walks already handle by name.
+fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
+    let text = crate::utils::fs::read_regular_to_string_sync(&nm.join(PNPM_MODULES_YAML)).ok()?;
+    let recorded = parse_modules_yaml_virtual_store_dir(&text)?;
+    let importer = normalize_lexically(nm.parent()?);
+    let store = normalize_lexically(&nm.join(recorded));
+    if store == normalize_lexically(&nm.join(".pnpm")) || store == normalize_lexically(nm) {
+        return None;
+    }
+    let below = store.strip_prefix(&importer).ok()?;
+    if below.as_os_str().is_empty() {
+        return None;
+    }
+    let mut dir = importer;
+    for component in below.components() {
+        dir.push(component);
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
 /// `(name, version)` a `.vlt/<DepID>` entry name advertises: the vlt store
 /// decoder over the lossless name, `None` for git/file/remote/workspace
 /// ids and for anything undecodable (which stays probeable). The pnpm
@@ -235,6 +352,16 @@ impl StoreEntry {
             .into_iter()
             .map(|(name, node_modules)| StoreEntry {
                 advertised: decode_pnpm_store_entry_name(&name),
+                node_modules,
+            })
+            .collect()
+    }
+
+    fn npm(entries: Vec<(String, PathBuf)>) -> Vec<StoreEntry> {
+        entries
+            .into_iter()
+            .map(|(name, node_modules)| StoreEntry {
+                advertised: decode_npm_store_entry_name(&name),
                 node_modules,
             })
             .collect()
@@ -1053,6 +1180,41 @@ impl NpmCrawler {
             let entries = Self::list_vlt_store_entries_sync(&nm_path.join(&entry.name));
             return vec![NestedNodeModules::StoreEntries(StoreEntry::vlt(entries))];
         }
+        // npm's `install-strategy=linked` store: the same transitive-only
+        // home, at `.store/<name>@<version>-<hash>/node_modules/<name>`.
+        if name_str == NPM_LINKED_STORE_NAME {
+            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                return Vec::new();
+            }
+            let entries = Self::list_npm_store_entries_sync(&nm_path.join(&entry.name), false)
+                .into_iter()
+                .map(|e| StoreEntry {
+                    advertised: e.advertised,
+                    node_modules: e.node_modules,
+                })
+                .collect();
+            return vec![NestedNodeModules::StoreEntries(entries)];
+        }
+        // A pnpm virtual store relocated by `virtualStoreDir`, found
+        // through the `.modules.yaml` pnpm writes next to it. It may sit
+        // outside this `node_modules` or under a hidden name the skip
+        // below would swallow.
+        if name_str == PNPM_MODULES_YAML {
+            if !entry.file_type.is_some_and(|ft| ft.is_file()) {
+                return Vec::new();
+            }
+            let Some(store) = relocated_pnpm_virtual_store_sync(nm_path) else {
+                return Vec::new();
+            };
+            let entries = Self::list_pnpm_store_entries_sync(&store, false)
+                .into_iter()
+                .map(|e| StoreEntry {
+                    advertised: e.advertised,
+                    node_modules: e.node_modules,
+                })
+                .collect();
+            return vec![NestedNodeModules::StoreEntries(entries)];
+        }
         // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
         // (there is no `.pnpm` at all) with the same
         // transitive-only-deps property, so it gets the same probing.
@@ -1343,6 +1505,8 @@ impl NpmCrawler {
         let listing = listing.unwrap_or_else(|| list_dir_sync(node_modules_path));
         let mut pnpm_store: Option<PathBuf> = None;
         let mut vlt_store: Option<PathBuf> = None;
+        let mut npm_store: Option<PathBuf> = None;
+        let mut relocated_pnpm_store: Option<PathBuf> = None;
         let mut legacy_stores: Vec<PathBuf> = Vec::new();
         let mut children: Vec<(PathBuf, String, FileType)> = Vec::new();
 
@@ -1371,6 +1535,23 @@ impl NpmCrawler {
             if !store_entry && name_str == VLT_STORE_NAME {
                 if entry.file_type.is_some_and(|ft| ft.is_dir()) {
                     vlt_store = Some(node_modules_path.join(&name_str));
+                }
+                continue;
+            }
+
+            // npm's linked-strategy store, deferred for the same reason.
+            if !store_entry && name_str == NPM_LINKED_STORE_NAME {
+                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                    npm_store = Some(node_modules_path.join(&name_str));
+                }
+                continue;
+            }
+
+            // A pnpm virtual store relocated by `virtualStoreDir` (see
+            // `relocated_pnpm_virtual_store_sync`), deferred like `.pnpm`.
+            if !store_entry && name_str == PNPM_MODULES_YAML {
+                if entry.file_type.is_some_and(|ft| ft.is_file()) {
+                    relocated_pnpm_store = relocated_pnpm_virtual_store_sync(node_modules_path);
                 }
                 continue;
             }
@@ -1435,8 +1616,16 @@ impl NpmCrawler {
                 .collect();
             events.extend(Self::gather_store_entries(entries));
         }
+        if let Some(store_path) = relocated_pnpm_store {
+            let entries = Self::list_pnpm_store_entries_sync(&store_path, true);
+            events.extend(Self::gather_store_entries(entries));
+        }
         if let Some(store_path) = vlt_store {
             let entries = Self::vlt_store_entry_dirs(&store_path);
+            events.extend(Self::gather_store_entries(entries));
+        }
+        if let Some(store_path) = npm_store {
+            let entries = Self::list_npm_store_entries_sync(&store_path, true);
             events.extend(Self::gather_store_entries(entries));
         }
 
@@ -1720,6 +1909,67 @@ impl NpmCrawler {
         run_walk(move || Self::list_vlt_store_entries_sync(&store_path)).await
     }
 
+    /// Enumerate npm's linked store (`node_modules/.store`, written by
+    /// `install-strategy=linked`), yielding every REAL entry dir whose
+    /// `node_modules` is a real dir, named by its store key. A scoped
+    /// package's entry sits one level down (`.store/@scope/<leaf>@<v>-<h>`),
+    /// so a real `@scope` dir is descended once and its entries are named
+    /// `@scope/<leaf>@<v>-<h>`. Skipped: dot-names, a `node_modules` child,
+    /// files and links (a link is never a store entry). Entries are probed
+    /// in parallel and yielded in listing order; with `read_listings` each
+    /// entry's `node_modules` listing rides along, as for pnpm.
+    fn list_npm_store_entries_sync(store_path: &Path, read_listings: bool) -> Vec<StoreEntryDir> {
+        let is_candidate = |entry: &ListedEntry| {
+            !(entry.name_str.starts_with('.') || entry.name_str == "node_modules")
+                && entry.file_type.is_some_and(|ft| ft.is_dir())
+        };
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+        for entry in list_dir_sync(store_path).entries {
+            if !is_candidate(&entry) {
+                continue;
+            }
+            let path = store_path.join(&entry.name);
+            if entry.name_str.starts_with('@') {
+                for scoped in list_dir_sync(&path).entries {
+                    if is_candidate(&scoped) && !scoped.name_str.starts_with('@') {
+                        let name = format!("{}/{}", entry.name_str, scoped.name_str);
+                        candidates.push((name, path.join(&scoped.name)));
+                    }
+                }
+            } else {
+                candidates.push((entry.name_str, path));
+            }
+        }
+        par_map(candidates, |(name, entry_path)| {
+            let node_modules = entry_path.join("node_modules");
+            if !std::fs::symlink_metadata(&node_modules).is_ok_and(|m| m.is_dir()) {
+                return None;
+            }
+            Some(StoreEntryDir {
+                advertised: decode_npm_store_entry_name(&name),
+                name,
+                listing: read_listings.then(|| list_dir_sync(&node_modules)),
+                node_modules,
+            })
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Async `(name, node_modules)` view of
+    /// [`Self::list_npm_store_entries_sync`].
+    async fn list_npm_store_entries(store_path: &Path) -> Vec<(String, PathBuf)> {
+        let store_path = store_path.to_path_buf();
+        run_walk(move || {
+            Self::list_npm_store_entries_sync(&store_path, false)
+                .into_iter()
+                .map(|entry| (entry.name, entry.node_modules))
+                .collect()
+        })
+        .await
+    }
+
     /// Descend a *nested* virtual-store host dir, yielding
     /// `(name@version, <version-dir>/node_modules)` for each package home
     /// found. Covers the two pre-flat layouts (both confirmed against
@@ -1866,6 +2116,7 @@ impl Default for NpmCrawler {
 enum StoreLayout {
     Pnpm,
     Vlt,
+    NpmLinked,
 }
 
 /// Find every OTHER physical copy of the package installed at `pkg_path`
@@ -1933,10 +2184,20 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
                         stores.push((StoreLayout::Vlt, dir.to_path_buf()));
                     }
                 }
+                // `.store` is npm's only when it sits in a `node_modules`.
+                Some(NPM_LINKED_STORE_NAME)
+                    if dir.parent().and_then(Path::file_name)
+                        == Some(OsStr::new("node_modules")) =>
+                {
+                    if seen_stores.insert(dir.to_path_buf()) {
+                        stores.push((StoreLayout::NpmLinked, dir.to_path_buf()));
+                    }
+                }
                 Some("node_modules") => {
                     for (child, layout) in [
                         (".pnpm", StoreLayout::Pnpm),
                         (VLT_STORE_NAME, StoreLayout::Vlt),
+                        (NPM_LINKED_STORE_NAME, StoreLayout::NpmLinked),
                     ] {
                         let store = dir.join(child);
                         if is_dir(&store).await && seen_stores.insert(store.clone()) {
@@ -1947,6 +2208,28 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
                 _ => {}
             }
             cur = dir.parent();
+        }
+    }
+    // A pnpm store relocated by `virtualStoreDir` has no fixed name; the
+    // importer's `node_modules/.modules.yaml` says where it is. Every
+    // ancestor is a candidate importer (a transitive copy's chain runs
+    // through the store, not through the importer's `node_modules`).
+    let importer_nms: Vec<PathBuf> = chains
+        .into_iter()
+        .flatten()
+        .flat_map(|start| start.ancestors().skip(1))
+        .map(|dir| dir.join("node_modules"))
+        .collect();
+    let relocated = run_walk(move || {
+        importer_nms
+            .iter()
+            .filter_map(|nm| relocated_pnpm_virtual_store_sync(nm))
+            .collect::<Vec<_>>()
+    })
+    .await;
+    for store in relocated {
+        if seen_stores.insert(store.clone()) {
+            stores.push((StoreLayout::Pnpm, store));
         }
     }
     if stores.is_empty() {
@@ -1969,6 +2252,9 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
                 StoreEntry::pnpm(NpmCrawler::list_pnpm_store_entries(&store).await)
             }
             StoreLayout::Vlt => StoreEntry::vlt(NpmCrawler::list_vlt_store_entries(&store).await),
+            StoreLayout::NpmLinked => {
+                StoreEntry::npm(NpmCrawler::list_npm_store_entries(&store).await)
+            }
         };
         for StoreEntry {
             advertised,
@@ -3440,5 +3726,218 @@ mod tests {
             scanned,
             vec![("pkg:npm/left-pad@1.3.0".to_string(), nm.join("left-pad"))]
         );
+    }
+
+    fn scan_paths(root: &Path) -> impl std::future::Future<Output = Vec<(String, PathBuf)>> {
+        let options = CrawlerOptions {
+            cwd: root.to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        async move {
+            let mut scanned: Vec<(String, PathBuf)> = NpmCrawler::new()
+                .crawl_all(&options)
+                .await
+                .into_iter()
+                .map(|p| (p.purl, p.path))
+                .collect();
+            scanned.sort();
+            scanned
+        }
+    }
+
+    #[test]
+    fn test_decode_npm_store_entry_name() {
+        let hash = "Pqc5my552wJdjE6sp0MCIg";
+        assert_eq!(
+            decode_npm_store_entry_name(&format!("is-number@6.0.0-{hash}")),
+            Some(("is-number".to_string(), "6.0.0".to_string()))
+        );
+        // The hash is base64url, so it can hold `-` and `_` itself.
+        assert_eq!(
+            decode_npm_store_entry_name("escape-string-regexp@1.0.5-YUOzcg-PmWvuNTSNPuN4qw"),
+            Some(("escape-string-regexp".to_string(), "1.0.5".to_string()))
+        );
+        assert_eq!(
+            decode_npm_store_entry_name(&format!("@babel/code-frame@7.0.0-beta.1-{hash}")),
+            Some(("@babel/code-frame".to_string(), "7.0.0-beta.1".to_string()))
+        );
+        // A shrinkwrapped dependency's un-hashed `name@version` dir, a
+        // missing hash, and a non-semver version stay undecodable.
+        assert_eq!(decode_npm_store_entry_name("foo@1.0.0"), None);
+        assert_eq!(decode_npm_store_entry_name(&format!("foo-{hash}")), None);
+        assert_eq!(
+            decode_npm_store_entry_name(&format!("foo@abc-{hash}")),
+            None
+        );
+        assert_eq!(decode_npm_store_entry_name(&format!("@1.0.0-{hash}")), None);
+    }
+
+    /// #359: npm's `install-strategy=linked` keeps every package in
+    /// `node_modules/.store/<name>@<version>-<hash>/node_modules/<name>`
+    /// (scoped: `.store/@scope/<leaf>@…/node_modules/@scope/<leaf>`). The
+    /// importer links direct deps only, so a transitive package is a real
+    /// dir ONLY inside the store. Scan, the resolver and the peer-variant
+    /// fan-out must all see it; dependency links inside an entry stay
+    /// edges.
+    #[tokio::test]
+    async fn test_npm_linked_store_transitive_packages_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        let store = nm.join(".store");
+
+        let odd_entry = store.join("is-odd@3.0.1-6I_Y0S8g8dpI-_3nzyUbcQ/node_modules");
+        write_pkg(&odd_entry.join("is-odd"), "is-odd", "3.0.1");
+        let number = store.join("is-number@6.0.0-Pqc5my552wJdjE6sp0MCIg/node_modules/is-number");
+        write_pkg(&number, "is-number", "6.0.0");
+        // Same name@version, different dependency graph: a second hash.
+        let number_twin =
+            store.join("is-number@6.0.0-AAAAAAAAAAAAAAAAAAAAAA/node_modules/is-number");
+        write_pkg(&number_twin, "is-number", "6.0.0");
+        link_dir(&number, &odd_entry.join("is-number"));
+        let frame = store
+            .join("@babel/code-frame@7.0.0-wERilBtYXgdUWVgsD7hGnw/node_modules/@babel/code-frame");
+        write_pkg(&frame, "@babel/code-frame", "7.0.0");
+        link_dir(&odd_entry.join("is-odd"), &nm.join("is-odd"));
+
+        let scanned = scan_paths(&root).await;
+        let purls: Vec<&str> = scanned.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            purls,
+            vec![
+                "pkg:npm/@babel/code-frame@7.0.0",
+                "pkg:npm/is-number@6.0.0",
+                "pkg:npm/is-odd@3.0.1",
+            ],
+            "{scanned:?}"
+        );
+        assert!(scanned.contains(&("pkg:npm/is-odd@3.0.1".to_string(), nm.join("is-odd"))));
+
+        let targets = [
+            "pkg:npm/is-number@6.0.0".to_string(),
+            "pkg:npm/@babel/code-frame@7.0.0".to_string(),
+        ];
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &targets)
+            .await
+            .unwrap();
+        let mut numbers: Vec<PathBuf> = found["pkg:npm/is-number@6.0.0"]
+            .iter()
+            .map(|p| p.path.clone())
+            .collect();
+        numbers.sort();
+        let mut want = vec![number.clone(), number_twin.clone()];
+        want.sort();
+        assert_eq!(numbers, want);
+        assert_eq!(found["pkg:npm/@babel/code-frame@7.0.0"][0].path, frame);
+
+        assert_eq!(
+            find_store_peer_variant_copies(&number).await,
+            vec![number_twin.clone()]
+        );
+    }
+
+    /// #362: pnpm's `virtualStoreDir` moves the virtual store, and
+    /// `node_modules/.modules.yaml` records where (relative to
+    /// `node_modules`: JSON on pnpm 10+, YAML before). A relocated store
+    /// inside the project is walked like `.pnpm`, wherever it sits.
+    #[tokio::test]
+    async fn test_pnpm_relocated_virtual_store_dir_is_walked() {
+        for (modules_yaml, store_rel) in [
+            (
+                "{\n  \"layoutVersion\": 5,\n  \"virtualStoreDir\": \"../.vstore\"\n}",
+                ".vstore",
+            ),
+            // Older pnpm wrote an absolute path.
+            (
+                "layoutVersion: 5\nvirtualStoreDir: \"<ROOT>/.abs-store\"\n",
+                ".abs-store",
+            ),
+            (
+                "layoutVersion: 5\nvirtualStoreDir: '.custom'\n",
+                "node_modules/.custom",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().components().collect();
+            let nm = root.join("node_modules");
+            let store = root.join(store_rel);
+            let odd_entry = store.join("is-odd@3.0.1/node_modules");
+            write_pkg(&odd_entry.join("is-odd"), "is-odd", "3.0.1");
+            let number = store.join("is-number@6.0.0/node_modules/is-number");
+            write_pkg(&number, "is-number", "6.0.0");
+            link_dir(&number, &odd_entry.join("is-number"));
+            let foo = store.join("foo@1.0.0(react@17.0.2)/node_modules/foo");
+            let foo_twin = store.join("foo@1.0.0(react@18.2.0)/node_modules/foo");
+            write_pkg(&foo, "foo", "1.0.0");
+            write_pkg(&foo_twin, "foo", "1.0.0");
+            std::fs::create_dir_all(nm.join(".pnpm")).unwrap();
+            let modules_yaml =
+                modules_yaml.replace("<ROOT>", &root.display().to_string().replace('\\', "\\\\"));
+            std::fs::write(nm.join(".modules.yaml"), modules_yaml).unwrap();
+            link_dir(&odd_entry.join("is-odd"), &nm.join("is-odd"));
+
+            let scanned = scan_paths(&root).await;
+            assert!(
+                scanned.contains(&("pkg:npm/is-number@6.0.0".to_string(), number.clone())),
+                "{store_rel}: {scanned:?}"
+            );
+            assert!(scanned.iter().any(|(p, _)| p == "pkg:npm/foo@1.0.0"));
+
+            let found = NpmCrawler::new()
+                .find_by_purls(&nm, &["pkg:npm/is-number@6.0.0".to_string()])
+                .await
+                .unwrap();
+            assert_eq!(
+                found
+                    .get("pkg:npm/is-number@6.0.0")
+                    .map(|c| c.iter().map(|p| p.path.clone()).collect::<Vec<_>>()),
+                Some(vec![number.clone()]),
+                "{store_rel}"
+            );
+
+            let mut variants = find_store_peer_variant_copies(&foo).await;
+            variants.sort();
+            assert_eq!(variants, vec![foo_twin.clone()], "{store_rel}");
+        }
+    }
+
+    /// A `virtualStoreDir` outside the project (pnpm's global virtual
+    /// store, `<store>/v10/links`, is shared by every project on the
+    /// machine) is NOT walked: agent mode must not patch a shared store
+    /// (#361). Nor is a link planted at the recorded path.
+    #[tokio::test]
+    async fn test_pnpm_virtual_store_dir_outside_project_is_ignored() {
+        let outside = tempfile::tempdir().unwrap();
+        let shared: PathBuf = outside.path().components().collect();
+        let number = shared.join("is-number@6.0.0/node_modules/is-number");
+        write_pkg(&number, "is-number", "6.0.0");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root: PathBuf = tmp.path().components().collect();
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        let rel = format!("{}", shared.display()).replace('\\', "\\\\");
+        std::fs::write(
+            nm.join(".modules.yaml"),
+            format!("{{\"virtualStoreDir\": \"{rel}\"}}"),
+        )
+        .unwrap();
+        assert!(scan_paths(&root).await.is_empty());
+
+        // A link inside the project pointing at the shared store.
+        std::fs::write(
+            nm.join(".modules.yaml"),
+            "{\"virtualStoreDir\": \"../.vstore\"}",
+        )
+        .unwrap();
+        link_dir(&shared, &root.join(".vstore"));
+        assert!(scan_paths(&root).await.is_empty());
+        let found = NpmCrawler::new()
+            .find_by_purls(&nm, &["pkg:npm/is-number@6.0.0".to_string()])
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 }
