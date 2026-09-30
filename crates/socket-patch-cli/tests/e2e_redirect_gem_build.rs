@@ -6,7 +6,7 @@
 //! `/api/v1/dependencies` fallback returned a zero-byte body); the 2026-08-18
 //! gem catalog republish fixed the served index, and this hermetic suite pins
 //! the contract from both sides regardless of production's current state —
-//! see the history section of `docs/testing/hosted-production-e2e.md`.
+//! see `docs/testing/hosted-production-e2e.md` for the live-service counterpart.
 //!
 //! Unlike the npm/cargo siblings, this suite is FULLY hermetic: the fixture
 //! gems are authored here and built with the real `gem build`, and ONE
@@ -1390,8 +1390,8 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
 
 /// The compact-index DEPENDENCY contract, pinned from the red side: a patch
 /// registry whose `/info` omits the gem's runtime deps (production's
-/// HISTORICAL behavior until the 2026-08-18 republish fixed the served index
-/// — see docs/testing/hosted-production-e2e.md's history section) BREAKS the
+/// HISTORICAL behavior until the 2026-08-18 republish fixed the served index)
+/// BREAKS the
 /// prescribed install with bundler's `APIResponseMismatchError`. If the CLI
 /// or fixture ever starts tolerating that silently, this turns red.
 #[tokio::test(flavor = "multi_thread")]

@@ -6,7 +6,7 @@
 //! machinery still has teeth against a tampered pin.
 //!
 //! The three properties this pins (each validated empirically before the
-//! feature was built — see `docs/design/golang-hosted.md`):
+//! feature was built — see `docs/ecosystems.md#go-directory-replaces-and-gosum`):
 //!
 //! 1. **No sumdb consultation**: `GOSUMDB` is set to a bogus database name
 //!    for every day-2 command. go parses `GOSUMDB` lazily and consults it only

@@ -37,49 +37,20 @@ core unit tests.
 
 ## Line endings
 
-yarn berry keeps one line ending per file, chosen by the same function for
-the lockfile and every manifest. At tag `@yarnpkg/cli/4.12.0` (the same code
-ships at 4.0.0 and 4.18.0; the published 3.8.7, 4.0.2, 4.6.0, 4.9.2 and
-4.18.0 bundles carry it verbatim, and 2.4.3 applies the same rule through
-`changeFilePromise`):
-
-- `packages/yarnpkg-fslib/sources/FakeFS.ts` (lines 799–812):
-  `getEndOfLine(content)` returns `os.EOL` when `content` has no line break —
-  the file is new — and otherwise `\r\n` only when CRLF breaks strictly
-  outnumber LF ones (a tie is LF); `normalizeLineEndings(original, next)`
-  respells every break of `next` that way.
-- `packages/yarnpkg-core/sources/Project.ts`: `persistLockfile` (lines
-  2014–2033) writes the generated lock through `normalizeLineEndings` against
-  the current file; the `--immutable` check (lines 1789–1858) fails with
-  YN0028 whenever `normalizeLineEndings(initialLockfile, generateLockfile())`
-  differs from the file — so a uniformly CRLF lock passes, while a lock with
-  mixed endings (or a BOM, which the re-render never writes) always fails.
-- `packages/yarnpkg-core/sources/Workspace.ts` (lines 217–229):
-  `persistManifest` writes `JSON.stringify(data, null, indent) + "\n"` through
-  `changeFilePromise(…, {automaticNewlines: true})`, the same rule, after every
-  install (`Project.ts` line 1881, `--immutable` included).
-  `Manifest.loadFromText` strips a BOM when reading (`Manifest.ts` lines
-  135–146 and 984–990); the rewrite never writes one back.
-- `packages/yarnpkg-parsers/sources/syml.ts`: `parseSyml` reads the lock with
-  js-yaml, which accepts CRLF.
-
-So on Windows every yarn berry project starts CRLF: the first `yarn install`
-writes a CRLF `yarn.lock`, and a `package.json` yarn pretty-prints for the
-first time (any compact one) comes back CRLF. On macOS and Linux both are LF.
-An existing file keeps its majority ending on every OS. Git adds its own
-path to CRLF: `core.autocrlf=true` (the Git for Windows installer's default)
-checks LF-committed text out as CRLF, and so does `core.autocrlf=true` or a
-`text eol=crlf` attribute on macOS and Linux; a lock committed with CRLF stays
-CRLF in every checkout.
+Yarn Berry preserves a file's majority line ending and uses the platform's
+ending for a new file. Uniform LF and CRLF files are supported. Mixed line
+endings can fail Yarn's immutable-install check; Socket Patch refuses mixed
+lockfiles before rewriting them. The suites below cover native and forced CRLF
+checkouts.
 
 What socket-patch does with those files:
 
 | | hosted (`yarn.lock`) | vendored (`yarn.lock` + root `package.json`) |
 | --- | --- | --- |
-| uniformly LF or CRLF | rewritten in the file's own ending; ledger fragments recorded as on disk | lock entry spliced in the file's ending; `package.json` re-serialized in its own layout (BOM, indent, ending, trailing newline) |
+| uniformly LF or CRLF | rewritten in the file's own ending; no hosted ledger | lock entry spliced in the file's ending; `package.json` re-serialized in its own layout (BOM, indent, ending, trailing newline) |
 | leading BOM | kept | kept, both files |
 | mixed CRLF / LF, or a bare CR | refused untouched: `redirect_yarn_berry_mixed_line_endings` | refused before any write: `vendor_yarn_berry_mixed_line_endings` |
-| revert (`rollback`, `remove`, takeovers) | byte-exact; a ledger recorded before a uniform LF ↔ CRLF checkout flip is replayed respelled; a mixed lock refuses as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
+| revert (`rollback`, `remove`, takeovers) | upstream entries reconstructed from registry metadata; mixed endings refuse as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
 | mode takeover into this mode | the berry gates (line endings, `cacheKey`, `compressionLevel`) run BEFORE the vendored wiring is reverted; a refused purl stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
 
 Every reader — manifest-less `vex`, the lockfile inventory, the npm flavor

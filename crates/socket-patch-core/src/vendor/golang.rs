@@ -1562,7 +1562,7 @@ mod tests {
             .any(|e| e.module == MODULE && e.owner == Some(ReplaceOwner::Vendor)));
     }
 
-    /// Cross-mode policy regression (docs/design/golang-hosted.md): vendor
+    /// Cross-mode policy regression (docs/ecosystems.md#go-directory-replaces-and-gosum): vendor
     /// takes over a hosted-mode replace through the LOCAL build leg too — only
     /// local *apply* refuses a Hosted-owned directive (its go-patches copy is
     /// uncommitted, so the takeover would break other machines). The hosted

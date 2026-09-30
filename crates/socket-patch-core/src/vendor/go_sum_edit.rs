@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Both lines are load-bearing on day-2 machines (validated empirically —
-//! see `docs/design/golang-hosted.md`): under the default `-mod=readonly` a
+//! see `docs/ecosystems.md#go-directory-replaces-and-gosum`): under the default `-mod=readonly` a
 //! missing zip line fails resolution up front, a missing `/go.mod` line fails
 //! after download, and a *present* line is verified against the fetched bytes
 //! (a wrong hash is a hard `SECURITY ERROR`). Crucially, go consults the

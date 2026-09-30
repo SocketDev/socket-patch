@@ -176,54 +176,14 @@ frozen and ordinary installs, and digest tampering.
 `cargo test -p socket-patch-cli --test e2e_bun_lockb` uses Bun on `PATH`; a modern
 Bun reads the committed binary fixture, so no separate old writer is needed.
 
-### Measured validation
+### Historical runtime limitations
 
-Measured on 2026-09-21, macOS arm64, using the native binary implementation in
-the worktree based on `4b61c9620b800d26056211060ebb4a4c60288da5`:
-
-| Suite | Result | Coverage |
-|-------|--------|----------|
-| Public patch service | 370 / 370 cases passed | 11 releases: 0.8.1, 1.0.0, 1.0.36, 1.1.0, 1.1.38, 1.1.45, 1.2.0, 1.2.23, 1.3.0, 1.3.14, 1.4.2. 340 accepted flows and 30 expected text-workspace refusals. Direct, alias, transitive, two-version, workspace, nested workspace, root workspace, lockfile-only, UUID/search get, legacy binary and both takeover shapes. |
-| Explicit warm-cache installs | 90 / 90 cases passed | Six eras: 0.8.1, 1.0.36, 1.1.45, 1.2.23, 1.3.14, 1.4.2. Direct, workspace, nested workspace, legacy binary and both takeovers, with cold and warmed-cache frozen and ordinary installs. Includes eight expected text-workspace refusals. |
-| Native binary writer/reader matrix | 25 / 25 pairs passed | All 17 fixture writers listed above; own-version readers from 0.5.9 onward, 0.5.9 readers for the three 0.1.x writers, five 1.2–1.4 readers of 1.1.45, and 1.4.2 readers of 0.1.1, 0.1.6 and 0.6.7. All three Rust acceptance tests ran in each pair. |
-| Historical concurrency regression | 30 / 30 pairs passed | Six repetitions of 0.5.9 reading 0.1.1, 0.1.6 and 0.5.9, plus 1.4.2 reading 0.1.1 and 0.1.6, with isolated temporary directories. |
-
-The public-service captures record CLI SHA-256
-`a3e7683d66e6e6654644c3cd51ada1260a58a8d8f9b96c0a2ea4f585a9219910`.
-The binary matrix records both Bun executable hashes and its test executable
-hash in every result. The final local reports are under
-`/tmp/socket-patch-bun-public-final`, `/tmp/socket-patch-bun-public-warm-final`
-and `/tmp/socket-patch-bun-native-final-isolated`.
-
-Early parallel historical probes exposed Bun 0.5.9's `FileNotFound extracting
-tarball` and Bun 0.1.1's lockfile `AccessDenied` errors in a shared temporary
-directory. The harness now gives every fixture its own temporary directory and
-an empty cache directory. Historical writers use timestamp-derived temporary
-names. The failing logs remain under `/tmp/socket-patch-bun-native-verified` and
-`/tmp/socket-patch-bun-native-emptycache-*`; the six repeated runs above verify
-the corrected isolation without retrying failed assertions or changing readers.
-
-On 2026-09-22, the full workspace test run passed 7,326 tests with no failures,
-and production Clippy passed with warnings denied. The production-filter
-regression passed all 33 public-service cases across the same 11 release eras,
-including cold and warmed-cache frozen and ordinary installs. A separate complex
-graph passed both scoped rollback orders on 0.8.1 and 1.0.0; that graph is now
-part of the permanent binary matrix. These local measurements use macOS arm64.
-
-The [PR validation run for `9644add`](https://github.com/SocketDev/socket-patch/actions/runs/35729497310)
-also passed all 25 native binary writer/reader pairs on macOS and all 13 pairs
-available on Windows, including the permanent production/scoped-rollback cases.
-Windows has no official Bun binaries before 1.1.0. Each pair ran all three Rust
-acceptance tests.
-
-The Linux runner exposed a separate historical-runtime boundary: official Bun
-0.5.9, 0.6.7 and 0.6.8 crashed with `SIGSEGV` during pristine installs on
-`ubuntu-latest` (Ubuntu 24.04), before `socket-patch` ran. The workflow retains
-all 25 required historical pairs on Ubuntu 22.04, and additionally runs the 16
-pairs using Bun 0.8.1 and later on `ubuntu-latest`; every historical format and
-reader remains in the required matrix. Linux failures upload bounded pristine
-runtime probes and, when available, syscall traces under the binary result artifact's
-`linux-diagnostics/` directory.
+The binary matrix keeps each fixture's temporary directory and cache isolated;
+old Bun writers can collide when sharing temporary paths. Windows has no official
+Bun binaries before 1.1.0. Official Bun 0.5.9, 0.6.7, and 0.6.8 can crash during
+pristine installs on Ubuntu 24.04, before Socket Patch runs; the compatibility
+workflow retains those historical pairs on Ubuntu 22.04. Read the workflow and
+its uploaded diagnostics for each run's coverage and results.
 
 ## Installer boundaries (measured)
 

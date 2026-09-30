@@ -1,4 +1,4 @@
-//! The per-run rollout stage (`docs/design/staged-rollout.md` §5, §9.2)
+//! The per-run rollout stage (`docs/configuration.md#gradual-rollout`)
 //! the disk scan and the in-memory engine share: classify the selected
 //! offers against the recorded state, spend the budget on NEW packages
 //! most critical first once each mode's eligibility checks ran, and

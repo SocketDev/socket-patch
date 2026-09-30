@@ -1,5 +1,5 @@
-//! Scan's side of the rollout stage (`docs/design/staged-rollout.md` §5,
-//! §9.2): `updates[]`, the hosted gate and the human lines. The stage
+//! Scan's side of the rollout stage (`docs/configuration.md#gradual-rollout`):
+//! `updates[]`, the hosted gate and the human lines. The stage
 //! itself is [`socket_patch_core::rollout::stage`].
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
