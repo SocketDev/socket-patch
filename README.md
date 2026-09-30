@@ -11,4 +11,7 @@ manager's "Bug hunt ledger: …" discussion (numbers in `discussions.json`).
 - `state/<pm>.md`: the current coverage matrix, backlog and known non-bugs.
   Every change is copied into the discussion body.
 
+`INSTRUCTIONS.md` is the shared procedure that every routine reads at the
+start of each run. Edit it to retune all the routines at once.
+
 Only add files under your own `<pm>`. Never rewrite or force-push this branch.
