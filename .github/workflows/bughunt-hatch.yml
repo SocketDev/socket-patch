@@ -115,5 +115,6 @@ jobs:
             if [ "$RUNNER_OS" = Windows ]; then py="h-$v/Scripts/python.exe"; h="$PWD/h-$v/Scripts/hatch.exe"; else py="h-$v/bin/python"; h="$PWD/h-$v/bin/hatch"; fi
             "$py" -m pip install -q "hatch==$v" >/dev/null 2>&1 || { echo "install hatch $v failed"; continue; }
             echo "################ $RUNNER_OS Hatch $v"
-            python probe.py "$h" "$cli" "$RUNNER_TEMP/w-$v" || echo "probe exit $?"
+            if [ "$RUNNER_OS" = Windows ]; then h=$(cygpath -w "$h"); c=$(cygpath -w "$cli"); else c=$cli; fi
+            python probe.py "$h" "$c" "$RUNNER_TEMP/w-$v" || echo "probe exit $?"
           done
