@@ -1,0 +1,100 @@
+name: bughunt go probe
+on:
+  push:
+    branches: ['bughunt/go/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        go: ['1.16.15', '1.21.13', '1.26.3']
+        include:
+          - {os: macos-latest, go: '1.24.13'}
+          - {os: macos-latest, go: '1.26.3'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        run: |
+          cat > "$RUNNER_TEMP/probe.sh" <<'PROBE'
+          # Portable (Linux/macOS/Windows git-bash) repro for two Go findings.
+          set -u
+          SP="$1"; ROOT="$2"; rm -rf "$ROOT"; mkdir -p "$ROOT"
+          PY=$(command -v python3 || command -v python)
+          mp() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
+          furl() { local p; p=$(mp "$1"); case "$p" in /*) echo "file://$p";; *) echo "file:///$p";; esac; }
+          export GOTOOLCHAIN=local GOSUMDB=off GOENV=off GOFLAGS= SOCKET_NO_CONFIG=1 SOCKET_NO_UPDATE_CHECK=1
+          stage() {
+            T="$1"; M=example.com/upstream; V=v1.0.0
+            mkdir -p "$T/stage/$M@$V" "$T/modcache" "$T/gocache" "$T/proxy/$M/@v" "$T/c/.socket/blobs"
+            printf 'module %s\n\ngo 1.16\n' $M > "$T/stage/$M@$V/go.mod"
+            printf 'package upstream\n\nfunc Greeting() string { return "PRISTINE" }\n' > "$T/stage/$M@$V/lib.go"
+            printf 'package upstream\n\nfunc Greeting() string { return "PATCHED" }\n' > "$T/patched.go"
+            echo "{\"Version\":\"$V\"}" > "$T/proxy/$M/@v/$V.info"; cp "$T/stage/$M@$V/go.mod" "$T/proxy/$M/@v/$V.mod"
+            "$PY" - "$T" "$M@$V" <<'P'
+          import sys,zipfile,os
+          t,pre=sys.argv[1],sys.argv[2]
+          src=os.path.join(t,'stage',pre); z=zipfile.ZipFile(os.path.join(t,'proxy','example.com','upstream','@v','v1.0.0.zip'),'w')
+          for f in ('go.mod','lib.go'): z.write(os.path.join(src,f),pre+'/'+f)
+          z.close()
+          import hashlib
+          def g(p):
+            d=open(p,'rb').read(); return hashlib.sha256(b'blob %d\0'%len(d)+d).hexdigest()
+          b=g(os.path.join(src,'lib.go')); a=g(os.path.join(t,'patched.go'))
+          import shutil; shutil.copy(os.path.join(t,'patched.go'),os.path.join(t,'c','.socket','blobs',a))
+          open(os.path.join(t,'c','.socket','manifest.json'),'w').write('{"patches":{"pkg:golang/example.com/upstream@v1.0.0":{"uuid":"4d5e6f70-8192-4a1b-8c2d-0123456789ab","exportedAt":"t","files":{"lib.go":{"beforeHash":"%s","afterHash":"%s"}},"vulnerabilities":{"GHSA-gogo-patc-hes1":{"cves":["CVE-2026-5151"],"summary":"s","severity":"high","description":"d"}},"description":"","license":"","tier":""}},"setup":{"manual":["golang"]}}'%(b,a))
+          P
+            export GOMODCACHE=$(mp "$T/modcache") GOCACHE=$(mp "$T/gocache") GOPROXY=$(furl "$T/proxy")
+            printf 'module example.com/consumer\n\ngo 1.16\n\nrequire %s %s\n' $M $V > "$T/c/go.mod"
+            printf 'package main\n\nimport (\n\t"fmt"\n\t"%s"\n)\n\nfunc main() { fmt.Println("OUT:", upstream.Greeting()) }\n' $M > "$T/c/main.go"
+            (cd "$T/c" && go mod download $M@$V && go mod tidy) || echo "STAGE FAILED"
+          }
+          res() { echo "RESULT $1: $2"; }
+          
+          echo "################ A. committed vendor/ + apply / vendor"
+          for cmd in apply vendor; do
+            T="$ROOT/vend-$cmd"; stage "$T"; cd "$T/c"
+            go mod vendor; go build -o out.bin . && res "A-$cmd baseline" "build ok"
+            "$SP" $cmd --offline --ecosystems golang; ec=$?
+            if go build -o out.bin . 2> build.err; then res "A-$cmd" "PASS apply-exit=$ec build ok"; else res "A-$cmd" "FAIL apply-exit=$ec build: $(head -2 build.err | tr '\n' ' ')"; fi
+            "$SP" apply --check --ecosystems golang >/dev/null 2>&1; res "A-$cmd apply--check exit" "$?"
+          done
+          
+          echo "################ B. go env -w GOMODCACHE (GOENV file) ignored by crawler"
+          T="$ROOT/genv"; stage "$T"; cd "$T/c"
+          export GOENV=$(mp "$T/goenv"); go env -w GOMODCACHE="$GOMODCACHE" GOPROXY="$GOPROXY"; unset GOMODCACHE GOPROXY
+          mkdir -p "$T/home"; export HOME=$(mp "$T/home") USERPROFILE=$(mp "$T/home")
+          echo "go env GOMODCACHE = $(go env GOMODCACHE)"; go build -o out.bin . && res "B baseline" "go build ok (go finds the module)"
+          "$SP" apply --offline --ecosystems golang; ec=$?
+          if [ $ec = 0 ]; then res B "PASS apply exit 0"; else res B "FAIL apply exit=$ec (module go itself uses reported not installed)"; fi
+          unset GOENV; export GOENV=off
+          
+          echo "################ C. go env -w GOPRIVATE ignored: private module path sent to proxy.golang.org"
+          T="$ROOT/gpriv"; stage "$T"; cd "$T/c"
+          export GOMODCACHE=$(mp "$T/coldcache") GOENV=$(mp "$T/goenv"); unset GOPROXY
+          go env -w GOPRIVATE=example.com
+          "$SP" vendor --ecosystems golang --json > out.json 2>/dev/null
+          if grep -q "proxy.golang.org" out.json; then res C "FAIL private module requested from proxy.golang.org: $(grep -o 'GET https[^"]*' out.json | head -1)"; else res C "PASS $(grep -o '"reason":"[^"]*' out.json | head -1)"; fi
+          export GOENV=off GOPRIVATE=example.com
+          "$SP" vendor --ecosystems golang --json > out2.json 2>/dev/null
+          if grep -q "proxy.golang.org" out2.json; then res C-control "FAIL"; else res C-control "PASS (GOPRIVATE as env var is honoured)"; fi
+          unset GOPRIVATE
+          PROBE
+          go version
+          SP="$PWD/target/release/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          bash "$RUNNER_TEMP/probe.sh" "$SP" "$RUNNER_TEMP/bh" 2>&1 | tee "$RUNNER_TEMP/log.txt"
+          echo "=========== SUMMARY"; grep RESULT "$RUNNER_TEMP/log.txt"
