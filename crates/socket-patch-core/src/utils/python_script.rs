@@ -627,7 +627,12 @@ mod rendering_tests {
             "{direct}"
         );
         assert!(uv_line.ends_with('}'), "{direct}");
-        assert!(direct.starts_with("[project]\nname = \"p\"\ndependencies = [\"alpha==1.0.0\"]\n\n[tool]\n"), "{direct}");
+        assert!(
+            direct.starts_with(
+                "[project]\nname = \"p\"\ndependencies = [\"alpha==1.0.0\"]\n\n[tool]\n"
+            ),
+            "{direct}"
+        );
         assert_settled(&direct);
 
         let transitive = rewrite_project_metadata(

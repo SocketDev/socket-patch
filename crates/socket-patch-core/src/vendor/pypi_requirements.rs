@@ -1,13 +1,20 @@
 //! requirements.txt wiring (pip & `uv pip`).
 //!
 //! The spike-verified line shape is
-//! `./<rel wheel>[ ; <marker>] --hash=sha256:<hex>  # socket-patch vendor: <name>==<ver>`:
+//! `./<rel wheel>[ ; <marker>] [--hash=sha256:<hex>]  # socket-patch vendor: <name>==<ver>`:
 //! both pip 26 and uv 0.11 accept the bare relative path (resolved against
 //! the INVOKING CWD, never the requirements-file dir — hence the documented
-//! root-only constraint), enforce the `--hash` pin (implicitly: any
-//! `--hash` on any line turns hash-checking on), strip the trailing comment,
-//! and genuinely EVALUATE a `; marker` on a path line — so an environment
-//! marker is carried over from the replaced pin instead of refused.
+//! root-only constraint), enforce the `--hash` pin, strip the trailing
+//! comment, and genuinely EVALUATE a `; marker` on a path line — so an
+//! environment marker is carried over from the replaced pin instead of
+//! refused.
+//!
+//! The `--hash` is written only when the requirements tree is already in
+//! pip's hash-checking mode ([`requires_hashes`]): any `--hash` on any line
+//! turns that mode on for the whole install, so a hashed vendor line in an
+//! unhashed tree would make pip refuse every other requirement (#376). A
+//! path line cannot carry a `#sha256=` fragment instead; the committed
+//! wheel is the repository's own content.
 //!
 //! Logical-line model: physical lines join on a trailing `\`; comments start
 //! at a `#` preceded by whitespace (or column 0) outside that. The dominant
@@ -19,7 +26,7 @@ use std::path::{Path, PathBuf};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::requirements::{
-    hash_options, logical_lines, split_comment, strip_comment, vendor_tag,
+    hash_options, logical_lines, requires_hashes, split_comment, strip_comment, vendor_tag,
 };
 
 use super::common::{detect_eol, refuse_symlinked};
@@ -440,6 +447,9 @@ async fn plan_requirements(
     wheel_sha256_hex: &str,
 ) -> Result<Vec<PlannedFile>, (&'static str, String)> {
     let files = collect_requirements_files(root).await?;
+    // pip's hash-checking mode spans the whole install: every reachable
+    // file (includes too) decides whether the vendor line is hashed.
+    let hashed = files.iter().any(|f| requires_hashes(&f.content));
     let mut planned: Vec<PlannedFile> = Vec::new();
     let mut rewrote_any = false;
 
@@ -497,7 +507,7 @@ async fn plan_requirements(
         for (start, count, marker, _) in spans.iter().rev() {
             let line = vendor_line(
                 rel_wheel,
-                wheel_sha256_hex,
+                hashed.then_some(wheel_sha256_hex),
                 canon_name,
                 version,
                 marker,
@@ -542,7 +552,7 @@ async fn plan_requirements(
             .expect("collect_requirements_files always yields the root file first");
         let line = vendor_line(
             rel_wheel,
-            wheel_sha256_hex,
+            hashed.then_some(wheel_sha256_hex),
             canon_name,
             version,
             &None,
@@ -572,15 +582,17 @@ async fn plan_requirements(
     Ok(planned)
 }
 
-/// The committed vendor line. `transitive` adds the `(transitive)` note so a
-/// reader knows the line was appended (no pin was replaced).
+/// The committed vendor line. `sha256_hex` is the `--hash` pin, `None` for a
+/// requirements tree outside hash-checking mode (module docs). `transitive`
+/// adds the `(transitive)` note so a reader knows the line was appended (no
+/// pin was replaced).
 ///
 /// Visible to the rest of `vendor` so the lockfile inventory's round-trip
 /// test can read back exactly what this writes (the two grammars — the one
 /// that writes a vendored line and the one that reads it — must agree).
 pub(in crate::vendor) fn vendor_line(
     rel_wheel: &str,
-    sha256_hex: &str,
+    sha256_hex: Option<&str>,
     canon_name: &str,
     version: &str,
     marker: &Option<String>,
@@ -590,9 +602,12 @@ pub(in crate::vendor) fn vendor_line(
         .as_ref()
         .map(|m| format!(" ; {m}"))
         .unwrap_or_default();
+    let hash_part = sha256_hex
+        .map(|hex| format!(" --hash=sha256:{hex}"))
+        .unwrap_or_default();
     let note = if transitive { " (transitive)" } else { "" };
     format!(
-        "./{rel_wheel}{marker_part} --hash=sha256:{sha256_hex}  # socket-patch vendor: {canon_name}=={version}{note}"
+        "./{rel_wheel}{marker_part}{hash_part}  # socket-patch vendor: {canon_name}=={version}{note}"
     )
 }
 
@@ -911,6 +926,11 @@ mod tests {
         format!("./{REL_WHEEL} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0")
     }
 
+    /// [`expected_line`] for a requirements tree outside hash-checking mode.
+    fn expected_unhashed_line() -> String {
+        format!("./{REL_WHEEL}  # socket-patch vendor: six==1.16.0")
+    }
+
     async fn write_root(content: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(tmp.path().join("requirements.txt"), content)
@@ -1019,7 +1039,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             read_root(tmp.path()).await,
-            format!("requests==2.31.0\n{}\n", expected_line())
+            format!("requests==2.31.0\n{}\n", expected_unhashed_line())
         );
         assert_eq!(wiring.len(), 1);
         assert_eq!(wiring[0].kind, "requirements_line");
@@ -1058,6 +1078,68 @@ mod tests {
         assert_eq!(read_root(tmp.path()).await, original);
     }
 
+    /// #376: an unhashed requirements set must stay unhashed. pip turns
+    /// hash-checking mode on for the whole install as soon as one line has a
+    /// `--hash`, so a hashed vendor line makes `pip install -r` refuse every
+    /// other (unhashed) requirement. A bare path cannot carry a `#sha256=`
+    /// fragment, so the committed wheel's line goes without one.
+    #[tokio::test]
+    async fn unhashed_requirements_get_an_unhashed_vendor_line() {
+        for (original, wired) in [
+            (
+                "six==1.16.0\nidna==3.7\n",
+                format!("./{REL_WHEEL}  # socket-patch vendor: six==1.16.0\nidna==3.7\n"),
+            ),
+            (
+                "idna==3.7\n",
+                format!(
+                    "idna==3.7\n./{REL_WHEEL}  # socket-patch vendor: six==1.16.0 (transitive)\n"
+                ),
+            ),
+        ] {
+            let tmp = write_root(original).await;
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap();
+            assert_eq!(read_root(tmp.path()).await, wired);
+            // Still read back as our line for this patch.
+            assert!(matches!(
+                preflight_requirements(tmp.path(), "six", "1.16.0", UUID).await,
+                Ok(RequirementsTarget::InSync { pin: None })
+            ));
+            let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert_eq!(read_root(tmp.path()).await, original);
+        }
+    }
+
+    /// #376: hashes anywhere in the requirements tree (an `-r` include, or
+    /// `--require-hashes`) mean pip is in hash-checking mode, so the vendor
+    /// line keeps its `--hash` pin.
+    #[tokio::test]
+    async fn hashes_in_an_include_keep_the_vendor_line_hashed() {
+        let tmp = write_root("-r deps.txt\nsix==1.16.0\n").await;
+        tokio::fs::write(tmp.path().join("deps.txt"), "idna==3.7 --hash=sha256:aa\n")
+            .await
+            .unwrap();
+        wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!("-r deps.txt\n{}\n", expected_line())
+        );
+
+        let tmp = write_root("--require-hashes\nsix==1.16.0\n").await;
+        wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!("--require-hashes\n{}\n", expected_line())
+        );
+    }
+
     #[tokio::test]
     async fn marker_is_carried_over_verbatim() {
         let tmp = write_root("six==1.16.0 ; python_version >= \"3.8\"\n").await;
@@ -1067,7 +1149,7 @@ mod tests {
         assert_eq!(
             read_root(tmp.path()).await,
             format!(
-                "./{REL_WHEEL} ; python_version >= \"3.8\" --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0\n"
+                "./{REL_WHEEL} ; python_version >= \"3.8\"  # socket-patch vendor: six==1.16.0\n"
             )
         );
     }
@@ -1081,7 +1163,7 @@ mod tests {
         assert_eq!(
             read_root(tmp.path()).await,
             format!(
-                "python-dateutil==2.8.2\n./{REL_WHEEL} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0 (transitive)\n"
+                "python-dateutil==2.8.2\n./{REL_WHEEL}  # socket-patch vendor: six==1.16.0 (transitive)\n"
             )
         );
         assert_eq!(wiring[0].action, WiringAction::Added);
@@ -1114,7 +1196,7 @@ mod tests {
             tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt"))
                 .await
                 .unwrap(),
-            format!("{}\n", expected_line())
+            format!("{}\n", expected_unhashed_line())
         );
         assert_eq!(wiring.len(), 1);
         assert_eq!(wiring[0].file, "deps/pinned.txt");
@@ -1224,7 +1306,7 @@ mod tests {
         );
         assert_eq!(
             read_root(tmp.path()).await,
-            format!("# vendored from C:\\deps\\\n{}\n", expected_line())
+            format!("# vendored from C:\\deps\\\n{}\n", expected_unhashed_line())
         );
     }
 
@@ -1373,8 +1455,12 @@ mod tests {
         let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
             .await
             .unwrap();
-        // Drift: the user edited the vendor line (changed the hash).
-        let drifted = read_root(tmp.path()).await.replace(SHA, &"0".repeat(64));
+        // Drift: the user edited the vendor line (added a marker).
+        let drifted = read_root(tmp.path()).await.replace(
+            "  # socket-patch vendor",
+            " ; python_version >= \"3\"  # socket-patch vendor",
+        );
+        assert_ne!(drifted, read_root(tmp.path()).await);
         tokio::fs::write(tmp.path().join("requirements.txt"), &drifted)
             .await
             .unwrap();
@@ -1457,7 +1543,7 @@ mod tests {
         );
         assert_eq!(
             read_root(tmp.path()).await,
-            format!("{}\n", expected_line())
+            format!("{}\n", expected_unhashed_line())
         );
 
         // The BOM travels inside the replaced physical line's record, so
@@ -1496,7 +1582,7 @@ mod tests {
             tokio::fs::read_to_string(tmp.path().join("dev.txt"))
                 .await
                 .unwrap(),
-            format!("{}\n", expected_line())
+            format!("{}\n", expected_unhashed_line())
         );
     }
 
@@ -1603,7 +1689,7 @@ mod tests {
             .unwrap();
         assert_eq!(wiring.len(), 2);
         let written = read_root(tmp.path()).await;
-        assert_eq!(written.matches(&expected_line()).count(), 2);
+        assert_eq!(written.matches(&expected_unhashed_line()).count(), 2);
 
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -1856,7 +1942,7 @@ mod tests {
         assert_eq!(
             read_root(tmp.path()).await,
             format!(
-                "requests==2.31.0\n./{REL_WHEEL} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0 (transitive)\n"
+                "requests==2.31.0\n./{REL_WHEEL}  # socket-patch vendor: six==1.16.0 (transitive)\n"
             )
         );
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
@@ -1878,7 +1964,7 @@ mod tests {
         assert_eq!(
             read_root(tmp.path()).await,
             format!(
-                "requests==2.31.0\r\nzope.interface==5.0\r\n./{REL_WHEEL} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0 (transitive)\r\n"
+                "requests==2.31.0\r\nzope.interface==5.0\r\n./{REL_WHEEL}  # socket-patch vendor: six==1.16.0 (transitive)\r\n"
             )
         );
     }
@@ -1918,7 +2004,7 @@ mod tests {
             tokio::fs::read_to_string(tmp.path().join("deps/b.txt"))
                 .await
                 .unwrap(),
-            format!("{}\n", expected_line())
+            format!("{}\n", expected_unhashed_line())
         );
         // No transitive duplicate at the root, and the other files are
         // byte-untouched — the walk really visited them.
@@ -2014,7 +2100,7 @@ mod tests {
             tokio::fs::read_to_string(tmp.path().join("dev.txt"))
                 .await
                 .unwrap(),
-            format!("{}\n", expected_line())
+            format!("{}\n", expected_unhashed_line())
         );
     }
 

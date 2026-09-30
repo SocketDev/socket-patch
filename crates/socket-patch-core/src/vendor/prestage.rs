@@ -464,7 +464,10 @@ mod sweep_tests {
         for dir in &kept {
             assert!(v.join(dir).exists(), "{dir} kept");
         }
-        assert!(!v.join("gem").exists(), "the levels only the tree kept alive are pruned");
+        assert!(
+            !v.join("gem").exists(),
+            "the levels only the tree kept alive are pruned"
+        );
         assert!(!v.join(format!("composer/{u}/psr/log@3.0.2")).exists());
         assert!(v.join("state.json").exists());
         assert_eq!(sweep_stale(root).await, 0, "idempotent");

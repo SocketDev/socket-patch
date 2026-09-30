@@ -182,8 +182,7 @@ async fn scan_discovers_maven_artifacts() {
     // the word "packages", which is exactly what let the old assertion
     // pass when discovery was disabled.
     assert!(
-        !combined.contains("No packages found")
-            && !combined.contains("No packages found"),
+        !combined.contains("No packages found") && !combined.contains("No packages found"),
         "scan reported zero packages — Maven discovery did not run:\n{combined}"
     );
     assert!(

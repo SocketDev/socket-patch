@@ -7272,8 +7272,11 @@ mod tests {
         let installed = |name: &str, body: &[u8]| {
             let dist = site.path().join(format!("{name}-1.0.0.dist-info"));
             std::fs::create_dir_all(&dist).unwrap();
-            std::fs::write(dist.join("METADATA"), format!("Name: {name}\nVersion: 1.0.0\n"))
-                .unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Name: {name}\nVersion: 1.0.0\n"),
+            )
+            .unwrap();
             std::fs::write(site.path().join(format!("{name}.py")), body).unwrap();
             compute_git_sha256_from_bytes(body)
         };
@@ -7317,7 +7320,10 @@ mod tests {
         mount(uuid("bs"), "beta_sdist.py".into(), "0".repeat(64), 0).await;
         for n in ["gw", "gs"] {
             Mock::given(method("GET"))
-                .and(wm_path(format!("/v0/orgs/test-org/patches/view/{}", uuid(n))))
+                .and(wm_path(format!(
+                    "/v0/orgs/test-org/patches/view/{}",
+                    uuid(n)
+                )))
                 .respond_with(ResponseTemplate::new(500))
                 .expect(0)
                 .mount(&server)

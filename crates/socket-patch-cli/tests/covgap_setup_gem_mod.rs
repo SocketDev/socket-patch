@@ -71,7 +71,10 @@ fn setup_remove_clears_bundler_registration_under_bundle_app_config() {
         &["setup", "--yes", "--json", "--ecosystems", "gem"],
         &[],
     );
-    assert_eq!(code, 0, "gem setup must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "gem setup must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let v = common::parse_json_envelope(&stdout);
     assert_eq!(v["status"], "success", "{v}");
     assert!(
@@ -110,7 +113,14 @@ fn setup_remove_clears_bundler_registration_under_bundle_app_config() {
     // Step 3: unwire with BUNDLE_APP_CONFIG set (child-only env injection).
     let (code, stdout, stderr) = common::run_with_env(
         root,
-        &["setup", "--remove", "--yes", "--json", "--ecosystems", "gem"],
+        &[
+            "setup",
+            "--remove",
+            "--yes",
+            "--json",
+            "--ecosystems",
+            "gem",
+        ],
         &[("BUNDLE_APP_CONFIG", "bundle-config")],
     );
     assert_eq!(

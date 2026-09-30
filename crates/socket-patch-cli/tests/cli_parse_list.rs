@@ -1202,7 +1202,10 @@ fn missing_manifest_with_corrupt_ledger_keeps_warning_in_error_envelope_via_bina
     assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
     let warnings = v["warnings"].as_array().expect("warnings[] present");
     assert_eq!(warnings.len(), 1, "envelope={v}");
-    assert_eq!(warnings[0]["code"], "redirect_ledger_corrupt", "envelope={v}");
+    assert_eq!(
+        warnings[0]["code"], "redirect_ledger_corrupt",
+        "envelope={v}"
+    );
     assert!(
         out.stderr.is_empty(),
         "--json must keep stderr clean: {}",
@@ -1214,7 +1217,10 @@ fn missing_manifest_with_corrupt_ledger_keeps_warning_in_error_envelope_via_bina
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr.contains("Warning: "), "stderr={stderr}");
-    assert!(stderr.contains("Error: Manifest not found at "), "stderr={stderr}");
+    assert!(
+        stderr.contains("Error: Manifest not found at "),
+        "stderr={stderr}"
+    );
 }
 
 #[test]

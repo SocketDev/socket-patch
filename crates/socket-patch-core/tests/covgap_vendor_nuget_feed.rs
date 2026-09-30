@@ -88,9 +88,7 @@ async fn stage_tempdir_creation_failure_is_reported_not_fatal() {
     drop(guard);
 
     match outcome {
-        VendorOutcome::Done {
-            result, entry, ..
-        } => {
+        VendorOutcome::Done { result, entry, .. } => {
             assert!(!result.success, "the stage failure must fail the vendor");
             assert!(entry.is_none(), "no ledger entry for a failed vendor");
             let err = result.error.as_deref().unwrap_or("");

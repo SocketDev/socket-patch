@@ -1090,10 +1090,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
-    let site_output = run_blocking(|| {
-        SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query)
-    })
-    .await;
+    let site_output =
+        run_blocking(|| SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query)).await;
     if let Some(stdout) = site_output {
         for p in parse_python_site_packages_output(&stdout) {
             add_path(p, &mut seen, &mut results);

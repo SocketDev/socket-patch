@@ -157,6 +157,25 @@ pub(crate) fn hash_options(code: &str) -> Vec<String> {
     hashes
 }
 
+/// Whether a requirements file puts pip into hash-checking mode for the whole
+/// install: pip turns it on as soon as ANY requirement carries a `--hash`
+/// option (of any algorithm), or the file sets `--require-hashes`. The mode
+/// is all or nothing: once on, every requirement — and every transitive
+/// dependency — must be `==`-pinned and hashed, so a writer must match it
+/// rather than add the first `--hash` (#376) or an unhashed line (#378).
+///
+/// Every line counts, socket-patch's own included: a line this writer
+/// emitted keeps the mode it was written for, so a re-scan is a no-op. A
+/// url's `#sha256=` fragment is not a hash option: pip verifies it without
+/// turning the mode on.
+pub(crate) fn requires_hashes(content: &str) -> bool {
+    logical_lines(content).iter().any(|line| {
+        strip_comment(&line.text).split_whitespace().any(|token| {
+            token == "--hash" || token.starts_with("--hash=") || token == "--require-hashes"
+        })
+    })
+}
+
 /// `(distribution, version)` a Python artifact filename names: a PEP 427
 /// wheel (`dist-version-…-tags.whl`) or an sdist (`dist-version.tar.gz` /
 /// `.zip` / `.tar.bz2` / `.tar.xz`). Names are returned as spelled (callers

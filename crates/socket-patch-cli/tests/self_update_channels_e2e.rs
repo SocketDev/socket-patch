@@ -55,7 +55,10 @@ async fn npm_project_local_refuses_with_local_hint() {
         "a project install must get the in-project upgrade command: {stderr}"
     );
     assert!(!stderr.contains("npm update -g"), "{stderr}");
-    assert!(stderr.starts_with("Error: This socket-patch binary ("), "{stderr}");
+    assert!(
+        stderr.starts_with("Error: This socket-patch binary ("),
+        "{stderr}"
+    );
 }
 
 /// An npm-bundled binary (any `node_modules` component) refuses with the

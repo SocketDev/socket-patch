@@ -572,5 +572,8 @@ async fn fetch_missing_blobs_mixed_outcomes_aggregate_and_format() {
     // End-to-end formatter exercise with a genuinely mixed result.
     let rendered = format_fetch_result(&result);
     assert!(rendered.contains("Downloaded 1 blob\n"), "{rendered}");
-    assert!(rendered.contains("Failed to download 2 blobs"), "{rendered}");
+    assert!(
+        rendered.contains("Failed to download 2 blobs"),
+        "{rendered}"
+    );
 }

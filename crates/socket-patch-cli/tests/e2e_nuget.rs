@@ -232,7 +232,8 @@ async fn scan_discovers_global_cache_packages() {
     // masked.
     assert!(
         !combined.contains("No packages found")
-            && !combined.contains("No packages found") && !combined.contains("No global packages found"),
+            && !combined.contains("No packages found")
+            && !combined.contains("No global packages found"),
         "scan failed to discover the fake global cache:\n{combined}"
     );
     // Exactly the two packages we planted (Newtonsoft.Json, System.Text.Json),
@@ -291,7 +292,8 @@ async fn scan_discovers_legacy_packages() {
     );
     assert!(
         !combined.contains("No packages found")
-            && !combined.contains("No packages found") && !combined.contains("No global packages found"),
+            && !combined.contains("No packages found")
+            && !combined.contains("No global packages found"),
         "scan failed to discover the legacy packages/ layout:\n{combined}"
     );
     // Exactly the single legacy package we planted (Newtonsoft.Json.13.0.3),
