@@ -1,0 +1,87 @@
+name: bughunt nuget probe
+on:
+  push:
+    branches: ['bughunt/nuget/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, dotnet: '6'}
+          - {os: ubuntu-latest, dotnet: '7'}
+          - {os: ubuntu-latest, dotnet: '8'}
+          - {os: ubuntu-latest, dotnet: '9'}
+          - {os: ubuntu-latest, dotnet: '10'}
+          - {os: macos-latest, dotnet: '8'}
+          - {os: macos-latest, dotnet: '9'}
+          - {os: windows-latest, dotnet: '8'}
+          - {os: windows-latest, dotnet: '9'}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ matrix.dotnet }}.0.x
+      - run: cargo build --release -p socket-patch-cli
+      - name: probe
+        shell: bash
+        env:
+          M: ${{ matrix.dotnet }}
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_NOLOGO: '1'
+          SOCKET_OFFLINE: '1'
+        run: |
+          set -u
+          SP="$GITHUB_WORKSPACE/target/release/socket-patch"
+          W="$RUNNER_TEMP/bh"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
+          wp(){ if command -v cygpath >/dev/null; then cygpath -w "$1"; else echo "$1"; fi; }
+          SDKV=$(dotnet --list-sdks | awk '{print $1}' | grep "^$M\." | sort -V | tail -1)
+          echo "{\"sdk\":{\"version\":\"$SDKV\",\"rollForward\":\"latestFeature\"}}" > global.json
+          dotnet --version
+          blob(){ local l; l=$(wc -c < "$1" | tr -d ' '); { printf 'blob %s\0' "$l"; cat "$1"; } | sha256sum | cut -d' ' -f1; }
+          stage(){ local o="$1" p="$2" u="$3" bh ah; bh=$(blob "$o"); ah=$(blob "$p")
+            mkdir -p .socket/blobs; cp "$p" ".socket/blobs/$ah"
+            printf '{"patches":{"pkg:nuget/Newtonsoft.Json@13.0.3":{"uuid":"%s","exportedAt":"2026-01-01T00:00:00Z","files":{"LICENSE.md":{"beforeHash":"%s","afterHash":"%s"}},"vulnerabilities":{},"description":"m","license":"MIT","tier":"free"}}}' "$u" "$bh" "$ah" > .socket/manifest.json; }
+          mkproj(){ mkdir -p "$1"; printf '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net%s.0</TargetFramework><RestorePackagesWithLockFile>%s</RestorePackagesWithLockFile><NuGetAudit>false</NuGetAudit></PropertyGroup><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>' "$M" "$2" > "$1/app.csproj"; echo 'System.Console.WriteLine("ok");' > "$1/Program.cs"; }
+          lic(){ echo "$1/newtonsoft.json/13.0.3/LICENSE.md"; }
+          res(){ echo "RESULT[$M/$RUNNER_OS] $*"; }
+          # ---- A: warm cache, no lockfile
+          mkproj A false; cd A; export NUGET_PACKAGES="$(wp "$W/cacheA")"
+          dotnet restore > r.log 2>&1 || { cat r.log; res "A setup restore failed"; }
+          cp "$(lic "$W/cacheA")" pristine.md; cp pristine.md patched.md; printf '\nSOCKET-MARKER\n' >> patched.md
+          stage pristine.md patched.md 11111111-1111-4111-8111-111111111111
+          "$SP" vendor --json --offline > v.json 2>&1; grep -E '"status"|errorCode' v.json
+          rm -rf obj bin; dotnet restore --force > r2.log 2>&1; echo "restore rc=$?"
+          grep -q SOCKET-MARKER "$(lic "$W/cacheA")" && res "A warm-nolock: PATCHED" || res "A warm-nolock: UNPATCHED (bug)"
+          export NUGET_PACKAGES="$(wp "$W/coldA")"; rm -rf obj; dotnet restore > r3.log 2>&1
+          grep -q SOCKET-MARKER "$(lic "$W/coldA")" && res "A cold-nolock control: PATCHED" || { cat r3.log; res "A cold control: UNPATCHED"; }
+          cd "$W"
+          # ---- B: warm cache, lockfile, --locked-mode
+          mkproj B true; cd B; export NUGET_PACKAGES="$(wp "$W/cacheB")"
+          dotnet restore > r.log 2>&1 || cat r.log
+          cp "$(lic "$W/cacheB")" pristine.md; cp pristine.md patched.md; printf '\nSOCKET-MARKER\n' >> patched.md
+          stage pristine.md patched.md 22222222-2222-4222-8222-222222222222
+          "$SP" vendor --json --offline > v.json 2>&1; grep -E '"status"|errorCode' v.json
+          rm -rf obj; dotnet restore --locked-mode > r2.log 2>&1; rc=$?
+          grep -q NU1403 r2.log && res "B warm-locked: NU1403 (bug) rc=$rc" || res "B warm-locked: rc=$rc no NU1403"
+          cd "$W"
+          # ---- C: solution layout, lock in src/App
+          mkdir C; mkproj C/src/App true; cd C; cp ../global.json .; export NUGET_PACKAGES="$(wp "$W/cacheC")"
+          dotnet new sln -n App > /dev/null; SLN=$(ls App.sln* | head -1); dotnet sln "$SLN" add src/App/app.csproj > /dev/null; dotnet new nugetconfig > /dev/null
+          dotnet restore > r.log 2>&1 || cat r.log
+          cp "$(lic "$W/cacheC")" "$W/pC.md"; cp "$W/pC.md" "$W/qC.md"; printf '\nSOCKET-MARKER\n' >> "$W/qC.md"
+          stage "$W/pC.md" "$W/qC.md" 33333333-3333-4333-8333-333333333333
+          cp src/App/packages.lock.json "$W/lockC.before"
+          "$SP" vendor --json --offline > "$W/vC.json" 2>&1; grep -E '"status"|errorCode' "$W/vC.json"
+          cmp -s "$W/lockC.before" src/App/packages.lock.json && res "C member lock UNCHANGED (bug)" || res "C member lock repinned"
+          mkdir -p "$W/Cco/src/App"; cp -r "$SLN" nuget.config global.json .socket "$W/Cco/"; cp src/App/app.csproj src/App/Program.cs src/App/packages.lock.json "$W/Cco/src/App/"
+          cd "$W/Cco"; export NUGET_PACKAGES="$(wp "$W/coldC")"; dotnet restore --locked-mode > r.log 2>&1; rc=$?
+          grep -q NU1403 r.log && res "C fresh cold locked restore: NU1403 (bug) rc=$rc" || res "C fresh cold locked restore rc=$rc"
+          echo "==== summary"; true
